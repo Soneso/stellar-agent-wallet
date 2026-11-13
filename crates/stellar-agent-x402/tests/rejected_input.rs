@@ -34,7 +34,7 @@ fn rejected_input_transfer_addresses() {
                 account.as_str(),
                 "CREDMARKER7",
                 "x402.invalid_recipient_address",
-                "invalid recipient address: pay_to must be a G-, C-, or M-strkey",
+                "invalid recipient address: pay_to must be a G-, C-, M-, or W-strkey",
             ),
             (
                 unsupported.as_str(),
@@ -62,7 +62,7 @@ fn rejected_input_transfer_addresses() {
                 account.as_str(),
                 unsupported.as_str(),
                 "x402.invalid_recipient_address",
-                "invalid recipient address: pay_to must be a G-, C-, or M-strkey",
+                "invalid recipient address: pay_to must be a G-, C-, M-, or W-strkey",
             ),
         ] {
             let error = build_sac_transfer_invoke(sac, from, to, 1).expect_err("invalid address");

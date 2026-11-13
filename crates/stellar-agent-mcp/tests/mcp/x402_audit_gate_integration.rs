@@ -90,6 +90,8 @@ enum Resimulation {
 /// How the mock answers `getNetwork`.
 #[derive(Clone, PartialEq, Eq)]
 enum NetworkAnswer {
+    /// Testnet protocols in request order, retaining the final value.
+    Protocols(Vec<u32>),
     /// This passphrase at a supported protocol version.
     Passphrase(&'static str),
     /// This passphrase after a delay.
@@ -209,6 +211,21 @@ impl X402Rpc {
             )
         };
         match &self.network {
+            NetworkAnswer::Protocols(protocols) => {
+                let count = self
+                    .observed
+                    .lock()
+                    .unwrap()
+                    .methods
+                    .iter()
+                    .filter(|method| *method == "getNetwork")
+                    .count();
+                let protocol = protocols[count.saturating_sub(1).min(protocols.len() - 1)];
+                simulate_result(
+                    req_id.clone(),
+                    serde_json::json!({"passphrase": TESTNET_PASSPHRASE, "protocolVersion": protocol}),
+                )
+            }
             NetworkAnswer::Passphrase(passphrase) => answer(passphrase),
             NetworkAnswer::Delayed(passphrase, delay) => answer(passphrase).set_delay(*delay),
             NetworkAnswer::ErrorObject => ResponseTemplate::new(200)
@@ -1779,6 +1796,111 @@ fn window_state(profile: &Profile, profile_name: &str) -> (i128, u32) {
         .expect("the window reads")
 }
 
+#[tokio::test]
+#[serial]
+async fn muxed_unlisted_budget_preserves_destination_and_amount() {
+    use stellar_agent_core::policy::Decision;
+    use stellar_agent_core::policy::v1::criteria::{
+        Criterion,
+        counterparty_allowlist::{
+            CounterpartyAllowlistCriterion, CounterpartyKind, UnlistedBudget, UnlistedMode,
+        },
+        per_period_cap::{PerPeriodCapCriterion, Window},
+    };
+    use stellar_agent_core::{PolicyDocument, PolicyEngineV1, PolicyRule, RuleMatch, ScopeId};
+    for tool in [Tool::CreatePayment, Tool::AuthenticatedPayment] {
+        for contract in [false, true] {
+            let expected = if contract {
+                ScAddress::MuxedContract(stellar_xdr::MuxedContract {
+                    id: 7,
+                    contract_id: ContractId(Hash([6; 32])),
+                })
+            } else {
+                ScAddress::MuxedAccount(stellar_xdr::MuxedEd25519Account {
+                    id: 7,
+                    ed25519: Uint256([6; 32]),
+                })
+            };
+            let payee =
+                stellar_agent_core::sc_address::scaddress_destination_strkey(&expected).unwrap();
+            let profile_name = "muxed-budget";
+            let mut fixture = fixture(profile_name, [0x47; 32], |rpc| {
+                rpc.network = NetworkAnswer::Protocols(vec![30])
+            })
+            .await;
+            let criteria: Vec<Box<dyn Criterion>> = vec![
+                Box::new(PerPeriodCapCriterion::new(
+                    ASSET.into(),
+                    Window::parse("1d").unwrap(),
+                    100_000_000,
+                )),
+                Box::new(
+                    CounterpartyAllowlistCriterion::new(
+                        vec![CounterpartyKind::GAccount, CounterpartyKind::CAccount],
+                        vec![],
+                    )
+                    .with_unlisted(UnlistedMode::Budget(UnlistedBudget::new(
+                        ASSET.into(),
+                        10_000_000,
+                        10_000_000,
+                        Window::parse("1d").unwrap(),
+                    ))),
+                ),
+            ];
+            let engine = PolicyEngineV1::new(
+                PolicyDocument {
+                    version: 1,
+                    scope: ScopeId::AllProfiles,
+                    signature: None,
+                    rules: vec![PolicyRule {
+                        r#match: RuleMatch {
+                            tool: "*".into(),
+                            chain: "*".into(),
+                        },
+                        criteria,
+                        decision: Decision::Allow,
+                        allow_opaque_signing: false,
+                    }],
+                },
+                profile_name.into(),
+            );
+            fixture.server.set_policy_engine_for_test(Arc::new(engine));
+            let requirements = payment_required_with(|r| r["payTo"] = payee.as_str().into());
+            let result = result_json(&call_with(&fixture, tool, &requirements).await);
+            assert_eq!(result["ok"], true, "{result}");
+            assert_eq!(result["data"]["payTo"], payee);
+            assert_eq!(
+                window_state(&fixture.profile, profile_name),
+                (10_000_000, 1)
+            );
+            let (rows, _) = x402_rows(&fixture.profile);
+            assert_eq!(
+                rows[0]["legs"][0]["destination_redacted"],
+                stellar_agent_core::observability::redact_strkey_first5_last5(&payee)
+            );
+            assert_eq!(rows[0]["legs"][0]["amount"], "10000000");
+            {
+                let observed = fixture.rpc.observed.lock().unwrap();
+                assert_eq!(observed.transmitted.len(), 1);
+                assert_eq!(observed.transmitted[0].2.args[1], ScVal::Address(expected));
+                assert_eq!(
+                    observed.transmitted[0].2.args[2],
+                    ScVal::from(10_000_000_i128)
+                );
+            }
+            let denied = result_json(&call_with(&fixture, tool, &requirements).await);
+            assert_eq!(
+                denied["error"]["code"], "policy.deny.unlisted_budget_exceeded",
+                "{denied}"
+            );
+            assert_eq!(
+                window_state(&fixture.profile, profile_name),
+                (10_000_000, 1)
+            );
+        }
+    }
+}
+
 /// Every invalid requirement field answers its own `x402.*` code through both
 /// tools before any request, and the spending window stays empty.
 #[tokio::test]
@@ -1862,13 +1984,45 @@ async fn valid_requirements_preserve_window_leg() {
             muxed,
             format!("{}", stellar_strkey::ed25519::PublicKey([0x2c; 32])),
         ),
+        (
+            stellar_strkey::MuxedContract {
+                contract_id: [3; 32],
+                id: 7,
+            }
+            .to_string()
+            .as_str()
+            .to_owned(),
+            stellar_strkey::Contract([3; 32])
+                .to_string()
+                .as_str()
+                .to_owned(),
+        ),
+        (
+            stellar_strkey::MuxedContract {
+                contract_id: [3; 32],
+                id: 7,
+            }
+            .to_string()
+            .as_str()
+            .to_owned(),
+            stellar_strkey::MuxedContract {
+                contract_id: [3; 32],
+                id: 7,
+            }
+            .to_string()
+            .as_str()
+            .to_owned(),
+        ),
     ];
     let mut seed = 0xe3;
     for tool in [Tool::CreatePayment, Tool::AuthenticatedPayment] {
         for (recipient, entry) in &recipients {
             seed += 1;
             let profile_name = format!("x402-leg-{seed:x}");
-            let mut fixture = fixture(&profile_name, [seed; 32], |_| {}).await;
+            let mut fixture = fixture(&profile_name, [seed; 32], |rpc| {
+                rpc.network = NetworkAnswer::Protocols(vec![30])
+            })
+            .await;
             fixture
                 .server
                 .set_policy_engine_for_test(Arc::new(cap_engine_with_recipient(
@@ -1920,6 +2074,12 @@ async fn valid_requirements_preserve_window_leg() {
                         ed25519: Uint256(account.ed25519),
                     })
                 }
+                stellar_strkey::Strkey::MuxedContract(contract) => {
+                    ScAddress::MuxedContract(stellar_xdr::MuxedContract {
+                        id: contract.id,
+                        contract_id: ContractId(Hash(contract.contract_id)),
+                    })
+                }
                 other => panic!("unexpected recipient {other:?}"),
             };
             let admitted_asset = leg["asset"].as_str().expect("the leg names its asset");
@@ -1932,6 +2092,53 @@ async fn valid_requirements_preserve_window_leg() {
             );
             assert_eq!(function.args[1], ScVal::Address(recipient_address));
             assert_eq!(function.args[2], ScVal::from(10_000_000_i128));
+        }
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn muxed_contract_protocol_table_and_library_mapping() {
+    let payee = stellar_strkey::MuxedContract {
+        contract_id: [3; 32],
+        id: 7,
+    }
+    .to_string();
+    for tool in [Tool::CreatePayment, Tool::AuthenticatedPayment] {
+        for protocols in [vec![28], vec![29], vec![30], vec![31], vec![30, 29]] {
+            let schedule = protocols.clone();
+            let fixture = fixture("muxed-protocol", [0x46; 32], |rpc| {
+                rpc.network = NetworkAnswer::Protocols(schedule)
+            })
+            .await;
+            let result = call_with(
+                &fixture,
+                tool,
+                &payment_required_with(|r| r["payTo"] = payee.as_str().into()),
+            )
+            .await;
+            let result = result_json(&result);
+            if *protocols.last().unwrap() < 30 {
+                assert_eq!(
+                    result["error"]["code"], "x402.muxed_contract_protocol_unsupported",
+                    "{tool:?}: {result}"
+                );
+                assert!(fixture.rpc.observed.lock().unwrap().signed.is_empty());
+                let observed = fixture.rpc.observed.lock().unwrap();
+                assert_eq!(observed.methods.len(), protocols.len());
+                assert_eq!(
+                    observed
+                        .methods
+                        .iter()
+                        .filter(|method| *method == "simulateTransaction")
+                        .count(),
+                    0
+                );
+                assert_eq!(window_state(&fixture.profile, "muxed-protocol"), (0, 0));
+            } else {
+                assert_eq!(result["ok"], true, "{tool:?}: {result}");
+                assert_eq!(result["data"]["payTo"], payee.as_str());
+            }
         }
     }
 }

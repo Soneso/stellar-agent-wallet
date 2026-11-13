@@ -134,12 +134,11 @@ impl PaytoAnchored {
 ///
 /// # Returns
 ///
-/// [`PaytoAnchored::Anchored`] if `pay_to` (a G-strkey) is in `accounts`.
-/// [`PaytoAnchored::NotAnchored`] if `accounts` is non-empty and `pay_to` (a
-/// G-strkey) is absent from it.
-/// [`PaytoAnchored::Unknown`] if `accounts` is empty, OR `pay_to` is not a
-/// G-strkey (e.g. a C-strkey SAC destination) — SEP-1 `ACCOUNTS` only enumerates
-/// G-strkeys, so a non-G `pay_to` can never match and anchoring is indeterminate.
+/// [`PaytoAnchored::Anchored`] if the G payee or the M payee's base G is listed.
+/// [`PaytoAnchored::NotAnchored`] if that account is absent from a non-empty list.
+/// [`PaytoAnchored::Unknown`] if the list is empty or the payee is C or W.
+/// SEP-1 `ACCOUNTS` lists accounts only. The result is advisory; the payment
+/// keeps the full recipient.
 ///
 /// # Panics
 ///
@@ -148,15 +147,14 @@ fn compute_payto_anchored(pay_to: &str, accounts: &[String]) -> PaytoAnchored {
     if accounts.is_empty() {
         return PaytoAnchored::Unknown;
     }
-    // SEP-1 `ACCOUNTS` only enumerates G-strkey accounts. An x402 `payTo` is
-    // frequently a C-strkey (SAC contract destination), which can never appear in
-    // a G-only `ACCOUNTS` list — so anchoring is genuinely indeterminate (Unknown),
-    // not a substitution warning (a `NotAnchored` here would be a false alarm that
-    // trains operators to ignore the signal).
-    if !pay_to.starts_with('G') {
-        return PaytoAnchored::Unknown;
-    }
-    if accounts.iter().any(|a| a == pay_to) {
+    let account = match stellar_strkey::Strkey::from_string(pay_to) {
+        Ok(stellar_strkey::Strkey::PublicKeyEd25519(key)) => key.to_string(),
+        Ok(stellar_strkey::Strkey::MuxedAccountEd25519(m)) => {
+            stellar_strkey::ed25519::PublicKey(m.ed25519).to_string()
+        }
+        _ => return PaytoAnchored::Unknown,
+    };
+    if accounts.iter().any(|a| a == account.as_str()) {
         PaytoAnchored::Anchored
     } else {
         PaytoAnchored::NotAnchored
@@ -487,6 +485,15 @@ impl WalletServer {
             Ok(amount) => amount,
             Err(ref err) => return Ok(x402_error_to_tool_result(err)),
         };
+        if let Err(result) = crate::tools::common::check_x402_payee_protocol(
+            &requirements.pay_to,
+            &self.profile,
+            || self.context.primary_client(),
+        )
+        .await
+        {
+            return Ok(result);
+        }
         // Off mainnet a supplied id is validated here and echoed. A mainnet
         // call takes its own path and checks its id at its record lookup,
         // after every refusal a call without one gives.
@@ -505,9 +512,6 @@ impl WalletServer {
         // Capture the gate-derived leg as an audit record before it moves into
         // the value descriptor, so the row carries exactly what the gate sized.
         let audit_leg = ValueLegRecord::from(&value_leg);
-        // Also retain an owned clone for the window-state record after
-        // authorization (single-derivation invariant on the recording side
-        // too) — `value_leg` itself moves into `ValueClass::single` below.
         let value_leg_for_record = value_leg.clone();
 
         // ── Telemetry preamble (redaction) ───────────────────────────────────
@@ -537,12 +541,14 @@ impl WalletServer {
             Ok(o) => o,
             Err(e) => return e.into_result(),
         };
-        match dispatch_outcome {
-            crate::tools::common::DispatchOutcome::Allow(_) => {}
+        let value_for_record = match dispatch_outcome {
+            crate::tools::common::DispatchOutcome::Allow(outcome) => outcome
+                .value_effects
+                .map_or(ValueClass::single(value_leg_for_record), ValueClass::Value),
             crate::tools::common::DispatchOutcome::RequireApproval(_) => {
                 return Ok(crate::tools::common::single_shot_require_approval_error());
             }
-        }
+        };
 
         // ── Audit pre-flight (fail-closed) ────────────────────────────────────
         // Runs AFTER the dispatch gate: a policy denial or approval escalation
@@ -692,7 +698,7 @@ impl WalletServer {
         if let Err(refusal) = crate::tools::x402_create_payment::record_x402_authorization(
             self,
             "stellar_x402_authenticated_payment",
-            &stellar_agent_core::policy::v1::ValueClass::single(value_leg_for_record),
+            &value_for_record,
         ) {
             return Ok(refusal);
         }
@@ -744,6 +750,12 @@ impl WalletServer {
                     return Ok(crate::tools::common::endpoint_refusal_result(refusal));
                 }
                 audit.record_withheld(X402Failure::CreatePayment(&source));
+                if matches!(
+                    source,
+                    stellar_agent_x402::X402Error::MuxedContractProtocolUnsupported { .. }
+                ) {
+                    return Ok(x402_error_to_tool_result(&source));
+                }
                 // Surface a uniform single-pipeline error envelope. The
                 // X402Error Display is redaction-safe (authority-only, no secrets).
                 return Ok(payment_build_error_result(&source.to_string()));
@@ -860,7 +872,7 @@ impl WalletServer {
     /// payer, checks the optional address, recomputes the payment root and
     /// intent digest, and runs the dispatch gate. Under an approval requirement, a
     /// call without approval arguments writes a pending x402 approval for the
-    /// intent and the home domain, and sends no request. A call that pays
+    /// intent and the home domain, after the W endpoint check. A call that pays
     /// checks that the startup proofs are unchanged and, with approval
     /// arguments, verifies the approval of the intent for the home domain.
     /// It runs the authorized identity gate, which signs the SEP-10
@@ -907,6 +919,14 @@ impl WalletServer {
             Ok(amount) => amount,
             Err(error) => return Ok(x402_error_to_tool_result(&error)),
         };
+        if let Err(result) =
+            crate::tools::common::check_x402_payee_protocol(&requirements.pay_to, profile, || {
+                guard.context.primary_client()
+            })
+            .await
+        {
+            return Ok(result);
+        }
         stellar_agent_core::profile::caip2::validate_chain_id_matches_profile(
             &args.chain_id,
             profile,
@@ -1336,6 +1356,7 @@ fn mainnet_payment_error(
     use stellar_agent_network::mainnet::MainnetAuthorizationError;
     use stellar_agent_x402::X402Error;
     match error {
+        X402Error::MuxedContractProtocolUnsupported { .. } => x402_error_to_tool_result(error),
         X402Error::MainnetAuthorization(MainnetAuthorizationError::PolicyDenied(_)) => {
             crate::tools::x402_create_payment::mainnet_x402_error(error, withheld, transmitted)
         }
@@ -1441,6 +1462,46 @@ mod tests {
 
     // ── compute_payto_anchored ─────────────────────────────────────────────────
 
+    #[test]
+    fn muxed_payee_anchoring_uses_only_the_account_base() {
+        let m = stellar_strkey::ed25519::MuxedAccount {
+            ed25519: [1; 32],
+            id: 7,
+        }
+        .to_string();
+        let base = stellar_strkey::ed25519::PublicKey([1; 32])
+            .to_string()
+            .as_str()
+            .to_owned();
+        assert_eq!(
+            compute_payto_anchored(&m, std::slice::from_ref(&base)),
+            PaytoAnchored::Anchored
+        );
+        assert_eq!(
+            compute_payto_anchored(&m, &[PAY_TO_A.to_owned()]),
+            PaytoAnchored::NotAnchored
+        );
+        assert_eq!(compute_payto_anchored(&m, &[]), PaytoAnchored::Unknown);
+        let w = stellar_strkey::MuxedContract {
+            contract_id: [1; 32],
+            id: 7,
+        }
+        .to_string();
+        assert_eq!(compute_payto_anchored(&w, &[base]), PaytoAnchored::Unknown);
+    }
+
+    #[cfg(feature = "mainnet-write")]
+    #[test]
+    fn mainnet_muxed_protocol_error_keeps_its_code() {
+        let error = stellar_agent_x402::X402Error::MuxedContractProtocolUnsupported {
+            protocol_version: 29,
+        };
+        let result = mainnet_payment_error(&error, "before signing", None);
+        let (code, message, _) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "x402.muxed_contract_protocol_unsupported");
+        assert_eq!(message, error.to_string());
+    }
+
     const PAY_TO_A: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
     const PAY_TO_B: &str = "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI";
     const PAY_TO_C: &str = "GBBHQ7H4V6RRORKYLHTCAWP6MOHNORRFJSDPXDFYDGJB2LPZUFPXUEW3";
@@ -1525,7 +1586,19 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
-        let server = make_require_approval_server();
+        let rpc = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(stellar_agent_test_support::EchoIdResponder::new(
+                serde_json::json!({
+                    "passphrase": stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+                    "protocolVersion": 29
+                }),
+            ))
+            .mount(&rpc)
+            .await;
+        let mut server = make_require_approval_server();
+        server.context =
+            stellar_agent_network::NetworkContext::new(server.profile.chain_id, rpc.uri());
         let mut requirements: serde_json::Value =
             serde_json::from_str(&sample_requirements_json()).unwrap();
         requirements["payTo"] = serde_json::json!(
@@ -1545,10 +1618,10 @@ mod tests {
             .await
             .unwrap();
         let (code, message, text) = crate::tools::common::assert_business_envelope(&result);
-        assert_eq!(code, "x402.invalid_recipient_address");
+        assert_eq!(code, "x402.muxed_contract_protocol_unsupported");
         assert_eq!(
             message,
-            "invalid recipient address: pay_to must be a G-, C-, or M-strkey"
+            "a W (muxed contract) payee requires Stellar protocol 30 or later; the network reports protocol 29"
         );
         assert!(!text.contains("paymentSignature"));
         assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), before);

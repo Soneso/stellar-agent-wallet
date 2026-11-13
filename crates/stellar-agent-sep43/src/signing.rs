@@ -50,6 +50,7 @@ use sha2::{Digest, Sha256};
 use stellar_agent_core::error::{MAINNET_SIGNING_REFUSAL_DETAIL, WalletError};
 use stellar_agent_core::observability::redact::redact_strkey_first5_last5;
 use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
+use stellar_agent_network::MuxedContractAdmission;
 #[cfg(feature = "mainnet-write")]
 use stellar_agent_network::mainnet::authorization::{
     MainnetSignedSorobanIntent, MainnetSorobanIntentAuthorization,
@@ -185,10 +186,54 @@ pub async fn sign_soroban_auth_entry(
     expected_network_passphrase: &str,
     network_passphrase_override: Option<&str>,
 ) -> Result<String, Sep43Error> {
+    sign_soroban_auth_entry_inner(
+        preimage_xdr,
+        signer,
+        expected_signer,
+        expected_network_passphrase,
+        network_passphrase_override,
+        None,
+    )
+    .await
+}
+
+/// Signs an auth entry with muxed contract admission from a checked endpoint.
+///
+/// # Errors
+/// Returns the errors of [`sign_soroban_auth_entry`]. Muxed contract addresses
+/// are accepted under `admission`; all other preimage checks apply.
+pub async fn sign_soroban_auth_entry_admitted(
+    preimage_xdr: &str,
+    signer: &(dyn Signer + Send + Sync),
+    expected_signer: &stellar_strkey::ed25519::PublicKey,
+    expected_network_passphrase: &str,
+    network_passphrase_override: Option<&str>,
+    admission: &MuxedContractAdmission,
+) -> Result<String, Sep43Error> {
+    sign_soroban_auth_entry_inner(
+        preimage_xdr,
+        signer,
+        expected_signer,
+        expected_network_passphrase,
+        network_passphrase_override,
+        Some(admission),
+    )
+    .await
+}
+
+async fn sign_soroban_auth_entry_inner(
+    preimage_xdr: &str,
+    signer: &(dyn Signer + Send + Sync),
+    expected_signer: &stellar_strkey::ed25519::PublicKey,
+    expected_network_passphrase: &str,
+    network_passphrase_override: Option<&str>,
+    admission: Option<&MuxedContractAdmission>,
+) -> Result<String, Sep43Error> {
     let received = decode_preimage(
         preimage_xdr,
         expected_network_passphrase,
         network_passphrase_override,
+        admission,
     )?;
     if received.network_id == mainnet_network_id() {
         return Err(mainnet_signing_forbidden());
@@ -260,12 +305,74 @@ pub async fn sign_soroban_auth_entry_authorized(
     consumer: MainnetConsumer,
     authorization: MainnetSorobanIntentAuthorization,
 ) -> Result<(String, MainnetSignedSorobanIntent), Sep43Error> {
+    sign_soroban_auth_entry_authorized_inner(
+        preimage_xdr,
+        signer,
+        expected_signer,
+        expected_network_passphrase,
+        network_passphrase_override,
+        consumer,
+        authorization,
+        None,
+    )
+    .await
+}
+
+/// Signs a mainnet auth entry under intent authority and muxed contract admission.
+///
+/// # Errors
+/// Returns the errors of [`sign_soroban_auth_entry_authorized`]. Muxed contract
+/// addresses are accepted under `admission`; all authorization checks apply.
+#[cfg(feature = "mainnet-write")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the signing parameters carry intent authority and endpoint admission"
+)]
+pub async fn sign_soroban_auth_entry_authorized_admitted(
+    preimage_xdr: &str,
+    signer: &(dyn Signer + Send + Sync),
+    expected_signer: &stellar_strkey::ed25519::PublicKey,
+    expected_network_passphrase: &str,
+    network_passphrase_override: Option<&str>,
+    consumer: MainnetConsumer,
+    authorization: MainnetSorobanIntentAuthorization,
+    admission: &MuxedContractAdmission,
+) -> Result<(String, MainnetSignedSorobanIntent), Sep43Error> {
+    sign_soroban_auth_entry_authorized_inner(
+        preimage_xdr,
+        signer,
+        expected_signer,
+        expected_network_passphrase,
+        network_passphrase_override,
+        consumer,
+        authorization,
+        Some(admission),
+    )
+    .await
+}
+
+#[cfg(feature = "mainnet-write")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the shared signing boundary carries the same authority and admission"
+)]
+async fn sign_soroban_auth_entry_authorized_inner(
+    preimage_xdr: &str,
+    signer: &(dyn Signer + Send + Sync),
+    expected_signer: &stellar_strkey::ed25519::PublicKey,
+    expected_network_passphrase: &str,
+    network_passphrase_override: Option<&str>,
+    consumer: MainnetConsumer,
+    authorization: MainnetSorobanIntentAuthorization,
+    admission: Option<&MuxedContractAdmission>,
+) -> Result<(String, MainnetSignedSorobanIntent), Sep43Error> {
     const PATH: &str = "sign_soroban_auth_entry_authorized";
 
     let received = decode_preimage(
         preimage_xdr,
         expected_network_passphrase,
         network_passphrase_override,
+        admission,
     )?;
     let bound_key = authorization.signer_public_key();
     let payload = SorobanAuthPayload::authorized(
@@ -305,6 +412,7 @@ fn decode_preimage(
     preimage_xdr: &str,
     expected_network_passphrase: &str,
     network_passphrase_override: Option<&str>,
+    admission: Option<&MuxedContractAdmission>,
 ) -> Result<ReceivedPreimage, Sep43Error> {
     // Network-passphrase guard.
     if let Some(provided) = network_passphrase_override
@@ -331,7 +439,8 @@ fn decode_preimage(
     .map_err(|e| Sep43Error::InvalidXdr {
         detail: format!("failed to decode HashIdPreimage: {e}"),
     })?;
-    if stellar_agent_core::sc_address::preimage_has_muxed_contract(&preimage) {
+    if admission.is_none() && stellar_agent_core::sc_address::preimage_has_muxed_contract(&preimage)
+    {
         return Err(Sep43Error::InvalidXdr {
             detail: stellar_agent_core::sc_address::MUXED_CONTRACT_REFUSAL.to_owned(),
         });
@@ -594,6 +703,78 @@ mod tests {
                 .to_string()
                 .ends_with("a muxed contract address (W) is not accepted on this path")
         );
+    }
+
+    #[tokio::test]
+    async fn muxed_contract_admission_signs_at_30() {
+        use std::io::{Read as _, Write as _};
+        use stellar_xdr::{Limits, WriteXdr};
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let responder = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let body = loop {
+                let mut bytes = [0; 4096];
+                let count = stream.read(&mut bytes).unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&bytes[..count]);
+                if let Some(start) = request.windows(4).position(|b| b == b"\r\n\r\n")
+                    && let Ok(body) =
+                        serde_json::from_slice::<serde_json::Value>(&request[start + 4..])
+                {
+                    break body;
+                }
+            };
+            let response = serde_json::json!({"jsonrpc": "2.0", "id": body["id"], "result": {"passphrase": TESTNET, "protocolVersion": 30}}).to_string();
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
+        });
+        let client = stellar_agent_network::StellarRpcClient::new(&uri).unwrap();
+        let identity = client
+            .endpoint_identity(
+                TESTNET,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        let admission = identity.muxed_contract_admission().unwrap();
+        responder.join().unwrap();
+        let mut preimage = HashIdPreimage::from_xdr_base64(
+            minimal_soroban_auth_preimage_xdr(TESTNET),
+            Limits::none(),
+        )
+        .unwrap();
+        let HashIdPreimage::SorobanAuthorization(auth) = &mut preimage else {
+            panic!("authorization");
+        };
+        let stellar_xdr::SorobanAuthorizedFunction::ContractFn(call) =
+            &mut auth.invocation.function
+        else {
+            panic!("transfer");
+        };
+        call.args = vec![stellar_xdr::ScVal::Address(ScAddress::MuxedContract(
+            stellar_xdr::MuxedContract {
+                id: 7,
+                contract_id: stellar_xdr::ContractId(stellar_xdr::Hash([3; 32])),
+            },
+        ))]
+        .try_into()
+        .unwrap();
+        let signer = CountingSigner::new([5; 32]);
+        let encoded = preimage.to_xdr_base64(Limits::none()).unwrap();
+        let key = signer.public_key().await.unwrap();
+        let refused = sign_soroban_auth_entry(&encoded, &signer, &key, TESTNET, None)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.wire_code(), "sep43.invalid_xdr");
+        assert_eq!(signer.sign_calls(), 0);
+        sign_soroban_auth_entry_admitted(&encoded, &signer, &key, TESTNET, None, &admission)
+            .await
+            .unwrap();
+        assert_eq!(signer.sign_calls(), 1);
     }
 
     /// Builds a minimal valid `TransactionEnvelope::Tx` (V1) XDR for signing

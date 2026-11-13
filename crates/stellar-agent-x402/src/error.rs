@@ -99,11 +99,20 @@ pub enum X402Error {
         detail: String,
     },
 
-    /// The `pay_to` recipient is not a valid G-, C-, or M-strkey address.
+    /// The `pay_to` recipient is not a valid G-, C-, M-, or W-strkey address.
     #[error("invalid recipient address: {detail}")]
     InvalidRecipientAddress {
         /// Human-readable reason for the validation failure.
         detail: String,
+    },
+
+    /// The checked endpoint does not support a muxed contract payee.
+    #[error(
+        "a W (muxed contract) payee requires Stellar protocol 30 or later; the network reports protocol {protocol_version}"
+    )]
+    MuxedContractProtocolUnsupported {
+        /// The protocol version reported by the checked endpoint.
+        protocol_version: u32,
     },
 
     /// The payer (`from`) is not a valid G-strkey account address.
@@ -253,6 +262,9 @@ impl X402Error {
             X402Error::MainnetSigningForbidden { .. } => "network.mainnet_write_forbidden",
             X402Error::InvalidAssetAddress { .. } => "x402.invalid_asset_address",
             X402Error::InvalidRecipientAddress { .. } => "x402.invalid_recipient_address",
+            X402Error::MuxedContractProtocolUnsupported { .. } => {
+                "x402.muxed_contract_protocol_unsupported"
+            }
             X402Error::InvalidPayerAddress { .. } => "x402.invalid_payer_address",
             X402Error::FeesNotSponsored => "x402.fees_not_sponsored",
             X402Error::AmountConversion { .. } => "x402.amount_conversion",

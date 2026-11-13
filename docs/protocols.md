@@ -119,10 +119,15 @@ The scope table defines mainnet admission for each build configuration. Public S
   - The `exact` scheme only, no `upto`.
   - No HTTP retry loop; the host orchestrates the HTTP exchange.
   - Targets x402 v2, not v3.x.
+  - Both tools preserve the full G, C, M or W payee, including mux ids. W requires protocol 30 or later and a facilitator that accepts W. The released `@x402/stellar` 2.30.0 facilitator accepts G, C and M only.
+  - W eligibility runs before policy admission, operation records, approvals and SEP-10. Endpoint identity and the mainnet supported-protocol range apply first; a supported endpoint below 30 returns `x402.muxed_contract_protocol_unsupported`.
+  - Simulation decides whether the C asset accepts W. A transfer error identifies the W payee form and simulation phase under `x402.rpc_simulate_failed`.
+  - Mainnet M and eligible W follow the rule's Allow or two-call RequireApproval flow. Testnet approval escalation returns `policy.approval_required_unsupported` for every payee form. An unlisted `budget` can admit payments within its shared cap.
+  - Authenticated anchoring compares M by its base G. A matching account is `anchored`, an absent account in a non-empty list is `not_anchored`, and an empty list is `unknown`. C and W remain `unknown`.
   - Before signing, the first simulation must return exactly one authorization entry. It carries legacy `Address` credentials for the payer, a zero expiration ledger, and no signature.
   - That entry's root invocation must equal the SAC `transfer` the wallet built, contract and every argument included, with no nested calls. Any other answer refuses before signing.
   - The signed re-simulation must return a decodable result whose authorization entries are empty or equal to the signed entry. Any other answer refuses, and no payment payload is returned.
-  - The requirements are validated before any request. Requirement validation checks the scheme, network, profile passphrase, asset, sponsorship, amount, recipient, and timeout. It requires a C-strkey asset, a strict `areFeesSponsored: true`, a positive amount, a G-, C-, or M-strkey `payTo`, and a `maxTimeoutSeconds` of at least one.
+  - The requirements are validated before any request. Requirement validation checks the scheme, network, profile passphrase, asset, sponsorship, amount, recipient, and timeout. It requires a C-strkey asset, a strict `areFeesSponsored: true`, a positive amount, a G-, C-, M-, or W-strkey `payTo`, and a `maxTimeoutSeconds` of at least one.
   - The authorized path validates these fields without refusing the mainnet network itself. The ordinary entry `validate_requirements` refuses a mainnet passphrase or a mainnet-pattern endpoint before any request.
   - Header fields named in an error are escaped and cut at 200 characters. A header that does not decode reports the JSON error class and position, not its values.
   - Every request of one payment goes to the primary client built from the operator's profile. Its first request is `getNetwork`. The authorized path checks that the configured endpoint serves mainnet before its first simulation. The ordinary path retains its endpoint network restrictions: an endpoint serving another network, reporting mainnet, or not identified before the caller's deadline refuses with its `network.*` code before any simulation.
