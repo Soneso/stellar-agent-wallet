@@ -1445,12 +1445,14 @@ mod tests {
         Answer::Bytes(Vec::new())
     }
 
-    /// Accepted connections and the connection of every request, in arrival
-    /// order.
+    /// Accepted connections, the connection of every request, and every
+    /// connection the client closed with the instant the fixture saw it
+    /// close, in arrival order.
     #[derive(Default)]
     struct Record {
         connections: Vec<Instant>,
         requests: Vec<usize>,
+        closed: Vec<(usize, Instant)>,
     }
 
     /// A loopback Friendbot that answers each request from a script and keeps
@@ -1468,6 +1470,10 @@ mod tests {
 
         fn requests(&self) -> Vec<usize> {
             self.record.lock().expect("record").requests.clone()
+        }
+
+        fn closed(&self) -> Vec<(usize, Instant)> {
+            self.record.lock().expect("record").closed.clone()
         }
     }
 
@@ -1536,6 +1542,8 @@ mod tests {
                 let mut chunk = [0; 1024];
                 let count = socket.read(&mut chunk).await.unwrap_or(0);
                 if count == 0 {
+                    let mut record = record.lock().expect("record");
+                    record.closed.push((connection, Instant::now()));
                     return;
                 }
                 pending.extend_from_slice(&chunk[..count]);
@@ -1652,23 +1660,92 @@ mod tests {
 
     /// A timed out attempt is followed, after the first pause, by a second
     /// one on a new connection.
-    #[tokio::test]
+    ///
+    /// The clock is paused and held, so it stands at the call's start, where
+    /// the first attempt arms its timeout, until the test advances it. Each
+    /// bound is proved by the call's own wake: one tick before the bound the
+    /// call is parked and has not woken since it parked in the state the
+    /// bound follows, and after the last tick its first wake reads the bound.
+    /// That wake precedes the I/O it leads to: the close of the stalled
+    /// connection, read at the timeout, and the second connection, read at
+    /// the end of the pause.
+    #[tokio::test(start_paused = true)]
     async fn friendbot_timeout_retries_then_succeeds() {
-        let friendbot = friendbot_serving(vec![stall(), bytes(OK)]).await;
+        use crate::timing::{ClockHold, Probe, drive_call, wait_until};
+        const TIMEOUT: Duration = Duration::from_millis(150);
+        const PAUSE: Duration = Duration::from_millis(200);
+        const TICK: Duration = Duration::from_millis(1);
 
-        let (outcome, attempts) =
-            friendbot_request_with_policy(&friendbot.url, &policy(3, 150, [200, 900], 10_000))
+        /// Moves the held clock onto `at` through the barrier above; `early`
+        /// runs at one tick before `at`.
+        async fn wake_at(probe: &Probe, at: Instant, what: &str, early: impl FnOnce()) {
+            wait_until("the call parks before the clock moves", || probe.parked()).await;
+            let woken = probe.wakes().len();
+            tokio::time::advance(at - TICK - Instant::now()).await;
+            // A call that ended early never parks again; the check below
+            // reports its wake.
+            wait_until("the call parks one tick before the bound", || {
+                probe.parked() || probe.finished()
+            })
+            .await;
+            let woke_early = probe.wakes().split_off(woken);
+            assert!(
+                woke_early.is_empty(),
+                "the call woke at {woke_early:?}, before {what} at {at:?}"
+            );
+            early();
+            tokio::time::advance(TICK).await;
+            wait_until(what, || probe.wakes().len() > woken).await;
+            assert_eq!(probe.wakes()[woken], at, "{what} wakes the call");
+        }
+
+        let _hold = ClockHold::new();
+        let friendbot = friendbot_serving(vec![stall(), bytes(OK)]).await;
+        let friendbot = &friendbot;
+        let retry = policy(3, 150, [200, 900], 10_000);
+        let started = Instant::now();
+
+        let (outcome, attempts) = drive_call(
+            friendbot_request_with_policy(&friendbot.url, &retry),
+            |probe| async move {
+                wait_until("the first request", || friendbot.requests().len() == 1).await;
+                assert_eq!(friendbot.connections(), [started]);
+
+                wake_at(&probe, started + TIMEOUT, "the attempt timeout", || {
+                    assert!(
+                        friendbot.closed().is_empty(),
+                        "the attempt runs to its timeout"
+                    );
+                })
                 .await;
+                wait_until("the timed out connection's close", || {
+                    !friendbot.closed().is_empty()
+                })
+                .await;
+                assert_eq!(friendbot.closed(), [(0, started + TIMEOUT)]);
+
+                wake_at(
+                    &probe,
+                    started + TIMEOUT + PAUSE,
+                    "the end of the pause",
+                    || {
+                        assert_eq!(
+                            friendbot.connections().len(),
+                            1,
+                            "the pause precedes a retry"
+                        );
+                    },
+                )
+                .await;
+                wait_until("the second request", || friendbot.requests().len() == 2).await;
+                assert_eq!(friendbot.connections()[1], started + TIMEOUT + PAUSE);
+            },
+        )
+        .await;
 
         assert_eq!(status_of(outcome), reqwest::StatusCode::OK);
         assert_eq!(attempts, 2);
         assert_eq!(friendbot.requests(), [0, 1]);
-        let connections = friendbot.connections();
-        let gap = connections[1] - connections[0];
-        assert!(
-            gap >= Duration::from_millis(350) && gap < Duration::from_millis(1_050),
-            "the second attempt follows the timeout and the first pause: {gap:?}"
-        );
     }
 
     /// A refused connection is followed by a second attempt.

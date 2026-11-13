@@ -15,6 +15,7 @@ use std::process::Command;
 use std::sync::Arc;
 use stellar_agent_core::audit_log::test_helpers::verified_audit_entries_from_path;
 use stellar_agent_core::audit_log::{EventKind, KeyPurpose};
+use stellar_agent_core::file_lock::HeldFileLock;
 use stellar_agent_core::policy::v1::criteria::state_store::{StateKey, WindowEntry, WindowLimit};
 use stellar_agent_core::profile::schema::{KeyringEntryRef, Profile, generation_account};
 use stellar_agent_network::policy_state::PersistedWindowStore;
@@ -256,7 +257,11 @@ fn sidecar(path: &Path, suffix: &str) -> PathBuf {
     path.into()
 }
 
-fn lock(path: &Path) -> std::fs::File {
+/// Locks `path` exclusively until the returned guard drops.
+///
+/// The guard unlocks explicitly, so a copy of its descriptor that a child
+/// forked by another test thread still holds does not keep the lock.
+fn lock(path: &Path) -> HeldFileLock {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -264,8 +269,7 @@ fn lock(path: &Path) -> std::fs::File {
         .write(true)
         .open(path)
         .unwrap();
-    file.try_lock().unwrap();
-    file
+    HeldFileLock::try_lock(file).unwrap_or_else(|error| panic!("lock {}: {error}", path.display()))
 }
 
 #[test]

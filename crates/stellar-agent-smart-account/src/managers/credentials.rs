@@ -4350,12 +4350,16 @@ registered_at_unix_ms = 1700000000000
     /// A rule with no pin record, admitted past the diversification gate by
     /// the single-verifier override, is refused for its missing baseline. No
     /// event of the call carries the rule id.
+    ///
+    /// The rule id has ten digits. Every captured line starts with a
+    /// timestamp whose six-digit fraction can spell a six-digit id, and
+    /// cannot spell ten digits.
     #[test]
     #[serial_test::serial]
     fn missing_baseline_refusal_logs_no_rule_id() {
         stellar_agent_test_support::keyring_mock::install().unwrap();
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-        const REFUSED_RULE_ID: u32 = 424_242;
+        const REFUSED_RULE_ID: u32 = 4_242_424_242;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

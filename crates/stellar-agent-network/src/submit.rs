@@ -3476,6 +3476,7 @@ mod tests {
         use stellar_agent_test_support::signed_envelope::{
             SignedTestEnvelope, TESTNET_PASSPHRASE, get_network_result,
         };
+        use stellar_agent_test_support::timing::Stamp;
         use wiremock::matchers::{body_partial_json, method};
         use wiremock::{Mock, MockServer};
 
@@ -3510,6 +3511,11 @@ mod tests {
             consume_delay: Duration,
             /// The send-by instant of every intent the consumption saw.
             send_bys: Mutex<Vec<Option<u64>>>,
+            /// When the first consumption returned its proof; the send
+            /// deadline is armed after it with no await between.
+            consumed_at: Stamp,
+            /// When the first outcome report started.
+            reported_at: Stamp,
         }
 
         impl<'a> CountingRecorder<'a> {
@@ -3522,7 +3528,17 @@ mod tests {
                     outcomes: Mutex::new(Vec::new()),
                     consume_delay: Duration::ZERO,
                     send_bys: Mutex::new(Vec::new()),
+                    consumed_at: Stamp::default(),
+                    reported_at: Stamp::default(),
                 }
+            }
+
+            /// The span from the consumption's return to the first outcome
+            /// report: the send, the confirmation, and the witness wait the
+            /// send deadline bounds, without the reads and records around
+            /// them.
+            fn deadline_span(&self) -> Duration {
+                self.reported_at.get("the outcome report") - self.consumed_at.get("the consumption")
             }
 
             fn send_bys(&self) -> Vec<Option<u64>> {
@@ -3561,6 +3577,7 @@ mod tests {
                 let mut envelope_hash = *proof.envelope_hash();
                 let mut content_digest = *proof.content_digest();
                 let mut id = *proof.authorization_id().as_bytes();
+                self.consumed_at.mark();
                 match self.tamper {
                     None => return Ok(proof),
                     Some(Tamper::EnvelopeHash) => envelope_hash[0] ^= 1,
@@ -3575,6 +3592,7 @@ mod tests {
             }
 
             async fn outcome(&self, intent: &SubmissionIntent, outcome: &SubmissionOutcome) {
+                self.reported_at.mark();
                 self.outcomes.lock().unwrap().push(match outcome {
                     SubmissionOutcome::Success { .. } => "success",
                     SubmissionOutcome::OnChainFailed { .. } => "on_chain_failed",
@@ -3731,8 +3749,8 @@ mod tests {
             }
         }
 
-        /// How far past its deadline a submission may return in the deadline
-        /// tests: the work around the bounded wait, never a second wait.
+        /// How far past its deadline a deadline test's outcome report may
+        /// start: the wake-up at the deadline, never a second wait.
         const SLACK: Duration = Duration::from_millis(1500);
 
         /// The JSON-RPC methods `server` was asked, in order.
@@ -4460,16 +4478,19 @@ mod tests {
             .await;
             let recorder = case.recorder(None);
 
-            let started = std::time::Instant::now();
             let result = case
                 .submit_witnessed_within(&recorder, Some(&oracle), DEADLINE)
                 .await;
-            let elapsed = started.elapsed();
 
+            let span = recorder.deadline_span();
             assert_submission_stands(&case, &recorder, result);
             assert!(
-                elapsed < DEADLINE + SLACK,
-                "the deadline ends the wait for the oracle: {elapsed:?}"
+                span >= DEADLINE,
+                "the wait for the oracle lasts until the deadline: {span:?}"
+            );
+            assert!(
+                span < DEADLINE + SLACK,
+                "the deadline ends the wait for the oracle: {span:?}"
             );
             assert_eq!(
                 methods_asked(&oracle_server).await,
@@ -4509,16 +4530,19 @@ mod tests {
             .await;
             let recorder = case.recorder(None);
 
-            let started = std::time::Instant::now();
             let result = case
                 .submit_witnessed_within(&recorder, Some(&oracle), DEADLINE)
                 .await;
-            let elapsed = started.elapsed();
 
+            let span = recorder.deadline_span();
             assert_submission_stands(&case, &recorder, result);
             assert!(
-                elapsed < DEADLINE + SLACK,
-                "the deadline ends the identity check: {elapsed:?}"
+                span >= DEADLINE,
+                "the identity check lasts until the deadline: {span:?}"
+            );
+            assert!(
+                span < DEADLINE + SLACK,
+                "the deadline ends the identity check: {span:?}"
             );
             assert_eq!(
                 methods_asked(&oracle_server).await,

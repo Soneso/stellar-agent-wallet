@@ -296,10 +296,34 @@ where
 
 /// Binds both families on the non-zero `port`, IPv4 first.
 async fn bind_fixed(port: u16) -> Result<LoopbackPair, PairBindError> {
-    let v4 = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+    bind_fixed_with(
+        port,
+        |port| TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port))),
+        |port| TcpListener::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, port))),
+    )
+    .await
+}
+
+/// Acquires a fixed-port pair: `bind_v4` and then `bind_v6` bind their
+/// family on the non-zero `port`.
+///
+/// A failed bind refuses as [`fixed_port_refusal`] maps it, and a refusal
+/// releases what was bound.
+pub(crate) async fn bind_fixed_with<V4, V4Fut, V6, V6Fut>(
+    port: u16,
+    bind_v4: V4,
+    bind_v6: V6,
+) -> Result<LoopbackPair, PairBindError>
+where
+    V4: FnOnce(u16) -> V4Fut,
+    V4Fut: Future<Output = io::Result<TcpListener>>,
+    V6: FnOnce(u16) -> V6Fut,
+    V6Fut: Future<Output = io::Result<TcpListener>>,
+{
+    let v4 = bind_v4(port)
         .await
         .map_err(|error| fixed_port_refusal(port, LoopbackFamily::V4, &error))?;
-    let v6 = TcpListener::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, port)))
+    let v6 = bind_v6(port)
         .await
         .map_err(|error| fixed_port_refusal(port, LoopbackFamily::V6, &error))?;
     Ok(LoopbackPair { v4, v6, port })
@@ -577,6 +601,49 @@ mod tests {
         let pair = LoopbackPair::bind(port).await.unwrap();
         assert_eq!(pair.port(), port);
         assert_eq!(pair.v6.local_addr().unwrap(), v6(port));
+    }
+
+    /// A fixed port whose IPv6 bind fails after IPv4 is held refuses with
+    /// the IPv6 family named and releases the IPv4 listener.
+    ///
+    /// The test owns both binds: the IPv4 listener is its own, and the IPv6
+    /// bind fails as told, so no other socket on the host takes part. The
+    /// connection queued on the IPv4 listener ends only when that listener
+    /// is closed.
+    #[tokio::test]
+    async fn a_fixed_port_refused_on_ipv6_releases_the_ipv4_listener() {
+        let listener = TcpListener::bind(v4(0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut queued = tokio::net::TcpStream::connect(v4(port)).await.unwrap();
+        let error = bind_fixed_with(
+            port,
+            move |requested| {
+                assert_eq!(requested, port, "IPv4 is bound on the requested port");
+                async move { Ok(listener) }
+            },
+            |requested| {
+                assert_eq!(requested, port, "IPv6 is bound on the requested port");
+                async { Err(io::Error::from(io::ErrorKind::AddrInUse)) }
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error,
+            PairBindError::PortUnavailable {
+                port,
+                family: LoopbackFamily::V6,
+                kind: io::ErrorKind::AddrInUse,
+            }
+        );
+        let mut byte = [0_u8; 1];
+        let read = tokio::time::timeout(WAIT, queued.read(&mut byte))
+            .await
+            .expect("the queued connection ends once the IPv4 listener is released");
+        assert!(
+            matches!(read, Ok(0) | Err(_)),
+            "the released listener sends no data: {read:?}"
+        );
     }
 
     #[tokio::test]

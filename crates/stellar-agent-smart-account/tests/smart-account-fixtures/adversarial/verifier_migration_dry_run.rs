@@ -1047,7 +1047,7 @@ fn a_rule_deleted_between_the_listing_and_the_read_refuses_without_its_id() {
     let ledger_resp =
         build_ledger_entries_account_and_contract(SOURCE_G, &dest_addr, OZ_VERIFIER_HASH);
 
-    let (result, logs) = wallet_traced(async {
+    let ((result, server_address), logs) = wallet_traced(async {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/"))
@@ -1058,7 +1058,7 @@ fn a_rule_deleted_between_the_listing_and_the_read_refuses_without_its_id() {
             .mount(&server)
             .await;
         let (manager, _tmp_dir) = manager_with_server(&server).await;
-        MigrationPlanner::new(&manager)
+        let result = MigrationPlanner::new(&manager)
             .with_max_scan_id(RULE_ID + 1)
             .build(
                 smart_account,
@@ -1066,8 +1066,23 @@ fn a_rule_deleted_between_the_listing_and_the_read_refuses_without_its_id() {
                 dest_addr,
                 "req-deleted-between-reads",
             )
-            .await
+            .await;
+        (result, *server.address())
     });
+    // The HTTP client's events name the mock server by its ephemeral port,
+    // whose digits can hold the marker. The two forms they print, the socket
+    // address and `Port(<n>)`, are replaced by fixed placeholders. Every
+    // other number in the capture is fixed by this test's mock sequence.
+    let logs = logs
+        .replace(&server_address.to_string(), "<mock-server>")
+        .replace(
+            &format!("Port({})", server_address.port()),
+            "Port(<mock-port>)",
+        );
+    assert!(
+        logs.contains("connecting to <mock-server>") && logs.contains("Port(<mock-port>)"),
+        "the capture holds the HTTP client's events: {logs}"
+    );
 
     let err = match result {
         Err(err) => err,

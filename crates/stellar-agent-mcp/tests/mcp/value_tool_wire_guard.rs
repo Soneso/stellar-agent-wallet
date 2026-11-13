@@ -104,6 +104,7 @@ const VOLATILE_KEYS: &[&str] = &[
     "nonce",
     "expires_at_unix_ms",
     "close_time_unix",
+    "close_lag_seconds",
 ];
 
 /// Masks the scalar values of [`VOLATILE_KEYS`] wherever they occur, and
@@ -236,6 +237,14 @@ async fn classic_server(
     crate::common::store_signer_identity("svc", account, seed);
     let rpc = MockServer::start().await;
     Mock::given(method("POST"))
+        .and(wiremock::matchers::body_partial_json(
+            json!({ "method": "getLedgers" }),
+        ))
+        .respond_with(AgedLedgers)
+        .with_priority(1)
+        .mount(&rpc)
+        .await;
+    Mock::given(method("POST"))
         .respond_with(crate::common::TimeoutRpc::new(entries).confirming_in(CONFIRM_LEDGER))
         .mount(&rpc)
         .await;
@@ -243,8 +252,51 @@ async fn classic_server(
     (rpc, WalletServer::new(profile).unwrap())
 }
 
-fn prepared(data: &Value) -> (String, u64, String) {
+/// The age, in seconds, of the latest ledger when the endpoint answers: inside
+/// the readiness bound, and larger than any call takes.
+const LEDGER_AGE_SECONDS: u64 = 30;
+
+/// Answers `getLedgers` with a latest ledger that closed
+/// [`LEDGER_AGE_SECONDS`] before the answer.
+struct AgedLedgers;
+
+impl Respond for AgedLedgers {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": body["id"],
+            "result": crate::common::ledgers_result(LEDGER_AGE_SECONDS),
+        }))
+    }
+}
+
+/// The host clock in Unix seconds.
+fn host_seconds() -> u64 {
+    stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1_000
+}
+
+/// The prepare's token, after checking its operational lag against the host
+/// clock.
+///
+/// The endpoint answers with a close time [`LEDGER_AGE_SECONDS`] before its
+/// answer, and the tool reads the host clock after that answer. The lag is
+/// therefore at least that age, and the close time plus the lag is the tool's
+/// reading: a second within `called`, the host clock before and after the
+/// call.
+fn prepared(data: &Value, called: (u64, u64)) -> (String, u64, String) {
     let data = &data["data"];
+    let operational = &data["operational"];
+    let close = operational["close_time_unix"].as_u64().unwrap();
+    let lag = operational["close_lag_seconds"].as_u64().unwrap();
+    assert!(
+        lag >= LEDGER_AGE_SECONDS,
+        "the lag covers the ledger's {LEDGER_AGE_SECONDS} s age: {data}"
+    );
+    assert!(
+        (called.0..=called.1).contains(&(close + lag)),
+        "the lag is the tool's clock minus the close time, within {called:?}: {data}"
+    );
     (
         data["nonce"].as_str().unwrap().to_owned(),
         data["expires_at_unix_ms"].as_u64().unwrap(),
@@ -265,6 +317,7 @@ async fn pay_wire_text() {
         vec![account_entry(&source), account_entry(&destination)],
     )
     .await;
+    let before = host_seconds();
     let prepare = server
         .call_stellar_pay(StellarPayArgs {
             chain_id: "stellar:testnet".to_owned(),
@@ -282,8 +335,9 @@ async fn pay_wire_text() {
         })
         .await
         .unwrap();
+    let called = (before, host_seconds());
     let (nonce, expires_at_unix_ms, envelope_xdr) =
-        prepared(&assert_text(Text::PayPrepare, &prepare));
+        prepared(&assert_text(Text::PayPrepare, &prepare), called);
     let commit = server
         .call_stellar_pay_commit(StellarPayCommitArgs {
             chain_id: "stellar:testnet".to_owned(),
@@ -317,6 +371,7 @@ async fn create_account_wire_text() {
     let destination = gstrkey_for_seed([0xeb; 32]);
     let (_rpc, server) =
         classic_server("acct-create-wire", seed, vec![account_entry(&source)]).await;
+    let before = host_seconds();
     let prepare = server
         .call_stellar_create_account(StellarCreateAccountArgs {
             chain_id: "stellar:testnet".to_owned(),
@@ -328,8 +383,9 @@ async fn create_account_wire_text() {
         })
         .await
         .unwrap();
+    let called = (before, host_seconds());
     let (nonce, expires_at_unix_ms, envelope_xdr) =
-        prepared(&assert_text(Text::CreateAccountPrepare, &prepare));
+        prepared(&assert_text(Text::CreateAccountPrepare, &prepare), called);
     let commit = server
         .call_stellar_create_account_commit(StellarCreateAccountCommitArgs {
             chain_id: "stellar:testnet".to_owned(),
@@ -360,6 +416,7 @@ async fn trustline_wire_text() {
         vec![account_entry(&source), account_entry(USDC_TESTNET_ISSUER)],
     )
     .await;
+    let before = host_seconds();
     let prepare = server
         .call_stellar_trustline(StellarTrustlineArgs {
             chain_id: "stellar:testnet".to_owned(),
@@ -371,8 +428,9 @@ async fn trustline_wire_text() {
         })
         .await
         .unwrap();
+    let called = (before, host_seconds());
     let (nonce, expires_at_unix_ms, envelope_xdr) =
-        prepared(&assert_text(Text::TrustlinePrepare, &prepare));
+        prepared(&assert_text(Text::TrustlinePrepare, &prepare), called);
     let commit = server
         .call_stellar_trustline_commit(StellarTrustlineCommitArgs {
             chain_id: "stellar:testnet".to_owned(),
@@ -401,6 +459,7 @@ async fn claim_wire_text() {
         vec![account_entry(&claimant), claimable_entry(&claimant)],
     )
     .await;
+    let before = host_seconds();
     let prepare = server
         .call_stellar_claim(StellarClaimArgs {
             chain_id: "stellar:testnet".to_owned(),
@@ -410,8 +469,9 @@ async fn claim_wire_text() {
         })
         .await
         .unwrap();
+    let called = (before, host_seconds());
     let (nonce, expires_at_unix_ms, envelope_xdr) =
-        prepared(&assert_text(Text::ClaimPrepare, &prepare));
+        prepared(&assert_text(Text::ClaimPrepare, &prepare), called);
     let commit = server
         .call_stellar_claim_commit(StellarClaimCommitArgs {
             chain_id: "stellar:testnet".to_owned(),
