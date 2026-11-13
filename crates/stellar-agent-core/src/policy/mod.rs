@@ -78,6 +78,9 @@ pub mod pin;
 /// the store, its authorization ledger, and the policy pin.
 pub mod state_lock;
 
+/// Value effects of caller-supplied transaction envelopes.
+pub mod transaction_effects;
+
 pub use v1::criteria::state_store::policy_now_ms;
 
 // ─────────────────────────────────────────────────────────────────────────────
