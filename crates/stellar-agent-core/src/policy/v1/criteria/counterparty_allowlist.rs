@@ -1261,7 +1261,7 @@ impl CounterpartyAllowlistCriterion {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Identifies a destination's kind and base address.
-fn destination_form(d: &str) -> Option<(CounterpartyKind, String)> {
+pub(crate) fn destination_form(d: &str) -> Option<(CounterpartyKind, String)> {
     match Strkey::from_string(d).ok()? {
         Strkey::PublicKeyEd25519(_) => Some((CounterpartyKind::GAccount, d.to_owned())),
         Strkey::MuxedAccountEd25519(m) => Some((

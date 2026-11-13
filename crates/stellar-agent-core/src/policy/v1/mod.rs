@@ -109,6 +109,10 @@ pub mod signature;
 /// Closed key sets of the policy file, checked before the owner signature.
 pub mod schema;
 
+/// Mainnet spending presets: derivation, generated policy body, spending
+/// summary, and funding plan.
+pub mod presets;
+
 /// Proptest strategy generators for property tests.  Gate-guarded; excluded
 /// from release builds.
 ///
