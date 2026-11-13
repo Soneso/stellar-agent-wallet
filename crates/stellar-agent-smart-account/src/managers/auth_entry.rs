@@ -1761,7 +1761,11 @@ pub(crate) async fn resimulate_with_signed_auth(
             phase: "simulate",
             redacted_reason: format!(
                 "re-simulate returned error: {}",
-                crate::managers::rules::SimulationErrorClass::of(sim_error)
+                crate::managers::rules::refusal_text(
+                    sim_error,
+                    &resim_response.events,
+                    &resim_envelope
+                )
             ),
         });
     }
@@ -4091,5 +4095,46 @@ mod tests {
             }
         ));
         assert_eq!(signer.sign_calls(), 1);
+    }
+
+    /// The signed re-simulation names the code the RPC 30.0.1 events confirm,
+    /// with the same variant, phase and wire code.
+    #[tokio::test]
+    async fn resimulation_refusal_names_the_code_on_rpc30() {
+        use crate::managers::rules::event_reason_tests::{
+            RPC30_ERROR, SAC, SMART_ACCOUNT, address, address_entry, read_only_server,
+            refusal_result, rpc30_events,
+        };
+        let source = stellar_strkey::ed25519::PublicKey([7; 32]).to_string();
+        let server = read_only_server(&source, refusal_result(RPC30_ERROR, &rpc30_events())).await;
+        let rpc = Client::new(&server.uri()).unwrap();
+        let rpc_client = StellarRpcClient::new(&server.uri()).unwrap();
+        let error = resimulate_with_signed_auth(
+            &rpc,
+            &rpc_client,
+            &address(SAC),
+            ScSymbol::try_from("transfer").unwrap(),
+            VecM::default(),
+            vec![address_entry(address(SMART_ACCOUNT), &address(SAC), vec![])],
+            &source,
+            TESTNET_PASSPHRASE,
+            PreSubmitBudget {
+                deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+                total: std::time::Duration::from_secs(30),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.wire_code(), "sa.deployment_failed");
+        match error {
+            SaError::DeploymentFailed {
+                phase: "simulate",
+                redacted_reason,
+            } => assert_eq!(
+                redacted_reason,
+                "re-simulate returned error: Error(Contract, #3221) [OZ:SpendingLimitExceeded]"
+            ),
+            other => panic!("expected the simulate refusal, got {other:?}"),
+        }
     }
 }

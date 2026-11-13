@@ -90,10 +90,11 @@
 //!
 //! On-chain `SaError::DeploymentFailed { phase: "simulate", .. }` failures
 //! carry the OZ symbolic error name inline in `message` (e.g.
-//! `[OZ:SpendingLimitExceeded]`, `[OZ:NotAllowed]`, `[OZ:UnvalidatedContext]`)
-//! — the same annotation mechanism every sibling smart-account write verb
-//! relies on (`augment_with_oz_error_name`, applied inside
-//! `submit_signed_invoke` itself).
+//! `[OZ:SpendingLimitExceeded]`, `[OZ:NotAllowed]`, `[OZ:UnvalidatedContext]`).
+//! Every sibling smart-account write verb uses the same annotation:
+//! `submit_signed_invoke` renders `refusal_text`, which classifies the error
+//! text with `SimulationErrorClass::of` and confirms a code from the
+//! response's events.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

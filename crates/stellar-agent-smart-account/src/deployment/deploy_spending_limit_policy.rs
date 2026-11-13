@@ -470,7 +470,11 @@ async fn deploy_spending_limit_policy_body(
                 phase: "simulate",
                 redacted_reason: format!(
                     "upload simulation returned error: {}",
-                    crate::managers::rules::SimulationErrorClass::of(sim_error)
+                    crate::managers::rules::refusal_text(
+                        sim_error,
+                        &upload_sim.events,
+                        &upload_envelope
+                    )
                 ),
             });
         }
@@ -647,7 +651,11 @@ async fn deploy_spending_limit_policy_body(
             phase: "simulate",
             redacted_reason: format!(
                 "deploy simulation returned error: {}",
-                crate::managers::rules::SimulationErrorClass::of(sim_error)
+                crate::managers::rules::refusal_text(
+                    sim_error,
+                    &sim_response.events,
+                    &deploy_envelope_pre
+                )
             ),
         });
     }

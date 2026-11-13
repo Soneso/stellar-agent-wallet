@@ -73,12 +73,11 @@ use crate::managers::authorization::{
     QuorumFailure, plan_quorum_signatures_within_budget, sign_quorum_plan_within_budget,
 };
 use crate::managers::rules::{
-    BASE_FEE_STROOPS, ExpiryCheck, HorizonCheck, SimulationErrorClass,
-    build_and_sign_delegated_g_key_entry, build_signed_invoke_envelope, chain_id_fingerprint,
-    check_rule_not_expired_standalone, fingerprint_invocation, fingerprint_invocation_nodes,
-    locate_smart_account_auth_entry, parse_c_strkey_to_smart_account, parse_min_resource_fee,
-    passphrase_fingerprint, resimulate_with_signed_auth, scaddress_to_strkey,
-    validate_latest_ledger,
+    BASE_FEE_STROOPS, ExpiryCheck, HorizonCheck, build_and_sign_delegated_g_key_entry,
+    build_signed_invoke_envelope, chain_id_fingerprint, check_rule_not_expired_standalone,
+    fingerprint_invocation, fingerprint_invocation_nodes, locate_smart_account_auth_entry,
+    parse_c_strkey_to_smart_account, parse_min_resource_fee, passphrase_fingerprint,
+    resimulate_with_signed_auth, scaddress_to_strkey, validate_latest_ledger,
 };
 use crate::managers::signers::{
     BorrowedRuleLocks, RuleLockGuard, SignersManager, V1Handling, find_rule_guard,
@@ -1290,7 +1289,11 @@ pub async fn submit_signed_invoke(
             redacted_reason: format!(
                 "{} simulation returned error: {}",
                 args.op_label,
-                SimulationErrorClass::of(sim_error)
+                crate::managers::rules::refusal_text(
+                    sim_error,
+                    &sim_response.events,
+                    &sim_envelope
+                )
             ),
         });
     }
@@ -4916,6 +4919,50 @@ mod tests {
             assert_deadline_refusal(&outcome, "simulate_recovery");
             outcome.assert_refused("sa.auth_entry_construction_failed", "recovery deadline");
             assert_eq!(primary.simulations(), 2);
+        }
+
+        /// The initial refusal names the code an event of the invoked contract
+        /// confirms, before any signature.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn initial_submit_refusal_uses_response_events() {
+            use crate::managers::rules::event_reason_tests::{RPC30_ERROR, encode, error_topics};
+            stellar_agent_test_support::keyring_mock::install().unwrap();
+            let events = encode(&[(Some(WALLET), error_topics(3221), stellar_xdr::ScVal::Void)]);
+            let primary = endpoint(LEDGER)
+                .simulation_response(move |n, response| {
+                    if n == 1 {
+                        response["error"] = serde_json::json!(RPC30_ERROR);
+                        response["events"] = serde_json::json!(events);
+                    }
+                })
+                .start()
+                .await;
+            let secondary = endpoint(LEDGER).start().await;
+            let outcome = submit_with(
+                SigningPath::Single,
+                &primary,
+                Some(&second_loopback_host(&secondary.uri())),
+                None,
+            )
+            .await;
+            let Err(error) = outcome.result else {
+                panic!("the refusal stops the submission");
+            };
+            assert_eq!(error.wire_code(), "sa.deployment_failed");
+            match error {
+                SaError::DeploymentFailed {
+                    phase: "simulate",
+                    redacted_reason,
+                } => assert_eq!(
+                    redacted_reason,
+                    "witness_test simulation returned error: Error(Contract, #3221) \
+                     [OZ:SpendingLimitExceeded]"
+                ),
+                other => panic!("expected the simulate refusal, got {other:?}"),
+            }
+            assert_eq!(outcome.signs, 0);
+            assert!(outcome.sent.is_empty());
         }
 
         #[tokio::test]

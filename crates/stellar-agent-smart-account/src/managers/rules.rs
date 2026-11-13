@@ -2289,13 +2289,17 @@ impl ContextRuleManager {
             .await
         {
             Ok(scval) => Ok(Some(scval)),
-            Err(SaError::DeploymentFailed {
-                phase,
-                redacted_reason,
-            }) if phase == "simulate"
-                && (redacted_reason.contains("ContextRuleNotFound")
-                    || redacted_reason.contains("#3000")
-                    || redacted_reason.contains("Error(Contract, #3000)")) =>
+            Err(failure)
+                if matches!(
+                    failure.text_error(),
+                    SaError::DeploymentFailed {
+                        phase,
+                        redacted_reason,
+                    } if *phase == "simulate"
+                        && (redacted_reason.contains("ContextRuleNotFound")
+                            || redacted_reason.contains("#3000")
+                            || redacted_reason.contains("Error(Contract, #3000)"))
+                ) =>
             {
                 // OZ `SmartAccountError::ContextRuleNotFound` has discriminant
                 // 3000 (OpenZeppelin stellar-contracts v0.7.2,
@@ -2308,7 +2312,7 @@ impl ContextRuleManager {
                 // symbolic names alongside the numeric code.
                 Ok(None)
             }
-            Err(other) => Err(other),
+            Err(other) => Err(other.into_shown()),
         }
     }
 
@@ -2331,7 +2335,8 @@ impl ContextRuleManager {
                 vec![],
                 source_account_strkey,
             )
-            .await?;
+            .await
+            .map_err(SimulationFailure::into_shown)?;
         match scval {
             ScVal::U32(n) => Ok(n),
             other => Err(SaError::DeploymentFailed {
@@ -3030,7 +3035,7 @@ impl ContextRuleManager {
         entrypoint: &'static str,
         invoke_args: Vec<ScVal>,
         source_account_strkey: &str,
-    ) -> Result<ScVal, SaError> {
+    ) -> Result<ScVal, SimulationFailure> {
         let auth_payload_err = |reason: String| SaError::AuthEntryConstructionFailed {
             stage: "auth_payload",
             redacted_reason: reason,
@@ -3082,10 +3087,12 @@ impl ContextRuleManager {
             .map_err(|e| auth_payload_err(format!("simulate_transaction_envelope failed: {e}")))?;
 
         if let Some(sim_error) = &sim_response.error {
-            return Err(SaError::DeploymentFailed {
-                phase: "simulate",
-                redacted_reason: read_only_simulation_reason(entrypoint, sim_error),
-            });
+            return Err(read_only_refusal(
+                entrypoint,
+                sim_error,
+                &sim_response.events,
+                &sim_envelope,
+            ));
         }
 
         let return_val = sim_response
@@ -4688,6 +4695,12 @@ const CONTEXT_RULE_NOT_FOUND_CODE: u32 = 3000;
 /// rule. No such text is logged or retained: an error, a log event or a
 /// retained source holds only this class, built from the error's numeric
 /// code and fixed names.
+///
+/// The class of the whole error text is the only input of every decision.
+/// The displayed class can also come from the response's diagnostic events,
+/// through [`event_reason`]: only an `error` topic of the invoked contract or
+/// of a smart account the sent auth entries name confirms a code. That class
+/// is display text only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SimulationErrorClass {
     /// The first `Error(Contract, #<code>)` the text names, with the OZ name
@@ -4818,6 +4831,296 @@ pub(crate) fn read_only_simulation_reason(entrypoint: &'static str, raw: &str) -
         }
         SimulationErrorClass::Unclassified => format!("{entrypoint} simulation failed"),
         class => format!("{entrypoint} simulation error: {class}"),
+    }
+}
+
+/// The line the host writes before its rendered event log in an error text.
+const EVENT_LOG_MARKER: &str = "Event log (newest first)";
+
+/// The displayed class of a simulation refusal, when it differs from the
+/// class of the error text.
+///
+/// The value is display text only. No decision reads it, and only
+/// [`refusal_class_text`] renders it.
+pub(crate) struct EventReason(SimulationErrorClass);
+
+impl std::fmt::Debug for EventReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EventReason(..)")
+    }
+}
+
+/// The part of the simulation error text `raw` before the host's event log.
+fn top_level_error(raw: &str) -> &str {
+    raw.find(EVENT_LOG_MARKER).map_or(raw, |end| &raw[..end])
+}
+
+/// The displayed class of the simulation refusal `raw` with the response's
+/// `events`, when it differs from the class of `raw`.
+///
+/// The displayed code is the code the old event-log order names first: the
+/// error text, then the events newest first. It is shown only when an `error`
+/// topic of a `Diagnostic` event of a contract in `origins` carries it.
+/// Otherwise the display is the class of the top-level error, the text before
+/// any event log. A top-level reason named without a code is always shown as
+/// named. Event data only orders the choice. A response without events, or
+/// with an event that does not decode, shows the top-level error.
+pub(crate) fn event_reason(
+    raw: &str,
+    events: &[String],
+    origins: &[ContractId],
+) -> Option<EventReason> {
+    let top = SimulationErrorClass::of(top_level_error(raw));
+    let shown = match top {
+        SimulationErrorClass::ContractNamed { .. } => top,
+        _ => confirmed_code(raw, events, origins).map_or(top, |code| {
+            SimulationErrorClass::Contract {
+                code,
+                name: oz_error_name(code),
+            }
+        }),
+    };
+    (shown != SimulationErrorClass::of(raw)).then_some(EventReason(shown))
+}
+
+/// The legacy-order contract error code of `raw` and `events`, when an
+/// eligible `error` topic carries it.
+///
+/// Every event of the response is decoded and scanned. The client accepts a
+/// response of at most 10 MiB (registry `stellar-rpc-client-30.0.0/src/lib.rs:1009`
+/// builds the default `jsonrpsee-http-client-0.26.0/src/client.rs:338` limit),
+/// which bounds the work. Each event decodes within depth 500 and its own length.
+fn confirmed_code(raw: &str, events: &[String], origins: &[ContractId]) -> Option<u32> {
+    use base64::Engine as _;
+    let error_symbol = ScSymbol::try_from("error").ok()?;
+    let mut decoded = Vec::with_capacity(events.len());
+    for event in events {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(event)
+            .ok()?;
+        let limits = stellar_agent_xdr_limits::untrusted_decode_limits(bytes.len());
+        decoded.push(stellar_xdr::DiagnosticEvent::from_xdr(&bytes, limits).ok()?);
+    }
+    let eligible: Vec<u32> = decoded
+        .iter()
+        .filter_map(|diagnostic| {
+            let event = &diagnostic.event;
+            let id = event.contract_id.as_ref()?;
+            if event.type_ != stellar_xdr::ContractEventType::Diagnostic || !origins.contains(id) {
+                return None;
+            }
+            let stellar_xdr::ContractEventBody::V0(body) = &event.body;
+            match body.topics.as_slice() {
+                [
+                    ScVal::Symbol(symbol),
+                    ScVal::Error(stellar_xdr::ScError::Contract(code)),
+                ] if *symbol == error_symbol => Some(*code),
+                _ => None,
+            }
+        })
+        .collect();
+    let code = first_contract_error_code(raw).or_else(|| {
+        let mut log = String::new();
+        for diagnostic in decoded.iter().rev() {
+            let stellar_xdr::ContractEventBody::V0(body) = &diagnostic.event.body;
+            log.push_str("topics:[");
+            for (index, topic) in body.topics.iter().enumerate() {
+                if index != 0 {
+                    log.push_str(", ");
+                }
+                render_legacy_value(topic, &mut log);
+            }
+            log.push_str("], data:");
+            render_legacy_value(&body.data, &mut log);
+            log.push('\n');
+        }
+        first_contract_error_code(&log)
+    })?;
+    eligible.contains(&code).then_some(code)
+}
+
+/// Writes `value` as the host renders it in an event log, for the renderings
+/// that can form or end an `Error(Contract, #<code>)` token; every other value
+/// is `_`.
+fn render_legacy_value(value: &ScVal, out: &mut String) {
+    let text = |bytes: &[u8], out: &mut String| out.push_str(&String::from_utf8_lossy(bytes));
+    match value {
+        ScVal::Error(stellar_xdr::ScError::Contract(code)) => {
+            out.push_str(&format!("Error(Contract, #{code})"));
+        }
+        ScVal::String(string) => {
+            out.push('"');
+            text(string.as_slice(), out);
+            out.push('"');
+        }
+        ScVal::Symbol(symbol) => text(symbol.as_slice(), out),
+        ScVal::ExecutableTag(tag) => {
+            out.push_str("ExecutableTag(\"");
+            text(tag.as_slice(), out);
+            out.push_str("\")");
+        }
+        ScVal::Vec(Some(items)) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index != 0 {
+                    out.push_str(", ");
+                }
+                render_legacy_value(item, out);
+            }
+            out.push(']');
+        }
+        ScVal::Map(Some(entries)) => {
+            out.push('{');
+            for (index, entry) in entries.iter().enumerate() {
+                if index != 0 {
+                    out.push_str(", ");
+                }
+                render_legacy_value(&entry.key, out);
+                out.push_str(": ");
+                render_legacy_value(&entry.val, out);
+            }
+            out.push('}');
+        }
+        ScVal::ContractInstance(stellar_xdr::ScContractInstance {
+            executable: stellar_xdr::ContractExecutable::ExternalRef(external),
+            ..
+        }) => {
+            out.push_str("ContractInstance(ExternalRef(_, ");
+            text(external.tag.as_slice(), out);
+            out.push_str("))");
+        }
+        _ => out.push('_'),
+    }
+}
+
+/// Renders the displayed class: `reason` when present, otherwise `text`.
+pub(crate) fn refusal_class_text(
+    text: &SimulationErrorClass,
+    reason: Option<&EventReason>,
+) -> String {
+    reason.map_or(text, |reason| &reason.0).to_string()
+}
+
+/// The displayed class of the simulation refusal `raw`, with the response's
+/// `events` and the origins of the sent `envelope`.
+pub(crate) fn refusal_text(
+    raw: &str,
+    events: &[String],
+    envelope: &stellar_xdr::TransactionEnvelope,
+) -> String {
+    refusal_class_text(
+        &SimulationErrorClass::of(raw),
+        event_reason(raw, events, &simulation_origins(envelope)).as_ref(),
+    )
+}
+
+/// The contracts whose `error` topics may confirm a displayed code: the
+/// invoked contract and the contract address of every `Address` credential of
+/// each `InvokeHostFunction` operation of a `Tx` envelope.
+///
+/// The list holds each id once. Other address kinds, other envelope types,
+/// arguments and sub-invocations add no origin.
+pub(crate) fn simulation_origins(envelope: &stellar_xdr::TransactionEnvelope) -> Vec<ContractId> {
+    let mut origins = Vec::new();
+    let stellar_xdr::TransactionEnvelope::Tx(tx) = envelope else {
+        return origins;
+    };
+    let mut add = |address: &ScAddress| {
+        if let ScAddress::Contract(id) = address
+            && !origins.contains(id)
+        {
+            origins.push(id.clone());
+        }
+    };
+    for operation in tx.tx.operations.iter() {
+        let OperationBody::InvokeHostFunction(invoke) = &operation.body else {
+            continue;
+        };
+        if let HostFunction::InvokeContract(args) = &invoke.host_function {
+            add(&args.contract_address);
+        }
+        for entry in invoke.auth.iter() {
+            if let SorobanCredentials::Address(credentials) = &entry.credentials {
+                add(&credentials.address);
+            }
+        }
+    }
+    origins
+}
+
+/// A simulation refusal: the error every decision reads and, when the
+/// response's events name another class, the error the wallet shows.
+#[derive(Debug)]
+pub(crate) struct SimulationFailure {
+    /// The error built from the class of the error text.
+    error: SaError,
+    /// The same error built from the displayed class.
+    shown: Option<SaError>,
+}
+
+impl From<SaError> for SimulationFailure {
+    fn from(error: SaError) -> Self {
+        Self { error, shown: None }
+    }
+}
+
+impl SimulationFailure {
+    /// The error built from the class of the error text; every decision
+    /// reads this error.
+    pub(crate) fn text_error(&self) -> &SaError {
+        &self.error
+    }
+
+    /// Whether the shown error differs from the text error.
+    pub(crate) fn is_described(&self) -> bool {
+        self.shown.is_some()
+    }
+
+    /// The error the wallet shows.
+    pub(crate) fn into_shown(self) -> SaError {
+        self.shown.unwrap_or(self.error)
+    }
+}
+
+/// The refusal of the simulation error text `raw`: `build` of the class of
+/// `raw` and, when the events name another class, `build` of that class.
+pub(crate) fn simulation_refusal(
+    raw: &str,
+    events: &[String],
+    envelope: &stellar_xdr::TransactionEnvelope,
+    build: impl Fn(String) -> SaError,
+) -> SimulationFailure {
+    let text = SimulationErrorClass::of(raw);
+    let reason = event_reason(raw, events, &simulation_origins(envelope));
+    SimulationFailure {
+        error: build(text.to_string()),
+        shown: reason.map(|reason| build(refusal_class_text(&text, Some(&reason)))),
+    }
+}
+
+/// The refusal of a failed read-only simulation of `entrypoint`: the text
+/// error carries [`read_only_simulation_reason`], and the shown error carries
+/// `<entrypoint> simulation error: <displayed class>`.
+pub(crate) fn read_only_refusal(
+    entrypoint: &'static str,
+    raw: &str,
+    events: &[String],
+    envelope: &stellar_xdr::TransactionEnvelope,
+) -> SimulationFailure {
+    let reason = event_reason(raw, events, &simulation_origins(envelope));
+    let refusal = |redacted_reason: String| SaError::DeploymentFailed {
+        phase: "simulate",
+        redacted_reason,
+    };
+    SimulationFailure {
+        error: refusal(read_only_simulation_reason(entrypoint, raw)),
+        shown: reason.map(|reason| {
+            let text = SimulationErrorClass::of(raw);
+            refusal(format!(
+                "{entrypoint} simulation error: {}",
+                refusal_class_text(&text, Some(&reason))
+            ))
+        }),
     }
 }
 
@@ -10799,5 +11102,1058 @@ mod tests {
             !server.received_requests().await.unwrap().is_empty(),
             "the call reaches its first RPC: {result:?}"
         );
+    }
+}
+
+/// Fixtures and tests of the reason a simulation refusal displays from the
+/// response's diagnostic events.
+#[cfg(test)]
+pub(crate) mod event_reason_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        reason = "test-only fixture construction"
+    )]
+
+    use super::*;
+    use stellar_xdr::{
+        ContractEvent, ContractEventBody, ContractEventType, ContractEventV0, DiagnosticEvent,
+        ExtensionPoint, MuxedAccount, ScError, ScErrorCode, SorobanAddressCredentials,
+        SorobanAuthorizedFunction, TransactionEnvelope, Uint256,
+    };
+
+    /// The top-level error of the captured RPC 30.0.1 refusal.
+    pub(crate) const RPC30_ERROR: &str = "HostError: Error(Auth, InvalidAction)";
+
+    /// Captured events 5 (policy), 9 (smart account) and 11 (SAC), in
+    /// response order.
+    pub(crate) const RPC30_EVENTS: [&str; 3] = [
+        "AAAAAAAAAAAAAAABG8lBu+s2Jq03akuRdzzlU3e48ED8czN+nsseBCUKEBAAAAACAAAAAAAAAAIAAAAPAAAABWVycm9yAAAAAAAAAgAAAAAAAAyVAAAAEAAAAAEAAAACAAAADgAAABtmYWlsaW5nIHdpdGggY29udHJhY3QgZXJyb3IAAAAAAwAADJU=",
+        "AAAAAAAAAAAAAAABSdB0NNJdz+bpaMaP1fL85SsPEe3slVmqLUY01rfS7bgAAAACAAAAAAAAAAIAAAAPAAAABWVycm9yAAAAAAAAAgAAAAAAAAyVAAAADgAAAEBlc2NhbGF0aW5nIGVycm9yIHRvIFZNIHRyYXAgZnJvbSBmYWlsZWQgaG9zdCBmdW5jdGlvbiBjYWxsOiBjYWxs",
+        "AAAAAAAAAAAAAAAB15KLcsJwPM/q9+uf9O9NUEpVqLl5/JtFDqLIQrTRzmEAAAACAAAAAAAAAAIAAAAPAAAABWVycm9yAAAAAAAAAgAAAAkAAAAGAAAAEAAAAAEAAAADAAAADgAAAChmYWlsZWQgYWNjb3VudCBhdXRoZW50aWNhdGlvbiB3aXRoIGVycm9yAAAAEgAAAAFJ0HQ00l3P5uloxo/V8vzlKw8R7eyVWaotRjTWt9LtuAAAAAIAAAAAAAAMlQ==",
+    ];
+
+    /// The smart account of the captured refusal.
+    pub(crate) const SMART_ACCOUNT: &str =
+        "49d07434d25dcfe6e968c68fd5f2fce52b0f11edec9559aa2d4634d6b7d2edb8";
+    /// The native SAC, the invoked contract of the captured refusal.
+    pub(crate) const SAC: &str = "d7928b72c2703ccfeaf7eb9ff4ef4d504a55a8b979fc9b450ea2c842b4d1ce61";
+    /// The spending-limit policy of the captured refusal.
+    pub(crate) const POLICY: &str =
+        "1bc941bbeb3626ad376a4b91773ce55377b8f040fc73337e9ecb1e04250a1010";
+    /// A second smart account that a nested authorization names.
+    pub(crate) const NESTED: &str =
+        "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b";
+
+    /// The old form of the captured refusal: the host line, then the three
+    /// events newest first.
+    pub(crate) const RPC30_OLD_TEXT: &str = "transaction simulation failed: host invocation \
+         failed\n\nCaused by:\n    HostError: Error(Auth, InvalidAction)\n\n    Event log (newest \
+         first):\n       0: [Diagnostic Event] \
+         contract:CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC, topics:[error, \
+         Error(Auth, InvalidAction)], data:[\"failed account authentication with error\", \
+         CBE5A5BU2JO47ZXJNDDI7VPS7TSSWDYR5XWJKWNKFVDDJVVX2LW3QMBV, Error(Contract, #3221)]\n       \
+         1: [Diagnostic Event] contract:CBE5A5BU2JO47ZXJNDDI7VPS7TSSWDYR5XWJKWNKFVDDJVVX2LW3QMBV, \
+         topics:[error, Error(Contract, #3221)], data:\"escalating error to VM trap from failed \
+         host function call: call\"\n       2: [Diagnostic Event] \
+         contract:CAN4SQN35M3CNLJXNJFZC5Z44VJXPOHQID6HGM36T3FR4BBFBIIBBO2E, topics:[error, \
+         Error(Contract, #3221)], data:[\"failing with contract error\", 3221]\n";
+
+    /// The 32 bytes of the hex contract id `hex`.
+    pub(crate) fn id(hex: &str) -> [u8; 32] {
+        stellar_agent_core::hex::decode_hex32(hex).unwrap()
+    }
+
+    /// The contract id of `hex`.
+    pub(crate) fn contract(hex: &str) -> ContractId {
+        ContractId(Hash(id(hex)))
+    }
+
+    /// The contract address of `hex`.
+    pub(crate) fn address(hex: &str) -> ScAddress {
+        ScAddress::Contract(contract(hex))
+    }
+
+    /// A symbol value.
+    pub(crate) fn sym(text: &str) -> ScVal {
+        ScVal::Symbol(ScSymbol::try_from(text).unwrap())
+    }
+
+    /// A string value.
+    pub(crate) fn string(text: &str) -> ScVal {
+        ScVal::String(ScString(text.try_into().unwrap()))
+    }
+
+    /// A vector value.
+    pub(crate) fn vec_of(items: Vec<ScVal>) -> ScVal {
+        ScVal::Vec(Some(ScVec(items.try_into().unwrap())))
+    }
+
+    /// A contract error value.
+    pub(crate) fn code(code: u32) -> ScVal {
+        ScVal::Error(ScError::Contract(code))
+    }
+
+    /// The topics `[error, Error(Contract(code))]`.
+    pub(crate) fn error_topics(error_code: u32) -> Vec<ScVal> {
+        vec![sym("error"), code(error_code)]
+    }
+
+    /// One synthetic event: emitting contract, topics and data.
+    pub(crate) type Event = (Option<[u8; 32]>, Vec<ScVal>, ScVal);
+
+    /// Encodes a synthetic diagnostic event as base64 XDR.
+    pub(crate) fn diagnostic_event(
+        contract: Option<[u8; 32]>,
+        kind: ContractEventType,
+        topics: Vec<ScVal>,
+        data: ScVal,
+    ) -> String {
+        DiagnosticEvent {
+            in_successful_contract_call: false,
+            event: ContractEvent {
+                ext: ExtensionPoint::V0,
+                contract_id: contract.map(|bytes| ContractId(Hash(bytes))),
+                type_: kind,
+                body: ContractEventBody::V0(ContractEventV0 {
+                    topics: topics.try_into().unwrap(),
+                    data,
+                }),
+            },
+        }
+        .to_xdr_base64(Limits::none())
+        .unwrap()
+    }
+
+    /// Encodes the `Diagnostic` events of `events`.
+    pub(crate) fn encode(events: &[Event]) -> Vec<String> {
+        events
+            .iter()
+            .map(|(contract, topics, data)| {
+                diagnostic_event(
+                    *contract,
+                    ContractEventType::Diagnostic,
+                    topics.clone(),
+                    data.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// A trusted-shape error event of `hex` carrying `error_code`, with
+    /// code-free data.
+    pub(crate) fn error_event(hex: &str, error_code: u32) -> String {
+        encode(&[(Some(id(hex)), error_topics(error_code), ScVal::Void)]).remove(0)
+    }
+
+    /// Renders `value` as the host does in an old-form event log, for the
+    /// values these tests use.
+    fn show(value: &ScVal) -> String {
+        match value {
+            ScVal::Void => "Void".to_owned(),
+            ScVal::U32(n) => n.to_string(),
+            ScVal::Symbol(s) => s.to_utf8_string_lossy(),
+            ScVal::String(s) => format!("\"{}\"", s.to_utf8_string_lossy()),
+            ScVal::Error(ScError::Contract(n)) => format!("Error(Contract, #{n})"),
+            ScVal::Error(ScError::Auth(c)) => format!("Error(Auth, {})", c.name()),
+            ScVal::Error(ScError::Context(c)) => format!("Error(Context, {})", c.name()),
+            ScVal::Vec(Some(items)) => format!(
+                "[{}]",
+                items.iter().map(show).collect::<Vec<_>>().join(", ")
+            ),
+            ScVal::Address(ScAddress::Contract(ContractId(Hash(bytes)))) => {
+                stellar_strkey::Contract(*bytes).to_string().to_string()
+            }
+            other => panic!("no old-form rendering for {other:?}"),
+        }
+    }
+
+    /// The old form of a refusal whose host line is `host` and whose events
+    /// are `events` in response order.
+    pub(crate) fn old_text(host: &str, events: &[Event]) -> String {
+        let mut text = format!(
+            "transaction simulation failed: host invocation failed\n\nCaused by:\n    \
+             HostError: {host}\n\n    Event log (newest first):\n"
+        );
+        for (index, (contract, topics, data)) in events.iter().rev().enumerate() {
+            let contract = contract.map_or(String::new(), |bytes| {
+                format!("contract:{}, ", stellar_strkey::Contract(bytes))
+            });
+            let topics = topics.iter().map(show).collect::<Vec<_>>().join(", ");
+            text.push_str(&format!(
+                "       {index}: [Diagnostic Event] {contract}topics:[{topics}], data:{}\n",
+                show(data)
+            ));
+        }
+        text
+    }
+
+    /// The displayed class of `text` with `events` and `origins`.
+    pub(crate) fn reason(text: &str, events: &[String], origins: &[ContractId]) -> String {
+        refusal_class_text(
+            &SimulationErrorClass::of(text),
+            event_reason(text, events, origins).as_ref(),
+        )
+    }
+
+    /// The captured events as owned strings.
+    pub(crate) fn rpc30_events() -> Vec<String> {
+        RPC30_EVENTS
+            .iter()
+            .map(|event| (*event).to_owned())
+            .collect()
+    }
+
+    /// A `simulateTransaction` result refusing with `error` and `events`.
+    pub(crate) fn refusal_result(error: &str, events: &[String]) -> serde_json::Value {
+        serde_json::json!({
+            "latestLedger": 5_711_022,
+            "minResourceFee": "0",
+            "cost": { "cpuInsns": "0", "memBytes": "0" },
+            "transactionData": "",
+            "events": events,
+            "error": error,
+        })
+    }
+
+    /// An `Address` authorization entry for `credential` invoking `invoked`.
+    pub(crate) fn address_entry(
+        credential: ScAddress,
+        invoked: &ScAddress,
+        sub_invocations: Vec<SorobanAuthorizedInvocation>,
+    ) -> SorobanAuthorizationEntry {
+        SorobanAuthorizationEntry {
+            credentials: SorobanCredentials::Address(SorobanAddressCredentials {
+                address: credential,
+                nonce: 1,
+                signature_expiration_ledger: 100,
+                signature: ScVal::Void,
+            }),
+            root_invocation: SorobanAuthorizedInvocation {
+                function: SorobanAuthorizedFunction::ContractFn(invoke_args(invoked, vec![])),
+                sub_invocations: sub_invocations.try_into().unwrap(),
+            },
+        }
+    }
+
+    /// The `transfer` invocation of `invoked` with `args`.
+    fn invoke_args(invoked: &ScAddress, args: Vec<ScVal>) -> InvokeContractArgs {
+        InvokeContractArgs {
+            contract_address: invoked.clone(),
+            function_name: ScSymbol::try_from("transfer").unwrap(),
+            args: args.try_into().unwrap(),
+        }
+    }
+
+    /// A `Tx` envelope with one operation of `body`.
+    fn tx_envelope(body: OperationBody) -> TransactionEnvelope {
+        TransactionEnvelope::Tx(stellar_xdr::TransactionV1Envelope {
+            tx: stellar_xdr::Transaction {
+                source_account: MuxedAccount::Ed25519(Uint256([7; 32])),
+                fee: 100,
+                seq_num: stellar_xdr::SequenceNumber(1),
+                cond: stellar_xdr::Preconditions::None,
+                memo: stellar_xdr::Memo::None,
+                operations: vec![Operation {
+                    source_account: None,
+                    body,
+                }]
+                .try_into()
+                .unwrap(),
+                ext: stellar_xdr::TransactionExt::V0,
+            },
+            signatures: VecM::default(),
+        })
+    }
+
+    /// A `Tx` envelope invoking `invoked` with `args` and `auth`.
+    pub(crate) fn invoke_envelope(
+        invoked: &ScAddress,
+        args: Vec<ScVal>,
+        auth: Vec<SorobanAuthorizationEntry>,
+    ) -> TransactionEnvelope {
+        tx_envelope(OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+            host_function: HostFunction::InvokeContract(invoke_args(invoked, args)),
+            auth: auth.try_into().unwrap(),
+        }))
+    }
+
+    /// A G account address.
+    fn account(byte: u8) -> ScAddress {
+        ScAddress::Account(stellar_xdr::AccountId(
+            stellar_xdr::PublicKey::PublicKeyTypeEd25519(Uint256([byte; 32])),
+        ))
+    }
+
+    const ANNOTATED_3221: &str = "Error(Contract, #3221) [OZ:SpendingLimitExceeded]";
+    const HOST: &str = "Error(Auth, InvalidAction)";
+
+    /// The live refusal names the smart account's code, as its old form does.
+    #[test]
+    fn rpc30_refusal_names_the_smart_account_code() {
+        let shown = reason(
+            RPC30_ERROR,
+            &rpc30_events(),
+            &[contract(SAC), contract(SMART_ACCOUNT)],
+        );
+        assert_eq!(shown, ANNOTATED_3221);
+        assert_eq!(shown, SimulationErrorClass::of(RPC30_OLD_TEXT).to_string());
+    }
+
+    /// A code only a contract outside the origins carries is not shown.
+    #[test]
+    fn rpc30_code_of_an_untrusted_contract_is_ignored() {
+        let events = rpc30_events();
+        assert_eq!(reason(RPC30_ERROR, &events, &[contract(SAC)]), HOST);
+        assert_eq!(reason(RPC30_ERROR, &events, &[]), HOST);
+        assert_eq!(
+            reason(
+                RPC30_ERROR,
+                &events[..1],
+                &[contract(SAC), contract(SMART_ACCOUNT)]
+            ),
+            HOST
+        );
+    }
+
+    /// The old form's code is shown only when an eligible topic carries it;
+    /// a response without events shows the top-level error.
+    #[test]
+    fn old_text_binds_its_code_to_eligible_topics() {
+        let events = rpc30_events();
+        let trusted = [contract(SAC), contract(SMART_ACCOUNT)];
+        assert_eq!(reason(RPC30_OLD_TEXT, &events, &trusted), ANNOTATED_3221);
+        assert_eq!(reason(RPC30_OLD_TEXT, &[], &trusted), HOST);
+        assert_eq!(reason(RPC30_OLD_TEXT, &events, &[contract(SAC)]), HOST);
+        assert_eq!(reason(RPC30_OLD_TEXT, &events, &[]), HOST);
+
+        let mut many = events.clone();
+        many.extend(std::iter::repeat_n(
+            encode(&[(Some(id(POLICY)), vec![sym("log")], ScVal::Void)]).remove(0),
+            254,
+        ));
+        assert_eq!(many.len(), 257);
+        assert_eq!(reason(RPC30_OLD_TEXT, &many, &trusted), ANNOTATED_3221);
+
+        let mut malformed = events.clone();
+        malformed.push("not base64!".to_owned());
+        assert_eq!(reason(RPC30_OLD_TEXT, &malformed, &trusted), HOST);
+
+        let log_only: Vec<Event> = vec![(
+            Some(id(SMART_ACCOUNT)),
+            vec![sym("log")],
+            vec_of(vec![string("caught"), code(4004)]),
+        )];
+        let log_text = old_text("Error(Auth, InvalidAction)", &log_only);
+        assert_eq!(reason(&log_text, &encode(&log_only), &trusted), HOST);
+        assert_eq!(
+            SimulationErrorClass::of(&log_text).to_string(),
+            "Error(Contract, #4004) [OZ:Unauthorized]"
+        );
+        assert_eq!(
+            SimulationErrorClass::of(RPC30_OLD_TEXT).to_string(),
+            ANNOTATED_3221
+        );
+    }
+
+    /// A contract code in the top-level error is shown as it is.
+    #[test]
+    fn top_level_code_is_kept() {
+        let text = "HostError: Error(Contract, #3221)";
+        let events = vec![error_event(SMART_ACCOUNT, 3223)];
+        assert_eq!(
+            reason(text, &events, &[contract(SMART_ACCOUNT)]),
+            ANNOTATED_3221
+        );
+        assert_eq!(reason(text, &events, &[]), ANNOTATED_3221);
+    }
+
+    /// A text that names a reason without a code shows that reason as the
+    /// base classifier of the same text does; an eligible event never
+    /// replaces it.
+    #[test]
+    fn named_only_reason_is_kept() {
+        let text = "ContextRuleNotFound: rule 7 not found";
+        let sequence: Vec<Event> = vec![(Some(id(SMART_ACCOUNT)), error_topics(3221), ScVal::Void)];
+        let events = encode(&sequence);
+        let shown = reason(text, &events, &[contract(SMART_ACCOUNT)]);
+        assert_eq!(shown, "[OZ:ContextRuleNotFound]");
+        assert_eq!(shown, SimulationErrorClass::of(text).to_string());
+        assert_eq!(reason(text, &events, &[]), "[OZ:ContextRuleNotFound]");
+    }
+
+    /// A response without events, omitted, null or empty, shows the
+    /// top-level error even when its old log renders a foreign contract's
+    /// code or a code only in data.
+    #[test]
+    fn absent_events_show_the_top_level_error() {
+        let foreign = old_text(HOST, &[(Some(id(POLICY)), error_topics(3221), ScVal::Void)]);
+        let data_only = old_text(
+            HOST,
+            &[(Some(id(SMART_ACCOUNT)), vec![sym("log")], code(3221))],
+        );
+        let origins = [contract(SAC), contract(SMART_ACCOUNT)];
+        for text in [&foreign, &data_only] {
+            assert_eq!(SimulationErrorClass::of(text).to_string(), ANNOTATED_3221);
+            for result in [
+                serde_json::json!({ "latestLedger": 5_711_022, "error": text }),
+                serde_json::json!({ "latestLedger": 5_711_022, "error": text, "events": null }),
+                serde_json::json!({ "latestLedger": 5_711_022, "error": text, "events": [] }),
+            ] {
+                let response: stellar_rpc_client::SimulateTransactionResponse =
+                    serde_json::from_value(result).unwrap();
+                assert_eq!(reason(text, &response.events, &origins), HOST);
+            }
+        }
+    }
+
+    /// A valid response of 257 events, or of 262,148 base64 characters, with
+    /// the named account's error topic last shows the confirmed code, as the
+    /// old form of the complete sequence does.
+    #[test]
+    fn large_valid_response_keeps_the_confirmed_code() {
+        let origins = [contract(SAC), contract(SMART_ACCOUNT)];
+        let log: Event = (Some(id(POLICY)), vec![sym("log")], ScVal::Void);
+        let trusted: Event = (Some(id(SMART_ACCOUNT)), error_topics(3221), ScVal::Void);
+        let mut sequence = vec![log; 256];
+        sequence.push(trusted.clone());
+        assert_eq!(sequence.len(), 257);
+        let shown = reason(RPC30_ERROR, &encode(&sequence), &origins);
+        assert_eq!(shown, ANNOTATED_3221);
+        assert_eq!(
+            shown,
+            SimulationErrorClass::of(&old_text(HOST, &sequence)).to_string()
+        );
+
+        let trusted_event = encode(&[trusted]).remove(0);
+        let mut events = fillers_summing_to(262_148 - trusted_event.len());
+        events.push(trusted_event);
+        assert_eq!(events.iter().map(String::len).sum::<usize>(), 262_148);
+        assert_eq!(reason(RPC30_ERROR, &events, &origins), ANNOTATED_3221);
+    }
+
+    /// A response without events shows the top-level error.
+    #[test]
+    fn no_events_keep_the_host_error() {
+        assert_eq!(
+            reason(RPC30_ERROR, &[], &[contract(SAC), contract(SMART_ACCOUNT)]),
+            HOST
+        );
+    }
+
+    /// The bytes of the base64 event `event`.
+    fn bytes_of(event: &str) -> Vec<u8> {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(event)
+            .unwrap()
+    }
+
+    /// The base64 of `bytes`.
+    fn base64_of(bytes: &[u8]) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    /// A malformed event invalidates the set; an event of the wrong shape
+    /// confirms no code.
+    #[test]
+    fn malformed_events_keep_the_host_error() {
+        let origins = [contract(SMART_ACCOUNT)];
+        let valid = error_event(SMART_ACCOUNT, 3221);
+        assert_eq!(
+            reason(RPC30_ERROR, std::slice::from_ref(&valid), &origins),
+            ANNOTATED_3221
+        );
+
+        let valid_bytes = bytes_of(&valid);
+        let mut trailing = valid_bytes.clone();
+        trailing.extend([0; 4]);
+        let mut body_one = valid_bytes.clone();
+        body_one[48..52].copy_from_slice(&1_i32.to_be_bytes());
+        for broken in [
+            "not base64!".to_owned(),
+            base64_of(&valid_bytes[..60]),
+            base64_of(&trailing),
+            base64_of(&body_one),
+        ] {
+            assert_eq!(
+                reason(RPC30_ERROR, &[valid.clone(), broken.clone()], &origins),
+                HOST,
+                "{broken}"
+            );
+        }
+
+        let sa = Some(id(SMART_ACCOUNT));
+        let shaped =
+            |contract: Option<[u8; 32]>,
+             kind: ContractEventType,
+             topics: Vec<ScVal>,
+             data: ScVal| diagnostic_event(contract, kind, topics, data);
+        let cases = [
+            shaped(
+                sa,
+                ContractEventType::Contract,
+                error_topics(3221),
+                ScVal::Void,
+            ),
+            shaped(
+                None,
+                ContractEventType::Diagnostic,
+                error_topics(3221),
+                ScVal::Void,
+            ),
+            shaped(sa, ContractEventType::Diagnostic, vec![], code(3221)),
+            shaped(
+                sa,
+                ContractEventType::Diagnostic,
+                vec![sym("error")],
+                code(3221),
+            ),
+            shaped(
+                sa,
+                ContractEventType::Diagnostic,
+                vec![sym("error"), code(3221), ScVal::U32(1)],
+                ScVal::Void,
+            ),
+            shaped(
+                sa,
+                ContractEventType::Diagnostic,
+                vec![sym("failure"), code(3221)],
+                ScVal::Void,
+            ),
+            shaped(
+                sa,
+                ContractEventType::Diagnostic,
+                vec![sym("error"), ScVal::U32(3221)],
+                code(3221),
+            ),
+        ];
+        for case in cases {
+            assert_eq!(reason(RPC30_ERROR, &[case], &origins), HOST);
+        }
+    }
+
+    /// A `log` event of `POLICY` with a string of `len` bytes as data.
+    fn filler(len: usize) -> String {
+        encode(&[(Some(id(POLICY)), vec![sym("log")], string(&"x".repeat(len)))]).remove(0)
+    }
+
+    /// Fillers whose base64 lengths sum to `target`.
+    fn fillers_summing_to(target: usize) -> Vec<String> {
+        for first in 0..4096 {
+            let one = filler(first);
+            if one.len() == target {
+                return vec![one];
+            }
+            if one.len() > target {
+                break;
+            }
+            let rest = target - one.len();
+            let base = filler(0).len();
+            if rest >= base {
+                let estimate = (rest - base) * 3 / 4;
+                for len in estimate.saturating_sub(8)..estimate + 8 {
+                    let two = filler(len);
+                    if two.len() == rest {
+                        return vec![one, two];
+                    }
+                }
+            }
+        }
+        panic!("no fillers sum to {target}");
+    }
+
+    /// A value nesting `ScVal::Vec` `levels` deep.
+    fn nested(levels: usize) -> ScVal {
+        (0..levels).fold(ScVal::Void, |inner, _| vec_of(vec![inner]))
+    }
+
+    /// Every event of an accepted response is scanned; the per-event depth
+    /// budget keeps the top-level error when an event exceeds it.
+    #[test]
+    fn event_budget_is_enforced() {
+        let origins = [contract(SMART_ACCOUNT)];
+        let trusted = error_event(SMART_ACCOUNT, 3221);
+        let log = encode(&[(Some(id(POLICY)), vec![sym("log")], ScVal::Void)]).remove(0);
+
+        let mut events = vec![log.clone(); 255];
+        events.push(trusted.clone());
+        assert_eq!(reason(RPC30_ERROR, &events, &origins), ANNOTATED_3221);
+        events.insert(0, log);
+        assert_eq!(events.len(), 257);
+        assert_eq!(reason(RPC30_ERROR, &events, &origins), ANNOTATED_3221);
+
+        for (total, expected) in [(262_144, ANNOTATED_3221), (262_148, ANNOTATED_3221)] {
+            let mut events = fillers_summing_to(total - trusted.len());
+            events.push(trusted.clone());
+            assert_eq!(events.iter().map(String::len).sum::<usize>(), total);
+            assert_eq!(reason(RPC30_ERROR, &events, &origins), expected, "{total}");
+        }
+
+        let too_deep = encode(&[(Some(id(POLICY)), vec![sym("log")], nested(200))]).remove(0);
+        let too_deep_bytes = bytes_of(&too_deep);
+        assert!(
+            DiagnosticEvent::from_xdr(
+                &too_deep_bytes,
+                stellar_agent_xdr_limits::untrusted_decode_limits(too_deep_bytes.len())
+            )
+            .is_err()
+        );
+        assert_eq!(
+            reason(RPC30_ERROR, &[trusted.clone(), too_deep], &origins),
+            HOST
+        );
+
+        let deep_data =
+            encode(&[(Some(id(SMART_ACCOUNT)), error_topics(3221), nested(100))]).remove(0);
+        assert_eq!(reason(RPC30_ERROR, &[deep_data], &origins), ANNOTATED_3221);
+    }
+
+    /// Among eligible codes, the one the old form lists first is shown.
+    #[test]
+    fn legacy_order_selects_among_eligible_codes() {
+        let sa = Some(id(SMART_ACCOUNT));
+        let sac = Some(id(SAC));
+        let origins = [contract(SAC), contract(SMART_ACCOUNT)];
+        let cases: [(Vec<Event>, &str); 3] = [
+            (
+                vec![
+                    (sa, error_topics(3221), ScVal::Void),
+                    (sa, error_topics(3223), ScVal::Void),
+                ],
+                "Error(Contract, #3223) [OZ:NotAllowed]",
+            ),
+            (
+                vec![
+                    (sac, error_topics(3000), ScVal::Void),
+                    (sa, error_topics(3221), ScVal::Void),
+                ],
+                ANNOTATED_3221,
+            ),
+            (
+                vec![
+                    (sa, error_topics(3221), ScVal::Void),
+                    (sac, error_topics(3000), ScVal::Void),
+                ],
+                "Error(Contract, #3000) [OZ:ContextRuleNotFound]",
+            ),
+        ];
+        for (sequence, expected) in cases {
+            let shown = reason(RPC30_ERROR, &encode(&sequence), &origins);
+            assert_eq!(shown, expected);
+            assert_eq!(
+                shown,
+                SimulationErrorClass::of(&old_text(HOST, &sequence)).to_string()
+            );
+        }
+    }
+
+    /// Account `account` catches two policy refusals, logs `logged`, and
+    /// fails with a host error.
+    fn caught_steps(account: &str, logged: u32) -> Vec<Event> {
+        let a = Some(id(account));
+        let p = Some(id(POLICY));
+        let try_failed = || vec_of(vec![string("contract try_call failed"), sym("enforce")]);
+        vec![
+            (p, error_topics(3221), ScVal::Void),
+            (a, error_topics(3221), try_failed()),
+            (p, error_topics(3223), ScVal::Void),
+            (a, error_topics(3223), try_failed()),
+            (
+                a,
+                vec![sym("log")],
+                vec_of(vec![string("caught"), code(logged)]),
+            ),
+            (
+                a,
+                vec![
+                    sym("error"),
+                    ScVal::Error(ScError::Context(ScErrorCode::UnexpectedType)),
+                ],
+                ScVal::Void,
+            ),
+        ]
+    }
+
+    /// The SAC's authentication error for `account`, whose own error is
+    /// `nested`.
+    fn auth_wrapper(emitter: &str, account: &str, nested: ScVal) -> Event {
+        (
+            Some(id(emitter)),
+            vec![
+                sym("error"),
+                ScVal::Error(ScError::Auth(ScErrorCode::InvalidAction)),
+            ],
+            vec_of(vec![
+                string("failed account authentication with error"),
+                ScVal::Address(address(account)),
+                nested,
+            ]),
+        )
+    }
+
+    /// A smart account that catches errors and logs one is named as its old
+    /// form names it.
+    #[test]
+    fn caught_error_sequence_matches_the_old_form() {
+        let origins = [contract(SAC), contract(SMART_ACCOUNT)];
+        for logged in [3221, 3223] {
+            let mut sequence = caught_steps(SMART_ACCOUNT, logged);
+            sequence.push(auth_wrapper(
+                SAC,
+                SMART_ACCOUNT,
+                ScVal::Error(ScError::Context(ScErrorCode::UnexpectedType)),
+            ));
+            let shown = reason(RPC30_ERROR, &encode(&sequence), &origins);
+            assert_eq!(
+                shown,
+                SimulationErrorClass::Contract {
+                    code: logged,
+                    name: oz_error_name(logged)
+                }
+                .to_string()
+            );
+            assert_eq!(
+                shown,
+                SimulationErrorClass::of(&old_text(HOST, &sequence)).to_string()
+            );
+        }
+    }
+
+    /// A nested smart account named by the auth entries is named as its old
+    /// form names it; one the entries do not name confirms nothing.
+    #[test]
+    fn nested_account_sequence_matches_the_old_form() {
+        let envelope = invoke_envelope(
+            &address(SAC),
+            vec![],
+            vec![
+                address_entry(address(SMART_ACCOUNT), &address(SAC), vec![]),
+                address_entry(address(NESTED), &address(SAC), vec![]),
+            ],
+        );
+        let named = simulation_origins(&envelope);
+        for logged in [3221, 3223] {
+            let mut sequence = caught_steps(NESTED, logged);
+            sequence.push(auth_wrapper(
+                SMART_ACCOUNT,
+                NESTED,
+                ScVal::Error(ScError::Context(ScErrorCode::UnexpectedType)),
+            ));
+            sequence.push(auth_wrapper(
+                SAC,
+                SMART_ACCOUNT,
+                ScVal::Error(ScError::Auth(ScErrorCode::InvalidAction)),
+            ));
+            let events = encode(&sequence);
+            let old = old_text(HOST, &sequence);
+            let shown = reason(RPC30_ERROR, &events, &named);
+            assert_eq!(shown, SimulationErrorClass::of(&old).to_string());
+            assert_eq!(
+                shown,
+                SimulationErrorClass::Contract {
+                    code: logged,
+                    name: oz_error_name(logged)
+                }
+                .to_string()
+            );
+            let unnamed = [contract(SAC), contract(SMART_ACCOUNT)];
+            assert_eq!(reason(RPC30_ERROR, &events, &unnamed), HOST);
+            assert_eq!(reason(&old, &events, &unnamed), HOST);
+        }
+    }
+
+    /// Event data orders the choice and never supplies the code.
+    #[test]
+    fn event_data_never_supplies_a_code() {
+        let origins = [contract(SAC), contract(SMART_ACCOUNT)];
+        assert_eq!(
+            reason(RPC30_ERROR, &[RPC30_EVENTS[2].to_owned()], &origins),
+            HOST
+        );
+        let auth_topic = encode(&[(
+            Some(id(SMART_ACCOUNT)),
+            vec![
+                sym("error"),
+                ScVal::Error(ScError::Auth(ScErrorCode::InvalidAction)),
+            ],
+            code(3221),
+        )]);
+        assert_eq!(reason(RPC30_ERROR, &auth_topic, &origins), HOST);
+        let newer_log = encode(&[
+            (Some(id(SMART_ACCOUNT)), error_topics(3221), ScVal::Void),
+            (Some(id(SMART_ACCOUNT)), vec![sym("log")], code(4004)),
+        ]);
+        assert_eq!(reason(RPC30_ERROR, &newer_log, &origins), HOST);
+    }
+
+    /// An early large event is read through the whole response.
+    #[test]
+    fn large_valid_event_is_selected() {
+        let mut events = encode(&[(
+            Some(id(SMART_ACCOUNT)),
+            error_topics(3221),
+            string(&"d".repeat(13_000)),
+        )]);
+        let log = encode(&[(Some(id(POLICY)), vec![sym("log")], ScVal::Void)]).remove(0);
+        events.extend(std::iter::repeat_n(log, 100));
+        assert_eq!(
+            reason(RPC30_ERROR, &events, &[contract(SMART_ACCOUNT)]),
+            ANNOTATED_3221
+        );
+    }
+
+    /// Origins are the invoked contract and the contract `Address`
+    /// credentials of the sent envelope.
+    #[test]
+    fn origins_come_from_the_sent_envelope() {
+        let sac = address(SAC);
+        let source_entry = SorobanAuthorizationEntry {
+            credentials: SorobanCredentials::SourceAccount,
+            root_invocation: SorobanAuthorizedInvocation {
+                function: SorobanAuthorizedFunction::ContractFn(invoke_args(&sac, vec![])),
+                sub_invocations: VecM::default(),
+            },
+        };
+        let envelope = invoke_envelope(
+            &sac,
+            vec![],
+            vec![
+                address_entry(address(SMART_ACCOUNT), &sac, vec![]),
+                address_entry(account(9), &sac, vec![]),
+                source_entry,
+            ],
+        );
+        assert_eq!(
+            simulation_origins(&envelope),
+            vec![contract(SAC), contract(SMART_ACCOUNT)]
+        );
+        let bump = tx_envelope(OperationBody::BumpSequence(stellar_xdr::BumpSequenceOp {
+            bump_to: stellar_xdr::SequenceNumber(2),
+        }));
+        assert!(simulation_origins(&bump).is_empty());
+    }
+
+    /// Duplicates occur once; other envelope types, arguments and
+    /// sub-invocations add no origin.
+    #[test]
+    fn origin_collection_deduplicates_and_ignores_other_envelopes() {
+        let sac = address(SAC);
+        let sub = SorobanAuthorizedInvocation {
+            function: SorobanAuthorizedFunction::ContractFn(invoke_args(&address(POLICY), vec![])),
+            sub_invocations: VecM::default(),
+        };
+        let envelope = invoke_envelope(
+            &sac,
+            vec![ScVal::Address(address(POLICY))],
+            vec![
+                address_entry(address(SMART_ACCOUNT), &sac, vec![sub]),
+                address_entry(address(SMART_ACCOUNT), &sac, vec![]),
+                address_entry(address(SAC), &sac, vec![]),
+            ],
+        );
+        assert_eq!(
+            simulation_origins(&envelope),
+            vec![contract(SAC), contract(SMART_ACCOUNT)]
+        );
+
+        let TransactionEnvelope::Tx(v1) = envelope.clone() else {
+            panic!("a Tx envelope");
+        };
+        let v0 = TransactionEnvelope::TxV0(stellar_xdr::TransactionV0Envelope {
+            tx: stellar_xdr::TransactionV0 {
+                source_account_ed25519: Uint256([7; 32]),
+                fee: 100,
+                seq_num: stellar_xdr::SequenceNumber(1),
+                time_bounds: None,
+                memo: stellar_xdr::Memo::None,
+                operations: v1.tx.operations.clone(),
+                ext: stellar_xdr::TransactionV0Ext::V0,
+            },
+            signatures: VecM::default(),
+        });
+        assert!(simulation_origins(&v0).is_empty());
+        let fee_bump = TransactionEnvelope::TxFeeBump(stellar_xdr::FeeBumpTransactionEnvelope {
+            tx: stellar_xdr::FeeBumpTransaction {
+                fee_source: MuxedAccount::Ed25519(Uint256([7; 32])),
+                fee: 200,
+                inner_tx: stellar_xdr::FeeBumpTransactionInnerTx::Tx(v1),
+                ext: stellar_xdr::FeeBumpTransactionExt::V0,
+            },
+            signatures: VecM::default(),
+        });
+        assert!(simulation_origins(&fee_bump).is_empty());
+    }
+
+    /// Omitted and null events deserialize to none and keep the host error.
+    #[test]
+    fn missing_and_null_events_keep_the_host_error() {
+        for result in [
+            serde_json::json!({ "latestLedger": 5_711_022, "error": RPC30_ERROR }),
+            serde_json::json!({ "latestLedger": 5_711_022, "error": RPC30_ERROR, "events": null }),
+        ] {
+            let response: stellar_rpc_client::SimulateTransactionResponse =
+                serde_json::from_value(result).unwrap();
+            assert!(response.events.is_empty());
+            assert_eq!(
+                reason(
+                    response.error.as_deref().unwrap(),
+                    &response.events,
+                    &[contract(SAC), contract(SMART_ACCOUNT)]
+                ),
+                HOST
+            );
+        }
+    }
+
+    /// Upload and create envelopes name no origin, so an old-form log code
+    /// is never shown, with or without events.
+    #[test]
+    fn deployment_refusal_has_no_event_origin() {
+        let upload = tx_envelope(OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+            host_function: HostFunction::UploadContractWasm(BytesM::default()),
+            auth: VecM::default(),
+        }));
+        let create = tx_envelope(OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+            host_function: HostFunction::CreateContractV2(stellar_xdr::CreateContractArgsV2 {
+                contract_id_preimage: stellar_xdr::ContractIdPreimage::Address(
+                    stellar_xdr::ContractIdPreimageFromAddress {
+                        address: account(9),
+                        salt: Uint256([1; 32]),
+                    },
+                ),
+                executable: stellar_xdr::ContractExecutable::Wasm(Hash([2; 32])),
+                constructor_args: VecM::default(),
+            }),
+            auth: VecM::default(),
+        }));
+        for envelope in [&upload, &create] {
+            assert!(simulation_origins(envelope).is_empty());
+            assert_eq!(
+                refusal_text(RPC30_OLD_TEXT, &rpc30_events(), envelope),
+                HOST
+            );
+            assert_eq!(refusal_text(RPC30_OLD_TEXT, &[], envelope), HOST);
+        }
+    }
+
+    /// Answers `getLedgerEntries` with the account `source` and every
+    /// `simulateTransaction` with `simulate`.
+    pub(crate) struct ReadOnlyResponder {
+        /// The source account the ledger read reports.
+        pub(crate) source: String,
+        /// The `simulateTransaction` result.
+        pub(crate) simulate: serde_json::Value,
+    }
+
+    impl wiremock::Respond for ReadOnlyResponder {
+        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let result = match body["method"].as_str() {
+                Some("getLedgerEntries") => {
+                    stellar_agent_test_support::signed_envelope::ledger_entries_result_for(&[self
+                        .source
+                        .as_str()])
+                }
+                Some("simulateTransaction") => self.simulate.clone(),
+                other => panic!("unexpected method {other:?}"),
+            };
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": body["id"],
+                "result": result,
+            }))
+        }
+    }
+
+    /// A rule manager reading from `rpc_url`.
+    fn manager_at(rpc_url: String) -> ContextRuleManager {
+        ContextRuleManager::new(ContextRuleManagerConfig {
+            intent_admission: None,
+            primary_rpc_url: rpc_url,
+            secondary_rpc_url: None,
+            network_passphrase: "Test SDF Network ; September 2015".to_owned(),
+            timeout: Duration::from_secs(30),
+            chain_id: "stellar:testnet".to_owned(),
+            signers_manager: None,
+            audit_writer: None,
+            session_rule_max_horizon_ledgers: None,
+        })
+        .unwrap()
+    }
+
+    /// A mock endpoint answering every simulation with `simulate`.
+    pub(crate) async fn read_only_server(
+        source: &str,
+        simulate: serde_json::Value,
+    ) -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(ReadOnlyResponder {
+                source: source.to_owned(),
+                simulate,
+            })
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// Read-only refusals show the event code while every decision reads
+    /// the text error.
+    #[tokio::test]
+    async fn read_only_reason_ignores_events() {
+        let source = stellar_strkey::ed25519::PublicKey([7; 32]).to_string();
+        let events = vec![error_event(SMART_ACCOUNT, 3000)];
+        let server = read_only_server(&source, refusal_result(RPC30_ERROR, &events)).await;
+        let result = manager_at(server.uri())
+            .get_rule(address(SMART_ACCOUNT), 7, &source)
+            .await;
+        match result {
+            Err(SaError::DeploymentFailed {
+                phase: "simulate",
+                redacted_reason,
+            }) => assert_eq!(
+                redacted_reason,
+                "get_context_rule simulation error: Error(Contract, #3000) \
+                 [OZ:ContextRuleNotFound]"
+            ),
+            other => panic!("expected the simulate refusal, got {other:?}"),
+        }
+
+        let mut sequence: Vec<Event> = caught_steps(SMART_ACCOUNT, 3221);
+        sequence.truncate(5);
+        let server = read_only_server(
+            &source,
+            refusal_result(
+                "HostError: Error(Context, UnexpectedType)",
+                &encode(&sequence),
+            ),
+        )
+        .await;
+        let count = manager_at(server.uri())
+            .get_rules_count(address(SMART_ACCOUNT), &source)
+            .await;
+        match count {
+            Err(SaError::DeploymentFailed {
+                phase: "simulate",
+                redacted_reason,
+            }) => assert_eq!(
+                redacted_reason,
+                format!("get_context_rules_count simulation error: {ANNOTATED_3221}")
+            ),
+            other => panic!("expected the simulate refusal, got {other:?}"),
+        }
+
+        let direct = old_text(
+            "Error(Contract, #3000)",
+            &[(Some(id(SMART_ACCOUNT)), error_topics(3000), ScVal::Void)],
+        );
+        let server = read_only_server(&source, refusal_result(&direct, &[])).await;
+        let missing = manager_at(server.uri())
+            .get_rule(address(SMART_ACCOUNT), 7, &source)
+            .await;
+        assert!(matches!(missing, Ok(None)), "{missing:?}");
     }
 }
