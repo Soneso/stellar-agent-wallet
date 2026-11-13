@@ -253,6 +253,27 @@ async fn invalid_recipient_rejected() {
     );
 }
 
+#[tokio::test]
+async fn muxed_contract_recipient_refuses_before_gate() {
+    let mut req = requirements_with("exact", X402_STELLAR_TESTNET, AMOUNT, true.into());
+    req.pay_to = stellar_strkey::MuxedContract {
+        contract_id: [3; 32],
+        id: 7,
+    }
+    .to_string()
+    .as_str()
+    .to_owned();
+    let called = AtomicBool::new(false);
+    let result = pay(&req, UNUSED_RPC_URL, TESTNET_PASSPHRASE, &called).await;
+    assert_gate_never_ran(&called);
+    let error = result.unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "invalid recipient address: pay_to must be a G-, C-, or M-strkey"
+    );
+    assert!(matches!(error, X402Error::InvalidRecipientAddress { .. }));
+}
+
 /// `maxTimeoutSeconds` of zero is rejected with `InvalidPaymentRequired`.
 #[tokio::test]
 async fn zero_max_timeout_rejected() {

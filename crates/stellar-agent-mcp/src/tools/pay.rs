@@ -2219,6 +2219,70 @@ mod tests {
     use super::*;
     use stellar_xdr::{Hash, StringM};
 
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[allow(clippy::expect_used, reason = "fixed test arguments")]
+    async fn muxed_contract_pay_stages_refuse_before_state() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        stellar_agent_test_support::keyring_mock::install().expect("keyring");
+        let server = WalletServer::new(
+            stellar_agent_core::profile::schema::Profile::builder_testnet(
+                "svc",
+                "acct",
+                "nonce-svc",
+                "nonce-acct",
+            )
+            .with_noop_engine()
+            .rpc_url(format!("http://{}:9", std::net::Ipv4Addr::LOCALHOST))
+            .build(),
+        )
+        .expect("server");
+        let source = stellar_strkey::ed25519::PublicKey([1; 32]).to_string();
+        let mut builder = stellar_agent_network::builder::ClassicOpBuilder::new(
+            source.as_str(),
+            1,
+            "Test SDF Network ; September 2015",
+            100,
+        );
+        builder
+            .payment(
+                source.as_str(),
+                stellar_agent_core::StellarAmount::from_stroops(1),
+                &stellar_agent_network::builder::Asset::Native,
+            )
+            .expect("operation");
+        let envelope = builder.build().expect("envelope");
+        let args = serde_json::json!({
+            "chain_id": "stellar:testnet",
+            "source": stellar_strkey::ed25519::PublicKey([1; 32]).to_string().as_str(),
+            "destination": stellar_agent_test_support::xdr_fixtures::muxed_contract_address().to_string(),
+            "asset": "native", "amount": "1 XLM",
+            "nonce": "nonce", "expires_at_unix_ms": 1, "envelope_xdr": envelope
+        });
+        let before = std::fs::read_dir(home.path()).expect("state").count();
+        for result in [
+            server
+                .call_stellar_pay(serde_json::from_value(args.clone()).expect("prepare"))
+                .await,
+            server
+                .call_stellar_pay_commit(serde_json::from_value(args).expect("commit"))
+                .await,
+        ] {
+            let error = result.expect_err("W refused");
+            assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+            assert!(
+                error
+                    .message
+                    .starts_with("invalid destination (expected G-strkey):")
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(home.path()).expect("state").count(),
+            before
+        );
+    }
+
     #[test]
     fn memo_text_valid_utf8_round_trips() -> Result<(), stellar_xdr::Error> {
         let memo = Memo::Text(StringM::<28>::try_from("hello stellar")?);

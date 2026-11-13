@@ -692,6 +692,11 @@ async fn run_sign_only<InitKeyring>(
 where
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
+    if let Err(e) =
+        stellar_agent_network::signing::envelope_signing::check_envelope_address_forms(unsigned_xdr)
+    {
+        return ClaimOutcome::failed(Envelope::<()>::err(&e));
+    }
     if let Err(envelope) = init_keyring_for_origin(resolved, origin, init_keyring) {
         return ClaimOutcome::failed(envelope);
     }
@@ -758,6 +763,11 @@ async fn run_submit_only<InitKeyring>(
 where
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
+    if let Err(e) =
+        stellar_agent_network::signing::envelope_signing::check_envelope_address_forms(signed_xdr)
+    {
+        return ClaimOutcome::failed(Envelope::<()>::err(&e));
+    }
     if let Err(envelope) = init_keyring_for_origin(resolved, origin, init_keyring) {
         return ClaimOutcome::failed(envelope);
     }
@@ -2366,6 +2376,61 @@ pub(crate) mod tests {
             timeout_seconds: None,
             rpc_url: Some(crate::common::network::TESTNET_RPC_URL.to_owned()),
             business_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn muxed_contract_staged_claim_refuses_before_keyring() {
+        let args = minimal_args();
+        let context = NetworkContext::new(
+            TargetNetwork::Testnet.caip2(),
+            crate::common::network::TESTNET_RPC_URL.to_owned(),
+        );
+        let resolved = ResolvedProfileName::from_flag("operator");
+        let profile = staged_test_profile();
+        let encoded = stellar_agent_test_support::xdr_fixtures::muxed_contract_envelope();
+        let accesses = std::cell::Cell::new(0);
+        let init = || {
+            accesses.set(accesses.get() + 1);
+            Err(WalletError::Protocol(
+                stellar_agent_core::error::ProtocolError::XdrCodecFailed {
+                    detail: "keyring reached".into(),
+                },
+            ))
+        };
+        for outcome in [
+            run_sign_only(
+                &context,
+                &args,
+                &resolved,
+                &encoded,
+                &profile,
+                ProfileOrigin::Persisted,
+                init,
+            )
+            .await,
+            run_submit_only(
+                &context,
+                &args,
+                &resolved,
+                &encoded,
+                &profile,
+                ProfileOrigin::Persisted,
+                init,
+            )
+            .await,
+        ] {
+            assert_eq!(accesses.get(), 0);
+            let ClaimEnd::Stage(Err(envelope)) = outcome.result else {
+                panic!("refusal");
+            };
+            let error = envelope.error.unwrap();
+            assert_eq!(error.code, "protocol.xdr_codec_failed");
+            assert!(
+                error
+                    .message
+                    .ends_with("a muxed contract address (W) is not accepted on this path")
+            );
         }
     }
 

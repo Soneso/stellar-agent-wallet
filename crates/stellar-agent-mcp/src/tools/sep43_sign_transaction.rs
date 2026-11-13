@@ -127,6 +127,12 @@ impl WalletServer {
             return Ok(crate::tools::common::mainnet_signing_forbidden_result());
         }
 
+        if let Err(result) =
+            crate::tools::common::check_sep43_envelope_address_forms(&args.transaction_xdr)
+        {
+            return Ok(result);
+        }
+
         let args_value = json!({
             "chain_id": &args.chain_id,
             "transaction_xdr_len": args.transaction_xdr.len(),
@@ -361,6 +367,46 @@ mod tests {
         ) -> Result<Decision, PolicyError> {
             Ok(Decision::Deny(DenyReason::NoMatchingRule))
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn muxed_contract_intake_refuses_before_state() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let home = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let reads = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&reads);
+        stellar_agent_test_support::keyring_mock::install_with_read_hooks(vec![
+            stellar_agent_test_support::keyring_mock::ReadHook::new(
+                "svc",
+                "acct",
+                Arc::new(move || {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }),
+            ),
+        ])
+        .unwrap();
+        let server = make_require_approval_server();
+        let before = std::fs::read_dir(home.path()).unwrap().count();
+        let result = server
+            .call_stellar_sep43_sign_transaction(Sep43SignTransactionArgs {
+                chain_id: "stellar:testnet".to_owned(),
+                transaction_xdr: stellar_agent_test_support::xdr_fixtures::muxed_contract_envelope(
+                ),
+                address: None,
+                network_passphrase: None,
+            })
+            .await
+            .unwrap();
+        let (code, message, _) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "sep43.invalid_xdr");
+        assert!(message.ends_with("a muxed contract address (W) is not accepted on this path"));
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), before);
     }
 
     fn make_require_approval_server() -> crate::server::WalletServer {

@@ -712,6 +712,8 @@ async fn submit_unauthorized(
         })
     })?;
 
+    crate::signing::envelope_signing::refuse_muxed_contract(&envelope)?;
+
     // A legacy V0 envelope has no SEP-23 tagged-transaction form, so neither
     // the signing path nor binding verification can construct a payload for
     // it. Refused here so it costs no round trip.
@@ -996,6 +998,7 @@ pub(crate) async fn authorized_submission(
             ),
         })
     })?;
+    crate::signing::envelope_signing::refuse_muxed_contract(&envelope)?;
     // No send attempt starts within the send margin of the envelope's
     // deadline. A deadline the margin already reaches refuses here, before
     // anything is read, recorded or consumed.
@@ -2502,6 +2505,57 @@ mod tests {
             );
             assert!(!format!("{error:?}").contains("Invalid symbol"));
         }
+    }
+
+    #[tokio::test]
+    async fn muxed_contract_submit_refuses_before_network() {
+        let endpoint = format!("http://{}:9", std::net::Ipv4Addr::LOCALHOST);
+        let client = StellarRpcClient::new(&endpoint).unwrap();
+        let encoded = stellar_agent_test_support::xdr_fixtures::muxed_contract_envelope();
+        let error = submit_transaction_and_wait(
+            &client,
+            &encoded,
+            Duration::from_secs(1),
+            "Test SDF Network ; September 2015",
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), "protocol.xdr_codec_failed");
+        assert!(
+            error
+                .to_string()
+                .ends_with("a muxed contract address (W) is not accepted on this path")
+        );
+    }
+
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn muxed_contract_authorized_submit_refuses_without_recording() {
+        use crate::mainnet::{MainnetConsumer, test_support::AuthorizedSubmissionFixture};
+        let f = AuthorizedSubmissionFixture::new("muxed", 1_800_000_000_000);
+        let endpoint = format!("http://{}:9", std::net::Ipv4Addr::LOCALHOST);
+        let client = StellarRpcClient::new(&endpoint).unwrap();
+        let (id, grant) = f.grant(&f.envelope(1, 1_800_000_120), &client, None, "nonce");
+        let before = std::fs::read(f.window_store_path()).unwrap();
+        let recorder = f.recorder(None, f.writer());
+        let result = submit_authorized_transaction_and_wait(
+            &client,
+            None,
+            &stellar_agent_test_support::xdr_fixtures::muxed_contract_envelope(),
+            Duration::from_secs(1),
+            "Public Global Stellar Network ; September 2015",
+            None,
+            &recorder,
+            MainnetConsumer::CliPay,
+            grant,
+        )
+        .await;
+        assert_eq!(result.unwrap_err().code(), "protocol.xdr_codec_failed");
+        assert!(f.is_open(id));
+        assert_eq!(std::fs::read(f.window_store_path()).unwrap(), before);
     }
 
     /// The send step's failure message, in the form the RPC client renders a

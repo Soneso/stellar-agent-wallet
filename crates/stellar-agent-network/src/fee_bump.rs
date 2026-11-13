@@ -531,6 +531,11 @@ pub(crate) fn decode_inner_v1(
         ),
     })?;
 
+    if stellar_agent_core::sc_address::envelope_has_muxed_contract(&envelope) {
+        return Err(FeeBumpError::InnerDecodeFailed {
+            detail: stellar_agent_core::sc_address::MUXED_CONTRACT_REFUSAL.to_owned(),
+        });
+    }
     match envelope {
         TransactionEnvelope::Tx(v1) => Ok(v1),
         TransactionEnvelope::TxV0(_) => Err(FeeBumpError::InnerNotV1 {
@@ -699,6 +704,26 @@ mod tests {
     // ── Test constants ────────────────────────────────────────────────────────
 
     const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
+
+    #[tokio::test]
+    async fn muxed_contract_fee_bump_refuses_before_signature() {
+        let signer = crate::signing::test_doubles::CountingSigner::new([5; 32]);
+        let key = ed25519_dalek::SigningKey::from_bytes(&[5; 32]);
+        let fee_source =
+            stellar_strkey::ed25519::PublicKey(key.verifying_key().to_bytes()).to_string();
+        let encoded = stellar_agent_test_support::xdr_fixtures::muxed_contract_envelope();
+        let result = build_and_sign_fee_bump(
+            &encoded,
+            fee_source.as_str(),
+            200,
+            1000,
+            TESTNET_PASSPHRASE,
+            &signer,
+        )
+        .await;
+        assert_eq!(signer.sign_calls(), 0);
+        assert_eq!(result.unwrap_err().code(), "feebump.inner_decode_failed");
+    }
 
     // Seed [1u8;32] → G-strkey GCFIRY65OQE7DFP5KLNS2PF2LVZMUZYJX4OZIEQ36N2IQANUB5XVYOJR
     // (verified via SoftwareSigningKey::new_from_bytes([1u8;32]).public_key())

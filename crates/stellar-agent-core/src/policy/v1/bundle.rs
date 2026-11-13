@@ -218,7 +218,10 @@ pub fn decompose_bundle_calls(
                 && let [ScVal::Address(from), ScVal::Address(to), ScVal::I128(parts)] =
                     call.args.as_slice()
                 && from == wallet
-                && let (Ok(from), Ok(to)) = (scaddress_to_strkey(from), scaddress_to_strkey(to))
+                && let (Ok(from), Ok(to)) = (
+                    scaddress_to_strkey(from),
+                    crate::sc_address::scaddress_destination_strkey(to),
+                )
             {
                 let amount = (i128::from(parts.hi) << 64) | i128::from(parts.lo);
                 if amount >= 0 {
@@ -295,6 +298,27 @@ mod tests {
             assert_eq!(recipient, &scaddress_to_strkey(&to).unwrap());
             assert_eq!(*amount, 30);
         }
+    }
+
+    #[test]
+    fn muxed_destination_transfer_is_valued_in_full() {
+        let wallet = account();
+        let m = ScAddress::MuxedAccount(stellar_xdr::MuxedEd25519Account {
+            id: 7,
+            ed25519: stellar_xdr::Uint256([1; 32]),
+        });
+        let calls = [
+            transfer(wallet.clone(), m.clone()),
+            transfer(
+                wallet.clone(),
+                ScAddress::LiquidityPool(stellar_xdr::PoolId(stellar_xdr::Hash([2; 32]))),
+            ),
+        ];
+        let descriptors = decompose_bundle_calls(&calls, &wallet);
+        assert!(
+            matches!(&descriptors[0], InnerOpDescriptor::TokenTransfer { to, .. } if to == &m.to_string())
+        );
+        assert!(matches!(&descriptors[1], InnerOpDescriptor::Generic { .. }));
     }
 
     #[test]

@@ -356,10 +356,9 @@ pub enum MemoKind {
 /// The memo kind of a single-payment envelope and the form of its
 /// destination.
 ///
-/// [`decode_authoritative_args`] reports an id memo as `memo: null` and
-/// resolves a muxed destination to its G account, so neither the absence of a
-/// memo nor a muxed destination can be read from its output; this shape keeps
-/// both.
+/// [`decode_authoritative_args`] reports an id memo as `memo: null`, so the
+/// absence of a memo cannot be read from its output. This shape keeps the
+/// memo kind and whether the destination is muxed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PaymentMemoShape {
@@ -705,7 +704,7 @@ fn decode_pay_args(
             asset,
             amount,
         } => {
-            let dest_strkey = muxed_account_to_strkey(dest);
+            let dest_strkey = muxed_account_to_display_strkey(dest);
             let asset_str = xdr_asset_to_string(asset)?;
             serde_json::json!({
                 "source": source_strkey,
@@ -723,7 +722,7 @@ fn decode_pay_args(
             dest_asset,
             dest_amount,
         } => {
-            let dest_strkey = muxed_account_to_strkey(dest);
+            let dest_strkey = muxed_account_to_display_strkey(dest);
             let send_asset_str = xdr_asset_to_string(send_asset)?;
             let dest_asset_str = xdr_asset_to_string(dest_asset)?;
             serde_json::json!({

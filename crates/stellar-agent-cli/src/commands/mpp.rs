@@ -1151,6 +1151,80 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn muxed_contract_challenge_refuses_before_state() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        stellar_agent_test_support::keyring_mock::install().expect("keyring");
+        let input = stellar_agent_mpp::ChallengeInput::Mcp {
+            challenges: vec![serde_json::json!({
+                "id": "challenge", "realm": "merchant", "method": "stellar", "intent": "charge",
+                "expires": stellar_agent_core::timefmt::format_rfc3339_utc(
+                    std::time::SystemTime::now() + std::time::Duration::from_secs(300)),
+                "request": {
+                    "amount": "10", "currency": stellar_strkey::Contract([8; 32]).to_string().as_str(),
+                    "recipient": stellar_agent_test_support::xdr_fixtures::muxed_contract_address().to_string(),
+                    "methodDetails": {"network": "stellar:testnet", "feePayer": true}
+                }
+            })],
+            selected_challenge_id: None,
+            context: stellar_agent_mpp::McpRequestContext::from_params(
+                "merchant",
+                stellar_agent_mpp::McpOperationKind::Tool,
+                "charge",
+                None,
+            )
+            .expect("context"),
+        };
+        let mut ordinary = input.clone();
+        if let stellar_agent_mpp::ChallengeInput::Mcp { challenges, .. } = &mut ordinary {
+            challenges[0]["request"]["recipient"] = serde_json::json!(
+                stellar_strkey::ed25519::PublicKey([1; 32])
+                    .to_string()
+                    .as_str()
+            );
+        }
+        let now = i64::try_from(stellar_agent_core::timefmt::now_unix_ms().expect("clock") / 1000)
+            .expect("time");
+        stellar_agent_mpp::select_and_validate(&ordinary, now).expect("valid ordinary challenge");
+        let path = home.path().join("challenge.json");
+        fs::write(&path, serde_json::to_vec(&input).expect("input")).expect("write");
+        let args = MppAuthorizeArgs {
+            profile: None,
+            input_stdin: false,
+            input_file: Some(path),
+            approval_id: None,
+        };
+        let payer = stellar_strkey::ed25519::PublicKey([1; 32]).to_string();
+        let profile =
+            Profile::builder_testnet("svc", payer.as_str(), "nonce-svc", "nonce-acct").build();
+        let context = NetworkContext::new(
+            "stellar:testnet".parse().expect("chain"),
+            crate::common::network::TESTNET_RPC_URL.to_owned(),
+        );
+        RENDERED.with(|rows| rows.borrow_mut().clear());
+        let now = stellar_agent_core::timefmt::now_unix_ms().expect("clock") / 1000;
+        assert_eq!(
+            prepare_and_authorize_without_state(
+                &context,
+                &args,
+                "operator",
+                profile,
+                i64::try_from(now).expect("time")
+            )
+            .await,
+            1
+        );
+        RENDERED.with(|rows| {
+            assert_eq!(
+                rows.borrow().last().expect("row")["error"]["code"],
+                "mpp.challenge_invalid"
+            )
+        });
+        assert_eq!(std::fs::read_dir(home.path()).expect("state").count(), 1);
+    }
+
     thread_local! {
         pub(super) static RENDERED: std::cell::RefCell<Vec<serde_json::Value>> =
             const { std::cell::RefCell::new(Vec::new()) };

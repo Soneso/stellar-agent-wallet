@@ -163,6 +163,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn muxed_contract_dispatch_refuses_before_signature() {
+        let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new([5; 32]);
+        let result = dispatch(
+            &testnet_profile(),
+            &signer,
+            &stellar_agent_test_support::xdr_fixtures::muxed_contract_preimage(),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(signer.sign_calls(), 0);
+        let error = result.unwrap_err();
+        assert_eq!(error.wire_code(), "sep43.invalid_xdr");
+        assert!(
+            error
+                .to_string()
+                .ends_with("a muxed contract address (W) is not accepted on this path")
+        );
+    }
+
+    #[tokio::test]
     async fn dispatch_invalid_xdr_returns_error() {
         let profile = testnet_profile();
         let key = SoftwareSigningKey::new_from_bytes([1u8; 32]);

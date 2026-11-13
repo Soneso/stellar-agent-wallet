@@ -12,7 +12,7 @@ ignore = [
     # There is no fixed release and no way to drop them without abandoning the
     # on-chain ABI types the smart-account encoding is verified against.
     "RUSTSEC-2024-0436", # paste: unmaintained
-    # Dependency path: stellar-baselib 0.6.0 -> libsodium-sys-stable 1.24.0 ->
+    # Dependency path: stellar-baselib 0.7.1 -> libsodium-sys-stable 1.24.0 ->
     # zip 8.6.0, as a build dependency. Every libsodium-sys-stable release
     # through 1.24.3 requires zip ^8.6, while the fix for these advisories is in
     # zip 9. zip runs only in the libsodium-sys-stable build script on Windows

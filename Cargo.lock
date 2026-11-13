@@ -1941,15 +1941,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "home"
-version = "0.5.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc627f471c528ff0c4a49e1d5e60450c8f6461dd6d10ba9dcd3a61d3dff7728d"
-dependencies = [
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "http"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4421,13 +4412,12 @@ dependencies = [
 
 [[package]]
 name = "soroban-spec"
-version = "28.0.0"
+version = "30.0.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f48c8e183fc140ccd89e1fe1663cc605fb18641967c0bb591f64887599fde59"
+checksum = "7b301fc1006c34f9d713960c5fd9d74490824ef3aa4b8eca27e780509e8324c5"
 dependencies = [
  "base64 0.22.1",
- "sha2 0.10.9",
- "stellar-xdr 28.0.0",
+ "stellar-xdr 30.0.0",
  "thiserror 1.0.69",
  "wasmparser 0.116.1",
 ]
@@ -4450,9 +4440,9 @@ dependencies = [
 
 [[package]]
 name = "soroban-spec-tools"
-version = "28.0.0"
+version = "30.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bba48e39e7eab8eda92435231d40535eb9b8f73719f3e8fac522b39f366cdbc4"
+checksum = "5083fd4e05d3ac3fdc509511a74a4cc32a30c0db284348e1833ffc7447d40f64"
 dependencies = [
  "base64 0.21.7",
  "escape-bytes",
@@ -4462,9 +4452,9 @@ dependencies = [
  "itertools 0.10.5",
  "serde",
  "serde_json",
- "soroban-spec 28.0.0",
- "stellar-strkey 0.0.16",
- "stellar-xdr 28.0.0",
+ "soroban-spec 30.0.0-rc.1",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "thiserror 1.0.69",
  "wasm-encoder",
  "wasmparser 0.116.1",
@@ -4572,7 +4562,7 @@ dependencies = [
  "stellar-agent-test-support",
  "stellar-agent-toolsets-runtime",
  "stellar-agent-webauthn-bridge",
- "stellar-strkey 0.0.18",
+ "stellar-strkey 1.0.0",
  "subtle",
  "tempfile",
  "thiserror 2.0.21",
@@ -4607,7 +4597,7 @@ dependencies = [
  "stellar-agent-loopback-http",
  "stellar-agent-test-support",
  "stellar-agent-toolsets-runtime",
- "stellar-xdr 28.0.0",
+ "stellar-xdr 30.0.0",
  "subtle",
  "tempfile",
  "thiserror 2.0.21",
@@ -4629,8 +4619,8 @@ dependencies = [
  "stellar-agent-network",
  "stellar-agent-test-support",
  "stellar-agent-xdr-limits",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "thiserror 2.0.21",
  "tokio",
  "wiremock",
@@ -4681,8 +4671,8 @@ dependencies = [
  "stellar-agent-windows-identity",
  "stellar-agent-xdr-limits",
  "stellar-baselib",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "syn 2.0.118",
  "tar",
  "tempfile",
@@ -4724,11 +4714,12 @@ dependencies = [
  "serde_json",
  "serial_test",
  "sha2 0.11.0",
+ "stellar-agent-soroban-auth",
  "stellar-agent-test-support",
  "stellar-agent-windows-identity",
  "stellar-agent-xdr-limits",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "subtle",
  "tempfile",
  "thiserror 2.0.21",
@@ -4755,8 +4746,8 @@ dependencies = [
  "stellar-agent-test-support",
  "stellar-agent-xdr-limits",
  "stellar-rpc-client",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -4778,8 +4769,8 @@ dependencies = [
  "stellar-agent-smart-account",
  "stellar-agent-test-support",
  "stellar-agent-xdr-limits",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -4800,8 +4791,8 @@ dependencies = [
  "stellar-agent-smart-account",
  "stellar-agent-test-support",
  "stellar-rpc-client",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -4890,8 +4881,8 @@ dependencies = [
  "stellar-agent-x402-identity",
  "stellar-agent-xdr-limits",
  "stellar-baselib",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -4942,8 +4933,8 @@ dependencies = [
  "stellar-agent-xdr-limits",
  "stellar-baselib",
  "stellar-rpc-client",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "subtle",
  "tempfile",
  "thiserror 2.0.21",
@@ -4988,8 +4979,8 @@ dependencies = [
  "stellar-baselib",
  "stellar-ledger",
  "stellar-rpc-client",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "subtle",
  "syn 2.0.118",
  "tempfile",
@@ -5044,8 +5035,8 @@ dependencies = [
  "stellar-agent-network",
  "stellar-agent-sep5",
  "stellar-agent-test-support",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -5069,8 +5060,8 @@ dependencies = [
  "stellar-agent-core",
  "stellar-agent-network",
  "stellar-agent-xdr-limits",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "thiserror 2.0.21",
  "tokio",
  "wiremock",
@@ -5094,8 +5085,8 @@ dependencies = [
  "stellar-agent-soroban-auth",
  "stellar-agent-test-support",
  "stellar-agent-xdr-limits",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "thiserror 2.0.21",
  "tokio",
 ]
@@ -5114,8 +5105,8 @@ dependencies = [
  "sha2 0.11.0",
  "stellar-agent-core",
  "stellar-agent-xdr-limits",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "thiserror 2.0.21",
  "tokio",
  "wiremock",
@@ -5135,8 +5126,8 @@ dependencies = [
  "stellar-agent-network",
  "stellar-agent-test-support",
  "stellar-agent-xdr-limits",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -5154,7 +5145,7 @@ dependencies = [
  "hmac 0.13.0",
  "secrecy",
  "sha2 0.11.0",
- "stellar-strkey 0.0.18",
+ "stellar-strkey 1.0.0",
  "thiserror 2.0.21",
  "zeroize",
 ]
@@ -5168,7 +5159,7 @@ dependencies = [
  "stellar-agent-core",
  "stellar-agent-network",
  "stellar-agent-test-support",
- "stellar-strkey 0.0.18",
+ "stellar-strkey 1.0.0",
  "thiserror 2.0.21",
  "tokio",
 ]
@@ -5184,8 +5175,8 @@ dependencies = [
  "stellar-agent-network",
  "stellar-agent-test-support",
  "stellar-agent-xdr-limits",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -5221,8 +5212,8 @@ dependencies = [
  "stellar-baselib",
  "stellar-governance",
  "stellar-rpc-client",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -5263,8 +5254,8 @@ dependencies = [
  "stellar-agent-webauthn-bridge",
  "stellar-baselib",
  "stellar-rpc-client",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "tempfile",
  "tokio",
  "url",
@@ -5278,8 +5269,8 @@ version = "0.1.0-alpha.13"
 dependencies = [
  "serde_json",
  "sha2 0.11.0",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "thiserror 2.0.21",
 ]
 
@@ -5295,7 +5286,7 @@ dependencies = [
  "stellar-agent-core",
  "stellar-agent-network",
  "stellar-agent-test-support",
- "stellar-strkey 0.0.18",
+ "stellar-strkey 1.0.0",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -5320,10 +5311,11 @@ dependencies = [
  "serde_json",
  "serial_test",
  "sha2 0.11.0",
+ "stellar-agent-soroban-auth",
  "stellar-baselib",
  "stellar-rpc-client",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "tempfile",
  "tokio",
  "tracing",
@@ -5359,7 +5351,7 @@ dependencies = [
  "stellar-agent-core",
  "stellar-agent-test-support",
  "stellar-agent-toolsets",
- "stellar-strkey 0.0.18",
+ "stellar-strkey 1.0.0",
  "subtle",
  "tar",
  "tempfile",
@@ -5380,7 +5372,7 @@ dependencies = [
  "stellar-agent-test-support",
  "stellar-agent-toolsets",
  "stellar-agent-toolsets-install",
- "stellar-strkey 0.0.18",
+ "stellar-strkey 1.0.0",
  "tar",
  "tempfile",
  "thiserror 2.0.21",
@@ -5439,8 +5431,8 @@ dependencies = [
  "stellar-agent-test-support",
  "stellar-baselib",
  "stellar-rpc-client",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -5462,8 +5454,8 @@ dependencies = [
  "stellar-agent-core",
  "stellar-agent-network",
  "stellar-agent-sep10",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -5475,14 +5467,14 @@ dependencies = [
 name = "stellar-agent-xdr-limits"
 version = "0.1.0-alpha.13"
 dependencies = [
- "stellar-xdr 28.0.0",
+ "stellar-xdr 30.0.0",
 ]
 
 [[package]]
 name = "stellar-baselib"
-version = "0.6.0"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9b66c47ab1e51d5b504f5360a63ba97b220b871a89337ef3c76a555920e651a"
+checksum = "14640925d6c1f5dd8f3488976392fcb97fbb0d928cf976dffb1cf1f475d5dc7c"
 dependencies = [
  "getrandom 0.3.4",
  "hex",
@@ -5494,8 +5486,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "stellar-strkey 0.0.15",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
 ]
 
 [[package]]
@@ -5509,24 +5501,20 @@ dependencies = [
 
 [[package]]
 name = "stellar-ledger"
-version = "28.0.0"
+version = "30.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b378e7301e3a7854e0797fdc125e2285a04770e1ea1ca773dfcac93b0380e980"
+checksum = "70680e399d983e377cd98402f6bfd6bb1742fad5db6cace48220093925e2a845"
 dependencies = [
  "async-trait",
- "byteorder",
- "ed25519-dalek",
  "hex",
- "home",
  "ledger-transport",
  "ledger-transport-hid",
  "reqwest 0.12.28",
  "serde",
- "serde_derive",
  "serde_json",
  "sha2 0.10.9",
- "stellar-strkey 0.0.16",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -5534,9 +5522,9 @@ dependencies = [
 
 [[package]]
 name = "stellar-rpc-client"
-version = "28.0.0"
+version = "30.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "808ecdeac737f975c52e0fd21236a56c02921ead20858dd818b870d63a53edc5"
+checksum = "a97e2088ac568e83bbd7db82c70f225d712903a366c287a6cdfc5f78aa67ebe5"
 dependencies = [
  "clap",
  "hex",
@@ -5549,8 +5537,8 @@ dependencies = [
  "serde_json",
  "serde_with",
  "sha2 0.10.9",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "termcolor",
  "termcolor_output",
  "thiserror 1.0.69",
@@ -5569,16 +5557,6 @@ dependencies = [
 
 [[package]]
 name = "stellar-strkey"
-version = "0.0.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97e1a364048067bfcd24e6f1a93bba43eeb79c16b854596c841c3e8bab0bfa0c"
-dependencies = [
- "crate-git-revision 0.0.6",
- "data-encoding",
-]
-
-[[package]]
-name = "stellar-strkey"
 version = "0.0.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "084afcb0d458c3d5d5baa2d294b18f881e62cc258ef539d8fdf68be7dbe45520"
@@ -5590,9 +5568,9 @@ dependencies = [
 
 [[package]]
 name = "stellar-strkey"
-version = "0.0.18"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f34ff61c0ca6f1c2b4169e8d1633417bd9225f58b6175e4e317204565d16277"
+checksum = "5038ed2bf4e11842210d118f65791d8ca4747622daddd222338b3d06b6051bc1"
 dependencies = [
  "crate-git-revision 0.0.9",
  "data-encoding",
@@ -5620,9 +5598,9 @@ dependencies = [
 
 [[package]]
 name = "stellar-xdr"
-version = "28.0.0"
+version = "30.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f93d09ff8b9f919b084f664003c4c546ac66a76affd5429460dbe29f4b326f8e"
+checksum = "56f2fb2008b42fc746c0f6b46e375600068dd91f07748e9f1737c6341a2255f2"
 dependencies = [
  "base64 0.22.1",
  "cfg_eval",
@@ -5633,7 +5611,7 @@ dependencies = [
  "serde",
  "serde_with",
  "sha2 0.10.9",
- "stellar-strkey 0.0.13",
+ "stellar-strkey 1.0.0",
 ]
 
 [[package]]

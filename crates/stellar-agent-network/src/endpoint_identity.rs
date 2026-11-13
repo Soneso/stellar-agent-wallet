@@ -20,6 +20,9 @@ use stellar_agent_core::profile::caip2::Caip2;
 /// network.
 pub const SUPPORTED_PROTOCOL_VERSIONS: RangeInclusive<u32> = 29..=30;
 
+/// The first protocol version that admits CAP-84 muxed contract addresses.
+pub const MUXED_CONTRACT_MIN_PROTOCOL: u32 = 30;
+
 /// What an RPC endpoint reports about itself, after the wallet checks it.
 ///
 /// The endpoint's passphrase matches the one the caller expects, and its
@@ -155,6 +158,12 @@ impl EndpointIdentity {
     #[must_use]
     pub fn protocol_version(&self) -> u32 {
         self.protocol_version
+    }
+
+    /// Whether the endpoint's protocol admits CAP-84 muxed contract addresses.
+    #[must_use]
+    pub fn admits_muxed_contract(&self) -> bool {
+        self.protocol_version() >= MUXED_CONTRACT_MIN_PROTOCOL
     }
 
     /// The endpoint's scheme, host, and port, the form every RPC error
@@ -394,6 +403,14 @@ mod tests {
     use stellar_agent_test_support::WarningCapture;
 
     use super::*;
+
+    #[test]
+    fn muxed_contract_protocol_boundary() {
+        for (version, admitted) in [(29, false), (30, true), (31, true)] {
+            let identity = EndpointIdentity::checked(None, version, String::new(), 0);
+            assert_eq!(identity.admits_muxed_contract(), admitted, "{version}");
+        }
+    }
 
     /// The fact digest follows the documented layout, against a vector
     /// computed independently, and names the client.
