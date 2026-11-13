@@ -2,12 +2,12 @@
 //! the approval surfaces, and the halt and resume rows of `profile halt` and
 //! `profile resume`.
 
-use crate::commands::value_audit::{KeyedAcquireError, acquire_keyed_audit_writer};
+use crate::commands::value_audit::{KeyedAcquireError, is_binding_refusal};
 use std::sync::{Arc, Mutex};
 use stellar_agent_core::approval::{DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF};
 use stellar_agent_core::audit_log::{
-    AuditOutbox, BindingCheck, drain_lock_is_held,
-    writer::{AuditWriter, WriterError},
+    AuditOutbox, BindingCheck, KeyedAuditAccess, drain_lock_is_held,
+    writer::{AuditWriter, AuditWriterRegistry, WriterError},
 };
 use stellar_agent_core::{error::WalletError, profile::schema::Profile};
 
@@ -52,10 +52,41 @@ pub(crate) fn acquire_operator_row_sink(
     profile: &Profile,
     profile_name: &str,
 ) -> Result<OperatorRowSink, WalletError> {
+    let access = stellar_agent_network::keyring::keyed_audit_access(
+        profile,
+        profile_name,
+        BindingCheck::Enforce,
+    )
+    .map_err(|error| {
+        let refusal = if is_binding_refusal(&error) {
+            tracing::warn!(
+                profile = %profile_name,
+                code = %error.code(),
+                "value audit: audit binding differs; refusing"
+            );
+            KeyedAcquireError::BindingChanged(error)
+        } else {
+            tracing::warn!(
+                profile = %profile_name,
+                error = %error,
+                "value audit: cannot load audit chain key; refusing"
+            );
+            KeyedAcquireError::KeyUnavailable
+        };
+        refusal.into_wallet_error(profile_name)
+    })?;
+    let history = access.binding_history();
+    let (key, anchor) = access.into_parts();
     let mut attempt = 0_u32;
     let contention = loop {
         attempt += 1;
-        match acquire_keyed_audit_writer(profile, profile_name, BindingCheck::Enforce) {
+        match AuditWriterRegistry::get_or_open_keyed(
+            profile_name,
+            &profile.audit_log_path,
+            KeyedAuditAccess::new(key.clone(), Arc::clone(&anchor)).with_binding_history(history),
+        )
+        .map_err(KeyedAcquireError::Writer)
+        {
             Ok(writer) => return Ok(OperatorRowSink::Writer(writer)),
             Err(error) if is_sidecar_contention(&error) => {
                 if attempt >= DEFAULT_RETRY_ATTEMPTS {
@@ -73,12 +104,10 @@ pub(crate) fn acquire_operator_row_sink(
             &profile.audit_log_path,
         ),
     ) {
-        Ok(true) => Ok(OperatorRowSink::Outbox(AuditOutbox::for_log(
+        Ok(true) => Ok(OperatorRowSink::Outbox(AuditOutbox::for_log_keyed(
             &profile.audit_log_path,
-            stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
-                &profile.audit_log_hash_chain_key_id,
-                &profile.audit_log_path,
-            ),
+            anchor,
+            key,
         ))),
         Ok(false) => Err(contention.into_wallet_error(profile_name)),
         Err(error) => Err(KeyedAcquireError::Writer(error).into_wallet_error(profile_name)),
@@ -88,6 +117,58 @@ pub(crate) fn acquire_operator_row_sink(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    #[allow(clippy::unwrap_used, clippy::panic, reason = "test assertions")]
+    fn contended_sink_queues_a_tagged_row_with_the_loaded_key() {
+        use base64::Engine as _;
+        use stellar_agent_core::audit_log::AuditEntry;
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut profile = Profile::builder_testnet_named(
+            "queued-key",
+            "fixture",
+            "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY",
+            "nonce-fixture",
+            "nonce-account",
+        )
+        .with_noop_engine()
+        .build();
+        profile.audit_log_path = dir.path().join("audit.jsonl");
+        let coordinate = &profile.audit_log_hash_chain_key_id;
+        let credential =
+            keyring_core::Entry::new(&coordinate.service, &coordinate.account).unwrap();
+        credential
+            .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x42; 32]))
+            .unwrap();
+        let access = stellar_agent_network::keyring::keyed_audit_access(
+            &profile,
+            "queued-key",
+            BindingCheck::Enforce,
+        )
+        .unwrap();
+        let mut holder = AuditWriter::open(profile.audit_log_path.clone(), Some(access)).unwrap();
+        let sink = acquire_operator_row_sink(&profile, "queued-key").unwrap();
+        let OperatorRowSink::Outbox(outbox) = sink else {
+            panic!("the draining holder selects the outbox")
+        };
+        credential.delete_credential().unwrap();
+        assert!(stellar_agent_network::keyring::load_hmac_key_32(coordinate).is_err());
+        outbox
+            .append(&AuditEntry::new_profile_resumed("fixture", true, "queued"))
+            .unwrap();
+        let bytes = std::fs::read(outbox.path()).unwrap();
+        assert!(bytes.starts_with(b"{\"k\":\"row\",\"g\":0,\"s\":1,\"r\":0,"));
+        assert_eq!(
+            holder.drain_outbox().unwrap(),
+            1,
+            "the original key verifies the queued row"
+        );
+        let text = std::fs::read_to_string(&profile.audit_log_path).unwrap();
+        let entry: AuditEntry = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        assert_eq!(entry.request_id, "queued");
+    }
 
     /// The operator-row acquisition is classified by the typed writer error:
     /// only sidecar contention is retried and resolved through the drain lock.

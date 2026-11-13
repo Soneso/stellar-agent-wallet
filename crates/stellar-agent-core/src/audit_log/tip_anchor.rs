@@ -445,6 +445,35 @@ pub trait TipAnchorStore: std::any::Any + std::fmt::Debug + Send + Sync {
         state: &OutboxState,
     ) -> Result<(), TipAnchorStoreError>;
 
+    /// Loads the owner state of one carrier generation.
+    ///
+    /// The default reports no owner state.
+    ///
+    /// # Errors
+    /// Returns an error when the backend cannot read the value.
+    fn load_outbox_owner_state(
+        &self,
+        carrier_generation: u64,
+    ) -> Result<Option<String>, TipAnchorStoreError> {
+        let _ = carrier_generation;
+        Ok(None)
+    }
+
+    /// Stores the owner state of one carrier generation.
+    ///
+    /// # Errors
+    /// Returns an error when owner state is unsupported or the backend rejects the write.
+    fn store_outbox_owner_state(
+        &self,
+        carrier_generation: u64,
+        value: &str,
+    ) -> Result<(), TipAnchorStoreError> {
+        let _ = (carrier_generation, value);
+        Err(TipAnchorStoreError::new(
+            "outbox owner state is unsupported",
+        ))
+    }
+
     /// Reads the anchor. `Ok(None)` means no anchor has ever been written for
     /// this path — the adoption path.
     ///
@@ -865,6 +894,7 @@ pub struct InMemoryTipAnchorStore {
 #[derive(Debug, Default)]
 struct InMemoryAnchorState {
     outbox: std::collections::BTreeMap<u64, OutboxState>,
+    outbox_owner: std::collections::BTreeMap<u64, String>,
     carriers: Option<CarrierRecord>,
     outbox_fail_reads: bool,
     outbox_fail_writes: bool,
@@ -983,6 +1013,32 @@ impl InMemoryTipAnchorStore {
 
 #[cfg(any(test, feature = "test-helpers"))]
 impl TipAnchorStore for InMemoryTipAnchorStore {
+    fn load_outbox_owner_state(
+        &self,
+        carrier_generation: u64,
+    ) -> Result<Option<String>, TipAnchorStoreError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| TipAnchorStoreError::new("store mutex"))?;
+        Ok(state.outbox_owner.get(&carrier_generation).cloned())
+    }
+
+    fn store_outbox_owner_state(
+        &self,
+        carrier_generation: u64,
+        value: &str,
+    ) -> Result<(), TipAnchorStoreError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| TipAnchorStoreError::new("store mutex"))?;
+        state
+            .outbox_owner
+            .insert(carrier_generation, value.to_owned());
+        Ok(())
+    }
+
     fn load_carrier_record(&self) -> Result<Option<CarrierRecord>, TipAnchorStoreError> {
         let state = self
             .state
@@ -1100,6 +1156,91 @@ mod tests {
     use super::*;
 
     const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[derive(Debug, Default)]
+    struct LegacyStore(InMemoryTipAnchorStore);
+
+    impl TipAnchorStore for LegacyStore {
+        fn load_carrier_record(&self) -> Result<Option<CarrierRecord>, TipAnchorStoreError> {
+            self.0.load_carrier_record()
+        }
+        fn store_carrier_record(&self, value: &CarrierRecord) -> Result<(), TipAnchorStoreError> {
+            self.0.store_carrier_record(value)
+        }
+        fn load_outbox_state(
+            &self,
+            generation: u64,
+        ) -> Result<Option<OutboxState>, TipAnchorStoreError> {
+            self.0.load_outbox_state(generation)
+        }
+        fn store_outbox_state(
+            &self,
+            generation: u64,
+            value: &OutboxState,
+        ) -> Result<(), TipAnchorStoreError> {
+            self.0.store_outbox_state(generation, value)
+        }
+        fn load_anchor(&self) -> Result<Option<TipAnchor>, TipAnchorStoreError> {
+            self.0.load_anchor()
+        }
+        fn load_raw(&self) -> Result<Option<String>, TipAnchorStoreError> {
+            self.0.load_raw()
+        }
+        fn store_anchor(&self, value: &TipAnchor) -> Result<(), TipAnchorStoreError> {
+            self.0.store_anchor(value)
+        }
+        fn bump_reanchor_count(&self) -> Result<u64, TipAnchorStoreError> {
+            self.0.bump_reanchor_count()
+        }
+        fn reanchor_count(&self) -> Result<Option<u64>, TipAnchorStoreError> {
+            self.0.reanchor_count()
+        }
+    }
+
+    #[test]
+    fn default_owner_state_methods_keep_legacy_behavior() {
+        use crate::audit_log::{AuditEntry, AuditOutbox, AuditWriter};
+        let store = Arc::new(LegacyStore::default());
+        assert_eq!(store.load_outbox_owner_state(1).unwrap(), None);
+        assert_eq!(
+            store
+                .store_outbox_owner_state(1, "state")
+                .unwrap_err()
+                .detail,
+            "outbox owner state is unsupported"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut writer = AuditWriter::open_with_tip_anchor(
+            path.clone(),
+            None,
+            store.clone(),
+            BindingHistory::NotRecorded,
+        )
+        .unwrap();
+        AuditOutbox::for_log(&path, store.clone())
+            .append(&AuditEntry::new_profile_resumed("fixture", true, "queued"))
+            .unwrap();
+        assert_eq!(writer.drain_outbox().unwrap(), 1);
+        assert_eq!(writer.drain_outbox().unwrap(), 0);
+        assert_eq!(
+            store.load_outbox_state(1).unwrap(),
+            Some(OutboxState::default())
+        );
+        assert_eq!(store.load_outbox_owner_state(1).unwrap(), None);
+        store.0.store_outbox_owner_state(1, "first").unwrap();
+        store.0.store_outbox_owner_state(2, "second").unwrap();
+        store.0.store_outbox_owner_state(1, "replacement").unwrap();
+        assert_eq!(
+            store.0.load_outbox_owner_state(1).unwrap().as_deref(),
+            Some("replacement")
+        );
+        assert_eq!(
+            store.0.load_outbox_owner_state(2).unwrap().as_deref(),
+            Some("second")
+        );
+        assert_eq!(store.0.load_outbox_owner_state(3).unwrap(), None);
+    }
 
     #[test]
     fn round_trips_through_the_keyring_representation() {
