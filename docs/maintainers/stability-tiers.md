@@ -56,8 +56,8 @@ Facts that apply to every crate:
 | `stellar-agent-network` | 1 | RPC client, submit, retry, keyring stores | supports admitted beta operations through authorized signing and submission |
 | `stellar-agent-nonce` | 1 | replay protection for MCP tools | supports admitted beta operations through MCP replay protection |
 | `stellar-agent-smart-account` | 1 | C-account deploy, rules, signers, submit | excluded from beta for writes; read or local only |
-| `stellar-agent-cli` | 1 | the `stellar-agent` binary | supports admitted beta operations through the listed full-mode verbs |
-| `stellar-agent-mcp` | 1 | the `stellar-agent-mcp` binary | supports admitted beta operations through the listed tools |
+| `stellar-agent-cli` | 1 | the `stellar-agent` executable, also delivered as `stellar-agent-mcp` | supports admitted beta operations through the listed full-mode verbs |
+| `stellar-agent-mcp` | 1 | the MCP server library the executable runs | supports admitted beta operations through the listed tools |
 | `stellar-agent-x402` | 1 | x402 exact-payment scheme | supports admitted beta operations through authorized x402 payments |
 | `stellar-agent-mpp` | 1 | machine-payable-page charge lifecycle | excluded from beta |
 | `stellar-agent-x402-identity` | 2 | SEP-10 gate for authenticated x402 | supports admitted beta operations through authenticated x402 payments |

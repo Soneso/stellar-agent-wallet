@@ -293,6 +293,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- One executable, `stellar-agent`, carries the CLI and the MCP server. It runs
+  the server as `stellar-agent mcp serve` or under the file name
+  `stellar-agent-mcp`. Release archives hold both names as byte-equal copies,
+  signed once on macOS. `cargo install` and `cargo binstall` of
+  `stellar-agent-cli` install `stellar-agent`; copy it to `stellar-agent-mcp`
+  for clients that start that name. `bootstrap.sh` installs both names from
+  one `--cli` source; `--mcp` is optional and must hold the same bytes.
 - Multicall transfers to M retain the full destination and count toward payment
   limits. Policies that require recognized transfers or record spending admit
   them when the asset, counterparty and limits pass, or request approval.
@@ -1004,6 +1011,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- The `stellar-agent-mcp` executable target and its binstall metadata. The
+  `stellar-agent-mcp` crate is a library.
 - `SettledRow` and `ReceiptStatus::settled_row`.
 
 - `compute_context_rule_proposal_sha256`, `compute_rule_proposal_digest` and

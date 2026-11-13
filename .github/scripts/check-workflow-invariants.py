@@ -112,7 +112,17 @@ runs the function.
 - ``release-shared-scripts``: a build job of ``release.yml`` or
   ``release-rehearsal.yml`` does not call the shared Perl, sodium, and build
   scripts once each, or ``build.sh`` does not run the environment guard on
-  its own checkout as its first command.
+  its own checkout as its first command. The normalized logical lines of
+  ``build.sh`` differ from ``BUILD_BODY``, or those of the notarization
+  smoke's build step differ from ``SMOKE_BUILD``, or those of
+  ``copy-alias.sh`` differ from ``COPY_HELPER_BODY``: comments and blank lines
+  are dropped and each run of blanks collapses to one space.
+- ``signing-order``: ``sign-notarize.sh`` lacks the contiguous normalized
+  ``SIGN_BLOCK``, which signs and verifies ``stellar-agent``, derives the
+  alias from the signed file and packs both names; a codesign call other
+  than ``SIGN_LINE`` signs; or the script does not end with ``SIGN_FINAL``;
+  or the normalized logical lines of ``derive-alias.sh`` differ from
+  ``DERIVE_BODY``.
 - ``release-guard-order``: the build does not immediately follow the Perl
   and sodium setup steps, so a command could follow their environment writes
   unguarded.
@@ -270,6 +280,131 @@ BUILD_CALLS = ("./.github/scripts/release/windows-perl.ps1",
                'bash .github/scripts/release/build.sh "$TARGET"')
 BUILD_GUARD = ('python3 "$(dirname "${BASH_SOURCE[0]}")/../check-feature-discipline.py" '
                '--env-guard "$(dirname "${BASH_SOURCE[0]}")/../../.."')
+# The reviewed body of build.sh, read as normalized logical lines: comments
+# and blank lines dropped, each run of blanks collapsed. It builds only the
+# canonical executable, copies it to the alias name with copy_alias, and
+# compares the bytes.
+BUILD_BODY = (
+    "set -euo pipefail",
+    BUILD_GUARD,
+    'if [ "$#" -ne 1 ]; then',
+    'echo "usage: build.sh <target>" >&2',
+    "exit 2",
+    "fi",
+    "TARGET=$1",
+    'case "$TARGET" in',
+    "'' | -* | *[!A-Za-z0-9_.-]*)",
+    "echo \"build.sh: invalid target '$TARGET'\" >&2",
+    "exit 2",
+    ";;",
+    "esac",
+    'cd "$(dirname "${BASH_SOURCE[0]}")/../../.."',
+    'if [ "$TARGET" = "aarch64-unknown-linux-gnu" ]; then',
+    'cross build --release --locked --target "$TARGET" --bin stellar-agent',
+    "else",
+    'cargo build --release --locked --target "$TARGET" --bin stellar-agent',
+    "fi",
+    "suffix=",
+    'case "$TARGET" in',
+    "*-windows-*) suffix=.exe ;;",
+    "esac",
+    'release="target/$TARGET/release"',
+    ". .github/scripts/release/copy-alias.sh",
+    'copy_alias "$release/stellar-agent$suffix" "$release/stellar-agent-mcp$suffix"',
+    'cmp "$release/stellar-agent$suffix" "$release/stellar-agent-mcp$suffix"',
+)
+# The reviewed run block of the notarization smoke build, normalized alike.
+SMOKE_BUILD = (
+    "set -euo pipefail",
+    "cargo build --release --locked --target aarch64-apple-darwin --bin stellar-agent",
+    "release=target/aarch64-apple-darwin/release",
+    ". .github/scripts/release/copy-alias.sh",
+    'copy_alias "$release/stellar-agent" "$release/stellar-agent-mcp"',
+    'cmp "$release/stellar-agent" "$release/stellar-agent-mcp"',
+)
+# The reviewed body of the copy helper that build.sh, check-host.sh,
+# verify-install.sh and the smoke build source, normalized alike: a new
+# mktemp file, a destination that is a regular file or absent, and a
+# rename(2) through perl that never follows a directory link.
+COPY_HELPER = RELEASE_SCRIPTS / "copy-alias.sh"
+COPY_HELPER_BODY = (
+    "copy_alias() {",
+    "local source=$1 destination=$2 temp",
+    'if [ -L "$destination" ] || { [ -e "$destination" ] && [ ! -f "$destination" ]; }; then',
+    'echo "copy_alias: $destination is not a regular file" >&2',
+    "return 1",
+    "fi",
+    'temp=$(mktemp "$(dirname "$destination")/.stellar-agent-mcp.XXXXXX")',
+    'if ! cp -p "$source" "$temp" ||',
+    "! perl -e 'rename($ARGV[0], $ARGV[1]) or die \"copy_alias: $ARGV[1]: $!\\n\"' \"$temp\" \"$destination\"; then",
+    'rm -f -- "$temp"',
+    "return 1",
+    "fi",
+    "}",
+)
+# The reviewed body of derive-alias.sh, normalized alike: a canonical regular
+# file with one link, an alias that is a regular file or absent, a new mktemp
+# file, and a rename(2) through perl that never follows a directory link.
+DERIVE_SCRIPT = pathlib.PurePosixPath(".github/actions/macos-sign-notarize/derive-alias.sh")
+DERIVE_BODY = (
+    "set -euo pipefail",
+    "fail() {",
+    'echo "derive-alias: $*" >&2',
+    "exit 1",
+    "}",
+    "single_link_file() {",
+    '[ -f "$1" ] && [ ! -L "$1" ] && [ -n "$(/usr/bin/find "$1" -prune -links 1)" ]',
+    "}",
+    'if [ "$#" -ne 2 ]; then',
+    "echo 'usage: derive-alias.sh <dir> <suffix>' >&2",
+    "exit 2",
+    "fi",
+    "dir=${1%/}",
+    "suffix=$2",
+    'case "$suffix" in',
+    "'' | .exe) ;;",
+    "*)",
+    "echo \"derive-alias: unsupported suffix '$suffix'\" >&2",
+    "exit 2",
+    ";;",
+    "esac",
+    'canonical="$dir/stellar-agent$suffix"',
+    'alias="$dir/stellar-agent-mcp$suffix"',
+    'if [ -L "$canonical" ] || [ ! -f "$canonical" ]; then',
+    'fail "$canonical is not a regular file"',
+    "fi",
+    'single_link_file "$canonical" || fail "$canonical has more than one link"',
+    'if [ -L "$alias" ] || { [ -e "$alias" ] && [ ! -f "$alias" ]; }; then',
+    'fail "$alias is not a regular file"',
+    "fi",
+    'temp="$(/usr/bin/mktemp "$dir/.stellar-agent-mcp.XXXXXX")"',
+    "trap '/bin/rm -f \"$temp\"' EXIT",
+    '/bin/cp -p "$canonical" "$temp"',
+    "/usr/bin/perl -e 'rename($ARGV[0], $ARGV[1]) or die \"derive-alias: $ARGV[1]: $!\\n\"' \"$temp\" \"$alias\"",
+    "trap - EXIT",
+    'single_link_file "$alias" || fail "$alias is not a regular file with one link"',
+    '/usr/bin/cmp "$canonical" "$alias" || fail "$alias differs from $canonical"',
+)
+# The signing script signs the canonical executable only, verifies it, then
+# derives the alias from the signed file and packs both for notarization.
+# SIGN_BLOCK holds those lines with their neighbours, contiguous and
+# normalized; SIGN_FINAL is the closing verification of both names.
+SIGN_SCRIPT = pathlib.PurePosixPath(".github/actions/macos-sign-notarize/sign-notarize.sh")
+SIGN_LINE = ('/usr/bin/codesign --force --options runtime --timestamp --keychain "$KEYCHAIN" '
+             '--sign "$IDENTITY" "$BINARY_DIR/stellar-agent"')
+SIGN_BLOCK = (
+    "fi",
+    SIGN_LINE,
+    '/usr/bin/codesign --verify --strict --verbose=2 "$BINARY_DIR/stellar-agent"',
+    "/bin/bash \"${BASH_SOURCE[0]%/*}/derive-alias.sh\" \"$BINARY_DIR\" ''",
+    '/usr/bin/zip -j "$SUBMIT_ZIP" "$BINARY_DIR/stellar-agent" "$BINARY_DIR/stellar-agent-mcp"',
+    "printf '%s' \"$ASC_KEY_B64\" | /usr/bin/base64 -d >\"$ASC_KEY\"",
+)
+SIGN_FINAL = (
+    "for bin in stellar-agent stellar-agent-mcp; do",
+    '/usr/bin/codesign --verify --strict --verbose=2 "$BINARY_DIR/$bin"',
+    "done",
+)
 # The release targets and the runner that executes each one's archive: the
 # Intel macOS archive runs under Rosetta 2 on the Apple silicon runner.
 VERIFY_RUNNERS = {
@@ -342,16 +477,23 @@ CONDITIONED_FEATURE_JOBS = {
         "cargo llvm-cov --workspace --no-default-features --features "
         "test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov-feature-off.json",)),
 }
-# The host recipe: the release build for the host target and the marker
-# check of both binaries, then the build of each binary package alone and
-# its marker check.
+# The host recipe: the release build for the host target, which places the
+# stellar-agent-mcp copy, the byte comparison of both names and the marker
+# check of each; then the build of the CLI package alone, the copy of its
+# debug executable to the alias name with copy_alias, the byte comparison,
+# and the marker check of both debug names.
+HOST_ALIAS = "target/tmp/host-alias/stellar-agent-mcp"
 HOST_CHECKS = ('bash .github/scripts/release/build.sh "$target"',
+               'cmp "target/$target/release/stellar-agent" "target/$target/release/stellar-agent-mcp"',
                'bash .github/scripts/check-binary-marker.sh "target/$target/release/stellar-agent" on',
                'bash .github/scripts/check-binary-marker.sh "target/$target/release/stellar-agent-mcp" on',
                "cargo build --locked -p stellar-agent-cli",
+               "mkdir -p target/tmp/host-alias",
+               ". .github/scripts/release/copy-alias.sh",
+               f"copy_alias target/debug/stellar-agent {HOST_ALIAS}",
+               f"cmp target/debug/stellar-agent {HOST_ALIAS}",
                "bash .github/scripts/check-binary-marker.sh target/debug/stellar-agent on",
-               "cargo build --locked -p stellar-agent-mcp",
-               "bash .github/scripts/check-binary-marker.sh target/debug/stellar-agent-mcp on")
+               f"bash .github/scripts/check-binary-marker.sh {HOST_ALIAS} on")
 # For each job: the action that receives a credential, and the text of the
 # checks that earlier steps must hold. The third entry is the text of the
 # workspace code that reads the downloaded data. A clean-checkout check must
@@ -984,6 +1126,38 @@ class Checker:
         lines = list(self.logical_lines(script)) if script is not None else []
         if lines[:2] != ["set -euo pipefail", BUILD_GUARD]:
             self.report(str(BUILD_SCRIPT), "release-shared-scripts", "environment guard is not the first build action")
+        if script is not None and self.normalized(script) != list(BUILD_BODY):
+            self.report(str(BUILD_SCRIPT), "release-shared-scripts", "build operations differ from BUILD_BODY")
+        smoke = [step for step in (self.job("notarize-smoke.yml", "build") or {}).get("steps", [])
+                 if step.get("name") == "Build binaries"]
+        if len(smoke) != 1 or self.normalized(self.run_text(smoke[0])) != list(SMOKE_BUILD):
+            self.report("notarize-smoke.yml", "release-shared-scripts", "smoke build operations differ from SMOKE_BUILD")
+        helper = self.read_script(COPY_HELPER, "release-shared-scripts")
+        if helper is not None and self.normalized(helper) != list(COPY_HELPER_BODY):
+            self.report(str(COPY_HELPER), "release-shared-scripts", "copy operations differ from COPY_HELPER_BODY")
+        self.check_signing_order()
+
+    @classmethod
+    def normalized(cls, text):
+        """The logical lines of text without blank lines, each run of blanks
+        collapsed to one space."""
+        return [" ".join(re.split(r"[ \t]+", line.strip(BLANKS)))
+                for line in cls.logical_lines(text) if line.strip(BLANKS)]
+
+    def check_signing_order(self):
+        script = self.read_script(SIGN_SCRIPT, "signing-order")
+        if script is None:
+            return
+        lines, block = self.normalized(script), list(SIGN_BLOCK)
+        if not any(lines[index:index + len(block)] == block for index in range(len(lines))):
+            self.report(str(SIGN_SCRIPT), "signing-order", "signing, derivation and packing differ from SIGN_BLOCK")
+        if [line for line in lines if "--sign" in line] != [SIGN_LINE]:
+            self.report(str(SIGN_SCRIPT), "signing-order", "a codesign call signs another file than stellar-agent")
+        if lines[-len(SIGN_FINAL):] != list(SIGN_FINAL):
+            self.report(str(SIGN_SCRIPT), "signing-order", "the script does not end by verifying both signatures")
+        derive = self.read_script(DERIVE_SCRIPT, "signing-order")
+        if derive is not None and self.normalized(derive) != list(DERIVE_BODY):
+            self.report(str(DERIVE_SCRIPT), "signing-order", "derivation operations differ from DERIVE_BODY")
 
     def check_release_gates(self):
         self.check_publish_wasm_gate()

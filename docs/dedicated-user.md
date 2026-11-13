@@ -12,11 +12,19 @@ Every macOS deployment claim is conditional: validated by the real-host run.
 
 ## Account and bootstrap
 
-Run the bootstrap as root with production binaries:
+Run the bootstrap as root with the production executable:
 
 ```bash
-bash scripts/deploy/bootstrap.sh --operator <account> --project <name> --cli <binary> --mcp <mcp-binary>
+bash scripts/deploy/bootstrap.sh --operator <account> --project <name> --cli <binary>
 ```
+
+The bootstrap stages and checks the `--cli` executable once, copies the staged
+file, compares the two copies, and installs them as `stellar-agent` and
+`stellar-agent-mcp`. An optional `--mcp <file>`, such as the second file of a
+release archive, passes the same checks and must hold the bytes of `--cli`;
+otherwise the bootstrap refuses with exit 65 before it changes the account or
+any installed file. The invocation name grants no wrapper permission: the
+wrappers allow the same forms whichever name runs.
 
 The bootstrap takes no secret. It creates a non-admin account, disables password
 login, and selects a non-login shell.

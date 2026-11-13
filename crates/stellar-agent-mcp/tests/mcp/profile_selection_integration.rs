@@ -30,13 +30,10 @@ use std::process::{Command, Output, Stdio};
 use stellar_agent_core::profile::caip2::{MAINNET_PASSPHRASE, TESTNET_PASSPHRASE};
 
 use crate::common::child_process::ChildDriver;
+use crate::common::server_binary::server_command;
 
 /// A profile name for which no file is ever written.
 const MISSING_PROFILE: &str = "__issue105_missing_profile__";
-
-fn mcp_binary() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_BIN_EXE_stellar-agent-mcp"))
-}
 
 /// A minimal, valid version-2 profile TOML with the Noop policy engine.
 ///
@@ -83,7 +80,7 @@ impl ProfileHome {
 
     /// Builds a `Command` for the MCP binary bound to this home directory.
     fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(mcp_binary());
+        let mut command = server_command();
         command
             .args(args)
             .env("STELLAR_AGENT_HOME", self.dir.path())

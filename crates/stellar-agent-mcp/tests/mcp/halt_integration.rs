@@ -826,7 +826,7 @@ impl HeadlessHome {
 
     /// The binary bound to this home and the headless keyring.
     fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_stellar-agent-mcp"));
+        let mut command = crate::common::server_binary::server_command();
         command
             .args(["--profile", PROFILE])
             .env("STELLAR_AGENT_HOME", self.home.path())

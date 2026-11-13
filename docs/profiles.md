@@ -29,21 +29,21 @@ Profile files live one-per-name in the OS-conventional data directory:
 | macOS    | `~/Library/Application Support/Soneso.stellar-agent/profiles/<name>.toml` |
 | Windows  | `%LOCALAPPDATA%\Soneso\stellar-agent\data\profiles\<name>.toml` |
 
-A profile is selected by name (the file stem). Both binaries resolve the name
+A profile is selected by name (the file stem). The CLI and the MCP server resolve the name
 the same way: an explicit `--profile <NAME>`, then the `STELLAR_AGENT_PROFILE`
 environment variable, then `default`. When no name was given and no
 `default.toml` exists yet, both fall back to an in-memory testnet
 configuration. The fallback lets the MCP server serve read-only requests and
 the CLI run `pay`, `claim`, and `accounts create` before any profile is
 authored. This fallback is never written to disk. A profile that WAS named but
-has no file is refused by both binaries rather than replaced by that fallback:
+has no file is refused by the CLI and the MCP server rather than replaced by that fallback:
 the fallback is a testnet, no-policy-engine configuration, so substituting it
 for a profile you named would answer on the wrong network under a governance
 setting you did not choose.
 
 A profile file is bound to its name by its keyring coordinates: renaming or
-copying `<a>.toml` to `<b>.toml` does not make it profile `b`. Both binaries
-refuse it under the new name. The MCP server refuses it at startup, and the CLI
+copying `<a>.toml` to `<b>.toml` does not make it profile `b`. The CLI and the
+MCP server refuse it under the new name. The MCP server refuses it at startup, and the CLI
 refuses it at every command that loads a profile, with the wire code
 `profile.name_mismatch`. The
 refusal names the offending `policy_owner_key_id.service` field without its
@@ -54,7 +54,7 @@ value or either profile name. Recover by creating the second profile with
 `profile show <name>` is the one command that still displays a mismatched
 profile: it is what you read to find the offending field.
 
-After name reconciliation, both binaries compare keyring entries with sibling
+After name reconciliation, the CLI and the MCP server compare keyring entries with sibling
 profile files in the same profiles directory. Mainnet conflicts refuse with
 `profile.key_scope_conflict`; testnet conflicts warn and keep the verb's behavior.
 The check includes wallet keys, provider credentials and derived entries.

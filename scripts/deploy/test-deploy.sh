@@ -345,12 +345,13 @@ STUB
   # perl and mv of the installs run the real tool. With the rename hook of
   # the case present, they first move a file at the rename destination
   # aside and put a directory there. That is the race between the
-  # directory check and the rename, whichever tool renames.
+  # directory check and the rename, whichever tool renames. A perl program
+  # that does not rename, such as the bootstrap lock, leaves the hook armed.
   for tool in perl mv; do
     {
       printf '#!/bin/bash\nHOOK=%q\nTOOL=%q\nMV=%q\n' "$STATE/rename_hook" "$(command -v "$tool")" "$(command -v mv)"
       cat <<'STUB'
-if [ -f "$HOOK" ]; then
+if [ -f "$HOOK" ] && { [ "${TOOL##*/}" != perl ] || [[ "${2-}" == *rename* ]]; }; then
   "$MV" "$HOOK" "$HOOK.used"
   for destination in "$@"; do :; done
   if [ -e "$destination" ]; then
@@ -463,7 +464,7 @@ run_bootstrap() {
 
 # The arguments of a regular bootstrap run of platform $P.
 bootstrap_args() {
-  BOOT_ARGS=(--operator "$OPERATOR" --project "$PROJECT" --cli "$BASE/src/stellar-agent" --mcp "$BASE/src/stellar-agent-mcp")
+  BOOT_ARGS=(--operator "$OPERATOR" --project "$PROJECT" --cli "$BASE/src/stellar-agent")
 }
 
 # Sets up platform $1 through a first bootstrap run.
@@ -885,6 +886,9 @@ case_wrapper_refuses_unlisted_verb() {
     refused_without_native provision profile init --network testnet --rpc-url https://rpc.example
     refused_without_native provision profile init --rpc-url https://rpc.example --network mainnet
     refused_without_native mcp-launch serve
+    # The server role of the one executable is no CLI wrapper form.
+    refused_without_native cli-launch mcp serve
+    refused_without_native cli-launch mcp
     # Each listed form with a trailing token, a caller profile, a caller
     # audit log, or an unknown option.
     while IFS= read -r form; do
@@ -2128,7 +2132,7 @@ case_bootstrap_refuses_test_helpers_binary() {
       esac
       : >"$STATE/system.log"
       cp "$PREFIX/bin/stellar-agent" "$WORK/installed.before"
-      run_bootstrap --operator "$OPERATOR" --project "$PROJECT" --cli "$WORK/candidate" --mcp "$BASE/src/stellar-agent-mcp"
+      run_bootstrap --operator "$OPERATOR" --project "$PROJECT" --cli "$WORK/candidate"
       [ "$BOOT_RC" -eq 65 ] || fail "$P a binary with '$literal' exited $BOOT_RC"
       [ "$BOOT_ERR" = "bootstrap: refused: $reason" ] || fail "$P a binary with '$literal' printed: $BOOT_ERR"
       cmp -s "$PREFIX/bin/stellar-agent" "$WORK/installed.before" || fail "$P a refused binary replaced the installed one"
@@ -2141,6 +2145,357 @@ case_bootstrap_refuses_test_helpers_binary() {
     [ "$BOOT_RC" -eq 65 ] || fail "$P a test-helpers MCP binary exited $BOOT_RC"
     [ "$BOOT_ERR" = "bootstrap: refused: the --mcp binary embeds the test override literal STELLAR_AGENT_TEST_" ] ||
       fail "$P a test-helpers MCP binary printed: $BOOT_ERR"
+  done
+}
+
+# One --cli source installs both names as equal files. A supplied --mcp
+# source with equal bytes is accepted; one with other bytes refuses 65
+# before any account or installation change.
+case_bootstrap_single_source_installs_one_executable() {
+  local platform
+  for platform in $PLATFORMS; do
+    use "$platform"
+    echo yes >"$STATE/account_exists"
+    write_native_stub "$WORK/single-cli" "STELLAR_AGENT_BUILD_MAINNET_WRITE=on single source"
+    run_bootstrap --operator "$OPERATOR" --project "$PROJECT" --cli "$WORK/single-cli"
+    [ "$BOOT_RC" -eq 0 ] || fail "$P a single-source bootstrap exited $BOOT_RC: $BOOT_ERR"
+    cmp -s "$WORK/single-cli" "$PREFIX/bin/stellar-agent" || fail "$P the --cli source is not the installed stellar-agent"
+    cmp -s "$WORK/single-cli" "$PREFIX/bin/stellar-agent-mcp" || fail "$P the alias differs from the --cli source"
+    [ ! -L "$PREFIX/bin/stellar-agent-mcp" ] || fail "$P the alias is a symlink"
+    [ "$(find "$PREFIX/bin/stellar-agent-mcp" -links 1 | wc -l | tr -d ' ')" -eq 1 ] || fail "$P the alias shares a link"
+    [ "$(host_facts "$PREFIX/bin/stellar-agent-mcp")" = "$ACCOUNT_UID 755" ] || fail "$P the alias is not 0755"
+
+    cp "$WORK/single-cli" "$WORK/single-mcp"
+    run_bootstrap --operator "$OPERATOR" --project "$PROJECT" --cli "$WORK/single-cli" --mcp "$WORK/single-mcp"
+    [ "$BOOT_RC" -eq 0 ] || fail "$P an equal --mcp source exited $BOOT_RC: $BOOT_ERR"
+
+    write_native_stub "$WORK/other-mcp" "STELLAR_AGENT_BUILD_MAINNET_WRITE=on other bytes"
+    : >"$STATE/system.log"
+    cp "$PREFIX/bin/stellar-agent" "$WORK/installed.before"
+    cp "$PREFIX/bin/stellar-agent-mcp" "$WORK/installed-alias.before"
+    run_bootstrap --operator "$OPERATOR" --project "$PROJECT" --cli "$BASE/src/stellar-agent" --mcp "$WORK/other-mcp"
+    [ "$BOOT_RC" -eq 65 ] || fail "$P a different --mcp source exited $BOOT_RC"
+    [ "$BOOT_ERR" = "bootstrap: refused: the --mcp binary differs from the --cli binary; both names install one executable" ] ||
+      fail "$P a different --mcp source printed: $BOOT_ERR"
+    cmp -s "$PREFIX/bin/stellar-agent" "$WORK/installed.before" || fail "$P a refused source replaced stellar-agent"
+    cmp -s "$PREFIX/bin/stellar-agent-mcp" "$WORK/installed-alias.before" || fail "$P a refused source replaced the alias"
+    if system_log | grep -qE "^(sysadminctl|useradd|usermod|dscl|chown|chmod|visudo|mkdir) "; then
+      fail "$P a different --mcp source reached a root step: $(system_log)"
+    fi
+
+    run_bootstrap --operator "$OPERATOR" --project "$PROJECT" --cli "$BASE/src/stellar-agent" --mcp "$WORK/missing-mcp"
+    [ "$BOOT_RC" -eq 64 ] || fail "$P a missing --mcp source exited $BOOT_RC"
+    [ "$BOOT_ERR" = "bootstrap: refused: $WORK/missing-mcp is not a file" ] || fail "$P a missing --mcp source printed: $BOOT_ERR"
+    bootstrap_args
+    run_bootstrap "${BOOT_ARGS[@]}"
+    [ "$BOOT_RC" -eq 0 ] || fail "$P the restoring bootstrap exited $BOOT_RC: $BOOT_ERR"
+  done
+}
+
+# One run holds the bootstrap lock, so a second run refuses before any
+# change. A staged copy or an installed name with other bytes refuses and
+# names the repair, and a rerun with the same source repairs the pair.
+case_bootstrap_lock_and_pair_checks() {
+  local platform lock
+  for platform in $PLATFORMS; do
+    use "$platform"
+    echo yes >"$STATE/account_exists"
+    bootstrap_args
+    lock="$(dirname "$PREFIX")/.stellar-agent-bootstrap.lock"
+    cp "$PREFIX/bin/stellar-agent" "$WORK/installed.before"
+    : >"$STATE/system.log"
+    exec 7>>"$lock"
+    # shellcheck disable=SC2016 # The Perl program reads its own variables.
+    "$PERL" -e 'use Fcntl qw(:flock); open(my $lock, ">&=", 7) or die; flock($lock, LOCK_EX) or die'
+    run_bootstrap "${BOOT_ARGS[@]}"
+    exec 7>&-
+    [ "$BOOT_RC" -eq 65 ] || fail "$P a run under a held lock exited $BOOT_RC"
+    [ "$BOOT_ERR" = "bootstrap: refused: another bootstrap run holds $lock; run bootstrap again after it ends" ] ||
+      fail "$P a run under a held lock printed: $BOOT_ERR"
+    if system_log | grep -qE "^(sysadminctl|useradd|usermod|dscl|chown|visudo) "; then
+      fail "$P a run under a held lock reached a root step: $(system_log)"
+    fi
+    cmp -s "$PREFIX/bin/stellar-agent" "$WORK/installed.before" || fail "$P a run under a held lock installed"
+
+    export CORRUPT_DIR="$PREFIX/bin" REAL_PERL="$PERL"
+    cat >"$BSTUBS/cp" <<'STUB'
+#!/bin/bash
+/bin/cp "$@" || exit
+case "${*: -2:1}" in
+  "$CORRUPT_DIR"/.stellar-agent.*) printf 'x' >>"${*: -1}" ;;
+esac
+STUB
+    chmod 755 "$BSTUBS/cp"
+    run_bootstrap "${BOOT_ARGS[@]}"
+    rm "$BSTUBS/cp"
+    [ "$BOOT_RC" -eq 65 ] || fail "$P a changed staged copy exited $BOOT_RC"
+    [ "$BOOT_ERR" = "bootstrap: refused: the staged copies of the --cli binary differ" ] ||
+      fail "$P a changed staged copy printed: $BOOT_ERR"
+    cmp -s "$PREFIX/bin/stellar-agent" "$WORK/installed.before" || fail "$P a changed staged copy installed"
+
+    # The harness perl runs the rename hook; it returns after this run.
+    mv "$BSTUBS/perl" "$WORK/perl.hook"
+    cat >"$BSTUBS/perl" <<'STUB'
+#!/bin/bash
+"$REAL_PERL" "$@" || exit
+[ "${*: -1}" != "$CORRUPT_DIR/stellar-agent-mcp" ] || printf 'x' >>"${*: -1}"
+STUB
+    chmod 755 "$BSTUBS/perl"
+    run_bootstrap "${BOOT_ARGS[@]}"
+    mv "$WORK/perl.hook" "$BSTUBS/perl"
+    [ "$BOOT_RC" -eq 65 ] || fail "$P an unequal installed pair exited $BOOT_RC"
+    [ "$BOOT_ERR" = "bootstrap: refused: $PREFIX/bin/stellar-agent and $PREFIX/bin/stellar-agent-mcp differ; run bootstrap again with the same --cli source" ] ||
+      fail "$P an unequal installed pair printed: $BOOT_ERR"
+    run_bootstrap "${BOOT_ARGS[@]}"
+    [ "$BOOT_RC" -eq 0 ] || fail "$P the repairing rerun exited $BOOT_RC: $BOOT_ERR"
+    cmp -s "$PREFIX/bin/stellar-agent" "$PREFIX/bin/stellar-agent-mcp" || fail "$P the rerun left an unequal pair"
+  done
+}
+
+# A lock call that fails for a reason other than contention refuses 65 with
+# that reason, before any root step. A module loaded through PERL5OPT makes
+# every flock fail with EOPNOTSUPP, as a file system without locking does.
+case_bootstrap_reports_lock_failures() {
+  local platform lock
+  mkdir -p "$WORK/perl-lib"
+  printf '%s\n' 'use POSIX ();' \
+    'BEGIN { *CORE::GLOBAL::flock = sub { $! = POSIX::EOPNOTSUPP(); return 0; }; }' '1;' \
+    >"$WORK/perl-lib/FlockUnsupported.pm"
+  for platform in $PLATFORMS; do
+    use "$platform"
+    echo yes >"$STATE/account_exists"
+    bootstrap_args
+    lock="$(dirname "$PREFIX")/.stellar-agent-bootstrap.lock"
+    cp "$PREFIX/bin/stellar-agent" "$WORK/installed.before"
+    : >"$STATE/system.log"
+    export PERL5LIB="$WORK/perl-lib" PERL5OPT=-MFlockUnsupported
+    run_bootstrap "${BOOT_ARGS[@]}"
+    unset PERL5LIB PERL5OPT
+    [ "$BOOT_RC" -eq 65 ] || fail "$P an unsupported lock exited $BOOT_RC"
+    [ "$BOOT_ERR" = "bootstrap: refused: the bootstrap lock $lock could not be taken: $("$PERL" -MPOSIX -e '$! = POSIX::EOPNOTSUPP(); print "$!"')" ] ||
+      fail "$P an unsupported lock printed: $BOOT_ERR"
+    if system_log | grep -qE "^(sysadminctl|useradd|usermod|dscl|chown|visudo) "; then
+      fail "$P an unsupported lock reached a root step: $(system_log)"
+    fi
+    cmp -s "$PREFIX/bin/stellar-agent" "$WORK/installed.before" || fail "$P an unsupported lock installed"
+  done
+}
+
+# mcp-launch starts the server only from two equal installed names, read
+# under the bootstrap lock: an unequal pair refuses 65 with the repair, a
+# bootstrap lock held past five seconds refuses 66 as busy, and a lock
+# released within the bound lets the server start.
+case_mcp_launch_requires_one_executable() {
+  local platform lock holder
+  for platform in $PLATFORMS; do
+    reset_platform "$platform"
+    lock="$(dirname "$PREFIX")/.stellar-agent-bootstrap.lock"
+    STDIN_TEXT=$'{"jsonrpc":"2.0","id":1,"method":"ping"}\n' run mcp-launch
+    [ "$RC" -eq 0 ] || fail "$P mcp-launch with an equal pair exited $RC: $ERR"
+    expect_native "$PREDICATE" "stellar-agent-mcp --profile mainnet"
+
+    cp "$PREFIX/bin/stellar-agent-mcp" "$WORK/alias.saved"
+    printf '# other bytes\n' >>"$PREFIX/bin/stellar-agent-mcp"
+    : >"$STATE/calls.jsonl"
+    STDIN_TEXT=$'{"jsonrpc":"2.0","id":1,"method":"ping"}\n' run mcp-launch
+    expect_refusal 65 "$PREFIX/bin/stellar-agent and $PREFIX/bin/stellar-agent-mcp: the two files differ; run bootstrap again with the same --cli source" \
+      "mcp-launch with an unequal pair"
+    expect_native
+    mv -f "$WORK/alias.saved" "$PREFIX/bin/stellar-agent-mcp"
+
+    # An alias that is a link to the canonical file refuses before the
+    # comparison, though the bytes it reaches are equal.
+    mv "$PREFIX/bin/stellar-agent-mcp" "$WORK/alias.saved"
+    ln -s "$PREFIX/bin/stellar-agent" "$PREFIX/bin/stellar-agent-mcp"
+    : >"$STATE/calls.jsonl"
+    STDIN_TEXT=$'{"jsonrpc":"2.0","id":1,"method":"ping"}\n' run mcp-launch
+    rm "$PREFIX/bin/stellar-agent-mcp"
+    mv "$WORK/alias.saved" "$PREFIX/bin/stellar-agent-mcp"
+    expect_refusal 65 "$PREFIX/bin/stellar-agent and $PREFIX/bin/stellar-agent-mcp: $PREFIX/bin/stellar-agent-mcp is a link; run bootstrap again with the same --cli source" \
+      "mcp-launch with a linked alias"
+    expect_native
+
+    : >"$STATE/calls.jsonl"
+    exec 7>>"$lock"
+    # shellcheck disable=SC2016 # The Perl program reads its own variables.
+    "$PERL" -e 'use Fcntl qw(:flock); open(my $lock, ">&=", 7) or die; flock($lock, LOCK_EX) or die'
+    run mcp-launch
+    exec 7>&-
+    expect_refusal 66 "a bootstrap run holds the installation of $PREFIX/bin/stellar-agent and $PREFIX/bin/stellar-agent-mcp; run mcp-launch again after it ends" \
+      "mcp-launch under a held bootstrap lock"
+    expect_native
+
+    : >"$STATE/calls.jsonl"
+    rm -f "$WORK/held"
+    # shellcheck disable=SC2016 # The Perl program reads its own variables.
+    "$PERL" -e 'use Fcntl qw(:flock); open(my $lock, ">>", $ARGV[0]) or die; flock($lock, LOCK_EX) or die;
+      open(my $held, ">", $ARGV[1]) or die; close($held); select(undef, undef, undef, 1.5)' "$lock" "$WORK/held" &
+    holder=$!
+    while [ ! -e "$WORK/held" ]; do
+      kill -0 "$holder" 2>/dev/null || fail "$P the lock holder ended before it held the lock"
+      sleep 0.05
+    done
+    STDIN_TEXT=$'{"jsonrpc":"2.0","id":1,"method":"ping"}\n' run mcp-launch
+    wait "$holder"
+    [ "$RC" -eq 0 ] || fail "$P mcp-launch after a released lock exited $RC: $ERR"
+    expect_native "$PREDICATE" "stellar-agent-mcp --profile mainnet"
+  done
+}
+
+# Writes the installed mcp-launch of platform $P with the search path $1 in
+# place of the rendered one. The saved original returns with
+# restore_launcher, or at the exit of the case subshell when the case fails
+# first, so a later case starts from the rendered launcher. The text is split
+# around the rendered line rather than passed through ${text/old/new}: bash
+# 3.2 keeps the quotes of a quoted replacement in its result.
+launcher_with_path() {
+  local text old
+  cp "$PREFIX/mcp-launch" "$WORK/mcp-launch.saved"
+  trap restore_launcher EXIT
+  text=$(cat "$PREFIX/mcp-launch")
+  old="PATH='$STUBS:/usr/bin:/bin'"
+  case "$text" in
+    *"$old"*) ;;
+    *) fail "$P the launcher has no rendered search path" ;;
+  esac
+  printf '%s\n' "${text%%"$old"*}PATH='$1'${text#*"$old"}" >"$PREFIX/mcp-launch"
+  grep -qxF "PATH='$1'" "$PREFIX/mcp-launch" || fail "$P the launcher search path was not replaced"
+}
+
+restore_launcher() {
+  trap - EXIT
+  mv -f "$WORK/mcp-launch.saved" "$PREFIX/mcp-launch"
+}
+
+# Every refusal of the pair gate is one stderr line that names both installed
+# paths, its reason, and the repair: an absent perl, a lock call that fails
+# for a reason other than contention, and a directory at the alias.
+case_mcp_launch_reports_pair_refusals() {
+  local platform limited tool pair repair
+  for platform in $PLATFORMS; do
+    reset_platform "$platform"
+    pair="$PREFIX/bin/stellar-agent and $PREFIX/bin/stellar-agent-mcp"
+    repair="run bootstrap again with the same --cli source"
+    limited="$WORK/limited-$platform"
+    rm -rf "$limited"
+    mkdir "$limited"
+    for tool in "$STUBS"/*; do
+      [ "${tool##*/}" = perl ] || ln -s "$tool" "$limited/${tool##*/}"
+    done
+    for tool in id cat pgrep cmp stat ls awk grep sed; do
+      [ -e "$limited/$tool" ] || ln -s "$(command -v "$tool")" "$limited/$tool"
+    done
+
+    launcher_with_path "$limited"
+    : >"$STATE/calls.jsonl"
+    STDIN_TEXT=$'{"jsonrpc":"2.0","id":1,"method":"ping"}\n' run mcp-launch
+    expect_refusal 65 "$pair: perl is not available; $repair" "mcp-launch without perl"
+    expect_native
+
+    {
+      printf '#!/bin/bash\nREAL=%q\n' "$PERL"
+      # shellcheck disable=SC2016 # The stub body expands when the stub runs.
+      printf '%s\n' 'program=$2' 'shift 2' \
+        'exec "$REAL" -e "use POSIX (); BEGIN { *CORE::GLOBAL::flock = sub { \$! = POSIX::EOPNOTSUPP(); return 0; }; } $program" "$@"'
+    } >"$limited/perl"
+    chmod 755 "$limited/perl"
+    : >"$STATE/calls.jsonl"
+    STDIN_TEXT=$'{"jsonrpc":"2.0","id":1,"method":"ping"}\n' run mcp-launch
+    expect_refusal 65 "$pair: the bootstrap lock cannot be taken; $repair" "mcp-launch with an unsupported lock"
+    expect_native
+    restore_launcher
+
+    mv "$PREFIX/bin/stellar-agent-mcp" "$WORK/alias.saved"
+    mkdir "$PREFIX/bin/stellar-agent-mcp"
+    : >"$STATE/calls.jsonl"
+    STDIN_TEXT=$'{"jsonrpc":"2.0","id":1,"method":"ping"}\n' run mcp-launch
+    rmdir "$PREFIX/bin/stellar-agent-mcp"
+    mv "$WORK/alias.saved" "$PREFIX/bin/stellar-agent-mcp"
+    expect_refusal 65 "$pair: $PREFIX/bin/stellar-agent-mcp is a directory; $repair" "mcp-launch with a directory alias"
+    expect_native
+  done
+}
+
+# A server that passed the pair check holds no lock: a bootstrap run that
+# starts right after the check completes while that server runs, leaves an
+# equal pair, and the next launch starts from it.
+case_mcp_launch_then_bootstrap() {
+  local platform server tries
+  for platform in $PLATFORMS; do
+    reset_platform "$platform"
+    echo yes >"$STATE/account_exists"
+    rm -f "$WORK/server.in"
+    mkfifo "$WORK/server.in"
+    "$PREFIX/mcp-launch" <"$WORK/server.in" >"$WORK/server.out" 2>"$WORK/server.err" &
+    server=$!
+    exec 6>"$WORK/server.in"
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"ping"}' >&6
+    tries=0
+    until ps -o args= -p "$server" 2>/dev/null | grep -qF native-stub.py; do
+      tries=$((tries + 1))
+      [ "$tries" -le 200 ] || fail "$P the server did not start: $(cat "$WORK/server.err")"
+      kill -0 "$server" 2>/dev/null || fail "$P mcp-launch ended before the server started: $(cat "$WORK/server.err")"
+      sleep 0.05
+    done
+    write_native_stub "$WORK/after-check-cli" "STELLAR_AGENT_BUILD_MAINNET_WRITE=on after the check"
+    run_bootstrap --operator "$OPERATOR" --project "$PROJECT" --cli "$WORK/after-check-cli"
+    [ "$BOOT_RC" -eq 0 ] || fail "$P bootstrap beside a running server exited $BOOT_RC: $BOOT_ERR"
+    cmp -s "$WORK/after-check-cli" "$PREFIX/bin/stellar-agent" || fail "$P bootstrap did not install the new canonical file"
+    cmp -s "$WORK/after-check-cli" "$PREFIX/bin/stellar-agent-mcp" || fail "$P bootstrap left an unequal pair"
+    exec 6>&-
+    RC=0
+    wait "$server" || RC=$?
+    rm -f "$WORK/server.in"
+    [ "$RC" -eq 0 ] || fail "$P the running server exited $RC: $(cat "$WORK/server.err")"
+    : >"$STATE/calls.jsonl"
+    STDIN_TEXT=$'{"jsonrpc":"2.0","id":1,"method":"ping"}\n' run mcp-launch
+    [ "$RC" -eq 0 ] || fail "$P the launch after bootstrap exited $RC: $ERR"
+    expect_native "$PREDICATE" "stellar-agent-mcp --profile mainnet"
+    bootstrap_args
+    run_bootstrap "${BOOT_ARGS[@]}"
+    [ "$BOOT_RC" -eq 0 ] || fail "$P the restoring bootstrap exited $BOOT_RC: $BOOT_ERR"
+  done
+}
+
+# A bootstrap killed between its two renames leaves an unequal pair, which
+# mcp-launch refuses before any native call; a rerun repairs it.
+case_mcp_launch_refuses_an_interrupted_upgrade() {
+  local platform text needle
+  for platform in $PLATFORMS; do
+    reset_platform "$platform"
+    # shellcheck disable=SC2016 # The needle is the literal text of bootstrap.sh.
+    needle='  install_staged "$canonical" 755 "$PREFIX/bin/stellar-agent"'
+    text=$(cat "$BASE/deploy/bootstrap.sh")
+    case "$text" in
+      *"$needle"*) ;;
+      *) fail "$P bootstrap.sh has no rename of stellar-agent" ;;
+    esac
+    # The kill line follows the first rename; the text is split around the
+    # needle because bash 3.2 keeps the quotes of a quoted ${text/old/new}
+    # replacement.
+    # shellcheck disable=SC2016 # The kill line is the literal text of the copy.
+    printf '%s\n%s%s\n' "${text%%"$needle"*}$needle" '  kill -KILL $$' "${text#*"$needle"}" \
+      >"$BASE/deploy/bootstrap-interrupted.sh"
+    chmod 755 "$BASE/deploy/bootstrap-interrupted.sh"
+    grep -qxF '  kill -KILL $$' "$BASE/deploy/bootstrap-interrupted.sh" || fail "$P the interrupted bootstrap has no kill"
+    echo yes >"$STATE/account_exists"
+    write_native_stub "$WORK/interrupted-cli" "STELLAR_AGENT_BUILD_MAINNET_WRITE=on interrupted upgrade"
+    BOOT_RC=0
+    "$BASE/deploy/bootstrap-interrupted.sh" --operator "$OPERATOR" --project "$PROJECT" --cli "$WORK/interrupted-cli" \
+      </dev/null >/dev/null 2>&1 || BOOT_RC=$?
+    rm "$BASE/deploy/bootstrap-interrupted.sh"
+    # The killed run never reached its exit trap; its staged files stay.
+    rm -f "$PREFIX/bin"/.stellar-agent.* "$PREFIX"/.stellar-agent.*
+    [ "$BOOT_RC" -eq 137 ] || fail "$P the interrupted bootstrap exited $BOOT_RC"
+    cmp -s "$WORK/interrupted-cli" "$PREFIX/bin/stellar-agent" || fail "$P the interrupted bootstrap did not rename stellar-agent"
+    : >"$STATE/calls.jsonl"
+    STDIN_TEXT=$'{"jsonrpc":"2.0","id":1,"method":"ping"}\n' run mcp-launch
+    expect_refusal 65 "$PREFIX/bin/stellar-agent and $PREFIX/bin/stellar-agent-mcp: the two files differ; run bootstrap again with the same --cli source" \
+      "mcp-launch after an interrupted bootstrap"
+    expect_native
+    bootstrap_args
+    run_bootstrap "${BOOT_ARGS[@]}"
+    [ "$BOOT_RC" -eq 0 ] || fail "$P the repairing bootstrap exited $BOOT_RC: $BOOT_ERR"
   done
 }
 
@@ -2274,8 +2629,9 @@ case_bootstrap_rerun_converges() {
     rmdir "$HOME_DIR/tmp"
     write_native_stub "$WORK/upgrade-cli" "STELLAR_AGENT_BUILD_MAINNET_WRITE=on upgrade"
     : >"$STATE/system.log"
-    run_bootstrap --operator "$OPERATOR" --project "$PROJECT" --cli "$WORK/upgrade-cli" --mcp "$BASE/src/stellar-agent-mcp"
+    run_bootstrap --operator "$OPERATOR" --project "$PROJECT" --cli "$WORK/upgrade-cli"
     [ "$BOOT_RC" -eq 0 ] || fail "$P the rerun exited $BOOT_RC: $BOOT_ERR"
+    cmp -s "$WORK/upgrade-cli" "$PREFIX/bin/stellar-agent-mcp" || fail "$P the rerun did not install the new binary under the alias"
     case "$BOOT_OUT" in
       *"R7 verifies the existing account $ACCOUNT"*) ;;
       *) fail "$P the rerun did not verify the existing account: $BOOT_OUT" ;;
@@ -2428,7 +2784,7 @@ STUB
 
 # Expected record entries of validation script $1.
 validation_entries() {
-  local common="account ownership refusal-64 refusal-65 keychain-unlock keychain-lock keychain-unlock-again provisioning-order platform-read-write refusal-66 mcp-stdio cross-user-file-denial cross-user-keyring-denial approval-round-trip"
+  local common="account ownership binary-identity refusal-64 refusal-65 keychain-unlock keychain-lock keychain-unlock-again provisioning-order platform-read-write refusal-66 mcp-stdio cross-user-file-denial cross-user-keyring-denial approval-round-trip"
   case "$1" in
     macos) echo "$common access-lists designated-requirement signed-upgrade dialog-counts no-desktop-session" ;;
     linux) echo "$common daemon-reuse" ;;
@@ -2453,11 +2809,37 @@ validation_entries() {
 # Every log but the empty one of mode c starts with the filter banner and
 # the column header. secret-tool always prints a stand-in secret, which
 # the record must never hold.
+#
+# codesign -dvvv answers by the hash mode in the file hash-mode: equal
+# prints one CDHash, the same for every file; failed exits 1; absent prints
+# no CDHash line; empty prints an empty one; duplicate prints two; unequal
+# prints a CDHash derived from the file name.
 write_validation_tools() {
   local name
-  for name in codesign launchctl who; do
+  for name in launchctl who; do
     printf '#!/bin/bash\nprintf "%%s\\n" "%s $*" >>%q\n' "$name" "$1/tools.log" >"$1/stubs/$name"
   done
+  {
+    # shellcheck disable=SC2016 # The stub body expands when the stub runs.
+    printf '#!/bin/bash\nprintf "%%s\\n" "codesign $*" >>%q\nHASH_MODE=$(cat %q)\n' "$1/tools.log" "$1/hash-mode"
+    cat <<'STUB'
+if [ "${1-}" = -dvvv ]; then
+  printf 'Executable=%s\nIdentifier=stellar-agent\n' "${2-}" >&2
+  case "$HASH_MODE" in
+    failed)
+      printf '%s: code object is not signed at all\n' "${2-}" >&2
+      exit 1
+      ;;
+    absent) ;;
+    empty) echo 'CDHash=' >&2 ;;
+    duplicate) printf 'CDHash=%s\nCDHash=%s\n' 0123456789abcdef 0123456789abcdef >&2 ;;
+    unequal) printf 'CDHash=%s\n' "$(basename "${2-}" | cksum | cut -d ' ' -f 1)" >&2 ;;
+    *) echo 'CDHash=0123456789abcdef0123456789abcdef01234567' >&2 ;;
+  esac
+fi
+STUB
+  } >"$1/stubs/codesign"
+  echo equal >"$1/hash-mode"
   for name in dscl getent; do
     {
       printf '#!/bin/bash\nprintf "%%s\\n" "%s $*" >>%q\n' "$name" "$1/tools.log"
@@ -2534,9 +2916,9 @@ STUB
 }
 
 # Runs validation script $1 of root $2 in mode $3 into the record
-# directory record-$3. Sets RC.
+# directory record-<label>, with the label $4 or else the mode. Sets RC.
 run_validation() {
-  local script=$1 root=$2 mode=$3
+  local script=$1 root=$2 mode=$3 label=${4:-$3}
   printf '%s\n' "$mode" >"$root/mode"
   : >"$root/calls.log"
   : >"$root/sudo.log"
@@ -2546,10 +2928,10 @@ run_validation() {
   exec 8<>"$root/tty"
   printf 'probe-approval\n\n\n\n' >&8
   RC=0
-  PATH="$root/stubs:$PATH" bash "$script" --record "$root/record-$mode" --rpc-url https://rpc.example \
+  PATH="$root/stubs:$PATH" bash "$script" --record "$root/record-$label" --rpc-url https://rpc.example \
     --providers "$root/providers.toml" --policy "$root/policy.toml" --cert "$root/cert.pem" \
     --key "$root/key.pem" --bind 127.0.0.1:8443 --rp-id wallet.example \
-    </dev/null >"$root/out-$mode" 2>"$root/err-$mode" 8>&- || RC=$?
+    </dev/null >"$root/out-$label" 2>"$root/err-$label" 8>&- || RC=$?
   exec 8>&-
 }
 
@@ -2588,6 +2970,10 @@ exec "$@"
 STUB
   } >"$root/stubs/sudo"
   write_validation_tools "$root"
+  # The installed executable under both names, as bootstrap leaves it.
+  printf '#!/bin/bash\n# installed executable fixture\nexit 0\n' >"$root/prefix/bin/stellar-agent"
+  cp "$root/prefix/bin/stellar-agent" "$root/prefix/bin/stellar-agent-mcp"
+  chmod 755 "$root/prefix/bin/stellar-agent" "$root/prefix/bin/stellar-agent-mcp"
   script="$root/validate-$platform.sh"
   cp "$DEPLOY/validate-$platform.sh" "$script"
   replace_line "$script" "ACCOUNT=stellar-agent" "ACCOUNT='$ACCOUNT'"
@@ -2864,6 +3250,72 @@ case_validation_read_needs_denial_evidence() {
   done
 }
 
+# The binary-identity entry is ok only for two present, byte-equal files,
+# and on macOS only when codesign succeeds for each with one nonempty,
+# equal CDHash. Every other outcome records failed.
+case_validation_records_binary_identity() {
+  local platform script root file bin label mode
+  for platform in $PLATFORMS; do
+    root="$WORK/identity-$platform"
+    prepare_validation "$platform" "$root"
+    script=$VALIDATION_SCRIPT
+    bin="$root/prefix/bin"
+
+    run_validation "$script" "$root" a equal
+    [ "$RC" -eq 0 ] || fail "validate-$platform.sh with equal files exited $RC: $(cat "$root/err-equal")"
+    file=$(entry_file "$root/record-equal" binary-identity)
+    [ "$(status_after "$file" "cmp $bin/stellar-agent $bin/stellar-agent-mcp")" = "status: ok (equal bytes)" ] ||
+      fail "validate-$platform.sh records equal files as: $(cat "$file")"
+    grep -qx 'identity: ok' "$file" || fail "validate-$platform.sh records no identity for equal files: $(cat "$file")"
+    if [ "$platform" = macos ]; then
+      [ "$(grep -c '^status: ok (CDHash 0123456789abcdef0123456789abcdef01234567)$' "$file")" -eq 2 ] ||
+        fail "macos records no CDHash for both names: $(cat "$file")"
+      grep -qxF "codesign -dvvv $bin/stellar-agent" "$root/tools.log" || fail "macos did not ask codesign for stellar-agent"
+      grep -qxF "codesign -dvvv $bin/stellar-agent-mcp" "$root/tools.log" || fail "macos did not ask codesign for the alias"
+    fi
+
+    printf '# other bytes\n' >>"$bin/stellar-agent-mcp"
+    run_validation "$script" "$root" a unequal-bytes
+    [ "$RC" -eq 1 ] || fail "validate-$platform.sh with unequal files exited $RC"
+    grep -qF "are not one executable; run bootstrap again with the same --cli source" "$root/err-unequal-bytes" ||
+      fail "validate-$platform.sh with unequal files printed: $(cat "$root/err-unequal-bytes")"
+    file=$(entry_file "$root/record-unequal-bytes" binary-identity)
+    [ "$(status_after "$file" "cmp $bin/stellar-agent $bin/stellar-agent-mcp")" = "status: failed (the installed names differ or cmp failed)" ] ||
+      fail "validate-$platform.sh records unequal files as: $(cat "$file")"
+    grep -qx 'identity: failed' "$file" || fail "validate-$platform.sh unequal files identity: $(cat "$file")"
+
+    mv "$bin/stellar-agent-mcp" "$root/alias.saved"
+    run_validation "$script" "$root" a missing-alias
+    [ "$RC" -eq 1 ] || fail "validate-$platform.sh without the alias exited $RC"
+    file=$(entry_file "$root/record-missing-alias" binary-identity)
+    [ "$(status_after "$file" "cmp $bin/stellar-agent $bin/stellar-agent-mcp")" = "status: failed (an installed name is missing)" ] ||
+      fail "validate-$platform.sh records a missing alias as: $(cat "$file")"
+    grep -qx 'identity: failed' "$file" || fail "validate-$platform.sh missing alias identity: $(cat "$file")"
+    cp "$bin/stellar-agent" "$bin/stellar-agent-mcp"
+
+    if [ "$platform" = macos ]; then
+      for mode in failed absent empty duplicate unequal; do
+        case "$mode" in
+          failed) label="status: failed (codesign exited 1)" ;;
+          unequal) label="status: failed (the CDHash values differ)" ;;
+          *) label="status: failed (no single nonempty CDHash)" ;;
+        esac
+        echo "$mode" >"$root/hash-mode"
+        run_validation "$script" "$root" a "hash-$mode"
+        [ "$RC" -eq 1 ] || fail "validate-macos.sh in hash mode $mode exited $RC"
+        file=$(entry_file "$root/record-hash-$mode" binary-identity)
+        grep -qxF "$label" "$file" || fail "macos hash mode $mode records: $(cat "$file")"
+        grep -qx 'identity: failed' "$file" || fail "macos hash mode $mode identity: $(cat "$file")"
+        if grep -qx 'identity: ok' "$file"; then
+          fail "macos hash mode $mode records an identity"
+        fi
+      done
+      echo equal >"$root/hash-mode"
+    fi
+    rm -f "$root/key.pem"
+  done
+}
+
 CASES="wrapper_refuses_unlisted_verb
 wrapper_refuses_foreign_home_owner
 wrapper_eligibility_follows_nonce
@@ -2895,12 +3347,20 @@ wrappers_share_identical_checks
 bootstrap_refuses_without_root
 bootstrap_renders_exact_sudoers
 bootstrap_refuses_test_helpers_binary
+bootstrap_single_source_installs_one_executable
+bootstrap_lock_and_pair_checks
+bootstrap_reports_lock_failures
+mcp_launch_requires_one_executable
+mcp_launch_reports_pair_refusals
+mcp_launch_then_bootstrap
+mcp_launch_refuses_an_interrupted_upgrade
 bootstrap_refuses_directory_destinations
 bootstrap_takes_no_secret
 bootstrap_rerun_converges
 bootstrap_rerun_refuses_admin_account
 validation_scripts_record_every_item
-validation_read_needs_denial_evidence"
+validation_read_needs_denial_evidence
+validation_records_binary_identity"
 
 main() {
   local selected=$CASES name passed=0 total=0 failures="" rc platform

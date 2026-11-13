@@ -12,6 +12,19 @@ make_binary() {
   printf '#!/usr/bin/env bash\nprintf "stub 1\\n%s%s\\n"\n' "$prefix" "${2:-off}" > "$1"
   chmod +x "$1"
 }
+# A binary whose report depends on its invocation name: the canonical name
+# reports $2 and the stellar-agent-mcp name reports the other state. Its file
+# holds only the $2 literal, so equal copies pass every check but the alias
+# marker run.
+make_name_sensitive() {
+  local opposite=on
+  [ "$2" != on ] || opposite=off
+  mkdir -p "$(dirname "$1")"
+  # shellcheck disable=SC2016 # The stub body expands when the stub runs.
+  printf '#!/usr/bin/env bash\ncase "${0##*/}" in\n  stellar-agent-mcp*) printf "stub 1\\n%s%%s\\n" "%s""%s" ;;\n  *) printf "stub 1\\n%s%s\\n" ;;\nesac\n' \
+    "$prefix" "${opposite:0:1}" "${opposite:1}" "$prefix" "$2" > "$1"
+  chmod +x "$1"
+}
 expect() {
   local name=$1 wanted=$2 rc=0
   shift 2
@@ -39,25 +52,31 @@ attempts() {
   rm "$tmp/count"
 }
 
-# Package verification builds the binaries into the shared target directory.
+# Package verification builds the canonical executable into the shared target
+# directory; the check derives the alias from it.
 target_dir="$tmp/target"
 cli="$target_dir/debug/stellar-agent"
-mcp="$target_dir/debug/stellar-agent-mcp"
 make_binary "$cli"
-make_binary "$mcp"
 touch -t 200001010000 "$tmp/start"
 check=(bash .github/scripts/check-packaged-markers.sh "$target_dir" "$tmp/start" off)
 expect package-fresh 0 "${check[@]}"
+expect_output package-fresh "$target_dir/debug/stellar-agent is off"
+expect_output package-fresh "/stellar-agent-mcp is off"
 expect package-start-missing 1 bash .github/scripts/check-packaged-markers.sh "$target_dir" "$tmp/missing" off
 expect_output package-start "missing start timestamp"
 expect package-usage 2 bash .github/scripts/check-packaged-markers.sh "$target_dir"
 expect_output package-usage "usage: check-packaged-markers.sh"
-mv "$mcp" "$tmp/mcp"
+mv "$cli" "$tmp/cli"
 expect package-binary-missing 1 "${check[@]}"
-expect_output package-binary-missing "expected one verification binary for stellar-agent-mcp, found 0"
-mv "$tmp/mcp" "$mcp"
+expect_output package-binary-missing "expected one verification binary for stellar-agent, found 0"
+mv "$tmp/cli" "$cli"
+# A leftover alias in the target directory is never a candidate.
+make_binary "$target_dir/debug/stellar-agent-mcp" on
+expect package-ignores-alias 0 "${check[@]}"
+rm "$target_dir/debug/stellar-agent-mcp"
 touch -t 199901010000 "$cli"
 expect package-stale 1 "${check[@]}"
+expect_output package-stale "stale stellar-agent"
 make_binary "$cli"
 # Both candidates sit where package verification puts binaries, so only the
 # count can fail the check.
@@ -70,35 +89,171 @@ mv "$cli" "$target_dir/x86_64-unknown-linux-gnu/debug/stellar-agent"
 expect package-location 1 "${check[@]}"
 expect_output package-location "outside $target_dir/debug"
 mv "$target_dir/x86_64-unknown-linux-gnu/debug/stellar-agent" "$cli"
-make_binary "$mcp" on
+make_binary "$cli" on
 expect package-state 1 "${check[@]}"
-make_binary "$mcp"
+# The canonical name passes, so only the derived alias can fail the check.
+make_name_sensitive "$cli" off
+expect package-alias-state 1 "${check[@]}"
+expect_output package-alias-state "$target_dir/debug/stellar-agent is off"
+make_binary "$cli"
+# A cp first on PATH that appends a comment line to every copy at an alias
+# or alias-temporary name. The copy still runs and reports the right state,
+# so only the byte comparison can refuse it.
+corrupt="$tmp/corrupt-bin"
+mkdir -p "$corrupt"
+cat > "$corrupt/cp" <<'STUB'
+#!/usr/bin/env bash
+/bin/cp "$@" || exit
+dest=${*: -1}
+case "${dest##*/}" in
+  stellar-agent-mcp* | .stellar-agent-mcp.*) printf '# corrupted copy\n' >> "$dest" ;;
+esac
+STUB
+chmod +x "$corrupt/cp"
+expect package-copy-differs 1 env PATH="$corrupt:$PATH" "${check[@]}"
+expect_output package-copy-differs "cmp: EOF on"
 
+# Fixture archives hold the release layout: one directory with README.md,
+# LICENSE, and the executable under both names.
 stem=stellar-agent-1.0.0-x86_64-unknown-linux-gnu
 mkdir "$tmp/$stem"
-cp "$cli" "$tmp/$stem/stellar-agent"
-cp "$mcp" "$tmp/$stem/stellar-agent-mcp"
-tar -cJf "$tmp/$stem.tar.xz" -C "$tmp" "$stem"
+printf 'readme\n' > "$tmp/$stem/README.md"
+printf 'license\n' > "$tmp/$stem/LICENSE"
+# Places $1 under both names as equal regular files and packs the archive.
+pack_equal() {
+  cp "$1" "$tmp/$stem/stellar-agent"
+  rm -f "$tmp/$stem/stellar-agent-mcp"
+  cp "$1" "$tmp/$stem/stellar-agent-mcp"
+  tar -cJf "$tmp/$stem.tar.xz" -C "$tmp" "$stem"
+}
+pack_equal "$cli"
 archive=(bash .github/scripts/release/verify-archive.sh "$tmp" 1.0.0)
 expect archive-markers 0 "${archive[@]}" x86_64-unknown-linux-gnu off
+expect_output archive-markers "/stellar-agent is off"
+expect_output archive-markers "/stellar-agent-mcp is off"
 expect archive-state 1 "${archive[@]}" x86_64-unknown-linux-gnu on
 expect archive-usage 2 "${archive[@]}"
 expect_output archive-usage "usage: verify-archive.sh"
-# The CLI binary passes, so only the MCP binary can fail the check.
-make_binary "$tmp/$stem/stellar-agent-mcp" on
+# Equal copies whose canonical name passes, so only the alias run can fail.
+make_name_sensitive "$tmp/name-sensitive" off
+pack_equal "$tmp/name-sensitive"
+expect archive-alias-state 1 "${archive[@]}" x86_64-unknown-linux-gnu off
+expect_output archive-alias-state "/stellar-agent is off"
+# Two regular files with different bytes, each reporting the right state.
+pack_equal "$cli"
+printf '# differs\n' >> "$tmp/$stem/stellar-agent-mcp"
 tar -cJf "$tmp/$stem.tar.xz" -C "$tmp" "$stem"
-expect archive-mcp 1 "${archive[@]}" x86_64-unknown-linux-gnu off
-expect_output archive-mcp "/stellar-agent is off"
+expect archive-unequal 1 "${archive[@]}" x86_64-unknown-linux-gnu off
+expect_output archive-unequal "stellar-agent and stellar-agent-mcp differ"
+# A symbolic link under the alias name.
+rm "$tmp/$stem/stellar-agent-mcp"
+ln -s stellar-agent "$tmp/$stem/stellar-agent-mcp"
+tar -cJf "$tmp/$stem.tar.xz" -C "$tmp" "$stem"
+expect archive-symlink 1 "${archive[@]}" x86_64-unknown-linux-gnu off
+expect_output archive-symlink "stellar-agent-mcp is not a regular file"
+# A hard link: the archive stores one name as a link to the other.
+rm "$tmp/$stem/stellar-agent-mcp"
+ln "$tmp/$stem/stellar-agent" "$tmp/$stem/stellar-agent-mcp"
+tar -cJf "$tmp/$stem.tar.xz" -C "$tmp" "$stem"
+expect archive-hardlink 1 "${archive[@]}" x86_64-unknown-linux-gnu off
+expect_output archive-hardlink "stellar-agent has more than one link"
+pack_equal "$cli"
 
 for literal in STELLAR_AGENT_HOME STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE; do
-  make_binary "$tmp/$stem/stellar-agent-mcp"
-  printf '# %s\n' "$literal" >> "$tmp/$stem/stellar-agent-mcp"
-  tar -cJf "$tmp/$stem.tar.xz" -C "$tmp" "$stem"
+  make_binary "$tmp/override"
+  printf '# %s\n' "$literal" >> "$tmp/override"
+  pack_equal "$tmp/override"
   expect "archive-test-override-$literal" 1 "${archive[@]}" x86_64-unknown-linux-gnu off
   expected_literal=$literal
   [ "$literal" != STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE ] || expected_literal=STELLAR_AGENT_TEST_
   expect_output "archive-test-override-$literal" "marker: test override literal $expected_literal is embedded"
 done
+pack_equal "$cli"
+
+# The signing action derives the alias from the signed canonical file.
+derive=(bash .github/actions/macos-sign-notarize/derive-alias.sh)
+signed="$tmp/signed"
+mkdir "$signed"
+make_binary "$signed/stellar-agent"
+chmod 0751 "$signed/stellar-agent"
+expect derive-ordinary 0 "${derive[@]}" "$signed" ''
+cmp "$signed/stellar-agent" "$signed/stellar-agent-mcp"
+if [ -L "$signed/stellar-agent-mcp" ] || [ -z "$(find "$signed/stellar-agent-mcp" -links 1 -perm 0751)" ]; then
+  echo 'FAIL derive-ordinary: the alias is not a single-link copy with the canonical mode' >&2
+  exit 1
+fi
+printf 'stale alias\n' > "$signed/stellar-agent-mcp"
+expect derive-replaces 0 "${derive[@]}" "$signed" ''
+cmp "$signed/stellar-agent" "$signed/stellar-agent-mcp"
+if [ "$(find "$signed" -name '.stellar-agent-mcp.*' | wc -l)" -ne 0 ]; then
+  echo 'FAIL derive-replaces: a temporary file is left' >&2
+  exit 1
+fi
+make_binary "$signed/stellar-agent.exe"
+expect derive-exe 0 "${derive[@]}" "$signed" .exe
+cmp "$signed/stellar-agent.exe" "$signed/stellar-agent-mcp.exe"
+expect derive-usage 2 "${derive[@]}" "$signed"
+expect_output derive-usage "usage: derive-alias.sh"
+expect derive-suffix 2 "${derive[@]}" "$signed" .bin
+mv "$signed/stellar-agent" "$tmp/signed-canonical"
+expect derive-missing 1 "${derive[@]}" "$signed" ''
+expect_output derive-missing "stellar-agent is not a regular file"
+ln -s "$tmp/signed-canonical" "$signed/stellar-agent"
+expect derive-symlink 1 "${derive[@]}" "$signed" ''
+expect_output derive-symlink "stellar-agent is not a regular file"
+rm "$signed/stellar-agent"
+ln "$tmp/signed-canonical" "$signed/stellar-agent"
+printf 'kept alias\n' > "$signed/stellar-agent-mcp"
+expect derive-hardlink 1 "${derive[@]}" "$signed" ''
+expect_output derive-hardlink "stellar-agent has more than one link"
+if [ "$(cat "$signed/stellar-agent-mcp")" != 'kept alias' ]; then
+  echo 'FAIL derive-hardlink: the refusal changed the alias' >&2
+  exit 1
+fi
+rm "$signed/stellar-agent" "$signed/stellar-agent-mcp"
+cp "$tmp/signed-canonical" "$signed/stellar-agent"
+# A directory link at the alias name refuses and receives nothing.
+mkdir -p "$tmp/derive-victimdir"
+ln -s "$tmp/derive-victimdir" "$signed/stellar-agent-mcp"
+expect derive-directory-link 1 "${derive[@]}" "$signed" ''
+expect_output derive-directory-link "stellar-agent-mcp is not a regular file"
+if [ -n "$(ls -A "$tmp/derive-victimdir")" ]; then
+  echo 'FAIL derive-directory-link: the linked directory received a file' >&2
+  exit 1
+fi
+rm "$signed/stellar-agent-mcp"
+# A file link at the alias name, even to the canonical file, refuses.
+ln -s "$signed/stellar-agent" "$signed/stellar-agent-mcp"
+expect derive-file-link 1 "${derive[@]}" "$signed" ''
+expect_output derive-file-link "stellar-agent-mcp is not a regular file"
+if [ ! -L "$signed/stellar-agent-mcp" ]; then
+  echo 'FAIL derive-file-link: the refusal replaced the link' >&2
+  exit 1
+fi
+rm "$signed/stellar-agent-mcp"
+# A directory link that appears at the alias name after the check is
+# replaced by the rename. A copy of the script whose cp plants that link
+# stands in for the race.
+mkdir -p "$tmp/derive-race"
+cat > "$tmp/derive-race/cp" <<'STUB'
+#!/bin/bash
+/bin/cp "$@" || exit
+rm -f "$RACE_LINK"
+ln -s "$RACE_VICTIM" "$RACE_LINK"
+STUB
+chmod +x "$tmp/derive-race/cp"
+sed "s#/bin/cp -p#$tmp/derive-race/cp -p#" .github/actions/macos-sign-notarize/derive-alias.sh > "$tmp/derive-race/derive-alias.sh"
+if [ "$(grep -c "$tmp/derive-race/cp -p" "$tmp/derive-race/derive-alias.sh")" -ne 1 ]; then
+  echo 'FAIL derive-directory-race: the copy of derive-alias.sh does not use the racing cp' >&2
+  exit 1
+fi
+expect derive-directory-race 0 env RACE_LINK="$signed/stellar-agent-mcp" RACE_VICTIM="$tmp/derive-victimdir" \
+  bash "$tmp/derive-race/derive-alias.sh" "$signed" ''
+if [ -n "$(ls -A "$tmp/derive-victimdir")" ] || [ -L "$signed/stellar-agent-mcp" ] ||
+  ! cmp -s "$signed/stellar-agent" "$signed/stellar-agent-mcp"; then
+  echo 'FAIL derive-directory-race: the raced directory link was followed' >&2
+  exit 1
+fi
 
 # The Windows archive is a ZIP that the stub 7z extracts.
 mkdir "$tmp/bin" "$tmp/runner"
@@ -117,7 +272,9 @@ STUB
 chmod +x "$tmp/bin/7z"
 windows=stellar-agent-1.0.0-x86_64-pc-windows-msvc
 make_binary "$tmp/$windows/stellar-agent.exe"
-make_binary "$tmp/$windows/stellar-agent-mcp.exe"
+cp "$tmp/$windows/stellar-agent.exe" "$tmp/$windows/stellar-agent-mcp.exe"
+printf 'readme\n' > "$tmp/$windows/README.md"
+printf 'license\n' > "$tmp/$windows/LICENSE"
 python3 - "$tmp/$windows.zip" "$tmp" "$windows" <<'PY'
 import pathlib, sys, zipfile
 root = pathlib.Path(sys.argv[2])
@@ -126,19 +283,21 @@ with zipfile.ZipFile(sys.argv[1], 'w') as archive:
         archive.write(path, path.relative_to(root).as_posix())
 PY
 expect archive-windows 0 env PATH="$tmp/bin:$PATH" "${archive[@]}" x86_64-pc-windows-msvc off
+expect_output archive-windows "/stellar-agent.exe is off"
 expect_output archive-windows "/stellar-agent-mcp.exe is off"
 
 cat > "$tmp/bin/cargo" <<'STUB'
 #!/usr/bin/env bash
 # The first four calls report the version missing from the registry, as
-# cargo does while the index lags; later calls install the binary of their
-# package from INSTALL_STATE.
+# cargo does while the index lags; later calls install the stellar-agent
+# executable from INSTALL_STATE. Only stellar-agent-cli is an install package.
 set -euo pipefail
 count=0
 [ ! -f "$INSTALL_STATE/count" ] || read -r count < "$INSTALL_STATE/count"
 count=$((count + 1))
 echo "$count" > "$INSTALL_STATE/count"
 [ "$1" = install ] && [ "$2" = --locked ] && [ "$3" = --version ] && [ "$4" = 1.0.0 ] || exit 2
+[ "$5" = stellar-agent-cli ] && [ "$6" = --root ] && [ "$#" -eq 7 ] || exit 3
 if [ "${INSTALL_ERROR:-0}" = 1 ]; then
   echo "error: failed to compile \`$5\`" >&2
   exit 101
@@ -148,26 +307,110 @@ if [ "${INSTALL_FAIL:-0}" = 1 ] || [ "$count" -lt 5 ]; then
   exit 101
 fi
 mkdir -p "$7/bin"
-cp "$INSTALL_STATE/$5" "$7/bin/$( [ "$5" = stellar-agent-cli ] && echo stellar-agent || echo stellar-agent-mcp )"
+cp "$INSTALL_STATE/stellar-agent" "$7/bin/stellar-agent"
 STUB
 printf '#!/usr/bin/env bash\nexit 0\n' > "$tmp/bin/sleep"
 chmod +x "$tmp/bin/cargo" "$tmp/bin/sleep"
-cp "$cli" "$tmp/stellar-agent-cli"
-cp "$mcp" "$tmp/stellar-agent-mcp"
+cp "$cli" "$tmp/stellar-agent"
 export INSTALL_STATE="$tmp" RUNNER_TEMP="$tmp/runner"
 install=(env PATH="$tmp/bin:$PATH" bash .github/scripts/release/verify-install.sh)
+# One package: four registry misses, then the fifth and last attempt installs.
 expect install-retry 0 "${install[@]}" v1.0.0 off
-attempts install-retry 6
+attempts install-retry 5
+expect_output install-retry "/bin/stellar-agent is off"
+expect_output install-retry "/bin/stellar-agent-mcp is off"
+cmp "$RUNNER_TEMP/verify-install/bin/stellar-agent" "$RUNNER_TEMP/verify-install/bin/stellar-agent-mcp"
 expect install-bounded 1 env INSTALL_FAIL=1 "${install[@]}" v1.0.0 off
 attempts install-bounded 5
 expect install-other-error 1 env INSTALL_ERROR=1 "${install[@]}" v1.0.0 off
 attempts install-other-error 1
 expect install-state 1 "${install[@]}" v1.0.0 on
-attempts install-state 6
-# The CLI binary passes, so only the MCP binary can fail the check.
-make_binary "$tmp/stellar-agent-mcp" on
-expect install-mcp 1 "${install[@]}" v1.0.0 off
-expect_output install-mcp "/stellar-agent is off"
+attempts install-state 5
+# The canonical name passes, so only the derived alias can fail the check.
+make_name_sensitive "$tmp/stellar-agent" off
+expect install-alias-state 1 "${install[@]}" v1.0.0 off
+expect_output install-alias-state "/stellar-agent is off"
+rm "$tmp/count"
+cp "$cli" "$tmp/stellar-agent"
+# A changed copy fails the comparison even though both names report off.
+expect install-copy-differs 1 env PATH="$corrupt:$tmp/bin:$PATH" bash .github/scripts/release/verify-install.sh v1.0.0 off
+expect_output install-copy-differs "cmp: EOF on"
+rm "$tmp/count"
+# A link planted at the former fixed temporary name is never followed: the
+# victim keeps its bytes and the alias is a new equal file.
+installed="$RUNNER_TEMP/verify-install/bin"
+printf 'victim\n' > "$tmp/victim"
+mkdir -p "$tmp/victimdir"
+ln -s "$tmp/victim" "$installed/.stellar-agent-mcp.tmp"
+expect install-links 0 "${install[@]}" v1.0.0 off
+if [ "$(cat "$tmp/victim")" != victim ] || [ -L "$installed/stellar-agent-mcp" ] ||
+  ! cmp -s "$installed/stellar-agent" "$installed/stellar-agent-mcp"; then
+  echo 'FAIL install-links: a planted link was followed or the alias is not an equal file' >&2
+  exit 1
+fi
+if [ "$(find "$installed" -name '.stellar-agent-mcp.?*' ! -name '.stellar-agent-mcp.tmp' | wc -l)" -ne 0 ]; then
+  echo 'FAIL install-links: a temporary file is left' >&2
+  exit 1
+fi
+rm "$installed/.stellar-agent-mcp.tmp" "$tmp/count"
+# A directory link at the alias name refuses and receives nothing.
+rm -f "$installed/stellar-agent-mcp"
+ln -s "$tmp/victimdir" "$installed/stellar-agent-mcp"
+expect install-directory-link 1 "${install[@]}" v1.0.0 off
+expect_output install-directory-link "stellar-agent-mcp is not a regular file"
+if [ -n "$(ls -A "$tmp/victimdir")" ]; then
+  echo 'FAIL install-directory-link: the linked directory received a file' >&2
+  exit 1
+fi
+rm "$installed/stellar-agent-mcp" "$tmp/count"
+# A file link at the alias name, even to the canonical file, refuses and the
+# canonical file keeps its bytes.
+cp "$installed/stellar-agent" "$tmp/canonical.before"
+ln -s "$installed/stellar-agent" "$installed/stellar-agent-mcp"
+expect install-file-link 1 "${install[@]}" v1.0.0 off
+expect_output install-file-link "stellar-agent-mcp is not a regular file"
+if [ ! -L "$installed/stellar-agent-mcp" ] || ! cmp -s "$installed/stellar-agent" "$tmp/canonical.before"; then
+  echo 'FAIL install-file-link: the link was replaced or the canonical file changed' >&2
+  exit 1
+fi
+rm "$installed/stellar-agent-mcp" "$tmp/count"
+# A directory link that appears at the alias name after the check, while the
+# copy runs, is replaced by the rename and receives nothing.
+race="$tmp/race-bin"
+mkdir -p "$race"
+cat > "$race/cp" <<'STUB'
+#!/usr/bin/env bash
+/bin/cp "$@" || exit
+case "${*: -1}" in
+  */.stellar-agent-mcp.*) rm -f "$RACE_LINK"; ln -s "$RACE_VICTIM" "$RACE_LINK" ;;
+esac
+STUB
+chmod +x "$race/cp"
+expect install-directory-race 0 env PATH="$race:$tmp/bin:$PATH" RACE_LINK="$installed/stellar-agent-mcp" \
+  RACE_VICTIM="$tmp/victimdir" bash .github/scripts/release/verify-install.sh v1.0.0 off
+if [ -n "$(ls -A "$tmp/victimdir")" ] || [ -L "$installed/stellar-agent-mcp" ] ||
+  ! cmp -s "$installed/stellar-agent" "$installed/stellar-agent-mcp"; then
+  echo 'FAIL install-directory-race: the raced directory link was followed' >&2
+  exit 1
+fi
+rm "$tmp/count"
+# The install log is never a fixed path: a link planted at the former log
+# path keeps its victim unchanged, and no log directory stays behind.
+if [ -e "$RUNNER_TEMP/verify-install.log" ] || [ -L "$RUNNER_TEMP/verify-install.log" ]; then
+  echo 'FAIL install-log-link: the earlier installs wrote the fixed log path' >&2
+  exit 1
+fi
+ln -s "$tmp/victim" "$RUNNER_TEMP/verify-install.log"
+expect install-log-link 0 "${install[@]}" v1.0.0 off
+if [ "$(cat "$tmp/victim")" != victim ]; then
+  echo 'FAIL install-log-link: the planted log link was followed' >&2
+  exit 1
+fi
+if [ "$(find "$RUNNER_TEMP" -maxdepth 1 -name 'verify-install-log.*' | wc -l)" -ne 0 ]; then
+  echo 'FAIL install-log-link: a log directory is left' >&2
+  exit 1
+fi
+rm "$RUNNER_TEMP/verify-install.log" "$tmp/count"
 expect install-tag 2 "${install[@]}" invalid off
 expect_output install-tag "does not match"
 expect install-usage 2 "${install[@]}" v1.0.0

@@ -36,7 +36,10 @@ Each unit is split into commands at `&&`, `||`, `;`, and `|`. A crate name
 matches only when neither a word character nor `-` adjoins it, so
 `stellar-agent-mcp-macros` is not `stellar-agent-mcp`.
 
-Rule 1, locked installs:
+Rule 1, locked installs of the CLI package:
+- No `cargo install` or `cargo binstall` command names `stellar-agent-mcp`,
+  alone or beside `stellar-agent-cli`. That package is a library with no
+  executable; `stellar-agent-cli` installs the `stellar-agent` executable.
 - A `cargo install` command that names `stellar-agent-cli`,
   `stellar-agent-mcp`, or `Soneso/stellar-agent-wallet` passes `--locked`.
 - A `cargo binstall` command that names one of them passes `--locked` and
@@ -85,9 +88,12 @@ outcome:
 - the next Markdown heading, of any level, or the end of the file: violation.
 A paragraph that follows a heading is not the paragraph after the block.
 
-Rule 4, binstall metadata: in both wallet crate manifests,
-`package.metadata.binstall` equals EXPECTED_BINSTALL exactly, so a changed,
-missing, or extra key or override table fails. Both manifests set
+Rule 4, binstall metadata: in the CLI manifest, `package.metadata.binstall`
+equals EXPECTED_BINSTALL exactly, so a changed, missing, or extra key or
+override table fails. The MCP manifest is a library: it declares no
+`[[bin]]` target and no `package.metadata.binstall`, and unless it sets
+`autobins = false`, its directory holds no `src/main.rs` or `src/bin`, which
+Cargo would build as executables. Both manifests set
 `package.repository` to `{ workspace = true }`, and the root
 `[workspace.package].repository` equals EXPECTED_REPOSITORY, which binstall's
 `{ repo }` template expands to.
@@ -113,10 +119,12 @@ from dataclasses import dataclass, field
 from typing import NoReturn
 
 EXPECTED_REPOSITORY = "https://github.com/Soneso/stellar-agent-wallet"
-WALLET_MANIFESTS = (
-    "crates/stellar-agent-cli/Cargo.toml",
-    "crates/stellar-agent-mcp/Cargo.toml",
-)
+CLI_MANIFEST = "crates/stellar-agent-cli/Cargo.toml"
+MCP_MANIFEST = "crates/stellar-agent-mcp/Cargo.toml"
+WALLET_MANIFESTS = (CLI_MANIFEST, MCP_MANIFEST)
+# The source paths Cargo turns into executable targets unless the package
+# sets autobins = false.
+IMPLICIT_EXECUTABLES = ("src/main.rs", "src/bin")
 EXPECTED_BINSTALL = {
     "pkg-url": (
         "{ repo }/releases/download/v{ version }/stellar-agent-{ version }-{ target }.tar.xz"
@@ -140,6 +148,8 @@ WALLET_TARGET = re.compile(
     r"(?<![\w-])(?:stellar-agent-cli|stellar-agent-mcp)(?![\w-])"
     r"|Soneso/stellar-agent-wallet(?![\w-])"
 )
+# The MCP library package, which no install command may name.
+LIBRARY_PACKAGE = re.compile(r"(?<![\w-])stellar-agent-mcp(?![\w-])")
 CARGO_INSTALL = re.compile(r"(?<![\w-])cargo\s+install(?![\w-])")
 CARGO_BINSTALL = re.compile(r"(?<![\w-])cargo\s+binstall(?![\w-])")
 CARGO_BUILD = re.compile(r"(?<![\w-])cargo\s+build(?![\w-])")
@@ -466,6 +476,12 @@ def check_rule_1(document: Document, report: Report) -> None:
     for number, command in command_units(document):
         if not WALLET_TARGET.search(command):
             continue
+        if (CARGO_INSTALL.search(command) or CARGO_BINSTALL.search(command)) and LIBRARY_PACKAGE.search(command):
+            message = (
+                "install command names the library package stellar-agent-mcp, which has no "
+                f"executable; install stellar-agent-cli: {command}"
+            )
+            report.add(document.path, number, "1", message)
         if CARGO_INSTALL.search(command) and not LOCKED.search(command):
             message = f"`cargo install` of a wallet crate without --locked: {command}"
             report.add(document.path, number, "1", message)
@@ -603,11 +619,29 @@ def check_rule_4(root: pathlib.Path, workspace: dict, report: Report) -> None:
                 "expected { workspace = true }"
             )
             report.add(manifest, None, "4", message)
-        binstall = package.get("metadata", {}).get("binstall")
-        if binstall != EXPECTED_BINSTALL:
-            prefix = "package.metadata.binstall"
-            for difference in table_differences(prefix, binstall, EXPECTED_BINSTALL):
-                report.add(manifest, None, "4", difference)
+    cli = load_toml(root, CLI_MANIFEST).get("package", {})
+    binstall = cli.get("metadata", {}).get("binstall")
+    if binstall != EXPECTED_BINSTALL:
+        prefix = "package.metadata.binstall"
+        for difference in table_differences(prefix, binstall, EXPECTED_BINSTALL):
+            report.add(CLI_MANIFEST, None, "4", difference)
+    check_library_package(root, report)
+
+
+def check_library_package(root: pathlib.Path, report: Report) -> None:
+    """The MCP package is a library: no executable target and no binstall metadata."""
+    manifest = load_toml(root, MCP_MANIFEST)
+    package = manifest.get("package", {})
+    if "bin" in manifest:
+        report.add(MCP_MANIFEST, None, "4", "declares a [[bin]] target; the package is a library")
+    if "binstall" in package.get("metadata", {}):
+        report.add(MCP_MANIFEST, None, "4", "package.metadata.binstall is present; the package is a library")
+    if package.get("autobins") is not False:
+        directory = (root / MCP_MANIFEST).parent
+        for relative in IMPLICIT_EXECUTABLES:
+            if (directory / relative).exists():
+                message = f"{relative} is an implicit executable target; the package is a library"
+                report.add(MCP_MANIFEST, None, "4", message)
 
 
 def table_differences(prefix: str, actual: object, expected: object) -> list[str]:

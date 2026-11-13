@@ -149,11 +149,14 @@ The `release-publish-sums` rule requires an unconditional checksum check before
 publication. The archives under `all-artifacts` must equal `SHA256SUMS` by
 name, count, and digest.
 
-The `sign-macos` job receives the unsigned binaries as a tar.
-`.github/scripts/validate-unsigned-archive.py` refuses the tar unless it holds
-exactly the two binaries as regular files, each a thin Mach-O executable for
-the target. The job then signs, notarizes, and packs the archive through the
-composite action in `.github/actions/macos-sign-notarize/`.
+The build copies `stellar-agent` to `stellar-agent-mcp` and compares the
+bytes, so the `sign-macos` job receives one executable under two names as a
+tar. `.github/scripts/validate-unsigned-archive.py` refuses the tar unless it
+holds exactly those two names as regular files with equal bytes, each a thin
+Mach-O executable for the target. The job then signs `stellar-agent`, copies
+the signed file to `stellar-agent-mcp` with `derive-alias.sh`, notarizes both,
+verifies both signatures, and packs the archive through the composite action
+in `.github/actions/macos-sign-notarize/`.
 
 The Windows build leg links libsodium from `libsodium-1.0.22-stable-msvc.zip`,
 and `.github/scripts/release/sodium.sh` pins its SHA-256 in

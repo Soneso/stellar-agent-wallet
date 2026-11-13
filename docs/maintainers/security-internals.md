@@ -1728,7 +1728,7 @@ attempt begins after the intent mint and before the signature. Its exposure
 names the intent authorization, the signed entries' digest and their
 expiration ledger. The exposure commits after the intent consumption and
 before the signed re-simulation. A returned payload ends it as `payload_released`. The
-dispatch-time reconciliation pass of both binaries applies the expiry edges
+dispatch-time reconciliation pass of the CLI and the MCP server applies the expiry edges
 once on a mainnet profile, before any work reads a record.
 
 The operator clear moves `sent_outcome_unknown` to `cancelled` and writes the

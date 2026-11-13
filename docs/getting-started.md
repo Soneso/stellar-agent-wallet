@@ -60,16 +60,36 @@ reads secret keys from a named environment variable, not from the command line.
 
 The declared install path is [`cargo binstall`](https://github.com/cargo-bins/cargo-binstall)
 from GitHub release archives. `cargo binstall` resolves the crate on crates.io
-and downloads the prebuilt archive from the tagged release assets. A single
-release archive carries both binaries:
+and downloads the prebuilt archive from the tagged release assets. One
+executable, `stellar-agent`, holds the CLI and the MCP server. A release
+archive carries it under two names:
 
 - Archive name: `stellar-agent-<version>-<target>.tar.xz` (`.zip` on Windows).
 - Top-level folder on every platform: `stellar-agent-<version>-<target>/`.
-- Binaries inside that folder: `stellar-agent` and `stellar-agent-mcp` (`.exe` on Windows).
+- Files inside that folder: `stellar-agent` and `stellar-agent-mcp`, byte-equal
+  copies of one executable (`.exe` on Windows).
 
 ```bash
-cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.13 stellar-agent-mcp@0.1.0-alpha.13
+cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.13
 ```
+
+`cargo binstall` installs the canonical name `stellar-agent` only. The
+executable runs the MCP server as `stellar-agent mcp serve`, and also when it
+runs under the file name `stellar-agent-mcp`. For MCP clients configured with
+`stellar-agent-mcp`,
+copy the installed executable:
+
+```bash
+cp ~/.cargo/bin/stellar-agent ~/.cargo/bin/stellar-agent-mcp
+```
+
+On Windows, in PowerShell:
+
+```powershell
+Copy-Item "$env:USERPROFILE\.cargo\bin\stellar-agent.exe" "$env:USERPROFILE\.cargo\bin\stellar-agent-mcp.exe"
+```
+
+Repeat the copy after each upgrade, so both names keep equal bytes.
 
 While crates.io holds only prerelease (alpha) versions, spell out the version.
 A bare crate name matches stable versions only. Each tagged release publishes
@@ -157,15 +177,19 @@ download, and you can repeat the `spctl` check on another Mac.
 
 ### cargo install (from crates.io)
 
-Builds the binaries from the sources published on crates.io and places them on
-your `PATH`; the `stellar-agent-cli` crate installs the binary named
+Builds the executable from the sources published on crates.io and places it on
+your `PATH`; the `stellar-agent-cli` crate installs the executable named
 `stellar-agent`:
 
 ```bash
-cargo install --locked stellar-agent-cli@0.1.0-alpha.13 stellar-agent-mcp@0.1.0-alpha.13
+cargo install --locked stellar-agent-cli@0.1.0-alpha.13
 ```
 
 `--locked` makes cargo build with the `Cargo.lock` published in the crate.
+`stellar-agent-mcp` on crates.io is the server library this executable links;
+it installs nothing. Copy the executable to `stellar-agent-mcp` as in
+[the binstall section](#prebuilt-binaries-cargo-binstall) when an MCP client
+starts that name.
 
 ### Build from source
 
@@ -175,12 +199,11 @@ Clone the release tag and build with its committed `Cargo.lock`:
 git clone --branch v0.1.0-alpha.13 https://github.com/Soneso/stellar-agent-wallet
 cd stellar-agent-wallet
 cargo build --release --locked
+cp target/release/stellar-agent target/release/stellar-agent-mcp
 ```
 
-The build writes the two binaries to:
-
-- `target/release/stellar-agent`
-- `target/release/stellar-agent-mcp`
+The build writes the executable to `target/release/stellar-agent`, and the
+copy places the same bytes at `target/release/stellar-agent-mcp`.
 
 Builds from this repository and releases from v0.1.0-alpha.14 on carry
 `mainnet-write`. A prebuilt archive carries the state of its release, which

@@ -52,7 +52,8 @@ RULE_INPUTS = {'D5': (), 'D6': ('Cross.toml',), 'D7': (),
 VARIANTS = {'D1': 8, 'D2': 4, 'D3': 2, 'D7': 3, 'D13': 6}
 # The normal dependencies of each synthetic workspace member, in the order
 # its mainnet-write declaration forwards to them; other declares no feature.
-# The binary members cli and mcp enable mainnet-write by default.
+# The members cli and mcp enable mainnet-write by default; cli alone has an
+# executable target, and mcp is a library.
 FIXTURE_DEPENDENCIES = {
     'core': [], 'network': ['core'], 'cli': ['core', 'network', 'mcp'],
     'mcp': ['core', 'network', 'sep43', 'x402', 'x402-identity'],
@@ -74,10 +75,10 @@ SINGLE_ERRORS = {
     ('D2', 3): 'D2: stellar-agent-mcp: dev dependency enables mainnet-write',
     ('D3', 1): 'positive control lacks feature',
 }
-# The binary members of the synthetic workspace and their default.
+# The default of the synthetic cli and mcp members.
 BINARY_DEFAULT = 'default=["mainnet-write"]'
 
-# The on graph of D3's second variant: both binaries reach every declaring
+# The on graph of D3's second variant: cli and mcp reach every declaring
 # crate, and neither selects x402 itself.
 SELECTED_ON = 'cargo test -p stellar-agent-cli -p stellar-agent-mcp --features mainnet-write'
 # Build-script output D4 accepts: literal directives, a cfg that is no
@@ -121,7 +122,7 @@ def workspace(root, mutation=None):
         path = root / name
         (path / 'src').mkdir(parents=True)
         (path / 'src/lib.rs').write_text('pub fn sample() {}\n')
-        if name in ('cli', 'mcp'):
+        if name == 'cli':
             (path / 'src/main.rs').write_text('fn main() {}\n')
         dependencies = FIXTURE_DEPENDENCIES[name]
         edges = [f'stellar-agent-{dep}/mainnet-write' for dep in dependencies]
@@ -795,7 +796,7 @@ def case_testnet_driver_partitions(m, tmp, checker):
     assert sorted(map(str, rows)) == sorted(map(str, reviewed)), 'reviewed share inventory differs'
     for index in (1, 2):
         targets = {re.search(r'--test "([^" ]+)"', row['command'])[1]
-                   for row in rows if row['job'] == f'acceptance-{index}'}
+                   for row in rows if row['job'] == f'acceptance-{index}' and '--no-run' not in row['command']}
         assert targets == {entry['target'] for entry in full[index - 1::2]}
 
 
@@ -836,6 +837,99 @@ def case_testnet_driver_activation(m, tmp, checker):
     expected = f'D9: testnet.yml:nightly: feature activation outside allowed jobs: {m.TESTNET_DRIVER} (mainnet-write,'
     assert c.errors and all(error.startswith(expected) for error in c.errors), \
         f'testnet-driver-activation: nightly fixture accepted or wrong failure: {c.errors}'
+
+
+def prebuild_driver(m, children='"m_child" "m_child_two"', prebuild=None):
+    """A testnet acceptance driver with three MCP suites, two of them
+    child-driver suites in share 1/2, and one suite of crate b."""
+    prebuild = m.TESTNET_PREBUILD if prebuild is None else prebuild
+    return (m.TESTNET_FEATURES_FUNCTION + '\n'
+            f'CHILD_DRIVER_SUITES=(\n  {children}\n)\n'
+            'SUITES=(\n  "stellar-agent-mcp testnet-acceptance m_child"\n'
+            '  "stellar-agent-mcp testnet-acceptance m_plain"\n'
+            '  "stellar-agent-mcp testnet-acceptance m_child_two"\n'
+            '  "b testnet-integration b_testnet"\n)\n'
+            'run_suite() {\n  local crate="$1" feature="$2" target="$3" features\n'
+            f'  {m.TESTNET_FEATURES_ASSIGNMENT}\n'
+            f'  if needs_server_child "$crate" "$target"; then\n    {prebuild} 2>&1 | tee "$log"\n  fi\n'
+            '  cargo test -p "$crate" --no-default-features --features "$features" --test "$target"\n}\n')
+
+
+def prebuild_inventory(m, tmp, driver):
+    for crate, features in (('stellar-agent-mcp', 'mainnet-write = []\n'), ('b', 'other = []\n')):
+        (tmp / 'crates' / crate).mkdir(parents=True, exist_ok=True)
+        (tmp / 'crates' / crate / 'Cargo.toml').write_text('[features]\n' + features)
+    workflow = {'testnet.yml': {'jobs': {f'acceptance-{k}': {'runs-on': 'ubuntu-24.04',
+        'env': {'SHARE': f'{k}/2'}, 'steps': [{'name': 'suites', 'run': 'bash ' + m.TESTNET_DRIVER}]}
+        for k in (1, 2)}}}
+    return m.inventory(tmp, workflow, {m.TESTNET_DRIVER: driver})
+
+
+@unit('testnet-driver-prebuild')
+def case_testnet_driver_prebuild(m, tmp, checker):
+    rows = prebuild_inventory(m, tmp / 'reviewed', prebuild_driver(m))
+    prebuilds = sorted((row['job'], row['command'], row['relied_on'], tuple(row['selection']), tuple(row['features']))
+                       for row in rows if '--no-run' in row['command'])
+    pair = ('-p', 'stellar-agent-cli', '-p', 'stellar-agent-mcp')
+    assert prebuilds == [
+        ('acceptance-1', 'cargo test -p stellar-agent-cli -p "stellar-agent-mcp" --no-default-features '
+         '--features "mainnet-write,testnet-acceptance" --no-run', 'on', pair,
+         ('--no-default-features', '--features', 'mainnet-write,testnet-acceptance')),
+        ('acceptance-1', 'cargo test -p stellar-agent-cli -p "stellar-agent-mcp" --no-default-features '
+         '--features "testnet-acceptance" --no-run', 'off', pair,
+         ('--no-default-features', '--features', 'testnet-acceptance')),
+    ], f'testnet-driver-prebuild: prebuild rows {prebuilds}'
+    suites = sorted((row['job'], row['command'].split('--test ')[1].split()[0]) for row in rows if '--test ' in row['command'])
+    assert suites == [('acceptance-1', '"m_child"'), ('acceptance-1', '"m_child"'),
+                      ('acceptance-1', '"m_child_two"'), ('acceptance-1', '"m_child_two"'),
+                      ('acceptance-2', '"b_testnet"'), ('acceptance-2', '"m_plain"'), ('acceptance-2', '"m_plain"')], \
+        f'testnet-driver-prebuild: suite rows {suites}'
+    cases = [
+        ('changed prebuild', prebuild_driver(m, prebuild=m.TESTNET_PREBUILD.replace('-p stellar-agent-cli ', '')),
+         'paired prebuild differs'),
+        ('foreign child', prebuild_driver(m, children='"b_testnet"'), 'outside the MCP SUITES entries'),
+        ('empty child list', prebuild_driver(m, children=''), 'outside the MCP SUITES entries'),
+    ]
+    for label, driver, message in cases:
+        try:
+            prebuild_inventory(m, tmp / label.replace(' ', '-'), driver)
+        except Exception as error:
+            assert isinstance(error, ValueError) and message in str(error), \
+                f'testnet-driver-prebuild: {label}: {type(error).__name__}: {error}'
+        else:
+            raise AssertionError(f'testnet-driver-prebuild: {label}: accepted')
+
+
+@unit('binary-names')
+def case_binary_names(m, tmp, checker):
+    original = m.INVOCATIONS
+    m.INVOCATIONS = []
+    try:
+        c = bare_checker(m, ROOT, packages=live_packages(m))
+        with contextlib.redirect_stdout(io.StringIO()):
+            c.D3()
+        assert not c.errors, f'binary-names: the live executable targets are refused: {c.errors}'
+        for label, mutate in (
+                ('implicit', lambda r: (r / 'mcp/src/main.rs').write_text('fn main() {}\n')),
+                ('explicit', lambda r: replace(r, 'mcp/Cargo.toml', '[dependencies]\n',
+                                               '[[bin]]\nname="stellar-agent-mcp"\npath="src/lib.rs"\n[dependencies]\n'))):
+            root = tmp / label
+            workspace(root, mutate)
+            c = m.Checker(root)
+            c.workflows, c.scripts = {}, {}
+            with contextlib.redirect_stdout(io.StringIO()):
+                c.D3()
+            assert len(c.errors) == 1 and 'executable targets' in c.errors[0] and 'stellar-agent-mcp' in c.errors[0], \
+                f'binary-names: an MCP executable target is accepted ({label}): {c.errors}'
+        root = tmp / 'library'
+        workspace(root)
+        c = m.Checker(root)
+        c.workflows, c.scripts = {}, {}
+        with contextlib.redirect_stdout(io.StringIO()):
+            c.D3()
+        assert not c.errors, f'binary-names: the library-only fixture is refused: {c.errors}'
+    finally:
+        m.INVOCATIONS = original
 
 
 @unit('transitive-scripts')
@@ -1638,11 +1732,26 @@ def case_graph_binary_views(m, tmp, checker):
     views = m.binary_views(graph, row)
     assert set(graph['roots']) == set(c.packages), 'graph-binary-views: workspace selection differs'
     cli, mcp = m.PACKAGES[2:4]
-    assert views[cli]['stellar-agent-core'] == [True] and views[mcp]['stellar-agent-sep10'] == [True], views
-    assert cli not in views[mcp] and mcp in views[cli], 'graph-binary-views: CLI view lacks MCP or MCP view holds CLI'
+    assert set(views) == {cli}, f'graph-binary-views: executable views beyond the CLI: {sorted(views)}'
+    assert views[cli]['stellar-agent-core'] == [True] and views[cli]['stellar-agent-sep10'] == [True], views
+    assert mcp in views[cli] and cli not in graph['roots'][mcp], \
+        'graph-binary-views: CLI view lacks MCP or the MCP closure holds CLI'
     original = m.graph_state
     try:
-        for package in (cli, mcp):
+        # The MCP root is a library graph: its absence or an off state there
+        # reaches no executable view.
+        for absent in (True, False):
+            changed = {'all': graph['all'], 'roots': {name: dict(view) for name, view in graph['roots'].items()}}
+            if absent:
+                del changed['roots'][mcp]
+            else:
+                changed['roots'][mcp]['stellar-agent-core'] = [False]
+            m.graph_state = lambda _root, _row: changed
+            c.errors = []
+            with contextlib.redirect_stdout(io.StringIO()):
+                c.D3()
+            assert not c.errors, f'graph-binary-views: the MCP library root changes an executable view: {c.errors}'
+        for package in (cli,):
             for absent in (True, False):
                 changed = {'all': graph['all'], 'roots': {name: dict(view) for name, view in graph['roots'].items()}}
                 if absent:
@@ -1662,20 +1771,20 @@ def case_graph_binary_views(m, tmp, checker):
     c = graph_checker(m, root, command, 'on')
     graph = m.graph_state(root, m.INVOCATIONS[0])
     views = m.binary_views(graph, m.INVOCATIONS[0])
-    assert views[mcp] and views[mcp]['stellar-agent-core'] == [True], \
-        'graph-binary-views: workspace unification disappears from MCP view'
-    c = graph_checker(m, root, 'cargo build -p stellar-agent-cli --no-default-features')
+    assert views[cli]['stellar-agent-mcp'] == [True] and graph['roots'][mcp]['stellar-agent-core'] == [True], \
+        'graph-binary-views: workspace unification disappears from the CLI view or the MCP root'
+    c = graph_checker(m, root, 'cargo build -p stellar-agent-mcp --no-default-features')
     row = m.INVOCATIONS[0]
     graph = m.graph_state(root, row)
     assert graph['all']['stellar-agent-core'] == [False], 'graph-binary-views: isolated scope differs'
-    assert m.binary_views(graph, row)[mcp] is None, 'graph-binary-views: unselected MCP reports a state'
+    assert m.binary_views(graph, row)[cli] is None, 'graph-binary-views: unselected CLI reports a state'
     output = io.StringIO()
     with contextlib.redirect_stdout(output):
         c.D3()
-    assert not c.errors and 'stellar-agent-mcp: not selected' in output.getvalue(), c.errors
-    for flags, selected in (('--bin stellar-agent', {cli}), ('--lib', set()), ('--bins', {cli, mcp}),
-                            ('--test sample', {cli, mcp}), ('--tests', {cli, mcp}),
-                            ('--bench sample', {cli, mcp}), ('--benches', {cli, mcp}),
+    assert not c.errors and 'stellar-agent: not selected' in output.getvalue(), c.errors
+    for flags, selected in (('--bin stellar-agent', {cli}), ('--lib', set()), ('--bins', {cli}),
+                            ('--test sample', {cli}), ('--tests', {cli}),
+                            ('--bench sample', {cli}), ('--benches', {cli}),
                             ('--example sample', set())):
         c = graph_checker(m, root, 'cargo build --workspace --no-default-features ' + flags)
         views = m.binary_views(graph, m.INVOCATIONS[0])
@@ -1728,10 +1837,14 @@ def case_graph_host_context(m, tmp, checker):
         builds = [row for row in rows if row['workflow'] == workflow and row['source'].endswith('/release/build.sh')]
         assert sorted(row['target'] for row in builds) == sorted(RELEASE_TARGETS), f'graph-host-context: {workflow}'
         for row in builds:
-            assert row['bins'] == ['stellar-agent', 'stellar-agent-mcp'], row
+            assert row['bins'] == ['stellar-agent'], row
     host = {'ci.yml': job([{'run': 'bash .github/scripts/release/check-host.sh'}], **{'runs-on': 'macos-26'})}
     rows = m.inventory(ROOT, host, scripts)
-    assert len(rows) == 3 and all(row['target'] == RELEASE_TARGETS[3] for row in rows), 'graph-host-context: host script'
+    assert len(rows) == 2 and all(row['target'] == RELEASE_TARGETS[3] for row in rows), 'graph-host-context: host script'
+    assert sorted(row['command'] for row in rows) == [
+        'cargo build --locked -p stellar-agent-cli',
+        'cargo build --release --locked --target "aarch64-apple-darwin" --bin stellar-agent'], \
+        'graph-host-context: host script commands'
 
 
 @unit('workflow-flag-guards')
@@ -1895,16 +2008,20 @@ def case_graph_exclude_binary(m, tmp, checker):
     root = tmp / 'workspace'
     workspace(root)
     cli, mcp = m.PACKAGES[2:4]
+    c = graph_checker(m, root, f'cargo build --workspace --exclude {cli} --no-default-features')
+    row = m.INVOCATIONS[0]
+    graph = m.graph_state(root, row)
+    assert m.binary_views(graph, row) == {cli: None}, 'graph-exclude-binary: excluded CLI reports a view'
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        c.D3()
+    assert not c.errors and 'stellar-agent: not selected' in output.getvalue(), \
+        f'graph-exclude-binary: excluded binary reports a state: {c.errors}'
     c = graph_checker(m, root, f'cargo build --workspace --exclude {mcp} --no-default-features')
     row = m.INVOCATIONS[0]
     graph = m.graph_state(root, row)
     views = m.binary_views(graph, row)
-    assert views[mcp] is None and views[cli], f'graph-exclude-binary: binary selection differs: {views}'
-    output = io.StringIO()
-    with contextlib.redirect_stdout(output):
-        c.D3()
-    assert not c.errors and 'stellar-agent-mcp: not selected' in output.getvalue(), \
-        f'graph-exclude-binary: excluded binary reports a state: {c.errors}'
+    assert set(views) == {cli} and views[cli], f'graph-exclude-binary: binary selection differs: {views}'
     changed = {'all': graph['all'], 'roots': {name: view for name, view in graph['roots'].items() if name != cli}}
     original = m.graph_state
     m.graph_state = lambda _root, _row: changed
@@ -1948,8 +2065,21 @@ MUTATIONS = {
         "target = translated['target'] or 'x86_64-unknown-linux-gnu'", 'graph-host-context:'),
     'D3-one-binary': ('graph-binary-views',
         'for package, view in binary_views(graph, row).items():',
-        'for package, view in binary_views(graph, row).items():\n                if package == PACKAGES[3]:\n                    continue',
+        'for package, view in binary_views(graph, row).items():\n                if package == PACKAGES[2]:\n                    continue',
         'graph-binary-views:'),
+    'D3-mcp-binary-name': ('binary-names',
+        "BINARY_NAMES = {PACKAGES[2]: 'stellar-agent'}",
+        "BINARY_NAMES = {PACKAGES[2]: 'stellar-agent', PACKAGES[3]: 'stellar-agent-mcp'}",
+        'binary-names: the live executable targets are refused'),
+    'D3-binary-targets': ('binary-names',
+        'if executables != expected_executables:', 'if False:',
+        'binary-names: an MCP executable target is accepted'),
+    'D3-testnet-prebuild-scope': ('testnet-driver-prebuild',
+        "if prebuild and (entry['crate'] != PACKAGES[3] or entry['target'] not in children):",
+        'if False:', 'testnet-driver-prebuild: prebuild rows'),
+    'D3-testnet-prebuild-text': ('testnet-driver-prebuild',
+        "if '--no-run' in words and not prebuild:", 'if False:',
+        'testnet-driver-prebuild: changed prebuild: accepted'),
     'D3-isolate-workspace': ('graph-binary-views',
         "*translated['selection'], *translated['features']",
         "*(['-p', PACKAGES[2]] if '--workspace' in translated['selection'] else translated['selection']), *translated['features']",

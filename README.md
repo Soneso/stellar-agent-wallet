@@ -109,20 +109,35 @@ crates on crates.io. While only prerelease (alpha) versions exist,
 `cargo install` and `cargo binstall` need the version spelled out, because a
 bare crate name matches stable versions only.
 
+One executable, `stellar-agent`, holds both the CLI and the MCP server. It
+runs the server as `stellar-agent mcp serve`, and also when it runs under the
+file name `stellar-agent-mcp`. The release archives hold both names as
+byte-equal files. A package install or a source build produces
+`stellar-agent` only; MCP client configurations that name `stellar-agent-mcp`
+need a copy of the executable under that name.
+
 ### cargo binstall (prebuilt binaries)
 
-`cargo binstall` downloads the prebuilt release archive for your platform:
+`cargo binstall` downloads the prebuilt release archive for your platform and
+installs `stellar-agent`:
 
 ```bash
-cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.13 stellar-agent-mcp@0.1.0-alpha.13
+cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.13
 ```
 
 ### cargo install (from crates.io)
 
-`cargo install` builds both binaries from the sources on crates.io:
+`cargo install` builds `stellar-agent` from the sources on crates.io:
 
 ```bash
-cargo install --locked stellar-agent-cli@0.1.0-alpha.13 stellar-agent-mcp@0.1.0-alpha.13
+cargo install --locked stellar-agent-cli@0.1.0-alpha.13
+```
+
+After either install, copy the executable for clients that start
+`stellar-agent-mcp`:
+
+```bash
+cp ~/.cargo/bin/stellar-agent ~/.cargo/bin/stellar-agent-mcp
 ```
 
 ### Build from source
@@ -133,6 +148,7 @@ Clone the release tag and build with its committed `Cargo.lock`:
 git clone --branch v0.1.0-alpha.13 https://github.com/Soneso/stellar-agent-wallet.git
 cd stellar-agent-wallet
 cargo build --release --locked
+cp target/release/stellar-agent target/release/stellar-agent-mcp
 ```
 
 The CLI is also discoverable as `stellar agent ...` through the `stellar-cli`
