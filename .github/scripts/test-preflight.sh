@@ -51,7 +51,7 @@ REAL_BASH=$(command -v bash)
 REAL_PYTHON=$(python3 -c 'import sys; print(sys.executable)')
 FIXTURE="$TMP/fixture"
 
-CASES="docs-only upstream-base origin-base synced-fork-base install-surface-doc deleted-install-surface-doc welcome-workflow release-workflow
+CASES="changelog-fragments changelog-selection changelog-registry docs-only upstream-base origin-base synced-fork-base install-surface-doc deleted-install-surface-doc welcome-workflow release-workflow
 release-rehearsal-workflow vendored-wasm-workflow
 triage-workflow triage-review-workflow triage-sweep-workflow
 ci-yml-only python-check-script proof-matrix-only shell-check-script testnet-driver-script deploy-scripts deploy-scripts-run skill inbox-web enroll-web bridge-web one-crate sep43-through-mcp two-owners
@@ -83,6 +83,8 @@ EXPECTED_REGISTRY=$(
 docs-style	python3 .github/scripts/check-docs-style.py
 install-surface	python3 .github/scripts/check-install-surface.py
 gate-tool-versions	bash .github/scripts/check-gate-tool-versions.sh
+changelog	python3 .github/scripts/changelog.py check
+self-test:test-changelog.py	python3 .github/scripts/test-changelog.py
 actionlint	actionlint
 feature-discipline	cargo fetch --locked && python3 .github/scripts/check-feature-discipline.py
 self-test:test-check-feature-discipline.py	python3 .github/scripts/test-check-feature-discipline.py --mutations
@@ -153,6 +155,8 @@ ci.yml	feature-on-doc	Install libudev (Linux hidapi)	installs Linux system heade
 ci.yml	feature-on-test	Free disk space	reclaims runner disk space
 ci.yml	feature-on-test	Install libudev (Linux hidapi)	installs Linux system headers on the runner
 ci.yml	feature-discipline	Fetch the locked graph	preflight includes fetch in the discipline row
+changelog.yml	changelog	Fetch main for changelog protection	CI supplies the remote ancestry
+changelog.yml	changelog	Protect integration changelog	CI checks the pull request event SHAs
 ci.yml	release-shape	Install libudev (Linux hidapi)	the row requires libudev instead of installing it
 ci.yml	clippy	Install libudev (Linux hidapi)	installs Linux system headers on the runner
 ci.yml	doc	Install libudev (Linux hidapi)	installs Linux system headers on the runner
@@ -215,6 +219,7 @@ build_fixture() {
     cp "$ROOT/$file" "$dir/$file"
   done
   cp -R "$ROOT/.github" "$dir/.github"
+  cp -R "$ROOT/changelog.d" "$dir/changelog.d"
   mkdir -p "$dir/scripts"
   cp -R "$ROOT/scripts/deploy" "$dir/scripts/deploy"
   if [ -n "${2:-}" ]; then
@@ -975,6 +980,41 @@ expect_drift() {
   done
 }
 
+case_changelog_fragments() {
+  start_case
+  edit changelog.d/README.md
+  expect_list "${ALWAYS[@]}" changelog self-test:test-changelog.py
+}
+
+case_changelog_selection() {
+  start_case
+  edit .github/scripts/changelog.py
+  expect_list "${ALWAYS[@]}" changelog self-test:test-changelog.py \
+    feature-discipline self-test:test-check-feature-discipline.py workflow-invariants self-test:test-check-workflow-invariants.py
+  edit .github/scripts/test-changelog.py
+  expect_list "${ALWAYS[@]}" changelog self-test:test-changelog.py \
+    feature-discipline self-test:test-check-feature-discipline.py workflow-invariants self-test:test-check-workflow-invariants.py
+  edit .github/workflows/changelog.yml
+  expect_list "${ALWAYS[@]}" changelog self-test:test-changelog.py actionlint \
+    feature-discipline self-test:test-check-feature-discipline.py workflow-invariants self-test:test-check-workflow-invariants.py
+}
+
+case_changelog_registry() {
+  start_case
+  python3 - <<'PY' || fail "changelog registry differs from workflow commands"
+from pathlib import Path
+source = Path('.github/scripts/preflight.sh').read_text()
+workflow = Path('.github/workflows/changelog.yml').read_text()
+for gate, command, step in (
+    ('changelog', 'python3 .github/scripts/changelog.py check', 'Check changelog fragments'),
+    ('self-test:test-changelog.py', 'python3 .github/scripts/test-changelog.py', 'Test changelog fragments'),
+):
+    row = '\t'.join((gate, command, '-', 'changelog.yml', 'changelog', step))
+    assert source.splitlines().count(row) == 1, 'changelog registry mapping differs'
+    assert f'      - name: {step}\n        run: {command}\n' in workflow, 'changelog workflow command differs'
+PY
+}
+
 # CHANGELOG.md is Markdown outside the surface scope.
 case_docs_only() {
   start_case
@@ -1395,8 +1435,15 @@ case_full() {
   start_case
   edit CONTRIBUTING.md
   read -r -a ids <<<"$(printf '%s\n' "$EXPECTED_REGISTRY" | awk -F '\t' '{ printf "%s ", $1 }')"
-  if [ "${#ids[@]}" -ne 61 ]; then
-    fail "the expected registry holds ${#ids[@]} rows, expected 61"
+  local original=0 added=0 id
+  for id in "${ids[@]}"; do
+    case "$id" in
+      changelog | self-test:test-changelog.py) added=$((added + 1)) ;;
+      *) original=$((original + 1)) ;;
+    esac
+  done
+  if [ "$original" -ne 61 ] || [ "$added" -ne 2 ]; then
+    fail "the expected registry requires 61 original rows and 2 changelog rows"
   fi
   expect_list --full "${ids[@]}"
 }
@@ -1890,7 +1937,7 @@ case_coverage_on_only_fails() {
   assert_clean_calls
 }
 
-MUTATION_CONTROLS="rename-source untracked-paths dev-dependencies target-dependencies unique-gates failed-gate unavailable-gate fresh-coverage"
+MUTATION_CONTROLS="changelog-fragments changelog-workflow changelog-registry rename-source untracked-paths dev-dependencies target-dependencies unique-gates failed-gate unavailable-gate fresh-coverage"
 
 # Prints the existing case that pins mutation control $1, then the message of
 # the assertion that must end the case log on the mutant.
@@ -1899,6 +1946,9 @@ mutation_case() {
   local end="the run exited 0, expected 1 with the last line 'preflight:" floors
   local end1="the run exited 1, expected 1 with the last line 'preflight:"
   case "$1" in
+    changelog-fragments) echo "changelog-fragments $differs" ;;
+    changelog-workflow) echo "changelog-selection $differs" ;;
+    changelog-registry) echo "changelog-registry changelog registry differs from workflow commands" ;;
     rename-source) echo "committed-cross-scope-rename $differs" ;;
     untracked-paths) echo "untracked-test-file $differs" ;;
     dev-dependencies) echo "dev-dependency-edge $differs" ;;
@@ -1920,6 +1970,15 @@ mutation_case() {
 apply_mutation() {
   local file=$2
   case "$1" in
+    changelog-fragments)
+      replace_line "$file" '    changelog.d/* | .github/scripts/changelog.py | .github/scripts/test-changelog.py) select_gate changelog ;;' \
+        '    .github/scripts/changelog.py | .github/scripts/test-changelog.py) select_gate changelog ;;' ;;
+    changelog-workflow)
+      replace_line "$file" 'INVARIANT_WORKFLOWS="release publish notarize-smoke labels stale triage triage-review triage-sweep welcome coverage release-rehearsal ci vendored-wasm changelog"' \
+        'INVARIANT_WORKFLOWS="release publish notarize-smoke labels stale triage triage-review triage-sweep welcome coverage release-rehearsal ci vendored-wasm"' ;;
+    changelog-registry)
+      replace_line "$file" $'changelog\tpython3 .github/scripts/changelog.py check\t-\tchangelog.yml\tchangelog\tCheck changelog fragments' \
+        $'changelog\tpython3 .github/scripts/changelog.py check\t-\tchangelog.yml\tchangelog\tCheck fragment entries' ;;
     rename-source)
       replace_line "$file" '  git diff --name-only -z --no-renames --merge-base "$BASE" -- >"$SCRATCH/diff" ||' \
         '  git diff --name-only -z --merge-base "$BASE" -- >"$SCRATCH/diff" ||' ;;

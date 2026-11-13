@@ -16,7 +16,9 @@ unmodified copy and that one failing case or PASSING entry, and the
 mutations that name it.
 """
 
+import ast
 import pathlib
+import pickle
 import re
 import shutil
 import subprocess
@@ -36,6 +38,174 @@ COVERAGE = ".github/workflows/coverage.yml"
 REHEARSAL = ".github/workflows/release-rehearsal.yml"
 CI = ".github/workflows/ci.yml"
 TESTNET = ".github/workflows/testnet.yml"
+CHANGELOG = ".github/workflows/changelog.yml"
+CHANGELOG_CONDITION = "github.event_name == 'pull_request' && github.base_ref == 'mainnet-write'"
+CHANGELOG_IF = f"        if: {CHANGELOG_CONDITION}\n"
+CHANGELOG_ARGS = 'guard --base "$BASE_SHA" --head "$HEAD_SHA" --main-ref refs/remotes/origin/main'
+CHANGELOG_COMMAND = ('set -euo pipefail\n'
+                     'GUARD_ENTRY=$(git ls-tree "$BASE_SHA" -- .github/scripts/changelog.py)\n'
+                     'if [ -n "$GUARD_ENTRY" ]; then\n'
+                     '  git show "$BASE_SHA:.github/scripts/changelog.py" | python3 - ' + CHANGELOG_ARGS + '\n'
+                     'else\n'
+                     '  python3 .github/scripts/changelog.py ' + CHANGELOG_ARGS + '\n'
+                     'fi')
+
+
+def changelog_run(command):
+    return "        run: |\n" + "".join("          " + line + "\n" for line in command.splitlines())
+
+
+CHANGELOG_RUN = changelog_run(CHANGELOG_COMMAND)
+CHANGELOG_FETCH = ("      - name: Fetch main for changelog protection\n        shell: bash\n"
+                   "        run: git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main\n")
+CHANGELOG_CHECK = ("      - name: Check changelog fragments\n"
+                   "        run: python3 .github/scripts/changelog.py check\n")
+CHANGELOG_TEST = ("      - name: Test changelog fragments\n"
+                  "        run: python3 .github/scripts/test-changelog.py\n")
+CHANGELOG_GUARD = ("      - name: Protect integration changelog\n" + CHANGELOG_IF + "        shell: bash\n"
+                   "        env:\n          BASE_SHA: ${{ github.event.pull_request.base.sha }}\n"
+                   "          HEAD_SHA: ${{ github.event.pull_request.head.sha }}\n" + CHANGELOG_RUN)
+PENDING_STEP = ("      - name: Verify no pending changelog fragments\n        shell: bash\n        run: |\n"
+                "          set -euo pipefail\n"
+                "          PENDING=$(find changelog.d -mindepth 1 -maxdepth 1 ! -name README.md -print)\n"
+                '          test -z "$PENDING"\n\n')
+
+
+def changelog_edit(old, new, path=CHANGELOG):
+    return [(path, old, new, 1)]
+
+
+# Each group exercises independent defects of one predicate.
+CHANGELOG_VARIANTS = {
+    "W01": [changelog_edit("  push:\n", "")],
+    "W02": [changelog_edit("  pull_request:\n    types: [opened, synchronize, reopened, edited]\n", "")],
+    "W03": [changelog_edit("    types: [opened, synchronize, reopened, edited]", "    types: [opened, synchronize, reopened]")]
+           + [changelog_edit("  " + event + ":\n", "  " + event + ":\n    " + field + ": [main]\n")
+              for event in ("push", "pull_request") for field in ("branches", "branches-ignore", "paths", "paths-ignore", "tags", "tags-ignore")]
+           + [changelog_edit("  push:\n", "  push:\n    types: [opened]\n")],
+    "W04": [changelog_edit("  changelog:\n", "  other:\n")],
+    "W05": [changelog_edit("  changelog:\n", "  changelog:\n    " + bypass + "\n")
+            for bypass in ("if: false", "needs: other", "continue-on-error: true")],
+    "W06": [changelog_edit(CHANGELOG_CHECK, "")],
+    "W07": [changelog_edit(CHANGELOG_CHECK, CHANGELOG_CHECK + "        " + bypass + "\n")
+            for bypass in ("if: false", "continue-on-error: true")],
+    "W08": [changelog_edit("run: python3 .github/scripts/changelog.py check", "run: " + value)
+            for value in ('"# python3 .github/scripts/changelog.py check"', "true", 'echo python3 .github/scripts/changelog.py check',
+                          "python3 .github/scripts/changelog.py check || true")],
+    "W09": [changelog_edit(CHANGELOG_TEST, "")],
+    "W10": [changelog_edit("run: python3 .github/scripts/test-changelog.py", "run: python3 .github/scripts/test-changelog.py || true"),
+             changelog_edit(CHANGELOG_TEST, CHANGELOG_TEST + "        if: false\n"),
+             changelog_edit(CHANGELOG_TEST, CHANGELOG_TEST + "        continue-on-error: true\n"),
+             changelog_edit("run: python3 .github/scripts/test-changelog.py", "run: true")],
+    "W11": [changelog_edit("fetch-depth: 0", "fetch-depth: 1"),
+             changelog_edit("fetch-depth: 0", "fetch-depth: 0\n          ref: main"),
+             changelog_edit(CHANGELOG_FETCH, ""),
+             changelog_edit(CHANGELOG_FETCH, CHANGELOG_FETCH + "        if: false\n"),
+             changelog_edit(CHANGELOG_FETCH, CHANGELOG_FETCH.rstrip() + " || true\n"),
+             changelog_edit(CHANGELOG_FETCH, CHANGELOG_FETCH.replace("refs/heads/main:", "refs/heads/other:")),
+             changelog_edit(CHANGELOG_FETCH + CHANGELOG_GUARD, CHANGELOG_GUARD + CHANGELOG_FETCH)],
+    "W12": [changelog_edit(CHANGELOG_GUARD, "")],
+    "W13": [changelog_edit(CHANGELOG_IF, value) for value in ("", CHANGELOG_IF.replace("'mainnet-write'", "'main'"),
+             CHANGELOG_IF.replace("'pull_request'", "'push'"), CHANGELOG_IF.rstrip() + " && false\n")],
+    "W14": [changelog_edit("HEAD_SHA: ${{ github.event.pull_request.head.sha }}", "HEAD_SHA: ${{ github.sha }}"),
+             changelog_edit("BASE_SHA: ${{ github.event.pull_request.base.sha }}", "BASE_SHA: ${{ github.sha }}")],
+    "W15": [changelog_edit(CHANGELOG_RUN, changelog_run(value)) for value in (
+             CHANGELOG_COMMAND.replace(" --main-ref refs/remotes/origin/main", ""),
+             CHANGELOG_COMMAND.replace("changelog.py", "other.py"),
+             CHANGELOG_COMMAND.replace("$BASE_SHA", "$HEAD_SHA"),
+             CHANGELOG_COMMAND.replace(" guard ", " check "),
+             CHANGELOG_COMMAND.replace('python3 - guard', 'python3 - check'),
+             CHANGELOG_COMMAND.replace('python3 .github/scripts/changelog.py guard', 'true # guard'),
+             CHANGELOG_COMMAND.replace('git show "$BASE_SHA:', 'git show "$HEAD_SHA:'),
+             CHANGELOG_COMMAND.replace('if [ -n', 'if [ -z'),
+             CHANGELOG_COMMAND.replace('set -euo pipefail', 'set -eu'),
+             CHANGELOG_COMMAND + " || true", "echo '" + CHANGELOG_COMMAND + "'",
+             "\n".join("# " + line for line in CHANGELOG_COMMAND.splitlines()))],
+    "W16": [changelog_edit(CHANGELOG_GUARD, CHANGELOG_GUARD + "        continue-on-error: true\n"),
+             changelog_edit(CHANGELOG_GUARD, CHANGELOG_GUARD.replace("shell: bash", "shell: sh"))],
+    "W18": [changelog_edit(PENDING_STEP, "", RELEASE),
+             changelog_edit(PENDING_STEP, PENDING_STEP.replace("shell: bash", "shell: sh"), RELEASE),
+             changelog_edit(PENDING_STEP, PENDING_STEP.replace("        shell:", "        if: false\n        shell:"), RELEASE),
+             changelog_edit(PENDING_STEP, PENDING_STEP.replace("        shell:", "        continue-on-error: true\n        shell:"), RELEASE),
+             changelog_edit(PENDING_STEP, PENDING_STEP.replace("-mindepth 1", "-mindepth 2"), RELEASE),
+             changelog_edit(PENDING_STEP, "      - run: true\n\n" + PENDING_STEP, RELEASE)],
+}
+CHANGELOG_MESSAGES = {
+    "W01": "push trigger is absent", "W02": "pull_request trigger is absent", "W03": "event filters or types differ",
+    "W04": "missing changelog job", "W05": "changelog job can be bypassed", "W06": "missing fragment check step",
+    "W07": "fragment check can be bypassed", "W08": "fragment check command differs", "W09": "missing fragment test step",
+    "W10": "fragment test can be bypassed", "W11": "checkout and main fetch must supply full history",
+    "W12": "missing integration guard", "W13": "integration guard condition differs", "W14": "integration guard event SHAs differ",
+    "W15": "integration guard command differs", "W16": "integration guard shell or failure behavior differs",
+    "W18": "pending fragments step must follow the version header check without bypasses",
+}
+
+
+def changelog_rule(label):
+    return "release-fragments" if label == "W18" else "changelog-guard" if label in ("W12", "W13", "W14", "W15", "W16") else "changelog-check"
+
+
+BASE_DOCUMENTS = {}
+YAML_DUMPS = {}
+
+
+def changelog_behavior(root, label):
+    """Exercise shell failure behavior with read-only command doubles."""
+    import yaml
+    problems = []
+    doc = yaml.safe_load((root / CHANGELOG).read_text())
+    steps = doc["jobs"]["changelog"]["steps"]
+    guard = next(step for step in steps if step.get("name") == "Protect integration changelog")
+    if label == "W15 main-only changelog changes pass":
+        for present, probe, show, status in ((1, 0, 0, 0), (1, 0, 0, 1), (1, 0, 0, 2),
+                                            (0, 0, 0, 0), (0, 0, 0, 1), (0, 0, 0, 2),
+                                            (1, 2, 0, 2), (1, 0, 2, 2)):
+            fake = r'''
+git() {
+  if [[ "$*" == "ls-tree base -- .github/scripts/changelog.py" ]]; then
+    if (( PRESENT )); then printf '100644 blob fixture\t.github/scripts/changelog.py\n'; fi
+    return "$PROBE"
+  fi
+  [[ "$*" == "show base:.github/scripts/changelog.py" ]] || return 9
+  printf 'base script\n'
+  return "$SHOW"
+}
+python3() {
+  if (( PRESENT )); then
+    [[ "$*" == "- guard --base base --head head --main-ref refs/remotes/origin/main" ]] || return 9
+    read -r source
+    [[ "$source" == "base script" ]] || return 9
+  else
+    [[ "$*" == ".github/scripts/changelog.py guard --base base --head head --main-ref refs/remotes/origin/main" ]] || return 9
+  fi
+  return "$STATUS"
+}
+'''
+            fake += f'PRESENT={present}; PROBE={probe}; SHOW={show}; STATUS={status}; BASE_SHA=base; HEAD_SHA=head;\n'
+            result = subprocess.run(["bash", "-c", fake + guard["run"]], capture_output=True, check=False)
+            if result.returncode != status:
+                problems.append(f"base script selection: {present}, {probe}, {show}: exit {result.returncode}, expected {status}")
+    if label == "W17":
+        condition = guard["if"].strip()
+        condition = condition[3:-2].strip() if condition.startswith("${{") else condition
+        for event, base, expected in (("pull_request", "mainnet-write", True), ("edited", "mainnet-write", True),
+                                      ("pull_request", "main", False), ("push", "mainnet-write", False), ("tag", "", False)):
+            name = "pull_request" if event == "edited" else "push" if event == "tag" else event
+            expression = condition.replace("github.event_name", repr(name)).replace("github.base_ref", repr(base)).replace("&&", "and")
+            if eval(expression, {"__builtins__": {}}, {}) != expected:
+                problems.append("guard event truth table differs")
+            for step_name in ("Check changelog fragments", "Test changelog fragments"):
+                if "if" in next(step for step in steps if step.get("name") == step_name):
+                    problems.append("fragment validation must run for every event")
+    if label == "W18":
+        release_doc = yaml.safe_load((root / RELEASE).read_text())
+        step = next(s for s in release_doc["jobs"]["preflight"]["steps"] if s.get("name") == "Verify no pending changelog fragments")
+        for pending, expected in (("", 0), ("entry.added.md", 1), (".hidden", 1), ("nested", 1)):
+            fake = 'find() { printf "%s" "$ENTRIES"; }; ENTRIES=' + repr(pending) + '; '
+            result = subprocess.run(["bash", "-c", fake + step["run"]], capture_output=True, check=False)
+            if result.returncode != expected:
+                problems.append(f"pending entries: exit {result.returncode}, expected {expected}")
+    return problems
 APT_LIBUDEV_RUN = ("        run: sudo apt-get -o Acquire::Retries=3 update && "
                    "sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config\n")
 SKILL_ARCHIVE_CONDITION = "github.base_ref != 'mainnet-write' && github.ref != 'refs/heads/mainnet-write'"
@@ -454,6 +624,8 @@ VARS_LOCATIONS = (
 # label, [(file, old, new, expected occurrences)];
 # the edited copy must pass.
 PASSING = [
+    ("W17", changelog_edit(CHANGELOG_IF, '        if: "  ${{ ' + CHANGELOG_CONDITION + ' }}  "\n')),
+    ("W15 main-only changelog changes pass", []),
     ("skill archive block run passes", [
         (CI, SKILL_ARCHIVE_RUN, "        run: |\n          .github/scripts/package-skill.sh --check\n", 1)]),
     ("apt-get in comments passes", [
@@ -1542,7 +1714,38 @@ CASES = [
 # Each mutation of check-workflow-invariants.py: the text it replaces, the
 # replacement, and the CASES or PASSING labels that must fail against the
 # mutated copy and pass against the restored one.
+CASES.extend((label, changelog_rule(label), CHANGELOG_MESSAGES[label], []) for label in CHANGELOG_VARIANTS)
+
 MUTATIONS = {
+    "W01": ('if "push" not in triggers:\n            self.report(workflow, rule, "push trigger is absent")',
+            'if False:\n            self.report(workflow, rule, "push trigger is absent")', ["W01"]),
+    "W02": ('if "pull_request" not in triggers:', 'if False:', ["W02"]),
+    "W03": ('triggers["pull_request"] != {"types": events}',
+            'triggers["pull_request"] not in ({"types": events}, {"types": events[:-1]})', ["W03"]),
+    "W04": ('self.report(workflow, rule, "missing changelog job")', 'pass', ["W04"]),
+    "W05": ('"if" in job or "needs" in job or "continue-on-error" in job',
+            '"needs" in job or "continue-on-error" in job', ["W05"]),
+    "W06": ('self.report(workflow, rule, "missing fragment check step")', 'pass', ["W06"]),
+    "W07": ('self.may_skip(check) or self.effective_shell', '"continue-on-error" in check or self.effective_shell', ["W07"]),
+    "W08": ('self.run_text(check).strip() != "python3 .github/scripts/changelog.py check"',
+            'self.run_text(check).strip().lstrip("# ") != "python3 .github/scripts/changelog.py check"', ["W08"]),
+    "W09": ('self.report(workflow, rule, "missing fragment test step")', 'pass', ["W09"]),
+    "W10": ('self.run_text(test).strip() != "python3 .github/scripts/test-changelog.py"',
+            'self.run_text(test).strip().removesuffix(" || true") != "python3 .github/scripts/test-changelog.py"', ["W10"]),
+    "W11": ('options.get("fetch-depth") != 0', 'options.get("fetch-depth") not in (0, 1)', ["W11"]),
+    "W12": ('self.report(workflow, "changelog-guard", "missing integration guard")', 'pass', ["W12"]),
+    "W13": ('if condition != CHANGELOG_CONDITION:',
+            'if condition not in (CHANGELOG_CONDITION, CHANGELOG_CONDITION.replace("mainnet-write", "main")):', ["W13"]),
+    "W14": ('if guard.get("env") != expected_env:',
+            'if guard.get("env") not in (expected_env, {**expected_env, "HEAD_SHA": "${{ github.sha }}"}):', ["W14"]),
+    "W15": ('if self.run_text(guard).strip() != CHANGELOG_GUARD:',
+            'if self.run_text(guard).strip().replace(" --main-ref refs/remotes/origin/main", "") '
+            '!= CHANGELOG_GUARD.replace(" --main-ref refs/remotes/origin/main", ""):', ["W15"]),
+    "W16": ('if "continue-on-error" in guard or guard.get("shell") != "bash":',
+            'if guard.get("shell") != "bash":', ["W16"]),
+    "W17": ('condition = self.unwrap_expression(guard.get("if", ""))', 'condition = guard.get("if", "")', ["W17"]),
+    "W18": ('self.report(workflow, rule, "pending fragments step must follow the version header check without bypasses")',
+            'pass', ["W18"]),
     "skill-archive-count": (
         'if len(steps) != 1:', 'if not steps:',
         ['skill archive step duplicated']),
@@ -1685,6 +1888,8 @@ def run_check(root, script=SCRIPT):
 def entry_problems(root, label, script=SCRIPT):
     """Copies the tree to root, applies the edits of the CASES or PASSING
     entry with this label, runs script and returns its problems."""
+    if label in CHANGELOG_VARIANTS:
+        return changelog_group(label, script)
     copy_tree(root)
     try:
         passing = dict(PASSING)
@@ -1694,6 +1899,7 @@ def entry_problems(root, label, script=SCRIPT):
                 rc, output = run_check(root, script)
                 if rc != 0:
                     problems.append(f"exit {rc}, expected 0: {output.strip()}")
+                problems.extend(changelog_behavior(root, label))
             return problems
         case = next(case for case in CASES if case[0] == label)
         problems = apply_edits(root, case[3])
@@ -1705,6 +1911,60 @@ def entry_problems(root, label, script=SCRIPT):
         return problems
     finally:
         shutil.rmtree(root)
+
+
+def changelog_group(label, script):
+    """Run grouped workflow edits through the checker without writing fixtures."""
+    import types
+    import yaml
+    from unittest.mock import patch
+    source = script.read_text()
+    ast.parse(source)
+    checker = types.ModuleType("workflow_checker")
+    exec(compile(source, str(script), "exec"), checker.__dict__)
+    original = pathlib.Path.read_text
+    dump = yaml.safe_dump
+
+    def memory_dump(data, *args, **kwargs):
+        # Reuse serialization by complete contents and options across cases.
+        # Every checker rule still runs for each variant and mutation.
+        key = pickle.dumps((data, args, kwargs))
+        if key not in YAML_DUMPS:
+            YAML_DUMPS[key] = dump(data, *args, **kwargs)
+        return YAML_DUMPS[key]
+
+    problems = []
+    for edits in CHANGELOG_VARIANTS[label]:
+        texts = {}
+        for relative, old, new, expected in edits:
+            path = ROOT / relative
+            text = texts.get(path, original(path))
+            if text.count(old) != expected:
+                problems.append(f"{label}: replacement count differs for {old!r}")
+                continue
+            texts[path] = text.replace(old, new, 1)
+            yaml.safe_load(texts[path])
+        load = checker.Checker.load
+        documents = {path: yaml.safe_load(text) for path, text in texts.items()}
+
+        def memory_load(instance, relative):
+            path = instance.root / relative
+            if path in documents:
+                return documents[path]
+            if path not in BASE_DOCUMENTS:
+                BASE_DOCUMENTS[path] = load(instance, relative)
+            return BASE_DOCUMENTS[path]
+
+        with patch.object(checker.Checker, "load", memory_load), \
+                patch.object(yaml, "safe_dump", memory_dump):
+            violations = checker.Checker(ROOT).run()
+        case = (label, changelog_rule(label), CHANGELOG_MESSAGES[label], [])
+        if not violations:
+            problems.append("exit 0, expected 1")
+        problems.extend(case_problems("\n".join(violations), case))
+    if label == "W18":
+        problems.extend(changelog_behavior(ROOT, label))
+    return problems
 
 
 def mutation_failures(tmp, selected):
@@ -1721,6 +1981,7 @@ def mutation_failures(tmp, selected):
             failures.append(f"mutation-{name}: mutation target found {source.count(needle)} times")
             continue
         for phase, text in (("mutation", source.replace(needle, replacement, 1)), ("control", source)):
+            ast.parse(text)
             path.write_text(text)
             path.touch()
             for label in labels:
@@ -1732,6 +1993,14 @@ def mutation_failures(tmp, selected):
                 else:
                     detail = f": {problems[0].splitlines()[0]}" if problems else ""
                     print(f"ok   {phase}-{name}: {label}{detail}")
+            if name.startswith("W") and not selected:
+                new_labels = list(CHANGELOG_VARIANTS) + ["W17", "W15 main-only changelog changes pass"]
+                actual = [label for label in new_labels if entry_problems(pathlib.Path(tmp) / "isolation", label, path)]
+                wanted = labels if phase == "mutation" else []
+                if actual != wanted:
+                    failures.append(f"{phase}-{name}: isolation fails: {actual}, expected {wanted}")
+                else:
+                    print(f"ok   {phase}-{name} isolation: {actual}; {len(new_labels)} groups")
     return failures
 
 

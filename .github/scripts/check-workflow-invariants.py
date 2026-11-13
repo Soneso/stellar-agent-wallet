@@ -7,7 +7,7 @@ Usage: ``check-workflow-invariants.py [repository-root]``
 Reads ``release.yml``, ``publish.yml``, ``notarize-smoke.yml``, ``labels.yml``,
 ``stale.yml``, ``triage.yml``, ``triage-review.yml``, ``triage-sweep.yml``,
 ``welcome.yml``, ``coverage.yml``, ``release-rehearsal.yml``, ``ci.yml``,
-and ``vendored-wasm.yml``
+``vendored-wasm.yml``, and ``changelog.yml``
 under ``.github/workflows/``.
 Also reads the composite action
 ``.github/actions/macos-sign-notarize/action.yml``, the shared build script
@@ -213,6 +213,9 @@ runs the function.
   ``-o Acquire::Retries=3``. Each call is checked separately; comments are ignored.
 - ``ci-triggers``: ``ci.yml`` lacks ``push`` or a ``pull_request`` branch list
   containing ``main``, or adds an event that requires re-evaluating the archive condition.
+- ``changelog-check``: fragment validation or tests can be bypassed, or checkout lacks full history and the main ref.
+- ``changelog-guard``: integration changelog protection differs from its condition, event SHAs, shell, or command.
+- ``release-fragments``: preflight lacks the read-only pending-fragment check immediately after the version header check.
 """
 
 import fnmatch
@@ -228,7 +231,20 @@ except ImportError:
 
 WORKFLOWS = ("release.yml", "publish.yml", "notarize-smoke.yml", "labels.yml", "stale.yml", "triage.yml",
              "triage-review.yml", "triage-sweep.yml", "welcome.yml", "coverage.yml", "release-rehearsal.yml",
-             "ci.yml", "vendored-wasm.yml")
+             "ci.yml", "vendored-wasm.yml", "changelog.yml")
+CHANGELOG_CONDITION = "github.event_name == 'pull_request' && github.base_ref == 'mainnet-write'"
+CHANGELOG_ARGS = 'guard --base "$BASE_SHA" --head "$HEAD_SHA" --main-ref refs/remotes/origin/main'
+CHANGELOG_GUARD = ('set -euo pipefail\n'
+                   'GUARD_ENTRY=$(git ls-tree "$BASE_SHA" -- .github/scripts/changelog.py)\n'
+                   'if [ -n "$GUARD_ENTRY" ]; then\n'
+                   '  git show "$BASE_SHA:.github/scripts/changelog.py" | python3 - ' + CHANGELOG_ARGS + '\n'
+                   'else\n'
+                   '  python3 .github/scripts/changelog.py ' + CHANGELOG_ARGS + '\n'
+                   'fi')
+CHANGELOG_FETCH = "git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main"
+PENDING_FRAGMENTS = ('set -euo pipefail\n'
+                     'PENDING=$(find changelog.d -mindepth 1 -maxdepth 1 ! -name README.md -print)\n'
+                     'test -z "$PENDING"')
 # GitHub resolves action names in any letter case.
 CACHE_ACTION = re.compile(r"(Swatinem/rust-cache|actions/cache)(/[\w.-]+)*@", re.IGNORECASE)
 SETUP_ACTION = re.compile(r"actions/setup-[\w.-]+@", re.IGNORECASE)
@@ -1429,6 +1445,96 @@ class Checker:
                 self.report(workflow, "release-toolchain",
                             f"{problem}: RUSTUP_TOOLCHAIN is not pinned between the install and the {action}")
 
+    def check_changelog_workflow(self):
+        workflow, rule = "changelog.yml", "changelog-check"
+        doc = self.docs.get(workflow, {})
+        triggers = doc.get("on", doc.get(True))
+        triggers = triggers if isinstance(triggers, dict) else {}
+        if "push" not in triggers:
+            self.report(workflow, rule, "push trigger is absent")
+        if "pull_request" not in triggers:
+            self.report(workflow, rule, "pull_request trigger is absent")
+        events = ["opened", "synchronize", "reopened", "edited"]
+        if (set(triggers) - {"push", "pull_request"}
+                or triggers.get("push") is not None
+                or ("pull_request" in triggers and triggers["pull_request"] != {"types": events})):
+            self.report(workflow, rule, "event filters or types differ")
+        job = self.job(workflow, "changelog")
+        if job is None:
+            self.report(workflow, rule, "missing changelog job")
+            return
+        if ("if" in job or "needs" in job or "continue-on-error" in job
+                or job.get("runs-on") != "ubuntu-24.04" or set(doc.get("jobs", {})) != {"changelog"}
+                or doc.get("permissions") != {"contents": "read"}
+                or job.get("permissions", {"contents": "read"}) != {"contents": "read"}):
+            self.report(workflow, rule, "changelog job can be bypassed or changes its execution contract")
+        steps = job.get("steps", [])
+
+        def named(name):
+            found = [(i, step) for i, step in enumerate(steps) if step.get("name") == name]
+            return found[0] if len(found) == 1 else (-1, {})
+
+        _, check = named("Check changelog fragments")
+        if not check:
+            self.report(workflow, rule, "missing fragment check step")
+        else:
+            if self.may_skip(check) or self.effective_shell(workflow, "changelog", check) not in (None, "bash"):
+                self.report(workflow, rule, "fragment check can be bypassed")
+            if self.run_text(check).strip() != "python3 .github/scripts/changelog.py check":
+                self.report(workflow, rule, "fragment check command differs")
+        _, test = named("Test changelog fragments")
+        if not test:
+            self.report(workflow, rule, "missing fragment test step")
+        elif (self.may_skip(test) or self.effective_shell(workflow, "changelog", test) not in (None, "bash")
+              or self.run_text(test).strip() != "python3 .github/scripts/test-changelog.py"):
+            self.report(workflow, rule, "fragment test can be bypassed or its command differs")
+        guard_index, guard = named("Protect integration changelog")
+        fetch_index, fetch = named("Fetch main for changelog protection")
+        checkouts = [(i, step) for i, step in enumerate(steps)
+                     if str(step.get("uses", "")).startswith("actions/checkout@")]
+        checkout_index, checkout = checkouts[0] if len(checkouts) == 1 else (-1, {})
+        options = checkout.get("with", {})
+        setup = [step for step in steps if str(step.get("uses", "")).startswith("actions/setup-python@")]
+        if (not checkout or self.may_skip(checkout) or options.get("fetch-depth") != 0
+                or "ref" in options or options.get("persist-credentials") is not False
+                or checkout.get("uses") != "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+                or len(setup) != 1 or self.may_skip(setup[0])
+                or setup[0].get("uses") != "actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0"
+                or str(setup[0].get("with", {}).get("python-version")) != "3.13"
+                or not fetch or self.may_skip(fetch) or fetch.get("shell") != "bash"
+                or self.run_text(fetch).strip() != CHANGELOG_FETCH
+                or self.step_position(workflow, "changelog", fetch_index, fetch, CHANGELOG_FETCH, rule) < 0
+                or not checkout_index < fetch_index
+                or (guard and fetch_index >= guard_index)):
+            self.report(workflow, rule, "checkout and main fetch must supply full history before the guard")
+        if not guard:
+            self.report(workflow, "changelog-guard", "missing integration guard")
+            return
+        condition = self.unwrap_expression(guard.get("if", ""))
+        if condition != CHANGELOG_CONDITION:
+            self.report(workflow, "changelog-guard", "integration guard condition differs")
+        expected_env = {"BASE_SHA": "${{ github.event.pull_request.base.sha }}",
+                        "HEAD_SHA": "${{ github.event.pull_request.head.sha }}"}
+        if guard.get("env") != expected_env:
+            self.report(workflow, "changelog-guard", "integration guard event SHAs differ")
+        if self.run_text(guard).strip() != CHANGELOG_GUARD:
+            self.report(workflow, "changelog-guard", "integration guard command differs")
+        if "continue-on-error" in guard or guard.get("shell") != "bash":
+            self.report(workflow, "changelog-guard", "integration guard shell or failure behavior differs")
+
+    def check_release_fragments(self):
+        workflow, rule = "release.yml", "release-fragments"
+        job = self.job(workflow, "preflight") or {}
+        steps = job.get("steps", [])
+        headers = [i for i, step in enumerate(steps) if step.get("name") == "Verify CHANGELOG version header exists"]
+        pending = [(i, step) for i, step in enumerate(steps)
+                   if step.get("name") == "Verify no pending changelog fragments"]
+        if (len(headers) != 1 or len(pending) != 1 or pending[0][0] != headers[0] + 1
+                or self.may_skip(job) or "needs" in job or self.may_skip(pending[0][1])
+                or pending[0][1].get("shell") != "bash"
+                or self.run_text(pending[0][1]).strip() != PENDING_FRAGMENTS):
+            self.report(workflow, rule, "pending fragments step must follow the version header check without bypasses")
+
     def check_ci_feature_jobs(self):
         for name, commands in CI_FEATURE_JOBS.items():
             job = self.job("ci.yml", name)
@@ -1627,6 +1733,8 @@ class Checker:
         self.check_composite_expressions()
         self.check_release_checks()
         self.check_release_vars()
+        self.check_changelog_workflow()
+        self.check_release_fragments()
         return self.violations
 
 

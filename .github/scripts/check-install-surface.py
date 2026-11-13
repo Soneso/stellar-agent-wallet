@@ -3,12 +3,13 @@
 
 Usage: check-install-surface.py [ROOT]
 
-ROOT defaults to the current directory and must be a git work tree. The check
-reads the Markdown files `git ls-files '*.md'` lists, except `CHANGELOG.md`,
-`crates/*/vendor/**`, `crates/*/tests/fixtures/**`, and
-`.github/scripts/fixtures/**`, which describe recorded artifacts rather than
-the install surface, plus the root `Cargo.toml` and the manifests of the two
-wallet crates. It prints one line per violation and exits 1 when it finds any,
+ROOT defaults to the current directory and must be a git work tree.
+The check reads the Markdown files `git ls-files '*.md'` lists.
+It excludes `CHANGELOG.md`, `changelog.d/**`, `crates/*/vendor/**`,
+`crates/*/tests/fixtures/**`, and `.github/scripts/fixtures/**`.
+These paths describe recorded artifacts rather than the install surface.
+The check also reads the root `Cargo.toml` and both wallet crate manifests.
+It prints one line per violation and exits 1 when it finds any,
 0 when it finds none, and 2 when it cannot run.
 
 Fenced blocks. A fence opens on a line of three or more backticks or tildes,
@@ -251,6 +252,8 @@ def is_scanned(path: str) -> bool:
     if not path.endswith(".md") or path == "CHANGELOG.md":
         return False
     parts = path.split("/")
+    if parts[0] == "changelog.d":
+        return False
     if len(parts) > 3 and parts[0] == "crates" and parts[2] == "vendor":
         return False
     if len(parts) > 3 and parts[:3] == [".github", "scripts", "fixtures"]:

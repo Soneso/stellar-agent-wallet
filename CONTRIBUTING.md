@@ -247,6 +247,54 @@ The file may live outside the checkout.
 Commit messages and pull request descriptions follow the same rules except for
 tense, which the next section sets.
 
+## Changelog entries
+
+A fragment is a pending changelog entry under `changelog.d/`.
+It supplies the entry that source compatibility policies require.
+Add one `<slug>.<category>.md` file for each category your change needs.
+Use a descriptive branch name as the slug.
+Lowercase it and replace every character outside `a-z`, `0-9`, and `-` with `-`.
+For example, `fix/Login_v2.1` becomes `fix-login-v2-1`.
+Use a topic slug for generic branch names such as `main` or `patch-1`.
+Use lowercase letters, digits, and hyphens; omit the pull request number.
+Categories are `added`, `changed`, `deprecated`, `removed`, `fixed`, and
+`security`.
+Each top-level entry starts with `- ` and contains text.
+Indented continuations and nested lists follow an entry; headings and metadata
+are invalid.
+
+For example, `changelog.d/account-timeouts.fixed.md` contains:
+
+```markdown
+- Retry an account lookup after a network timeout.
+```
+
+Keep `CHANGELOG.md` and the fragment README unchanged in contributing pull
+requests. Move any direct changelog entries into fragments.
+Remove the `CHANGELOG.md` edits from the branch history.
+For example, use an interactive rebase that drops or amends those commits.
+A later revert commit still fails the integration guard.
+Commits that `main` holds are exempt.
+An eligible sync merge has exactly two parents and brings new ancestry from
+`main` through its second parent.
+Its `CHANGELOG.md` equals the clean three-way merge over the parents' merge
+base, preserving both sides' lines.
+The guard refuses conflicts; a maintainer resolves and merges them.
+The guard never accepts hand-resolved changelog bytes.
+Never edit an existing fragment. Add a new file for a further entry.
+Each fragment file belongs to one pull request and is never reused.
+A sync merge deletes fragments that `main` folds and deletes.
+It never deletes a fragment that holds an unreleased entry under this rule.
+Distinct fragment filenames avoid changelog conflicts between pull requests.
+Rename one fragment when two files share a filename and produce an add/add
+conflict.
+
+Run `python3 .github/scripts/changelog.py check` to validate your fragments.
+Run `python3 .github/scripts/changelog.py preview` to read the folded
+Unreleased section without changing files.
+See [Fragment format](changelog.d/README.md) and
+[Release preparation](docs/maintainers/releasing.md#cut-a-release-tag).
+
 ## Commit and pull request conventions
 
 - The subject line of a commit and the title of a pull request are one imperative

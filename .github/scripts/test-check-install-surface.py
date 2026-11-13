@@ -937,6 +937,24 @@ def excluded_files(tree: pathlib.Path) -> None:
     add_tracked(tree, ".github/scripts/fixtures/notes.md", unlocked)
 
 
+def scope_cases(check, selected=None):
+    groups = {
+        "I01": [("changelog.d/entry.added.md", False), ("changelog.d/README.md", False)],
+        "I02": [("docs/changelog.d/note.md", True), ("changelog.docs/note.md", True)],
+    }
+    failures = 0
+    for label, paths in groups.items():
+        if selected and selected != label:
+            continue
+        bad = [path for path, expected in paths if check.is_scanned(path) != expected]
+        if bad:
+            failures += 1
+            print(f"FAIL {label}: install scope differs for {', '.join(bad)}")
+        else:
+            print(f"ok    {label}: install scope holds")
+    return failures
+
+
 def workspace_version(tree: pathlib.Path) -> str:
     with open(tree / "Cargo.toml", "rb") as handle:
         return tomllib.load(handle)["workspace"]["package"]["version"]
@@ -950,10 +968,12 @@ BASELINES = (
 
 
 def main(argv: list[str]) -> int:
+    if len(argv) == 3 and argv[1] == "--case":
+        return (1 if scope_cases(load_check(), argv[2]) else 0) if argv[2] in ("I01", "I02") else 2
     root = pathlib.Path(argv[1] if len(argv) > 1 else HERE.parent.parent).resolve()
     check = load_check()
     version = workspace_version(root)
-    failures = 0
+    failures = scope_cases(check)
     with tempfile.TemporaryDirectory(prefix="install-surface-") as scratch:
         pristine = pathlib.Path(scratch) / "pristine"
         for relative in check.scanned_files(root):
@@ -1010,7 +1030,7 @@ def main(argv: list[str]) -> int:
                     f"FAIL  {case.name}: exit {result.returncode}, "
                     f"no rule {case.rule} violation on {prefix}\n{result.stdout}{result.stderr}"
                 )
-    total = len(BASELINES) + len(cases(version))
+    total = len(BASELINES) + len(cases(version)) + 2
     print(f"install surface self-test: {total - failures} of {total} passed")
     return 1 if failures else 0
 
