@@ -30,10 +30,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A generated body lists G, M, and C recipients in one list per payment rule.
   An unlisted budget is one table on every payment rule, shared by CLI `pay`
   and the MCP payment tools.
+- Both x402 tools accept W payees at protocol 30 or later, preserving the full
+  address and id. A C allowlist entry admits its W destinations; an exact W
+  entry admits only that id. Testnet rules without a counterparty criterion
+  admit W within their caps.
+- Mainnet x402 accepts M under a base G or exact M allowlist entry. Eligible W
+  follows the same Allow or two-call RequireApproval flow under C or exact W.
+  Signed policies apply without rewriting their bytes.
+- Empty, non-matching and wrong-kind lists admit unlisted M or eligible W
+  under a configured budget, with shared-window exhaustion refusing the next call.
+  Testnet approval escalation refuses for every address form.
+- Authenticated x402 anchoring compares M by its base G account. Empty lists,
+  C payees and W payees report `unknown`.
 - CAP-84 W destinations decode, retain their mux id in approval displays,
   and redact to five leading and five trailing characters in audit text.
   C allowlist entries cover their W destinations; a W entry covers only itself.
-  Signing, submission and execution refuse W before storing a request.
+  Envelope signing, submission, SEP-43 tools and MPP refuse W before storing a
+  request.
   SEP-43 addresses report that a muxed contract address (W) is not a signer.
 
 - `approve revoke` and authenticated inbox actions revoke existing durable approvals without changing consent, clocks or operation state.
@@ -357,6 +370,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Missing destinations, unverified domains, reserved kinds, gated-inflow
   failures, and opaque signing keep their refusals in every mode.
 
+- A keyed audit outbox starts with a generation line, tags each queued row, and
+  keeps owner state in the keyring. `audit acknowledge-outbox-loss` refuses
+  such a queue with `audit.outbox_unusable` (`queue held by owner state`)
+  before it revokes or writes anything. The next keyed acquisition delivers
+  the queue instead.
+- `profile rotate-audit-key` fences the audit outbox before it writes the new
+  key, so no row is queued under the replaced key. Every keyed audit writer
+  open compares its key with the stored key before it writes anything. A
+  replaced key refuses with `audit.key_replaced`, and opening again loads the
+  stored key.
 - On mainnet, CLI `pay`, `claim`, `trustline`, and sponsored `accounts create`
   sign actions the signed policy allows without a passkey ceremony. An approval
   rule requires a passkey ceremony.

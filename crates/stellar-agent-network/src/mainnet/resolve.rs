@@ -1189,17 +1189,8 @@ mod enabled {
         Sha256::digest(context.network_passphrase().as_bytes()).into()
     }
     fn address_string(address: &ScAddress) -> Result<String, MainnetAuthorizationError> {
-        match address {
-            ScAddress::Account(stellar_xdr::AccountId(
-                stellar_xdr::PublicKey::PublicKeyTypeEd25519(key),
-            )) => Ok(stellar_strkey::ed25519::PublicKey(key.0)
-                .to_string()
-                .to_string()),
-            ScAddress::Contract(key) => {
-                Ok(stellar_strkey::Contract(key.0.0).to_string().to_string())
-            }
-            _ => Err(refused(P::IntentShape)),
-        }
+        stellar_agent_core::sc_address::scaddress_destination_strkey(address)
+            .map_err(|_| refused(P::IntentShape))
     }
     pub(super) async fn intent(
         req: SorobanIntentRequest<'_>,
@@ -1242,6 +1233,10 @@ mod enabled {
         else {
             return Err(refused(P::IntentShape));
         };
+        require(
+            !matches!(to, ScAddress::MuxedContract(_)) || endpoint.admits_muxed_contract(),
+            P::IntentPayeeProtocolUnsupported,
+        )?;
         let payer = stellar_strkey::ed25519::PublicKey(req.signer.public_key())
             .to_string()
             .to_string();
@@ -1285,7 +1280,7 @@ mod enabled {
                 now,
             )
             .map_err(|_| refused(P::PolicyEvaluationFailed))?;
-        check_evaluation(&evaluation, req.authority)?;
+        let value = check_evaluation(&evaluation, req.authority)?;
         let entries = engine
             .size_window_entries(&descriptor, req.context.profile(), &value, now)
             .map_err(|_| refused(P::PolicyEvaluationFailed))?;
@@ -2398,6 +2393,139 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn resolve_muxed_payees_preserves_full_destination() {
+        assert_muxed_payees(false).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn resolve_muxed_unlisted_budget_records_and_refuses_exhaustion() {
+        assert_muxed_payees(true).await;
+    }
+
+    async fn assert_muxed_payees(budget: bool) {
+        for contract in [false, true] {
+            let destination = if contract {
+                ScAddress::MuxedContract(stellar_xdr::MuxedContract {
+                    id: 7,
+                    contract_id: stellar_xdr::ContractId(stellar_xdr::Hash([6; 32])),
+                })
+            } else {
+                ScAddress::MuxedAccount(stellar_xdr::MuxedEd25519Account {
+                    id: 7,
+                    ed25519: stellar_xdr::Uint256([6; 32]),
+                })
+            };
+            let encoded =
+                stellar_agent_core::sc_address::scaddress_destination_strkey(&destination).unwrap();
+            let f = ResolverFixture::configured(
+                |_| {},
+                |raw| {
+                    let mut doc = raw
+                        .replace("stellar_pay", "stellar_x402_create_payment")
+                        .replace("\"native\"", &format!("\"{}\"", token()))
+                        .replace("native =", &format!("\"{}\" =", token()))
+                        .parse::<toml_edit::DocumentMut>()
+                        .unwrap();
+                    for rule in doc["rules"].as_array_of_tables_mut().unwrap().iter_mut() {
+                        for criterion in rule["criteria"].as_array_mut().unwrap().iter_mut() {
+                            let criterion = criterion.as_inline_table_mut().unwrap();
+                            if criterion.get("kind").and_then(toml_edit::Value::as_str)
+                                == Some("counterparty_allowlist")
+                            {
+                                criterion.insert(
+                                    "kinds",
+                                    toml_edit::Value::Array(
+                                        [if contract { "C_ACCOUNT" } else { "G_ACCOUNT" }]
+                                            .into_iter()
+                                            .collect(),
+                                    ),
+                                );
+                                criterion.insert(
+                                    "allowlist",
+                                    toml_edit::Value::Array(
+                                        [if budget { "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF" } else { encoded.as_str() }].into_iter().collect(),
+                                    ),
+                                );
+                                if budget {
+                                    criterion.insert(
+                                        "unlisted",
+                                        format!(
+                                            "{{ mode = \"budget\", asset = \"{}\", per_tx_stroops = 10, per_period_stroops = 10, window = \"1d\" }}",
+                                            token()
+                                        )
+                                        .parse::<toml_edit::Value>()
+                                        .unwrap(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    doc.to_string()
+                },
+            );
+            let mut root = root(&f);
+            let SorobanAuthorizedFunction::ContractFn(call) = &mut root.function else {
+                panic!("transfer");
+            };
+            let mut args = call.args.to_vec();
+            args[1] = ScVal::Address(destination.clone());
+            call.args = args.try_into().unwrap();
+            let server = f.server().await;
+            let mut network = stellar_agent_test_support::signed_envelope::get_network_result(
+                stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE,
+            );
+            network["protocolVersion"] = 30.into();
+            wiremock::Mock::given(wiremock::matchers::body_partial_json(
+                serde_json::json!({"method": "getNetwork"}),
+            ))
+            .respond_with(stellar_agent_test_support::EchoIdResponder::new(network))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+            let url = url::Url::parse(&f.profile.rpc_url).unwrap();
+            let context = f.context_with_routes(&[(url.host_str().unwrap(), &server.uri())]);
+            let authorization = resolved_intent(&f, &context, &root).await;
+            assert!(!authorization.entries().is_empty(), "{encoded}");
+            if budget {
+                let entries: Vec<_> = authorization.entries().iter().filter(|entry| {
+                    matches!(entry.limit(), stellar_agent_core::policy::v1::criteria::state_store::WindowLimit::Unlisted { .. })
+                }).collect();
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].amount(), 10);
+                // The next payment is another intent: one stroop within the
+                // per-transaction cap that the exhausted shared window refuses.
+                let mut next = root.clone();
+                let SorobanAuthorizedFunction::ContractFn(call) = &mut next.function else {
+                    panic!("transfer");
+                };
+                let mut args = call.args.to_vec();
+                args[2] = ScVal::I128(stellar_xdr::Int128Parts { hi: 0, lo: 1 });
+                call.args = args.try_into().unwrap();
+                let before = f.wire();
+                let client = context.primary_client().unwrap();
+                let intent = intent(&next);
+                let approval = intent_approval(&f, &next, None);
+                let error = resolve_soroban_intent(intent_request(
+                    &f,
+                    &context,
+                    &client,
+                    &intent,
+                    &MainnetAuthority::Approval(&approval),
+                ))
+                .await
+                .unwrap_err();
+                let MainnetAuthorizationError::PolicyDenied(reason) = error else {
+                    panic!("expected budget denial: {error:?}");
+                };
+                assert_eq!(reason.wire_code(), "policy.deny.unlisted_budget_exceeded");
+                assert_eq!(f.wire(), before);
+            }
+        }
+    }
+
     async fn intent_refusal(case: &str, expected: P) {
         let f = soroban_fixture();
         let root = root(&f);
@@ -2428,6 +2556,22 @@ mod tests {
             args[0] = ScVal::Address(ScAddress::Contract(stellar_xdr::ContractId(
                 stellar_xdr::Hash([4; 32]),
             )));
+            function.args = args.try_into().unwrap();
+        }
+        if case == "muxed_payer" {
+            let mut args = function.args.to_vec();
+            args[0] = ScVal::Address(ScAddress::MuxedAccount(stellar_xdr::MuxedEd25519Account {
+                id: 7,
+                ed25519: stellar_xdr::Uint256(f.signer.public_key()),
+            }));
+            function.args = args.try_into().unwrap();
+        }
+        if case == "muxed_contract_protocol" {
+            let mut args = function.args.to_vec();
+            args[1] = ScVal::Address(ScAddress::MuxedContract(stellar_xdr::MuxedContract {
+                id: 7,
+                contract_id: stellar_xdr::ContractId(stellar_xdr::Hash([3; 32])),
+            }));
             function.args = args.try_into().unwrap();
         }
         let mut intent = intent(&changed);
@@ -2469,6 +2613,16 @@ mod tests {
     intent_case!(intent_function_refuses, "function", IntentShape);
     intent_case!(intent_network_refuses, "network", IntentNetworkMismatch);
     intent_case!(intent_payer_refuses, "payer", IntentPayerMismatch);
+    intent_case!(
+        intent_muxed_payer_refuses,
+        "muxed_payer",
+        IntentPayerMismatch
+    );
+    intent_case!(
+        intent_muxed_contract_protocol_refuses,
+        "muxed_contract_protocol",
+        IntentPayeeProtocolUnsupported
+    );
     intent_case!(
         intent_authenticated_consumer_refuses,
         "authenticated",

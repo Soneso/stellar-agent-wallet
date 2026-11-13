@@ -69,6 +69,122 @@ fn sign_policy_toml(policy_body: &str, sk: &SigningKey, owner_id: &str) -> Strin
     format!("{policy_body}\n[signature]\nowner_id = \"{owner_id}\"\nsig = \"{sig_hex}\"\n")
 }
 
+#[test]
+fn signed_policy_admits_muxed_x402_without_rewriting_bytes() {
+    use stellar_agent_core::policy::{
+        ToolValueKind,
+        v1::value::{ActionKind, ValueClass, ValueLeg},
+    };
+    let key = SigningKey::from_bytes(&[11; 32]);
+    let owner = stellar_strkey::ed25519::PublicKey(key.verifying_key().to_bytes()).to_string();
+    let asset = stellar_agent_core::asset_id::CanonicalAsset::Native
+        .sac_contract_id(TESTNET_PASSPHRASE)
+        .unwrap();
+    let contract = stellar_strkey::Contract([3; 32]).to_string();
+    let w = stellar_strkey::MuxedContract {
+        contract_id: [3; 32],
+        id: 7,
+    }
+    .to_string();
+    let m = stellar_strkey::ed25519::MuxedAccount {
+        ed25519: [1; 32],
+        id: 7,
+    }
+    .to_string();
+    let g = stellar_strkey::ed25519::PublicKey([1; 32]).to_string();
+    for (payee, kinds, listed, budget) in [
+        (w.as_str(), "C_ACCOUNT", contract.as_str(), false),
+        (w.as_str(), "C_ACCOUNT", w.as_str(), false),
+        (w.as_str(), "G_ACCOUNT", g.as_str(), true),
+        (w.as_str(), "C_ACCOUNT", "", true),
+        (w.as_str(), "", "", false),
+        (m.as_str(), "G_ACCOUNT", g.as_str(), false),
+        (m.as_str(), "C_ACCOUNT", contract.as_str(), true),
+    ] {
+        let unlisted = if budget {
+            format!(
+                ", unlisted = {{ mode = \"budget\", asset = \"{asset}\", per_tx_stroops = 10, per_period_stroops = 20, window = \"1d\" }}"
+            )
+        } else {
+            String::new()
+        };
+        let criterion = if kinds.is_empty() {
+            String::new()
+        } else {
+            let list = if listed.is_empty() {
+                String::new()
+            } else {
+                format!("\"{listed}\"")
+            };
+            format!(
+                "{{ kind = \"counterparty_allowlist\", kinds = [\"{kinds}\"], allowlist = [{list}]{unlisted} }},"
+            )
+        };
+        let body = format!(
+            "version = 2\nscope = \"profile:muxed\"\nsequence = 1\n[[rules]]\nmatch = {{ tool = \"*\", chain = \"*\" }}\ncriteria = [{criterion}{{kind = \"per_tx_cap\", asset = \"{asset}\", max_stroops = 100}}, {{kind = \"per_period_cap\", asset = \"{asset}\", max_stroops = 100, window = \"1d\"}}]\ndecision = \"allow\"\n"
+        );
+        let signed = sign_policy_toml(&body, &key, &owner);
+        let before = canonical_bytes(&signed).unwrap();
+        for name in [
+            "stellar_x402_create_payment",
+            "stellar_x402_authenticated_payment",
+        ] {
+            let document = stellar_agent_core::policy::v1::loader::load_signed_policy_text(
+                &signed,
+                "muxed",
+                &key.verifying_key().to_bytes(),
+                TESTNET_PASSPHRASE,
+            )
+            .unwrap();
+            let engine = PolicyEngineV1::new(document, "muxed".into());
+            let requirements = stellar_agent_x402::wire::PaymentRequirements {
+                scheme: "exact".into(),
+                network: "stellar:testnet".into(),
+                asset: asset.clone(),
+                amount: "1".into(),
+                pay_to: payee.into(),
+                max_timeout_seconds: 60,
+                extra: serde_json::json!({"areFeesSponsored": true}),
+            };
+            let amount = stellar_agent_x402::exact::validate_requirements_for_payment(
+                &requirements,
+                TESTNET_PASSPHRASE,
+            )
+            .unwrap();
+            let tool = ToolDescriptor::from_registration(&McpToolRegistration {
+                name,
+                destructive_hint: true,
+                read_only_hint: false,
+                chain_id_required: true,
+                value_kind: ToolValueKind::MovesValue,
+            });
+            let profile = Profile::builder_testnet_named("muxed", "s", "a", "n", "a").build();
+            let decision = engine
+                .evaluate_with_value(
+                    &tool,
+                    &serde_json::json!({"chain_id": "stellar:testnet"}),
+                    &profile,
+                    ValueClass::single(ValueLeg {
+                        kind: ActionKind::X402Payment,
+                        amount: Some(amount),
+                        asset: Some(requirements.asset),
+                        destination: Some(requirements.pay_to),
+                    }),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    1_700_000_000_000,
+                )
+                .unwrap();
+            assert_eq!(decision, Decision::Allow, "{name}: {payee}");
+            assert_eq!(canonical_bytes(&signed).unwrap(), before);
+            assert_eq!(sign_policy_toml(&body, &key, &owner), signed);
+        }
+    }
+}
+
 /// Writes `content` to `<dir>/<name>` and returns the path.
 fn write_policy_file(dir: &TempDir, name: &str, content: &str) -> std::path::PathBuf {
     let path = dir.path().join(name);

@@ -6774,6 +6774,9 @@ mod tests {
     }
 
     impl crate::audit_log::TipAnchorStore for WritesFailFrom {
+        fn reads_audit_key(&self) -> bool {
+            false
+        }
         fn load_carrier_record(
             &self,
         ) -> Result<

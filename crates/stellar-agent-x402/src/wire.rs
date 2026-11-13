@@ -76,7 +76,7 @@ pub struct PaymentRequirements {
     pub asset: String,
     /// Payment amount in atomic token units (e.g. for USDC: 1 USDC = 10_000_000).
     pub amount: String,
-    /// Recipient address (G-, C-, or M-strkey; muxed recipients are accepted).
+    /// Recipient address (G-, C-, M-, or W-strkey; muxed recipients are accepted).
     pub pay_to: String,
     /// Maximum ledger window in seconds for payment validity.
     pub max_timeout_seconds: u32,

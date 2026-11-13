@@ -23,6 +23,13 @@ pub const SUPPORTED_PROTOCOL_VERSIONS: RangeInclusive<u32> = 29..=30;
 /// The first protocol version that admits CAP-84 muxed contract addresses.
 pub const MUXED_CONTRACT_MIN_PROTOCOL: u32 = 30;
 
+/// Evidence that a checked endpoint admits muxed contract addresses.
+/// Only [`EndpointIdentity::muxed_contract_admission`] constructs this value.
+#[derive(Debug)]
+pub struct MuxedContractAdmission {
+    _private: (),
+}
+
 /// What an RPC endpoint reports about itself, after the wallet checks it.
 ///
 /// The endpoint's passphrase matches the one the caller expects, and its
@@ -164,6 +171,13 @@ impl EndpointIdentity {
     #[must_use]
     pub fn admits_muxed_contract(&self) -> bool {
         self.protocol_version() >= MUXED_CONTRACT_MIN_PROTOCOL
+    }
+
+    /// Admits muxed contract signing when the checked protocol supports it.
+    #[must_use]
+    pub fn muxed_contract_admission(&self) -> Option<MuxedContractAdmission> {
+        self.admits_muxed_contract()
+            .then_some(MuxedContractAdmission { _private: () })
     }
 
     /// The endpoint's scheme, host, and port, the form every RPC error
@@ -409,6 +423,11 @@ mod tests {
         for (version, admitted) in [(29, false), (30, true), (31, true)] {
             let identity = EndpointIdentity::checked(None, version, String::new(), 0);
             assert_eq!(identity.admits_muxed_contract(), admitted, "{version}");
+            assert_eq!(
+                identity.muxed_contract_admission().is_some(),
+                admitted,
+                "{version}"
+            );
         }
     }
 
