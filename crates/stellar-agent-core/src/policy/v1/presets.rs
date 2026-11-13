@@ -52,6 +52,7 @@
 //! ```
 
 use super::asset_equivalence::assets_equivalent;
+use super::criteria::counterparty_allowlist::destination_form;
 use super::criteria::per_period_cap::Window;
 use super::mainnet_minimum::{
     MAINNET_CLAIM_TOOLS, MAINNET_READ_ONLY_TOOLS, MAINNET_TRUSTLINE_TOOLS, MAINNET_VALUE_OUT_TOOLS,
@@ -101,10 +102,6 @@ const PAYMENT_TOOLS: [&str; 4] = [
 /// The payment tools whose rules carry the balance floor. The x402 tools
 /// evaluate without an account view, so a floor there denies every call.
 const FLOOR_TOOLS: [&str; 2] = ["stellar_pay", "stellar_pay_commit"];
-
-/// The one tool whose rule carries the unlisted budget. A policy holds one
-/// `unlisted` table, and a rule names one tool.
-const UNLISTED_TOOL: &str = "stellar_x402_create_payment";
 
 /// The x402 tools, which evaluate without an account view.
 const X402_TOOLS: [&str; 2] = [
@@ -304,7 +301,7 @@ pub struct PresetInput {
     /// The typical payment in stroops of XLM; required for XLM and refused
     /// for USDC, whose presets fix it.
     pub typical_payment_stroops: Option<i128>,
-    /// Whether `stellar_x402_create_payment` pays unlisted recipients from a
+    /// Whether the payment tools pay unlisted recipients from one shared
     /// budget; api presets only.
     pub unlisted_budget: bool,
     /// Whether the payment rules carry a non-renewing total budget of `L`.
@@ -691,12 +688,17 @@ fn rate_limits(per_minute: u32, per_hour: u32) -> [String; 2] {
 /// decides `allow`, and sets `allow_opaque_signing = false`:
 ///
 /// - `stellar_pay`, `stellar_pay_commit`, and both x402 tools carry the asset
-///   allowlist, an empty `G_ACCOUNT` allowlist, the per-payment, 1d, and 1w
-///   caps, and the 1m and 1h rate limits. Shop and business add the approval
-///   threshold when it is below the per-payment cap, a chosen total budget
-///   adds `total_budget`, and the two pay
-///   tools add the balance floor. A chosen unlisted budget sits on the
-///   `stellar_x402_create_payment` rule alone.
+///   allowlist, the per-payment, 1d, and 1w caps, and the 1m and 1h rate
+///   limits. Shop and business add the approval threshold when it is below
+///   the per-payment cap, a chosen total budget adds `total_budget`, and the
+///   two pay tools add the balance floor.
+/// - Each payment rule's counterparty criterion selects `G_ACCOUNT` and
+///   `C_ACCOUNT` with an empty allowlist, so G, M, and C recipients share one
+///   list. No listed recipient is paid until one is added.
+/// - A chosen unlisted budget writes the same `unlisted` table text on every
+///   payment rule. Equal tables share one counter per asset, so one budget
+///   bounds `stellar_pay`, `stellar_pay_commit`, and both x402 tools
+///   together.
 /// - The trustline tools of a USDC profile allow USDC alone; the claim tools
 ///   carry no asset allowlist. Both take 2 calls per 1m and 6 per 1h.
 /// - The read-only tools carry no criterion. Native account funding, and the
@@ -709,21 +711,23 @@ pub fn policy_body(profile_name: &str, derived: &DerivedSpending) -> String {
         "version = 2\nscope = {}\nsequence = 1\n",
         toml_string(&format!("profile:{profile_name}"))
     );
+    // One table text on every payment rule: the loader admits equal tables
+    // only, and equal budget tables share one counter per asset.
+    let unlisted = derived.unlisted.map_or_else(String::new, |budget| {
+        format!(
+            ", unlisted = {{ mode = \"budget\", asset = {asset}, window = \"1d\", \
+             per_tx_stroops = {}, per_period_stroops = {} }}",
+            amount(budget.per_payment_stroops),
+            amount(budget.per_day_stroops)
+        )
+    });
     for tool in PAYMENT_TOOLS {
         let mut criteria = vec![format!(
             "{{ kind = \"asset_allowlist\", assets = [{asset}] }}"
         )];
-        let unlisted = match derived.unlisted {
-            Some(budget) if tool == UNLISTED_TOOL => format!(
-                ", unlisted = {{ mode = \"budget\", asset = {asset}, window = \"1d\", \
-                 per_tx_stroops = {}, per_period_stroops = {} }}",
-                amount(budget.per_payment_stroops),
-                amount(budget.per_day_stroops)
-            ),
-            _ => String::new(),
-        };
         criteria.push(format!(
-            "{{ kind = \"counterparty_allowlist\", kinds = [\"G_ACCOUNT\"], allowlist = []{unlisted} }}"
+            "{{ kind = \"counterparty_allowlist\", kinds = [\"G_ACCOUNT\", \"C_ACCOUNT\"], \
+             allowlist = []{unlisted} }}"
         ));
         criteria.push(format!(
             "{{ kind = \"per_tx_cap\", asset = {asset}, max_stroops = {} }}",
@@ -789,14 +793,15 @@ pub fn policy_body(profile_name: &str, derived: &DerivedSpending) -> String {
     body
 }
 
-/// Adds `recipient` to every counterparty list of `body` that checks its
-/// kind: a G address joins the `G_ACCOUNT` lists, a C address the
-/// `C_ACCOUNT` lists. A list that already names it is unchanged. The result
-/// is an unsigned body; it takes effect once the owner signs it.
+/// Adds a recipient to lists selecting its destination kind. G and M join
+/// `G_ACCOUNT` lists; C joins `C_ACCOUNT` lists. This is how the engine
+/// classifies a destination. An M entry covers only its own mux id. A list that already
+/// names it is unchanged. The result is an unsigned body; it takes effect
+/// once the owner signs it.
 ///
 /// # Errors
 /// Returns [`PresetError::Invalid`] when `body` is not a policy body, when
-/// `recipient` is neither a G nor a C address, or when no list of `body`
+/// `recipient` is not a G, M, or C address, or when no list of `body`
 /// checks its kind.
 ///
 /// # Examples
@@ -822,15 +827,12 @@ pub fn policy_body(profile_name: &str, derived: &DerivedSpending) -> String {
 /// assert!(body.contains(recipient));
 /// ```
 pub fn add_recipient(body: &str, recipient: &str) -> Result<String, PresetError> {
-    let kind = if stellar_strkey::ed25519::PublicKey::from_string(recipient).is_ok() {
-        "G_ACCOUNT"
-    } else if stellar_strkey::Contract::from_string(recipient).is_ok() {
-        "C_ACCOUNT"
-    } else {
+    let Some((kind, _)) = destination_form(recipient) else {
         return Err(PresetError::Invalid(format!(
-            "recipient {recipient:?} is neither a G nor a C address"
+            "recipient {recipient:?} is not a G, M, or C address"
         )));
     };
+    let kind = kind.tag();
     let mut document: DocumentMut = body.parse().map_err(|error| {
         PresetError::Invalid(format!("the policy body does not parse: {error}"))
     })?;
@@ -1013,14 +1015,16 @@ pub struct ToolLimits {
     pub total_budget: Option<String>,
     /// The amount above which a payment requests approval.
     pub approval_above: Option<String>,
-    /// At most what this tool alone pays in each window of the asset, and in
-    /// `total` until the next signature, to the recipients of
-    /// `largest_payment`; when it pays one, also at most what it pays every
-    /// recipient together. `0` when no such recipient exists, `null` for no
-    /// bound.
+    /// At most what this tool alone pays without approval in each window of
+    /// the asset, and in `total` until the next signature, to the recipients
+    /// of `largest_payment`. When it pays one, it is also at most what it
+    /// pays every recipient together. Only payments the evaluation allows
+    /// count; a payment that requests approval never does. `0` when no such
+    /// recipient is paid with `allow`, `null` for no bound.
     pub bounds: Vec<PeriodBound>,
-    /// At most what this tool alone pays through the unlisted budget and to
-    /// addresses in no list, per window; `0` when the rule pays neither.
+    /// At most what this tool alone pays without approval through the
+    /// unlisted budget and to addresses in no list, per window. `0` when the
+    /// rule pays neither with `allow`.
     pub unlisted_bounds: Vec<PeriodBound>,
     /// The criterion kinds and shapes of the rule the bounds do not model;
     /// each marks the tool's bounds as not known to be reachable.
@@ -1065,7 +1069,7 @@ pub struct RateCap {
     pub writers: u32,
 }
 
-/// At most what one tool can pay in one window.
+/// At most what one tool can pay without approval in one window.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PeriodBound {
     /// A rolling window, or `total` for the time until the next signature.
@@ -1110,8 +1114,8 @@ pub struct Counter {
     pub writers: Agreed<u32>,
 }
 
-/// At most what the asset can lose in one window through every tool
-/// together.
+/// At most what the asset can lose without approval in one window through
+/// every tool together.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AssetBound {
     /// A rolling window, or `total` for the time until the next signature.
@@ -1168,13 +1172,13 @@ pub struct AssetLimits {
     pub unlisted_period_cap: Agreed<PeriodCap>,
     /// Every counter the evaluation keeps for the asset.
     pub counters: Vec<Counter>,
-    /// At most what the asset loses in every window of the asset, and in
-    /// `total`, to the recipients of [`ToolLimits::bounds`]; when every
-    /// paying tool pays such a recipient, also at most what every payment
-    /// together loses.
+    /// At most what the asset loses without approval in every window of the
+    /// asset, and in `total`, to the recipients of [`ToolLimits::bounds`].
+    /// When every paying tool pays such a recipient, it is also at most what
+    /// every payment together loses.
     pub bounds: Vec<AssetBound>,
-    /// At most what the asset loses through the unlisted budget and to
-    /// addresses in no list, per window.
+    /// At most what the asset loses without approval through the unlisted
+    /// budget and to addresses in no list, per window.
     pub unlisted_bounds: Vec<AssetBound>,
     /// The limits of each tool whose effective rule admits the asset.
     pub tools: Vec<ToolLimits>,
@@ -1469,14 +1473,15 @@ const fn modeled_criterion_kinds() -> &'static [&'static str] {
     ]
 }
 
-/// The counterparty kinds the recipient model reads: a recipient is listed
-/// when its address appears in the allowlist.
+/// The counterparty kinds the recipient model reads. They are alternatives:
+/// a criterion lists a recipient when it selects the recipient's kind and
+/// its allowlist holds the recipient or, for an M address, its base G.
 const MODELED_COUNTERPARTY_KINDS: [&str; 2] = ["G_ACCOUNT", "C_ACCOUNT"];
 
-/// Whether a list entry is a payment destination: a G or a C address.
+/// Whether a list entry is a payment destination: a G, M, or C address, as
+/// the engine classifies a destination.
 fn is_address(entry: &str) -> bool {
-    stellar_strkey::ed25519::PublicKey::from_string(entry).is_ok()
-        || stellar_strkey::Contract::from_string(entry).is_ok()
+    destination_form(entry).is_some()
 }
 
 /// The criterion kinds that make a recipient's class depend on a verified
@@ -1639,6 +1644,38 @@ impl ToolView {
         !self.blocked && (!self.classified || self.has_recipient(class))
     }
 
+    /// Whether the tool pays some recipient of the class with `allow`: its
+    /// rule allows, and the class holds a recipient no criterion escalates.
+    /// Without a modeled classification any recipient may be one.
+    fn pays_unattended(&self, class: Class) -> bool {
+        let named = |treatment: Treatment| {
+            self.recipients
+                .iter()
+                .any(|(recipient, t)| is_address(recipient) && *t == treatment)
+        };
+        self.decision == "allow"
+            && !self.blocked
+            && (!self.classified
+                || match class {
+                    Class::Listed => self.open || named(Treatment::Allowed),
+                    Class::Unlisted => {
+                        matches!(self.unlisted, Treatment::Allowed | Treatment::Budgeted)
+                            || named(Treatment::Budgeted)
+                    }
+                })
+    }
+
+    /// The largest single payment to the class the evaluation allows
+    /// without approval: the largest admitted payment, at most the approval
+    /// threshold. `0` when the tool pays no recipient of the class with
+    /// `allow`.
+    fn unattended_largest(&self, class: Class) -> Option<i128> {
+        if !self.pays_unattended(class) {
+            return Some(0);
+        }
+        min_present([self.largest(class), self.approval])
+    }
+
     /// The counters a payment to the class writes and must fit.
     fn class_caps(&self, class: Class) -> Vec<&CapView> {
         let budgeted = self.budgeted(class);
@@ -1703,14 +1740,15 @@ impl ToolView {
         }
     }
 
-    /// At most what this tool alone can pay the class in a window: the
-    /// tightest counter bound, `None` without one, zero when it pays no
-    /// recipient of the class.
+    /// At most what this tool alone can pay the class in a window without
+    /// approval: the tightest counter bound over payments the evaluation
+    /// allows, `None` without one. Zero when it pays no recipient of the
+    /// class with `allow`. A payment that requests approval never counts.
     fn bound(&self, class: Class, window: Option<u64>) -> Option<i128> {
-        if !self.admits(class) {
+        if !self.pays_unattended(class) {
             return Some(0);
         }
-        let amax = self.largest(class);
+        let amax = self.unattended_largest(class);
         min_present(
             self.class_caps(class)
                 .into_iter()
@@ -1722,7 +1760,7 @@ impl ToolView {
     /// covering the window first, shortest first, then a shorter one.
     fn binding_cap(&self, class: Class, window: Option<u64>) -> Option<&CapView> {
         let bound = self.bound(class, window)?;
-        let amax = self.largest(class);
+        let amax = self.unattended_largest(class);
         let mut caps = self.class_caps(class);
         caps.sort_by_key(|c| {
             let covers = match (c.secs, window) {
@@ -1736,24 +1774,25 @@ impl ToolView {
             .find(|cap| Self::cap_bound(cap, window, amax) == Some(bound))
     }
 
-    /// Whether a sequence of payments is known to spend exactly the bound:
-    /// every criterion is modeled, a recipient of the class exists, and a
-    /// run over the counters reaches the bound within the window. The runs
-    /// are the greedy one, and the staged one that first pays up to the
-    /// bound less the largest payment and then pays the largest payment; the
-    /// staged run reaches the bound `⌊(L − amax)/m⌋ + amax` of an amount
-    /// counter written `m` times. A bound neither run reaches is not
-    /// reachable.
+    /// Whether a sequence of payments the evaluation allows is known to
+    /// spend exactly the bound. Every criterion is modeled, the class holds
+    /// a recipient paid with `allow`, and a run over the counters reaches the
+    /// bound within the window. The runs are the greedy one and the staged
+    /// one. The staged run first pays up to the bound less the largest
+    /// payment, then pays the largest payment. It reaches the bound
+    /// `⌊(L − amax)/m⌋ + amax` of an amount counter written `m` times. A
+    /// bound neither run reaches is not reachable.
     fn reachable(&self, class: Class, window: Option<u64>) -> bool {
-        if !self.admits(class) {
+        if !self.pays_unattended(class) {
             return true;
         }
-        let (Some(bound), Some(amax)) = (self.bound(class, window), self.largest(class)) else {
+        let (Some(bound), Some(amax)) = (self.bound(class, window), self.unattended_largest(class))
+        else {
             return false;
         };
         let caps = self.class_caps(class);
         self.unmodeled.is_empty()
-            && self.has_recipient(class)
+            && self.classified
             && (greedy_reaches(&caps, amax, bound, window, 0)
                 || greedy_reaches(&caps, amax, bound, window, amax))
     }
@@ -1912,16 +1951,17 @@ fn greedy_reaches(
     false
 }
 
-/// At most what the paying `views` together pay the class in a window, as
-/// the counters admit it.
+/// At most what the paying `views` together pay the class in a window
+/// without approval, as the counters admit it.
 ///
 /// A tool's payments count in every counter its rule writes, and each
 /// payment must fit every one of them. Whatever the other tools pay, a tool
 /// pays at most its own bound. The tools are grouped by the counter that
 /// gives each its bound. The bound is stated when every group's tools agree
-/// on that counter, its limit, its writers, and their largest payment, and
-/// no two groups share a counter: one group spends at most its bound, and
-/// separate groups spend independently, so the asset spends at most the sum.
+/// on that counter, its limit, its writers, and their largest unattended
+/// payment, and no two groups share a counter. One group spends at most its
+/// bound, and separate groups spend independently, so the asset spends at
+/// most the sum.
 /// It is reachable when every group's tool reaches its own bound. Otherwise
 /// the per-tool bounds apply.
 fn combined_bound(
@@ -1943,7 +1983,7 @@ fn combined_bound(
     };
     let paying: Vec<&&ToolView> = views
         .iter()
-        .filter(|v| v.admits(class) && v.bound(class, window) != Some(0))
+        .filter(|v| v.pays_unattended(class) && v.bound(class, window) != Some(0))
         .collect();
     if paying.is_empty() {
         return AssetBound {
@@ -1964,7 +2004,7 @@ fn combined_bound(
             cap.limit,
             cap.writers,
             cap.kind,
-            view.largest(class),
+            view.unattended_largest(class),
         );
         match groups.iter_mut().find(|(s, _, _)| s.0 == signature.0) {
             Some((s, group_bound, members)) if *s == signature && *group_bound == bound => {
@@ -2010,6 +2050,11 @@ fn combined_bound(
 
 /// The flags of `recipient` under the counterparty criteria of `rule`;
 /// `None` stands for an address in no list.
+///
+/// A criterion lists the recipient only when three things hold. The
+/// recipient is a G, M, or C address, the criterion's `kinds` select its
+/// kind, and its allowlist holds the recipient or its base G. An entry of an unselected kind leaves the
+/// recipient unlisted, as in the engine.
 fn recipient_flags(
     rule: &RuleView<'_>,
     recipient: Option<&str>,
@@ -2017,12 +2062,23 @@ fn recipient_flags(
     passphrase: &str,
 ) -> Flags {
     let mut flags = Flags::default();
+    let form = recipient.and_then(|recipient| {
+        destination_form(recipient).map(|(kind, base)| (recipient, kind.tag(), base))
+    });
     for criterion in rule.of_kind("counterparty_allowlist") {
-        let listed = recipient.is_some_and(|recipient| {
+        let listed = form.as_ref().is_some_and(|(recipient, kind, base)| {
             criterion
-                .get("allowlist")
+                .get("kinds")
                 .and_then(Value::as_array)
-                .is_some_and(|list| list.iter().any(|entry| entry.as_str() == Some(recipient)))
+                .is_some_and(|kinds| kinds.iter().any(|k| k.as_str() == Some(*kind)))
+                && criterion
+                    .get("allowlist")
+                    .and_then(Value::as_array)
+                    .is_some_and(|list| {
+                        list.iter()
+                            .filter_map(Value::as_str)
+                            .any(|entry| entry == *recipient || entry == base.as_str())
+                    })
         });
         if listed {
             continue;
@@ -2382,9 +2438,12 @@ fn x402_approval_notes(views: &[ToolView], asset: &str, mainnet: bool) -> Vec<St
 /// contributing tool states it, else [`Agreed::PerTool`].
 ///
 /// Every criterion of a rule applies. A recipient is treated per
-/// counterparty criterion, listed or by that criterion's unlisted mode, and
-/// the treatments combine: a denial denies, an `approval` mode escalates, and
-/// a `budget` mode bounds the payment by the budget. A rule without a
+/// counterparty criterion, listed or by that criterion's unlisted mode. The
+/// treatments combine: a denial denies, an `approval` mode escalates, and a
+/// `budget` mode bounds the payment by the budget. As in the engine, the G
+/// and C kinds are alternatives. A criterion lists a G, M, or C recipient
+/// when its `kinds` select the recipient's kind. Its allowlist must also
+/// hold the recipient or, for an M address, its base G. A rule without a
 /// counterparty criterion admits every recipient, reported as
 /// `unrestricted`. A rule's floor is its highest floor; an x402 rule with a
 /// floor denies every call, since x402 tools evaluate without an account
@@ -2904,6 +2963,7 @@ mod tests {
 
     use super::*;
     use crate::asset_id::CanonicalAsset;
+    use crate::policy::v1::criteria::counterparty_allowlist::RecipientClass;
     use crate::policy::v1::criteria::state_store::set_query_time_for_test;
     use crate::policy::v1::mainnet_minimum::{self, RequirementStatus};
     use crate::policy::v1::{
@@ -2921,6 +2981,8 @@ mod tests {
     const ISSUER: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
     const OTHER_ISSUER: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
     const PROFILE: &str = "preset-test";
+    /// The x402 tool that creates a payment.
+    const CREATE_TOOL: &str = "stellar_x402_create_payment";
     /// A policy instant far from the host clock.
     const T0: u64 = 1_800_000_000_000;
     /// The spacing of recorded payments, beyond the 1m window.
@@ -3217,6 +3279,99 @@ mod tests {
         })
     }
 
+    /// One payment a property check evaluates. `asset` is `native` or an
+    /// identity of the fixture USDC.
+    #[derive(Debug, Clone, Copy)]
+    struct Payment<'a> {
+        tool: &'a str,
+        asset: &'a str,
+        to: &'a str,
+        amount: i128,
+    }
+
+    impl Payment<'_> {
+        fn native(self) -> bool {
+            self.asset == "native"
+        }
+
+        /// The arguments of the classic payment, with the envelope fee.
+        fn pay_args(self, fee_stroops: i64) -> serde_json::Value {
+            let asset = if self.native() {
+                "native".to_owned()
+            } else {
+                format!("USDC:{ISSUER}")
+            };
+            serde_json::json!({
+                "destination": self.to,
+                "asset": asset,
+                "amount_stroops": self.amount.to_string(),
+                "total_fee_stroops": fee_stroops,
+            })
+        }
+
+        /// The value of the x402 payment on `net`.
+        fn x402_value(self, net: Net) -> ValueClass {
+            let asset = if self.native() {
+                CanonicalAsset::Native
+            } else {
+                CanonicalAsset::parse_threshold_key(&format!("USDC:{ISSUER}")).unwrap()
+            };
+            ValueClass::single(ValueLeg {
+                kind: ActionKind::X402Payment,
+                amount: Some(self.amount),
+                asset: Some(asset.sac_contract_id(net.passphrase()).unwrap()),
+                destination: Some(self.to.to_owned()),
+            })
+        }
+    }
+
+    /// Evaluates `payment` as its tool does: a classic payment with a fresh
+    /// read of an account holding `balance` and the envelope fee `fee`, an
+    /// x402 payment without an account view.
+    fn evaluate_payment(
+        engine: &PolicyEngineV1,
+        payment: Payment<'_>,
+        (now_ms, balance, fee): (u64, i64, i64),
+        net: Net,
+    ) -> Decision {
+        let descriptor = tool_on(payment.tool, net);
+        let profile = net.profile();
+        if X402_TOOLS.contains(&payment.tool) {
+            return engine
+                .evaluate_with_value(
+                    &descriptor,
+                    &serde_json::json!({}),
+                    &profile,
+                    payment.x402_value(net),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    now_ms,
+                )
+                .unwrap();
+        }
+        let observed = ObservedAccount::new(Balance(balance), 1, now_ms, now_ms - 5_000);
+        let floor = FloorInput {
+            observed: &observed,
+            effective_reservations_stroops: 0,
+        };
+        engine
+            .evaluate(
+                &descriptor,
+                &payment.pay_args(fee),
+                &profile,
+                Some(&floor),
+                None,
+                None,
+                None,
+                None,
+                now_ms,
+            )
+            .unwrap()
+    }
+
     fn pay(engine: &PolicyEngineV1, to: &str, amount: i128, now_ms: u64) -> Decision {
         pay_from(engine, to, amount, now_ms, 1_000 * 10_000_000)
     }
@@ -3325,20 +3480,37 @@ mod tests {
         now_ms: u64,
         net: Net,
     ) -> Decision {
+        let usdc = format!("USDC:{ISSUER}");
+        let payment = Payment {
+            tool,
+            asset: &usdc,
+            to,
+            amount,
+        };
+        spend_payment(engine, payment, now_ms, net)
+    }
+
+    /// [`spend`] for any [`Payment`].
+    fn spend_payment(
+        engine: &PolicyEngineV1,
+        payment: Payment<'_>,
+        now_ms: u64,
+        net: Net,
+    ) -> Decision {
         let _clock = set_query_time_for_test(now_ms);
         let profile = net.profile();
-        let descriptor = tool_on(tool, net);
+        let descriptor = tool_on(payment.tool, net);
         let observed = ObservedAccount::new(Balance(i64::MAX), 1, now_ms, now_ms - 5_000);
         let floor = FloorInput {
             observed: &observed,
             effective_reservations_stroops: 0,
         };
-        let evaluation = if X402_TOOLS.contains(&tool) {
+        let evaluation = if X402_TOOLS.contains(&payment.tool) {
             engine.evaluate_with_value_full(
                 &descriptor,
                 &serde_json::json!({}),
                 &profile,
-                x402_value_on(to, amount, net),
+                payment.x402_value(net),
                 None,
                 None,
                 None,
@@ -3349,7 +3521,7 @@ mod tests {
         } else {
             engine.evaluate_full(
                 &descriptor,
-                &pay_args(to, amount),
+                &payment.pay_args(0),
                 &profile,
                 Some(&floor),
                 None,
@@ -4141,7 +4313,7 @@ mod tests {
     }
 
     #[test]
-    fn payment_rules_list_accounts_only() {
+    fn payment_rules_list_every_address_kind() {
         for input in usdc_inputs() {
             let body = doc(&policy_body(PROFILE, &derive(&input).unwrap()));
             for (tool, criteria) in rules_of(&body) {
@@ -4160,41 +4332,216 @@ mod tests {
                         .map(|v| v.as_str().unwrap().to_owned())
                         .collect::<Vec<_>>()
                 };
-                assert_eq!(strings("kinds"), ["G_ACCOUNT"], "{tool}");
+                assert_eq!(strings("kinds"), ["G_ACCOUNT", "C_ACCOUNT"], "{tool}");
                 assert!(strings("allowlist").is_empty(), "{tool}");
             }
         }
     }
 
     #[test]
-    fn unlisted_table_only_on_x402_create_payment() {
+    fn unlisted_tables_equal_on_every_payment_rule() {
         for name in ["api-day", "api-week", "api-2weeks"] {
             for total in [true, false] {
                 let body = policy_body(PROFILE, &derived(name, true, total));
                 validate_unsigned_policy(&body, PROFILE, MAINNET_PASSPHRASE)
                     .unwrap_or_else(|error| panic!("{name}: {error}"));
-                let carriers: Vec<String> = rules_of(&doc(&body))
+                let tables: Vec<(String, String)> = rules_of(&doc(&body))
                     .into_iter()
-                    .filter(|(_, criteria)| criteria.iter().any(|c| c.contains_key("unlisted")))
-                    .map(|(tool, _)| tool)
+                    .flat_map(|(tool, criteria)| {
+                        criteria
+                            .iter()
+                            .filter_map(|c| c.get("unlisted"))
+                            .map(|table| (tool.clone(), table.to_string().trim().to_owned()))
+                            .collect::<Vec<_>>()
+                    })
                     .collect();
-                assert_eq!(carriers, ["stellar_x402_create_payment"], "{name}");
-                assert_eq!(body.matches("unlisted").count(), 1, "{name}");
-                let summary = summary_of(&body);
-                assert_eq!(summary.limits[0].unlisted_mode, Agreed::PerTool);
-                for (tool, mode) in [
-                    ("stellar_pay", "deny"),
-                    (UNLISTED_TOOL, "budget"),
-                    ("stellar_x402_authenticated_payment", "deny"),
-                ] {
-                    assert_eq!(tool_limits(&summary, tool).unlisted_mode, mode, "{tool}");
-                }
-                assert_eq!(
-                    summary.limits[0].unlisted_tools,
-                    ["stellar_x402_create_payment"]
+                let carriers: Vec<&str> = tables.iter().map(|(tool, _)| tool.as_str()).collect();
+                assert_eq!(carriers, PAYMENT_TOOLS, "{name}");
+                assert!(
+                    tables.iter().all(|(_, text)| *text == tables[0].1),
+                    "{name}: {tables:?}"
                 );
+                let summary = summary_of(&body);
+                let limits = &summary.limits[0];
+                assert_eq!(limits.unlisted_mode, Agreed::Uniform(Some("budget")));
+                assert_eq!(limits.unlisted_tools, PAYMENT_TOOLS);
+                let unlisted: Vec<&Counter> = limits
+                    .counters
+                    .iter()
+                    .filter(|c| c.kind == "unlisted")
+                    .collect();
+                assert_eq!(unlisted.len(), 1, "{name}");
+                assert_eq!(unlisted[0].tools, PAYMENT_TOOLS, "{name}");
             }
         }
+    }
+
+    fn muxed(seed: u8, id: u64) -> String {
+        stellar_strkey::ed25519::MuxedAccount {
+            ed25519: [seed; 32],
+            id,
+        }
+        .to_string()
+        .as_str()
+        .to_owned()
+    }
+
+    fn contract(seed: u8) -> String {
+        stellar_strkey::Contract([seed; 32])
+            .to_string()
+            .as_str()
+            .to_owned()
+    }
+
+    /// The allowlist of every payment rule of `body`, in rule order.
+    fn payment_lists(body: &str) -> Vec<(String, Vec<String>)> {
+        rules_of(&doc(body))
+            .into_iter()
+            .filter(|(tool, _)| PAYMENT_TOOLS.contains(&tool.as_str()))
+            .map(|(tool, criteria)| {
+                let list = of_kind(&criteria, "counterparty_allowlist")[0]
+                    .get("allowlist")
+                    .and_then(Value::as_array)
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_str().unwrap().to_owned())
+                    .collect();
+                (tool, list)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn add_recipient_accepts_every_address_form() {
+        let (g, m, c) = (account(7), muxed(8, 5), contract(3));
+        let body = policy_body(PROFILE, &derived("api-day", false, true));
+        let mut added = body.clone();
+        for recipient in [&g, &m, &c] {
+            added = add_recipient(&added, recipient).unwrap();
+        }
+        validate_unsigned_policy(&added, PROFILE, MAINNET_PASSPHRASE).unwrap();
+        for (tool, list) in payment_lists(&added) {
+            assert_eq!(list, [g.clone(), m.clone(), c.clone()], "{tool}");
+        }
+        // A list that names the recipient stays unchanged.
+        assert_eq!(add_recipient(&added, &m).unwrap(), added);
+
+        // A rule whose list selects G only takes G and M, never C.
+        let mixed = edit_rules(&body, &["stellar_pay"], |criteria| {
+            for value in criteria.iter_mut() {
+                let table = value.as_inline_table_mut().unwrap();
+                if table["kind"].as_str() == Some("counterparty_allowlist") {
+                    table.insert("kinds", Value::from_iter(["G_ACCOUNT"]));
+                }
+            }
+        });
+        let mut added = mixed;
+        for recipient in [&g, &m, &c] {
+            added = add_recipient(&added, recipient).unwrap();
+        }
+        for (tool, list) in payment_lists(&added) {
+            let expected = if tool == "stellar_pay" {
+                vec![g.clone(), m.clone()]
+            } else {
+                vec![g.clone(), m.clone(), c.clone()]
+            };
+            assert_eq!(list, expected, "{tool}");
+        }
+        let g_only = body.replace(
+            "kinds = [\"G_ACCOUNT\", \"C_ACCOUNT\"]",
+            "kinds = [\"G_ACCOUNT\"]",
+        );
+        assert_eq!(
+            add_recipient(&g_only, &c),
+            Err(PresetError::Invalid(
+                "no counterparty list of the body checks C_ACCOUNT recipients".to_owned()
+            ))
+        );
+        assert!(add_recipient(&g_only, &m).unwrap().contains(&m));
+
+        // Every other form refuses, with no list changed.
+        let pool = stellar_strkey::Strkey::LiquidityPool(stellar_strkey::LiquidityPool([4; 32]))
+            .to_string()
+            .as_str()
+            .to_owned();
+        for other in [pool.as_str(), "not-an-address", ""] {
+            assert_eq!(
+                add_recipient(&body, other),
+                Err(PresetError::Invalid(format!(
+                    "recipient {other:?} is not a G, M, or C address"
+                ))),
+                "{other}"
+            );
+        }
+    }
+
+    /// The summary lists a recipient as the engine does. G and C kinds are
+    /// alternatives, and an M address matches its exact entry or its base G.
+    /// An entry of an unselected kind is unlisted.
+    #[test]
+    fn summary_treats_address_kinds_as_alternatives() {
+        let (g, m, c) = (account(7), muxed(8, 5), contract(3));
+        let body = policy_body(PROFILE, &derived("api-day", false, true));
+        let mut main = body.clone();
+        for recipient in [&g, &m, &c] {
+            main = add_recipient(&main, recipient).unwrap();
+        }
+        let summary = summary_of(&main);
+        assert_eq!(summary.recipients.kinds, ["G_ACCOUNT", "C_ACCOUNT"]);
+        assert!(summary.recipients.without_listed_recipient.is_empty());
+        let listed: Vec<(&str, &Agreed<Treatment>)> = summary
+            .recipients
+            .listed
+            .iter()
+            .map(|r| (r.recipient.as_str(), &r.treatment))
+            .collect();
+        let allowed = Agreed::Uniform(Some(Treatment::Allowed));
+        assert_eq!(
+            listed,
+            [
+                (g.as_str(), &allowed),
+                (m.as_str(), &allowed),
+                (c.as_str(), &allowed)
+            ]
+        );
+        let engine = verified_engine(&main);
+        let amount = 100_000;
+        assert_eq!(pay(&engine, &g, amount, T0), Decision::Allow);
+        assert_eq!(pay(&engine, &muxed(7, 9), amount, T0), Decision::Allow);
+        assert_eq!(pay(&engine, &m, amount, T0), Decision::Allow);
+        assert_eq!(label(&pay(&engine, &muxed(8, 6), amount, T0)), "deny");
+        assert_eq!(x402(&engine, CREATE_TOOL, &c, amount, T0), Decision::Allow);
+
+        // A list that selects G only leaves its C entry unlisted.
+        let g_only = main.replace(
+            "kinds = [\"G_ACCOUNT\", \"C_ACCOUNT\"]",
+            "kinds = [\"G_ACCOUNT\"]",
+        );
+        let summary = summary_of(&g_only);
+        let c_entry = summary
+            .recipients
+            .listed
+            .iter()
+            .find(|r| r.recipient == c)
+            .unwrap();
+        assert_eq!(c_entry.treatment, Agreed::Uniform(Some(Treatment::Denied)));
+        assert_eq!(
+            label(&x402(
+                &verified_engine(&g_only),
+                CREATE_TOOL,
+                &c,
+                amount,
+                T0
+            )),
+            "deny"
+        );
+
+        // An M address alone is a recipient the pay rule pays.
+        let m_only = add_recipient(&body, &m).unwrap();
+        let summary = summary_of(&m_only);
+        let pay_limits = tool_limits(&summary, "stellar_pay");
+        assert_eq!(pay_limits.largest_payment, pay_limits.per_tx_cap);
+        assert_eq!(pay_limits.largest_payment.as_deref(), Some("0.2"));
     }
 
     #[test]
@@ -4309,7 +4656,7 @@ mod tests {
         );
         let engine = verified_engine(&body);
         assert_eq!(
-            x402(&engine, UNLISTED_TOOL, &listed, 100_000, T0),
+            x402(&engine, CREATE_TOOL, &listed, 100_000, T0),
             Decision::Allow
         );
         assert_eq!(
@@ -4340,7 +4687,7 @@ mod tests {
         assert!(authenticated.denies_every_call);
         assert_eq!(authenticated.unlisted_mode, "deny");
         assert_eq!(authenticated.recipients[0].treatment, Treatment::Denied);
-        assert!(!tool_limits(&summary, UNLISTED_TOOL).denies_every_call);
+        assert!(!tool_limits(&summary, CREATE_TOOL).denies_every_call);
         let floors: Vec<(&str, Option<&str>)> = summary
             .balance_floors
             .iter()
@@ -4351,7 +4698,7 @@ mod tests {
             [
                 ("stellar_pay", Some("4.5")),
                 ("stellar_pay_commit", Some("4.5")),
-                (UNLISTED_TOOL, None),
+                (CREATE_TOOL, None),
                 ("stellar_x402_authenticated_payment", Some("10")),
             ]
         );
@@ -4544,7 +4891,7 @@ mod tests {
             [
                 "stellar_pay",
                 "stellar_pay_commit",
-                UNLISTED_TOOL,
+                CREATE_TOOL,
                 "stellar_x402_authenticated_payment"
             ]
         );
@@ -4667,10 +5014,7 @@ mod tests {
         let engine = verified_engine(&narrowed);
         for to in [&first, &second] {
             assert_eq!(label(&pay(&engine, to, 100_000, T0)), "deny");
-            assert_eq!(
-                label(&x402(&engine, UNLISTED_TOOL, to, 100_000, T0)),
-                "deny"
-            );
+            assert_eq!(label(&x402(&engine, CREATE_TOOL, to, 100_000, T0)), "deny");
         }
         let summary = summary_of(&narrowed);
         let denied = Agreed::Uniform(Some(Treatment::Denied));
@@ -4693,16 +5037,19 @@ mod tests {
         let (a, b, c) = (account(7), account(9), account(11));
         for mode in ["budget", "approval"] {
             for second_first in [false, true] {
-                let base = listed_body(&derived("api-week", true, true), &a);
-                let body = edit_rules(&base, &[UNLISTED_TOOL], |criteria| {
-                    if mode == "approval" {
+                let mut base = listed_body(&derived("api-week", true, true), &a);
+                if mode == "approval" {
+                    // Every payment rule carries the same table.
+                    base = edit_rules(&base, &PAYMENT_TOOLS, |criteria| {
                         for item in criteria.iter_mut() {
                             let table = item.as_inline_table_mut().unwrap();
                             if table["kind"].as_str() == Some("counterparty_allowlist") {
                                 table.insert("unlisted", criterion("{ mode = \"approval\" }"));
                             }
                         }
-                    }
+                    });
+                }
+                let body = edit_rules(&base, &[CREATE_TOOL], |criteria| {
                     let restriction = criterion(&format!(
                         "{{ kind = \"counterparty_allowlist\", kinds = [\"G_ACCOUNT\"], allowlist = [\"{b}\"] }}"
                     ));
@@ -4713,7 +5060,7 @@ mod tests {
                     }
                 });
                 let engine = verified_engine(&body);
-                let create = tool_limits(&summary_of(&body), UNLISTED_TOOL).clone();
+                let create = tool_limits(&summary_of(&body), CREATE_TOOL).clone();
                 let stated = |recipient: &str| {
                     create
                         .recipients
@@ -4732,7 +5079,7 @@ mod tests {
                 assert_eq!(create.unlisted_mode, "deny", "{mode} {second_first}");
                 for (to, decision) in [(&a, "deny"), (&b, b_decision), (&c, "deny")] {
                     assert_eq!(
-                        label(&x402(&engine, UNLISTED_TOOL, to, 100_000, T0)),
+                        label(&x402(&engine, CREATE_TOOL, to, 100_000, T0)),
                         decision,
                         "{mode} {second_first}"
                     );
@@ -4742,11 +5089,11 @@ mod tests {
                     assert_eq!(create.unlisted_per_tx_cap.as_deref(), Some("0.25"));
                     assert_eq!(create.unlisted_exhaustion, "deny");
                     assert_eq!(
-                        label(&x402(&engine, UNLISTED_TOOL, &b, 2_500_000, T0)),
+                        label(&x402(&engine, CREATE_TOOL, &b, 2_500_000, T0)),
                         "allow"
                     );
                     assert_eq!(
-                        label(&x402(&engine, UNLISTED_TOOL, &b, 2_500_001, T0)),
+                        label(&x402(&engine, CREATE_TOOL, &b, 2_500_001, T0)),
                         "deny"
                     );
                 }
@@ -4771,10 +5118,10 @@ mod tests {
         let per_tool = Agreed::PerTool;
         let bodies = [
             (uniform("deny"), compute.clone()),
-            (per_tool.clone(), budget.clone()),
+            (uniform("budget"), budget.clone()),
             (
                 uniform("deny"),
-                edit_rules(&budget, &[UNLISTED_TOOL], |criteria| {
+                edit_rules(&budget, &PAYMENT_TOOLS, |criteria| {
                     criteria.push(criterion(&format!(
                         "{{ kind = \"counterparty_allowlist\", kinds = [\"G_ACCOUNT\"], allowlist = [\"{listed}\"] }}"
                     )));
@@ -4799,7 +5146,7 @@ mod tests {
             let engine = verified_engine(body);
             for name in [
                 "stellar_pay",
-                UNLISTED_TOOL,
+                CREATE_TOOL,
                 "stellar_x402_authenticated_payment",
             ] {
                 let decision = if name == "stellar_pay" {
@@ -4923,15 +5270,15 @@ mod tests {
             with["unlisted_exhaustion"],
             serde_json::json!({"uniform": "deny"})
         );
-        assert_eq!(with["limits"][0]["unlisted_mode"], "per_tool");
+        assert_eq!(
+            with["limits"][0]["unlisted_mode"],
+            serde_json::json!({"uniform": "budget"})
+        );
         let create = &with["limits"][0]["tools"][2];
-        assert_eq!(create["tool"], UNLISTED_TOOL);
+        assert_eq!(create["tool"], CREATE_TOOL);
         assert_eq!(create["unlisted_mode"], "budget");
         assert_eq!(create["unlisted_exhaustion"], "deny");
-        assert_eq!(
-            with["limits"][0]["tools"][0]["unlisted_exhaustion"],
-            "unbudgeted"
-        );
+        assert_eq!(with["limits"][0]["tools"][0]["unlisted_exhaustion"], "deny");
         let without = serde_json::to_value(summary_of(&policy_body(
             PROFILE,
             &derived("api-week", false, true),
@@ -4958,9 +5305,8 @@ mod tests {
         );
     }
 
-    /// An unrestricted pay rule beside a budgeted create rule: the unlisted
-    /// caps and the exhaustion behavior differ per tool, and the summary
-    /// states each.
+    /// An unrestricted pay rule beside budgeted rules: the unlisted caps and
+    /// the exhaustion behavior differ per tool, and the summary states each.
     #[test]
     fn summary_unlisted_caps_per_tool() {
         let (listed, unlisted) = (account(7), account(9));
@@ -4976,13 +5322,13 @@ mod tests {
         let engine = verified_engine(&body);
         assert_eq!(pay(&engine, &unlisted, 3_000_000, T0), Decision::Allow);
         assert_eq!(
-            label(&x402(&engine, UNLISTED_TOOL, &unlisted, 3_000_000, T0)),
+            label(&x402(&engine, CREATE_TOOL, &unlisted, 3_000_000, T0)),
             "deny"
         );
         let summary = summary_of(&body);
         let limits = &summary.limits[0];
         let per_tool = Agreed::PerTool;
-        assert_eq!(limits.unlisted_tools, ["stellar_pay", UNLISTED_TOOL]);
+        assert_eq!(limits.unlisted_tools, PAYMENT_TOOLS);
         assert_eq!(limits.unlisted_per_tx_cap, per_tool);
         assert_eq!(limits.unlisted_period_cap, Agreed::PerTool);
         assert_eq!(summary.unlisted_exhaustion, Agreed::PerTool);
@@ -4995,7 +5341,7 @@ mod tests {
             ("unrestricted", None)
         );
         assert_eq!(pay_limits.unlisted_exhaustion, "unbudgeted");
-        let create = tool_limits(&summary, UNLISTED_TOOL);
+        let create = tool_limits(&summary, CREATE_TOOL);
         assert_eq!(
             (create.unlisted_mode, create.unlisted_per_tx_cap.as_deref()),
             ("budget", Some("0.25"))
@@ -5369,7 +5715,7 @@ mod tests {
                 "deny",
             ),
             plain_rule(
-                UNLISTED_TOOL,
+                CREATE_TOOL,
                 &classic,
                 &[per_tx(&classic, 100_000_000)],
                 "require_approval",
@@ -5389,7 +5735,7 @@ mod tests {
         let engine = verified_engine(&body);
         assert_eq!(label(&pay(&engine, &listed, 1, T0)), "approval");
         assert_eq!(
-            label(&x402(&engine, UNLISTED_TOOL, &listed, 1, T0)),
+            label(&x402(&engine, CREATE_TOOL, &listed, 1, T0)),
             "approval"
         );
         let clause = if cfg!(feature = "mainnet-write") {
@@ -5423,7 +5769,7 @@ mod tests {
                 "allow",
             ),
             plain_rule(
-                UNLISTED_TOOL,
+                CREATE_TOOL,
                 &classic,
                 &[period_cap(&classic, "1d", 30_000_000)],
                 "allow",
@@ -5466,7 +5812,7 @@ mod tests {
         for (tool, bound) in [
             ("stellar_pay", 10_000_000),
             ("stellar_pay_commit", 20_000_000),
-            (UNLISTED_TOOL, 30_000_000),
+            (CREATE_TOOL, 30_000_000),
         ] {
             let engine = verified_engine(&body);
             assert_eq!(
@@ -5511,7 +5857,7 @@ mod tests {
         for net in [Net::Mainnet, Net::Testnet] {
             let body = net.body(&policy_body(PROFILE, &derived("api-day", true, true)));
             let summary = net.summary(&body);
-            let create = tool_limits(&summary, UNLISTED_TOOL);
+            let create = tool_limits(&summary, CREATE_TOOL);
             assert_eq!(create.unlisted_largest_payment.as_deref(), Some("0.1"));
             let day = tool_bound(create, true, "1d");
             assert_eq!((day.amount.as_deref(), day.reachable), (Some("0.5"), true));
@@ -5522,7 +5868,7 @@ mod tests {
                 (Some("0"), true)
             );
             let added = net.summary(&add_recipient(&body, &account(7)).unwrap());
-            let added_create = tool_limits(&added, UNLISTED_TOOL);
+            let added_create = tool_limits(&added, CREATE_TOOL);
             assert_eq!(added_create.largest_payment.as_deref(), Some("0.2"));
             let added_day = tool_bound(added_create, false, "1d");
             assert_eq!(
@@ -5550,7 +5896,7 @@ mod tests {
             assert_eq!(
                 label(&x402_on(
                     &engine,
-                    UNLISTED_TOOL,
+                    CREATE_TOOL,
                     &unlisted,
                     1_000_001,
                     T0,
@@ -5562,7 +5908,7 @@ mod tests {
                 assert_eq!(
                     spend(
                         &engine,
-                        UNLISTED_TOOL,
+                        CREATE_TOOL,
                         &unlisted,
                         1_000_000,
                         T0 + i * STEP_MS,
@@ -5574,7 +5920,7 @@ mod tests {
             assert_eq!(
                 label(&spend(
                     &engine,
-                    UNLISTED_TOOL,
+                    CREATE_TOOL,
                     &unlisted,
                     1,
                     T0 + 5 * STEP_MS,
@@ -5879,6 +6225,63 @@ mod tests {
         assert_eq!(bodies, 24);
     }
 
+    /// A payment that requests approval never counts toward a bound. With a
+    /// threshold of 140 USDC and two calls per minute, business-week states
+    /// 280 USDC per minute without approval. The evaluation pays it and
+    /// never passes it. The largest admitted payment stays the per-payment cap.
+    #[test]
+    fn unattended_bounds_exclude_approved_payments() {
+        let body = with_every_address_form(&policy_body(
+            PROFILE,
+            &derived("business-week", false, true),
+        ));
+        let summary = summary_of(&body);
+        let limits = &summary.limits[0];
+        for tool in &limits.tools {
+            assert_eq!(
+                (
+                    tool.largest_payment.as_deref(),
+                    tool.approval_above.as_deref()
+                ),
+                (Some("280"), Some("140")),
+                "{}",
+                tool.tool
+            );
+            let minute = tool_bound(tool, false, "1m");
+            assert_eq!(
+                (minute.amount.as_deref(), minute.reachable),
+                (Some("280"), true),
+                "{}",
+                tool.tool
+            );
+        }
+        assert_eq!(
+            bound_of(limits, "1m"),
+            &Agreed::Uniform(Some("280".to_owned()))
+        );
+        // Payment sequences the evaluation allows meet every stated bound.
+        let counts = check_every_bound(&body, Net::Mainnet, &summary);
+        assert!(counts.checked > 0);
+
+        let engine = verified_engine(&body);
+        let listed = account(7);
+        assert_eq!(label(&pay(&engine, &listed, 2_800_000_000, T0)), "approval");
+        for i in 0..2 {
+            assert_eq!(
+                spend(
+                    &engine,
+                    "stellar_pay",
+                    &listed,
+                    1_400_000_000,
+                    T0 + i,
+                    Net::Mainnet
+                ),
+                Decision::Allow
+            );
+        }
+        assert_eq!(label(&pay(&engine, &listed, 1, T0 + 2)), "deny");
+    }
+
     /// The criterion kinds the bounds do not model, each marking them.
     const MARKED_CRITERION_KINDS: [&str; 12] = [
         "minimum_reserve",
@@ -6091,18 +6494,14 @@ mod tests {
     /// The generated bodies: every pair of list configurations on three tool
     /// pairs, a same-tool pair whose second rule is shadowed, and a rotation
     /// of triples on two tool orders. Floors and thresholds vary with the
-    /// position. A policy holds one `unlisted` table, so the loader refuses a
-    /// body with two budget or approval lists; such bodies are left out.
+    /// position. The loader refuses a body whose `unlisted` tables differ;
+    /// such bodies are left out.
     fn generated_bodies() -> Vec<String> {
         const PAY: &str = "stellar_pay";
         const AUTHENTICATED: &str = "stellar_x402_authenticated_payment";
         let configs = list_configs();
         let mut specs: Vec<Vec<(&str, &[ListKind])>> = Vec::new();
-        for tools in [
-            [PAY, UNLISTED_TOOL],
-            [UNLISTED_TOOL, AUTHENTICATED],
-            [PAY, PAY],
-        ] {
+        for tools in [[PAY, CREATE_TOOL], [CREATE_TOOL, AUTHENTICATED], [PAY, PAY]] {
             for first in &configs {
                 for second in &configs {
                     specs.push(vec![(tools[0], first), (tools[1], second)]);
@@ -6110,8 +6509,8 @@ mod tests {
             }
         }
         for tools in [
-            [PAY, UNLISTED_TOOL, AUTHENTICATED],
-            [AUTHENTICATED, PAY, UNLISTED_TOOL],
+            [PAY, CREATE_TOOL, AUTHENTICATED],
+            [AUTHENTICATED, PAY, CREATE_TOOL],
         ] {
             for i in 0..configs.len() {
                 specs.push(
@@ -6155,7 +6554,7 @@ mod tests {
                 body.push_str(&generated_rule(tool, lists, shape, r));
             }
             if let Err(error) = validate_unsigned_policy(&body, PROFILE, MAINNET_PASSPHRASE) {
-                // One `unlisted` table per policy, and approval and budget
+                // Equal `unlisted` tables only, and approval and budget
                 // criteria only on `allow` rules.
                 let detail = error.to_string();
                 assert!(
@@ -6164,15 +6563,27 @@ mod tests {
                 );
                 continue;
             }
-            assert!(tables <= 1);
+            let texts: Vec<String> = rules_of(&doc(&body))
+                .iter()
+                .flat_map(|(_, criteria)| criteria.iter().filter_map(|c| c.get("unlisted")))
+                .map(|table| table.to_string().trim().to_owned())
+                .collect();
+            assert_eq!(texts.len(), tables, "{body}");
+            assert!(texts.iter().all(|t| *t == texts[0]), "{body}");
             bodies.push(body);
         }
-        // The generated preset bodies as written and with one recipient.
+        // The generated preset bodies in USDC with the total budget on and
+        // off, and in XLM, each as written and with a G, an M, and a C
+        // recipient.
         for spec in &PRESETS {
             let unlisted = spec.archetype == Archetype::Api;
-            let generated = policy_body(PROFILE, &derived(spec.name, unlisted, true));
-            bodies.push(add_recipient(&generated, &account(7)).unwrap());
-            bodies.push(generated);
+            let usdc = [true, false]
+                .map(|total| policy_body(PROFILE, &derived(spec.name, unlisted, total)));
+            let xlm = policy_body(PROFILE, &derive(&xlm_input(spec.name, "100", "1")).unwrap());
+            for generated in usdc.into_iter().chain([xlm]) {
+                bodies.push(with_every_address_form(&generated));
+                bodies.push(generated);
+            }
         }
         bodies
     }
@@ -6239,42 +6650,138 @@ mod tests {
         }
     }
 
+    /// The base G of an M address.
+    fn base_account(recipient: &str) -> Option<String> {
+        match stellar_strkey::Strkey::from_string(recipient) {
+            Ok(stellar_strkey::Strkey::MuxedAccountEd25519(muxed)) => Some(
+                stellar_strkey::ed25519::PublicKey(muxed.ed25519)
+                    .to_string()
+                    .as_str()
+                    .to_owned(),
+            ),
+            _ => None,
+        }
+    }
+
+    /// The treatment the summary states for `recipient` by the tool of
+    /// `stated`, and whether a payment rule lists it. It is the recipient's
+    /// own entry, for an M address the entry of its base G, else the
+    /// unlisted mode.
+    fn stated_treatment(stated: &ToolLimits, recipient: &str) -> (Treatment, bool) {
+        let entry = |address: &str| stated.recipients.iter().find(|r| r.recipient == address);
+        entry(recipient)
+            .or_else(|| base_account(recipient).and_then(|base| entry(&base)))
+            .map_or_else(
+                || (treatment_of_mode(stated.unlisted_mode), false),
+                |r| (r.treatment, true),
+            )
+    }
+
+    /// The largest payment to `recipient` the summary states the tool of
+    /// `stated` admits, at most its approval threshold; `0` when unstated.
+    fn largest_stated(stated: &ToolLimits, recipient: &str) -> i128 {
+        let (treatment, named) = stated_treatment(stated, recipient);
+        let budgeted = matches!(
+            treatment,
+            Treatment::Budgeted | Treatment::ApprovalWithinBudget
+        );
+        let largest = if budgeted || !named {
+            &stated.unlisted_largest_payment
+        } else {
+            &stated.largest_payment
+        };
+        let stroops = |v: &Option<String>| v.as_deref().map(|v| parse_amount(v).unwrap_or(0));
+        min_present([
+            stroops(largest),
+            stroops(&stated.approval_above),
+            if budgeted {
+                stroops(&stated.unlisted_per_tx_cap)
+            } else {
+                None
+            },
+        ])
+        .unwrap_or(0)
+    }
+
+    /// The recipients a property check pays. They are G addresses the
+    /// generated bodies list and one they do not. Three M addresses follow:
+    /// one by its base G, one by its own entry, one in no list. A listed and
+    /// an unlisted C address close the list.
+    fn property_recipients() -> Vec<String> {
+        vec![
+            account(7),
+            account(9),
+            account(11),
+            muxed(7, 1),
+            muxed(9, 4),
+            muxed(9, 5),
+            contract(3),
+            contract(5),
+        ]
+    }
+
+    /// The listed forms [`property_recipients`] pays by entry: a G, an M,
+    /// and a C address.
+    fn with_every_address_form(body: &str) -> String {
+        [account(7), muxed(9, 4), contract(3)]
+            .iter()
+            .fold(body.to_owned(), |body, recipient| {
+                add_recipient(&body, recipient).unwrap()
+            })
+    }
+
+    /// The payment tools a property check evaluates, each with one payment.
+    const PROPERTY_TOOLS: [&str; 4] = [
+        "stellar_pay",
+        "stellar_pay_commit",
+        CREATE_TOOL,
+        "stellar_x402_authenticated_payment",
+    ];
+
     /// Checks every statement of the summary of `body` on `net` against the
     /// evaluation, returning the number of evaluations compared.
     fn check_summary_property(body: &str, net: Net) -> usize {
         let engine = verified_engine_on(body, net);
         let summary = net.summary(body);
-        let (a, b, c) = (account(7), account(9), account(11));
+        let recipients = property_recipients();
+        let a = &recipients[0];
         let mut cases = 0;
-        let evaluate = |tool: &str, to: &str, amount: i128, balance: i64| {
-            if tool == "stellar_pay" {
-                pay_on(&engine, tool, to, amount, (T0, balance), net)
-            } else {
-                x402_on(&engine, tool, to, amount, T0, net)
-            }
+        let asset = summary
+            .limits
+            .first()
+            .map_or("native", |l| l.asset.as_str())
+            .to_owned();
+        let evaluate = |tool: &str, to: &str, amount: i128, (balance, fee): (i64, i64)| {
+            let payment = Payment {
+                tool,
+                asset: &asset,
+                to,
+                amount,
+            };
+            evaluate_payment(&engine, payment, (T0, balance, fee), net)
         };
         // A body whose every rule denies states no asset; every tool denies.
         if summary.limits.is_empty() {
-            for tool in [
-                "stellar_pay",
-                UNLISTED_TOOL,
-                "stellar_x402_authenticated_payment",
-            ] {
+            for tool in PROPERTY_TOOLS {
                 assert!(summary.tools.uncovered.iter().any(|t| t == tool));
-                assert_eq!(coarse(&evaluate(tool, &a, 1, i64::MAX)), "deny", "{body}");
+                assert_eq!(
+                    coarse(&evaluate(tool, a, 1, (i64::MAX, 0))),
+                    "deny",
+                    "{body}"
+                );
                 cases += 1;
             }
             return cases;
         }
         let limits = &summary.limits[0];
-        for tool in [
-            "stellar_pay",
-            UNLISTED_TOOL,
-            "stellar_x402_authenticated_payment",
-        ] {
+        for tool in PROPERTY_TOOLS {
             let Some(stated) = limits.tools.iter().find(|t| t.tool == tool) else {
                 assert!(summary.tools.uncovered.iter().any(|t| t == tool));
-                assert_eq!(coarse(&evaluate(tool, &a, 1, i64::MAX)), "deny", "{body}");
+                assert_eq!(
+                    coarse(&evaluate(tool, a, 1, (i64::MAX, 0))),
+                    "deny",
+                    "{body}"
+                );
                 cases += 1;
                 continue;
             };
@@ -6299,9 +6806,9 @@ mod tests {
             if unclassified(stated) {
                 let largest =
                     |v: &Option<String>| v.as_deref().map(|v| parse_amount(v).unwrap_or(0));
-                for recipient in [&a, &b, &c] {
+                for recipient in &recipients {
                     for amount in &amounts {
-                        if coarse(&evaluate(tool, recipient, *amount, i64::MAX)) != "deny" {
+                        if coarse(&evaluate(tool, recipient, *amount, (i64::MAX, 0))) != "deny" {
                             for stated_largest in [
                                 largest(&stated.largest_payment),
                                 largest(&stated.unlisted_largest_payment),
@@ -6317,50 +6824,47 @@ mod tests {
                 }
                 continue;
             }
-            for recipient in [&a, &b, &c] {
-                let treatment = stated
-                    .recipients
-                    .iter()
-                    .find(|r| &r.recipient == recipient)
-                    .map_or_else(|| treatment_of_mode(stated.unlisted_mode), |r| r.treatment);
-                let named = stated.recipients.iter().any(|r| &r.recipient == recipient);
+            for recipient in &recipients {
+                let (treatment, named) = stated_treatment(stated, recipient);
                 for amount in &amounts {
                     assert_eq!(
-                        coarse(&evaluate(tool, recipient, *amount, i64::MAX)),
+                        coarse(&evaluate(tool, recipient, *amount, (i64::MAX, 0))),
                         stated_decision(stated, (treatment, named), *amount),
                         "{net:?} {tool} {recipient} {amount} {treatment:?}\n{body}"
                     );
                     cases += 1;
                 }
             }
-            // The stated floor: a balance at it pays, one stroop below denies.
+            // The stated floor holds after the payment's native debit and
+            // the envelope fee: a balance leaving exactly the floor pays,
+            // one stroop less denies. A payment of another asset debits
+            // only the fee.
             let floor = summary
                 .balance_floors
                 .iter()
                 .find(|f| f.tool == tool)
                 .and_then(|f| f.floor_xlm.as_deref())
                 .map(|f| i64::try_from(parse_amount(f).unwrap()).unwrap());
-            if tool == "stellar_pay" {
-                let payable = [&a, &b, &c].into_iter().find_map(|r| {
-                    let treatment = stated
-                        .recipients
-                        .iter()
-                        .find(|t| &t.recipient == r)
-                        .map_or_else(|| treatment_of_mode(stated.unlisted_mode), |t| t.treatment);
-                    let named = stated.recipients.iter().any(|t| &t.recipient == r);
-                    let decision = stated_decision(stated, (treatment, named), 1);
-                    (decision != "deny").then_some((r, decision))
-                });
-                if let Some((recipient, decision)) = payable {
+            if !X402_TOOLS.contains(&tool) {
+                let payable = recipients
+                    .iter()
+                    .find(|r| stated_decision(stated, stated_treatment(stated, r), 1) != "deny");
+                if let Some(recipient) = payable {
+                    const FEE: i64 = 100;
+                    let amount = largest_stated(stated, recipient).max(1);
+                    let decision =
+                        stated_decision(stated, stated_treatment(stated, recipient), amount);
+                    let debit = if asset == "native" { amount } else { 0 };
+                    let debit = i64::try_from(debit).unwrap() + FEE;
                     let balances = match floor {
-                        Some(floor) => [(floor, decision), (floor - 1, "deny")],
-                        None => [(0, decision), (1, decision)],
+                        Some(floor) => [(floor + debit, decision), (floor + debit - 1, "deny")],
+                        None => [(debit, decision), (debit - 1, decision)],
                     };
                     for (balance, expected) in balances {
                         assert_eq!(
-                            coarse(&evaluate(tool, recipient, 1, balance)),
+                            coarse(&evaluate(tool, recipient, amount, (balance, FEE))),
                             expected,
-                            "{net:?} floor {floor:?} {balance}\n{body}"
+                            "{net:?} {tool} floor {floor:?} {balance} {amount}\n{body}"
                         );
                         cases += 1;
                     }
@@ -6465,7 +6969,7 @@ mod tests {
         }
         assert_eq!(
             (bodies.len(), cases, bounds, sequences, unreachable, staged),
-            (239, 8_533, 1_252, 145_456, 341, 79),
+            (320, 36_650, 1_960, 550_121, 360, 60),
             "property size"
         );
         // The family holds both rate windows, a repeated counter, an
@@ -6485,7 +6989,7 @@ mod tests {
                     .count(),
                 holding("mode = \"budget\""),
             ),
-            (88, 78, 46, 92),
+            (146, 88, 52, 98),
             "generated shapes"
         );
         assert_eq!(
@@ -6494,8 +6998,18 @@ mod tests {
                 holding("kinds = [\"HOME_DOMAIN\"]"),
                 holding("allowlist = []"),
             ),
-            (12, 30, 81),
+            (12, 33, 109),
             "generated classifications"
+        );
+        // The preset bodies pay XLM, and list an M and a C recipient.
+        assert_eq!(
+            (
+                holding("assets = [\"native\"]"),
+                holding(&muxed(9, 4)),
+                holding(&contract(3)),
+            ),
+            (24, 36, 36),
+            "generated assets and address forms"
         );
     }
 
@@ -6599,11 +7113,14 @@ mod tests {
         (label != TOTAL).then(|| Window::parse(label).unwrap().as_secs() * 1_000)
     }
 
-    /// A payer of a bound check: the tool, a recipient of the class, and the
-    /// class's stated largest payment.
+    /// A payer of a bound check: the tool, the asset it pays, a recipient of
+    /// the class, the class's stated largest admitted payment, and its
+    /// largest payment without approval.
     struct Payer<'a> {
         tool: &'a str,
+        asset: &'a str,
         recipient: String,
+        admitted: Option<i128>,
         largest: Option<i128>,
         /// The tool's own bounds for the class.
         own: &'a [PeriodBound],
@@ -6634,84 +7151,81 @@ mod tests {
             .any(|c| c == "counterparty_allowlist.kinds" || c == "home_domain_resolved")
     }
 
-    /// The payers of `class` among `tools`: a listed recipient the rule pays
-    /// without the unlisted budget, or every address under a rule without a
-    /// list; an address in no list, or a listed recipient paid through the
-    /// budget. A tool without a modeled classification pays an address in no
-    /// list in both classes.
-    fn payers<'a>(tools: &[&'a ToolLimits], unlisted: bool, open: &[String]) -> Vec<Payer<'a>> {
+    /// The payers of `class` among `tools` paying `asset` without approval.
+    /// The listed class pays a listed recipient the rule allows without the
+    /// unlisted budget, or every address under a rule without a list. The
+    /// unlisted class pays an address in no list, or a listed recipient paid
+    /// through the budget, when the rule allows either. A tool without a
+    /// modeled classification pays an address in no list in both classes. A `require_approval` rule pays nobody without approval,
+    /// and no payer pays above the approval threshold.
+    fn payers<'a>(
+        tools: &[&'a ToolLimits],
+        asset: &'a str,
+        unlisted: bool,
+        open: &[String],
+    ) -> Vec<Payer<'a>> {
         let outsider = account(11);
         let stroops = |v: &Option<String>| v.as_deref().map(|v| parse_amount(v).unwrap_or(0));
+        let named = |t: &ToolLimits, treatment: Treatment| {
+            t.recipients
+                .iter()
+                .find(|r| is_address(&r.recipient) && r.treatment == treatment)
+                .map(|r| r.recipient.clone())
+        };
         tools
             .iter()
+            .filter(|t| t.decision == "allow")
             .filter_map(|t| {
                 let own = if unlisted {
                     &t.unlisted_bounds
                 } else {
                     &t.bounds
                 };
-                let (recipient, largest) = if unclassified(t) {
-                    let largest = if unlisted {
-                        &t.unlisted_largest_payment
-                    } else {
-                        &t.largest_payment
-                    };
-                    (Some(outsider.clone()), stroops(largest))
-                } else if unlisted {
-                    let budgeted = t
-                        .recipients
-                        .iter()
-                        .find(|r| {
-                            is_address(&r.recipient)
-                                && matches!(
-                                    r.treatment,
-                                    Treatment::Budgeted | Treatment::ApprovalWithinBudget
-                                )
-                        })
-                        .map(|r| r.recipient.clone());
-                    (
-                        (t.unlisted_mode != "deny")
-                            .then(|| outsider.clone())
-                            .or(budgeted),
-                        stroops(&t.unlisted_largest_payment),
-                    )
+                let largest = if unlisted {
+                    &t.unlisted_largest_payment
                 } else {
-                    let listed = t
-                        .recipients
-                        .iter()
-                        .find(|r| {
-                            is_address(&r.recipient)
-                                && matches!(r.treatment, Treatment::Allowed | Treatment::Approval)
-                        })
-                        .map(|r| r.recipient.clone());
-                    let open = open.contains(&t.tool).then(|| outsider.clone());
-                    (listed.or(open), stroops(&t.largest_payment))
+                    &t.largest_payment
                 };
+                let recipient = if unclassified(t) {
+                    Some(outsider.clone())
+                } else if unlisted {
+                    matches!(t.unlisted_mode, "budget" | "unrestricted")
+                        .then(|| outsider.clone())
+                        .or_else(|| named(t, Treatment::Budgeted))
+                } else {
+                    named(t, Treatment::Allowed)
+                        .or_else(|| open.contains(&t.tool).then(|| outsider.clone()))
+                };
+                let admitted = stroops(largest);
                 recipient.map(|recipient| Payer {
                     tool: t.tool.as_str(),
+                    asset,
                     recipient,
-                    largest,
+                    admitted,
+                    largest: min_present([admitted, stroops(&t.approval_above)]),
                     own,
                 })
             })
             .collect()
     }
 
-    /// Whether `engine` admits a payment of `amount` to `to` by `tool`.
+    /// Whether `engine` allows a payment of `amount` by `payer` without
+    /// approval. A payment answered with an approval request is not
+    /// admitted: the stated bounds hold what is spendable unattended.
     fn engine_admits(
         engine: &PolicyEngineV1,
-        tool: &str,
-        to: &str,
+        payer: &Payer<'_>,
         amount: i128,
         now: u64,
         net: Net,
     ) -> bool {
-        let decision = if tool == "stellar_pay" || tool == "stellar_pay_commit" {
-            pay_on(engine, tool, to, amount, (now, i64::MAX), net)
-        } else {
-            x402_on(engine, tool, to, amount, now, net)
+        let payment = Payment {
+            tool: payer.tool,
+            asset: payer.asset,
+            to: &payer.recipient,
+            amount,
         };
-        coarse(&decision) != "deny"
+        evaluate_payment(engine, payment, (now, i64::MAX, 0), net) == Decision::Allow
     }
 
     /// The outcome of one payment run: evaluations, total paid, the last
@@ -6743,9 +7257,9 @@ mod tests {
         let engine = verified_engine_on(body, net);
         let span = window_ms(window);
         let mut evaluations = 0;
-        let mut admits = |tool: &str, to: &str, amount: i128, now: u64| {
+        let mut admits = |payer: &Payer<'_>, amount: i128, now: u64| {
             evaluations += 1;
-            engine_admits(&engine, tool, to, amount, now, net)
+            engine_admits(&engine, payer, amount, now, net)
         };
         let mut times: Vec<u64> = Vec::new();
         let mut total: i128 = 0;
@@ -6758,7 +7272,9 @@ mod tests {
         for _ in 0..3_000 {
             let mut paid = false;
             for (i, payer) in payers.iter().enumerate() {
-                let largest = payer.largest.unwrap_or(i128::MAX);
+                // The evaluation, not the stated threshold, decides how much
+                // of the largest admitted payment it allows unattended.
+                let largest = payer.admitted.unwrap_or(i128::MAX);
                 let ceiling = if paid_by[i] < stages[i] {
                     (stages[i] - paid_by[i]).min(bound - total).min(largest)
                 } else if stages.iter().zip(&paid_by).any(|(s, p)| p < s) {
@@ -6770,13 +7286,13 @@ mod tests {
                 if ceiling <= 0 {
                     continue;
                 }
-                let amount = if admits(payer.tool, &payer.recipient, ceiling, now) {
+                let amount = if admits(payer, ceiling, now) {
                     ceiling
                 } else {
                     let (mut low, mut high) = (0, ceiling);
                     while high - low > 1 {
                         let mid = low + (high - low) / 2;
-                        if admits(payer.tool, &payer.recipient, mid, now) {
+                        if admits(payer, mid, now) {
                             low = mid;
                         } else {
                             high = mid;
@@ -6792,17 +7308,13 @@ mod tests {
                     "{window} bound {bound} passed: {total} + {amount} by {}\n{body}",
                     payer.tool
                 );
-                assert_ne!(
-                    coarse(&spend(
-                        &engine,
-                        payer.tool,
-                        &payer.recipient,
-                        amount,
-                        now,
-                        net
-                    )),
-                    "deny"
-                );
+                let payment = Payment {
+                    tool: payer.tool,
+                    asset: payer.asset,
+                    to: &payer.recipient,
+                    amount,
+                };
+                assert_eq!(spend_payment(&engine, payment, now, net), Decision::Allow);
                 total += amount;
                 paid_by[i] += amount;
                 times.push(now);
@@ -6865,14 +7377,7 @@ mod tests {
             for payer in payers {
                 evaluations += 1;
                 assert!(
-                    !engine_admits(
-                        &reached.engine,
-                        payer.tool,
-                        &payer.recipient,
-                        1,
-                        reached.now,
-                        net
-                    ),
+                    !engine_admits(&reached.engine, payer, 1, reached.now, net),
                     "{}",
                     payer.tool
                 );
@@ -6926,9 +7431,10 @@ mod tests {
         let open = &summary.recipients.unrestricted_tools;
         let all: Vec<&ToolLimits> = limits.tools.iter().collect();
         let windows = stated_windows_ms(&all);
+        let asset = limits.asset.as_str();
         for unlisted in [false, true] {
             for tool in &all {
-                let own = payers(&[*tool], unlisted, open);
+                let own = payers(&[*tool], asset, unlisted, open);
                 let bounds = if unlisted {
                     &tool.unlisted_bounds
                 } else {
@@ -6953,7 +7459,7 @@ mod tests {
                     ));
                 }
             }
-            let joint = payers(&all, unlisted, open);
+            let joint = payers(&all, asset, unlisted, open);
             let asset_bounds = if unlisted {
                 &limits.unlisted_bounds
             } else {
@@ -6993,8 +7499,8 @@ mod tests {
         let mut family: Vec<(Net, String)> = Vec::new();
         for tools in [
             vec![PAY, COMMIT],
-            vec![PAY, COMMIT, UNLISTED_TOOL],
-            vec![UNLISTED_TOOL, PAY],
+            vec![PAY, COMMIT, CREATE_TOOL],
+            vec![CREATE_TOOL, PAY],
         ] {
             for n in 0..24 {
                 let rules: Vec<String> = tools
@@ -7043,13 +7549,13 @@ mod tests {
             (
                 114,
                 BoundCounts {
-                    evaluations: 1_439_013,
-                    checked: 1_691,
-                    staged: 92,
+                    evaluations: 1_010_390,
+                    checked: 1_580,
+                    staged: 86,
                 },
-                253,
-                73,
-                314
+                202,
+                0,
+                176
             ),
             "bound property size"
         );
@@ -7082,12 +7588,13 @@ mod tests {
         "per_tx:allow",
         "per_tx+1:deny",
         "x402_per_tx:allow",
-        "unlisted_pay:deny",
+        "unlisted_pay:allow",
         "unlisted_half:allow",
         "unlisted_half+1:deny",
-        "unlisted_authenticated:deny",
+        "unlisted_authenticated:allow",
         "unlisted_within_u:allow",
         "unlisted_beyond_u:deny",
+        "unlisted_pay_beyond_u:deny",
     ];
     const APPROVING: &[&str] = &[
         "typical:allow",
@@ -7130,13 +7637,19 @@ mod tests {
         ("business-2weeks", false, APPROVING),
     ];
 
+    /// Records a confirmed payment of any amount to a listed recipient. The
+    /// effects carry the listed class, as the effects of a permitted
+    /// evaluation do, since an unlisted budget sizes by that class.
     fn record_pay(engine: &PolicyEngineV1, to: &str, amount: i128) {
         let args = pay_args(to, amount);
+        let ValueClass::Value(effects) = derive_value_class("stellar_pay", &args) else {
+            panic!("a payment moves value");
+        };
         engine
             .record_confirmed(
                 &tool("stellar_pay"),
                 &mainnet_profile(),
-                &derive_value_class("stellar_pay", &args),
+                &ValueClass::Value(effects.with_recipient_class(Some(RecipientClass::Listed))),
             )
             .unwrap();
     }
@@ -7147,7 +7660,7 @@ mod tests {
     fn record_x402(engine: &PolicyEngineV1, to: &str, amount: i128, now_ms: u64) {
         let evaluation = engine
             .evaluate_with_value_full(
-                &tool(UNLISTED_TOOL),
+                &tool(CREATE_TOOL),
                 &serde_json::json!({}),
                 &mainnet_profile(),
                 x402_value(to, amount),
@@ -7162,7 +7675,7 @@ mod tests {
         assert_eq!(evaluation.decision, Decision::Allow);
         engine
             .record_confirmed(
-                &tool(UNLISTED_TOOL),
+                &tool(CREATE_TOOL),
                 &mainnet_profile(),
                 &ValueClass::Value(evaluation.value_effects.unwrap()),
             )
@@ -7190,12 +7703,12 @@ mod tests {
                 push("approval+1", pay(&fresh(), &listed, threshold + 1, T0));
                 push(
                     "x402_above_approval",
-                    x402(&fresh(), UNLISTED_TOOL, &listed, threshold + 1, T0),
+                    x402(&fresh(), CREATE_TOOL, &listed, threshold + 1, T0),
                 );
             }
             None => push(
                 "x402_per_tx",
-                x402(&fresh(), UNLISTED_TOOL, &listed, per_tx, T0),
+                x402(&fresh(), CREATE_TOOL, &listed, per_tx, T0),
             ),
         }
         push("unlisted_pay", pay(&fresh(), &unlisted, typical, T0));
@@ -7207,11 +7720,11 @@ mod tests {
         {
             push(
                 "unlisted_half",
-                x402(&fresh(), UNLISTED_TOOL, &unlisted, half, T0),
+                x402(&fresh(), CREATE_TOOL, &unlisted, half, T0),
             );
             push(
                 "unlisted_half+1",
-                x402(&fresh(), UNLISTED_TOOL, &unlisted, half + 1, T0),
+                x402(&fresh(), CREATE_TOOL, &unlisted, half + 1, T0),
             );
             push(
                 "unlisted_authenticated",
@@ -7232,18 +7745,23 @@ mod tests {
             let now = T0 + 4 * STEP_MS;
             push(
                 "unlisted_within_u",
-                x402(&engine, UNLISTED_TOOL, &unlisted, half, now),
+                x402(&engine, CREATE_TOOL, &unlisted, half, now),
             );
             clock.set(now);
             record_x402(&engine, &unlisted, half, now);
             push(
                 "unlisted_beyond_u",
-                x402(&engine, UNLISTED_TOOL, &unlisted, 1, now + STEP_MS),
+                x402(&engine, CREATE_TOOL, &unlisted, 1, now + STEP_MS),
+            );
+            // The pay rule shares the budget the x402 payments spent.
+            push(
+                "unlisted_pay_beyond_u",
+                pay(&engine, &unlisted, 1, now + STEP_MS),
             );
         } else {
             push(
                 "unlisted_x402",
-                x402(&fresh(), UNLISTED_TOOL, &unlisted, typical, T0),
+                x402(&fresh(), CREATE_TOOL, &unlisted, typical, T0),
             );
         }
         // Each bound alone: the earlier spend lies inside its window and
