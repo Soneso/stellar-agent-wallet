@@ -382,6 +382,8 @@ pub(crate) async fn sign_and_submit_classic(
         },
     };
     let render = |error: WalletError| submission_error_result(&error, envelope);
+    stellar_agent_network::signing::envelope_signing::check_envelope_address_forms(envelope)
+        .map_err(render)?;
     let timeout = super::common::submit_timeout(record.profile);
     if let Some(guard) = guard {
         let authority = authority.ok_or_else(|| {

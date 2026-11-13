@@ -666,6 +666,186 @@ fn signed_mixed_g_c_debits_and_bundle_admit() {
         }
     }
 }
+
+#[test]
+fn muxed_bundle_signed_policy_guards_value_the_transfer() {
+    use stellar_agent_core::policy::{
+        Decision,
+        v1::bundle::{BundleStateOverlay, BundleView, decompose_bundle_calls},
+    };
+    use stellar_agent_test_support::xdr_fixtures::destination_transfer;
+    use stellar_xdr::{MuxedEd25519Account, ScAddress, SorobanAuthorizedFunction, Uint256};
+    let wallet: ScAddress = address_g().parse().unwrap();
+    let destination = ScAddress::MuxedAccount(MuxedEd25519Account {
+        id: 7,
+        ed25519: Uint256([1; 32]),
+    });
+    let SorobanAuthorizedFunction::ContractFn(call) = destination_transfer(destination).function
+    else {
+        unreachable!()
+    };
+    let asset = call.contract_address.to_string();
+    let inners = decompose_bundle_calls(&[call], &wallet);
+    let mut mismatches = Vec::new();
+    for (criterion, opaque, expected) in [
+        (String::new(), false, "allow"),
+        (
+            "{ kind = \"rate_limit\", max_calls = 10, window = \"1d\" }".to_owned(),
+            true,
+            "allow",
+        ),
+        (
+            format!(
+                "{{ kind = \"bundle_aggregate_cap\", asset = \"{asset}\", max_amount = \"10\" }}"
+            ),
+            true,
+            "allow",
+        ),
+        (
+            format!("{{ kind = \"bundle_per_tx_cap\", asset = \"{asset}\", max_stroops = 10 }}"),
+            true,
+            "allow",
+        ),
+        (
+            format!(
+                "{{ kind = \"bundle_per_period_cap\", asset = \"{asset}\", max_stroops = 10, window = \"1d\" }}"
+            ),
+            true,
+            "allow",
+        ),
+        (
+            "{ kind = \"restrict_bundle_to_recognised_kinds\", enabled = true }".to_owned(),
+            true,
+            "allow",
+        ),
+        (
+            format!("{{ kind = \"asset_allowlist\", assets = [\"{asset}\"] }}"),
+            false,
+            "allow",
+        ),
+        (
+            "{ kind = \"asset_allowlist\", assets = [\"native\"] }".to_owned(),
+            true,
+            "deny",
+        ),
+        (
+            format!("{{ kind = \"per_tx_cap\", asset = \"{asset}\", max_stroops = 5 }}"),
+            true,
+            "deny",
+        ),
+        (
+            "{ kind = \"counterparty_allowlist\", kinds = [\"G_ACCOUNT\"], allowlist = [] }"
+                .to_owned(),
+            true,
+            "deny",
+        ),
+        ("{ kind = \"counterparty_allowlist\", kinds = [\"G_ACCOUNT\"], allowlist = [], unlisted = { mode = \"approval\" } }".to_owned(), true, "approval"),
+    ] {
+        let raw = format!(
+            "version = 2\nscope = \"profile:operator\"\nsequence = 1\n[[rules]]\nmatch = {{ tool = \"*\", chain = \"*\" }}\ncriteria = [{criterion}]\ndecision = \"allow\"\nallow_opaque_signing = {opaque}\n"
+        );
+        let bytes = signed(&raw, &owner_key());
+        let document = load_signed_policy_text(
+            &bytes,
+            "operator",
+            &owner_key().verifying_key().to_bytes(),
+            TESTNET_PASSPHRASE,
+        )
+        .unwrap();
+        let engine = stellar_agent_core::PolicyEngineV1::new(document, "operator".into());
+        let overlay = BundleStateOverlay::default();
+        let decision = engine
+            .evaluate_bundle(
+                &address_tool("wallet_multicall", ToolValueKind::MovesValue),
+                &serde_json::Value::Null,
+                &address_profile(),
+                &BundleView {
+                    inners: &inners,
+                    overlay: &overlay,
+                },
+            )
+            .unwrap();
+        let actual = match decision {
+            Decision::Allow => "allow",
+            Decision::Deny(_) => "deny",
+            Decision::RequireApproval(_) => "approval",
+            _ => "unsupported",
+        };
+        if actual != expected { mismatches.push(format!("{criterion}: {decision:?}, expected {expected}")); }
+        assert_eq!(signed(&raw, &owner_key()), bytes);
+    }
+    assert!(mismatches.is_empty(), "{mismatches:?}");
+}
+#[test]
+fn muxed_bundle_shares_the_overlay_and_records_confirmed_inners() {
+    use stellar_agent_core::policy::{
+        Decision,
+        v1::bundle::{BundleStateOverlay, BundleView, decompose_bundle_calls},
+    };
+    use stellar_agent_test_support::xdr_fixtures::destination_transfer;
+    use stellar_xdr::{ScAddress, SorobanAuthorizedFunction};
+    let _clock =
+        stellar_agent_core::policy::v1::criteria::state_store::set_query_time_for_test(NOW_MS);
+    let wallet: ScAddress = address_g().parse().unwrap();
+    let calls: Vec<_> = [address_g(), address_m()]
+        .iter()
+        .map(|destination| {
+            let SorobanAuthorizedFunction::ContractFn(call) =
+                destination_transfer(destination.parse().unwrap()).function
+            else {
+                unreachable!()
+            };
+            call
+        })
+        .collect();
+    let asset = calls[0].contract_address.to_string();
+    let raw = format!(
+        "version = 2\nscope = \"profile:operator\"\nsequence = 1\n[[rules]]\nmatch = {{ tool = \"*\", chain = \"*\" }}\ncriteria = [{{ kind = \"counterparty_allowlist\", kinds = [\"G_ACCOUNT\"], allowlist = [\"{}\"] }}, {{ kind = \"bundle_per_period_cap\", asset = \"{asset}\", max_stroops = 20, window = \"1d\" }}]\ndecision = \"allow\"\n",
+        address_g()
+    );
+    let bytes = signed(&raw, &owner_key());
+    let document = load_signed_policy_text(
+        &bytes,
+        "operator",
+        &owner_key().verifying_key().to_bytes(),
+        TESTNET_PASSPHRASE,
+    )
+    .unwrap();
+    let engine = stellar_agent_core::PolicyEngineV1::new(document, "operator".into());
+    let inners = decompose_bundle_calls(&calls, &wallet);
+    let overlay = BundleStateOverlay::default();
+    let bundle = BundleView {
+        inners: &inners,
+        overlay: &overlay,
+    };
+    let tool = address_tool("wallet_multicall", ToolValueKind::MovesValue);
+    assert_eq!(
+        engine
+            .evaluate_bundle(&tool, &serde_json::Value::Null, &address_profile(), &bundle)
+            .unwrap(),
+        Decision::Allow
+    );
+    let entries = engine
+        .record_confirmed_bundle(&tool, &address_profile(), &bundle)
+        .unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries.iter().map(|entry| entry.amount()).sum::<i128>(), 12);
+    assert_eq!(
+        engine
+            .state_store()
+            .query_window(entries[0].key(), NOW_MS)
+            .unwrap(),
+        (12, 2)
+    );
+    assert!(matches!(
+        engine
+            .evaluate_bundle(&tool, &serde_json::Value::Null, &address_profile(), &bundle)
+            .unwrap(),
+        Decision::Deny(DenyReason::BundleDenied { inner_index: 1, .. })
+    ));
+    assert_eq!(signed(&raw, &owner_key()), bytes);
+}
+
 #[test]
 fn signed_x402_contract_under_g_only_reaches_mode() {
     use stellar_agent_core::policy::PolicyEngine;

@@ -3246,6 +3246,36 @@ mod tests {
         assert!(!text.contains("untrusted-asset"));
     }
 
+    #[test]
+    fn muxed_destinations_keep_their_full_cli_summary() {
+        use stellar_agent_test_support::xdr_fixtures::{
+            destination_transfer, muxed_contract_address,
+        };
+        for destination in [
+            muxed_contract_address(),
+            stellar_xdr::ScAddress::MuxedAccount(stellar_xdr::MuxedEd25519Account {
+                id: 7,
+                ed25519: stellar_xdr::Uint256([1; 32]),
+            }),
+        ] {
+            let entry = PendingApproval::new_x402_pending(
+                &[1; 32],
+                &destination_transfer(destination.clone()),
+                None,
+                "1000".into(),
+                DEFAULT_TTL_MS,
+            )
+            .unwrap();
+            let mut output = Vec::new();
+            write_summary(&entry, &test_context(), &mut output).unwrap();
+            assert!(
+                String::from_utf8(output)
+                    .unwrap()
+                    .contains(&destination.to_string())
+            );
+        }
+    }
+
     /// The outcome of the mainnet rule for a mainnet profile when `mainnet`
     /// is true and a testnet one otherwise, with `--yes` as given and stdin
     /// and stderr reported as `terminal`; asserts the rule checked no

@@ -934,6 +934,8 @@ code used by wallet entry guards. Library signing uses
 A policy `RequireApproval` verdict (which every single-shot sign tool,
 including SEP-43, refuses fail-closed) carries
 `policy.approval_required_unsupported`.
+The transaction and auth-entry tools refuse XDR containing a muxed contract
+address (W) with `sep43.invalid_xdr` before key access or storing a request.
 SEP-53 and x402 use the same standard envelope for every business error.
 
 Both `stellar_sep43_sign_message` and `stellar_sep53_sign_message` use these

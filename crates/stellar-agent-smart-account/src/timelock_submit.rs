@@ -284,6 +284,7 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
     args: TimelockSubmitArgs<'_>,
 ) -> Result<TimelockSubmitResult, SaError> {
     refuse_mainnet_sa(args.network_passphrase, args.primary_rpc_url)?;
+    crate::submit::check_invoke_address_forms(&args.host_function)?;
 
     // Every signature below rests on a second endpoint's ledger observation.
     let secondary_rpc_url = checked_secondary_rpc_url(
@@ -1080,6 +1081,72 @@ mod tests {
         let admission =
             stellar_agent_network::NoValueAdmission::with_store(profile, store, sizing).unwrap();
         (dir, admission)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn muxed_contract_timelock_intake_refuses_before_admission() {
+        let (dir, admission) = no_value_fixture();
+        let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new([5; 32]);
+        let endpoint = format!("http://{}:9", std::net::Ipv4Addr::LOCALHOST);
+        let secondary = format!("http://{}:9", std::net::Ipv4Addr::new(127, 0, 0, 2));
+        let before = std::fs::read_dir(dir.path()).unwrap().count();
+        let error = submit_timelock_invoke_with_g_key_auth(TimelockSubmitArgs {
+            schedule_identity: None,
+            host_function: HostFunction::InvokeContract(InvokeContractArgs {
+                contract_address: stellar_agent_test_support::xdr_fixtures::muxed_contract_address(
+                ),
+                ..Default::default()
+            }),
+            signer: &signer,
+            primary_rpc_url: &endpoint,
+            secondary_rpc_url: &secondary,
+            network_passphrase: stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+            timeout: std::time::Duration::from_secs(1),
+            op_label: "schedule",
+            admission: stellar_agent_network::SigningAdmission::NoValue(&admission),
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(signer.sign_calls(), 0);
+        assert_eq!(signer.key_accesses(), 0);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), before);
+        assert_eq!(error.wire_code(), "sa.deployment_failed");
+        assert!(
+            error
+                .to_string()
+                .ends_with("a muxed contract address (W) is not accepted on this path")
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mainnet_timelock_with_muxed_contract_refuses_mainnet_first() {
+        let (dir, admission) = no_value_fixture();
+        let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new([5; 32]);
+        let endpoint = format!("http://{}:9", std::net::Ipv4Addr::LOCALHOST);
+        let before = std::fs::read_dir(dir.path()).unwrap().count();
+        let error = submit_timelock_invoke_with_g_key_auth(TimelockSubmitArgs {
+            schedule_identity: None,
+            host_function: HostFunction::InvokeContract(InvokeContractArgs {
+                contract_address: stellar_agent_test_support::xdr_fixtures::muxed_contract_address(
+                ),
+                ..Default::default()
+            }),
+            signer: &signer,
+            primary_rpc_url: &endpoint,
+            secondary_rpc_url: &endpoint,
+            network_passphrase: stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE,
+            timeout: std::time::Duration::from_secs(1),
+            op_label: "schedule",
+            admission: stellar_agent_network::SigningAdmission::NoValue(&admission),
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.wire_code(), "network.mainnet_write_forbidden");
+        assert_eq!(signer.sign_calls(), 0);
+        assert_eq!(signer.key_accesses(), 0);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), before);
     }
 
     /// Verifies that `TimelockSubmitArgs` with a non-`InvokeContract` host function

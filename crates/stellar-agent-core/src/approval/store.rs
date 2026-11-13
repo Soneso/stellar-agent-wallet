@@ -6637,6 +6637,26 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[test]
+    fn muxed_destinations_keep_their_full_terms() {
+        use stellar_agent_test_support::xdr_fixtures::{
+            destination_transfer, muxed_contract_address,
+        };
+        for destination in [
+            muxed_contract_address(),
+            stellar_xdr::ScAddress::MuxedAccount(stellar_xdr::MuxedEd25519Account {
+                id: 7,
+                ed25519: stellar_xdr::Uint256([1; 32]),
+            }),
+        ] {
+            let terms = super::x402_transfer_terms(&destination_transfer(destination.clone()));
+            assert_eq!(
+                terms.map(|terms| terms.payee),
+                Some(destination.to_string())
+            );
+        }
+    }
+
     thread_local! {
         /// The persists the stores on this thread have performed.
         static PERSISTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };

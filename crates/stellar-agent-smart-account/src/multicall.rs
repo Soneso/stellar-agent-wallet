@@ -2030,6 +2030,12 @@ fn json_args_to_scval_vec(
                 .map_err(|_| {
                     format!("inner[{idx}] arg[{elem_idx}]: scval must be a base64 XDR string")
                 })?;
+                if stellar_agent_core::sc_address::scval_has_muxed_contract(&value) {
+                    return Err(format!(
+                        "inner[{idx}] arg[{elem_idx}]: {}",
+                        stellar_agent_core::sc_address::MUXED_CONTRACT_REFUSAL
+                    ));
+                }
                 if matches!(
                     value,
                     ScVal::ContractInstance(_)
@@ -2641,6 +2647,21 @@ mod tests {
     use super::*;
 
     // ── Verifier status phase, unsizable calls and argument forms ────────────
+
+    #[test]
+    fn muxed_contract_argument_refuses_before_policy() {
+        use stellar_xdr::{ContractId, Hash, Limits, MuxedContract, WriteXdr};
+        let value = ScVal::Address(ScAddress::MuxedContract(MuxedContract {
+            contract_id: ContractId(Hash([3; 32])),
+            id: 7,
+        }));
+        let json = serde_json::json!([{ "scval": value.to_xdr_base64(Limits::none()).unwrap() }]);
+        let error = json_args_to_scval_vec(&json, 0).unwrap_err();
+        assert_eq!(
+            error,
+            "inner[0] arg[0]: a muxed contract address (W) is not accepted on this path"
+        );
+    }
 
     /// A revoked or retired verifier refuses at the policy gate, like the
     /// pinned-hash drift check whose match path raises it.

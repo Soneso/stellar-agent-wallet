@@ -54,6 +54,36 @@ use crate::tools::common::tests::mainnet::{
 use crate::tools::common::{GatedApprovalKind, verify_attestation_subject_gate, x402_value_leg};
 
 const TOOL: &str = "stellar_x402_authenticated_payment";
+
+#[tokio::test]
+#[serial_test::serial(keyring)]
+async fn muxed_contract_mainnet_payment_refuses_before_state() {
+    let f = Fixture::new(|raw| raw);
+    let mut requirements = f.requirements();
+    requirements.pay_to =
+        stellar_agent_test_support::xdr_fixtures::muxed_contract_address().to_string();
+    let result = f
+        .server
+        .call_stellar_x402_authenticated_payment(X402AuthenticatedPaymentArgs {
+            payment_required: serde_json::to_string(&requirements).unwrap(),
+            chain_id: "stellar:mainnet".to_owned(),
+            home_domain: String::new(),
+            address: None,
+            business_id: None,
+            approval_nonce: None,
+            approval_attestation: None,
+        })
+        .await
+        .unwrap();
+    let (code, message, _) = crate::tools::common::assert_business_envelope(&result);
+    assert_eq!(code, "x402.invalid_recipient_address");
+    assert_eq!(
+        message,
+        "invalid recipient address: pay_to must be a G-, C-, or M-strkey"
+    );
+    assert_eq!(f.seed_reads.load(Ordering::SeqCst), 0);
+    assert!(authorizations(&f).is_empty());
+}
 pub(super) const HOME: &str = "anchor.example.com";
 /// The host of the web auth endpoint the identity transport points at.
 const WEB_AUTH_DOMAIN: &str = "127.0.0.1";

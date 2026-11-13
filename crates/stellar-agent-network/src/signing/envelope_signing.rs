@@ -184,11 +184,37 @@ pub(crate) async fn authorized_signature(
     Ok(append_signature(envelope, &public_key.0, &sig_bytes)?)
 }
 
+/// Refuses a decoded W address before an intake persists or accesses a key.
+/// Malformed XDR remains subject to the caller's existing validation order.
+///
+/// # Errors
+///
+/// Returns `protocol.xdr_codec_failed` for a CAP-84 muxed contract address.
+pub fn check_envelope_address_forms(envelope_xdr: &str) -> Result<(), WalletError> {
+    if let Ok(envelope) = TransactionEnvelope::from_xdr_base64(
+        envelope_xdr,
+        stellar_agent_xdr_limits::untrusted_decode_limits(envelope_xdr.len()),
+    ) {
+        refuse_muxed_contract(&envelope)?;
+    }
+    Ok(())
+}
+
+/// Refuses a decoded envelope that carries a muxed contract address.
+pub(crate) fn refuse_muxed_contract(envelope: &TransactionEnvelope) -> Result<(), WalletError> {
+    if stellar_agent_core::sc_address::envelope_has_muxed_contract(envelope) {
+        return Err(WalletError::Protocol(ProtocolError::XdrCodecFailed {
+            detail: stellar_agent_core::sc_address::MUXED_CONTRACT_REFUSAL.to_owned(),
+        }));
+    }
+    Ok(())
+}
+
 /// Decodes a caller-supplied envelope under the untrusted-input limits.
 fn decode_envelope(envelope_xdr: &str) -> Result<TransactionEnvelope, WalletError> {
     // The unsigned envelope is caller-supplied and untrusted; bounded limits
     // prevent a deeply nested auth-invocation tree from exhausting the stack.
-    TransactionEnvelope::from_xdr_base64(
+    let envelope = TransactionEnvelope::from_xdr_base64(
         envelope_xdr,
         stellar_agent_xdr_limits::untrusted_decode_limits(envelope_xdr.len()),
     )
@@ -198,7 +224,9 @@ fn decode_envelope(envelope_xdr: &str) -> Result<TransactionEnvelope, WalletErro
                 "failed to decode TransactionEnvelope: {TRANSACTION_ENVELOPE_XDR_FORM}"
             ),
         })
-    })
+    })?;
+    refuse_muxed_contract(&envelope)?;
+    Ok(envelope)
 }
 
 /// Appends the signature by `public_key` to the envelope's signature list and
@@ -313,6 +341,47 @@ mod tests {
             )
             .expect("payment op");
         builder.build().expect("build unsigned envelope")
+    }
+
+    #[tokio::test]
+    async fn muxed_contract_envelope_refuses_before_signature() {
+        let signer = CountingSigner::new([5; 32]);
+        let mut tx = stellar_xdr::TransactionV1Envelope::default();
+        tx.tx.operations = vec![stellar_xdr::Operation {
+            source_account: None,
+            body: stellar_xdr::OperationBody::InvokeHostFunction(
+                stellar_xdr::InvokeHostFunctionOp {
+                    host_function: stellar_xdr::HostFunction::InvokeContract(
+                        stellar_xdr::InvokeContractArgs {
+                            contract_address: stellar_xdr::ScAddress::MuxedContract(
+                                stellar_xdr::MuxedContract {
+                                    id: 7,
+                                    contract_id: stellar_xdr::ContractId(stellar_xdr::Hash(
+                                        [3; 32],
+                                    )),
+                                },
+                            ),
+                            ..Default::default()
+                        },
+                    ),
+                    auth: Default::default(),
+                },
+            ),
+        }]
+        .try_into()
+        .unwrap();
+        let encoded = TransactionEnvelope::Tx(tx)
+            .to_xdr_base64(Limits::none())
+            .unwrap();
+        let result = attach_signature(&encoded, &signer, TESTNET).await;
+        assert_eq!(signer.sign_calls(), 0);
+        let error = result.unwrap_err();
+        assert_eq!(error.code(), "protocol.xdr_codec_failed");
+        assert!(
+            error
+                .to_string()
+                .ends_with("a muxed contract address (W) is not accepted on this path")
+        );
     }
 
     /// Builds a `TransactionEnvelope::TxV0` and returns its base64 XDR.
@@ -1108,6 +1177,44 @@ mod tests {
                 P::PolicyPinMismatch
             );
             assert!(f.is_open(auth.id()));
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn muxed_contract_authorized_signature_refuses_without_consuming() {
+            let f = fixtures::LedgerFixture::new("muxed", NOW);
+            let signer = CountingSigner::new(SIGNER_SEED);
+            let TransactionEnvelope::Tx(mut v1) = TransactionEnvelope::from_xdr_base64(
+                stellar_agent_test_support::xdr_fixtures::muxed_contract_envelope(),
+                Limits::none(),
+            )
+            .unwrap() else {
+                panic!("transaction")
+            };
+            v1.tx.source_account = MuxedAccount::Ed25519(Uint256(signer.key_bytes()));
+            v1.tx.seq_num = SequenceNumber(SEQUENCE);
+            let payload = TransactionSignaturePayload {
+                network_id: Hash(Sha256::digest(MAINNET.as_bytes()).into()),
+                tagged_transaction: TransactionSignaturePayloadTaggedTransaction::Tx(v1.tx.clone()),
+            };
+            let hash = stellar_agent_core::hex::encode(&Sha256::digest(
+                payload.to_xdr(Limits::none()).unwrap(),
+            ));
+            let encoded = TransactionEnvelope::Tx(v1)
+                .to_xdr_base64(Limits::none())
+                .unwrap();
+            let auth = f.mint(fixtures::tx_binding(&encoded, &hash), &[], None, "nonce");
+            let result = attach_signature_authorized(
+                &encoded,
+                &signer,
+                MAINNET,
+                MainnetConsumer::CliPay,
+                &auth,
+            )
+            .await;
+            assert_eq!(signer.sign_calls(), 0);
+            assert!(f.is_open(auth.id()));
+            assert_eq!(result.unwrap_err().code(), "protocol.xdr_codec_failed");
         }
 
         #[tokio::test]

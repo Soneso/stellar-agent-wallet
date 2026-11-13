@@ -135,6 +135,15 @@ impl WalletServer {
             return Ok(crate::tools::common::mainnet_signing_forbidden_result());
         }
 
+        if let Err(err) =
+            stellar_agent_sep43::signing::check_preimage_address_forms(&args.auth_entry_xdr)
+        {
+            return Ok(crate::tools::common::business_error_result(
+                err.wire_code(),
+                err.to_string(),
+            ));
+        }
+
         let args_value = json!({
             "chain_id": &args.chain_id,
             "auth_entry_xdr_len": args.auth_entry_xdr.len(),
@@ -364,6 +373,66 @@ mod tests {
         ) -> Result<Decision, PolicyError> {
             Ok(Decision::Deny(DenyReason::NoMatchingRule))
         }
+    }
+
+    /// Builds a testnet V1 preimage whose transfer argument holds a muxed
+    /// contract address (W) and returns its base64 XDR.
+    fn muxed_contract_preimage_xdr() -> String {
+        use sha2::{Digest, Sha256};
+        use stellar_agent_test_support::xdr_fixtures::{
+            destination_transfer, muxed_contract_address,
+        };
+        use stellar_xdr::{Limits, WriteXdr};
+
+        stellar_agent_soroban_auth::build_auth_preimage(
+            stellar_agent_soroban_auth::AuthCredentialsVersion::V1,
+            Sha256::digest(b"Test SDF Network ; September 2015").into(),
+            7,
+            100,
+            &muxed_contract_address(),
+            destination_transfer(muxed_contract_address()),
+        )
+        .to_xdr_base64(Limits::none())
+        .expect("soroban auth preimage must encode")
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn muxed_contract_intake_refuses_before_state() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let home = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let reads = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&reads);
+        stellar_agent_test_support::keyring_mock::install_with_read_hooks(vec![
+            stellar_agent_test_support::keyring_mock::ReadHook::new(
+                "svc",
+                "acct",
+                Arc::new(move || {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }),
+            ),
+        ])
+        .unwrap();
+        let server = make_require_approval_server();
+        let before = std::fs::read_dir(home.path()).unwrap().count();
+        let result = server
+            .call_stellar_sep43_sign_auth_entry(Sep43SignAuthEntryArgs {
+                chain_id: "stellar:testnet".to_owned(),
+                auth_entry_xdr: muxed_contract_preimage_xdr(),
+                address: None,
+                network_passphrase: None,
+            })
+            .await
+            .unwrap();
+        let (code, message, _) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "sep43.invalid_xdr");
+        assert!(message.ends_with("a muxed contract address (W) is not accepted on this path"));
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), before);
     }
 
     fn make_require_approval_server() -> crate::server::WalletServer {

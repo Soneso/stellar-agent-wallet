@@ -996,6 +996,7 @@ pub struct SubmitInvokeArgs<'a> {
 pub async fn submit_signed_invoke(
     args: SubmitInvokeArgs<'_>,
 ) -> Result<SubmitInvokeResult, SaError> {
+    check_invoke_address_forms(&args.host_function)?;
     validate_submit_invoke_args(&args)?;
 
     // ── Signing-path mutual-exclusivity guard — execute FIRST before any I/O ──
@@ -2347,6 +2348,23 @@ fn check_declared_calls(
     Ok(())
 }
 
+/// Refuses a W target or argument before signing admission records a plan.
+pub(crate) fn check_invoke_address_forms(host_function: &HostFunction) -> Result<(), SaError> {
+    if let HostFunction::InvokeContract(invoke) = host_function
+        && (matches!(invoke.contract_address, ScAddress::MuxedContract(_))
+            || invoke
+                .args
+                .iter()
+                .any(stellar_agent_core::sc_address::scval_has_muxed_contract))
+    {
+        return Err(SaError::DeploymentFailed {
+            phase: "submit",
+            redacted_reason: stellar_agent_core::sc_address::MUXED_CONTRACT_REFUSAL.to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// Refuses a [`SubmitInvokeArgs`] whose fields contradict each other,
 /// before any network I/O.
 ///
@@ -3110,6 +3128,33 @@ mod tests {
             .required_checks(required_checks)
             .maybe_multicall_check(multicall_check)
             .build()
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn muxed_contract_submit_intake_refuses_before_admission() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new([5; 32]);
+        let endpoint = format!("http://{}:9", std::net::Ipv4Addr::LOCALHOST);
+        let secondary = format!("http://{}:9", std::net::Ipv4Addr::new(127, 0, 0, 2));
+        let mut args = minimal_args(None, &[]);
+        args.signer = &signer;
+        args.primary_rpc_url = &endpoint;
+        args.secondary_rpc_url = Some(&secondary);
+        args.network_passphrase = stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
+        args.host_function = HostFunction::InvokeContract(InvokeContractArgs {
+            contract_address: stellar_agent_test_support::xdr_fixtures::muxed_contract_address(),
+            ..Default::default()
+        });
+        let error = submit_signed_invoke(args).await.unwrap_err();
+        assert_eq!(signer.sign_calls(), 0);
+        assert_eq!(signer.key_accesses(), 0);
+        assert_eq!(error.wire_code(), "sa.deployment_failed");
+        assert!(
+            error
+                .to_string()
+                .ends_with("a muxed contract address (W) is not accepted on this path")
+        );
     }
 
     /// `check_required` with `required_checks = &["multicall"]` and a

@@ -1326,7 +1326,7 @@ Each criterion is a `Box<dyn Criterion>` (`Send + Sync`) with a snake_case kind 
 | `approval_above` | Per-transaction approval threshold on `allow` rules |
 | `per_period_cap` | Sliding-window per-period value cap |
 | `rate_limit` | Sliding-window count of recorded calls, one shared count per profile and window |
-| `counterparty_allowlist` | Destination allowlist (`G_ACCOUNT` / `C_ACCOUNT` / `KNOWN_ISSUER` / `HOME_DOMAIN`; `SEP10_IDENTITY` and `ONE_TIME_ADDRESS` are reserved, not evaluated); `KNOWN_ISSUER` checks debit legs only unless the criterion's `gate_inflows = true` opt-in extends it to inflow legs too; the v2 `unlisted` table denies, escalates, or budgets a verified recipient outside the list |
+| `counterparty_allowlist` | Destination allowlist (`G_ACCOUNT` for G/M, `C_ACCOUNT` for C/W, `KNOWN_ISSUER`, `HOME_DOMAIN`); a base G or C covers its muxed destinations, and an M or W entry covers only itself. `SEP10_IDENTITY` and `ONE_TIME_ADDRESS` are reserved. `KNOWN_ISSUER` checks debit legs unless `gate_inflows = true`. The v2 `unlisted` table denies, escalates, or budgets a verified recipient outside the list. |
 | `minimum_reserve` | Minimum-reserve guard (classic-account tools only, see below) |
 | `inner_invocation_count_cap` | Multicall inner-count cap |
 | `bundle_aggregate_cap` | Multicall aggregate-value cap (implicitly enforces the Generic-rejection check below, on any rule that carries it) |
@@ -1342,6 +1342,14 @@ Each criterion is a `Box<dyn Criterion>` (`Send + Sync`) with a snake_case kind 
 | `balance_floor` | Absolute native floor over an observed account read, v2 only |
 | `memo_binding` | Required memo per bound `G...` destination, v2 only |
 
+W addresses decode for inspection and display. Envelope signing, submission,
+SEP-43 auth signing, multicall arguments and CLI execute arguments refuse W
+before signing, sending or persistence. Staged pay and claim refuse W before
+keyring access, policy evaluation and audit preparation. These paths identify
+the unsupported W address form. The MCP SEP-43 transaction and auth-entry tools
+answer `sep43.invalid_xdr`. Network-layer envelope signing and submission answer
+`protocol.xdr_codec_failed`.
+
 Recipient classes govern the `unlisted` table. Each debit leg is `Listed`,
 `Unlisted` (well-formed, verified, outside the criterion's own list), or
 `Unverifiable` (missing destination or asset, an unverified home-domain step,
@@ -1349,7 +1357,7 @@ or an unsupported kind). The strictest class over the legs and kinds governs.
 Only `Unlisted` reaches the mode; every other failure keeps the criterion's
 first denial in kind order. G_ACCOUNT and C_ACCOUNT form one address check,
 at their first position. A listed destination needs its kind and an exact
-entry or base G. An exact M entry covers only that mux id.
+entry or base G or C. An exact M or W entry covers only that mux id.
 Other forms and malformed strings return a fixed evaluation error.
 Inflow legs carry no class. Reserved kinds are unverifiable without debits too.
 HOME_DOMAIN can deny an inflow-only call while its class remains Listed.

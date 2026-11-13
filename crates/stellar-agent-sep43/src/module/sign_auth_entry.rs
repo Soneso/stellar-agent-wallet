@@ -162,6 +162,47 @@ mod tests {
         .expect("soroban auth preimage must encode")
     }
 
+    /// Builds a testnet V1 preimage whose transfer argument holds a muxed
+    /// contract address (W) and returns its base64 XDR.
+    fn muxed_contract_preimage_xdr() -> String {
+        use stellar_agent_test_support::xdr_fixtures::{
+            destination_transfer, muxed_contract_address,
+        };
+        use stellar_xdr::{Limits, WriteXdr};
+
+        stellar_agent_soroban_auth::build_auth_preimage(
+            stellar_agent_soroban_auth::AuthCredentialsVersion::V1,
+            Sha256::digest(TESTNET.as_bytes()).into(),
+            7,
+            100,
+            &muxed_contract_address(),
+            destination_transfer(muxed_contract_address()),
+        )
+        .to_xdr_base64(Limits::none())
+        .expect("soroban auth preimage must encode")
+    }
+
+    #[tokio::test]
+    async fn muxed_contract_dispatch_refuses_before_signature() {
+        let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new([5; 32]);
+        let result = dispatch(
+            &testnet_profile(),
+            &signer,
+            &muxed_contract_preimage_xdr(),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(signer.sign_calls(), 0);
+        let error = result.unwrap_err();
+        assert_eq!(error.wire_code(), "sep43.invalid_xdr");
+        assert!(
+            error
+                .to_string()
+                .ends_with("a muxed contract address (W) is not accepted on this path")
+        );
+    }
+
     #[tokio::test]
     async fn dispatch_invalid_xdr_returns_error() {
         let profile = testnet_profile();

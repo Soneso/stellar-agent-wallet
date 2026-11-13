@@ -586,6 +586,14 @@ pub(crate) fn business_error_result(
     result
 }
 
+/// Refuses W envelopes with the SEP-43 tool code before persistence or key access.
+pub(super) fn check_sep43_envelope_address_forms(
+    envelope_xdr: &str,
+) -> Result<(), rmcp::model::CallToolResult> {
+    stellar_agent_network::signing::envelope_signing::check_envelope_address_forms(envelope_xdr)
+        .map_err(|err| business_error_result("sep43.invalid_xdr", err.to_string()))
+}
+
 /// Test-only: asserts the shared business-error envelope invariants
 /// (`is_error == true`, `ok == false`, non-empty `request_id`) and returns the
 /// `(code, message, full_text)` triple for further per-tool assertions.

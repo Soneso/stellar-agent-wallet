@@ -197,6 +197,7 @@ pub async fn submit_transaction_idempotent(
 
     // ── Step 1: decode XDR and compute idempotency key ─────────────────────
     let (envelope, envelope_hash) = decode_and_hash_envelope(envelope_xdr)?;
+    crate::signing::envelope_signing::refuse_muxed_contract(&envelope)?;
 
     // ── Step 2: reject non-V1 envelopes fail-closed ────────────────────────
     //
@@ -2059,6 +2060,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = ReceiptStore::open_at(dir.path(), "test").unwrap();
         (dir, store)
+    }
+
+    #[tokio::test]
+    async fn muxed_contract_idempotent_submit_creates_no_receipt() {
+        let (_dir, store) = open_temp_store();
+        let encoded = stellar_agent_test_support::xdr_fixtures::muxed_contract_envelope();
+        let (_, hash) = decode_and_hash_envelope(&encoded).unwrap();
+        let endpoint = format!("http://{}:9", std::net::Ipv4Addr::LOCALHOST);
+        let client = StellarRpcClient::new(&endpoint).unwrap();
+        let result = submit_transaction_idempotent(
+            &client,
+            &encoded,
+            Duration::from_secs(1),
+            "Test SDF Network ; September 2015",
+            &store,
+            1,
+        )
+        .await;
+        assert!(store.get(&hash).unwrap().is_none());
+        assert_eq!(result.unwrap_err().code(), "protocol.xdr_codec_failed");
     }
 
     /// `extract_max_time` returns 0 for an envelope without time bounds.
