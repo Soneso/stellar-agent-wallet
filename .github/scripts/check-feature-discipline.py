@@ -342,7 +342,8 @@ REVIEWED_EMISSIONS = {
 # The cross image Cross.toml may name; Cross.toml alone holds the digest.
 CROSS_IMAGE = r'ghcr\.io/cross-rs/aarch64-unknown-linux-gnu@sha256:[0-9a-f]{64}'
 CROSS_PRE_BUILD = ['dpkg --add-architecture $CROSS_DEB_ARCH',
-                   'apt-get update && apt-get install --assume-yes libudev-dev:$CROSS_DEB_ARCH']
+                   'apt-get -o Acquire::Retries=3 update && '
+                   'apt-get -o Acquire::Retries=3 install --assume-yes libudev-dev:$CROSS_DEB_ARCH']
 
 
 def run_cargo(root, args):

@@ -2,7 +2,7 @@ name: CI
 
 # Every pull request to main or mainnet-write runs the offline gate suite,
 # including docs changes. Pushes to those branches use the paths filter below.
-# Skill changes run the archive checks.
+# Skill changes run the archive checks on main.
 # The suite covers format, lint, rustdoc, offline tests, dependencies, and licenses.
 # Coverage runs in coverage.yml.
 # Live testnet tests run in a separate workflow.
@@ -12,7 +12,7 @@ on:
     branches: [main, mainnet-write]
     # Documentation, the license, and the plugin manifest cannot change a gate
     # result, so pushes skip them.
-    # Skill changes run CI because release-contracts verifies the archive.
+    # Skill changes run CI because release-contracts verifies the archive on main.
     paths:
       - '**'
       - '!**/*.md'
@@ -67,7 +67,7 @@ jobs:
       # stellar-ledger pulls hidapi, which links libudev on Linux for HID device
       # enumeration. The runner ships pkg-config but not the libudev headers.
       - name: Install libudev (Linux hidapi)
-        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+        run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # The explicit feature list compile-checks the code behind
       # the testnet-acceptance features, without executing any test. The
@@ -92,7 +92,7 @@ jobs:
         with:
           toolchain: stable
       - name: Install libudev (Linux hidapi)
-        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+        run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # --no-default-features keeps mainnet-write off; the binary packages
       # enable it by default.
@@ -125,7 +125,7 @@ jobs:
         with:
           toolchain: stable
       - name: Install libudev (Linux hidapi)
-        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+        run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # Offline tier only. The enabled features expose the test-only helpers and
       # fixtures the integration suites depend on; none of them pulls the live
@@ -171,7 +171,7 @@ jobs:
       # device enumeration. The runner ships pkg-config but not the libudev
       # headers.
       - name: Install libudev (Linux hidapi)
-        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+        run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # The explicit feature list compile-checks the code behind
       # the testnet-acceptance features, without executing any test. The
@@ -194,7 +194,7 @@ jobs:
         with:
           toolchain: stable
       - name: Install libudev (Linux hidapi)
-        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+        run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Build the rustdoc
         run: cargo doc --workspace --no-deps --features "mainnet-write,$FEATURES_EXCEPT_MAINNET_WRITE"
@@ -225,7 +225,7 @@ jobs:
         with:
           toolchain: stable
       - name: Install libudev (Linux hidapi)
-        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+        run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # Offline tier only. The enabled features expose the test-only helpers
       # and fixtures the integration suites depend on; none of them pulls the
@@ -278,7 +278,7 @@ jobs:
         with:
           toolchain: stable
       - name: Install libudev (Linux hidapi)
-        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+        run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config
       # The host recipe that preflight's release-shape row runs too: the
       # release build script for the host target, then the marker check of
       # both binaries.
@@ -345,7 +345,9 @@ jobs:
         run: .github/scripts/test-publish-crates-check.sh
       - name: Check the publish tiers
         run: .github/scripts/publish-crates.sh --check
+      # Many open pull requests conflict in the binary archive on the integration branch; the pull request into main runs the check.
       - name: Check the skill archive
+        if: github.base_ref != 'mainnet-write' && github.ref != 'refs/heads/mainnet-write'
         run: .github/scripts/package-skill.sh --check
       - name: Check the signer-set baseline gate
         run: bash .github/scripts/check-no-direct-sasignersetbaselined-emit.sh
@@ -541,9 +543,9 @@ jobs:
         with:
           toolchain: stable
       - name: Install libudev (Linux hidapi)
-        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+        run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config
       - name: Install gnome-keyring and dbus
-        run: sudo apt-get install -y gnome-keyring dbus
+        run: sudo apt-get -o Acquire::Retries=3 install -y gnome-keyring dbus
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: platform-keyring

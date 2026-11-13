@@ -35,6 +35,13 @@ WELCOME = ".github/workflows/welcome.yml"
 COVERAGE = ".github/workflows/coverage.yml"
 REHEARSAL = ".github/workflows/release-rehearsal.yml"
 CI = ".github/workflows/ci.yml"
+TESTNET = ".github/workflows/testnet.yml"
+APT_LIBUDEV_RUN = ("        run: sudo apt-get -o Acquire::Retries=3 update && "
+                   "sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config\n")
+SKILL_ARCHIVE_CONDITION = "github.base_ref != 'mainnet-write' && github.ref != 'refs/heads/mainnet-write'"
+SKILL_ARCHIVE_IF = f"        if: {SKILL_ARCHIVE_CONDITION}\n"
+SKILL_ARCHIVE_RUN = "        run: .github/scripts/package-skill.sh --check\n"
+SKILL_ARCHIVE_STEP = "      - name: Check the skill archive\n" + SKILL_ARCHIVE_IF + SKILL_ARCHIVE_RUN
 BUILD_SCRIPT = ".github/scripts/release/build.sh"
 HOST_SCRIPT = ".github/scripts/release/check-host.sh"
 ACTION = ".github/actions/macos-sign-notarize/action.yml"
@@ -447,6 +454,13 @@ VARS_LOCATIONS = (
 # label, [(file, old, new, expected occurrences)];
 # the edited copy must pass.
 PASSING = [
+    ("skill archive block run passes", [
+        (CI, SKILL_ARCHIVE_RUN, "        run: |\n          .github/scripts/package-skill.sh --check\n", 1)]),
+    ("apt-get in comments passes", [
+        (TESTNET, APT_LIBUDEV_RUN,
+         "        run: |\n          # sudo apt-get update\n          true # sudo apt-get install -y libudev-dev\n", 2)]),
+    ("wrapped skill archive condition passes", [
+        (CI, SKILL_ARCHIVE_IF, f"        if: ${{{{ {SKILL_ARCHIVE_CONDITION} }}}}\n", 1)]),
     ("publication call inputs in another order pass", [
         (PUBLISH, PUBLICATION_WITH, "      publication: true\n      source_sha: ${{ needs.verify.outputs.sha }}\n", 1)]),
     ("wrapped tag cache guard passes", [
@@ -486,6 +500,44 @@ PASSING = [
 # replaces only the first occurrence. A case that expects several lines gives
 # tuples of rules and fragments of the same length, in output order.
 CASES = [
+    ("skill archive step duplicated", "skill-archive", "expected exactly one skill archive step", [
+        (CI, SKILL_ARCHIVE_STEP, SKILL_ARCHIVE_STEP * 2, 1)], 1),
+    ("skill archive step shell bypass", "skill-archive", "skill archive check can be bypassed", [
+        (CI, SKILL_ARCHIVE_RUN, SKILL_ARCHIVE_RUN + "        shell: true {0}\n", 1)], 1),
+    ("skill archive job shell bypass", "skill-archive", "skill archive check can be bypassed", [
+        (CI, "  release-contracts:\n",
+         "  release-contracts:\n    defaults:\n      run:\n        shell: true {0}\n", 1)], 1),
+    ("skill archive workflow shell bypass", "skill-archive", "skill archive check can be bypassed", [
+        (CI, "name: CI\n", "name: CI\ndefaults:\n  run:\n    shell: true {0}\n", 1)]),
+    ("apt-get without retries", "apt-retries", "apt-get call lacks -o Acquire::Retries=3", [
+        (TESTNET, "sudo apt-get -o Acquire::Retries=3 install -y gnome-keyring dbus",
+         "sudo apt-get install -y gnome-keyring dbus", 2)], 1),
+    ("apt-get multiline second call without retries", "apt-retries", "apt-get call lacks -o Acquire::Retries=3", [
+        (TESTNET, APT_LIBUDEV_RUN,
+         "        run: |\n          sudo apt-get -o Acquire::Retries=3 update\n"
+         "          sudo apt-get install -y libudev-dev pkg-config\n", 2)], 1),
+    ("CI pull request branches without main", "ci-triggers", "pull_request branches must include main", [
+        (CI, "  pull_request:\n    branches: [main, mainnet-write]\n",
+         "  pull_request:\n    branches: [mainnet-write]\n", 1)], 1),
+    ("CI adds workflow_dispatch", "ci-triggers",
+     "archive condition must be re-evaluated for the new event: workflow_dispatch", [
+        (CI, "on:\n", "on:\n  workflow_dispatch:\n", 1)], 1),
+    ("skill archive step removed", "skill-archive", "expected exactly one skill archive step", [
+        (CI, SKILL_ARCHIVE_STEP, "", 1)], 1),
+    ("skill archive skipped for main pull requests", "skill-archive", "skill archive condition differs", [
+        (CI, SKILL_ARCHIVE_IF, SKILL_ARCHIVE_IF.replace("'mainnet-write'", "'main'"), 1)], 1),
+    ("skill archive skipped for main pushes", "skill-archive", "skill archive condition differs", [
+        (CI, SKILL_ARCHIVE_IF, SKILL_ARCHIVE_IF.replace("refs/heads/mainnet-write", "refs/heads/main"), 1)], 1),
+    ("skill archive always skipped", "skill-archive", "skill archive condition differs", [
+        (CI, SKILL_ARCHIVE_IF, "        if: false\n", 1)], 1),
+    ("skill archive without integration exception", "skill-archive", "skill archive condition differs", [
+        (CI, SKILL_ARCHIVE_IF, "", 1)], 1),
+    ("skill archive command removed", "skill-archive", "skill archive command differs", [
+        (CI, SKILL_ARCHIVE_RUN, "        run: true\n", 1)], 1),
+    ("skill archive continues on error", "skill-archive", "skill archive check can be bypassed", [
+        (CI, SKILL_ARCHIVE_IF, SKILL_ARCHIVE_IF + "        continue-on-error: true\n", 1)], 1),
+    ("skill archive job skipped", "skill-archive", "skill archive check can be bypassed", [
+        (CI, "  release-contracts:\n", "  release-contracts:\n    if: false\n", 1)], 1),
     ("crate publish without Wasm dependency", "publish-wasm-gate", "publish must need verify and vendored-wasm", [
         (PUBLISH, "needs: [verify, vendored-wasm]", "needs: verify", 1)]),
     ("crate Wasm call uses another workflow", "publish-wasm-gate", "must call the local workflow", [
@@ -1491,6 +1543,53 @@ CASES = [
 # replacement, and the CASES or PASSING labels that must fail against the
 # mutated copy and pass against the restored one.
 MUTATIONS = {
+    "skill-archive-count": (
+        'if len(steps) != 1:', 'if not steps:',
+        ['skill archive step duplicated']),
+    "skill-archive-strip": (
+        'if self.run_text(step).strip() != ".github/scripts/package-skill.sh --check":',
+        'if self.run_text(step) != ".github/scripts/package-skill.sh --check":',
+        ['skill archive block run passes']),
+    "skill-archive-shell": (
+        ' or shell not in (None, "bash"):', ':',
+        ['skill archive step shell bypass', 'skill archive job shell bypass',
+         'skill archive workflow shell bypass']),
+    "skill-archive-job-skip": (
+        'if self.may_skip(job) or "continue-on-error" in step or shell not in (None, "bash"):',
+        'if "continue-on-error" in step or shell not in (None, "bash"):',
+        ['skill archive job skipped']),
+    "skill-archive-step-error": (
+        'if self.may_skip(job) or "continue-on-error" in step or shell not in (None, "bash"):',
+        'if self.may_skip(job) or shell not in (None, "bash"):',
+        ['skill archive continues on error']),
+    "skill-archive-unwrap": (
+        'if self.unwrap_expression(step.get("if", "")) != SKILL_ARCHIVE_CONDITION:',
+        'if step.get("if", "") != SKILL_ARCHIVE_CONDITION:',
+        ['wrapped skill archive condition passes']),
+    "skill-archive-condition": (
+        'if self.unwrap_expression(step.get("if", "")) != SKILL_ARCHIVE_CONDITION:', 'if False:',
+        ['skill archive skipped for main pull requests']),
+    "skill-archive-command": (
+        'if self.run_text(step).strip() != ".github/scripts/package-skill.sh --check":', 'if False:',
+        ['skill archive command removed']),
+    "apt-retries-option": (
+        'if not APT_RETRIES.search(arguments):', 'if False:',
+        ['apt-get without retries', 'apt-get multiline second call without retries']),
+    "apt-retries-comments": (
+        '                    for line in self.logical_lines(self.run_text(step)):\n'
+        '                        line = re.split(r"(?<![^ \\t])#", line, maxsplit=1)[0]\n',
+        '                    for line in self.run_text(step).splitlines():\n',
+        ['apt-get in comments passes']),
+    "ci-trigger-main": (
+        'if not isinstance(branches, list) or "main" not in branches:', 'if False:',
+        ['CI pull request branches without main']),
+    "ci-trigger-events": (
+        'for event in sorted(set(triggers) - {"push", "pull_request"}):', 'for event in ():',
+        ['CI adds workflow_dispatch']),
+    "skill-archive-check": (
+        '        self.check_skill_archive()\n', '',
+        ['skill archive step removed', 'skill archive skipped for main pull requests',
+         'skill archive skipped for main pushes', 'skill archive command removed']),
     "publish-wasm-call-check": (
         '        self.check_publish_wasm_gate()\n', '',
         ['crate publish without Wasm dependency']),

@@ -252,6 +252,10 @@ workflow. Local coverage, `cargo machete`, and `cargo deny check` are optional
 reproductions. See the build-gate dimension of the
 [review checklist](review-checklist.md#8-build-gates).
 
+CI also checks the skill archive.
+CI skips this check for pull requests into and pushes to the `mainnet-write` integration branch.
+The pull request that merges that branch into `main` runs the check.
+
 ### Preflight
 
 `.github/scripts/preflight.sh` runs the local CI checks that apply to the files
