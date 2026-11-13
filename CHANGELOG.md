@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `stellar_agent_core::policy::v1::presets` derives mainnet spending presets,
+  writes their v2 policy body, and states a funding plan. Its summary of any
+  policy body bounds what the payment tools pay without approval. `mainnet_minimum` exports
+  `MAINNET_READ_ONLY_TOOLS`, `MAINNET_TRUSTLINE_TOOLS`, and
+  `MAINNET_CLAIM_TOOLS`.
+- `profile init --network mainnet --engine v1` writes the policy body of a
+  spending preset. `--preset`, `--asset`, `--tolerated-loss`,
+  `--typical-payment`, `--unlisted-budget`, `--total-budget`, and `--output`
+  choose it; elsewhere they refuse with `validation.usage_error`. A terminal
+  answers missing inputs. The bounds are previewed on stderr before any write,
+  and the envelope adds `spending_summary` and `plan`. New codes are
+  `profile.preset_invalid`, `profile.preset_input_required`,
+  `profile.spending_preview_unwritable`, `profile.policy_already_exists`, and
+  `profile.preset_write_failed`.
+- `profile enable-mainnet --check` adds the `spending_summary` of the
+  installed signed policy. The ceremony previews the rebound policy on stderr
+  before its first write, and later refusals carry it at
+  `error.details.preview`.
+- A generated body lists G, M, and C recipients in one list per payment rule.
+  An unlisted budget is one table on every payment rule, shared by CLI `pay`
+  and the MCP payment tools.
 - CAP-84 W destinations decode, retain their mux id in approval displays,
   and redact to five leading and five trailing characters in audit text.
   C allowlist entries cover their W destinations; a W entry covers only itself.
@@ -300,6 +321,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `stellar-agent-cli` install `stellar-agent`; copy it to `stellar-agent-mcp`
   for clients that start that name. `bootstrap.sh` installs both names from
   one `--cli` source; `--mcp` is optional and must hold the same bytes.
+- A full `profile enable-mainnet` binding writes
+  `classic_max_fee_per_op_stroops = 10000` into `[mainnet]` when the policy
+  states no fee cap, and keeps an authored one.
+- The mainnet V1 `profile init` next step asks to review the generated
+  `version = 2` policy file.
+- The startup advisory skips `profile init` and `profile enable-mainnet`. No
+  startup advisory precedes the spending preview.
 - Multicall transfers to M retain the full destination and count toward payment
   limits. Policies that require recognized transfers or record spending admit
   them when the asset, counterparty and limits pass, or request approval.

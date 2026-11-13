@@ -289,9 +289,11 @@ The same pre-flight proves the audit log still contains the chain tip its keyrin
 
 ## Startup advisory
 
-Before dispatching any command, the CLI scans the profile's audit log for
-context rules that reference revoked or retired verifier WASM hashes. The scan
-reads without a writer and issues no network calls.
+Before dispatching any command except `profile init` and
+`profile enable-mainnet`, the CLI scans the profile's audit log for context
+rules that reference revoked or retired verifier WASM hashes. The scan reads
+without a writer and issues no network calls. The two profile commands skip
+it. No startup advisory precedes the spending preview.
 
 A finding prints a stderr advisory and opens a writer to append a
 `sa_verifier_allowlist_advisory` row with the profile's audit key. The writer

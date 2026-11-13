@@ -51,6 +51,30 @@ State-changing (writes the profile file; no network, no keyring). Creates and pe
 - `--network <testnet|mainnet>`: target network (default `testnet`).
 - `--rpc-url <URL>`: optional on testnet, where an omitted value takes the testnet endpoint; required with `--network mainnet`, which has no default endpoint. The URL must use `http` or `https`, and `https` on mainnet. The flag parser refuses credentials.
 - `--engine <v1|noop>`: policy engine (default `v1`). See the `[policy]` block in [profiles.md](../profiles.md). On a V1 profile, the MCP server starts once the owner key is enrolled and the owner-signed policy loads; the rest of the [V1 setup](../profiles.md#opt-in-to-v1) gates approvals and signing. For V1, `next_steps` adds `profile enroll-owner-key`, `profile rotate-attestation-key`, a step to [create the policy file](../profiles.md#create-the-v1-policy-file) `policies/<name>.toml`, then `profile sign-policy`. A testnet `noop` profile supports server startup and read access immediately. Mint the audit key with `profile rotate-audit-key` before `profile enroll-signer` so enrollment writes its audit row. Then run `profile rotate-nonce-key` before MCP payment simulation.
+- `--preset <NAME>`: spending preset of the generated policy body (default `api-day`). Each `-week` preset fits an agent left unattended for a week. The presets are listed in [Mainnet policy body](../profiles.md#mainnet-policy-body).
+- `--asset <USDC|XLM>`: asset of the caps (default `USDC`).
+- `--tolerated-loss <AMOUNT>` and `--typical-payment <AMOUNT>`: the XLM amounts the caps derive from. USDC presets carry their own amounts and refuse these flags.
+- `--unlisted-budget <yes|no>`: whether the payment tools pay recipients outside the list from one shared budget. Api presets only; they ask when the flag is absent.
+- `--total-budget <yes|no>`: whether a total budget bounds spending until the next policy signature (default `yes`).
+- `--output <FORMAT>`: format of the stderr preview, `json` (default) or `table`. The stdout envelope stays JSON.
+
+The seven preset flags apply to `--network mainnet --engine v1` only. Elsewhere, any of them refuses with `validation.usage_error` and the message `<flags>: these flags apply only to --network mainnet --engine v1`, naming the given flags but never their values. Nothing is written.
+
+#### Mainnet spending presets
+
+On `--network mainnet --engine v1`, `init` also writes the unsigned `version = 2` policy body of a spending preset to `policies/<name>.toml` in the wallet's state directory. Its payment rules list G, M, and C recipients in one empty list, so no listed recipient is paid until one is added. The body and the twelve presets are described in [Mainnet policy body](../profiles.md#mainnet-policy-body).
+
+At a terminal, where stdin and stderr are both terminals, `init` asks for each missing input:
+
+- `Tolerated loss in XLM: ` and `Typical payment in XLM: ` for an XLM preset without the amount flags.
+- `Allow payments to unlisted recipients up to <U> <asset> per rolling day, shared by all payment tools, at most <P/2> <asset> per payment? [yes/no]: ` for an api preset without `--unlisted-budget`. Only `yes` or `no` is accepted, in any case.
+- `Limit total spending to <L> <asset> until the next policy signature? A new signature starts a new allocation. [Y/n]: ` without `--total-budget`. An empty answer, `y`, or `yes` means yes; `n` or `no` means no.
+
+Without a terminal, the total budget is chosen, and a missing XLM amount or a missing api answer refuses with `profile.preset_input_required`. The message names the flag that supplies the answer.
+
+Before any write, `init` writes the spending preview to stderr. It holds `phase = "before_write"`, the `spending_summary` of the body with `authority_status = "draft"`, and the funding `plan`. With `--output json` it is one JSON line; with `--output table` it is one `path: value` line per value. Its `bounds` count only payments the policy allows without approval; a payment that requests approval never counts. The policy file follows, then the profile, then the envelope, whose `data` adds `spending_summary` and `plan`.
+
+The policy file is written without replacing a file. An existing policy file with equal bytes is kept, so a rerun after a failed profile write continues. Other content refuses with `profile.policy_already_exists`, and the profile is not written. Every refusal after the preview carries the preview at `error.details.preview`.
 
 A mainnet profile is written with `classic_max_fee_per_op_stroops = 10000`.
 A testnet profile is written without a cap.
@@ -87,8 +111,18 @@ The flag parser refuses a malformed `--rpc-url`, or one that carries credentials
 2. `validation.mainnet_rpc_url_required` if `--network mainnet` is selected without `--rpc-url`.
 3. `validation.profile_already_exists` if the named profile already exists.
 4. `validation.config_invalid` if the resolved `rpc_url` breaks the endpoint rule: it must use `http` or `https`, and on mainnet `https` with no username or password (see [Loader source order](../profiles.md#loader-source-order)).
+5. `validation.usage_error` if a preset flag or `--output` is given outside `--network mainnet --engine v1`.
+6. `profile.preset_invalid` for an unknown preset, a malformed amount, or an amount flag on a USDC preset. It also covers `--unlisted-budget yes` on a preset other than api, a derived limit of zero, and an answer outside the accepted set.
+7. `profile.preset_input_required` for a missing XLM amount or api answer that no terminal can supply.
+8. `internal.unexpected_state` if the generated policy body does not load.
+9. `profile.spending_preview_unwritable` if the preview cannot be written to stderr.
+10. `profile.policy_already_exists` if the policy file holds other content, and `profile.preset_write_failed` if it cannot be written.
 
-Each exits `1` and writes nothing. A failed write (I/O error, unwritable directory) exits `1` with an internal error.
+Each exits `1`. Refusals 1 to 9 write nothing, and refusal 10 writes no profile. A failed profile write (I/O error, unwritable directory) exits `1` with an internal error, after the policy file is written.
+
+On mainnet, `init` adds a review step after `rotate-attestation-key`. It reads:
+
+``Review the generated policy file `policies/<name>.toml` in the wallet's state directory, with `version = 2` and `scope = "profile:<name>"` (see "Set up mainnet writes" in the getting-started guide).``
 
 ### `profile list`
 
@@ -557,10 +591,27 @@ An existing pin stays in place, including during nonce rotation.
 The ceremony records `mainnet_enablement_minted` through the
 strict audit writer, stores an installation nonce, then atomically rewrites
 the policy with the profile, normalized endpoint host, and nonce digest.
-The operator supplies the fee cap, optional authorization
-TTL, thresholds, and at least one approval credential from
-`approve credential enroll`, then signs the policy as the output's `next`
-list directs.
+A full binding writes `classic_max_fee_per_op_stroops = 10000` into
+`[mainnet]` when the policy states no fee cap, and keeps an authored one.
+The operator reviews that fee cap and supplies the optional authorization
+TTL and thresholds. The operator also adds at least one approval credential
+from `approve credential enroll`, then signs the policy as the output's
+`next` list directs.
+
+Before its first write, the ceremony writes the spending preview to stderr
+as one JSON line. It holds `phase = "before_write"` and the
+`spending_summary` of the rebound policy, with
+`authority_status = "requires_signature"`; the summary is `null` when no
+signed policy was read. It summarizes the body `profile sign-policy` signs
+from the written file, with the sequence signing assigns. A preview that cannot be written refuses with
+`profile.spending_preview_unwritable`, and nothing is written. Every later
+refusal carries the preview at `error.details.preview`, and the result
+repeats the summary as `spending_summary`.
+
+`--check` adds `spending_summary` for the installed signed policy. Its
+`authority_status` is `verified` when the verified load passed and
+`unavailable` otherwise. The summary is `null` when no signed policy was
+read. `--check` and `--state` write no preview.
 
 See [the policy schema and minimum](../profiles.md#mainnet-policy-body) for
 required signed fields and rules. After enablement, complete and sign the
@@ -650,6 +701,7 @@ Exits `1` on refusal:
 - `profile.enable_mainnet_precondition`: a named precondition or effect failed.
 - `profile.enable_mainnet_nonce_exists`: rerun with `--rotate` to replace the nonce.
 - `policy.pin_absent`: the installation holds a nonce but no pin; see the recovery above.
+- `policy.pin_unusable`: the pin cannot be read or is malformed, and nothing is written. Rerun once the keyring is reachable if it was unavailable. No command repairs a malformed pin in this release, since a replacement could lower its recorded sequence; create a profile under a new name.
 - Strict audit errors retain their own codes.
 
 ### Key-rotation subcommands

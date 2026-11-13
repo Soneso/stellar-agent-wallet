@@ -621,10 +621,30 @@ afterward. Mainnet `pay`, `claim` and `accounts create` take no signer flag,
 which signs with the enrolled seed in the keyring, or `--sign-with-ledger`;
 they refuse `--secret-env`.
 
-Write a v2 policy body for the profile, with `version = 2` and without a
-`[mainnet]` table, and sign it with `profile sign-policy`. The enablement
-ceremony refuses a v1 or unsigned policy, because it pins the signed policy
-before it stores the installation nonce.
+`profile init --network mainnet` writes the v2 policy body of a spending
+preset to `policies/<NAME>.toml`, after it previews the bounds on stderr.
+`--preset` picks the preset (default `api-day`), and `--asset` picks USDC
+(default) or XLM. The body has `version = 2` and no `[mainnet]` table.
+Review it before you sign it with `profile sign-policy`:
+
+- Recipients: each payment rule lists G, M, and C recipients in one
+  `allowlist`, which starts empty. Add each recipient's address to the
+  `allowlist` of all four payment rules before signing.
+- Unlisted recipients: with `--unlisted-budget yes`, an api preset pays
+  recipients outside the list from one budget per rolling day, shared by
+  CLI `pay` and the MCP payment tools. A payment beyond it is denied.
+- Caps: every payment rule allows the preset's asset alone, with a
+  per-payment cap, 1d and 1w caps, and rate limits. A chosen
+  `total_budget` bounds all spending until the next policy signature.
+- Floor: `stellar_pay` and `stellar_pay_commit` keep a native balance floor.
+- Approval: shop and business presets request approval for a payment above
+  their threshold.
+
+Use a separate operating account for the agent. Fund it with the plan's
+operating balance in the asset and the recommended XLM balance, both shown in
+the preview. [Mainnet policy body](profiles.md#generated-policy-body) lists
+the presets. The enablement ceremony refuses a v1 or unsigned policy, because
+it pins the signed policy before it stores the installation nonce.
 
 Run `profile bind-signer --profile <NAME> --owner-secret-env <VAR>` with the
 policy owner's seed to bind the enrolled signer to this profile and owner.

@@ -67,7 +67,11 @@ mismatched profile, so the offending field can be read.
 Create a new profile file with `stellar-agent profile init` (name resolves
 `--profile` -> `STELLAR_AGENT_PROFILE` -> `default`; testnet,
 `engine = "v1"`); mainnet requires an explicit `https://` `--rpc-url`.
-See [cli-reference.md](cli-reference.md) for flags.
+On `--network mainnet --engine v1`, `init` also writes the unsigned v2 policy
+body of a spending preset (`--preset`, default `api-day`) to
+`policies/<name>.toml`, after it previews the bounds on stderr. Review that
+body, add recipients to its payment rules, and sign it with
+`profile sign-policy`. See [cli-reference.md](cli-reference.md) for flags.
 
 `init` writes the `audit_log_hash_chain_key_id` coordinate only.
 Run `stellar-agent profile rotate-audit-key <name>` before

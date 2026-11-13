@@ -155,6 +155,13 @@ Then use `provision` for these forms, in order:
 4. `profile rotate-nonce-key` and `profile rotate-attestation-key`.
 5. `providers`, with the complete provider fragment on stdin.
 
+Step 1 runs `profile init` with `--unlisted-budget no`. It writes the policy
+body of the default spending preset, `api-day`, without an unlisted budget.
+To add one later, edit the body and install it with `provision policy-install`,
+then sign it with `provision profile sign-policy`. The
+[generated policy body](profiles.md#generated-policy-body) lists the presets
+and the unlisted table.
+
 For local approval, run `cli-launch approve credential enroll --open-by-operator`.
 Add its exported entry to the complete policy body, then use `provision policy-install`.
 

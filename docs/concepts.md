@@ -175,7 +175,9 @@ through injected views; a missing required view refuses the call.
 A version 2 policy accepts four more restrictions: an `unlisted` table on
 `counterparty_allowlist`, `total_budget`, `balance_floor`, and `memo_binding`.
 A version 1 policy that uses one fails to load. A policy without them keeps
-its canonical bytes and its signature.
+its canonical bytes and its signature. The
+[spending presets](profiles.md#generated-policy-body) that
+`profile init` writes on mainnet use the first three.
 
 The `unlisted` table decides a payment to a well-formed, verified recipient
 outside the criterion's own list:
@@ -232,6 +234,8 @@ The allocation never renews with time. Signing the policy again starts a new
 allocation at zero. An exhausted allocation refuses with
 `policy.deny.total_budget_exhausted`, which names the maximum and the
 remaining amount. The criterion requires `decision = "allow"`.
+An exhausted allocation or unlisted budget denies the payment; neither
+requests an approval.
 A confirmed `smart-account multicall` bundle counts each of its transfers
 against the allocation and against an unlisted budget.
 Under either criterion, a bundle with a call the wallet does not recognize as
