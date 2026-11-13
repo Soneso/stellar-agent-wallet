@@ -2697,6 +2697,7 @@ mod tests {
                 .insert(entry.clone(), timefmt::now_unix_ms().unwrap())
                 .unwrap();
             let outbox = outbox_with_rows(&dir.path().join("audit").join("audit.jsonl"), 0);
+            assert!(!outbox.path().exists(), "{kind}: no outbox before");
             crate::audit_log::outbox::test_seam::arm_oversized(outbox.path());
             let mut grant_persisted = false;
             let err = attest_and_persist(
@@ -2720,8 +2721,8 @@ mod tests {
             assert!(still_pending(&store_path, &nonce), "{kind}: no attestation");
             assert!(!grant_persisted, "{kind}: no grant persisted");
             assert!(
-                std::fs::read(outbox.path()).unwrap().is_empty(),
-                "{kind}: nothing is queued"
+                !outbox.path().exists(),
+                "{kind}: nothing is queued and no outbox is created"
             );
         }
     }

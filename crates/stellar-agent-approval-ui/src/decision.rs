@@ -2110,6 +2110,9 @@ mod tests {
     struct MemAnchor(Mutex<MemAnchorState>);
 
     impl TipAnchorStore for MemAnchor {
+        fn reads_audit_key(&self) -> bool {
+            false
+        }
         fn load_carrier_record(
             &self,
         ) -> Result<

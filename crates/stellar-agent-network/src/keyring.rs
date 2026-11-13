@@ -918,8 +918,13 @@ impl KeyringAuditBindingStore {
 /// headless keyring backend these entries are kept in a file on the same host.
 /// Anyone who can write that file can restore older entries or delete one,
 /// which needs no key material.
+///
+/// The store also keeps the audit-key coordinate it was derived from, never
+/// the key. A keyed queue append can then read the current key again after
+/// a rotation publishes the queue's generation line under a new key.
 #[derive(Debug, Clone)]
 pub struct KeyringTipAnchorStore {
+    audit_key_ref: KeyringEntryRef,
     anchor_ref: KeyringEntryRef,
     counter_ref: KeyringEntryRef,
     outbox_ref: KeyringEntryRef,
@@ -952,6 +957,7 @@ impl KeyringTipAnchorStore {
             carrier_record,
         } = AuditKeyringEntries::for_path_digest(audit_key_ref, path_sha256);
         Self {
+            audit_key_ref: audit_key_ref.clone(),
             anchor_ref: tip_anchor,
             counter_ref: reanchor_counter,
             outbox_ref: outbox_state,
@@ -1000,6 +1006,15 @@ impl KeyringTipAnchorStore {
 }
 
 impl TipAnchorStore for KeyringTipAnchorStore {
+    /// Reads the audit key at the coordinate this store was derived from.
+    ///
+    /// The read writes nothing: an absent key stays absent and is reported
+    /// as `None`.
+    fn reload_audit_key(&self) -> Result<Option<Zeroizing<[u8; 32]>>, TipAnchorStoreError> {
+        read_secret_32(&self.audit_key_ref)
+            .map_err(|e| anchor_store_error("audit key reload failed", &e))
+    }
+
     fn load_outbox_owner_state(
         &self,
         carrier_generation: u64,
@@ -3067,6 +3082,74 @@ mod tests {
         )
         .unwrap();
         assert!(store.store_outbox_owner_state(2, "value").is_err());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn audit_key_reload_uses_the_original_coordinate() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use stellar_agent_core::audit_log::log_path_sha256;
+        let key = audit_ref();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&reads);
+        keyring_mock::install_with_read_hooks(vec![keyring_mock::ReadHook::new(
+            &key.service,
+            &key.account,
+            Arc::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }),
+        )])
+        .unwrap();
+        let path = Path::new("reload.jsonl");
+        let stores = [
+            KeyringTipAnchorStore::new(&key, path),
+            KeyringTipAnchorStore::for_path_digest(&key, &log_path_sha256(path)),
+        ];
+        let mutations = keyring_mock::record_mutations().unwrap();
+        for store in &stores {
+            assert!(store.reload_audit_key().unwrap().is_none());
+        }
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        assert!(
+            mutations.mutations().is_empty(),
+            "a reload mints no key: {:?}",
+            mutations.mutations()
+        );
+        let secret = [0x5a_u8; 32];
+        write_keyring_string(&key, &URL_SAFE_NO_PAD.encode(secret)).unwrap();
+        for (g, store) in stores.iter().enumerate() {
+            let owner = store.owner_entry(g as u64);
+            write_keyring_string(&owner, &URL_SAFE_NO_PAD.encode([0xa5_u8; 32])).unwrap();
+            write_keyring_string(&store.outbox_ref, &URL_SAFE_NO_PAD.encode([0x33_u8; 32]))
+                .unwrap();
+        }
+        let written = mutations.mutations().len();
+        for store in &stores {
+            let reloaded = store.reload_audit_key().unwrap().unwrap();
+            assert_eq!(*reloaded, secret);
+            let debug = format!("{store:?}");
+            assert!(debug.contains(&key.account), "{debug}");
+            assert!(!debug.contains(&URL_SAFE_NO_PAD.encode(secret)), "{debug}");
+            assert!(!debug.contains("90, 90"), "{debug}");
+        }
+        assert_eq!(reads.load(Ordering::SeqCst), 4);
+        assert_eq!(
+            mutations.mutations().len(),
+            written,
+            "a reload writes nothing"
+        );
+        keyring_mock::install().unwrap();
+        keyring_mock::inject_error(
+            &key.service,
+            &key.account,
+            keyring_core::Error::NoStorageAccess(Box::new(std::io::Error::other("unavailable"))),
+        )
+        .unwrap();
+        let error = stores[0].reload_audit_key().unwrap_err();
+        assert!(
+            error.detail.starts_with("audit key reload failed"),
+            "{error:?}"
+        );
     }
 
     #[test]

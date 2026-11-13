@@ -47,26 +47,39 @@
 //!
 //! # Append
 //!
-//! A keyed append writes `{"k":"row","g":G,"s":S,"r":R,"body":B,"tag":"T"}`.
+//! A keyed append writes `{"k":"row","g":G,"s":S,"r":0,"body":B,"tag":"T"}`.
 //! The body is the entry's canonical JSON. The tag is lowercase hex HMAC-SHA256
 //! over `stellar-agent-outbox-row:v2`, big-endian u64 generation and sequence,
 //! one evidence byte, and the exact body bytes, without separators or newline.
-//! In the legacy state, generation and evidence are zero. The sequence is the
-//! one-based line number, including untagged lines, assigned under the outbox lock.
+//! Without a generation line, G is zero and S is the one-based line number,
+//! untagged lines included. With one, G is its generation and S is the row's
+//! position after it. Both are assigned under the outbox lock.
+//!
+//! A keyed append neither reads nor writes a keyring commitment or owner
+//! state. Under the outbox lock it reads an existing file, checks the carrier
+//! generation, authenticates a first generation line and checks the quota.
+//! It then measures and encodes its row. A generation line that does not
+//! verify under the held key triggers one reload of the audit key; the
+//! reloaded key then also tags this row. It writes and syncs its row, syncs
+//! the directory, and checks the carrier generation again. The directory
+//! sync makes the file's name durable before the row is acknowledged, also
+//! after a publication whose own directory sync failed.
+//!
 //! An unkeyed append writes the serialized entry. The v1 commitment covers every
 //! line's bytes in file order, and its stored representation stays v1.
+//! Under the outbox lock it first checks the keyring commitment against the
+//! complete lines as read. A committed line that lost its newline or its tail
+//! therefore refuses the append with the file unchanged. After its row is
+//! written and synced, it stores the new count and chain head.
 //!
-//! Under the outbox lock an append first checks the keyring commitment against
-//! the complete lines as read, so a committed line that lost its newline or
-//! its tail refuses the append with the file unchanged. Only then does it
-//! repair a torn tail. A final segment with no terminating newline is an
-//! append that never returned `Ok`, so the file is truncated back to just
-//! after the last newline and synced. It then appends one line, syncs
-//! it, and stores the new count and chain head. Any write or state error
-//! truncates the file back to its length before the append and returns the
-//! error, so a refused append leaves the file as it found it. If that
-//! truncate-back also fails, a complete line from the refused operator-row
-//! append can remain; the delivery limits below cover it. Truncation is
+//! Every append follows one rule. A refusal before the first write changes
+//! nothing: the checks, the row's measure and its encoding all run first. The
+//! first write creates a missing file or drops a torn tail, a final segment
+//! with no terminating newline. Such a segment is an append that never
+//! returned `Ok`, so the file is truncated back to just after the last
+//! newline and synced. A failure after a write truncates the file back to its
+//! length before the row. A failed truncation is logged as such; a complete
+//! line can then remain, and it is never reported queued. Truncation is
 //! always in place: the writer refuses to open beside a `*.tmp` file in the
 //! audit directory.
 //!
@@ -78,15 +91,68 @@
 //! refuses a row over [`MAX_ROW_BYTES`](super::writer::MAX_ROW_BYTES) with
 //! [`WriterError::OutboxRowTooLarge`]. Neither refusal appends the candidate
 //! row or stores its consent, and every admitted row fits the writer's byte
-//! cap. The append's preparation can still create the file or repair a torn
-//! tail before either refusal.
+//! cap. Both refuse before the first write, so the outbox stays as it was.
 //!
 //! # Drain
 //!
-//! The legacy state accepts tagged and untagged lines in file order. Tagged rows
-//! require exact layout, authentication, canonical body bytes, matching position,
-//! and an operator kind, in that order. Recognition under a zero commitment
-//! decodes lines before the commitment check to identify a delivered batch.
+//! The legacy state holds no owner state. Its queue is the v1-committed
+//! prefix, tagged or untagged, followed by tagged rows of generation zero at
+//! their physical line numbers. Tagged rows require exact layout,
+//! authentication, canonical body bytes, matching position, and an operator
+//! kind, in that order. A queue with only untagged lines drains as described
+//! below; recognition under a zero commitment decodes those lines before the
+//! commitment check to identify a delivered batch.
+//!
+//! The first drain that finds a tagged line cuts over. It validates the
+//! committed prefix and every row, appends every row to the log, and
+//! requires the tip anchor to cover them. It then stores owner state of
+//! queue generation one, whose closed batch commits those rows. Last, it
+//! stores the zero commitment and publishes generation line one. Once owner
+//! state exists, a drain of live generation G validates the generation line
+//! and every row of G, appends them, and requires the anchor. It then stores
+//! owner state G+1 closing G and publishes generation line G+1. An empty
+//! live queue commits nothing. A drain that
+//! finds owner state G+1 beside queue generation G skips the rows the closed
+//! batch commits, delivers any later rows of G, and publishes G+1. Different
+//! content at the closed coordinates refuses with `audit.outbox_rows_missing`.
+//! A nonzero commitment other than the one the owner state recorded at
+//! cutover refuses with `audit.outbox_unusable` before any row is decoded.
+//!
+//! [`check_outbox_commitment`] applies the same owner rules without a key:
+//! a queue generation or row position the owner state does not hold refuses.
+//! Without owner state, a queue that starts with a generation line refuses,
+//! since a cutover stores owner state before it publishes. The legacy loss
+//! report and acknowledgement leave a queue under owner state to the owner
+//! drain and refuse it with `audit.outbox_unusable`.
+//!
+//! # Key change
+//!
+//! `profile rotate-audit-key` fences the drained queue before it persists the
+//! new key. The fence is a generation line whose tag is all zeros, which no
+//! key verifies. A queue without owner state first gets owner state of
+//! generation one, whose closed batch is the empty batch of generation zero.
+//! While the fence stands, every keyed append refuses under any key it holds
+//! or reloads. The rotation then publishes the line under the new key, and an
+//! appender holding the old key reloads the new one. A drain after a crash in
+//! between re-signs the lone fence line under its own key. Every keyed writer
+//! open first compares its key with the stored key under its carriers. A key
+//! that differs refuses with `audit.key_replaced` before any write. A writer
+//! opened with a key that a rotation replaced therefore signs no queue line.
+//! A row is acknowledged only when it verifies under the key of the next
+//! drain.
+//!
+//! # Publication
+//!
+//! Under the outbox lock a drain removes a leftover `<log>.outbox.next`,
+//! writes the new generation line to it, and syncs it. It then checks the
+//! carrier generation, renames it over `<log>.outbox`, and syncs the
+//! directory. A
+//! leftover replacement never counts as queued rows and never blocks a writer
+//! open. The directory sync after replacement makes the rename durable on
+//! Unix. Other platforms provide atomic replacement without this
+//! directory-durability guarantee.
+//!
+//! The legacy drain of untagged lines:
 //!
 //! [`AuditWriter::drain_outbox`](super::writer::AuditWriter::drain_outbox)
 //! takes the outbox lock, reads the file, discards a torn final segment,
@@ -102,10 +168,33 @@
 //!
 //! # Delivery and its limits
 //!
-//! Only committed operator rows drain. A complete line past the committed
-//! prefix refuses every drain and every append with `audit.outbox_rows_missing`
-//! until `audit acknowledge-outbox-loss` discards it: nothing that was not
-//! committed under the outbox lock enters the log through the outbox.
+//! Only committed operator rows and authenticated tagged rows at their
+//! positions drain. In a queue without owner state, any other complete line
+//! past the committed prefix refuses every drain and every unkeyed append
+//! with `audit.outbox_rows_missing` until `audit acknowledge-outbox-loss`
+//! discards it. An actor with the audit
+//! MAC key is inside the trust boundary. Without it, forgery, reordering and
+//! replay fail authentication, position or closed-batch checks. Loss of an
+//! unreferenced tail row is not detected before delivery.
+//!
+//! A file writer can also restore a generation line signed under a replaced
+//! key. A keyed append reloads the key only when the line fails to verify. An
+//! appender that still holds the replaced key therefore queues its row behind
+//! the restored line and is told so. Detection waits for the next drain that
+//! uses the stored key, and more rows can queue until then. Log verification
+//! and the commitment check of `audit verify` do not detect it, since neither
+//! authenticates a queue tag. A drain that uses the stored key refuses the
+//! queue at line 1 with `tagged record whose tag does not verify`. It leaves
+//! the queue unchanged. Every writer open drains first, so a value-moving verb
+//! reports `audit.chain_key_unavailable` with the `audit.outbox_unusable`
+//! detail. `profile rotate-audit-key` reports `internal.unexpected_state`
+//! with the same detail. A writer open that holds the replaced key refuses
+//! with `audit.key_replaced` before it drains, so no drain delivers the row
+//! under that key. The legacy loss acknowledgement refuses the queue with
+//! `queue held by owner state`. A changed retired commitment opens it only
+//! under the stored key, and it then acknowledges only the retired loss. The
+//! active queue and its refusal stay. The row is reported, never delivered
+//! or dropped without a refusal.
 //!
 //! An interrupted append can leave an uncommitted operator row. Approval
 //! consent and resuming a halted profile require the row to commit first, so
@@ -113,12 +202,15 @@
 //! marker takes effect before its audit row is queued, so an uncommitted
 //! `profile_halted` row can record a halt that is in effect.
 //!
-//! Delivery is at least once. A crash between the appends and the reset of
-//! the commitment repeats those rows on the next drain; a repeated row keeps
-//! its `request_id`, which identifies it. A crash between that reset and the
-//! truncation leaves a zero commitment and complete lines whose canonical
-//! bodies equal, in order, those of the active file's last entries; the next
-//! drain recognizes that batch as delivered and truncates the outbox without
+//! Delivery is at least once, for the legacy drain and the owner drain alike.
+//! A retried row repeats with the same `request_id` and, for a tagged row,
+//! the same queue coordinates. In an owner drain, a crash after the appends
+//! and before the owner state is stored repeats those rows on the next drain.
+//! In the legacy drain, a crash between the appends and the reset of the
+//! commitment repeats them. A crash between that reset and the truncation
+//! leaves a zero commitment and complete lines. Their canonical bodies equal,
+//! in order, those of the active file's last entries. The next drain
+//! recognizes that batch as delivered and truncates the outbox without
 //! appending. The keyring commitment detects missing, changed, reordered, or
 //! added queued rows before parsing or appending any of them. An absent
 //! commitment reads as zero. Raw deletion or restore of keyring entries
@@ -134,9 +226,11 @@
 //! digest, and at most 15 requested row digests, oldest first.
 //! Recent evidence includes only rows whose evidence flag is one.
 //! The legacy digest hashes the exact v1 commitment value at cutover.
-//! Batch commitments hash ordered binary row digests. Owner accounts follow
-//! carrier generations, independently of the queue generation inside the value.
-//! Runtime appends and drains use the v1 commitment and create no owner value.
+//! Batch commitments hash ordered binary row digests. A row digest hashes the
+//! row's bytes without its tag and newline. An untagged row of a cutover
+//! prefix hashes as a row of generation zero at its line with evidence zero.
+//! Owner accounts follow carrier generations, independently of the queue
+//! generation inside the value. Only a draining writer writes owner state.
 //!
 //! A generation header is `{"k":"gen","g":G,"tag":"T"}` followed by a newline.
 //! No header means queue generation zero.
@@ -225,7 +319,6 @@ impl OutboxState {
 }
 
 /// Owner evidence for one queue generation.
-#[cfg(any(test, feature = "test-helpers"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboxOwnerState {
     g: u64,
@@ -234,7 +327,6 @@ pub struct OutboxOwnerState {
     recent: Vec<[u8; 32]>,
 }
 
-#[cfg(any(test, feature = "test-helpers"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ClosedBatch {
     g: u64,
@@ -242,7 +334,6 @@ struct ClosedBatch {
     batch: [u8; 32],
 }
 
-#[cfg(any(test, feature = "test-helpers"))]
 impl OutboxOwnerState {
     /// Parses the owner value with bounded evidence and required fields.
     ///
@@ -338,9 +429,13 @@ impl OutboxOwnerState {
     }
 
     fn record_delivery(&mut self, g: u64, rows: &[(u8, [u8; 32])]) {
-        let mut batch = Sha256::new();
-        for (r, digest) in rows {
-            batch.update(digest);
+        self.close(g, rows, 0);
+    }
+
+    /// Closes generation `g` over `rows`, of which the first `delivered`
+    /// already count in the recent evidence.
+    fn close(&mut self, g: u64, rows: &[(u8, [u8; 32])], delivered: usize) {
+        for (r, digest) in rows.get(delivered..).unwrap_or_default() {
             if *r == 1 {
                 self.recent.push(*digest);
             }
@@ -349,9 +444,18 @@ impl OutboxOwnerState {
         self.closed = Some(ClosedBatch {
             g,
             n: rows.len() as u64,
-            batch: batch.finalize().into(),
+            batch: batch_digest(rows),
         });
     }
+}
+
+/// The batch commitment: SHA-256 over the ordered binary row digests.
+fn batch_digest(rows: &[(u8, [u8; 32])]) -> [u8; 32] {
+    let mut batch = Sha256::new();
+    for (_, digest) in rows {
+        batch.update(digest);
+    }
+    batch.finalize().into()
 }
 
 /// Counts describing a missing or changed committed prefix.
@@ -383,6 +487,149 @@ fn committed_prefix<'l, 'b>(lines: &'l [&'b [u8]], state: &OutboxState) -> Optio
         .ok()
         .and_then(|pending| lines.get(..pending))
         .filter(|prefix| OutboxState::over(prefix).head == state.head)
+}
+
+/// How the tagged rows past a legacy commitment are checked.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SuffixCheck<'k> {
+    /// Authenticate every tagged row under the key; without one, a tagged row
+    /// refuses.
+    Keyed(Option<&'k [u8; 32]>),
+    /// Check layout, canonical body, position and kind without a key.
+    Keyless,
+}
+
+/// Validates a legacy queue: the v1 chain over the first `state.pending`
+/// lines first, then every following complete line as a tagged row of
+/// generation zero at its physical line number.
+///
+/// The prefix lines are not decoded here.
+///
+/// # Errors
+///
+/// - [`WriterError::OutboxRowsMissing`] with the committed and found counts
+///   when the prefix is missing or changed. It carries the expected position
+///   and zero for an untagged line past the prefix. It carries the expected
+///   and found positions for a tagged row out of place.
+/// - [`WriterError::OutboxUnusable`] and [`WriterError::OutboxRowKindRefused`]
+///   for a tagged row past the prefix that fails layout, authentication,
+///   canonical form or kind.
+fn validate_legacy_queue(
+    lines: &[&[u8]],
+    state: &OutboxState,
+    check: SuffixCheck<'_>,
+) -> Result<Vec<AuditEntry>, WriterError> {
+    let prefix = committed_prefix(lines, state).ok_or(WriterError::OutboxRowsMissing {
+        recorded: state.pending,
+        found: lines.len() as u64,
+    })?;
+    lines
+        .iter()
+        .enumerate()
+        .skip(prefix.len())
+        .map(|(index, line)| {
+            let number = index + 1;
+            if !is_tagged(line) {
+                return Err(WriterError::OutboxRowsMissing {
+                    recorded: number as u64,
+                    found: 0,
+                });
+            }
+            decode_tagged(line, number, check, 0, number as u64).map(|row| row.entry)
+        })
+        .collect()
+}
+
+/// Validates a queue that no owner state holds.
+///
+/// Only a cutover publishes a generation line, and it stores the owner state
+/// first. A generation line without owner state therefore belongs to no
+/// queue of this log, and refuses.
+///
+/// # Errors
+///
+/// - [`WriterError::OutboxRowsMissing`] for a queue that starts with a
+///   generation line, counting the rows after it as found.
+/// - [`WriterError::OutboxUnusable`] for a first line that is an unusable
+///   generation line.
+/// - The errors of [`validate_legacy_queue`] for any other queue.
+fn validate_unowned_queue(
+    lines: &[&[u8]],
+    state: &OutboxState,
+    check: SuffixCheck<'_>,
+) -> Result<(), WriterError> {
+    match first_generation(lines)? {
+        Some(_) => Err(WriterError::OutboxRowsMissing {
+            recorded: 0,
+            found: lines.len() as u64 - 1,
+        }),
+        None => validate_legacy_queue(lines, state, check).map(drop),
+    }
+}
+
+/// One decoded tagged row with its evidence flag and digest.
+struct DecodedRow {
+    r: u8,
+    digest: [u8; 32],
+    entry: AuditEntry,
+}
+
+/// Decodes the tagged row at physical line `number`, expected at queue
+/// generation `g` and position `s`.
+///
+/// The checks run in this order: exact layout, authentication, canonical
+/// body, position, operator kind.
+fn decode_tagged(
+    line: &[u8],
+    number: usize,
+    check: SuffixCheck<'_>,
+    g: u64,
+    s: u64,
+) -> Result<DecodedRow, WriterError> {
+    if generation_at(line, number)?.is_some() {
+        return Err(tagged_refusal(number, "tagged record that does not parse"));
+    }
+    let row = tagged_layout(line)
+        .ok_or_else(|| tagged_refusal(number, "tagged record that does not parse"))?;
+    match check {
+        SuffixCheck::Keyed(Some(key)) => row_mac(key, row.g, row.s, row.r, row.body)
+            .verify_slice(&row.tag)
+            .map_err(|_| tagged_refusal(number, "tagged record whose tag does not verify"))?,
+        SuffixCheck::Keyed(None) => {
+            return Err(tagged_refusal(number, "tagged record without an audit key"));
+        }
+        SuffixCheck::Keyless => {}
+    }
+    let entry = canonical_entry(row.body, number)?;
+    if row.g != g || row.s != s {
+        return Err(WriterError::OutboxRowsMissing {
+            recorded: s,
+            found: row.s,
+        });
+    }
+    if !is_operator_row(&entry) {
+        return Err(WriterError::OutboxRowKindRefused { line: number });
+    }
+    Ok(DecodedRow {
+        r: row.r,
+        digest: layout_digest(row.g, row.s, row.r, row.body),
+        entry,
+    })
+}
+
+/// Decodes an untagged line at physical line `number` as an operator row.
+fn decode_raw(line: &[u8], number: usize) -> Result<AuditEntry, WriterError> {
+    let entry = serde_json::from_slice::<AuditEntry>(line).map_err(|error| {
+        WriterError::OutboxUnusable {
+            line: number,
+            column: error.column(),
+            reason: parse_failure_class(&error),
+        }
+    })?;
+    if !is_operator_row(&entry) {
+        return Err(WriterError::OutboxRowKindRefused { line: number });
+    }
+    Ok(entry)
 }
 
 /// Whether `entry` is an operator row, the only kinds the outbox carries.
@@ -455,13 +702,18 @@ fn encode_tagged_row(
     Ok(line)
 }
 
-#[cfg(any(test, feature = "test-helpers"))]
+/// The digest of the row `entry` at `(g, s)` with evidence flag `r`: SHA-256
+/// over the row's bytes without its tag and newline.
 fn row_digest(g: u64, s: u64, r: u8, entry: &AuditEntry) -> Result<[u8; 32], serde_json::Error> {
+    Ok(layout_digest(g, s, r, &entry.canonical_json_body()?))
+}
+
+fn layout_digest(g: u64, s: u64, r: u8, body: &[u8]) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(row_prefix(g, s, r));
-    digest.update(entry.canonical_json_body()?);
+    digest.update(body);
     digest.update(b"}");
-    Ok(digest.finalize().into())
+    digest.finalize().into()
 }
 
 fn is_tagged(line: &[u8]) -> bool {
@@ -530,7 +782,6 @@ fn generation_at(line: &[u8], number: usize) -> Result<Option<(u64, [u8; 32])>, 
         .ok_or_else(|| tagged_refusal(number, "tagged record that does not parse"))
 }
 
-#[cfg(any(test, feature = "test-helpers"))]
 #[allow(
     clippy::expect_used,
     reason = "HMAC-SHA256 accepts a key of any length"
@@ -543,11 +794,54 @@ fn generation_mac(key: &[u8; 32], g: u64) -> Hmac<Sha256> {
     mac
 }
 
-#[cfg(any(test, feature = "test-helpers"))]
+fn generation_verifies(key: &[u8; 32], g: u64, tag: &[u8; 32]) -> bool {
+    generation_mac(key, g).verify_slice(tag).is_ok()
+}
+
+/// Reads the audit key the store holds now.
+fn reload_stored_key(
+    store: &dyn TipAnchorStore,
+) -> Result<Option<Zeroizing<[u8; 32]>>, WriterError> {
+    store.reload_audit_key().map_err(|_| {
+        WriterError::TipAnchorStore(TipAnchorStoreError::new("audit key reload failed"))
+    })
+}
+
+/// Whether `held` is the audit key the store holds now, compared in
+/// constant time. An absent stored key matches no held key.
+pub(super) fn is_stored_key(
+    store: &dyn TipAnchorStore,
+    held: &[u8; 32],
+) -> Result<bool, WriterError> {
+    use subtle::ConstantTimeEq as _;
+    Ok(reload_stored_key(store)?
+        .is_some_and(|stored| bool::from(stored.as_slice().ct_eq(held.as_slice()))))
+}
+
+/// The generation header of the first complete line, its layout checked.
+fn first_generation(lines: &[&[u8]]) -> Result<Option<(u64, [u8; 32])>, WriterError> {
+    lines
+        .first()
+        .map_or(Ok(None), |line| generation_at(line, 1))
+}
+
 fn encode_generation_line(key: &[u8; 32], g: u64) -> Vec<u8> {
+    generation_line_with_tag(g, &generation_mac(key, g).finalize().into_bytes())
+}
+
+/// The fence line of generation `g`: a generation line whose tag is all
+/// zeros, which no key verifies.
+///
+/// An appender then refuses under any key it holds or reloads. A drain
+/// re-signs a lone fence line of the owned generation under its own key.
+fn encode_fence_line(g: u64) -> Vec<u8> {
+    generation_line_with_tag(g, &[0; 32])
+}
+
+fn generation_line_with_tag(g: u64, tag: &[u8]) -> Vec<u8> {
     format!(
         "{{\"k\":\"gen\",\"g\":{g},\"tag\":\"{}\"}}\n",
-        crate::hex::encode(&generation_mac(key, g).finalize().into_bytes())
+        crate::hex::encode(tag)
     )
     .into_bytes()
 }
@@ -567,7 +861,6 @@ fn authenticated_generation(lines: &[&[u8]], key: Option<&[u8; 32]>) -> Result<u
     Ok(generation)
 }
 
-#[cfg(any(test, feature = "test-helpers"))]
 fn advance_generation(g: u64) -> Result<u64, WriterError> {
     g.checked_add(1)
         .ok_or_else(|| tagged_refusal(1, "queue generation overflows"))
@@ -604,6 +897,11 @@ fn tagged_layout(line: &[u8]) -> Option<TaggedRow<'_>> {
     })
 }
 
+/// The refusal of the legacy loss path for a queue that owner state holds.
+pub(crate) fn owned_queue_refusal() -> WriterError {
+    tagged_refusal(1, "queue held by owner state")
+}
+
 fn tagged_refusal(number: usize, reason: &'static str) -> WriterError {
     WriterError::OutboxUnusable {
         line: number,
@@ -621,45 +919,27 @@ fn canonical_entry(body: &[u8], number: usize) -> Result<AuditEntry, WriterError
     Ok(entry)
 }
 
+/// Decodes a line of the legacy state: an untagged entry, or a tagged row of
+/// generation zero at its physical line number.
 fn decode_line(
     line: &[u8],
     number: usize,
     key: Option<&[u8; 32]>,
 ) -> Result<AuditEntry, WriterError> {
-    let entry = if is_tagged(line) {
-        let row = tagged_layout(line)
-            .ok_or_else(|| tagged_refusal(number, "tagged record that does not parse"))?;
-        let key =
-            key.ok_or_else(|| tagged_refusal(number, "tagged record without an audit key"))?;
-        row_mac(key, row.g, row.s, row.r, row.body)
-            .verify_slice(&row.tag)
-            .map_err(|_| tagged_refusal(number, "tagged record whose tag does not verify"))?;
-        let entry = canonical_entry(row.body, number)?;
-        if row.g != 0 || row.s != number as u64 {
-            return Err(WriterError::OutboxRowsMissing {
-                recorded: number as u64,
-                found: row.s,
-            });
-        }
-        entry
+    if is_tagged(line) {
+        decode_tagged(line, number, SuffixCheck::Keyed(key), 0, number as u64).map(|row| row.entry)
     } else {
-        serde_json::from_slice::<AuditEntry>(line).map_err(|error| WriterError::OutboxUnusable {
-            line: number,
-            column: error.column(),
-            reason: parse_failure_class(&error),
-        })?
-    };
-    if !is_operator_row(&entry) {
-        return Err(WriterError::OutboxRowKindRefused { line: number });
+        decode_raw(line, number)
     }
-    Ok(entry)
 }
 
-/// Whether `bytes` are exactly the rows `state` commits: complete lines only,
-/// the committed prefix, and nothing past it.
-pub(super) fn holds_exactly_committed(bytes: &[u8], state: &OutboxState) -> bool {
+/// The number of rows in `bytes` when they are a valid legacy queue under
+/// `state` with complete lines only, checked without a key.
+pub(super) fn legacy_rows(bytes: &[u8], state: &OutboxState) -> Option<u64> {
     let parsed = parse_lines(bytes);
-    parsed.torn_bytes == 0 && committed_prefix_loss(&parsed.lines, state).is_none()
+    (parsed.torn_bytes == 0
+        && validate_legacy_queue(&parsed.lines, state, SuffixCheck::Keyless).is_ok())
+    .then_some(parsed.lines.len() as u64)
 }
 
 fn check_committed_prefix(lines: &[&[u8]], state: &OutboxState) -> Result<(), WriterError> {
@@ -693,13 +973,28 @@ fn load_state(store: &dyn TipAnchorStore, generation: u64) -> Result<OutboxState
 ///   be read.
 /// - [`WriterError::Io`] when the outbox cannot be read.
 /// - [`WriterError::OutboxRowsMissing`] for a missing or changed committed
-///   prefix, or a complete line past it.
+///   prefix, an untagged line past it, or a tagged row past it out of place.
+/// - [`WriterError::OutboxUnusable`] and [`WriterError::OutboxRowKindRefused`]
+///   for a tagged row past the prefix that fails layout, canonical form or
+///   kind. Tags are not authenticated here.
+/// - Under owner state, every refusal of the owner drain except
+///   authentication: a changed commitment, and a queue generation or row
+///   position the owner state does not hold. Rows at the closed coordinates
+///   must reproduce the closed batch.
+/// - Without owner state, [`WriterError::OutboxRowsMissing`] for a queue
+///   that starts with a generation line.
 pub fn check_outbox_commitment(
     log_path: &Path,
     store: &dyn TipAnchorStore,
 ) -> Result<(), WriterError> {
     let batch = OutboxBatch::read_locked(log_path, store)?;
-    check_committed_prefix(&parse_lines(&batch.bytes).lines, &batch.state)
+    let lines = parse_lines(&batch.bytes).lines;
+    match batch.owner(store)? {
+        Some(owner) => batch
+            .owner_delivery(&lines, owner, SuffixCheck::Keyless)
+            .map(drop),
+        None => validate_unowned_queue(&lines, &batch.state, SuffixCheck::Keyless),
+    }
 }
 
 /// How long an append or a drain waits for the outbox lock before refusing
@@ -840,11 +1135,35 @@ pub(crate) fn lock_outbox(
     lock_path: &Path,
     store: &dyn TipAnchorStore,
 ) -> Result<BoundCarrierLock, WriterError> {
+    wait_for_outbox(lock_path, || {
+        AuditWriterLock::acquire_bound(lock_path, Carrier::Outbox, store)
+    })
+}
+
+/// [`lock_outbox`] for a keyed queue append: the same wait and identity
+/// check, without the retired watch, which the drain runs.
+///
+/// # Errors
+///
+/// The errors of [`lock_outbox`] except [`WriterError::RetiredOutboxChanged`].
+fn lock_queue(
+    lock_path: &Path,
+    store: &dyn TipAnchorStore,
+) -> Result<BoundCarrierLock, WriterError> {
+    wait_for_outbox(lock_path, || {
+        AuditWriterLock::acquire_queue_bound(lock_path, store)
+    })
+}
+
+fn wait_for_outbox(
+    lock_path: &Path,
+    acquire: impl Fn() -> Result<BoundCarrierLock, WriterError>,
+) -> Result<BoundCarrierLock, WriterError> {
     let wait = outbox_lock_wait();
     let deadline = Instant::now() + wait;
     let mut waiting = false;
     loop {
-        match AuditWriterLock::acquire_bound(lock_path, Carrier::Outbox, store) {
+        match acquire() {
             Err(WriterError::FileLocked) => {
                 if Instant::now() >= deadline {
                     return Err(WriterError::OutboxBusy);
@@ -930,28 +1249,34 @@ impl AuditOutbox {
 
     /// Appends `entry` as one line and syncs it, under the outbox lock.
     ///
-    /// `Ok` means the line is durable and committed. A refusal on the
-    /// commitment leaves the file unchanged; any later error leaves it at the
-    /// length it had before the append, after the torn-tail repair. See the
-    /// module documentation.
+    /// `Ok` means the line is durable, and for an unkeyed outbox committed.
+    /// For a keyed outbox the file's name is durable too. A refusal before the
+    /// first write leaves the outbox unchanged. A later error truncates it back
+    /// to its length before the row, unless that truncation fails as well. See
+    /// the module documentation.
     ///
     /// # Errors
     ///
     /// - [`WriterError::OutboxBusy`] when the outbox lock stays held.
     /// - [`WriterError::CarrierReplaced`], [`WriterError::CarriersUnbound`] or
     ///   [`WriterError::CarrierIdentityUnavailable`] when the outbox lock file
-    ///   is not the recorded one, and [`WriterError::CarrierGenerationChanged`]
-    ///   when a binding started a new generation while the append waited.
-    /// - [`WriterError::RetiredOutboxChanged`] when the retired generation's
-    ///   commitment changed after the binding.
-    /// - [`WriterError::OutboxRowsMissing`] when committed rows are lost or
-    ///   changed, a missing file included, or when a complete line follows
-    ///   them. The file is neither created nor changed.
+    ///   is not the recorded one.
+    /// - [`WriterError::CarrierGenerationChanged`] when a binding started a
+    ///   new generation while the append waited or before its row was synced.
+    ///   The row is then not queued.
+    /// - [`WriterError::RetiredOutboxChanged`], for an unkeyed outbox, when the
+    ///   retired generation's commitment changed after the binding.
+    /// - [`WriterError::OutboxRowsMissing`], for an unkeyed outbox, when
+    ///   committed rows are lost or changed, a missing file included, or when
+    ///   a complete line follows them. The file is neither created nor changed.
+    /// - [`WriterError::OutboxUnusable`], for a keyed outbox, when the first
+    ///   generation line does not parse, has no reloadable key, or does not
+    ///   verify under the held or the reloaded key.
     /// - [`WriterError::OutboxFull`] when the outbox holds [`MAX_OUTBOX_ROWS`]
     ///   rows, and [`WriterError::OutboxRowTooLarge`] when the row exceeds the
     ///   writer's row cap. Neither appends the candidate row.
     /// - [`WriterError::TipAnchorStore`] when the commitment cannot be read or
-    ///   stored.
+    ///   stored, or the audit key cannot be reloaded.
     /// - [`WriterError::Serialise`] when the entry cannot be serialized.
     /// - [`WriterError::Io`] on any read, write, flush, or sync failure.
     pub fn append(&self, entry: &AuditEntry) -> Result<(), WriterError> {
@@ -963,26 +1288,33 @@ impl AuditOutbox {
         if let Some(parent) = self.path.parent() {
             create_private_dir(parent)?;
         }
-        let lock = lock_outbox(&self.lock_path, self.state.as_ref())?;
+        let lock = if self.key.is_some() {
+            lock_queue(&self.lock_path, self.state.as_ref())?
+        } else {
+            lock_outbox(&self.lock_path, self.state.as_ref())?
+        };
         self.prepare_append_locked(lock)
     }
 
     /// Loads the state of one append under an outbox lock already held.
     ///
-    /// The commitment is the one of the generation `lock` was taken under.
+    /// An unkeyed append uses the commitment of the generation `lock` was
+    /// taken under. A keyed append reads no commitment.
     pub(crate) fn prepare_append_locked(
         &self,
         lock: BoundCarrierLock,
     ) -> Result<PreparedOutboxAppend<'_>, WriterError> {
+        if let Some(key) = &self.key {
+            return self.prepare_keyed(lock, key);
+        }
         let state = load_state(self.state.as_ref(), lock.generation())?;
-        let created = !self.path.try_exists()?;
-        if created && state.pending > 0 {
+        let (file, bytes) = open_existing_outbox(&self.path)?;
+        if file.is_none() && state.pending > 0 {
             return Err(WriterError::OutboxRowsMissing {
                 recorded: state.pending,
                 found: 0,
             });
         }
-        let mut file = open_outbox_0600(&self.path)?;
         // Recovery can replace a renamed carrier before this data handle opens.
         // Once the handle is open, a matching generation fixes which file it holds.
         lock.check_generation(self.state.as_ref())?;
@@ -991,7 +1323,6 @@ impl AuditOutbox {
         // file into a loss. A complete line past the commitment refuses too,
         // so the commitment below covers exactly the committed lines and this
         // append's own.
-        let bytes = read_all(&mut file)?;
         let lines = parse_lines(&bytes).lines;
         check_committed_prefix(&lines, &state)?;
         // Admission counts every queued row, delivered or not, and never
@@ -1002,35 +1333,133 @@ impl AuditOutbox {
                 cap: MAX_OUTBOX_ROWS as u64,
             });
         }
-        repair_torn_tail(&file, &self.path, &bytes)?;
         #[cfg(test)]
         test_seam::run_admitted(&self.path);
 
         Ok(PreparedOutboxAppend {
             outbox: self,
-            before: file.metadata()?.len(),
             file,
-            committed: OutboxState::over(&lines),
-            created,
+            extent: Extent::of(&bytes),
+            coordinates: Coordinates::Committed(OutboxState::over(&lines)),
             lock,
         })
     }
+
+    /// Prepares a keyed append under `lock`: reads an existing file, checks
+    /// the carrier generation, authenticates a first generation line, and
+    /// checks the quota. It writes nothing and reads no commitment or owner
+    /// state.
+    fn prepare_keyed(
+        &self,
+        lock: BoundCarrierLock,
+        key: &Zeroizing<[u8; 32]>,
+    ) -> Result<PreparedOutboxAppend<'_>, WriterError> {
+        let (file, bytes) = open_existing_outbox(&self.path)?;
+        lock.check_generation(self.state.as_ref())?;
+        let lines = parse_lines(&bytes).lines;
+        let header = first_generation(&lines)?;
+        let (g, key) = match header {
+            Some((g, tag)) => (g, self.generation_key(key, g, &tag)?),
+            None => (0, key.clone()),
+        };
+        // The generation line takes neither a quota slot nor a position.
+        let rows = lines.len() - usize::from(header.is_some());
+        if rows >= MAX_OUTBOX_ROWS {
+            return Err(WriterError::OutboxFull {
+                queued: rows as u64,
+                cap: MAX_OUTBOX_ROWS as u64,
+            });
+        }
+        #[cfg(test)]
+        test_seam::run_admitted(&self.path);
+
+        Ok(PreparedOutboxAppend {
+            outbox: self,
+            file,
+            extent: Extent::of(&bytes),
+            coordinates: Coordinates::Keyed {
+                key,
+                g,
+                s: rows as u64 + 1,
+            },
+            lock,
+        })
+    }
+
+    /// The key that verifies the generation line of queue generation `g`:
+    /// the held key, or else the key one reload returns.
+    fn generation_key(
+        &self,
+        held: &Zeroizing<[u8; 32]>,
+        g: u64,
+        tag: &[u8; 32],
+    ) -> Result<Zeroizing<[u8; 32]>, WriterError> {
+        if generation_verifies(held, g, tag) {
+            return Ok(held.clone());
+        }
+        let reloaded = reload_stored_key(self.state.as_ref())?
+            .ok_or_else(|| tagged_refusal(1, "tagged record without an audit key"))?;
+        if !generation_verifies(&reloaded, g, tag) {
+            return Err(tagged_refusal(1, "tagged record whose tag does not verify"));
+        }
+        Ok(reloaded)
+    }
 }
 
-/// One append with the outbox lock and commitment state already acquired.
+/// What one prepared append writes and commits.
+enum Coordinates {
+    /// An unkeyed append: the commitment over the lines already queued, to
+    /// which the append adds its line.
+    Committed(OutboxState),
+    /// A keyed append: the key that tags the row and the row's coordinates.
+    Keyed {
+        key: Zeroizing<[u8; 32]>,
+        g: u64,
+        s: u64,
+    },
+}
+
+/// One append with the outbox lock and its state already acquired.
 pub(crate) struct PreparedOutboxAppend<'a> {
     outbox: &'a AuditOutbox,
-    file: File,
-    committed: OutboxState,
-    before: u64,
-    created: bool,
+    /// The open outbox, or `None` when no file exists yet.
+    file: Option<File>,
+    extent: Extent,
+    coordinates: Coordinates,
     /// The outbox lock, held until the append returns; its generation selects
-    /// the commitment the append stores.
+    /// the commitment an unkeyed append stores and is checked again after a
+    /// keyed append's sync.
     lock: BoundCarrierLock,
 }
 
+/// The length of the outbox as preparation read it, and the length up to
+/// and including its last newline.
+#[derive(Clone, Copy)]
+struct Extent {
+    len: u64,
+    complete: u64,
+}
+
+impl Extent {
+    fn of(bytes: &[u8]) -> Self {
+        let complete = bytes
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |index| index + 1);
+        Self {
+            len: bytes.len() as u64,
+            complete: complete as u64,
+        }
+    }
+}
+
 impl PreparedOutboxAppend<'_> {
-    /// Writes one row and commits it while retaining the acquired lock.
+    /// Writes one row while retaining the acquired lock, and commits it for
+    /// an unkeyed outbox.
+    ///
+    /// The row's measure and encoding run before the first write, so their
+    /// refusals leave the outbox as preparation found it. The first write
+    /// creates a missing file or drops a torn tail.
     pub(crate) fn append(mut self, entry: &AuditEntry) -> Result<(), WriterError> {
         #[cfg(test)]
         if test_seam::take_oversized(&self.outbox.path) {
@@ -1041,28 +1470,49 @@ impl PreparedOutboxAppend<'_> {
             });
         }
         refuse_undeliverable_row(entry)?;
-        let mut line = match self.outbox.key.as_deref() {
-            Some(key) => encode_tagged_row(key, 0, self.committed.pending + 1, 0, entry),
-            None => serde_json::to_vec(entry),
+        let mut line = match &self.coordinates {
+            Coordinates::Keyed { key, g, s } => encode_tagged_row(key, *g, *s, 0, entry),
+            Coordinates::Committed(_) => serde_json::to_vec(entry),
         }
         .map_err(WriterError::Serialise)?;
         line.push(b'\n');
-        self.committed.push(&line[..line.len() - 1]);
-        // The append that created the file also makes the creation durable,
-        // so a crash cannot keep the synced line and lose the directory entry.
-        let appended = write_line(&mut self.file, &self.outbox.path, &line).and_then(|()| {
-            if self.created {
-                sync_parent_dir(&self.outbox.path)?;
+        let outbox = self.outbox;
+        let (mut file, created) = match self.file.take() {
+            Some(file) => (file, false),
+            None => {
+                let file = open_outbox_0600(&outbox.path)?;
+                // A handle opened here is checked as preparation checks its own.
+                self.lock.check_generation(outbox.state.as_ref())?;
+                (file, true)
             }
-            self.outbox
-                .state
-                .store_outbox_state(self.lock.generation(), &self.committed)
-                .map_err(WriterError::TipAnchorStore)
+        };
+        repair_torn_tail(&file, &outbox.path, self.extent)?;
+        let keyed = matches!(self.coordinates, Coordinates::Keyed { .. });
+        let appended = write_line(&mut file, &outbox.path, &line).and_then(|()| {
+            // The directory sync makes the file's name durable before the
+            // row is acknowledged. An append that created the file needs it,
+            // and so does a keyed append after a publication whose own
+            // directory sync failed.
+            if created || keyed {
+                sync_parent_dir(&outbox.path)?;
+            }
+            match &mut self.coordinates {
+                Coordinates::Committed(committed) => {
+                    committed.push(&line[..line.len() - 1]);
+                    outbox
+                        .state
+                        .store_outbox_state(self.lock.generation(), committed)
+                        .map_err(WriterError::TipAnchorStore)
+                }
+                // A binding that started a new generation after the first
+                // check moved this file aside: the row is not in the queue.
+                Coordinates::Keyed { .. } => self.lock.check_generation(outbox.state.as_ref()),
+            }
         });
         if let Err(error) = appended {
-            if let Err(rollback) = truncate_in_place(&self.file, self.before) {
+            if let Err(rollback) = roll_back(&file, &outbox.path, self.extent.complete) {
                 tracing::error!(
-                    outbox = %basename(&self.outbox.path),
+                    outbox = %basename(&outbox.path),
                     error = %rollback,
                     "audit outbox: a refused append could not be truncated back; a line \
                      from the refused operator-row append may remain"
@@ -1072,6 +1522,15 @@ impl PreparedOutboxAppend<'_> {
         }
         Ok(())
     }
+}
+
+/// Truncates a refused append's file back to `len`.
+fn roll_back(file: &File, path: &Path, len: u64) -> io::Result<()> {
+    #[cfg(any(test, feature = "test-helpers"))]
+    test_seam::check_sync(path, test_seam::SyncStep::Rollback)?;
+    #[cfg(not(any(test, feature = "test-helpers")))]
+    let _ = path;
+    truncate_in_place(file, len)
 }
 
 /// The most rows one outbox holds.
@@ -1142,36 +1601,57 @@ pub(super) fn sync_parent_dir(path: &Path) -> io::Result<()> {
     test_seam::check_sync(path, test_seam::SyncStep::Directory)?;
     #[cfg(unix)]
     if let Some(parent) = path.parent() {
-        File::open(parent)?.sync_all()?;
+        sync_directory(&File::open(parent)?, path)?;
     }
     #[cfg(not(unix))]
     let _ = path;
     Ok(())
 }
 
-/// Truncates `file`, whose contents are `bytes`, back to just after its last
-/// newline when its final segment has none, and syncs it.
+/// Syncs `dir`, the open directory that holds `path`.
+///
+/// The body is the system call and its test record, so a record of the
+/// step is also a record of the call.
+#[cfg(unix)]
+fn sync_directory(dir: &File, path: &Path) -> io::Result<()> {
+    dir.sync_all()?;
+    #[cfg(any(test, feature = "test-helpers"))]
+    test_seam::record_sync(path, test_seam::SyncStep::Directory);
+    #[cfg(not(any(test, feature = "test-helpers")))]
+    let _ = path;
+    Ok(())
+}
+
+/// Truncates `file`, read as `extent`, back to just after its last newline
+/// when its final segment has none, and syncs it.
 ///
 /// Such a segment is an append that never returned `Ok`, so nothing relied on
 /// it; it is dropped with a `warn`.
-fn repair_torn_tail(file: &File, path: &Path, bytes: &[u8]) -> Result<(), WriterError> {
-    let Some(&last) = bytes.last() else {
-        return Ok(());
-    };
-    if last == b'\n' {
+fn repair_torn_tail(file: &File, path: &Path, extent: Extent) -> Result<(), WriterError> {
+    if extent.len == extent.complete {
         return Ok(());
     }
-    let keep = bytes
-        .iter()
-        .rposition(|&b| b == b'\n')
-        .map_or(0, |idx| idx + 1);
     tracing::warn!(
         outbox = %basename(path),
-        torn_bytes = bytes.len() - keep,
+        torn_bytes = extent.len - extent.complete,
         "audit outbox: dropping a torn final segment left by an append that never completed"
     );
-    truncate_in_place(file, keep as u64)?;
+    truncate_in_place(file, extent.complete)?;
     Ok(())
+}
+
+/// Opens an existing outbox for reading and writing and reads it.
+///
+/// A missing file reads as no bytes and stays missing.
+fn open_existing_outbox(path: &Path) -> Result<(Option<File>, Vec<u8>), WriterError> {
+    match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(mut file) => {
+            let bytes = read_all(&mut file)?;
+            Ok((Some(file), bytes))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok((None, Vec::new())),
+        Err(e) => Err(WriterError::Io(e)),
+    }
 }
 
 /// Writes `line` at the end of the file, flushes, and syncs it.
@@ -1192,12 +1672,31 @@ fn write_line(file: &mut File, path: &Path, line: &[u8]) -> Result<(), WriterErr
     Ok(())
 }
 
+/// Syncs the data of `file`, the outbox or its replacement at `path`.
+///
+/// After the fault seam, the body is the system call and its test record,
+/// so a record of the step is also a record of the call.
 fn sync_outbox_file(file: &File, path: &Path) -> io::Result<()> {
     #[cfg(any(test, feature = "test-helpers"))]
     test_seam::check_sync(path, test_seam::SyncStep::File)?;
+    file.sync_data()?;
+    #[cfg(any(test, feature = "test-helpers"))]
+    test_seam::record_sync(path, test_seam::SyncStep::File);
     #[cfg(not(any(test, feature = "test-helpers")))]
     let _ = path;
-    file.sync_data()?;
+    Ok(())
+}
+
+/// Renames the replacement at `replacement` over the outbox at `outbox`.
+///
+/// After the fault seam, the body is the rename and its test record, so a
+/// test reads the order of the file sync, the rename and the directory sync.
+fn rename_replacement(replacement: &Path, outbox: &Path) -> io::Result<()> {
+    #[cfg(any(test, feature = "test-helpers"))]
+    test_seam::check_sync(replacement, test_seam::SyncStep::Rename)?;
+    fs::rename(replacement, outbox)?;
+    #[cfg(any(test, feature = "test-helpers"))]
+    test_seam::record_sync(replacement, test_seam::SyncStep::Rename);
     Ok(())
 }
 
@@ -1218,6 +1717,9 @@ fn read_all(file: &mut File) -> io::Result<Vec<u8>> {
 enum BatchGuard {
     /// The lock the batch took itself, checked against the carrier record.
     Bound(BoundCarrierLock),
+    /// The bound lock a key-rotation writer retains for its whole life. The
+    /// batch shares it and checks its generation like a bound lock.
+    Retained(Arc<BoundCarrierLock>),
     /// The outbox carrier a recovery writer took at its path. The batch shares
     /// ownership of it, so the carrier stays locked while the batch lives even
     /// when the writer that took it drops first.
@@ -1271,6 +1773,28 @@ impl OutboxBatch {
             store,
             generation,
             BatchGuard::Bound(lock),
+        )
+    }
+
+    /// Reads the commitment and the outbox file under the bound outbox lock
+    /// `held` that a key-rotation writer retains, without acquiring it again.
+    ///
+    /// # Errors
+    ///
+    /// [`WriterError::CarrierGenerationChanged`] and
+    /// [`WriterError::CarriersUnbound`] when the record does not name the
+    /// lock's generation, and the store and I/O errors of
+    /// [`Self::read_locked`].
+    pub(crate) fn read_retained(
+        log_path: &Path,
+        store: &dyn TipAnchorStore,
+        held: &Arc<BoundCarrierLock>,
+    ) -> Result<Self, WriterError> {
+        Self::read_generation(
+            outbox_path(log_path),
+            store,
+            held.generation(),
+            BatchGuard::Retained(Arc::clone(held)),
         )
     }
 
@@ -1342,8 +1866,10 @@ impl OutboxBatch {
         // A binding can retire the generation between the lock and the open;
         // a matching generation after the open fixes which file the handle
         // holds.
-        if let BatchGuard::Bound(lock) = &guard {
-            lock.check_generation(store)?;
+        match &guard {
+            BatchGuard::Bound(lock) => lock.check_generation(store)?,
+            BatchGuard::Retained(lock) => lock.check_generation(store)?,
+            BatchGuard::Recovery { .. } => {}
         }
         let bytes = file.as_mut().map(read_all).transpose()?.unwrap_or_default();
         Ok(Self {
@@ -1362,21 +1888,35 @@ impl OutboxBatch {
         self.generation
     }
 
-    /// The committed lines, each with its newline, after checking that the
-    /// complete lines are exactly the committed prefix.
+    /// The selected lines of a valid legacy queue, each verbatim with its
+    /// newline, and their number.
+    ///
+    /// The lines are the committed prefix and the tagged rows after it, each
+    /// row authenticated under `key`.
     ///
     /// # Errors
     ///
-    /// [`WriterError::OutboxRowsMissing`] when they are not.
-    pub(crate) fn committed_bytes(&self) -> Result<Vec<u8>, WriterError> {
+    /// The errors of the legacy-queue validation: for example
+    /// [`WriterError::OutboxRowsMissing`] when the prefix is missing or an
+    /// untagged line follows it.
+    pub(crate) fn committed_bytes(
+        &self,
+        key: Option<&[u8; 32]>,
+    ) -> Result<(Vec<u8>, u64), WriterError> {
         let lines = parse_lines(&self.bytes).lines;
-        check_committed_prefix(&lines, &self.state)?;
+        validate_legacy_queue(&lines, &self.state, SuffixCheck::Keyed(key))?;
         let mut bytes = Vec::new();
-        for line in lines {
+        for line in &lines {
             bytes.extend_from_slice(line);
             bytes.push(b'\n');
         }
-        Ok(bytes)
+        Ok((bytes, lines.len() as u64))
+    }
+
+    /// The path of the file the batch read.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 
     /// The commitment as the store held it, in its keyring form, or the
@@ -1461,6 +2001,18 @@ impl OutboxBatch {
             .transpose()
     }
 
+    /// Whether owner state holds this batch's generation.
+    ///
+    /// Owner recovery delivers such a queue, so the legacy loss path neither
+    /// reports nor clears it.
+    ///
+    /// # Errors
+    ///
+    /// [`WriterError::TipAnchorStore`] when the owner state cannot be read.
+    pub(crate) fn is_owned(&self, store: &dyn TipAnchorStore) -> Result<bool, WriterError> {
+        Ok(store.load_outbox_owner_state(self.generation)?.is_some())
+    }
+
     /// The number of complete lines.
     pub(crate) fn complete_lines(&self) -> usize {
         parse_lines(&self.bytes).lines.len()
@@ -1472,9 +2024,20 @@ impl OutboxBatch {
     }
 
     /// The loss of committed rows this batch shows, without changing either
-    /// the commitment or the file.
-    pub(crate) fn loss(&self) -> Option<OutboxLoss> {
-        committed_prefix_loss(&parse_lines(&self.bytes).lines, &self.state)
+    /// the commitment or the file. The caller has checked that no owner
+    /// state holds the batch.
+    ///
+    /// A valid legacy queue shows no loss: its committed prefix followed by
+    /// tagged rows authenticated under `key` at their lines. Any other queue
+    /// shows the committed count against the complete lines found.
+    pub(crate) fn loss(&self, key: Option<&[u8; 32]>) -> Option<OutboxLoss> {
+        let lines = parse_lines(&self.bytes).lines;
+        validate_unowned_queue(&lines, &self.state, SuffixCheck::Keyed(key))
+            .err()
+            .map(|_| OutboxLoss {
+                expected_rows: self.state.pending,
+                found_rows: lines.len() as u64,
+            })
     }
 
     /// Parses every complete line, in queue order, as an operator row before the
@@ -1513,6 +2076,436 @@ impl OutboxBatch {
         }
         Ok(())
     }
+
+    /// Decides the owner delivery of this batch, or `None` for a legacy
+    /// queue of untagged lines only, which drains through
+    /// [`Self::checked`].
+    ///
+    /// Without owner state, a queue with any tagged line cuts over. With
+    /// owner state, the stored commitment must be absent, zero, or the one
+    /// the owner state recorded at cutover, before any row is decoded. Then
+    /// the queue generation selects a live drain or the recovery of the
+    /// closed generation. Every row to deliver is validated before the
+    /// caller appends any.
+    ///
+    /// # Errors
+    ///
+    /// - [`WriterError::TipAnchorStore`] when the owner state cannot be read
+    ///   or is unusable.
+    /// - [`WriterError::OutboxUnusable`] for a changed commitment, an unusable
+    ///   generation line or row, and generation overflow.
+    /// - [`WriterError::OutboxRowsMissing`] for a changed committed prefix,
+    ///   an untagged row where only tagged rows are valid, or a row out of
+    ///   place. It also refuses a generation line naming another generation,
+    ///   and content at the closed coordinates that the closed batch does
+    ///   not commit.
+    /// - [`WriterError::OutboxRowKindRefused`] for a row of another kind.
+    pub(crate) fn owner_plan(
+        &self,
+        store: &dyn TipAnchorStore,
+        key: Option<&[u8; 32]>,
+    ) -> Result<Option<OwnerDelivery>, WriterError> {
+        let lines = parse_lines(&self.bytes).lines;
+        match self.owner(store)? {
+            None if lines.iter().any(|line| is_tagged(line)) => self.cutover(&lines, key).map(Some),
+            None => Ok(None),
+            Some(owner) => self
+                .owner_delivery(&lines, owner, SuffixCheck::Keyed(key))
+                .map(Some),
+        }
+    }
+
+    /// The owner state of this batch's generation, if any.
+    fn owner(&self, store: &dyn TipAnchorStore) -> Result<Option<OutboxOwnerState>, WriterError> {
+        Ok(store
+            .load_outbox_owner_state(self.generation)?
+            .map(|raw| OutboxOwnerState::parse(&raw))
+            .transpose()?)
+    }
+
+    /// The cutover of a legacy queue that holds a tagged line.
+    fn cutover(
+        &self,
+        lines: &[&[u8]],
+        key: Option<&[u8; 32]>,
+    ) -> Result<OwnerDelivery, WriterError> {
+        let prefix =
+            committed_prefix(lines, &self.state).ok_or(WriterError::OutboxRowsMissing {
+                recorded: self.state.pending,
+                found: lines.len() as u64,
+            })?;
+        let mut rows = Vec::with_capacity(lines.len());
+        let mut entries = Vec::with_capacity(lines.len());
+        for (index, line) in lines.iter().enumerate() {
+            let number = index + 1;
+            let decoded = if is_tagged(line) {
+                decode_tagged(line, number, SuffixCheck::Keyed(key), 0, number as u64)?
+            } else if index < prefix.len() {
+                let entry = decode_raw(line, number)?;
+                DecodedRow {
+                    r: 0,
+                    digest: row_digest(0, number as u64, 0, &entry)
+                        .map_err(WriterError::Serialise)?,
+                    entry,
+                }
+            } else {
+                return Err(WriterError::OutboxRowsMissing {
+                    recorded: number as u64,
+                    found: 0,
+                });
+            };
+            rows.push((decoded.r, decoded.digest));
+            entries.push(decoded.entry);
+        }
+        let mut owner = OutboxOwnerState::new(
+            advance_generation(0)?,
+            (!self.stored_state.is_empty()).then_some(&self.state),
+        );
+        owner.record_delivery(0, &rows);
+        Ok(OwnerDelivery {
+            publish: Some(owner.g),
+            entries,
+            owner: Some(owner),
+            zero_legacy: true,
+        })
+    }
+
+    /// The delivery of a queue under owner state `owner`.
+    ///
+    /// A keyless `check` applies every rule except authentication, which
+    /// is what the commitment check states.
+    fn owner_delivery(
+        &self,
+        lines: &[&[u8]],
+        mut owner: OutboxOwnerState,
+        check: SuffixCheck<'_>,
+    ) -> Result<OwnerDelivery, WriterError> {
+        let clean = self.stored_state.is_empty() || self.state == OutboxState::default();
+        let zero_legacy =
+            !clean && owner.legacy == Some(Sha256::digest(self.stored_state.as_bytes()).into());
+        if !clean && !zero_legacy {
+            return Err(tagged_refusal(
+                1,
+                "legacy outbox state changed in the owner state",
+            ));
+        }
+        let header = first_generation(lines)?;
+        let rows = &lines[usize::from(header.is_some())..];
+        let offset = usize::from(header.is_some());
+        if let (Some((g, tag)), SuffixCheck::Keyed(key)) = (header, check) {
+            let key = key.ok_or_else(|| tagged_refusal(1, "tagged record without an audit key"))?;
+            if !generation_verifies(key, g, &tag) {
+                // A rotation fences the queue and persists the new key before
+                // it publishes the line under that key. A lone line of the
+                // owned generation is therefore signed again under `key`. The
+                // writer's open compared `key` with the stored key under the
+                // writer carrier, and only a rotation holding that carrier
+                // replaces the stored key, so `key` is the stored key.
+                if g == owner.g && rows.is_empty() && !zero_legacy {
+                    return Ok(OwnerDelivery::publish_only(owner.g));
+                }
+                return Err(tagged_refusal(1, "tagged record whose tag does not verify"));
+            }
+        }
+        let queue = header.map_or(0, |(g, _)| g);
+        if header.is_some() && queue == owner.g {
+            let mut decoded = Vec::with_capacity(rows.len());
+            for (index, line) in rows.iter().enumerate() {
+                decoded.push(owned_row(
+                    line,
+                    offset + index + 1,
+                    check,
+                    queue,
+                    index + 1,
+                )?);
+            }
+            if decoded.is_empty() {
+                return Ok(OwnerDelivery {
+                    entries: Vec::new(),
+                    owner: None,
+                    zero_legacy,
+                    publish: None,
+                });
+            }
+            let next = advance_generation(queue)?;
+            let digests: Vec<_> = decoded.iter().map(|row| (row.r, row.digest)).collect();
+            owner.g = next;
+            owner.record_delivery(queue, &digests);
+            return Ok(OwnerDelivery {
+                entries: decoded.into_iter().map(|row| row.entry).collect(),
+                owner: Some(owner),
+                zero_legacy,
+                publish: Some(next),
+            });
+        }
+        let Some(closed) = owner
+            .closed
+            .clone()
+            .filter(|closed| closed.g == queue && closed.g.checked_add(1) == Some(owner.g))
+        else {
+            return Err(WriterError::OutboxRowsMissing {
+                recorded: 0,
+                found: rows.len() as u64,
+            });
+        };
+        let changed = || WriterError::OutboxRowsMissing {
+            recorded: closed.n,
+            found: rows.len() as u64,
+        };
+        let delivered = usize::try_from(closed.n)
+            .ok()
+            .filter(|n| *n <= rows.len())
+            .ok_or_else(changed)?;
+        let mut digests = Vec::with_capacity(rows.len());
+        for (index, line) in rows[..delivered].iter().enumerate() {
+            let (number, s) = (offset + index + 1, index as u64 + 1);
+            if is_tagged(line) {
+                let row = decode_tagged(line, number, check, queue, s)?;
+                digests.push((row.r, row.digest));
+            } else if header.is_none() {
+                // An untagged row is valid only in a cutover prefix.
+                let entry = decode_raw(line, number)?;
+                digests.push((
+                    0,
+                    row_digest(0, s, 0, &entry).map_err(WriterError::Serialise)?,
+                ));
+            } else {
+                return Err(WriterError::OutboxRowsMissing {
+                    recorded: s,
+                    found: 0,
+                });
+            }
+        }
+        if batch_digest(&digests) != closed.batch {
+            return Err(changed());
+        }
+        let mut entries = Vec::with_capacity(rows.len() - delivered);
+        for (index, line) in rows.iter().enumerate().skip(delivered) {
+            let row = owned_row(line, offset + index + 1, check, queue, index + 1)?;
+            digests.push((row.r, row.digest));
+            entries.push(row.entry);
+        }
+        if entries.is_empty() {
+            return Ok(OwnerDelivery {
+                zero_legacy,
+                ..OwnerDelivery::publish_only(owner.g)
+            });
+        }
+        owner.close(queue, &digests, delivered);
+        Ok(OwnerDelivery {
+            entries,
+            publish: Some(owner.g),
+            owner: Some(owner),
+            zero_legacy,
+        })
+    }
+
+    /// The generation line a key change publishes in place of a queue that
+    /// holds no row.
+    ///
+    /// An owned queue qualifies when it holds only the generation line of
+    /// the owned generation. A queue without owner state qualifies when it
+    /// holds no line under an absent or zero commitment. The target then
+    /// carries new owner state of generation one, which the caller stores
+    /// before it publishes. Its closed batch is the empty batch of generation
+    /// zero, so a drain delivers a row queued before the line is published.
+    /// Any other queue has no target.
+    ///
+    /// # Errors
+    ///
+    /// [`WriterError::TipAnchorStore`] when the owner state cannot be read or
+    /// is unusable, and [`WriterError::OutboxUnusable`] for a first line
+    /// that is an unusable generation line.
+    pub(crate) fn key_change_target(
+        &self,
+        store: &dyn TipAnchorStore,
+    ) -> Result<Option<KeyChangeTarget>, WriterError> {
+        let lines = parse_lines(&self.bytes).lines;
+        match self.owner(store)? {
+            Some(owner) => Ok(match first_generation(&lines)? {
+                Some((g, _)) if g == owner.g && lines.len() == 1 => Some(KeyChangeTarget {
+                    owner: None,
+                    generation: g,
+                }),
+                _ => None,
+            }),
+            None if lines.is_empty() && self.state == OutboxState::default() => {
+                let mut owner = OutboxOwnerState::new(
+                    advance_generation(0)?,
+                    (!self.stored_state.is_empty()).then_some(&self.state),
+                );
+                owner.record_delivery(0, &[]);
+                Ok(Some(KeyChangeTarget {
+                    generation: owner.g,
+                    owner: Some(owner),
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Publishes the fence line of generation `g` in place of the queue, as
+    /// [`Self::publish`] publishes a generation line.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::publish`].
+    pub(crate) fn publish_fence(
+        self,
+        g: u64,
+        store: &dyn TipAnchorStore,
+    ) -> Result<(), WriterError> {
+        self.publish_line(&encode_fence_line(g), store)
+    }
+
+    /// Publishes generation line `g` under `key` in place of the queue.
+    ///
+    /// Removes a leftover replacement, then writes and syncs a new one in the
+    /// audit directory. Checks that the carrier record still names the
+    /// batch's generation, renames the replacement over the outbox, and syncs
+    /// the directory. The rename never runs through a stale generation.
+    ///
+    /// # Errors
+    ///
+    /// - [`WriterError::CarriersUnbound`] when the record is gone, and
+    ///   [`WriterError::CarrierGenerationChanged`] when it names another
+    ///   generation. The queue is unchanged.
+    /// - [`WriterError::TipAnchorStore`] when the record cannot be read.
+    /// - [`WriterError::Io`] when a file operation or sync fails.
+    pub(crate) fn publish(
+        self,
+        key: &[u8; 32],
+        g: u64,
+        store: &dyn TipAnchorStore,
+    ) -> Result<(), WriterError> {
+        self.publish_line(&encode_generation_line(key, g), store)
+    }
+
+    fn publish_line(mut self, line: &[u8], store: &dyn TipAnchorStore) -> Result<(), WriterError> {
+        let replacement = replacement_path(&self.path);
+        #[cfg(any(test, feature = "test-helpers"))]
+        test_seam::check_sync(&replacement, test_seam::SyncStep::Remove)?;
+        match fs::remove_file(&replacement) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(WriterError::Io(e)),
+        }
+        #[cfg(any(test, feature = "test-helpers"))]
+        test_seam::check_sync(&replacement, test_seam::SyncStep::Create)?;
+        let mut file = create_replacement_0600(&replacement)?;
+        write_line(&mut file, &replacement, line)?;
+        drop(file);
+        #[cfg(any(test, feature = "test-helpers"))]
+        test_seam::check_stop(&self.path, test_seam::Stop::ReplacementSynced)?;
+        match &self._guard {
+            BatchGuard::Bound(lock) => lock.check_generation(store)?,
+            BatchGuard::Retained(lock) => lock.check_generation(store)?,
+            BatchGuard::Recovery { .. } => {
+                let current = store
+                    .load_carrier_record()?
+                    .ok_or(WriterError::CarriersUnbound)?
+                    .generation;
+                if current != self.generation {
+                    return Err(WriterError::CarrierGenerationChanged {
+                        held: self.generation,
+                        current,
+                    });
+                }
+            }
+        }
+        drop(self.file.take());
+        rename_replacement(&replacement, &self.path)?;
+        #[cfg(any(test, feature = "test-helpers"))]
+        test_seam::check_stop(&self.path, test_seam::Stop::Renamed)?;
+        sync_parent_dir(&replacement)?;
+        #[cfg(any(test, feature = "test-helpers"))]
+        test_seam::check_stop(&self.path, test_seam::Stop::DirectorySynced)?;
+        Ok(())
+    }
+}
+
+/// Decodes a row of owned queue generation `g` at position `s`, physical
+/// line `number`: only a tagged row is valid there.
+fn owned_row(
+    line: &[u8],
+    number: usize,
+    check: SuffixCheck<'_>,
+    g: u64,
+    s: usize,
+) -> Result<DecodedRow, WriterError> {
+    if !is_tagged(line) {
+        return Err(WriterError::OutboxRowsMissing {
+            recorded: s as u64,
+            found: 0,
+        });
+    }
+    decode_tagged(line, number, check, g, s as u64)
+}
+
+/// What one owner drain delivers and commits.
+///
+/// In order: the entries appended to the log, the owner state stored after
+/// the anchor covers them, the zero commitment, and the published
+/// generation line.
+pub(crate) struct OwnerDelivery {
+    /// The rows to append, in queue order.
+    pub(crate) entries: Vec<AuditEntry>,
+    /// The owner state to store, or `None` when it stays unchanged.
+    owner: Option<OutboxOwnerState>,
+    /// Whether the commitment the owner state recorded at cutover is zeroed.
+    pub(crate) zero_legacy: bool,
+    /// The generation line to publish, or `None` when the queue stays.
+    pub(crate) publish: Option<u64>,
+}
+
+impl OwnerDelivery {
+    fn publish_only(g: u64) -> Self {
+        Self {
+            entries: Vec::new(),
+            owner: None,
+            zero_legacy: false,
+            publish: Some(g),
+        }
+    }
+
+    /// The owner value to store, in its keyring form.
+    pub(crate) fn owner_value(&self) -> Option<String> {
+        self.owner.as_ref().map(OutboxOwnerState::to_keyring_value)
+    }
+}
+
+/// What a key change publishes: the generation of its line, and the owner
+/// state to store first when the queue has none.
+pub(crate) struct KeyChangeTarget {
+    owner: Option<OutboxOwnerState>,
+    /// The generation of the line to publish.
+    pub(crate) generation: u64,
+}
+
+impl KeyChangeTarget {
+    /// The owner state to store before the publication, in its keyring form.
+    pub(crate) fn owner_value(&self) -> Option<String> {
+        self.owner.as_ref().map(OutboxOwnerState::to_keyring_value)
+    }
+}
+
+/// Returns `<outbox>.next`, the replacement a publication writes.
+fn replacement_path(outbox: &Path) -> PathBuf {
+    let mut name = outbox.as_os_str().to_os_string();
+    name.push(".next");
+    PathBuf::from(name)
+}
+
+/// Creates the replacement at `path`, truncated, with mode `0600` on Unix.
+fn create_replacement_0600(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)
 }
 
 /// The class of a parse failure, from a closed set that carries none of the
@@ -1661,6 +2654,27 @@ pub mod test_seam {
         super::encode_generation_line(key, g)
     }
 
+    /// Encodes the key-change fence line of generation `g`, including its
+    /// newline.
+    pub fn fence_line(g: u64) -> Vec<u8> {
+        super::encode_fence_line(g)
+    }
+
+    /// Encodes `entry` as a tagged row at queue coordinates `(g, s)` with
+    /// evidence flag `r`, tagged under `key`, without its newline.
+    ///
+    /// # Errors
+    /// Returns an error when the entry cannot be serialized.
+    pub fn tagged_row(
+        key: &[u8; 32],
+        g: u64,
+        s: u64,
+        r: u8,
+        entry: &crate::audit_log::AuditEntry,
+    ) -> Result<Vec<u8>, serde_json::Error> {
+        super::encode_tagged_row(key, g, s, r, entry)
+    }
+
     /// Authenticates generation headers in complete lines without newlines.
     ///
     /// # Errors
@@ -1682,21 +2696,80 @@ pub mod test_seam {
 
     static PARTIAL_WRITES: Mutex<Vec<(PathBuf, usize)>> = Mutex::new(Vec::new());
 
-    /// The durability operation whose next call refuses.
+    /// The file operation whose next call refuses.
+    ///
+    /// Append faults are keyed by the outbox path, and the faults of a
+    /// publication by its replacement path, `<log>.outbox.next`.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum SyncStep {
-        /// The appended file's data sync.
+        /// The written file's data sync.
         File,
-        /// The creating append's parent directory sync.
+        /// The parent directory sync after a creation or a rename.
         Directory,
+        /// The truncation that rolls a refused append back.
+        Rollback,
+        /// The removal of a leftover replacement.
+        Remove,
+        /// The creation of the replacement.
+        Create,
+        /// The rename of the replacement over the outbox.
+        Rename,
+    }
+
+    /// A point of the drain protocol at which a drain stops with an error,
+    /// as a crash there would.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Stop {
+        /// Before the first append of a delivery.
+        BeforeAppends,
+        /// After the given number of appends, counted from one.
+        AfterAppend(usize),
+        /// After the anchor check that follows the appends.
+        AnchorChecked,
+        /// After the owner state is stored.
+        OwnerStored,
+        /// After the zero commitment is stored.
+        LegacyZeroed,
+        /// After the replacement is written and synced.
+        ReplacementSynced,
+        /// After the replacement is renamed over the outbox.
+        Renamed,
+        /// After the directory sync that ends a publication.
+        DirectorySynced,
+    }
+
+    static STOPS: Mutex<Vec<(PathBuf, Stop)>> = Mutex::new(Vec::new());
+
+    /// Stops the next drain of the outbox at `outbox_path` at `stop`,
+    /// consuming this arm.
+    pub fn arm_stop(outbox_path: &Path, stop: Stop) {
+        if let Ok(mut armed) = STOPS.lock() {
+            armed.retain(|(path, _)| path != outbox_path);
+            armed.push((outbox_path.to_path_buf(), stop));
+        }
+    }
+
+    pub(crate) fn check_stop(outbox_path: &Path, stop: Stop) -> std::io::Result<()> {
+        let hit = STOPS.lock().is_ok_and(|mut armed| {
+            armed
+                .iter()
+                .position(|(p, s)| p == outbox_path && *s == stop)
+                .map(|index| armed.swap_remove(index))
+                .is_some()
+        });
+        if hit {
+            return Err(std::io::Error::other("test stop: outbox drain protocol"));
+        }
+        Ok(())
     }
 
     static SYNC_FAILURES: Mutex<Vec<(PathBuf, SyncStep)>> = Mutex::new(Vec::new());
 
     /// Fails the next matching sync for `outbox_path`, consuming this arm.
+    /// Arms for other steps of the same path stay.
     pub fn arm_sync_failure(outbox_path: &Path, step: SyncStep) {
         if let Ok(mut armed) = SYNC_FAILURES.lock() {
-            armed.retain(|(path, _)| path != outbox_path);
+            armed.retain(|(path, armed_step)| path != outbox_path || *armed_step != step);
             armed.push((outbox_path.to_path_buf(), step));
         }
     }
@@ -1713,6 +2786,44 @@ pub mod test_seam {
             return Err(std::io::Error::other("test fault: outbox sync"));
         }
         Ok(())
+    }
+
+    static RECORDED_SYNCS: Mutex<Vec<(PathBuf, Vec<SyncStep>)>> = Mutex::new(Vec::new());
+
+    /// Starts recording the file syncs, renames and directory syncs that
+    /// complete for `path`, discarding an earlier recording for it.
+    pub fn record_syncs(path: &Path) {
+        if let Ok(mut recorded) = RECORDED_SYNCS.lock() {
+            recorded.retain(|(recorded_path, _)| recorded_path != path);
+            recorded.push((path.to_path_buf(), Vec::new()));
+        }
+    }
+
+    /// Stops recording for `path` and returns its completed syncs in order.
+    pub fn take_syncs(path: &Path) -> Vec<SyncStep> {
+        RECORDED_SYNCS.lock().map_or_else(
+            |_| Vec::new(),
+            |mut recorded| {
+                recorded
+                    .iter()
+                    .position(|(recorded_path, _)| recorded_path == path)
+                    .map(|index| recorded.swap_remove(index).1)
+                    .unwrap_or_default()
+            },
+        )
+    }
+
+    /// Notes a step of `path` that returned `Ok`. Only the helper that makes
+    /// the step's system call calls this, after that call, so a removed call
+    /// site leaves no record.
+    pub(super) fn record_sync(path: &Path, step: SyncStep) {
+        if let Ok(mut recorded) = RECORDED_SYNCS.lock()
+            && let Some((_, steps)) = recorded
+                .iter_mut()
+                .find(|(recorded_path, _)| recorded_path == path)
+        {
+            steps.push(step);
+        }
     }
 
     /// Arms the seam for `outbox_path`: the next append to that outbox writes
@@ -2453,9 +3564,10 @@ mod tests {
         assert_eq!(&ids[ids.len() - 4..], ["local", "remote", "halt", "resume"]);
         outbox.append(&own_row("refused")).unwrap();
         let before = fs::read(&path).unwrap();
+        // The refused row is physical line 2, after the generation line.
         assert!(matches!(
             writer.drain_outbox(),
-            Err(WriterError::OutboxRowKindRefused { line: 1 })
+            Err(WriterError::OutboxRowKindRefused { line: 2 })
         ));
         assert_eq!(fs::read(&path).unwrap(), before);
     }
@@ -2527,8 +3639,18 @@ mod tests {
         }
         assert_eq!(writer.drain_outbox().unwrap(), 3);
         keyed_outbox(&path, &store).append(&row("reset")).unwrap();
-        let record: serde_json::Value = serde_json::from_slice(&outbox_bytes(&path)).unwrap();
-        assert_eq!(record["s"], 1);
+        let bytes = outbox_bytes(&path);
+        let lines = parse_lines(&bytes).lines;
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            test_seam::queue_generation(&lines[..1], Some(&ROW_KEY)).unwrap(),
+            1
+        );
+        let record: serde_json::Value = serde_json::from_slice(lines[1]).unwrap();
+        assert_eq!(
+            (record["g"].as_u64(), record["s"].as_u64()),
+            (Some(1), Some(1))
+        );
         assert_eq!(writer.drain_outbox().unwrap(), 1);
     }
 
@@ -2542,20 +3664,25 @@ mod tests {
             }
             let before = outbox_bytes(&path);
             let state = store.load_outbox_state(1).unwrap();
+            if fault == 3 {
+                // A keyed append touches neither the commitment nor the owner
+                // state, so forbidding both item APIs leaves it admitted.
+                store.forbid_outbox_items(true);
+                outbox.append(&row("accepted")).unwrap();
+                store.forbid_outbox_items(false);
+                let bytes = outbox_bytes(&path);
+                assert_eq!(&bytes[..before.len()], before.as_slice());
+                assert_eq!(parse_lines(&bytes).lines.len(), 2);
+                assert_eq!(store.load_outbox_state(1).unwrap(), state);
+                continue;
+            }
             match fault {
                 0 => test_seam::arm_partial_write(outbox.path(), 17),
                 1 => test_seam::arm_sync_failure(outbox.path(), test_seam::SyncStep::File),
-                2 => test_seam::arm_sync_failure(outbox.path(), test_seam::SyncStep::Directory),
-                _ => store.set_outbox_failing(false, true),
+                _ => test_seam::arm_sync_failure(outbox.path(), test_seam::SyncStep::Directory),
             }
             let error = outbox.append(&row("refused")).unwrap_err();
-            assert!(
-                matches!(
-                    (&error, fault),
-                    (WriterError::Io(_), 0..=2) | (WriterError::TipAnchorStore(_), 3)
-                ),
-                "{error:?}"
-            );
+            assert!(matches!(error, WriterError::Io(_)), "{error:?}");
             assert_eq!(outbox_bytes(&path), before, "fault {fault} preserves bytes");
             assert_eq!(
                 store.load_outbox_state(1).unwrap(),
@@ -2565,6 +3692,77 @@ mod tests {
             store.set_outbox_failing(false, false);
             outbox.append(&row("accepted")).unwrap();
         }
+    }
+
+    /// An oversized row refuses before the first write: a torn tail stays,
+    /// and a missing outbox stays missing, keyed and unkeyed.
+    #[test]
+    fn an_oversized_append_refuses_before_any_write() {
+        let over = consent_row_of_len("large", super::super::writer::MAX_ROW_BYTES + 1);
+        for keyed in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let path = log_path(&dir);
+            let store = bound_store(&path);
+            let outbox = if keyed {
+                keyed_outbox(&path, &store)
+            } else {
+                AuditOutbox::for_log(&path, store.clone())
+            };
+            let refuses = |outbox: &AuditOutbox| {
+                assert!(
+                    matches!(
+                        outbox.append(&over),
+                        Err(WriterError::OutboxRowTooLarge { .. })
+                    ),
+                    "keyed {keyed}"
+                );
+            };
+            refuses(&outbox);
+            assert!(
+                !outbox_path(&path).exists(),
+                "keyed {keyed}: nothing created"
+            );
+            outbox.append(&row("kept")).unwrap();
+            let mut torn = outbox_bytes(&path);
+            torn.extend_from_slice(b"{\"ts\":\"2026-");
+            fs::write(outbox_path(&path), &torn).unwrap();
+            let state = store.load_outbox_state(1).unwrap();
+            refuses(&outbox);
+            assert_eq!(outbox_bytes(&path), torn, "keyed {keyed}: torn tail kept");
+            assert_eq!(store.load_outbox_state(1).unwrap(), state, "keyed {keyed}");
+        }
+    }
+
+    /// A keyed append syncs the directory before it acknowledges the row,
+    /// also when the file exists. After a publication whose directory sync
+    /// failed, the outbox's name may not be durable yet.
+    #[test]
+    fn a_keyed_append_after_an_unsynced_publication_syncs_the_directory() {
+        let (_dir, path, store, mut writer) = keyed_fixture();
+        enqueue(&path, &store, &["delivered"]);
+        test_seam::arm_sync_failure(
+            &replacement_path(&outbox_path(&path)),
+            test_seam::SyncStep::Directory,
+        );
+        assert!(matches!(writer.drain_outbox(), Err(WriterError::Io(_))));
+        assert_eq!(outbox_bytes(&path), header(1));
+        let outbox = keyed_outbox(&path, &store);
+        test_seam::arm_sync_failure(outbox.path(), test_seam::SyncStep::Directory);
+        let refused = outbox.append(&row("refused-until-synced"));
+        assert!(matches!(refused, Err(WriterError::Io(_))), "{refused:?}");
+        assert_eq!(outbox_bytes(&path), header(1));
+        test_seam::record_syncs(outbox.path());
+        outbox.append(&row("accepted")).unwrap();
+        let expected: &[test_seam::SyncStep] = if cfg!(unix) {
+            &[test_seam::SyncStep::File, test_seam::SyncStep::Directory]
+        } else {
+            &[test_seam::SyncStep::File]
+        };
+        assert_eq!(test_seam::take_syncs(outbox.path()), expected);
+        drop(writer);
+        let _writer = reopen(&path, &store);
+        assert_eq!(delivered(&path, "accepted"), 1);
+        assert_eq!(delivered(&path, "refused-until-synced"), 0);
     }
 
     #[test]
@@ -2599,13 +3797,30 @@ mod tests {
         let raw = AuditOutbox::for_log(&path, store.clone());
         let keyed = keyed_outbox(&path, &store);
         let mut expected = Vec::new();
-        for (index, sink) in [&raw, &keyed, &raw].into_iter().enumerate() {
-            let mut entry = fixed_row();
-            entry.request_id = format!("queued-{index}");
-            entry.ts = format!("2026-01-01T00:00:0{index}.000Z");
-            sink.append(&entry).unwrap();
-            expected.push(entry.canonical_json_body().unwrap());
-        }
+        let entries: Vec<_> = (0..3)
+            .map(|index| {
+                let mut entry = fixed_row();
+                entry.request_id = format!("queued-{index}");
+                entry.ts = format!("2026-01-01T00:00:0{index}.000Z");
+                expected.push(entry.canonical_json_body().unwrap());
+                entry
+            })
+            .collect();
+        raw.append(&entries[0]).unwrap();
+        keyed.append(&entries[1]).unwrap();
+        // The keyed row is past the commitment, so the unkeyed exact check
+        // refuses the next raw append and leaves the bytes.
+        let uncommitted = outbox_bytes(&path);
+        assert!(matches!(
+            raw.append(&entries[2]),
+            Err(WriterError::OutboxRowsMissing {
+                recorded: 1,
+                found: 2
+            })
+        ));
+        assert_eq!(outbox_bytes(&path), uncommitted);
+        commit_every_line(&path, &store);
+        raw.append(&entries[2]).unwrap();
         assert_eq!(writer.drain_outbox().unwrap(), 3);
         let rows = log_rows(&path);
         let actual: Vec<_> = rows[rows.len() - 3..]
@@ -2626,13 +3841,21 @@ mod tests {
         let outbox = keyed_outbox(&path, &store);
         outbox.append(&row("one")).unwrap();
         outbox.append(&row("two")).unwrap();
-        writer.set_skip_outbox_truncate(true);
-        assert_eq!(writer.drain_outbox().unwrap(), 2);
+        test_seam::arm_stop(&outbox_path(&path), test_seam::Stop::LegacyZeroed);
+        assert!(matches!(writer.drain_outbox(), Err(WriterError::Io(_))));
         assert_eq!(
             store.load_outbox_state(1).unwrap(),
             Some(OutboxState::default())
         );
-        assert!(!outbox_bytes(&path).is_empty());
+        let owner =
+            OutboxOwnerState::parse(&store.load_outbox_owner_state(1).unwrap().unwrap()).unwrap();
+        assert_eq!(owner.g, 1);
+        assert_eq!(
+            owner.closed.map(|closed| (closed.g, closed.n)),
+            Some((0, 2))
+        );
+        let queued = outbox_bytes(&path);
+        assert_eq!(parse_lines(&queued).lines.len(), 2);
         let before = fs::read(&path).unwrap();
         drop(writer);
         let mut writer = AuditWriter::open(
@@ -2641,8 +3864,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(writer.drain_outbox().unwrap(), 0);
-        assert_eq!(fs::read(&path).unwrap(), before);
-        assert!(outbox_bytes(&path).is_empty());
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "no row is delivered twice"
+        );
+        assert_eq!(outbox_bytes(&path), test_seam::generation_line(&ROW_KEY, 1));
     }
 
     #[test]
@@ -4140,5 +5367,1855 @@ mod tests {
         drop(checked);
         let mut repair = AuditWriter::open_for_reanchor(path.clone(), None, store.clone()).unwrap();
         refuses(&mut repair);
+    }
+
+    /// A queue under owner state belongs to the owner drain. In the cutover
+    /// window, the legacy report refuses, and the acknowledgement open
+    /// refuses with nothing written. The owner drain then delivers the queued
+    /// suffix.
+    #[test]
+    fn a_loss_acknowledgement_refuses_a_queue_under_owner_state() {
+        let (_dir, path, store, mut writer) = keyed_fixture();
+        AuditOutbox::for_log(&path, store.clone())
+            .append(&row("raw"))
+            .unwrap();
+        enqueue(&path, &store, &["cutover-tagged"]);
+        test_seam::arm_sync_failure(
+            &replacement_path(&outbox_path(&path)),
+            test_seam::SyncStep::Rename,
+        );
+        assert!(matches!(writer.drain_outbox(), Err(WriterError::Io(_))));
+        assert_eq!(owner_summary(&store), (1, Some((0, 2))));
+        enqueue(&path, &store, &["accepted-in-window"]);
+        let owned = || owned_queue_refusal().to_string();
+        assert_eq!(writer.outbox_loss().unwrap_err().to_string(), owned());
+        drop(writer);
+        let outbox = outbox_bytes(&path);
+        let log = fs::read(&path).unwrap();
+        let state = store.load_outbox_state(1).unwrap();
+        let owner = store.load_outbox_owner_state(1).unwrap();
+        let refused = AuditWriter::open_for_outbox_acknowledgement(
+            path.clone(),
+            Some(Zeroizing::new(ROW_KEY)),
+            store.clone(),
+            crate::audit_log::BindingHistory::NotRecorded,
+        )
+        .map(drop)
+        .unwrap_err();
+        assert_eq!(refused.to_string(), owned());
+        assert_eq!(fs::read(&path).unwrap(), log, "no acknowledgement row");
+        assert_eq!(outbox_bytes(&path), outbox);
+        assert_eq!(store.load_outbox_state(1).unwrap(), state);
+        assert_eq!(store.load_outbox_owner_state(1).unwrap(), owner);
+        let _writer = reopen(&path, &store);
+        for id in ["raw", "cutover-tagged", "accepted-in-window"] {
+            assert_eq!(delivered(&path, id), 1, "{id} delivered once");
+        }
+        assert_eq!(outbox_bytes(&path), header(1));
+    }
+
+    // Owner delivery, publication and the keyed queue path.
+
+    fn header(g: u64) -> Vec<u8> {
+        test_seam::generation_line(&ROW_KEY, g)
+    }
+
+    fn owner_state(store: &InMemoryTipAnchorStore) -> Option<OutboxOwnerState> {
+        store
+            .load_outbox_owner_state(1)
+            .unwrap()
+            .map(|raw| OutboxOwnerState::parse(&raw).unwrap())
+    }
+
+    /// The owner's generation and its closed batch's generation and count.
+    fn owner_summary(store: &InMemoryTipAnchorStore) -> (u64, Option<(u64, u64)>) {
+        let owner = owner_state(store).unwrap();
+        (owner.g, owner.closed.map(|closed| (closed.g, closed.n)))
+    }
+
+    fn enqueue(path: &Path, store: &Arc<InMemoryTipAnchorStore>, ids: &[&str]) {
+        let outbox = keyed_outbox(path, store);
+        for id in ids {
+            outbox.append(&row(id)).unwrap();
+        }
+    }
+
+    /// Opens a fresh draining keyed writer, which drains at open.
+    fn reopen(path: &Path, store: &Arc<InMemoryTipAnchorStore>) -> AuditWriter {
+        AuditWriter::open(
+            path.to_path_buf(),
+            Some(KeyedAuditAccess::new(
+                Zeroizing::new(ROW_KEY),
+                store.clone(),
+            )),
+        )
+        .unwrap()
+    }
+
+    fn delivered(path: &Path, id: &str) -> usize {
+        request_ids(path).iter().filter(|seen| *seen == id).count()
+    }
+
+    /// Signs a tagged row over exact body bytes at `(g, s)` with flag `r`.
+    fn sign_row(g: u64, s: u64, r: u8, body: &[u8]) -> Vec<u8> {
+        let tag = row_mac(&ROW_KEY, g, s, r, body).finalize().into_bytes();
+        let mut line = row_prefix(g, s, r);
+        line.extend_from_slice(body);
+        line.extend_from_slice(b",\"tag\":\"");
+        line.extend_from_slice(crate::hex::encode(&tag).as_bytes());
+        line.extend_from_slice(b"\"}");
+        line
+    }
+
+    /// A keyed fixture whose queue was cut over: generation line 1 alone.
+    fn cut_over_fixture() -> (TempDir, PathBuf, Arc<InMemoryTipAnchorStore>, AuditWriter) {
+        let (dir, path, store, mut writer) = keyed_fixture();
+        enqueue(&path, &store, &["cutover"]);
+        assert_eq!(writer.drain_outbox().unwrap(), 1);
+        assert_eq!(outbox_bytes(&path), header(1));
+        (dir, path, store, writer)
+    }
+
+    #[test]
+    fn replacement_faults_preserve_recoverable_state() {
+        use test_seam::SyncStep;
+        #[derive(Debug, Clone, Copy)]
+        enum Fault {
+            Step(SyncStep),
+            Partial,
+            Carrier,
+        }
+        for fault in [
+            Fault::Step(SyncStep::Remove),
+            Fault::Step(SyncStep::Create),
+            Fault::Partial,
+            Fault::Step(SyncStep::File),
+            Fault::Carrier,
+            Fault::Step(SyncStep::Rename),
+            Fault::Step(SyncStep::Directory),
+        ] {
+            let (_dir, path, store, mut writer) = keyed_fixture();
+            enqueue(&path, &store, &["one", "two"]);
+            let queued = outbox_bytes(&path);
+            let next = replacement_path(&outbox_path(&path));
+            let leftover = b"{\"k\":\"gen\",\"g\":7,\"tag\":\"00\"}\ntorn".to_vec();
+            fs::write(&next, &leftover).unwrap();
+            match fault {
+                Fault::Step(step) => test_seam::arm_sync_failure(&next, step),
+                Fault::Partial => test_seam::arm_partial_write(&next, 5),
+                Fault::Carrier => {
+                    let store = store.clone();
+                    writer.set_drain_after_snapshot(move || {
+                        let mut record = store.load_carrier_record().unwrap().unwrap();
+                        record.generation += 1;
+                        store.store_carrier_record(&record).unwrap();
+                    });
+                }
+            }
+            let error = writer.drain_outbox().unwrap_err();
+            match fault {
+                Fault::Carrier => assert!(
+                    matches!(
+                        error,
+                        WriterError::CarrierGenerationChanged {
+                            held: 1,
+                            current: 2
+                        }
+                    ),
+                    "{error:?}"
+                ),
+                _ => assert!(matches!(error, WriterError::Io(_)), "{fault:?}: {error:?}"),
+            }
+            assert_eq!(owner_summary(&store), (1, Some((0, 2))), "{fault:?}");
+            let renamed = matches!(fault, Fault::Step(SyncStep::Directory));
+            assert_eq!(
+                outbox_bytes(&path),
+                if renamed { header(1) } else { queued.clone() },
+                "{fault:?}"
+            );
+            match fault {
+                Fault::Step(SyncStep::Remove) => assert_eq!(fs::read(&next).unwrap(), leftover),
+                Fault::Step(SyncStep::Create | SyncStep::Directory) => {
+                    assert!(!next.exists(), "{fault:?}");
+                }
+                _ => assert!(next.exists(), "{fault:?}"),
+            }
+            if let Fault::Carrier = fault {
+                let mut record = store.load_carrier_record().unwrap().unwrap();
+                record.generation = 1;
+                store.store_carrier_record(&record).unwrap();
+            }
+            drop(writer);
+            let mut writer = reopen(&path, &store);
+            assert_eq!(writer.drain_outbox().unwrap(), 0);
+            for id in ["one", "two"] {
+                assert_eq!(delivered(&path, id), 1, "{fault:?} delivers {id} once");
+            }
+            assert_eq!(outbox_bytes(&path), header(1), "{fault:?}");
+            assert!(!next.exists(), "{fault:?}");
+            assert_eq!(owner_summary(&store), (1, Some((0, 2))), "{fault:?}");
+        }
+    }
+
+    /// A publication completes the replacement's data sync before the rename
+    /// and the directory sync after it.
+    #[test]
+    fn a_publication_syncs_the_replacement_and_its_directory() {
+        use test_seam::SyncStep;
+        let (_dir, path, store, mut writer) = keyed_fixture();
+        enqueue(&path, &store, &["one"]);
+        let next = replacement_path(&outbox_path(&path));
+        test_seam::record_syncs(&next);
+        assert_eq!(writer.drain_outbox().unwrap(), 1);
+        let expected: &[SyncStep] = if cfg!(unix) {
+            &[SyncStep::File, SyncStep::Rename, SyncStep::Directory]
+        } else {
+            &[SyncStep::File, SyncStep::Rename]
+        };
+        assert_eq!(test_seam::take_syncs(&next), expected);
+        assert_eq!(outbox_bytes(&path), header(1));
+    }
+
+    /// The sync helpers return what the system call returns. A pipe accepts
+    /// no sync, so each helper refuses it and records nothing.
+    #[cfg(unix)]
+    #[test]
+    fn the_sync_helpers_report_the_system_call() {
+        use std::os::fd::OwnedFd;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("outbox");
+        test_seam::record_syncs(&path);
+        let (reader, _writer) = io::pipe().unwrap();
+        let pipe = File::from(OwnedFd::from(reader));
+        assert!(sync_outbox_file(&pipe, &path).is_err());
+        assert!(sync_directory(&pipe, &path).is_err());
+        assert!(test_seam::take_syncs(&path).is_empty());
+    }
+
+    /// A directory sync opens the directory itself, so a removed directory
+    /// refuses the sync.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_sync_of_a_removed_directory_refuses() {
+        let dir = TempDir::new().unwrap();
+        let gone = dir.path().join("gone");
+        fs::create_dir(&gone).unwrap();
+        let path = gone.join("outbox");
+        test_seam::record_syncs(&path);
+        sync_parent_dir(&path).unwrap();
+        assert_eq!(
+            test_seam::take_syncs(&path),
+            [test_seam::SyncStep::Directory]
+        );
+        fs::remove_dir(&gone).unwrap();
+        test_seam::record_syncs(&path);
+        assert_eq!(
+            sync_parent_dir(&path).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert!(test_seam::take_syncs(&path).is_empty());
+    }
+
+    /// A leftover replacement that is a symbolic link is removed, so the
+    /// publication writes a new file and never writes through the link.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_leftover_replacement_is_removed_not_followed() {
+        let (dir, path, store, mut writer) = keyed_fixture();
+        enqueue(&path, &store, &["one"]);
+        let decoy = dir.path().join("decoy");
+        fs::write(&decoy, b"decoy").unwrap();
+        let next = replacement_path(&outbox_path(&path));
+        std::os::unix::fs::symlink(&decoy, &next).unwrap();
+        assert_eq!(writer.drain_outbox().unwrap(), 1);
+        assert_eq!(fs::read(&decoy).unwrap(), b"decoy");
+        let outbox = outbox_path(&path);
+        assert!(fs::symlink_metadata(&outbox).unwrap().file_type().is_file());
+        assert_eq!(outbox_bytes(&path), header(1));
+        assert!(!next.exists());
+    }
+
+    /// The key a key-change test persists in place of [`ROW_KEY`].
+    const NEXT_KEY: [u8; 32] = [0x35; 32];
+
+    /// Where a key rotation stops, in the order of its writes.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum KeyChange {
+        /// The open drained; nothing of the key change is written.
+        BeforeFence,
+        /// New owner state is stored and the fence line is not published.
+        OwnerStored,
+        /// The fence line is published and the new key is not persisted.
+        Fenced,
+        /// The new key is persisted and the queue's line is still the fence.
+        KeyPersisted,
+        /// The rotation switched the writer and published its line.
+        Done,
+    }
+
+    /// Stops a rotation at `stop`, then runs an append under the old key,
+    /// one under the new key, and a drain under the key the keyring holds.
+    ///
+    /// Asserts which appends are acknowledged, that the drain delivers each
+    /// acknowledged row once, and that it refuses none. The new key exists
+    /// only once persisted. Before that, a queue without a generation line
+    /// has nothing that could refuse a key, so no new-key append runs there.
+    fn stop_key_change(owned: bool, stop: KeyChange) {
+        let (_dir, path, store, writer) = if owned {
+            cut_over_fixture()
+        } else {
+            keyed_fixture()
+        };
+        assert_eq!(owner_state(&store).is_some(), owned);
+        let old = keyed_outbox(&path, &store);
+        let new = AuditOutbox::for_log_keyed(&path, store.clone(), Zeroizing::new(NEXT_KEY));
+        drop(writer);
+        store.set_reload(Ok(Some(ROW_KEY)));
+        let mut rotation = AuditWriter::open_for_key_rotation(
+            path.clone(),
+            Some(Zeroizing::new(ROW_KEY)),
+            store.clone(),
+            crate::audit_log::BindingHistory::NotRecorded,
+        )
+        .unwrap();
+        match stop {
+            KeyChange::BeforeFence => {}
+            KeyChange::OwnerStored => {
+                test_seam::arm_stop(&outbox_path(&path), test_seam::Stop::OwnerStored);
+                assert!(matches!(
+                    rotation.fence_outbox_for_key_change(),
+                    Err(WriterError::Io(_))
+                ));
+            }
+            KeyChange::Fenced | KeyChange::KeyPersisted | KeyChange::Done => {
+                rotation.fence_outbox_for_key_change().unwrap();
+            }
+        }
+        let persisted = matches!(stop, KeyChange::KeyPersisted | KeyChange::Done);
+        if persisted {
+            store.set_reload(Ok(Some(NEXT_KEY)));
+        }
+        if stop == KeyChange::Done {
+            rotation
+                .switch_entry_tag_key(Zeroizing::new(NEXT_KEY), "rotation")
+                .unwrap();
+        }
+        drop(rotation);
+        let fenced = matches!(stop, KeyChange::Fenced | KeyChange::KeyPersisted);
+        let old_acked = old.append(&row("old-key")).is_ok();
+        assert_eq!(old_acked, !fenced, "{stop:?} owned {owned}: old-key append");
+        let new_runs = owned || !matches!(stop, KeyChange::BeforeFence | KeyChange::OwnerStored);
+        let new_acked = new_runs && new.append(&row("new-key")).is_ok();
+        assert_eq!(
+            new_acked,
+            new_runs && !fenced,
+            "{stop:?} owned {owned}: new-key append"
+        );
+        let current = if persisted { NEXT_KEY } else { ROW_KEY };
+        let drain = AuditWriter::open_for_key_rotation(
+            path.clone(),
+            Some(Zeroizing::new(current)),
+            store.clone(),
+            crate::audit_log::BindingHistory::NotRecorded,
+        );
+        assert!(drain.is_ok(), "{stop:?} owned {owned}: {:?}", drain.err());
+        assert_eq!(
+            delivered(&path, "old-key"),
+            usize::from(old_acked),
+            "{stop:?} owned {owned}"
+        );
+        assert_eq!(
+            delivered(&path, "new-key"),
+            usize::from(new_acked),
+            "{stop:?} owned {owned}"
+        );
+        let bytes = outbox_bytes(&path);
+        let lines = parse_lines(&bytes).lines;
+        assert_eq!(
+            lines.len(),
+            1,
+            "{stop:?} owned {owned}: the drain leaves a lone line"
+        );
+        assert!(
+            test_seam::queue_generation(&lines, Some(&current)).is_ok(),
+            "{stop:?} owned {owned}: the line verifies under the keyring's key"
+        );
+    }
+
+    #[test]
+    fn a_key_change_stopped_before_the_fence_delivers_every_acknowledged_row() {
+        stop_key_change(true, KeyChange::BeforeFence);
+        stop_key_change(false, KeyChange::BeforeFence);
+    }
+
+    #[test]
+    fn a_key_change_stopped_after_the_owner_state_delivers_every_acknowledged_row() {
+        stop_key_change(false, KeyChange::OwnerStored);
+    }
+
+    #[test]
+    fn a_key_change_stopped_at_the_fence_acknowledges_no_row() {
+        stop_key_change(true, KeyChange::Fenced);
+        stop_key_change(false, KeyChange::Fenced);
+    }
+
+    #[test]
+    fn a_key_change_stopped_after_the_key_write_acknowledges_no_row() {
+        stop_key_change(true, KeyChange::KeyPersisted);
+        stop_key_change(false, KeyChange::KeyPersisted);
+    }
+
+    #[test]
+    fn a_completed_key_change_delivers_both_appends_under_the_new_key() {
+        stop_key_change(true, KeyChange::Done);
+        stop_key_change(false, KeyChange::Done);
+    }
+
+    /// Without owner state, a rotation that only switches the key still
+    /// publishes a line under the new key. An appender that cached the old
+    /// key reloads it and queues a row the new key's drain delivers.
+    #[test]
+    fn a_stale_appender_after_a_rotation_without_owner_state_queues_under_the_new_key() {
+        let (_dir, path, store, writer) = keyed_fixture();
+        let stale = keyed_outbox(&path, &store);
+        assert!(owner_state(&store).is_none());
+        drop(writer);
+        let mut rotation = AuditWriter::open_for_key_rotation(
+            path.clone(),
+            Some(Zeroizing::new(ROW_KEY)),
+            store.clone(),
+            crate::audit_log::BindingHistory::NotRecorded,
+        )
+        .unwrap();
+        store.set_reload(Ok(Some(NEXT_KEY)));
+        rotation
+            .switch_entry_tag_key(Zeroizing::new(NEXT_KEY), "rotation")
+            .unwrap();
+        crate::audit_log::resign_chain_root_sidecars(&path, &NEXT_KEY).unwrap();
+        drop(rotation);
+        assert_eq!(owner_summary(&store), (1, Some((0, 0))));
+        assert_eq!(
+            outbox_bytes(&path),
+            test_seam::generation_line(&NEXT_KEY, 1)
+        );
+        stale.append(&row("stale-after-rotation")).unwrap();
+        assert_eq!(store.reload_count(), 1);
+        drop(
+            AuditWriter::open(
+                path.clone(),
+                Some(KeyedAuditAccess::new(
+                    Zeroizing::new(NEXT_KEY),
+                    store.clone(),
+                )),
+            )
+            .unwrap(),
+        );
+        assert_eq!(delivered(&path, "stale-after-rotation"), 1);
+    }
+
+    /// Completes a rotation of the cut-over fixture from `ROW_KEY` to
+    /// `NEXT_KEY` and returns the queue as the rotation left it.
+    fn rotate_cut_over(path: &Path, store: &Arc<InMemoryTipAnchorStore>) -> Vec<u8> {
+        let mut rotation = AuditWriter::open_for_key_rotation(
+            path.to_path_buf(),
+            Some(Zeroizing::new(ROW_KEY)),
+            store.clone(),
+            crate::audit_log::BindingHistory::NotRecorded,
+        )
+        .unwrap();
+        store.set_reload(Ok(Some(ROW_KEY)));
+        rotation.fence_outbox_for_key_change().unwrap();
+        store.set_reload(Ok(Some(NEXT_KEY)));
+        rotation
+            .switch_entry_tag_key(Zeroizing::new(NEXT_KEY), "rotation")
+            .unwrap();
+        drop(rotation);
+        let queue = outbox_bytes(path);
+        assert_eq!(queue, test_seam::generation_line(&NEXT_KEY, 1));
+        queue
+    }
+
+    /// A writer opened with a key that a completed rotation replaced signs
+    /// no queue line. Its open compares its key with the stored key and
+    /// refuses with `audit.key_replaced` before any write. An appender that
+    /// cached the replaced key then reloads the stored key, and the stored
+    /// key's drain delivers its row.
+    #[test]
+    fn a_writer_opened_with_a_replaced_key_signs_no_queue_line() {
+        let (_dir, path, store, writer) = cut_over_fixture();
+        let stale = keyed_outbox(&path, &store);
+        drop(writer);
+        let queue = rotate_cut_over(&path, &store);
+        let log = fs::read(&path).unwrap();
+        let replaced = AuditWriter::open_for_key_rotation(
+            path.clone(),
+            Some(Zeroizing::new(ROW_KEY)),
+            store.clone(),
+            crate::audit_log::BindingHistory::NotRecorded,
+        );
+        assert!(
+            matches!(replaced, Err(WriterError::AuditKeyReplaced)),
+            "a rotation opener with the replaced key: {:?}",
+            replaced.err()
+        );
+        assert_eq!(outbox_bytes(&path), queue);
+        let ordinary = AuditWriter::open(
+            path.clone(),
+            Some(KeyedAuditAccess::new(
+                Zeroizing::new(ROW_KEY),
+                store.clone(),
+            )),
+        );
+        assert!(
+            matches!(ordinary, Err(WriterError::AuditKeyReplaced)),
+            "an ordinary opener with the replaced key: {:?}",
+            ordinary.err()
+        );
+        assert_eq!(outbox_bytes(&path), queue);
+        assert_eq!(fs::read(&path).unwrap(), log);
+        stale.append(&row("after-stale-open")).unwrap();
+        drop(
+            AuditWriter::open_for_key_rotation(
+                path.clone(),
+                Some(Zeroizing::new(NEXT_KEY)),
+                store.clone(),
+                crate::audit_log::BindingHistory::NotRecorded,
+            )
+            .unwrap(),
+        );
+        assert_eq!(delivered(&path, "after-stale-open"), 1);
+        assert_eq!(
+            outbox_bytes(&path),
+            test_seam::generation_line(&NEXT_KEY, 2)
+        );
+    }
+
+    /// A file writer that restores a generation line signed under a replaced
+    /// key lets an appender holding that key queue a row. A writer open with
+    /// the replaced key refuses with `audit.key_replaced` before any write.
+    /// The stored key's drain refuses the queue and leaves it unchanged on
+    /// every attempt. The legacy acknowledgement refuses it too, so the row
+    /// is reported and never delivered or dropped.
+    #[test]
+    fn a_restored_header_under_a_replaced_key_refuses_the_drain_and_keeps_the_row() {
+        let (_dir, path, store, writer) = cut_over_fixture();
+        let old_header = outbox_bytes(&path);
+        let stale = keyed_outbox(&path, &store);
+        drop(writer);
+        rotate_cut_over(&path, &store);
+        fs::write(outbox_path(&path), &old_header).unwrap();
+        stale.append(&row("behind-a-restored-header")).unwrap();
+        let queue = outbox_bytes(&path);
+        assert_eq!(parse_lines(&queue).lines.len(), 2);
+        let log = fs::read(&path).unwrap();
+        let owner = store.load_outbox_owner_state(1).unwrap();
+        let state = store.load_outbox_state(1).unwrap();
+        let stale_open = AuditWriter::open(
+            path.clone(),
+            Some(KeyedAuditAccess::new(
+                Zeroizing::new(ROW_KEY),
+                store.clone(),
+            )),
+        );
+        assert!(
+            matches!(stale_open, Err(WriterError::AuditKeyReplaced)),
+            "a stale process's next open: {:?}",
+            stale_open.err()
+        );
+        assert_eq!(outbox_bytes(&path), queue);
+        assert_eq!(fs::read(&path).unwrap(), log);
+        assert_eq!(store.load_outbox_owner_state(1).unwrap(), owner);
+        assert_eq!(store.load_outbox_state(1).unwrap(), state);
+        for attempt in 0..2 {
+            let drain = AuditWriter::open_for_key_rotation(
+                path.clone(),
+                Some(Zeroizing::new(NEXT_KEY)),
+                store.clone(),
+                crate::audit_log::BindingHistory::NotRecorded,
+            );
+            assert!(
+                matches!(
+                    drain,
+                    Err(WriterError::OutboxUnusable {
+                        line: 1,
+                        reason: "tagged record whose tag does not verify",
+                        ..
+                    })
+                ),
+                "attempt {attempt}: {:?}",
+                drain.err()
+            );
+            assert_eq!(outbox_bytes(&path), queue, "attempt {attempt}");
+        }
+        let acknowledgement = AuditWriter::open_for_outbox_acknowledgement(
+            path.clone(),
+            Some(Zeroizing::new(NEXT_KEY)),
+            store.clone(),
+            crate::audit_log::BindingHistory::NotRecorded,
+        )
+        .map(drop)
+        .unwrap_err();
+        assert_eq!(
+            acknowledgement.to_string(),
+            owned_queue_refusal().to_string()
+        );
+        assert_eq!(outbox_bytes(&path), queue);
+        assert_eq!(fs::read(&path).unwrap(), log);
+        assert_eq!(delivered(&path, "behind-a-restored-header"), 0);
+    }
+
+    /// What a refused open must leave as it found it: the log, the queue,
+    /// the owner state and the commitment of the active generation, and the
+    /// carrier record.
+    #[derive(Debug, PartialEq, Eq)]
+    struct OpenEvidence {
+        log: Vec<u8>,
+        queue: Vec<u8>,
+        owner: Option<String>,
+        state: Option<OutboxState>,
+        record: Option<crate::audit_log::tip_anchor::CarrierRecord>,
+    }
+
+    impl OpenEvidence {
+        fn read(path: &Path, store: &InMemoryTipAnchorStore) -> Self {
+            let record = store.load_carrier_record().unwrap();
+            let generation = record.as_ref().map_or(0, |record| record.generation);
+            Self {
+                log: fs::read(path).unwrap(),
+                queue: outbox_bytes(path),
+                owner: store.load_outbox_owner_state(generation).unwrap(),
+                state: store.load_outbox_state(generation).unwrap(),
+                record,
+            }
+        }
+    }
+
+    /// Asserts that `open`, which holds the key a completed rotation
+    /// replaced, refuses with `audit.key_replaced` and changes no evidence.
+    fn assert_stale_open_refuses<T>(
+        path: &Path,
+        store: &InMemoryTipAnchorStore,
+        opener: &str,
+        open: impl FnOnce() -> Result<T, WriterError>,
+    ) {
+        let before = OpenEvidence::read(path, store);
+        let refused = open();
+        assert!(
+            matches!(refused, Err(WriterError::AuditKeyReplaced)),
+            "{opener}: {:?}",
+            refused.err()
+        );
+        assert_eq!(OpenEvidence::read(path, store), before, "{opener}");
+    }
+
+    /// The cut-over fixture after a completed rotation from `ROW_KEY` to
+    /// `NEXT_KEY`, with the keyring holding `NEXT_KEY`.
+    fn rotated_fixture() -> (TempDir, PathBuf, Arc<InMemoryTipAnchorStore>) {
+        let (dir, path, store, writer) = cut_over_fixture();
+        drop(writer);
+        rotate_cut_over(&path, &store);
+        crate::audit_log::resign_chain_root_sidecars(&path, &NEXT_KEY).unwrap();
+        (dir, path, store)
+    }
+
+    #[test]
+    fn a_tip_anchor_open_with_a_replaced_key_refuses_before_any_write() {
+        let (_dir, path, store) = rotated_fixture();
+        let open = |key| {
+            AuditWriter::open_with_tip_anchor(
+                path.clone(),
+                Some(Zeroizing::new(key)),
+                store.clone(),
+                crate::audit_log::BindingHistory::NotRecorded,
+            )
+        };
+        assert_stale_open_refuses(&path, &store, "tip-anchor open", || open(ROW_KEY));
+        drop(open(NEXT_KEY).unwrap());
+    }
+
+    #[test]
+    fn a_reanchor_open_with_a_replaced_key_refuses_before_any_write() {
+        let (_dir, path, store) = rotated_fixture();
+        let open = |key| {
+            AuditWriter::open_for_reanchor(path.clone(), Some(Zeroizing::new(key)), store.clone())
+        };
+        assert_stale_open_refuses(&path, &store, "reanchor open", || open(ROW_KEY));
+        drop(open(NEXT_KEY).unwrap());
+    }
+
+    /// A binding that holds the replaced key refuses at the key comparison.
+    /// A binding that holds the stored key passes it and binds.
+    #[test]
+    fn a_carrier_binding_with_a_replaced_key_refuses_before_any_write() {
+        let (_dir, path, store) = rotated_fixture();
+        assert_stale_open_refuses(&path, &store, "binding open", || {
+            AuditWriter::open_for_carrier_binding(
+                path.clone(),
+                KeyedAuditAccess::new(Zeroizing::new(ROW_KEY), store.clone()),
+            )
+        });
+
+        let (_dir, path, store, writer) = keyed_fixture();
+        drop(writer);
+        store.set_reload(Ok(Some(ROW_KEY)));
+        let mut binding = AuditWriter::open_for_carrier_binding(
+            path.clone(),
+            KeyedAuditAccess::new(Zeroizing::new(ROW_KEY), store.clone()),
+        )
+        .unwrap();
+        binding.bind_carriers().unwrap();
+    }
+
+    /// The registry acquisition the MCP server and keyed CLI verbs use opens
+    /// through [`AuditWriter::open`], so a replaced key refuses there too.
+    #[test]
+    fn a_registry_acquisition_with_a_replaced_key_refuses_before_any_write() {
+        let (_dir, path, store) = rotated_fixture();
+        let profile = "outbox-replaced-key-acquisition";
+        let access = |key| {
+            KeyedAuditAccess::new(
+                Zeroizing::new(key),
+                store.clone() as Arc<dyn TipAnchorStore>,
+            )
+        };
+        assert_stale_open_refuses(&path, &store, "registry acquisition", || {
+            AuditWriterRegistry::get_or_open_keyed(profile, &path, access(ROW_KEY))
+        });
+        drop(AuditWriterRegistry::get_or_open_keyed(profile, &path, access(NEXT_KEY)).unwrap());
+        AuditWriterRegistry::remove_for_test(profile);
+    }
+
+    /// The acknowledgement open with the replaced key refuses at the key
+    /// comparison, before the owner-state refusal the stored key meets.
+    #[test]
+    fn a_loss_acknowledgement_with_a_replaced_key_refuses_before_any_write() {
+        let (_dir, path, store) = rotated_fixture();
+        let open = |key| {
+            AuditWriter::open_for_outbox_acknowledgement(
+                path.clone(),
+                Some(Zeroizing::new(key)),
+                store.clone(),
+                crate::audit_log::BindingHistory::NotRecorded,
+            )
+        };
+        assert_stale_open_refuses(&path, &store, "acknowledgement open", || open(ROW_KEY));
+        let stored = open(NEXT_KEY).map(drop).unwrap_err();
+        assert_eq!(stored.to_string(), owned_queue_refusal().to_string());
+    }
+
+    /// A changed retired commitment lets the acknowledgement open past the
+    /// owner check. An acknowledgement that loaded its key before a completed
+    /// rotation then refuses at the key comparison, before its drain or its
+    /// row. The stored key's acknowledgement records the retired loss only,
+    /// and the active queue and its owner state stay.
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_acknowledgement_of_a_retired_change_refuses_before_any_write() {
+        let (_dir, path, store, writer) = keyed_fixture();
+        store.set_reload(Ok(Some(ROW_KEY)));
+        drop(writer);
+        AuditOutbox::for_log(&path, store.clone())
+            .append(&row("retired"))
+            .unwrap();
+        let retired_batch = OutboxBatch::read_locked(&path, store.as_ref()).unwrap();
+        let carrier = outbox_lock_path(&path);
+        fs::rename(&carrier, carrier.with_extension("replaced")).unwrap();
+        File::create(&carrier).unwrap();
+        let mut binding = AuditWriter::open_for_carrier_binding(
+            path.clone(),
+            KeyedAuditAccess::new(Zeroizing::new(ROW_KEY), store.clone()),
+        )
+        .unwrap();
+        assert_eq!(binding.bind_carriers().unwrap().generation, 2);
+        drop(binding);
+        keyed_outbox(&path, &store)
+            .append(&row("cut-over"))
+            .unwrap();
+        drop(
+            AuditWriter::open(
+                path.clone(),
+                Some(KeyedAuditAccess::new(
+                    Zeroizing::new(ROW_KEY),
+                    store.clone(),
+                )),
+            )
+            .unwrap(),
+        );
+        assert!(store.load_outbox_owner_state(2).unwrap().is_some());
+        rotate_cut_over(&path, &store);
+        crate::audit_log::resign_chain_root_sidecars(&path, &NEXT_KEY).unwrap();
+        // The retired generation's drain commits after the binding and the
+        // rotation, so the retired watch sees a changed commitment.
+        store
+            .store_outbox_state(1, &OutboxState::default())
+            .unwrap();
+        retired_batch.clear().unwrap();
+        let open = |key| {
+            AuditWriter::open_for_outbox_acknowledgement(
+                path.clone(),
+                Some(Zeroizing::new(key)),
+                store.clone(),
+                crate::audit_log::BindingHistory::NotRecorded,
+            )
+        };
+        assert_stale_open_refuses(&path, &store, "retired acknowledgement", || open(ROW_KEY));
+        let queue = outbox_bytes(&path);
+        let owner = store.load_outbox_owner_state(2).unwrap();
+        let mut stored = open(NEXT_KEY).unwrap();
+        stored
+            .acknowledge_outbox_loss("retired loss", Default::default())
+            .unwrap();
+        drop(stored);
+        assert_eq!(outbox_bytes(&path), queue, "the active queue stays");
+        assert_eq!(store.load_outbox_owner_state(2).unwrap(), owner);
+    }
+
+    /// After a rotation stops past the fence, the legacy acknowledgement open
+    /// refuses before it writes anything. The log, the queue, the owner state
+    /// and the commitment stay byte-identical; without the refusal the open
+    /// would first append its key repair row.
+    #[test]
+    fn a_loss_acknowledgement_after_a_stopped_key_change_refuses_before_any_write() {
+        let (_dir, path, store, writer) = cut_over_fixture();
+        drop(writer);
+        let mut rotation = AuditWriter::open_for_key_rotation(
+            path.clone(),
+            Some(Zeroizing::new(ROW_KEY)),
+            store.clone(),
+            crate::audit_log::BindingHistory::NotRecorded,
+        )
+        .unwrap();
+        rotation.fence_outbox_for_key_change().unwrap();
+        store.set_reload(Ok(Some(NEXT_KEY)));
+        drop(rotation);
+        let log = fs::read(&path).unwrap();
+        let queue = outbox_bytes(&path);
+        let owner = store.load_outbox_owner_state(1).unwrap();
+        let state = store.load_outbox_state(1).unwrap();
+        let record = store.load_carrier_record().unwrap();
+        let refused = AuditWriter::open_for_outbox_acknowledgement(
+            path.clone(),
+            Some(Zeroizing::new(NEXT_KEY)),
+            store.clone(),
+            crate::audit_log::BindingHistory::NotRecorded,
+        )
+        .map(drop)
+        .unwrap_err();
+        assert_eq!(refused.to_string(), owned_queue_refusal().to_string());
+        assert_eq!(fs::read(&path).unwrap(), log, "the log is unchanged");
+        assert_eq!(outbox_bytes(&path), queue, "the queue is unchanged");
+        assert_eq!(store.load_outbox_owner_state(1).unwrap(), owner);
+        assert_eq!(store.load_outbox_state(1).unwrap(), state);
+        assert_eq!(store.load_carrier_record().unwrap(), record);
+    }
+
+    /// A first key replaces none, so no appender holds an older key. The
+    /// fence and the switch leave a queue without owner state as it is, and
+    /// an unkeyed append still queues.
+    #[test]
+    fn a_first_key_leaves_a_queue_without_owner_state_as_it_is() {
+        let dir = TempDir::new().unwrap();
+        let path = log_path(&dir);
+        let store = bound_store(&path);
+        let mut rotation = AuditWriter::open_for_key_rotation(
+            path.clone(),
+            None,
+            store.clone(),
+            crate::audit_log::BindingHistory::NotRecorded,
+        )
+        .unwrap();
+        rotation.fence_outbox_for_key_change().unwrap();
+        rotation
+            .switch_entry_tag_key(Zeroizing::new(NEXT_KEY), "first-key")
+            .unwrap();
+        drop(rotation);
+        assert!(owner_state(&store).is_none());
+        assert!(!outbox_path(&path).exists());
+        AuditOutbox::for_log(&path, store.clone())
+            .append(&row("unkeyed"))
+            .unwrap();
+        assert_eq!(parse_lines(&outbox_bytes(&path)).lines.len(), 1);
+    }
+
+    /// Only a key-rotation writer fences, and a fence refuses a queue that
+    /// holds a row, with nothing written.
+    #[test]
+    fn a_fence_needs_a_rotation_writer_and_a_drained_queue() {
+        let (_dir, path, store, mut writer) = keyed_fixture();
+        let error = writer.fence_outbox_for_key_change().unwrap_err();
+        assert!(
+            matches!(&error, WriterError::Io(e) if e.kind() == io::ErrorKind::InvalidInput),
+            "{error:?}"
+        );
+        drop(writer);
+        let mut rotation = AuditWriter::open_for_key_rotation(
+            path.clone(),
+            Some(Zeroizing::new(ROW_KEY)),
+            store.clone(),
+            crate::audit_log::BindingHistory::NotRecorded,
+        )
+        .unwrap();
+        let queued = encode_tagged_row(&ROW_KEY, 0, 1, 0, &row("planted")).unwrap();
+        let mut bytes = queued;
+        bytes.push(b'\n');
+        fs::write(outbox_path(&path), &bytes).unwrap();
+        assert_eq!(
+            format!("{:?}", rotation.fence_outbox_for_key_change()),
+            format!(
+                "Err({:?})",
+                tagged_refusal(1, "queue not drained before a key change")
+            )
+        );
+        assert_eq!(outbox_bytes(&path), bytes);
+        assert!(owner_state(&store).is_none());
+    }
+
+    /// The commitment check compares a published queue with the owner state:
+    /// a restored older generation, a stale lone generation line, and a
+    /// generation line without owner state all refuse.
+    #[test]
+    fn verification_refuses_a_queue_the_owner_state_does_not_hold() {
+        let (_dir, path, store, mut writer) = cut_over_fixture();
+        enqueue(&path, &store, &["old"]);
+        let old_queue = outbox_bytes(&path);
+        assert_eq!(writer.drain_outbox().unwrap(), 1);
+        enqueue(&path, &store, &["current"]);
+        assert_eq!(writer.drain_outbox().unwrap(), 1);
+        assert_eq!(owner_summary(&store), (3, Some((2, 1))));
+        check_outbox_commitment(&path, store.as_ref()).unwrap();
+        let refusal = |path: &Path, store: &InMemoryTipAnchorStore| {
+            format!("{:?}", check_outbox_commitment(path, store))
+        };
+        // Generation 2 is the closed one: its line alone lacks the closed row.
+        for (queue, recorded, found) in [(old_queue, 0, 1), (header(1), 0, 0), (header(2), 1, 0)] {
+            fs::write(outbox_path(&path), &queue).unwrap();
+            assert_eq!(
+                refusal(&path, &store),
+                format!("Err(OutboxRowsMissing {{ recorded: {recorded}, found: {found} }})")
+            );
+            assert!(writer.drain_outbox().is_err());
+            assert_eq!(outbox_bytes(&path), queue);
+        }
+        fs::write(outbox_path(&path), header(3)).unwrap();
+        check_outbox_commitment(&path, store.as_ref()).unwrap();
+        // Without owner state, a generation line belongs to no queue.
+        let (_dir, path, store, _writer) = keyed_fixture();
+        for found in [0, 1] {
+            let mut queue = header(1);
+            if found == 1 {
+                queue.extend_from_slice(
+                    &encode_tagged_row(&ROW_KEY, 1, 1, 0, &row("foreign")).unwrap(),
+                );
+                queue.push(b'\n');
+            }
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(outbox_path(&path), &queue).unwrap();
+            assert!(owner_state(&store).is_none());
+            assert_eq!(
+                refusal(&path, &store),
+                format!("Err(OutboxRowsMissing {{ recorded: 0, found: {found} }})")
+            );
+        }
+    }
+
+    #[test]
+    fn the_generation_line_states() {
+        // A row after the generation line takes position 1 at physical line 2.
+        let (_dir, path, store, mut writer) = cut_over_fixture();
+        enqueue(&path, &store, &["after"]);
+        let lines_of = |path: &Path| {
+            parse_lines(&outbox_bytes(path))
+                .lines
+                .iter()
+                .map(|line| line.to_vec())
+                .collect::<Vec<_>>()
+        };
+        let lines = lines_of(&path);
+        assert_eq!(lines.len(), 2);
+        let after: serde_json::Value = serde_json::from_slice(&lines[1]).unwrap();
+        let entry: AuditEntry = serde_json::from_value(after["body"].clone()).unwrap();
+        assert_eq!(entry.request_id, "after");
+        assert_eq!(
+            lines[1],
+            encode_tagged_row(&ROW_KEY, 1, 1, 0, &entry).unwrap()
+        );
+        // Verification accepts the published queue, and refuses a row of
+        // another generation or a nonzero commitment. The legacy loss report
+        // leaves an owned queue to the owner drain either way.
+        check_outbox_commitment(&path, store.as_ref()).unwrap();
+        let owned = format!("{:?}", owned_queue_refusal());
+        assert_eq!(
+            format!("{:?}", writer.outbox_loss()),
+            format!("Err({owned})")
+        );
+        let published = outbox_bytes(&path);
+        let mut moved = header(1);
+        moved.extend_from_slice(&encode_tagged_row(&ROW_KEY, 2, 1, 0, &entry).unwrap());
+        moved.push(b'\n');
+        fs::write(outbox_path(&path), &moved).unwrap();
+        assert!(matches!(
+            check_outbox_commitment(&path, store.as_ref()),
+            Err(WriterError::OutboxRowsMissing {
+                recorded: 1,
+                found: 1
+            })
+        ));
+        assert_eq!(
+            format!("{:?}", writer.outbox_loss()),
+            format!("Err({owned})")
+        );
+        fs::write(outbox_path(&path), &published).unwrap();
+        commit_every_line(&path, &store);
+        let error = check_outbox_commitment(&path, store.as_ref()).unwrap_err();
+        assert_eq!(
+            format!("{error:?}"),
+            format!(
+                "{:?}",
+                unusable("legacy outbox state changed in the owner state")
+            )
+        );
+        store
+            .store_outbox_state(1, &OutboxState::default())
+            .unwrap();
+        // A generation line past the first line is out of place.
+        let before = fs::read(&path).unwrap();
+        let mut planted = outbox_bytes(&path);
+        planted.extend_from_slice(&header(1));
+        fs::write(outbox_path(&path), &planted).unwrap();
+        let error = writer.drain_outbox().unwrap_err();
+        assert!(
+            matches!(
+                error,
+                WriterError::OutboxUnusable {
+                    line: 3,
+                    column: 1,
+                    reason: "generation line out of place"
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(outbox_bytes(&path), planted);
+        drop(writer);
+
+        // The generation line takes no quota slot: 64 rows fit after it.
+        let (_dir, path, store, _writer) = cut_over_fixture();
+        let outbox = keyed_outbox(&path, &store);
+        for index in 0..MAX_OUTBOX_ROWS {
+            outbox.append(&row(&format!("row-{index}"))).unwrap();
+        }
+        let full = outbox_bytes(&path);
+        assert!(matches!(
+            outbox.append(&row("over")),
+            Err(WriterError::OutboxFull {
+                queued: 64,
+                cap: 64
+            })
+        ));
+        assert_eq!(outbox_bytes(&path), full);
+        assert_eq!(parse_lines(&full).lines.len(), MAX_OUTBOX_ROWS + 1);
+
+        // The last generation cannot advance: the drain refuses before any
+        // append.
+        let (_dir, path, store, mut writer) = keyed_fixture();
+        store
+            .store_outbox_owner_state(1, &test_seam::owner_value(u64::MAX, None))
+            .unwrap();
+        fs::write(outbox_path(&path), header(u64::MAX)).unwrap();
+        enqueue(&path, &store, &["last"]);
+        let lines = lines_of(&path);
+        let last: serde_json::Value = serde_json::from_slice(&lines[1]).unwrap();
+        assert_eq!(
+            (last["g"].as_u64(), last["s"].as_u64()),
+            (Some(u64::MAX), Some(1))
+        );
+        let log = fs::read(&path).unwrap();
+        let queued = outbox_bytes(&path);
+        let error = writer.drain_outbox().unwrap_err();
+        assert_eq!(
+            format!("{error:?}"),
+            format!("{:?}", unusable("queue generation overflows"))
+        );
+        assert_eq!(fs::read(&path).unwrap(), log);
+        assert_eq!(outbox_bytes(&path), queued);
+        drop(writer);
+
+        // A leftover replacement is never a queued row and never blocks open.
+        let (_dir, path, store, writer) = keyed_fixture();
+        enqueue(&path, &store, &["kept"]);
+        let next = replacement_path(&outbox_path(&path));
+        fs::write(
+            &next,
+            encode_tagged_row(&ROW_KEY, 0, 2, 0, &row("leftover")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(inspect_outbox(&path).unwrap().pending, 1);
+        drop(writer);
+        let _writer = reopen(&path, &store);
+        assert_eq!(delivered(&path, "kept"), 1);
+        assert_eq!(delivered(&path, "leftover"), 0);
+        assert!(!next.exists());
+        assert_eq!(outbox_bytes(&path), header(1));
+
+        // An append between the rename and the directory sync queues under
+        // the published generation, and the next drain delivers it.
+        let (_dir, path, store, mut writer) = keyed_fixture();
+        enqueue(&path, &store, &["first"]);
+        test_seam::arm_stop(&outbox_path(&path), test_seam::Stop::Renamed);
+        assert!(matches!(writer.drain_outbox(), Err(WriterError::Io(_))));
+        assert_eq!(outbox_bytes(&path), header(1));
+        enqueue(&path, &store, &["window"]);
+        let lines = lines_of(&path);
+        let window: serde_json::Value = serde_json::from_slice(&lines[1]).unwrap();
+        assert_eq!(
+            (window["g"].as_u64(), window["s"].as_u64()),
+            (Some(1), Some(1))
+        );
+        assert_eq!(writer.drain_outbox().unwrap(), 1);
+        assert_eq!(delivered(&path, "first"), 1);
+        assert_eq!(delivered(&path, "window"), 1);
+        assert_eq!(outbox_bytes(&path), header(2));
+        assert_eq!(owner_summary(&store), (2, Some((1, 1))));
+    }
+
+    #[test]
+    fn the_queue_path_never_accesses_either_item() {
+        use crate::audit_log::tip_anchor::RetiredOutbox;
+        let (_dir, path, store, _writer) = keyed_fixture();
+        // A retired generation makes a retired watch read its commitment.
+        let mut record = store.load_carrier_record().unwrap().unwrap();
+        record.retired = Some(RetiredOutbox {
+            generation: 0,
+            state: String::new(),
+            file: None,
+        });
+        store.store_carrier_record(&record).unwrap();
+        store.forbid_outbox_items(true);
+        let accesses = store.outbox_item_accesses();
+        let outbox = keyed_outbox(&path, &store);
+        for id in ["one", "two", "three"] {
+            outbox.append(&row(id)).unwrap();
+        }
+        assert_eq!(store.outbox_item_accesses(), accesses, "no item access");
+        assert_eq!(parse_lines(&outbox_bytes(&path)).lines.len(), 3);
+        // The unkeyed path reads its commitment and the retired watch.
+        let error = AuditOutbox::for_log(&path, store.clone())
+            .append(&row("raw"))
+            .unwrap_err();
+        assert!(matches!(error, WriterError::TipAnchorStore(_)), "{error:?}");
+        assert!(store.outbox_item_accesses() > accesses);
+        store.forbid_outbox_items(false);
+        assert!(store.outbox_item_writes().is_empty());
+    }
+
+    #[test]
+    fn generation_tag_mismatch_reloads_once() {
+        let (_dir, path, store, mut writer) = cut_over_fixture();
+        let stale = AuditOutbox::for_log_keyed(&path, store.clone(), Zeroizing::new([0x11; 32]));
+        // A held key that verifies the generation line reloads nothing.
+        keyed_outbox(&path, &store).append(&row("current")).unwrap();
+        assert_eq!(store.reload_count(), 0);
+        store.set_reload(Ok(Some(ROW_KEY)));
+        stale.append(&row("reloaded")).unwrap();
+        assert_eq!(store.reload_count(), 1);
+        stale.append(&row("again")).unwrap();
+        assert_eq!(store.reload_count(), 2, "the outbox keeps its own key");
+        let bytes = outbox_bytes(&path);
+        let lines = parse_lines(&bytes).lines;
+        for (index, id) in ["current", "reloaded", "again"].into_iter().enumerate() {
+            let value: serde_json::Value = serde_json::from_slice(lines[index + 1]).unwrap();
+            let entry: AuditEntry = serde_json::from_value(value["body"].clone()).unwrap();
+            assert_eq!(entry.request_id, id);
+            assert_eq!(
+                lines[index + 1],
+                encode_tagged_row(&ROW_KEY, 1, index as u64 + 1, 0, &entry)
+                    .unwrap()
+                    .as_slice(),
+                "the row is tagged under the reloaded key"
+            );
+        }
+        for (reload, expected) in [
+            (Ok(None), unusable("tagged record without an audit key")),
+            (
+                Ok(Some([0x22; 32])),
+                unusable("tagged record whose tag does not verify"),
+            ),
+            (
+                Err("backend"),
+                WriterError::TipAnchorStore(TipAnchorStoreError::new("audit key reload failed")),
+            ),
+        ] {
+            store.set_reload(reload);
+            let count = store.reload_count();
+            let error = stale.append(&row("refused")).unwrap_err();
+            assert_eq!(format!("{error:?}"), format!("{expected:?}"));
+            assert_eq!(store.reload_count(), count + 1, "one reload per append");
+            assert_eq!(outbox_bytes(&path), bytes);
+        }
+        assert_eq!(writer.drain_outbox().unwrap(), 3);
+    }
+
+    #[test]
+    fn keyed_queue_faults_leave_no_successful_row() {
+        use super::super::writer::MAX_ROW_BYTES;
+        use test_seam::SyncStep;
+        let (_dir, path, store, _writer) = keyed_fixture();
+        let outbox = keyed_outbox(&path, &store);
+        // The creating append syncs the directory; its failure rolls back.
+        test_seam::arm_sync_failure(outbox.path(), SyncStep::Directory);
+        assert!(matches!(
+            outbox.append(&row("created")),
+            Err(WriterError::Io(_))
+        ));
+        assert!(outbox_bytes(&path).is_empty());
+        outbox.append(&row("kept")).unwrap();
+        let before = outbox_bytes(&path);
+        test_seam::arm_partial_write(outbox.path(), 9);
+        assert!(matches!(
+            outbox.append(&row("torn")),
+            Err(WriterError::Io(_))
+        ));
+        assert_eq!(outbox_bytes(&path), before);
+        test_seam::arm_sync_failure(outbox.path(), SyncStep::File);
+        assert!(matches!(
+            outbox.append(&row("unsynced")),
+            Err(WriterError::Io(_))
+        ));
+        assert_eq!(outbox_bytes(&path), before);
+        // A failed rollback still refuses; the orphan line stays.
+        test_seam::arm_sync_failure(outbox.path(), SyncStep::File);
+        test_seam::arm_sync_failure(outbox.path(), SyncStep::Rollback);
+        assert!(matches!(
+            outbox.append(&row("orphan")),
+            Err(WriterError::Io(_))
+        ));
+        let orphaned = outbox_bytes(&path);
+        assert_eq!(parse_lines(&orphaned).lines.len(), 2);
+        assert!(orphaned.starts_with(&before));
+        fs::write(outbox_path(&path), &before).unwrap();
+        // The row cap refuses before writing.
+        let over = consent_row_of_len("over", MAX_ROW_BYTES + 1);
+        assert!(matches!(
+            outbox.append(&over),
+            Err(WriterError::OutboxRowTooLarge {
+                cap: MAX_ROW_BYTES,
+                ..
+            })
+        ));
+        assert_eq!(outbox_bytes(&path), before);
+        // The queue cap refuses the row past it.
+        for index in 1..MAX_OUTBOX_ROWS {
+            outbox.append(&row(&format!("row-{index}"))).unwrap();
+        }
+        let full = outbox_bytes(&path);
+        assert!(matches!(
+            outbox.append(&row("over")),
+            Err(WriterError::OutboxFull {
+                queued: 64,
+                cap: 64
+            })
+        ));
+        assert_eq!(outbox_bytes(&path), full);
+    }
+
+    #[test]
+    fn a_legacy_tagged_suffix_authenticates_after_the_prefix() {
+        let (_dir, path, store, mut writer) = keyed_fixture();
+        AuditOutbox::for_log(&path, store.clone())
+            .append(&row("raw"))
+            .unwrap();
+        enqueue(&path, &store, &["two", "three"]);
+        let valid = outbox_bytes(&path);
+        let lines = parse_lines(&valid).lines;
+        let suffix: Vec<_> = lines[1..].iter().map(|line| line.to_vec()).collect();
+        assert!(suffix[0].starts_with(b"{\"k\":\"row\",\"g\":0,\"s\":2,"));
+        check_outbox_commitment(&path, store.as_ref()).unwrap();
+        assert_eq!(writer.outbox_loss().unwrap(), None);
+
+        // A changed prefix refuses first, whatever follows it.
+        let mut forged = suffix[0].clone();
+        let end = forged.len();
+        forged[end - 3] = if forged[end - 3] == b'0' { b'1' } else { b'0' };
+        let mut changed = serde_json::to_vec(&row("changed")).unwrap();
+        changed.push(b'\n');
+        for line in [&forged, &suffix[1]] {
+            changed.extend_from_slice(line);
+            changed.push(b'\n');
+        }
+        fs::write(outbox_path(&path), &changed).unwrap();
+        let missing = WriterError::OutboxRowsMissing {
+            recorded: 1,
+            found: 3,
+        };
+        let error = check_outbox_commitment(&path, store.as_ref()).unwrap_err();
+        assert_eq!(format!("{error:?}"), format!("{missing:?}"));
+        let error = writer.drain_outbox().unwrap_err();
+        assert_eq!(format!("{error:?}"), format!("{missing:?}"));
+
+        // A forged suffix tag passes the keyless check and refuses keyed.
+        let mut tampered = valid[..lines[0].len() + 1].to_vec();
+        for line in [&forged, &suffix[1]] {
+            tampered.extend_from_slice(line);
+            tampered.push(b'\n');
+        }
+        fs::write(outbox_path(&path), &tampered).unwrap();
+        check_outbox_commitment(&path, store.as_ref()).unwrap();
+        let tag = WriterError::OutboxUnusable {
+            line: 2,
+            column: 1,
+            reason: "tagged record whose tag does not verify",
+        };
+        let error = writer.drain_outbox().unwrap_err();
+        assert_eq!(format!("{error:?}"), format!("{tag:?}"));
+        let loss = writer.outbox_loss().unwrap().unwrap();
+        assert_eq!((loss.expected_rows, loss.found_rows), (1, 3));
+
+        // An untagged line past the prefix refuses at its position.
+        let mut raw_suffix = valid.clone();
+        raw_suffix.extend_from_slice(&serde_json::to_vec(&row("raw-suffix")).unwrap());
+        raw_suffix.push(b'\n');
+        fs::write(outbox_path(&path), &raw_suffix).unwrap();
+        let untagged = WriterError::OutboxRowsMissing {
+            recorded: 4,
+            found: 0,
+        };
+        let error = check_outbox_commitment(&path, store.as_ref()).unwrap_err();
+        assert_eq!(format!("{error:?}"), format!("{untagged:?}"));
+        let error = writer.drain_outbox().unwrap_err();
+        assert_eq!(format!("{error:?}"), format!("{untagged:?}"));
+        assert!(log_rows(&path).iter().all(|row| row["request_id"] != "raw"));
+
+        // Binding selects the prefix and the authenticated suffix verbatim.
+        fs::write(outbox_path(&path), &valid).unwrap();
+        drop(writer);
+        let access = KeyedAuditAccess::new(Zeroizing::new(ROW_KEY), store.clone());
+        let mut binding = AuditWriter::open_for_carrier_binding(path.clone(), access).unwrap();
+        let report = binding.bind_carriers().unwrap();
+        assert_eq!((report.generation, report.carried_rows), (2, 3));
+        assert_eq!(outbox_bytes(&path), valid);
+    }
+
+    #[test]
+    fn first_tagged_drain_cuts_over_in_order() {
+        // An empty startup and a raw-only queue stay legacy.
+        let (_dir, path, store, mut writer) = keyed_fixture();
+        assert_eq!(writer.drain_outbox().unwrap(), 0);
+        assert_eq!(store.load_outbox_owner_state(1).unwrap(), None);
+        AuditOutbox::for_log(&path, store.clone())
+            .append(&row("raw-only"))
+            .unwrap();
+        assert_eq!(writer.drain_outbox().unwrap(), 1);
+        assert_eq!(store.load_outbox_owner_state(1).unwrap(), None);
+        assert!(outbox_bytes(&path).is_empty());
+        assert!(
+            store
+                .outbox_item_writes()
+                .iter()
+                .all(|(kind, _)| *kind == "legacy")
+        );
+        drop(writer);
+
+        // A tagged row cuts over: appends, anchor, owner, zero v1, header.
+        let (_dir, path, store, mut writer) = keyed_fixture();
+        AuditOutbox::for_log(&path, store.clone())
+            .append(&row("raw"))
+            .unwrap();
+        enqueue(&path, &store, &["tagged"]);
+        let legacy = store.load_outbox_state(1).unwrap().unwrap();
+        let writes = store.outbox_item_writes().len();
+        test_seam::arm_stop(&outbox_path(&path), test_seam::Stop::AnchorChecked);
+        assert!(matches!(writer.drain_outbox(), Err(WriterError::Io(_))));
+        assert_eq!(
+            request_ids(&path)[request_ids(&path).len() - 2..],
+            ["raw", "tagged"]
+        );
+        assert_eq!(store.load_outbox_owner_state(1).unwrap(), None);
+        assert_eq!(store.outbox_item_writes().len(), writes);
+        test_seam::arm_stop(&outbox_path(&path), test_seam::Stop::OwnerStored);
+        assert!(matches!(writer.drain_outbox(), Err(WriterError::Io(_))));
+        let owner = owner_state(&store).unwrap();
+        assert_eq!(owner.g, 1);
+        assert_eq!(
+            owner.legacy,
+            Some(Sha256::digest(legacy.to_keyring_value().as_bytes()).into())
+        );
+        let bytes = outbox_bytes(&path);
+        let lines = parse_lines(&bytes).lines;
+        let raw = decode_raw(lines[0], 1).unwrap();
+        let tagged = test_seam::delivered_row_digest(lines[1]).unwrap();
+        let closed = owner.closed.unwrap();
+        assert_eq!((closed.g, closed.n), (0, 2));
+        assert_eq!(
+            closed.batch,
+            batch_digest(&[(0, row_digest(0, 1, 0, &raw).unwrap()), tagged])
+        );
+        assert_eq!(store.load_outbox_state(1).unwrap(), Some(legacy));
+        assert_eq!(writer.drain_outbox().unwrap(), 0);
+        assert_eq!(
+            store.outbox_item_writes()[writes..],
+            [("owner", 1), ("legacy", 1)],
+            "the owner state precedes the zero commitment"
+        );
+        assert_eq!(
+            store.load_outbox_state(1).unwrap(),
+            Some(OutboxState::default())
+        );
+        assert_eq!(outbox_bytes(&path), header(1));
+        for id in ["raw", "tagged"] {
+            assert_eq!(
+                delivered(&path, id),
+                2,
+                "delivered before and after the stop"
+            );
+        }
+
+        // Without a commitment the owner records none.
+        let (_dir, path, store, mut writer) = keyed_fixture();
+        assert_eq!(store.load_outbox_state(1).unwrap(), None);
+        enqueue(&path, &store, &["absent"]);
+        assert_eq!(writer.drain_outbox().unwrap(), 1);
+        assert_eq!(owner_state(&store).unwrap().legacy, None);
+        assert_eq!(
+            store.load_outbox_state(1).unwrap(),
+            Some(OutboxState::default())
+        );
+    }
+
+    #[test]
+    fn cutover_recovers_every_boundary() {
+        use test_seam::Stop;
+        for (stop, repeated) in [
+            (Stop::BeforeAppends, 0),
+            (Stop::AfterAppend(1), 1),
+            (Stop::AfterAppend(2), 2),
+            (Stop::AnchorChecked, 3),
+            (Stop::OwnerStored, 0),
+            (Stop::LegacyZeroed, 0),
+            (Stop::ReplacementSynced, 0),
+            (Stop::Renamed, 0),
+            (Stop::DirectorySynced, 0),
+        ] {
+            let (_dir, path, store, mut writer) = keyed_fixture();
+            AuditOutbox::for_log(&path, store.clone())
+                .append(&row("raw"))
+                .unwrap();
+            enqueue(&path, &store, &["two", "three"]);
+            test_seam::arm_stop(&outbox_path(&path), stop);
+            assert!(
+                matches!(writer.drain_outbox(), Err(WriterError::Io(_))),
+                "{stop:?}"
+            );
+            drop(writer);
+            let mut writer = reopen(&path, &store);
+            assert_eq!(writer.drain_outbox().unwrap(), 0, "{stop:?}");
+            for (index, id) in ["raw", "two", "three"].into_iter().enumerate() {
+                let times = if index < repeated { 2 } else { 1 };
+                assert_eq!(delivered(&path, id), times, "{stop:?}: {id}");
+            }
+            assert_eq!(outbox_bytes(&path), header(1), "{stop:?}");
+            assert_eq!(owner_summary(&store), (1, Some((0, 3))), "{stop:?}");
+            assert_eq!(
+                store.load_outbox_state(1).unwrap(),
+                Some(OutboxState::default()),
+                "{stop:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_old_client_rewrite_refuses_unusable() {
+        let refusal = unusable("legacy outbox state changed in the owner state");
+        // Stopped after the owner store: the commitment still hashes to L.
+        let (_dir, path, store, mut writer) = keyed_fixture();
+        AuditOutbox::for_log(&path, store.clone())
+            .append(&row("raw"))
+            .unwrap();
+        enqueue(&path, &store, &["tagged"]);
+        test_seam::arm_stop(&outbox_path(&path), test_seam::Stop::OwnerStored);
+        assert!(matches!(writer.drain_outbox(), Err(WriterError::Io(_))));
+        // An unkeyed client imports a raw row and commits every line.
+        plant_uncommitted(&path, b"not JSON");
+        commit_every_line(&path, &store);
+        let log = fs::read(&path).unwrap();
+        let queued = outbox_bytes(&path);
+        let owner = store.load_outbox_owner_state(1).unwrap();
+        let error = writer.drain_outbox().unwrap_err();
+        assert_eq!(format!("{error:?}"), format!("{refusal:?}"));
+        assert_eq!(fs::read(&path).unwrap(), log);
+        assert_eq!(outbox_bytes(&path), queued);
+        assert_eq!(store.load_outbox_owner_state(1).unwrap(), owner);
+        drop(writer);
+
+        // After the cutover completed, a rewritten commitment refuses too.
+        let (_dir, path, store, mut writer) = cut_over_fixture();
+        plant_uncommitted(&path, &serde_json::to_vec(&row("imported")).unwrap());
+        commit_every_line(&path, &store);
+        let log = fs::read(&path).unwrap();
+        let error = writer.drain_outbox().unwrap_err();
+        assert_eq!(format!("{error:?}"), format!("{refusal:?}"));
+        assert_eq!(fs::read(&path).unwrap(), log);
+        assert_eq!(delivered(&path, "imported"), 0);
+    }
+
+    #[test]
+    fn owner_rows_require_tags_and_current_positions() {
+        let body = fixed_row().canonical_json_body().unwrap();
+        let noncanonical = String::from_utf8(body.clone())
+            .unwrap()
+            .replacen('{', "{ ", 1)
+            .into_bytes();
+        let mut forged = sign_row(1, 1, 0, &body);
+        let end = forged.len();
+        forged[end - 3] = if forged[end - 3] == b'0' { b'1' } else { b'0' };
+        let cases: Vec<(Vec<u8>, Vec<u8>, WriterError)> = vec![
+            (
+                header(1),
+                serde_json::to_vec(&fixed_row()).unwrap(),
+                WriterError::OutboxRowsMissing {
+                    recorded: 1,
+                    found: 0,
+                },
+            ),
+            (
+                header(1),
+                line_of(&sign_row(1, 1, 0, &body))
+                    .replace("\"g\":1", "\"g\":00")
+                    .into_bytes(),
+                WriterError::OutboxRowsMissing {
+                    recorded: 1,
+                    found: 0,
+                },
+            ),
+            (
+                header(1),
+                sign_row(0, 1, 0, &body),
+                WriterError::OutboxRowsMissing {
+                    recorded: 1,
+                    found: 1,
+                },
+            ),
+            (
+                header(1),
+                sign_row(1, 2, 0, &body),
+                WriterError::OutboxRowsMissing {
+                    recorded: 1,
+                    found: 2,
+                },
+            ),
+            (
+                header(5),
+                sign_row(5, 1, 0, &body),
+                WriterError::OutboxRowsMissing {
+                    recorded: 0,
+                    found: 1,
+                },
+            ),
+            (
+                test_seam::generation_line(&[0x11; 32], 1),
+                sign_row(1, 1, 0, &body),
+                unusable("tagged record whose tag does not verify"),
+            ),
+            (
+                header(1),
+                b"{\"k\":\"row\"}".to_vec(),
+                WriterError::OutboxUnusable {
+                    line: 2,
+                    column: 1,
+                    reason: "tagged record that does not parse",
+                },
+            ),
+            (
+                header(1),
+                forged,
+                WriterError::OutboxUnusable {
+                    line: 2,
+                    column: 1,
+                    reason: "tagged record whose tag does not verify",
+                },
+            ),
+            (
+                header(1),
+                sign_row(1, 1, 0, &noncanonical),
+                WriterError::OutboxUnusable {
+                    line: 2,
+                    column: 1,
+                    reason: "tagged record that is not canonical",
+                },
+            ),
+            (
+                header(1),
+                encode_tagged_row(&ROW_KEY, 1, 1, 0, &own_row("own")).unwrap(),
+                WriterError::OutboxRowKindRefused { line: 2 },
+            ),
+        ];
+        for (first, second, expected) in cases {
+            let (_dir, path, store, mut writer) = cut_over_fixture();
+            let mut bytes = first;
+            bytes.extend_from_slice(&second);
+            bytes.push(b'\n');
+            fs::write(outbox_path(&path), &bytes).unwrap();
+            let log = fs::read(&path).unwrap();
+            let owner = store.load_outbox_owner_state(1).unwrap();
+            let error = writer.drain_outbox().unwrap_err();
+            assert_eq!(format!("{error:?}"), format!("{expected:?}"));
+            assert_eq!(fs::read(&path).unwrap(), log);
+            assert_eq!(outbox_bytes(&path), bytes);
+            assert_eq!(store.load_outbox_owner_state(1).unwrap(), owner);
+        }
+    }
+
+    fn line_of(bytes: &[u8]) -> String {
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[test]
+    fn generation_advance_recovers_every_crash_boundary() {
+        use test_seam::Stop;
+        // An empty live drain commits nothing and keeps the generation.
+        let (_dir, path, store, mut writer) = cut_over_fixture();
+        let writes = store.outbox_item_writes();
+        assert_eq!(writer.drain_outbox().unwrap(), 0);
+        assert_eq!(store.outbox_item_writes(), writes);
+        assert_eq!(outbox_bytes(&path), header(1));
+        drop(writer);
+        for (stop, repeated) in [
+            (Stop::BeforeAppends, 0),
+            (Stop::AfterAppend(1), 1),
+            (Stop::AfterAppend(2), 2),
+            (Stop::AnchorChecked, 2),
+            (Stop::OwnerStored, 0),
+            (Stop::ReplacementSynced, 0),
+            (Stop::Renamed, 0),
+            (Stop::DirectorySynced, 0),
+        ] {
+            let (_dir, path, store, mut writer) = cut_over_fixture();
+            enqueue(&path, &store, &["one", "two"]);
+            test_seam::arm_stop(&outbox_path(&path), stop);
+            assert!(
+                matches!(writer.drain_outbox(), Err(WriterError::Io(_))),
+                "{stop:?}"
+            );
+            let committed = !matches!(
+                stop,
+                Stop::BeforeAppends | Stop::AfterAppend(_) | Stop::AnchorChecked
+            );
+            assert_eq!(
+                owner_summary(&store),
+                if committed {
+                    (2, Some((1, 2)))
+                } else {
+                    (1, Some((0, 1)))
+                },
+                "{stop:?}"
+            );
+            drop(writer);
+            let mut writer = reopen(&path, &store);
+            assert_eq!(writer.drain_outbox().unwrap(), 0, "{stop:?}");
+            for (index, id) in ["one", "two"].into_iter().enumerate() {
+                let times = if index < repeated { 2 } else { 1 };
+                assert_eq!(delivered(&path, id), times, "{stop:?}: {id}");
+            }
+            assert_eq!(outbox_bytes(&path), header(2), "{stop:?}");
+            assert_eq!(owner_summary(&store), (2, Some((1, 2))), "{stop:?}");
+        }
+    }
+
+    #[test]
+    fn the_window_suffix_is_delivered_not_cleared() {
+        let (_dir, path, store, mut writer) = cut_over_fixture();
+        enqueue(&path, &store, &["one", "two"]);
+        test_seam::arm_stop(&outbox_path(&path), test_seam::Stop::OwnerStored);
+        assert!(matches!(writer.drain_outbox(), Err(WriterError::Io(_))));
+        assert_eq!(owner_summary(&store), (2, Some((1, 2))));
+        // An appender still sees generation 1 and appends at position 3.
+        enqueue(&path, &store, &["three"]);
+        let flagged = encode_tagged_row(&ROW_KEY, 1, 4, 1, &row("four")).unwrap();
+        plant_uncommitted(&path, &flagged);
+        let bytes = outbox_bytes(&path);
+        let lines = parse_lines(&bytes).lines;
+        let three: serde_json::Value = serde_json::from_slice(lines[3]).unwrap();
+        assert_eq!(
+            (three["g"].as_u64(), three["s"].as_u64()),
+            (Some(1), Some(3))
+        );
+        let digests: Vec<_> = lines[1..]
+            .iter()
+            .map(|line| test_seam::delivered_row_digest(line).unwrap())
+            .collect();
+        assert_eq!(writer.drain_outbox().unwrap(), 2);
+        for id in ["one", "two", "three", "four"] {
+            assert_eq!(delivered(&path, id), 1, "{id}");
+        }
+        let owner = owner_state(&store).unwrap();
+        let closed = owner.closed.clone().unwrap();
+        assert_eq!((owner.g, closed.g, closed.n), (2, 1, 4));
+        assert_eq!(closed.batch, batch_digest(&digests));
+        assert_eq!(owner.recent, vec![digests[3].1]);
+        assert_eq!(outbox_bytes(&path), header(2));
+    }
+
+    #[test]
+    fn a_restored_row_at_closed_coordinates_refuses() {
+        let (_dir, path, store, mut writer) = cut_over_fixture();
+        enqueue(&path, &store, &["one", "two"]);
+        test_seam::arm_stop(&outbox_path(&path), test_seam::Stop::OwnerStored);
+        assert!(matches!(writer.drain_outbox(), Err(WriterError::Io(_))));
+        let bytes = outbox_bytes(&path);
+        let lines = parse_lines(&bytes).lines;
+        let mut restored = [lines[0], lines[1]].join(&b'\n');
+        restored.push(b'\n');
+        restored.extend_from_slice(&encode_tagged_row(&ROW_KEY, 1, 2, 0, &row("other")).unwrap());
+        restored.push(b'\n');
+        fs::write(outbox_path(&path), &restored).unwrap();
+        let log = fs::read(&path).unwrap();
+        let owner = store.load_outbox_owner_state(1).unwrap();
+        let error = writer.drain_outbox().unwrap_err();
+        assert!(
+            matches!(
+                error,
+                WriterError::OutboxRowsMissing {
+                    recorded: 2,
+                    found: 2
+                }
+            ),
+            "{error:?}"
+        );
+        assert!(error.to_string().starts_with("audit.outbox_rows_missing"));
+        assert_eq!(fs::read(&path).unwrap(), log);
+        assert_eq!(outbox_bytes(&path), restored);
+        assert_eq!(store.load_outbox_owner_state(1).unwrap(), owner);
+    }
+
+    #[test]
+    fn a_failed_anchor_write_commits_no_evidence() {
+        let (_dir, path, store, mut writer) = keyed_fixture();
+        enqueue(&path, &store, &["anchored"]);
+        let queued = outbox_bytes(&path);
+        let legacy = store.load_outbox_state(1).unwrap();
+        // The append's anchor write and its in-line retry fail, and so does
+        // the strict check's retry after the appends.
+        store.fail_next_writes(3);
+        let error = writer.drain_outbox().unwrap_err();
+        assert!(matches!(error, WriterError::TipAnchorStore(_)), "{error:?}");
+        assert_eq!(delivered(&path, "anchored"), 1);
+        assert_eq!(store.load_outbox_owner_state(1).unwrap(), None);
+        assert_eq!(store.load_outbox_state(1).unwrap(), legacy);
+        assert_eq!(outbox_bytes(&path), queued);
+        assert!(store.outbox_item_writes().is_empty());
+        assert_eq!(writer.drain_outbox().unwrap(), 1);
+        assert_eq!(
+            delivered(&path, "anchored"),
+            2,
+            "redelivered with its request id"
+        );
+        assert_eq!(outbox_bytes(&path), header(1));
+    }
+
+    /// A store with only the default owner-state support.
+    #[derive(Debug)]
+    struct DefaultOwnerStore(Arc<InMemoryTipAnchorStore>);
+
+    impl TipAnchorStore for DefaultOwnerStore {
+        fn reads_audit_key(&self) -> bool {
+            false
+        }
+        fn load_carrier_record(
+            &self,
+        ) -> Result<Option<crate::audit_log::tip_anchor::CarrierRecord>, TipAnchorStoreError>
+        {
+            self.0.load_carrier_record()
+        }
+        fn store_carrier_record(
+            &self,
+            record: &crate::audit_log::tip_anchor::CarrierRecord,
+        ) -> Result<(), TipAnchorStoreError> {
+            self.0.store_carrier_record(record)
+        }
+        fn load_outbox_state(
+            &self,
+            generation: u64,
+        ) -> Result<Option<OutboxState>, TipAnchorStoreError> {
+            self.0.load_outbox_state(generation)
+        }
+        fn store_outbox_state(
+            &self,
+            generation: u64,
+            value: &OutboxState,
+        ) -> Result<(), TipAnchorStoreError> {
+            self.0.store_outbox_state(generation, value)
+        }
+        fn load_anchor(
+            &self,
+        ) -> Result<Option<crate::audit_log::tip_anchor::TipAnchor>, TipAnchorStoreError> {
+            self.0.load_anchor()
+        }
+        fn load_raw(&self) -> Result<Option<String>, TipAnchorStoreError> {
+            self.0.load_raw()
+        }
+        fn store_anchor(
+            &self,
+            anchor: &crate::audit_log::tip_anchor::TipAnchor,
+        ) -> Result<(), TipAnchorStoreError> {
+            self.0.store_anchor(anchor)
+        }
+        fn bump_reanchor_count(&self) -> Result<u64, TipAnchorStoreError> {
+            self.0.bump_reanchor_count()
+        }
+        fn reanchor_count(&self) -> Result<Option<u64>, TipAnchorStoreError> {
+            self.0.reanchor_count()
+        }
+    }
+
+    #[test]
+    fn tagged_owner_store_failure_repeats_rows() {
+        let (_dir, path, store, mut writer) = keyed_fixture();
+        enqueue(&path, &store, &["one", "two"]);
+        let queued = outbox_bytes(&path);
+        let legacy = store.load_outbox_state(1).unwrap();
+        store.set_owner_failing(false, true);
+        let error = writer.drain_outbox().unwrap_err();
+        assert_eq!(
+            format!("{error:?}"),
+            format!(
+                "{:?}",
+                WriterError::TipAnchorStore(TipAnchorStoreError::new("owner write fault"))
+            )
+        );
+        assert_eq!(outbox_bytes(&path), queued);
+        assert_eq!(store.load_outbox_state(1).unwrap(), legacy);
+        store.set_owner_failing(false, false);
+        assert_eq!(writer.drain_outbox().unwrap(), 2);
+        for id in ["one", "two"] {
+            assert_eq!(delivered(&path, id), 2, "{id}");
+        }
+        assert_eq!(outbox_bytes(&path), header(1));
+        drop(writer);
+
+        // A store without owner support delivers once per attempt.
+        let dir = TempDir::new().unwrap();
+        let path = log_path(&dir);
+        let inner = Arc::new(InMemoryTipAnchorStore::new());
+        let store: Arc<dyn TipAnchorStore> = Arc::new(DefaultOwnerStore(inner.clone()));
+        let mut writer = AuditWriter::open(
+            path.clone(),
+            Some(KeyedAuditAccess::new(
+                Zeroizing::new(ROW_KEY),
+                store.clone(),
+            )),
+        )
+        .unwrap();
+        AuditOutbox::for_log_keyed(&path, store.clone(), Zeroizing::new(ROW_KEY))
+            .append(&row("default"))
+            .unwrap();
+        let queued = outbox_bytes(&path);
+        let unsupported = WriterError::TipAnchorStore(TipAnchorStoreError::new(
+            "outbox owner state is unsupported",
+        ));
+        for attempt in 1..=2 {
+            let error = writer.drain_outbox().unwrap_err();
+            assert_eq!(format!("{error:?}"), format!("{unsupported:?}"));
+            assert_eq!(delivered(&path, "default"), attempt);
+            assert_eq!(outbox_bytes(&path), queued, "nothing is cleared");
+        }
     }
 }

@@ -453,6 +453,19 @@ where
         .require_anchor_current()
         .map_err(|e| anchor_not_current(args.profile_name(), &e))?;
 
+    // ── Fence: before the key write, publish a generation line that no key
+    // verifies in place of the drained queue.  Until step 4 publishes the
+    // line under the new key, every keyed append refuses.  An appender that
+    // holds the old key is never told a row is queued that the new key's
+    // drain would refuse.  A refused fence leaves the key unchanged.
+    writer.fence_outbox_for_key_change().map_err(|e| {
+        crate::commands::audit::audit_writer_error(
+            &e,
+            "audit.writer_unavailable",
+            args.profile_name(),
+        )
+    })?;
+
     // ── Step 3: persist the new chain-root key (destroys the old key).
     rotate_hmac_like_key(entry_ref, "rotate_audit_key")?;
 
@@ -495,13 +508,12 @@ where
         &request_id,
     );
 
-    // ── Step 6: bring the tip anchor onto the file as it stands and drain
-    // any consent row queued since the open, BEFORE the re-sign.  The writer
-    // holds the new key since step 4, so a drained row is tagged under it, and
-    // one that starts a new file has its chain root signed under it too; the
-    // re-sign below rewrites every sidecar under the new key in one pass.  The
-    // writer appends nothing after the re-sign.  A row queued later drains at
-    // the next acquisition, which opens under the new key.
+    // ── Step 6: bring the tip anchor onto the file as it stands, BEFORE the
+    // re-sign.  Its drain retries a generation line that step 4 could not
+    // publish, under the new key.  No row can be queued while the rotation
+    // holds the outbox lock, so the drain delivers none.  The re-sign below
+    // rewrites every sidecar under the new key in one pass, and the writer
+    // appends nothing after it.
     // Non-fatal: the key has rotated, and the next acquisition reconciles and
     // drains anyway.
     // Root and marker tags remain under the old key until the re-sign below.
@@ -697,146 +709,344 @@ mod tests {
         );
     }
 
-    /// A consent row queued after the verb's own row drains BEFORE the
-    /// re-sign, even when its append rotates the log, so the whole chain
-    /// verifies under the new key.
-    ///
-    /// A read hook at the tip-anchor coordinate queues the row once the verb's
-    /// `keyring_key_written` row is in the log, after the drain that row's
-    /// append ran, and lowers the rotation threshold to the log's length at
-    /// that moment: the verb's rekey row and its own row fit, and the queued
-    /// row's append rotates the log, during the final
-    /// reconciliation. The queued row then opens the new file, whose chain
-    /// root the writer signs with the key it was opened under.
-    #[tokio::test]
-    #[serial]
-    async fn a_consent_row_drained_by_the_final_reconciliation_is_resigned_under_the_new_key() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
+    /// A consent row in the shape of the contended consent sink: tagged under
+    /// the key the profile holds when it is queued.
+    fn consent_row(request_id: &str) -> stellar_agent_core::audit_log::AuditEntry {
+        stellar_agent_core::audit_log::AuditEntry::new_approval_attested(
+            "PaymentSimulated",
+            "stellar_pay_commit",
+            None,
+            "ABCDEFGHIJKLMNOPQRSTUV",
+            "cli",
+            request_id,
+        )
+    }
 
-        use stellar_agent_core::audit_log::rotation::test_seam;
-        use stellar_agent_core::audit_log::{
-            AuditEntry, AuditOutbox, PolicyDecision, inspect_outbox, tip_anchor_account, verify_log,
-        };
-        use stellar_agent_test_support::keyring_mock::{ReadHook, install_with_read_hooks};
-
-        let dir = tempfile::tempdir().expect("tmp dir");
-        let name = "rotate-drain-resign";
-        let mut profile = Profile::builder_testnet(name, "acct", "n-svc", "n-acct")
-            .with_profile_name(name)
-            .build();
-        profile.audit_log_path = dir.path().join("audit.jsonl");
-        let log_path = profile.audit_log_path.clone();
-        let entry_ref = profile.audit_log_hash_chain_key_id.clone();
-
-        let queued = Arc::new(AtomicBool::new(false));
-        let hook = {
-            let queued = Arc::clone(&queued);
-            let log_path = log_path.clone();
-            let outbox_store = stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
+    /// Queues `request_id` through a keyed outbox under the profile's current
+    /// audit key.
+    fn queue_keyed(
+        profile: &Profile,
+        name: &str,
+        request_id: &str,
+    ) -> Result<(), stellar_agent_core::audit_log::WriterError> {
+        let key = load_audit_hmac_key(profile, name).expect("load the current key");
+        stellar_agent_core::audit_log::AuditOutbox::for_log_keyed(
+            &profile.audit_log_path,
+            KeyringTipAnchorStore::shared(
                 &profile.audit_log_hash_chain_key_id,
-                &log_path,
-            );
-            Arc::new(move || {
-                if queued.load(Ordering::SeqCst) {
-                    return;
-                }
-                let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-                if !log.contains(r#""kind":"keyring_key_written""#) {
-                    return;
-                }
-                queued.store(true, Ordering::SeqCst);
-                // The guard set before the verb restores the default when it
-                // drops; this lowered value replaces its threshold until then.
-                std::mem::forget(test_seam::set_rotation_threshold(
-                    &log_path,
-                    u64::try_from(log.len()).expect("log length"),
-                ));
-                AuditOutbox::for_log(&log_path, outbox_store.clone())
-                    .append(&AuditEntry::new_approval_attested(
-                        "PaymentSimulated",
-                        "stellar_pay_commit",
-                        None,
-                        "ABCDEFGHIJKLMNOPQRSTUV",
-                        "cli",
-                        "queued-after-the-verb-row",
-                    ))
-                    .expect("queue a consent row");
-            }) as Arc<dyn Fn() + Send + Sync>
-        };
-        install_with_read_hooks(vec![ReadHook::new(
-            &entry_ref.service,
-            &tip_anchor_account(&entry_ref.account, &log_path),
-            hook,
-        )])
-        .expect("mock keyring store");
+                &profile.audit_log_path,
+            ),
+            key,
+        )
+        .append(&consent_row(request_id))
+    }
 
-        rotate_hmac_like_key(&entry_ref, "test_seed").expect("seed the old key");
-        let old_key = load_audit_hmac_key(&profile, name).expect("load the old key");
-        {
-            let mut writer = open_locked_audit_writer(&profile, name, BindingHistory::NotRecorded)
-                .expect("open the writer");
-            writer
-                .write_entry(AuditEntry::new_value_action_submitted(
-                    "stellar_pay",
-                    "stellar:testnet",
-                    Vec::new(),
-                    "abcd1234…wxyz5678",
-                    7,
-                    PolicyDecision::Allow,
-                    None,
-                    None,
-                    None,
-                    "req-pre",
-                    None,
-                ))
-                .expect("append a pre-rotation row");
+    /// The outbox bytes of the profile's log, or `None` without an outbox.
+    fn outbox_bytes(profile: &Profile) -> Option<Vec<u8>> {
+        match std::fs::read(stellar_agent_core::audit_log::outbox_path(
+            &profile.audit_log_path,
+        )) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => panic!("read the outbox: {e}"),
         }
-        // No append rotates until the hook lowers the threshold.
-        let threshold_guard = test_seam::set_rotation_threshold(&log_path, u64::MAX);
+    }
 
+    /// The `kind` of every row of the active file, in order.
+    fn active_kinds(profile: &Profile) -> Vec<String> {
+        std::fs::read_to_string(&profile.audit_log_path)
+            .expect("read the log")
+            .lines()
+            .map(|line| {
+                let row: serde_json::Value = serde_json::from_str(line).expect("JSON row");
+                row["kind"].as_str().expect("kind").to_owned()
+            })
+            .collect()
+    }
+
+    /// Runs the verb for `name` and requires it to succeed.
+    async fn rotate_succeeds(profile: &Profile, name: &str) {
         let args = RotateAuditKeyArgs {
             name: Some(name.to_owned()),
             profile: None,
         };
         let cloned_profile = profile.clone();
-        let result = rotate(&args, move |_name| Ok(cloned_profile.clone()), || Ok(())).await;
-        drop(threshold_guard);
-        match result {
+        match rotate(&args, move |_name| Ok(cloned_profile.clone()), || Ok(())).await {
             Ok(_) => {}
             Err(RotateRefusal::Integrity(e)) => panic!("unexpected integrity refusal: {e}"),
             Err(RotateRefusal::Wallet(e)) => panic!("the rotation must succeed: {e}"),
             Err(RotateRefusal::ProfileAccess(e)) => panic!("the rotation must succeed: {e}"),
         }
+    }
 
-        assert!(
-            queued.load(Ordering::SeqCst),
-            "the consent row was queued after the verb's row"
-        );
+    /// A consent row queued before the verb starts is drained by the verb's
+    /// own open, under the held outbox lock and before the key write. The
+    /// rekey row tagged under the new key covers it, so the log verifies
+    /// under the new key and fails under the old one.
+    ///
+    /// The rotation writer keeps the outbox lock from its open to its drop, so
+    /// the open's drain is the last one that can deliver a row in the verb.
+    #[tokio::test]
+    #[serial]
+    async fn a_consent_row_queued_before_the_rotation_is_resigned_under_the_new_key() {
+        use stellar_agent_core::audit_log::{inspect_outbox, verify_log};
+
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let name = "rotate-drain-resign";
+        let profile = tagged_profile(name, dir.path());
+        let old_key = load_audit_hmac_key(&profile, name).expect("load the old key");
+        queue_keyed(&profile, name, "queued-before-the-verb").expect("queue a consent row");
+        assert_eq!(inspect_outbox(&profile.audit_log_path).unwrap().pending, 1);
+
+        rotate_succeeds(&profile, name).await;
+
         assert_eq!(
-            inspect_outbox(&log_path).expect("inspect").pending,
-            0,
-            "the verb drained the queued row"
+            active_kinds(&profile),
+            [
+                "audit_entry_tags_started",
+                "tool_invocation",
+                "approval_attested",
+                "audit_entry_tags_rekeyed",
+                "keyring_key_written"
+            ],
+            "the open drained the queued row before the rekey row"
         );
-        let first_active: serde_json::Value = serde_json::from_str(
-            std::fs::read_to_string(&log_path)
-                .expect("read the active file")
-                .lines()
-                .next()
-                .expect("the active file has a row"),
-        )
-        .expect("a JSON row");
+        let log = std::fs::read_to_string(&profile.audit_log_path).expect("read the log");
         assert_eq!(
-            first_active["request_id"], "queued-after-the-verb-row",
-            "the queued row's append rotated the log and opened the new file"
+            log.matches("\"queued-before-the-verb\"").count(),
+            1,
+            "{log}"
         );
+        assert_eq!(inspect_outbox(&profile.audit_log_path).unwrap().pending, 0);
 
         let new_key = load_audit_hmac_key(&profile, name).expect("load the new key");
         assert_ne!(*new_key, *old_key, "the key rotated");
-        let verified =
-            verify_log(&log_path, Some(&new_key)).expect("every file verifies under the new key");
+        let verified = verify_log(&profile.audit_log_path, Some(&new_key))
+            .expect("the log verifies under the new key");
         assert!(verified.hmac_verified, "{verified:?}");
-        assert_eq!(verified.files_walked, 2, "{verified:?}");
+        assert!(verified.entry_tags_verified, "{verified:?}");
+        let boundary = verified.entry_tags_boundary.expect("a boundary");
+        assert_eq!(boundary.kind, "audit_entry_tags_rekeyed");
+        assert_eq!(boundary.line, 4, "the rekey row covers the drained row");
+        assert!(
+            verify_log(&profile.audit_log_path, Some(&old_key)).is_err(),
+            "the old key does not verify the rotated log"
+        );
+    }
+
+    /// While the verb holds the outbox, an unkeyed and a keyed append both
+    /// refuse `OutboxBusy`, the outbox bytes stay as they are, and the
+    /// rotation completes without either row.
+    ///
+    /// A read hook at the tip-anchor coordinate runs once the verb's
+    /// `keyring_key_written` row is in the log. That is after the key write,
+    /// while the rotation writer still holds its outbox lock.
+    #[tokio::test]
+    #[serial]
+    async fn appends_during_the_rotation_refuse_busy_and_leave_the_outbox() {
+        use std::sync::{Arc, Mutex};
+
+        use stellar_agent_core::audit_log::{
+            AuditOutbox, WriterError, tip_anchor_account, verify_log,
+        };
+        use stellar_agent_test_support::keyring_mock::{ReadHook, install_with_read_hooks};
+
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let name = "rotate-busy-outbox";
+        let mut profile = Profile::builder_testnet(name, "acct", "n-svc", "n-acct")
+            .with_profile_name(name)
+            .build();
+        profile.audit_log_path = dir.path().join("audit.jsonl");
+        let entry_ref = profile.audit_log_hash_chain_key_id.clone();
+
+        type Attempts = Option<(Option<Vec<u8>>, String, String, Option<Vec<u8>>)>;
+        let attempts: Arc<Mutex<Attempts>> = Arc::new(Mutex::new(None));
+        let hook = {
+            let attempts = Arc::clone(&attempts);
+            let profile = profile.clone();
+            Arc::new(move || {
+                if attempts.lock().unwrap().is_some() {
+                    return;
+                }
+                let log = std::fs::read_to_string(&profile.audit_log_path).unwrap_or_default();
+                if !log.contains(r#""kind":"keyring_key_written""#) {
+                    return;
+                }
+                let before = outbox_bytes(&profile);
+                let unkeyed = AuditOutbox::for_log(
+                    &profile.audit_log_path,
+                    KeyringTipAnchorStore::shared(
+                        &profile.audit_log_hash_chain_key_id,
+                        &profile.audit_log_path,
+                    ),
+                )
+                .append(&consent_row("unkeyed-during-the-verb"));
+                let keyed = queue_keyed(&profile, name, "keyed-during-the-verb");
+                let after = outbox_bytes(&profile);
+                *attempts.lock().unwrap() =
+                    Some((before, format!("{unkeyed:?}"), format!("{keyed:?}"), after));
+            }) as Arc<dyn Fn() + Send + Sync>
+        };
+        install_with_read_hooks(vec![ReadHook::new(
+            &entry_ref.service,
+            &tip_anchor_account(&entry_ref.account, &profile.audit_log_path),
+            hook,
+        )])
+        .expect("mock keyring store");
+        rotate_hmac_like_key(&entry_ref, "test_seed").expect("seed the old key");
+        {
+            let mut writer = open_locked_audit_writer(&profile, name, BindingHistory::NotRecorded)
+                .expect("open the writer");
+            writer
+                .write_entry(consent_row("req-pre"))
+                .expect("append a pre-rotation row");
+        }
+        queue_keyed(&profile, name, "queued-before-the-verb").expect("queue a consent row");
+
+        rotate_succeeds(&profile, name).await;
+
+        let (before, unkeyed, keyed, after) = attempts
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the hook ran during the rotation");
+        let busy = format!("{:?}", Err::<(), _>(WriterError::OutboxBusy));
+        assert_eq!(unkeyed, busy, "the unkeyed append waits and refuses");
+        assert_eq!(keyed, busy, "the keyed append waits and refuses");
+        assert!(before.is_some(), "the open published the drained queue");
+        assert_eq!(before, after, "the refused appends leave the outbox bytes");
+        assert_eq!(
+            outbox_bytes(&profile),
+            before,
+            "the rotation queued nothing"
+        );
+        let log = std::fs::read_to_string(&profile.audit_log_path).expect("read the log");
+        assert!(!log.contains("during-the-verb"), "{log}");
+        let new_key = load_audit_hmac_key(&profile, name).expect("load the new key");
+        assert!(
+            verify_log(&profile.audit_log_path, Some(&new_key))
+                .expect("the log verifies under the new key")
+                .hmac_verified
+        );
+    }
+
+    /// A consent row queued after the verb returned queues under the new key
+    /// behind the re-signed generation line and drains at the next open,
+    /// tagged under the new key.
+    #[tokio::test]
+    #[serial]
+    async fn a_row_queued_after_the_rotation_drains_under_the_new_key() {
+        use stellar_agent_core::audit_log::{inspect_outbox, verify_log};
+
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let name = "rotate-then-queue";
+        let profile = tagged_profile(name, dir.path());
+        let old_key = load_audit_hmac_key(&profile, name).expect("load the old key");
+        queue_keyed(&profile, name, "queued-before-the-verb").expect("queue a consent row");
+
+        rotate_succeeds(&profile, name).await;
+
+        queue_keyed(&profile, name, "queued-after-the-verb")
+            .expect("the re-signed queue takes a row under the new key");
+        assert_eq!(inspect_outbox(&profile.audit_log_path).unwrap().pending, 1);
+        {
+            let _writer = open_locked_audit_writer(&profile, name, BindingHistory::NotRecorded)
+                .expect("the next open drains the queue");
+        }
+        assert_eq!(inspect_outbox(&profile.audit_log_path).unwrap().pending, 0);
+        let kinds = active_kinds(&profile);
+        assert_eq!(kinds.last().map(String::as_str), Some("approval_attested"));
+        let last: serde_json::Value = serde_json::from_str(
+            std::fs::read_to_string(&profile.audit_log_path)
+                .expect("read the log")
+                .lines()
+                .last()
+                .expect("a row"),
+        )
+        .expect("JSON row");
+        assert_eq!(last["request_id"], "queued-after-the-verb");
+
+        let new_key = load_audit_hmac_key(&profile, name).expect("load the new key");
+        let verified = verify_log(&profile.audit_log_path, Some(&new_key))
+            .expect("the log verifies under the new key");
+        assert!(verified.hmac_verified, "{verified:?}");
+        assert!(verified.entry_tags_verified, "{verified:?}");
+        assert!(
+            verify_log(&profile.audit_log_path, Some(&old_key)).is_err(),
+            "the old key does not verify the drained row"
+        );
+    }
+
+    /// The outbox fence runs before the key write: a fence that fails refuses
+    /// the verb with the key unchanged. A rerun completes the rotation. An
+    /// appender that cached the old key before either run then queues under
+    /// the reloaded new key, and the next open delivers its row.
+    #[tokio::test]
+    #[serial]
+    async fn the_outbox_fence_precedes_the_key_write_and_a_stale_appender_queues_under_the_new_key()
+    {
+        use stellar_agent_core::audit_log::outbox::test_seam;
+        use stellar_agent_core::audit_log::{AuditOutbox, outbox_path, verify_log};
+
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let name = "rotate-fence-first";
+        let profile = tagged_profile(name, dir.path());
+        let old_key = load_audit_hmac_key(&profile, name).expect("load the old key");
+        let stale = AuditOutbox::for_log_keyed(
+            &profile.audit_log_path,
+            KeyringTipAnchorStore::shared(
+                &profile.audit_log_hash_chain_key_id,
+                &profile.audit_log_path,
+            ),
+            old_key.clone(),
+        );
+        let mut replacement = outbox_path(&profile.audit_log_path).into_os_string();
+        replacement.push(".next");
+        test_seam::arm_sync_failure(
+            std::path::Path::new(&replacement),
+            test_seam::SyncStep::Create,
+        );
+        let args = RotateAuditKeyArgs {
+            name: Some(name.to_owned()),
+            profile: None,
+        };
+        let cloned_profile = profile.clone();
+        let refused = rotate(&args, move |_name| Ok(cloned_profile.clone()), || Ok(())).await;
+        assert!(
+            matches!(refused, Err(RotateRefusal::Wallet(_))),
+            "a failed fence refuses the verb"
+        );
+        assert_eq!(
+            *load_audit_hmac_key(&profile, name).expect("load the key"),
+            *old_key,
+            "the key is unchanged"
+        );
+
+        rotate_succeeds(&profile, name).await;
+        let new_key = load_audit_hmac_key(&profile, name).expect("load the new key");
+        assert_ne!(*new_key, *old_key);
+        stale
+            .append(&consent_row("cached-old-key"))
+            .expect("the appender reloads the new key and queues under it");
+        {
+            let _writer = open_locked_audit_writer(&profile, name, BindingHistory::NotRecorded)
+                .expect("the next open drains the queue");
+        }
+        let last: serde_json::Value = serde_json::from_str(
+            std::fs::read_to_string(&profile.audit_log_path)
+                .expect("read the log")
+                .lines()
+                .last()
+                .expect("a row"),
+        )
+        .expect("JSON row");
+        assert_eq!(last["request_id"], "cached-old-key");
+        let verified = verify_log(&profile.audit_log_path, Some(&new_key))
+            .expect("the log verifies under the new key");
+        assert!(verified.entry_tags_verified, "{verified:?}");
     }
 
     /// The verb's first row, its rekey row, opens a file before the re-sign
