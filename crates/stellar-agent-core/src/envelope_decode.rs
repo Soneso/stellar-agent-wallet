@@ -415,6 +415,36 @@ pub fn payment_memo_shape(
 /// in its place.
 pub const TRANSACTION_ENVELOPE_XDR_FORM: &str = "must be base64-encoded TransactionEnvelope XDR";
 
+// This local input budget includes base64 whitespace. The protocol's Soroban
+// byte limit is configurable through ConfigSettingContractBandwidthV0.tx_max_size_bytes.
+pub(crate) const MAX_ENVELOPE_BASE64_LEN: usize = 2 * 1024 * 1024;
+pub(crate) const ENVELOPE_INPUT_TOO_LONG: &str = "the envelope exceeds the input length limit";
+
+#[derive(Debug)]
+pub(crate) enum EnvelopeReadError {
+    InputTooLong,
+    Xdr(stellar_xdr::Error),
+}
+
+/// Reads an envelope within fixed input and protocol collection bounds.
+///
+/// `stellar-xdr` limits `Transaction.operations` to 100 and `CreateClaimableBalanceOp.claimants` to 10.
+/// Its `VecM::read_xdr` checks each bound before reading the collection's elements.
+pub(crate) fn read_envelope(
+    envelope_xdr_b64: &str,
+) -> Result<stellar_xdr::TransactionEnvelope, EnvelopeReadError> {
+    use stellar_xdr::ReadXdr;
+
+    if envelope_xdr_b64.len() > MAX_ENVELOPE_BASE64_LEN {
+        return Err(EnvelopeReadError::InputTooLong);
+    }
+    stellar_xdr::TransactionEnvelope::from_xdr_base64(
+        envelope_xdr_b64,
+        stellar_agent_xdr_limits::untrusted_decode_limits(envelope_xdr_b64.len()),
+    )
+    .map_err(EnvelopeReadError::Xdr)
+}
+
 /// The accepted form of a caller-supplied `ScVal`, in the place of a decoder
 /// error that quotes a byte of the input.
 pub const SCVAL_XDR_FORM: &str = "must be base64-encoded ScVal XDR";
@@ -441,20 +471,12 @@ fn describe_xdr_decode_error(error: &stellar_xdr::Error) -> String {
 fn decode_single_operation(
     envelope_xdr_b64: &str,
 ) -> Result<(stellar_xdr::Transaction, stellar_xdr::Operation, String), EnvelopeDecodeError> {
-    use stellar_xdr::{ReadXdr, TransactionEnvelope};
-    // 2. Decode base64 → raw XDR bytes (via from_xdr_base64).
-    //    Bounded limits are required because the envelope is caller-supplied and
-    //    untrusted. A deeply nested `SorobanAuthorizedInvocation.sub_invocations`
-    //    chain would otherwise exhaust the stack (the XDR reader calls
-    //    `with_limited_depth` per recursive node). Both depth and len are capped:
-    //    depth prevents stack exhaustion, len prevents an oversized-allocation
-    //    attack from a forged length field.
-    let envelope = TransactionEnvelope::from_xdr_base64(
-        envelope_xdr_b64,
-        stellar_agent_xdr_limits::untrusted_decode_limits(envelope_xdr_b64.len()),
-    )
-    .map_err(|e| EnvelopeDecodeError::XdrDecode {
-        detail: describe_xdr_decode_error(&e),
+    use stellar_xdr::TransactionEnvelope;
+    let envelope = read_envelope(envelope_xdr_b64).map_err(|e| EnvelopeDecodeError::XdrDecode {
+        detail: match e {
+            EnvelopeReadError::InputTooLong => ENVELOPE_INPUT_TOO_LONG.to_owned(),
+            EnvelopeReadError::Xdr(error) => describe_xdr_decode_error(&error),
+        },
     })?;
 
     // 3. Extract the TransactionV1 body.
@@ -1277,6 +1299,48 @@ mod tests {
         clippy::panic,
         reason = "test-only; panics and unwraps acceptable in unit tests"
     )]
+
+    #[test]
+    fn envelope_reader_distinguishes_the_byte_budget_from_truncation() {
+        use base64::Engine as _;
+        use stellar_xdr::{HostFunction, InvokeHostFunctionOp, Limits, ReadXdr, WriteXdr};
+
+        let env = build_envelope(
+            SOURCE_G,
+            Operation {
+                source_account: None,
+                body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                    host_function: HostFunction::UploadContractWasm(Default::default()),
+                    auth: Default::default(),
+                }),
+            },
+            Memo::None,
+        );
+        let mut raw = env.to_xdr(Limits::none()).unwrap();
+        // The empty WASM length precedes the auth, extension, and signature counts.
+        let offset = raw.len() - 16;
+        raw[offset..offset + 4].copy_from_slice(&4096u32.to_be_bytes());
+        let encoded = base64::engine::general_purpose::STANDARD.encode(raw);
+        assert!(matches!(
+            read_envelope(&encoded),
+            Err(EnvelopeReadError::Xdr(
+                stellar_xdr::Error::LengthLimitExceeded
+            ))
+        ));
+        assert!(matches!(
+            TransactionEnvelope::from_xdr_base64(&encoded, Limits::none()),
+            Err(stellar_xdr::Error::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof
+        ));
+        let too_long = "!".repeat(MAX_ENVELOPE_BASE64_LEN + 1);
+        assert!(matches!(
+            read_envelope(&too_long),
+            Err(EnvelopeReadError::InputTooLong)
+        ));
+        assert!(matches!(
+            decode_authoritative_args(&too_long, "stellar_pay_commit"),
+            Err(EnvelopeDecodeError::XdrDecode { detail }) if detail == ENVELOPE_INPUT_TOO_LONG
+        ));
+    }
 
     use stellar_xdr::{
         AccountId, Asset, CreateAccountOp, Limits, Memo, MuxedAccount, MuxedAccountMed25519,
