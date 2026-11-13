@@ -1713,9 +1713,32 @@ async fn mcp_empty_resimulation_data_records_paired_withheld_row() {
 
 /// A V1 engine whose only rule caps the payment asset at `cap` per day.
 fn cap_engine(profile_name: &str, cap: i128) -> stellar_agent_core::PolicyEngineV1 {
+    cap_engine_with_recipient(profile_name, cap, None)
+}
+
+fn cap_engine_with_recipient(
+    profile_name: &str,
+    cap: i128,
+    recipient: Option<&str>,
+) -> stellar_agent_core::PolicyEngineV1 {
     use stellar_agent_core::policy::Decision;
     use stellar_agent_core::policy::v1::criteria::per_period_cap::{PerPeriodCapCriterion, Window};
+    use stellar_agent_core::policy::v1::criteria::{
+        Criterion,
+        counterparty_allowlist::{CounterpartyAllowlistCriterion, CounterpartyKind},
+    };
     use stellar_agent_core::{PolicyDocument, PolicyEngineV1, PolicyRule, RuleMatch, ScopeId};
+    let mut criteria: Vec<Box<dyn Criterion>> = vec![Box::new(PerPeriodCapCriterion::new(
+        ASSET.into(),
+        Window::parse("1d").expect("window"),
+        cap,
+    ))];
+    if let Some(recipient) = recipient {
+        criteria.push(Box::new(CounterpartyAllowlistCriterion::new(
+            vec![CounterpartyKind::GAccount, CounterpartyKind::CAccount],
+            vec![recipient.to_owned()],
+        )));
+    }
     PolicyEngineV1::new(
         PolicyDocument {
             version: 1,
@@ -1726,11 +1749,7 @@ fn cap_engine(profile_name: &str, cap: i128) -> stellar_agent_core::PolicyEngine
                     tool: "*".into(),
                     chain: "*".into(),
                 },
-                criteria: vec![Box::new(PerPeriodCapCriterion::new(
-                    ASSET.into(),
-                    Window::parse("1d").expect("window"),
-                    cap,
-                ))],
+                criteria,
                 decision: Decision::Allow,
                 allow_opaque_signing: false,
             }],
@@ -1833,19 +1852,30 @@ async fn valid_requirements_preserve_window_leg() {
         .as_str()
         .to_owned();
     let recipients = [
-        PAY_TO.to_owned(),
-        "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC".to_owned(),
-        muxed,
+        (PAY_TO.to_owned(), PAY_TO.to_owned()),
+        (
+            "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC".to_owned(),
+            "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC".to_owned(),
+        ),
+        (muxed.clone(), muxed.clone()),
+        (
+            muxed,
+            format!("{}", stellar_strkey::ed25519::PublicKey([0x2c; 32])),
+        ),
     ];
     let mut seed = 0xe3;
     for tool in [Tool::CreatePayment, Tool::AuthenticatedPayment] {
-        for recipient in &recipients {
+        for (recipient, entry) in &recipients {
             seed += 1;
             let profile_name = format!("x402-leg-{seed:x}");
             let mut fixture = fixture(&profile_name, [seed; 32], |_| {}).await;
             fixture
                 .server
-                .set_policy_engine_for_test(Arc::new(cap_engine(&profile_name, 100_000_000)));
+                .set_policy_engine_for_test(Arc::new(cap_engine_with_recipient(
+                    &profile_name,
+                    100_000_000,
+                    Some(entry),
+                )));
             let result = call_with(
                 &fixture,
                 tool,
@@ -1864,6 +1894,7 @@ async fn valid_requirements_preserve_window_leg() {
                 "{tool:?} {recipient}"
             );
             let (authorized, _) = x402_rows(&fixture.profile);
+            assert_eq!(authorized[0]["policy_decision"], "allow");
             let leg = &authorized[0]["legs"][0];
             assert_eq!(leg["amount"], "10000000", "{tool:?} {recipient}");
             assert_eq!(leg["asset"], ASSET, "{tool:?} {recipient}");

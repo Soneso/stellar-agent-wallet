@@ -24,6 +24,7 @@ for build configuration, admitted operations, and exclusions. Per tool on
 - `stellar_toolset_invoke` is annotated destructive, so its own policy gate
   refuses its other actions on mainnet: the default engine refuses a
   destructive tool, and a mainnet policy rule cannot name it.
+  On testnet, the toolset outer gate evaluates a payment action's effects.
 
 `stellar-agent-mcp` is a [Model Context Protocol](https://modelcontextprotocol.io)
 server that exposes the Stellar Agent Wallet to an MCP client. It speaks

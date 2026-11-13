@@ -74,6 +74,46 @@ use crate::policy::v1::proptest_strategies::{
 };
 use crate::policy::{Decision, DenyReason, PolicyEngine};
 
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(10_000))]
+
+    #[test]
+    fn address_check_lists_selected_kind_with_exact_or_base_entry(
+        bytes in any::<[u8; 32]>(),
+        form in 0u8..3,
+        kinds in 0u8..4,
+        entries in 0u8..32,
+        id in any::<u64>(),
+    ) {
+        use crate::policy::v1::criteria::counterparty_allowlist::{
+            CounterpartyAllowlistCriterion, CounterpartyKind, RecipientClass,
+        };
+        let g = format!("{}", stellar_strkey::ed25519::PublicKey(bytes));
+        let c = format!("{}", stellar_strkey::Contract(bytes));
+        let m = format!("{}", stellar_strkey::ed25519::MuxedAccount { ed25519: bytes, id });
+        let other_m = format!("{}", stellar_strkey::ed25519::MuxedAccount { ed25519: bytes, id: id.wrapping_add(1) });
+        let destination = [&g, &m, &c][usize::from(form)];
+        let mut selected = Vec::new();
+        if kinds & 1 != 0 { selected.push(CounterpartyKind::GAccount); }
+        if kinds & 2 != 0 { selected.push(CounterpartyKind::CAccount); }
+        let list: Vec<_> = [g.clone(), m.clone(), c.clone(), other_m, format!(" {g}")].into_iter()
+            .enumerate().filter(|(index, _)| entries & (1 << index) != 0).map(|(_, entry)| entry).collect();
+        let expected = (if form == 2 { kinds & 2 != 0 } else { kinds & 1 != 0 })
+            && (list.contains(destination) || (form == 1 && list.contains(&g)));
+        let criterion = CounterpartyAllowlistCriterion::new(selected, list);
+        let tool = crate::policy::ToolDescriptor::from_registration(&crate::policy::McpToolRegistration {
+            name: "registry_read", destructive_hint: false, read_only_hint: true,
+            chain_id_required: false, value_kind: crate::policy::ToolValueKind::ReadOnly,
+        });
+        let profile = crate::profile::schema::Profile::builder_testnet("svc", "acct", "nonce", "acct").build();
+        let store = crate::policy::v1::PolicyStateStore::new();
+        let args = serde_json::Value::Null;
+        let ctx = crate::policy::v1::EvalContext::new(&tool, &args, "operator", &profile, &store, 1_700_000_000_000);
+        let class = criterion.address_class_for_test(&ctx, destination).unwrap();
+        prop_assert_eq!(class == RecipientClass::Listed, expected);
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Decision equivalence helper
 // ─────────────────────────────────────────────────────────────────────────────
