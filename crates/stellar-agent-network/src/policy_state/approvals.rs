@@ -15,6 +15,7 @@ use stellar_agent_core::approval::{
     verify_attestation,
     witness::{ApprovalWitness, ApprovedKind},
 };
+use stellar_agent_core::policy::state_lock::WindowStoreLock;
 use stellar_agent_core::profile::{
     Profile, name::profile_name_for_approval, owner_key::OwnerKeyContext,
 };
@@ -22,7 +23,7 @@ use stellar_agent_core::profile::{
 use super::WindowStoreError;
 use super::operations::{
     APPROVAL_NONCE_MAX, CapacityDetail, FILE_THRESHOLD, OperationAudit, OperationId, OperationLink,
-    OperationRecorder, WindowSection,
+    OperationRecorder, Session, WindowSection,
 };
 use super::store::{PersistedWindowStore, RETENTION_MS, WIRE_VERSION_OPERATIONS, WireFile, now_ms};
 use crate::mainnet::{MainnetPrecondition, types::hex32};
@@ -621,28 +622,47 @@ impl<'a> ApprovalRecorder<'a> {
     ///
     /// Refuses an absent record, a clock before creation and store errors.
     pub fn revoke(&mut self, id: [u8; 32]) -> Result<ApprovalView, WindowStoreError> {
-        self.recorder.run(None, |session| {
-            let record = session
-                .wire
-                .approvals
-                .as_mut()
-                .and_then(|s| s.records.iter_mut().find(|r| r.id == id))
-                .ok_or_else(|| unexpected("the approval record is absent"))?;
-            if record.state == ApprovalState::Revoked || session.now >= record.expiry() {
-                return Ok(record.view(session.now));
-            }
-            if session.now < record.created_at_ms
-                || record.consumed_at_ms.is_some_and(|at| session.now < at)
-            {
-                return Err(unexpected("revocation precedes the approval"));
-            }
-            record.state = ApprovalState::Revoked;
-            record.revoked_at_ms = Some(session.now);
-            record.closed_at_ms = Some(session.now);
-            session.changed = true;
-            Ok(record.view(session.now))
-        })
+        self.recorder.run(None, |session| revoke_step(session, id))
     }
+
+    /// [`Self::revoke`] under `lock`, the exclusive policy-state guard the
+    /// caller holds across its whole request. The write takes no lock.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::revoke`]; a guard of another window-state entry refuses
+    /// and changes nothing.
+    pub fn revoke_held(
+        &mut self,
+        lock: &WindowStoreLock,
+        id: [u8; 32],
+    ) -> Result<ApprovalView, WindowStoreError> {
+        self.recorder
+            .run_held(lock, None, |session| revoke_step(session, id))
+    }
+}
+
+/// Revokes the live record `id` in `session`.
+fn revoke_step(session: &mut Session<'_>, id: [u8; 32]) -> Result<ApprovalView, WindowStoreError> {
+    let record = session
+        .wire
+        .approvals
+        .as_mut()
+        .and_then(|s| s.records.iter_mut().find(|r| r.id == id))
+        .ok_or_else(|| unexpected("the approval record is absent"))?;
+    if record.state == ApprovalState::Revoked || session.now >= record.expiry() {
+        return Ok(record.view(session.now));
+    }
+    if session.now < record.created_at_ms
+        || record.consumed_at_ms.is_some_and(|at| session.now < at)
+    {
+        return Err(unexpected("revocation precedes the approval"));
+    }
+    record.state = ApprovalState::Revoked;
+    record.revoked_at_ms = Some(session.now);
+    record.closed_at_ms = Some(session.now);
+    session.changed = true;
+    Ok(record.view(session.now))
 }
 
 fn verify_payload(

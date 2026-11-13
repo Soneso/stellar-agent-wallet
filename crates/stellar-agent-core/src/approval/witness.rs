@@ -518,6 +518,40 @@ pub fn verify_approval(
     )
 }
 
+/// [`verify_approval`] for a caller that holds `admission`: the current
+/// policy is read through its guard, and no lock is taken.
+///
+/// # Errors
+///
+/// As [`verify_approval`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the producer takes each input it does not derive itself"
+)]
+pub fn verify_approval_admitted(
+    pending: &PendingApprovalStore,
+    profile: &Profile,
+    profile_name: &str,
+    nonce: &str,
+    attestation: &[u8; 32],
+    expected: &ApprovalExpectation,
+    policy: &VerifiedPolicy,
+    now_ms: u64,
+    admission: &super::presence_policy::PolicyAdmission,
+) -> Result<ApprovalWitness, WalletError> {
+    verify_approval_with(
+        pending,
+        profile,
+        profile_name,
+        nonce,
+        attestation,
+        expected,
+        policy,
+        now_ms,
+        |name| MainnetApprovalAuthority::for_profile(name)?.load_admitted(admission),
+    )
+}
+
 /// [`verify_approval`] with the current policy read by `current` from the
 /// profile name.
 #[allow(
@@ -1709,6 +1743,51 @@ mod tests {
             &consented.policy,
             now_ms,
         )
+    }
+
+    /// Both witness producers read the current policy. A writer that holds
+    /// the policy-state lock through the retries refuses each as busy; an
+    /// invalid policy file refuses each as unavailable, also under the
+    /// writer. Once both are gone, each yields its witness.
+    #[test]
+    #[serial]
+    fn mainnet_witness_loads_answer_busy_and_unavailable_apart() {
+        let fixture = MainnetConsentFixture::new(NAME);
+        let decision = fixture.decision(DEFAULT_TTL_MS);
+        let expect = |code: &dyn Fn() -> Option<String>| {
+            let busy = Some("approval.presence_policy_busy".to_owned());
+            let unavailable = Some("approval.presence_policy_unavailable".to_owned());
+            let writer = crate::policy::state_lock::WindowStoreLock::acquire_for(
+                &crate::profile::schema::default_policy_window_state_path_for(NAME),
+                &fixture.profile().policy_window_state_key_id,
+            )
+            .unwrap();
+            assert_eq!(code(), busy);
+            let path = fixture.policy_path();
+            let signed = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(&path, "not a policy").unwrap();
+            assert_eq!(code(), unavailable);
+            drop(writer);
+            assert_eq!(code(), unavailable);
+            std::fs::write(&path, signed).unwrap();
+            assert_eq!(code(), None);
+        };
+        {
+            let entry = fixture.payment(DEFAULT_TTL_MS);
+            let consented = consent(&fixture, &entry);
+            let expected = payment_expectation(&entry);
+            expect(&|| {
+                verify(&fixture, &consented, &expected, &consented.policy, now())
+                    .err()
+                    .map(|error| error.code().to_owned())
+            });
+        }
+        let intents = intent_consent(&fixture, DEFAULT_TTL_MS, |_| {});
+        expect(&|| {
+            verify_intent(&fixture, &intents, &intents.intent, &decision, now())
+                .err()
+                .map(|error| error.code().to_owned())
+        });
     }
 
     /// The fixture store file with `edit` applied to the record `nonce`,

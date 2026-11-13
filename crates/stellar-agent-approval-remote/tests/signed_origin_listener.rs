@@ -234,6 +234,22 @@ impl Browser {
         assert_eq!(actual, expected);
     }
     async fn login_with(&mut self, auth: &TestAuthenticator, count: u32) -> StatusCode {
+        let body = self.login_body(auth, count).await;
+        let response = self
+            .request("POST", "/login/assertion")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        if response.status() == StatusCode::OK {
+            let cookie = response.headers()["set-cookie"].to_str().unwrap();
+            assert!(cookie.contains("HttpOnly; Secure; SameSite=Strict"));
+            self.cookie = cookie.split(';').next().unwrap().to_owned();
+        }
+        response.status()
+    }
+    /// The body of a login assertion by `auth` over a fresh login challenge.
+    async fn login_body(&self, auth: &TestAuthenticator, count: u32) -> Value {
         let options: Value = self
             .request("POST", "/login/challenge")
             .send()
@@ -252,21 +268,9 @@ impl Browser {
             5,
             count,
         );
-        let body = json!({"assertion": {"id": B64.encode(assertion.credential_id), "response": {
+        json!({"assertion": {"id": B64.encode(assertion.credential_id), "response": {
             "authenticator_data": B64.encode(assertion.authenticator_data), "client_data_json": B64.encode(assertion.client_data_json), "signature": B64.encode(assertion.signature_der)
-        }}});
-        let response = self
-            .request("POST", "/login/assertion")
-            .json(&body)
-            .send()
-            .await
-            .unwrap();
-        if response.status() == StatusCode::OK {
-            let cookie = response.headers()["set-cookie"].to_str().unwrap();
-            assert!(cookie.contains("HttpOnly; Secure; SameSite=Strict"));
-            self.cookie = cookie.split(';').next().unwrap().to_owned();
-        }
-        response.status()
+        }}})
     }
     async fn login(&mut self, count: u32) {
         assert_eq!(
@@ -1708,6 +1712,565 @@ async fn signed_origin_concurrent_counters_keep_the_highest_value() {
     let counters = String::from_utf8(f.counter_bytes()).unwrap();
     assert_eq!(counters.matches("sign_count = ").count(), 1);
     assert!(counters.contains("sign_count = 3"));
+    handle.shutdown().await.unwrap();
+}
+
+/// A login completes while another reader holds the policy-state lock for a
+/// pin comparison, as a concurrent request of the listener does: the policy
+/// loads of the challenge and the assertion share that lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn signed_origin_login_proceeds_beside_a_policy_reader() {
+    let f = Fixture::new();
+    let (handle, mut browser) = f.start(false).await;
+    let window =
+        stellar_agent_core::profile::schema::default_policy_window_state_path_for(f.fixture.name());
+    let reader =
+        stellar_agent_core::policy::state_lock::WindowStoreReadLock::acquire_existing_for_with_retry(
+            &window,
+            &f.fixture.profile().policy_window_state_key_id,
+        )
+        .unwrap()
+        .expect("the fixture's pinning load created the lock file");
+    browser.login(1).await;
+    drop(reader);
+    let counters = String::from_utf8(f.counter_bytes()).unwrap();
+    assert_eq!(counters.matches("sign_count = ").count(), 1, "{counters}");
+    assert!(counters.contains("sign_count = 1"), "{counters}");
+    handle.shutdown().await.unwrap();
+}
+
+/// Asserts the retriable busy answer of a busy store, without a session
+/// cookie.
+async fn assert_busy(response: Response, route: &str) {
+    assert_eq!(
+        response.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{route}"
+    );
+    assert!(!response.headers().contains_key("set-cookie"), "{route}");
+    assert_eq!(
+        response.json::<Value>().await.unwrap(),
+        json!({"error": "store_busy", "retriable": true}),
+        "{route}"
+    );
+}
+
+/// The exclusive policy-state guard of the fixture's window-state entry,
+/// held as a policy-state writer holds it.
+fn policy_writer(f: &Fixture) -> stellar_agent_core::policy::state_lock::WindowStoreLock {
+    stellar_agent_core::policy::state_lock::WindowStoreLock::acquire_for(
+        &stellar_agent_core::profile::schema::default_policy_window_state_path_for(
+            f.fixture.name(),
+        ),
+        &f.fixture.profile().policy_window_state_key_id,
+    )
+    .unwrap()
+}
+
+/// The session and asset paths that read the policy through the session
+/// check, for the fixture's entry. The approval link comes last, because it
+/// renders the login page once the session is gone.
+fn session_paths(nonce: &str) -> [String; 9] {
+    [
+        "/inbox".to_owned(),
+        "/pending.json".to_owned(),
+        "/static/app.js".to_owned(),
+        "/static/app-shared.js".to_owned(),
+        "/static/mainnet-presence.js".to_owned(),
+        "/static/revoke.js".to_owned(),
+        "/static/revoke.css".to_owned(),
+        format!("/approval/{nonce}"),
+        format!("/approvals/{nonce}"),
+    ]
+}
+
+/// While a policy-state writer holds the lock, every route that loads the
+/// policy answers the retriable busy body: login challenge and assertion,
+/// session reads and assets, and consent mutations. No counter, session or
+/// approval changes. After the release, the session reads answer again with
+/// the same cookie. The consent challenge, the consent assertion and the
+/// login assertion then succeed with their same bodies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn signed_origin_routes_answer_busy_beside_a_policy_writer() {
+    let f = Fixture::new();
+    let second_entry = f.fixture.payment(600_000);
+    PendingApprovalStore::open(f.fixture.store_path())
+        .unwrap()
+        .insert(second_entry.clone(), now())
+        .unwrap();
+    let (handle, mut browser) = f.start(false).await;
+    browser.login(1).await;
+    let nonce = f.entry.approval_nonce.clone();
+    let (csrf, consent) = browser.assertion(&nonce, 2).await;
+    let second = &second_entry.approval_nonce;
+    let second_page = browser.page(second).await;
+    let second_csrf = second_page["csrf"].as_str().unwrap().to_owned();
+    let second_challenge = json!({"consent_view_digest": second_page["consent_view_digest"]});
+    let other = Browser::new(handle.local_addr(), SIGNED_ORIGIN);
+    let login = other.login_body(&fixture_authenticator(), 3).await;
+    let counters = f.counter_bytes();
+    let stored = serde_json::to_value(f.stored()).unwrap();
+    let session = browser.cookie.clone();
+
+    let writer = policy_writer(&f);
+    assert_busy(
+        other
+            .request("POST", "/login/challenge")
+            .send()
+            .await
+            .unwrap(),
+        "login challenge",
+    )
+    .await;
+    assert_busy(
+        other
+            .request("POST", "/login/assertion")
+            .json(&login)
+            .send()
+            .await
+            .unwrap(),
+        "login assertion",
+    )
+    .await;
+    for path in session_paths(&nonce) {
+        assert_busy(browser.request("GET", &path).send().await.unwrap(), &path).await;
+    }
+    assert_busy(
+        browser
+            .action(second, &second_csrf, "challenge", &second_challenge)
+            .await,
+        "consent challenge",
+    )
+    .await;
+    for action in ["assertion", "reject", "revoke", "cancel"] {
+        assert_busy(
+            browser.action(&nonce, &csrf, action, &consent).await,
+            action,
+        )
+        .await;
+    }
+    assert_eq!(f.counter_bytes(), counters);
+    assert_eq!(serde_json::to_value(f.stored()).unwrap(), stored);
+    assert_eq!(browser.cookie, session);
+    drop(writer);
+
+    for path in session_paths(&nonce) {
+        let status = browser.request("GET", &path).send().await.unwrap().status();
+        assert!(
+            status == StatusCode::OK || status == StatusCode::TEMPORARY_REDIRECT,
+            "{path}: {status}"
+        );
+    }
+    let response = browser
+        .action(second, &second_csrf, "challenge", &second_challenge)
+        .await;
+    assert_eq!(response.status(), StatusCode::OK, "consent challenge");
+    let response = browser.action(&nonce, &csrf, "assertion", &consent).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "{}",
+        response.text().await.unwrap()
+    );
+    assert!(f.stored().attestation_blob_b64.is_some());
+    assert_eq!(
+        other
+            .request("POST", "/login/challenge")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let response = other
+        .request("POST", "/login/assertion")
+        .json(&login)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "login assertion");
+    let counters = String::from_utf8(f.counter_bytes()).unwrap();
+    assert!(counters.contains("sign_count = 3"), "{counters}");
+    handle.shutdown().await.unwrap();
+}
+
+/// An invalid, a missing and a rolled-back policy keep their answers on the
+/// routes that answer busy beside a writer: the login refuses as an invalid
+/// assertion, and a session check drops the session and answers 404.
+#[tokio::test]
+#[serial_test::serial]
+async fn signed_origin_routes_keep_their_answers_for_an_invalid_policy() {
+    let mut f = Fixture::new();
+    let (handle, mut browser) = f.start(false).await;
+    let policy_path = f.fixture.policy_path();
+    let older = std::fs::read_to_string(&policy_path).unwrap();
+    f.fixture
+        .sign_signed_origin_policy(&[&fixture_authenticator()], &f.leaf.pin);
+    let current = std::fs::read_to_string(&policy_path).unwrap();
+    let hidden = policy_path.with_extension("hidden");
+    let nonce = f.entry.approval_nonce.clone();
+    let mut count = 0;
+    for variant in ["invalid", "missing", "rolled back"] {
+        count += 2;
+        browser.login(count - 1).await;
+        let page = browser.page(&nonce).await;
+        let csrf = page["csrf"].as_str().unwrap().to_owned();
+        let other = Browser::new(handle.local_addr(), SIGNED_ORIGIN);
+        let login = other.login_body(&fixture_authenticator(), count).await;
+        let counters = f.counter_bytes();
+        match variant {
+            "invalid" => std::fs::write(&policy_path, "not a policy").unwrap(),
+            "missing" => std::fs::rename(&policy_path, &hidden).unwrap(),
+            _ => std::fs::write(&policy_path, &older).unwrap(),
+        }
+        for response in [
+            other
+                .request("POST", "/login/challenge")
+                .send()
+                .await
+                .unwrap(),
+            other
+                .request("POST", "/login/assertion")
+                .json(&login)
+                .send()
+                .await
+                .unwrap(),
+        ] {
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{variant}");
+            assert_eq!(
+                response.json::<Value>().await.unwrap(),
+                json!({"error": "webauthn_assertion_invalid"}),
+                "{variant}"
+            );
+        }
+        let response = browser
+            .action(
+                &nonce,
+                &csrf,
+                "challenge",
+                &json!({"consent_view_digest": page["consent_view_digest"]}),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{variant}");
+        assert_eq!(f.counter_bytes(), counters, "{variant}");
+        if variant == "missing" {
+            std::fs::rename(&hidden, &policy_path).unwrap();
+        }
+        std::fs::write(&policy_path, &current).unwrap();
+        assert_eq!(
+            browser
+                .request("GET", "/inbox")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND,
+            "{variant}: the refused session stays dropped"
+        );
+    }
+    handle.shutdown().await.unwrap();
+}
+
+/// Signs a newer policy, pins it with an advancing load, and restores the
+/// older signed policy, which every load then refuses as a rollback.
+fn roll_back(f: &mut Fixture) {
+    let path = f.fixture.policy_path();
+    let older = std::fs::read_to_string(&path).unwrap();
+    f.fixture
+        .sign_signed_origin_policy(&[&fixture_authenticator()], &f.leaf.pin);
+    f.fixture.authority().load_current().unwrap();
+    std::fs::write(&path, older).unwrap();
+    assert_eq!(
+        f.fixture
+            .authority()
+            .load_current_compare_only()
+            .unwrap_err()
+            .code(),
+        "approval.presence_policy_unavailable"
+    );
+}
+
+/// The counter file of the fixture, when it exists.
+fn counters(f: &Fixture) -> Option<Vec<u8>> {
+    std::fs::read(
+        RemoteApprovalAuthority::for_profile(f.fixture.name())
+            .unwrap()
+            .credentials_path(),
+    )
+    .ok()
+}
+
+/// Whether the listener holds a live session.
+fn has_session(handle: &RemoteServeHandle) -> bool {
+    handle.session_for_test().lock().unwrap().is_some()
+}
+
+/// Login family. Under a rolled-back policy and a held writer, the login
+/// challenge and assertion answer busy and change nothing. After the
+/// release each refuses as an invalid assertion, with no session or counter.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_rolled_back_policy_answers_busy_then_refuses_the_login() {
+    let mut f = Fixture::new();
+    let (handle, browser) = f.start(false).await;
+    let login = browser.login_body(&fixture_authenticator(), 1).await;
+    roll_back(&mut f);
+    let before = counters(&f);
+
+    let writer = policy_writer(&f);
+    let challenge = browser.request("POST", "/login/challenge").send().await;
+    assert_busy(challenge.unwrap(), "login challenge").await;
+    let assertion = browser.request("POST", "/login/assertion").json(&login);
+    assert_busy(assertion.send().await.unwrap(), "login assertion").await;
+    assert_eq!(counters(&f), before);
+    assert!(!has_session(&handle));
+    drop(writer);
+
+    for path in ["/login/challenge", "/login/assertion"] {
+        let response = browser
+            .request("POST", path)
+            .json(&login)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+        assert!(!response.headers().contains_key("set-cookie"), "{path}");
+        assert_eq!(
+            response.json::<Value>().await.unwrap(),
+            json!({"error": "webauthn_assertion_invalid"}),
+            "{path}"
+        );
+    }
+    assert_eq!(counters(&f), before);
+    assert!(!has_session(&handle));
+    handle.shutdown().await.unwrap();
+}
+
+/// Session family. Under a rolled-back policy and a held writer, every
+/// session read and asset answers busy and keeps the session. After the
+/// release the first read drops it, and each answers as without a session.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_rolled_back_policy_answers_busy_then_drops_the_session() {
+    let mut f = Fixture::new();
+    let (handle, mut browser) = f.start(false).await;
+    browser.login(1).await;
+    let nonce = f.entry.approval_nonce.clone();
+    roll_back(&mut f);
+
+    let writer = policy_writer(&f);
+    for path in session_paths(&nonce) {
+        assert_busy(browser.request("GET", &path).send().await.unwrap(), &path).await;
+    }
+    assert!(has_session(&handle));
+    drop(writer);
+
+    for path in session_paths(&nonce) {
+        let response = browser.request("GET", &path).send().await.unwrap();
+        let expected = if path.starts_with("/approvals/") {
+            StatusCode::OK
+        } else {
+            StatusCode::NOT_FOUND
+        };
+        assert_eq!(response.status(), expected, "{path}");
+    }
+    assert!(!has_session(&handle));
+    handle.shutdown().await.unwrap();
+}
+
+/// Consent family. Under a rolled-back policy and a held writer, the consent
+/// challenge, assertion, rejection and revocation answer busy and change
+/// nothing. After the release each refuses at the session check.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_rolled_back_policy_answers_busy_then_refuses_consent() {
+    let mut f = Fixture::new();
+    let (handle, mut browser) = f.start(false).await;
+    browser.login(1).await;
+    let nonce = f.entry.approval_nonce.clone();
+    let page = browser.page(&nonce).await;
+    let challenge = json!({"consent_view_digest": page["consent_view_digest"]});
+    let (csrf, consent) = browser.assertion(&nonce, 2).await;
+    let actions = [
+        ("challenge", &challenge),
+        ("assertion", &consent),
+        ("reject", &consent),
+        ("revoke", &consent),
+    ];
+    roll_back(&mut f);
+    let before = counters(&f);
+    let stored = serde_json::to_value(f.stored()).unwrap();
+
+    let writer = policy_writer(&f);
+    for (action, body) in actions {
+        assert_busy(browser.action(&nonce, &csrf, action, body).await, action).await;
+    }
+    assert_eq!(counters(&f), before);
+    assert_eq!(serde_json::to_value(f.stored()).unwrap(), stored);
+    assert!(has_session(&handle));
+    drop(writer);
+
+    for (action, body) in actions {
+        let response = browser.action(&nonce, &csrf, action, body).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{action}");
+    }
+    assert_eq!(counters(&f), before);
+    assert_eq!(serde_json::to_value(f.stored()).unwrap(), stored);
+    assert!(!has_session(&handle));
+    handle.shutdown().await.unwrap();
+}
+
+/// Ceremony family. Under a rolled-back policy and a held writer, a cancel
+/// answers busy. After the release it refuses at the session check, and the
+/// ceremony receives no completion.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_rolled_back_policy_answers_busy_then_refuses_the_cancel() {
+    let mut f = Fixture::new();
+    let (mut handle, mut browser) = f.start(true).await;
+    browser.login(1).await;
+    let nonce = f.entry.approval_nonce.clone();
+    let csrf = browser.page(&nonce).await["csrf"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let cancel = json!({"reason": "operator_cancel"});
+    roll_back(&mut f);
+
+    let writer = policy_writer(&f);
+    assert_busy(
+        browser.action(&nonce, &csrf, "cancel", &cancel).await,
+        "cancel",
+    )
+    .await;
+    assert!(has_session(&handle));
+    drop(writer);
+
+    let response = browser.action(&nonce, &csrf, "cancel", &cancel).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(!has_session(&handle));
+    let pending = handle
+        .take_completion()
+        .unwrap()
+        .await_presence(Instant::now())
+        .await
+        .unwrap_err();
+    assert_eq!(pending.code(), "approval.presence_expired", "no completion");
+    handle.shutdown().await.unwrap();
+}
+
+/// A rejection beside a held writer answers busy and leaves the entry and
+/// the counter unchanged. After the release, the same body, cookie and CSRF
+/// value reject the entry once, without consent, and a replay fails.
+#[tokio::test]
+#[serial_test::serial]
+async fn signed_origin_reject_retries_after_policy_busy() {
+    let f = Fixture::new();
+    let (handle, mut browser) = f.start(false).await;
+    browser.login(1).await;
+    let nonce = &f.entry.approval_nonce;
+    let (csrf, assertion) = browser.assertion(nonce, 2).await;
+    let before = f.counter_bytes();
+    let stored = serde_json::to_value(f.stored()).unwrap();
+
+    let writer = policy_writer(&f);
+    assert_busy(
+        browser.action(nonce, &csrf, "reject", &assertion).await,
+        "reject",
+    )
+    .await;
+    assert_eq!(f.counter_bytes(), before);
+    assert_eq!(serde_json::to_value(f.stored()).unwrap(), stored);
+    drop(writer);
+
+    let response = browser.action(nonce, &csrf, "reject", &assertion).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["status"],
+        "rejected"
+    );
+    let entry = f.stored();
+    assert!(matches!(
+        entry.kind,
+        stellar_agent_core::approval::ApprovalKind::Rejected { .. }
+    ));
+    assert!(entry.attestation_blob_b64.is_none());
+    assert_ne!(f.counter_bytes(), before);
+    let after = f.counter_bytes();
+    let replay = browser.action(nonce, &csrf, "reject", &assertion).await;
+    assert_ne!(replay.status(), StatusCode::OK);
+    assert_eq!(f.counter_bytes(), after);
+    handle.shutdown().await.unwrap();
+}
+
+/// A ceremony cancel beside a held writer answers busy and changes nothing:
+/// the challenge and the completion stay pending, so the assertion then
+/// completes the ceremony. In a second ceremony, the same cancel body
+/// answers busy, then cancels once the writer releases.
+#[tokio::test]
+#[serial_test::serial]
+async fn signed_origin_cancel_retries_after_policy_busy() {
+    {
+        let f = Fixture::new();
+        let (mut handle, mut browser) = f.start(true).await;
+        browser.login(1).await;
+        let nonce = &f.entry.approval_nonce;
+        let (csrf, consent) = browser.assertion(nonce, 2).await;
+        let cancel = json!({"reason": "browser_unavailable"});
+        let writer = policy_writer(&f);
+        assert_busy(
+            browser.action(nonce, &csrf, "cancel", &cancel).await,
+            "cancel",
+        )
+        .await;
+        drop(writer);
+        let response = browser.action(nonce, &csrf, "assertion", &consent).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["status"],
+            "presence_verified"
+        );
+        let presence = handle
+            .take_completion()
+            .unwrap()
+            .await_presence(Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(presence.approval_nonce(), nonce.as_str());
+        handle.shutdown().await.unwrap();
+    }
+    let f = Fixture::new();
+    let (mut handle, mut browser) = f.start(true).await;
+    browser.login(1).await;
+    let nonce = &f.entry.approval_nonce;
+    let csrf = browser.page(nonce).await["csrf"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let cancel = json!({"reason": "operator_cancel"});
+    let writer = policy_writer(&f);
+    assert_busy(
+        browser.action(nonce, &csrf, "cancel", &cancel).await,
+        "cancel",
+    )
+    .await;
+    drop(writer);
+    let response = browser.action(nonce, &csrf, "cancel", &cancel).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.json::<Value>().await.unwrap(),
+        json!({"status": "canceled"})
+    );
+    let canceled = handle
+        .take_completion()
+        .unwrap()
+        .await_presence(Instant::now() + Duration::from_secs(5))
+        .await
+        .unwrap_err();
+    assert_eq!(canceled.code(), "approval.presence_canceled");
+    assert!(f.stored().attestation_blob_b64.is_none());
     handle.shutdown().await.unwrap();
 }
 

@@ -348,6 +348,7 @@ Other build failures use `policy.engine_unavailable` or `trustline.policy_engine
 | `policy.reset_consent_replayed` | The latest reset already consumes this request id. Run the reset again; each run signs a fresh reset statement with a fresh request id. |
 | `approval.presence_required` | Mainnet consent requires a verified assertion from an approval credential in the owner-signed policy; use the local passkey approval page. |
 | `approval.presence_policy_unavailable` | The current owner-signed mainnet policy cannot be verified, lists no approval credential, or changed since the consent was recorded. |
+| `approval.presence_policy_busy` | `approval.presence_policy_busy` means the required policy-state lock stays busy; the listener returns retriable HTTP 503 `store_busy`; retry the operation. |
 | `approval.listener_policy_stale` | The approval listener serves an earlier owner-signed mainnet policy; restart it under the current policy. |
 | `approval.origin_signed_remote` | The owner-signed policy serves mainnet consent at its approval origin; approve there. |
 | `approval.mainnet_remote_unsupported` | Remote mainnet approval requires a signed approval origin. |

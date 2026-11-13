@@ -19,15 +19,16 @@
 //! loopback gate is the listener's own session state.
 //!
 //! Pending-store locks cover snapshots and final decisions only. Challenge-table
-//! locks cover insertion and removal only. Policy loads follow pending-store
-//! acquisition and never hold a window-state lock across a browser wait. The
-//! attestation key a page view needs loads while no pending-store lock is
-//! held.
+//! locks cover insertion and removal only. The policy-state lock comes before
+//! the pending store: a route takes it while it holds no pending store, and
+//! reads the policy under a pending store only through a guard it holds. No
+//! route holds the policy-state lock across a browser wait. The attestation
+//! key a page view needs loads while no pending-store lock is held.
 
 use crate::{
     PageIdentity, PresenceStartRefusal, ServeStartError,
     auth::{AuthState, OpaqueToken, SessionPurpose, SessionState, compute_csrf},
-    decision::{Decision, DecisionContext, RequestIdentity, apply_decision},
+    decision::{Decision, DecisionContext, RequestIdentity, apply_admitted_decision},
     routes::{SESSION_ACTIVITY_NONCE, authorize_mutation, outcome_to_response, require_session},
     templates::{ConsentPageMode, render_mainnet_consent_page, render_not_found_page},
 };
@@ -58,7 +59,7 @@ use stellar_agent_core::{
         VerifiedMainnetPresence, approval_view_digest, issue_mainnet_intent_presence,
         issue_mainnet_presence, load_and_validate_entry, mainnet_consent_view_digest,
         mainnet_intent_consent_view_digest, mainnet_presence_origin, open_with_retry,
-        process_uid_for_attestation, verify_mainnet_presence,
+        presence_policy::PolicyAdmission, process_uid_for_attestation, verify_mainnet_presence,
     },
 };
 use stellar_agent_loopback_http::{LoopbackPair, PairBindError, PairServer};
@@ -157,7 +158,9 @@ pub trait ConsentSessionGate: Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// The ready response that refuses a request without a live session.
+    /// The ready response that refuses a request without a live session. A
+    /// gate answers status 503 only for a busy policy-state lock, which
+    /// keeps the session.
     #[allow(
         clippy::result_large_err,
         reason = "the Err variant is the ready-to-return axum Response for the auth-boundary rejection"
@@ -189,6 +192,47 @@ pub trait ConsentSessionGate: Send + Sync + 'static {
     /// Returns a refusal when the listener cannot accept the verified assertion.
     fn verified(&self, _presence: &VerifiedMainnetPresence) -> Result<(), WalletError> {
         Ok(())
+    }
+
+    /// Authorizes a state-changing request as [`Self::authorize_mutation`]
+    /// does and returns its session, with the policy admission `admit` takes.
+    ///
+    /// A gate that reads the policy calls `admit` after its cookie and CSRF
+    /// checks and reads the policy only through the returned admission, so
+    /// the request takes the policy-state lock once. The default suits a
+    /// gate that reads no policy.
+    ///
+    /// # Errors
+    ///
+    /// The ready response that refuses the request, or the response `admit`
+    /// returns.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the Err variant is the ready-to-return axum Response for the auth-boundary rejection"
+    )]
+    fn admitted_mutation(
+        &self,
+        headers: &HeaderMap,
+        csrf_nonce: &str,
+        admit: &dyn Fn() -> Result<PolicyAdmission, Response>,
+    ) -> Result<(Self::Session, PolicyAdmission), Response> {
+        self.authorize_mutation(headers, csrf_nonce)?;
+        let session = self.session(headers)?;
+        Ok((session, admit()?))
+    }
+
+    /// [`Self::verified`] for a request that holds `admission`. A gate that
+    /// reads the policy reads it through the admission.
+    ///
+    /// # Errors
+    /// As [`Self::verified`].
+    fn verified_admitted(
+        &self,
+        presence: &VerifiedMainnetPresence,
+        admission: &PolicyAdmission,
+    ) -> Result<(), WalletError> {
+        let _ = admission;
+        self.verified(presence)
     }
 }
 
@@ -264,20 +308,24 @@ impl<G: ConsentSessionGate> PresenceState<G> {
         }
     }
 
+    /// The pending store and the current policy, read before the store opens:
+    /// through `admission` when the request holds one, otherwise by a load
+    /// that advances the pin when `advance` is set.
     fn snapshot(
         &self,
         nonce: &str,
         advance: bool,
+        admission: Option<&PolicyAdmission>,
     ) -> Result<(PendingApprovalStore, CurrentMainnetApprovalPolicy), WalletError> {
         if !self.mode.serves(nonce) {
             return Err(failure(Failure::PresenceChanged));
         }
-        let store = self.open_store()?;
-        let current = if advance {
-            self.authority.load_current()?
-        } else {
-            self.authority.load_current_compare_only()?
+        let current = match admission {
+            Some(admission) => self.authority.load_admitted(admission)?,
+            None if advance => self.authority.load_current()?,
+            None => self.authority.load_current_compare_only()?,
         };
+        let store = self.open_store()?;
         if current
             .policy()
             .mainnet()
@@ -348,6 +396,7 @@ impl<G: ConsentSessionGate> PresenceState<G> {
     fn reshow_key(
         &self,
         nonce: &str,
+        admission: &PolicyAdmission,
     ) -> Result<Option<impl std::ops::Deref<Target = Vec<u8>>>, WalletError> {
         let attested_opt_in = self.open_store()?.get(nonce).is_some_and(|entry| {
             entry.attestation_blob_b64.is_some()
@@ -356,7 +405,7 @@ impl<G: ConsentSessionGate> PresenceState<G> {
         if !attested_opt_in {
             return Ok(None);
         }
-        let current = self.authority.load_current_compare_only()?;
+        let current = self.authority.load_admitted(admission)?;
         stellar_agent_core::approval::load_attestation_key(
             &current.profile().attestation_key_id,
             &stellar_agent_core::profile::owner_key::OwnerKeyContext::for_profile(
@@ -488,6 +537,7 @@ fn start_refusal(error: &WalletError) -> ServeStartError {
         WalletError::Approval(Failure::PresencePolicyUnavailable) => {
             PresenceStartRefusal::PolicyUnavailable
         }
+        WalletError::Approval(Failure::PresencePolicyBusy) => PresenceStartRefusal::PolicyBusy,
         WalletError::Approval(Failure::OriginSignedRemote) => {
             PresenceStartRefusal::OriginSignedRemote
         }
@@ -610,7 +660,7 @@ fn check_presented<G: ConsentSessionGate>(
     presented: &PendingApproval,
 ) -> Result<(), ServeStartError> {
     let (store, current) = state
-        .snapshot(&presented.approval_nonce, true)
+        .snapshot(&presented.approval_nonce, true, None)
         .map_err(|error| start_refusal(&error))?;
     let entry = state
         .live_entry(&store, &presented.approval_nonce)
@@ -823,11 +873,28 @@ fn now_ms() -> Result<u64, WalletError> {
     stellar_agent_core::timefmt::now_unix_ms().map_err(|_| failure(Failure::PresenceUnavailable))
 }
 
+/// The live session a mutation reads again inside its request, after the
+/// gate authorized it. A gate refusal with status 503 is a busy
+/// policy-state lock and refuses as `approval.presence_policy_busy`. Every
+/// other refusal means the session ended, so the challenge is consumed.
+fn session_again<G: ConsentSessionGate>(
+    gate: &G,
+    headers: &HeaderMap,
+) -> Result<G::Session, WalletError> {
+    gate.session(headers).map_err(|response| {
+        if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+            failure(Failure::PresencePolicyBusy)
+        } else {
+            failure(Failure::PresenceConsumed)
+        }
+    })
+}
+
 /// The HTTP status of a mainnet presence refusal.
 ///
 /// 403 for a refusal no retry of the same request can overcome, 409 for a
 /// challenge or entry that changed or ended, 503 for an authority or store
-/// that cannot be read. A failure that is not a presence refusal is a
+/// that cannot be read or stays busy. A failure that is not a presence refusal is a
 /// server error.
 #[must_use]
 pub fn refusal_status(failure: &Failure) -> StatusCode {
@@ -842,9 +909,9 @@ pub fn refusal_status(failure: &Failure) -> StatusCode {
         Failure::PresenceExpired | Failure::PresenceConsumed | Failure::PresenceChanged => {
             StatusCode::CONFLICT
         }
-        Failure::PresencePolicyUnavailable | Failure::PresenceUnavailable => {
-            StatusCode::SERVICE_UNAVAILABLE
-        }
+        Failure::PresencePolicyUnavailable
+        | Failure::PresencePolicyBusy
+        | Failure::PresenceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -936,8 +1003,11 @@ fn render_detail<G: ConsentSessionGate>(
     if !state.mode.serves(nonce) {
         return Err(failure(Failure::PresenceChanged));
     }
-    let key = state.reshow_key(nonce)?;
-    let (store, current) = state.snapshot(nonce, false)?;
+    // One shared guard covers every policy read of the page, taken before
+    // the pending store.
+    let admission = state.authority.admit()?;
+    let key = state.reshow_key(nonce, &admission)?;
+    let (store, current) = state.snapshot(nonce, false, Some(&admission))?;
     let Some(view) = store
         .snapshot(now_ms()?)
         .into_iter()
@@ -952,7 +1022,7 @@ fn render_detail<G: ConsentSessionGate>(
     };
     if view.attested {
         let key = key.as_ref().map(|key| key.as_slice());
-        let blob = match verified_blob(state, &store, &current, nonce, key) {
+        let blob = match verified_blob(state, &store, &current, nonce, key, &admission) {
             Ok(blob) => Some(blob),
             Err(error) if crate::decision::presence_refusal(&error).is_some() => {
                 return Err(error);
@@ -1031,37 +1101,52 @@ async fn signed_revoke<G: ConsentSessionGate>(
     Path(nonce): Path<String>,
     body: Bytes,
 ) -> Response {
-    signed_action(&state, &headers, nonce, &body, |nonce| Decision::Revoke {
+    signed_action(
+        &state,
+        &headers,
         nonce,
-    })
+        &body,
+        MainnetApprovalAuthority::admit_exclusive,
+        |nonce| Decision::Revoke { nonce },
+    )
 }
 
 /// Applies `decision` for `nonce` after the session, its per-nonce CSRF and
 /// a fresh action assertion verify on the signed-origin inbox.
+///
+/// The gate takes the admission `admit` makes after its cookie and CSRF
+/// checks and before the challenge is consumed, so a busy lock answers
+/// before anything changes. The request holds that one guard until the
+/// decision returns, and every policy read and write runs under it. A
+/// revocation takes it exclusively, so its durable write needs no lock.
 fn signed_action<G: ConsentSessionGate>(
     state: &PresenceState<G>,
     headers: &HeaderMap,
     nonce: String,
     body: &[u8],
+    admit: fn(&MainnetApprovalAuthority) -> Result<PolicyAdmission, WalletError>,
     decision: impl FnOnce(String) -> Decision,
 ) -> Response {
-    if let Err(response) = state.auth.authorize_mutation(headers, &nonce) {
-        return response;
-    }
+    #[allow(
+        clippy::result_large_err,
+        reason = "the Err variant is the ready-to-return axum Response for the refusal"
+    )]
+    let take = || admit(&state.authority).map_err(|error| error_response(&error));
+    let (session, admission) = match state.auth.admitted_mutation(headers, &nonce, &take) {
+        Ok(admitted) => admitted,
+        Err(response) => return response,
+    };
     let result = (|| {
         let Mode::Inbox(context) = &state.mode else {
             return Err(failure(Failure::PresenceChanged));
         };
-        let session = state
-            .auth
-            .session(headers)
-            .map_err(|_| failure(Failure::PresenceConsumed))?;
-        let (presence, _) = verified_presence(state, &session, &nonce, body)?;
+        let (presence, _) = verified_presence(state, &session, &nonce, body, &admission)?;
         state.discard(&nonce);
-        Ok(outcome_to_response(apply_decision(
+        Ok(outcome_to_response(apply_admitted_decision(
             context,
             decision(nonce),
             RequestIdentity::SignedOrigin(presence),
+            &admission,
         )))
     })();
     match result {
@@ -1098,10 +1183,11 @@ fn verified_blob<G: ConsentSessionGate>(
     current: &CurrentMainnetApprovalPolicy,
     nonce: &str,
     key: Option<&[u8]>,
+    admission: &PolicyAdmission,
 ) -> Result<String, WalletError> {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use stellar_agent_core::approval::witness::{
-        ApprovalExpectation, ApprovedKind, verify_approval,
+        ApprovalExpectation, ApprovedKind, verify_approval_admitted,
     };
     let entry = store
         .get(nonce)
@@ -1132,13 +1218,14 @@ fn verified_blob<G: ConsentSessionGate>(
                 .ok_or_else(|| failure(Failure::PresenceChanged))?
                 .try_into()
                 .map_err(|_| failure(Failure::PresenceInvalid))?;
-            if !store.verify_mainnet_trustline_clawback_opt_in(
+            if !store.verify_mainnet_trustline_clawback_opt_in_admitted(
                 key,
                 &state.context.binding(),
                 code,
                 issuer,
                 current.policy(),
                 now_ms()?,
+                admission,
             )? {
                 return Err(failure(Failure::PresenceInvalid));
             }
@@ -1153,7 +1240,7 @@ fn verified_blob<G: ConsentSessionGate>(
             &state.context.binding(),
         )?,
     };
-    verify_approval(
+    verify_approval_admitted(
         store,
         current.profile(),
         &state.context.profile_name,
@@ -1162,6 +1249,7 @@ fn verified_blob<G: ConsentSessionGate>(
         &expected,
         current.policy(),
         now_ms()?,
+        admission,
     )?;
     Ok(encoded.clone())
 }
@@ -1205,13 +1293,10 @@ async fn challenge<G: ConsentSessionGate>(
         return response;
     }
     let result = (|| {
-        let session = state
-            .auth
-            .session(&headers)
-            .map_err(|_| failure(Failure::PresenceConsumed))?;
+        let session = session_again(state.auth.as_ref(), &headers)?;
         let request: PresenceChallengeRequest =
             serde_json::from_slice(&body).map_err(|_| failure(Failure::PresenceChanged))?;
-        let (store, current) = state.snapshot(&nonce, true)?;
+        let (store, current) = state.snapshot(&nonce, true, None)?;
         let entry = state.live_entry(&store, &nonce)?;
         let view_digest = hex::encode(mainnet_consent_view_digest(
             &entry,
@@ -1286,6 +1371,7 @@ fn verified_presence<G: ConsentSessionGate>(
     session: &G::Session,
     nonce: &str,
     body: &[u8],
+    admission: &PolicyAdmission,
 ) -> Result<(VerifiedMainnetPresence, String), WalletError> {
     let request: PresenceAssertionRequest =
         serde_json::from_slice(body).map_err(|_| failure(Failure::PresenceInvalid))?;
@@ -1319,29 +1405,46 @@ fn verified_presence<G: ConsentSessionGate>(
     .decode()?;
     let presence =
         verify_mainnet_presence(challenge.pending, assertion, now_ms()?, Instant::now())?;
-    state.auth.verified(&presence)?;
+    state.auth.verified_admitted(&presence, admission)?;
     Ok((presence, challenge.view_digest))
 }
 
+/// `POST /approval/{nonce}/assertion`: verifies a consent assertion and
+/// approves, or completes a ceremony.
+///
+/// The gate takes the shared policy admission after its cookie and CSRF
+/// checks, before the challenge is consumed and the counter recorded. The
+/// request holds that one guard until the response is ready, and reads the
+/// policy only through it. A busy lock answers `503` before anything
+/// changes, and the same body succeeds later. Lock order: policy-state
+/// lock, challenge map, credential store, pending store.
 async fn assertion<G: ConsentSessionGate>(
     State(state): State<Arc<PresenceState<G>>>,
     headers: HeaderMap,
     Path(nonce): Path<String>,
     body: Bytes,
 ) -> Response {
-    if let Err(response) = state.auth.authorize_mutation(&headers, &nonce) {
-        return response;
-    }
+    #[allow(
+        clippy::result_large_err,
+        reason = "the Err variant is the ready-to-return axum Response for the refusal"
+    )]
+    let take = || {
+        state
+            .authority
+            .admit()
+            .map_err(|error| error_response(&error))
+    };
+    let (session, admission) = match state.auth.admitted_mutation(&headers, &nonce, &take) {
+        Ok(admitted) => admitted,
+        Err(response) => return response,
+    };
     if matches!(state.site, Site::Signed(_)) && !state.mode.serves(&nonce) {
         return error_response(&failure(Failure::PresenceChanged));
     }
     let result = (|| {
-        let session = state
-            .auth
-            .session(&headers)
-            .map_err(|_| failure(Failure::PresenceConsumed))?;
-        let (presence, view_digest) = verified_presence(&state, &session, &nonce, &body)?;
-        let (store, current) = state.snapshot(&nonce, false)?;
+        let (presence, view_digest) =
+            verified_presence(&state, &session, &nonce, &body, &admission)?;
+        let (store, current) = state.snapshot(&nonce, false, Some(&admission))?;
         let entry = state.live_entry(&store, &nonce)?;
         if hex::encode(mainnet_consent_view_digest(
             &entry,
@@ -1353,7 +1456,7 @@ async fn assertion<G: ConsentSessionGate>(
         }
         drop(store);
         match &state.mode {
-            Mode::Inbox(context) => Ok(outcome_to_response(apply_decision(
+            Mode::Inbox(context) => Ok(outcome_to_response(apply_admitted_decision(
                 context,
                 Decision::Approve {
                     nonce,
@@ -1366,6 +1469,7 @@ async fn assertion<G: ConsentSessionGate>(
                     Site::Loopback => RequestIdentity::Mainnet(presence),
                     Site::Signed(_) => RequestIdentity::SignedOrigin(presence),
                 },
+                &admission,
             ))),
             Mode::OneShot { completion, .. } => {
                 let request_id = presence.request_id().to_owned();
@@ -1411,10 +1515,7 @@ async fn cancel<G: ConsentSessionGate>(
         }
         let request: PresenceCancelRequest =
             serde_json::from_slice(&body).map_err(|_| failure(Failure::PresenceInvalid))?;
-        let session = state
-            .auth
-            .session(&headers)
-            .map_err(|_| failure(Failure::PresenceConsumed))?;
+        let session = session_again(state.auth.as_ref(), &headers)?;
         let now = now_ms()?;
         let challenge_expired = state
             .challenges
@@ -1477,9 +1578,14 @@ async fn signed_reject<G: ConsentSessionGate>(
     Path(nonce): Path<String>,
     body: Bytes,
 ) -> Response {
-    signed_action(&state, &headers, nonce, &body, |nonce| Decision::Reject {
+    signed_action(
+        &state,
+        &headers,
         nonce,
-    })
+        &body,
+        MainnetApprovalAuthority::admit,
+        |nonce| Decision::Reject { nonce },
+    )
 }
 
 async fn stale_approve(

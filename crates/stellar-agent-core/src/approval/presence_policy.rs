@@ -17,10 +17,21 @@
 //!
 //! # Locks
 //!
-//! A load takes the policy window-state lock for the pin comparison and
-//! releases it before returning. A caller that also holds the pending
-//! approval store takes the store first, then loads; no presence code runs
-//! while it holds the window-state lock.
+//! A load takes the policy window-state lock shared for the pin comparison,
+//! and exclusive only to advance the pin, and releases it before returning.
+//! A lock that a writer holds through the final retry refuses the load as
+//! `approval.presence_policy_busy`. The signature and body checks may have
+//! run, but the pin freshness check has not, so the answer invites a retry.
+//!
+//! [`MainnetApprovalAuthority::admit`] holds the lock shared across one
+//! request, and [`MainnetApprovalAuthority::admit_exclusive`] holds it
+//! exclusively for a request that also writes window state. The request
+//! takes it while it holds no other lock and before it consumes a challenge,
+//! so a busy answer leaves stored state unchanged. The policy-state lock
+//! comes before the pending approval store. Every later read of the request
+//! goes through [`MainnetApprovalAuthority::load_admitted`], and its write
+//! runs under [`PolicyAdmission::exclusive`], so the request takes the lock
+//! once.
 //!
 //! The issuing load advances the pin, so an observed credential removal at a
 //! higher signed sequence cannot be rolled back through wallet commands. The
@@ -28,8 +39,14 @@
 
 use crate::error::{ApprovalFailure, WalletError};
 use crate::mainnet::verified_policy::VerifiedPolicy;
+use crate::policy::PolicyError;
+use crate::policy::pin::{self, PinScope, PinState};
+use crate::policy::state_lock::{StateLockError, WindowStoreLock, WindowStoreReadLock};
 use crate::policy::v1::PolicyStateStore;
-use crate::policy::v1::verified::{OwnerKeySource, PinMode, PolicyLoad, load_verified_policy};
+use crate::policy::v1::verified::{
+    OwnerKeySource, PinMode, PolicyLoad, check_signed_policy, load_verified_policy,
+    load_verified_policy_against,
+};
 use crate::profile::schema::{PolicyEngineKind, Profile};
 
 /// The profile whose owner-signed mainnet policy holds the approval
@@ -82,6 +99,56 @@ impl CurrentMainnetApprovalPolicy {
     }
 }
 
+/// A guard on the policy-state lock of one profile, from
+/// [`MainnetApprovalAuthority::admit`] (shared) or
+/// [`MainnetApprovalAuthority::admit_exclusive`]. Dropping it releases the
+/// lock. [`MainnetApprovalAuthority::load_admitted`] reads the pin through it.
+#[derive(Debug)]
+pub struct PolicyAdmission {
+    guard: AdmissionGuard,
+}
+
+#[derive(Debug)]
+enum AdmissionGuard {
+    Shared(WindowStoreReadLock),
+    Exclusive(WindowStoreLock),
+}
+
+impl PolicyAdmission {
+    /// The exclusive guard, which a write of the same request runs under.
+    /// `None` for a shared admission.
+    #[must_use]
+    pub fn exclusive(&self) -> Option<&WindowStoreLock> {
+        match &self.guard {
+            AdmissionGuard::Exclusive(lock) => Some(lock),
+            AdmissionGuard::Shared(_) => None,
+        }
+    }
+
+    /// Reads the pin of `profile` under the held guard. A guard for another
+    /// window-state entry refuses with the pin's wrong-guard error.
+    fn read_pin(
+        &self,
+        window_path: &std::path::Path,
+        profile: &Profile,
+    ) -> Result<PinState, PolicyError> {
+        let scope = PinScope::for_profile(window_path, profile);
+        match &self.guard {
+            AdmissionGuard::Shared(lock) => pin::read_shared(lock, &scope),
+            AdmissionGuard::Exclusive(lock) => pin::read(lock, &scope),
+        }
+        .map_err(PolicyError::from)
+    }
+}
+
+/// How a load reads the pin: by taking the lock in `PinMode`, or through
+/// the guard of an admission the caller holds.
+#[derive(Clone, Copy)]
+enum PinRead<'a> {
+    Mode(PinMode),
+    Held(&'a PolicyAdmission),
+}
+
 /// Whether two verified policies have the same sequence, digest, and owner.
 #[must_use]
 pub fn same_policy(a: &VerifiedPolicy, b: &VerifiedPolicy) -> bool {
@@ -91,6 +158,19 @@ pub fn same_policy(a: &VerifiedPolicy, b: &VerifiedPolicy) -> bool {
 fn unavailable(code: &str) -> WalletError {
     tracing::debug!(code, "mainnet approval policy unavailable");
     WalletError::Approval(ApprovalFailure::PresencePolicyUnavailable)
+}
+
+fn busy() -> WalletError {
+    tracing::debug!("mainnet approval policy-state lock busy");
+    WalletError::Approval(ApprovalFailure::PresencePolicyBusy)
+}
+
+/// The refusal of an admission whose lock acquisition failed.
+fn lock_refusal(error: StateLockError) -> WalletError {
+    match error {
+        StateLockError::WriterLocked => busy(),
+        StateLockError::Io { .. } => unavailable("policy.state_lock_io"),
+    }
 }
 
 impl MainnetApprovalAuthority {
@@ -121,10 +201,12 @@ impl MainnetApprovalAuthority {
     ///
     /// # Errors
     ///
-    /// `approval.presence_policy_unavailable` when any step the module
+    /// `approval.presence_policy_busy` when the policy-state lock stays held
+    /// by a writer through the final retry, and
+    /// `approval.presence_policy_unavailable` when any other step the module
     /// documents fails.
     pub fn load_current(&self) -> Result<CurrentMainnetApprovalPolicy, WalletError> {
-        self.load(PinMode::Advance)
+        self.load(PinRead::Mode(PinMode::Advance))
     }
 
     /// Loads the current policy and compares it with the pin without writing
@@ -134,10 +216,84 @@ impl MainnetApprovalAuthority {
     ///
     /// As [`Self::load_current`].
     pub fn load_current_compare_only(&self) -> Result<CurrentMainnetApprovalPolicy, WalletError> {
-        self.load(PinMode::CompareOnly)
+        self.load(PinRead::Mode(PinMode::CompareOnly))
     }
 
-    fn load(&self, mode: PinMode) -> Result<CurrentMainnetApprovalPolicy, WalletError> {
+    /// Takes the policy-state lock of the profile shared and holds it until
+    /// the returned admission drops.
+    ///
+    /// A request takes it before it consumes a challenge or records a
+    /// counter, and keeps it until it publishes its result. While it lives,
+    /// no writer takes the lock, so every compare-only load under it reads
+    /// the same pin. An advancing load under it answers busy. The admission
+    /// does not stop an edit of the policy file, which each load verifies.
+    ///
+    /// # Errors
+    ///
+    /// The admission runs the checks every load runs before its lock: the
+    /// profile, the owner key, and the policy signature and body. Each
+    /// refuses as `approval.presence_policy_unavailable`. Then
+    /// `approval.presence_policy_busy` when a writer holds the lock through
+    /// the final retry. A busy lock wins over a refusal that needs the pin,
+    /// such as a rollback. An absent or unreadable lock file is unavailable.
+    pub fn admit(&self) -> Result<PolicyAdmission, WalletError> {
+        self.admit_with(false)
+    }
+
+    /// Takes the policy-state lock of the profile exclusively, for a request
+    /// that writes window state under it, and holds it until the returned
+    /// admission drops.
+    ///
+    /// The request reads the policy only through
+    /// [`Self::load_admitted`] and writes only under
+    /// [`PolicyAdmission::exclusive`], so it never takes the lock twice.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::admit`]; any held guard, shared or exclusive, is busy.
+    pub fn admit_exclusive(&self) -> Result<PolicyAdmission, WalletError> {
+        self.admit_with(true)
+    }
+
+    fn admit_with(&self, exclusive: bool) -> Result<PolicyAdmission, WalletError> {
+        let inputs = self.load_inputs()?;
+        check_signed_policy(&inputs.policy_load(&self.profile_name))
+            .map_err(|error| unavailable(error.wire_code()))?;
+        let (window, key) = (
+            &inputs.window_path,
+            &inputs.profile.policy_window_state_key_id,
+        );
+        let guard = if exclusive {
+            WindowStoreLock::acquire_existing_for_with_retry(window, key)
+                .map(|guard| guard.map(AdmissionGuard::Exclusive))
+        } else {
+            WindowStoreReadLock::acquire_existing_for_with_retry(window, key)
+                .map(|guard| guard.map(AdmissionGuard::Shared))
+        };
+        match guard {
+            Ok(Some(guard)) => Ok(PolicyAdmission { guard }),
+            Ok(None) => Err(unavailable("policy.pin_absent")),
+            Err(error) => Err(lock_refusal(error)),
+        }
+    }
+
+    /// Loads the current policy and compares it with the pin read through
+    /// `admission`, without taking the lock.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::load_current_compare_only`]. An admission for another
+    /// window-state entry refuses as `approval.presence_policy_unavailable`.
+    pub fn load_admitted(
+        &self,
+        admission: &PolicyAdmission,
+    ) -> Result<CurrentMainnetApprovalPolicy, WalletError> {
+        self.load(PinRead::Held(admission))
+    }
+
+    /// The persisted profile and its directory, after the profile checks
+    /// every load makes before it reads the policy.
+    fn persisted_profile(&self) -> Result<(Profile, std::path::PathBuf), WalletError> {
         let name = self.profile_name.as_str();
         let profile_dir = crate::profile::schema::default_profile_dir()
             .map_err(|_| unavailable("profile.state_dir"))?;
@@ -158,29 +314,49 @@ impl MainnetApprovalAuthority {
         {
             return Err(unavailable("mainnet.not_enabled"));
         }
+        Ok((profile, profile_dir))
+    }
+
+    /// The profile, owner key and paths a load or an admission reads.
+    fn load_inputs(&self) -> Result<LoadInputs, WalletError> {
+        let name = self.profile_name.as_str();
+        let (profile, profile_dir) = self.persisted_profile()?;
         let owner = read_owner_key(&profile)?;
         let policy_path = crate::profile::schema::default_policy_dir()
             .map_err(|_| unavailable("policy.state_dir"))?
             .join(format!("{name}.toml"));
         let window_path = crate::profile::schema::default_policy_window_state_path_for(name);
-        let policy = load_verified_policy(
-            &PolicyLoad {
-                path: &policy_path,
-                profile: &profile,
-                profile_name: name,
-                owner_pubkey: &owner,
-                owner_source: OwnerKeySource::Keyring,
-                window_path: &window_path,
-            },
-            PolicyStateStore::new(),
-            mode,
-        )
-        .map_err(|error| unavailable(error.wire_code()))?;
+        Ok(LoadInputs {
+            profile,
+            profile_dir,
+            owner,
+            policy_path,
+            window_path,
+        })
+    }
+
+    fn load(&self, pin: PinRead<'_>) -> Result<CurrentMainnetApprovalPolicy, WalletError> {
+        let name = self.profile_name.as_str();
+        let inputs = self.load_inputs()?;
+        let load = inputs.policy_load(name);
+        let (profile, window_path) = (&inputs.profile, &inputs.window_path);
+        let policy = match pin {
+            PinRead::Mode(mode) => load_verified_policy(&load, PolicyStateStore::new(), mode),
+            PinRead::Held(admission) => {
+                admission.read_pin(window_path, profile).and_then(|state| {
+                    load_verified_policy_against(&load, PolicyStateStore::new(), &state)
+                })
+            }
+        }
+        .map_err(|error| match error {
+            PolicyError::StateLockBusy => busy(),
+            error => unavailable(error.wire_code()),
+        })?;
         crate::mainnet::enablement::verify_enablement_bindings(
             &policy,
             name,
-            &profile,
-            &profile_dir,
+            profile,
+            &inputs.profile_dir,
             &crate::mainnet::enablement::read_enablement_nonce,
         )
         .map_err(|error| unavailable(error.code()))?;
@@ -190,7 +366,32 @@ impl MainnetApprovalAuthority {
         {
             return Err(unavailable("policy.approval_credentials"));
         }
-        Ok(CurrentMainnetApprovalPolicy { profile, policy })
+        Ok(CurrentMainnetApprovalPolicy {
+            profile: inputs.profile,
+            policy,
+        })
+    }
+}
+
+/// What a load reads besides the policy file and the pin.
+struct LoadInputs {
+    profile: Profile,
+    profile_dir: std::path::PathBuf,
+    owner: [u8; 32],
+    policy_path: std::path::PathBuf,
+    window_path: std::path::PathBuf,
+}
+
+impl LoadInputs {
+    fn policy_load<'a>(&'a self, name: &'a str) -> PolicyLoad<'a> {
+        PolicyLoad {
+            path: &self.policy_path,
+            profile: &self.profile,
+            profile_name: name,
+            owner_pubkey: &self.owner,
+            owner_source: OwnerKeySource::Keyring,
+            window_path: &self.window_path,
+        }
     }
 }
 
@@ -304,6 +505,45 @@ mod tests {
             "approval.presence_policy_unavailable",
             "no owner key"
         );
+    }
+
+    /// A policy-state writer that holds the lock through the final retry
+    /// refuses both loads as busy, never as an unavailable policy, and a
+    /// load after its release succeeds. An unsigned edit stays unavailable,
+    /// whether or not the writer holds the lock.
+    #[test]
+    #[serial]
+    fn a_held_policy_lock_answers_policy_busy() {
+        let fixture = MainnetConsentFixture::new("main");
+        let window = crate::profile::schema::default_policy_window_state_path_for("main");
+        let key = &fixture.profile().policy_window_state_key_id;
+        let writer = crate::policy::state_lock::WindowStoreLock::acquire_for(&window, key).unwrap();
+        for load in [
+            MainnetApprovalAuthority::load_current_compare_only,
+            MainnetApprovalAuthority::load_current,
+        ] {
+            assert_eq!(
+                refused(load(&fixture.authority())),
+                "approval.presence_policy_busy"
+            );
+        }
+        let policy_path = fixture.policy_path();
+        let signed = std::fs::read_to_string(&policy_path).unwrap();
+        std::fs::write(&policy_path, signed.replace("sequence = 1", "sequence = 2")).unwrap();
+        assert_eq!(
+            refused(fixture.authority().load_current_compare_only()),
+            "approval.presence_policy_unavailable",
+            "an unsigned edit under a held lock"
+        );
+        drop(writer);
+        assert_eq!(
+            refused(fixture.authority().load_current_compare_only()),
+            "approval.presence_policy_unavailable",
+            "an unsigned edit"
+        );
+        std::fs::write(&policy_path, &signed).unwrap();
+        assert!(fixture.authority().load_current_compare_only().is_ok());
+        assert!(fixture.authority().load_current().is_ok());
     }
 
     /// The issuing load advances the pin, so a credential removal observed
