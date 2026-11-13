@@ -128,6 +128,22 @@
 //! The initial head is zero; each next head hashes `stellar-agent-outbox:v1`,
 //! the prior head, and the line bytes without the newline, in that order.
 
+//! # Owner and generation codecs
+//!
+//! The owner value records a queue generation, a closed batch, a legacy-state
+//! digest, and at most 15 requested row digests, oldest first.
+//! Recent evidence includes only rows whose evidence flag is one.
+//! The legacy digest hashes the exact v1 commitment value at cutover.
+//! Batch commitments hash ordered binary row digests. Owner accounts follow
+//! carrier generations, independently of the queue generation inside the value.
+//! Runtime appends and drains use the v1 commitment and create no owner value.
+//!
+//! A generation header is `{"k":"gen","g":G,"tag":"T"}` followed by a newline.
+//! No header means queue generation zero.
+//! Its HMAC-SHA256 tag binds `stellar-agent-outbox-gen:v2` and the big-endian u64 generation.
+//! A correctly laid-out first header contributes no pending row or sequence position.
+//! Inspection checks layout without a key and keeps physical warning line numbers.
+
 use super::tip_anchor::{TipAnchorStore, TipAnchorStoreError};
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
@@ -205,6 +221,136 @@ impl OutboxState {
             state.push(line);
         }
         state
+    }
+}
+
+/// Owner evidence for one queue generation.
+#[cfg(any(test, feature = "test-helpers"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboxOwnerState {
+    g: u64,
+    closed: Option<ClosedBatch>,
+    legacy: Option<[u8; 32]>,
+    recent: Vec<[u8; 32]>,
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClosedBatch {
+    g: u64,
+    n: u64,
+    batch: [u8; 32],
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl OutboxOwnerState {
+    /// Parses the owner value with bounded evidence and required fields.
+    ///
+    /// # Errors
+    /// Returns a store error when the owner value is unusable.
+    pub fn parse(raw: &str) -> Result<Self, TipAnchorStoreError> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct StoredClosed {
+            g: u64,
+            n: u64,
+            batch: String,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Stored {
+            v: u64,
+            g: u64,
+            #[serde(deserialize_with = "serde::Deserialize::deserialize")]
+            closed: Option<StoredClosed>,
+            #[serde(deserialize_with = "serde::Deserialize::deserialize")]
+            legacy: Option<String>,
+            recent: Vec<String>,
+        }
+        let invalid = || TipAnchorStoreError::new("outbox owner state is unusable");
+        let hash = |text: &str| bare_hash(text.as_bytes()).ok_or_else(invalid);
+        let stored: Stored = serde_json::from_str(raw).map_err(|_| invalid())?;
+        if stored.v != 1 || stored.recent.len() > 15 {
+            return Err(invalid());
+        }
+        let owner = Self {
+            g: stored.g,
+            closed: stored
+                .closed
+                .map(|closed| {
+                    Ok::<_, TipAnchorStoreError>(ClosedBatch {
+                        g: closed.g,
+                        n: closed.n,
+                        batch: hash(&closed.batch)?,
+                    })
+                })
+                .transpose()?,
+            legacy: stored.legacy.as_deref().map(hash).transpose()?,
+            recent: stored
+                .recent
+                .iter()
+                .map(|text| hash(text))
+                .collect::<Result<_, _>>()?,
+        };
+        if owner.to_keyring_value() != raw {
+            return Err(invalid());
+        }
+        Ok(owner)
+    }
+
+    /// Encodes the owner fields in their persistence order.
+    #[must_use]
+    pub fn to_keyring_value(&self) -> String {
+        let closed = self.closed.as_ref().map_or_else(
+            || "null".to_owned(),
+            |closed| {
+                format!(
+                    r#"{{"g":{},"n":{},"batch":"{}"}}"#,
+                    closed.g,
+                    closed.n,
+                    crate::hex::encode(&closed.batch)
+                )
+            },
+        );
+        let legacy = self.legacy.as_ref().map_or_else(
+            || "null".to_owned(),
+            |hash| format!(r#""{}""#, crate::hex::encode(hash)),
+        );
+        let recent = self
+            .recent
+            .iter()
+            .map(|hash| format!(r#""{}""#, crate::hex::encode(hash)))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            r#"{{"v":1,"g":{},"closed":{closed},"legacy":{legacy},"recent":[{recent}]}}"#,
+            self.g
+        )
+    }
+
+    fn new(g: u64, legacy: Option<&OutboxState>) -> Self {
+        Self {
+            g,
+            closed: None,
+            legacy: legacy.map(|state| Sha256::digest(state.to_keyring_value()).into()),
+            recent: Vec::new(),
+        }
+    }
+
+    fn record_delivery(&mut self, g: u64, rows: &[(u8, [u8; 32])]) {
+        let mut batch = Sha256::new();
+        for (r, digest) in rows {
+            batch.update(digest);
+            if *r == 1 {
+                self.recent.push(*digest);
+            }
+        }
+        self.recent.drain(..self.recent.len().saturating_sub(15));
+        self.closed = Some(ClosedBatch {
+            g,
+            n: rows.len() as u64,
+            batch: batch.finalize().into(),
+        });
     }
 }
 
@@ -309,7 +455,7 @@ fn encode_tagged_row(
     Ok(line)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-helpers"))]
 fn row_digest(g: u64, s: u64, r: u8, entry: &AuditEntry) -> Result<[u8; 32], serde_json::Error> {
     let mut digest = Sha256::new();
     digest.update(row_prefix(g, s, r));
@@ -348,6 +494,83 @@ fn take_decimal(input: &mut &[u8]) -> Option<u64> {
     let value = std::str::from_utf8(digits).ok()?.parse().ok()?;
     *input = rest;
     Some(value)
+}
+
+fn bare_hash(bytes: &[u8]) -> Option<[u8; 32]> {
+    if bytes.len() != 64
+        || !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    {
+        return None;
+    }
+    crate::hex::decode_hex32(std::str::from_utf8(bytes).ok()?).ok()
+}
+
+fn generation_layout(line: &[u8]) -> Option<(u64, [u8; 32])> {
+    let mut rest = line.strip_prefix(b"{\"k\":\"gen\",\"g\":")?;
+    let g = take_decimal(&mut rest)?;
+    let tag = rest.strip_prefix(b",\"tag\":\"")?.strip_suffix(b"\"}")?;
+    Some((g, bare_hash(tag)?))
+}
+
+fn generation_at(line: &[u8], number: usize) -> Result<Option<(u64, [u8; 32])>, WriterError> {
+    let is_generation = line.starts_with(b"{\"k\":\"gen\"")
+        || serde_json::from_slice::<serde_json::Value>(line)
+            .ok()
+            .is_some_and(|value| value.get("k").and_then(|k| k.as_str()) == Some("gen"));
+    if !is_generation {
+        return Ok(None);
+    }
+    if number != 1 {
+        return Err(tagged_refusal(number, "generation line out of place"));
+    }
+    generation_layout(line)
+        .map(Some)
+        .ok_or_else(|| tagged_refusal(number, "tagged record that does not parse"))
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+#[allow(
+    clippy::expect_used,
+    reason = "HMAC-SHA256 accepts a key of any length"
+)]
+fn generation_mac(key: &[u8; 32], g: u64) -> Hmac<Sha256> {
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(key).expect("HMAC-SHA256 accepts a key of any length");
+    mac.update(b"stellar-agent-outbox-gen:v2");
+    mac.update(&g.to_be_bytes());
+    mac
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+fn encode_generation_line(key: &[u8; 32], g: u64) -> Vec<u8> {
+    format!(
+        "{{\"k\":\"gen\",\"g\":{g},\"tag\":\"{}\"}}\n",
+        crate::hex::encode(&generation_mac(key, g).finalize().into_bytes())
+    )
+    .into_bytes()
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+fn authenticated_generation(lines: &[&[u8]], key: Option<&[u8; 32]>) -> Result<u64, WriterError> {
+    let mut generation = 0;
+    for (index, line) in lines.iter().enumerate() {
+        if let Some((g, tag)) = generation_at(line, index + 1)? {
+            let key = key.ok_or_else(|| tagged_refusal(1, "tagged record without an audit key"))?;
+            generation_mac(key, g)
+                .verify_slice(&tag)
+                .map_err(|_| tagged_refusal(1, "tagged record whose tag does not verify"))?;
+            generation = g;
+        }
+    }
+    Ok(generation)
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+fn advance_generation(g: u64) -> Result<u64, WriterError> {
+    g.checked_add(1)
+        .ok_or_else(|| tagged_refusal(1, "queue generation overflows"))
 }
 
 fn tagged_layout(line: &[u8]) -> Option<TaggedRow<'_>> {
@@ -1332,7 +1555,7 @@ fn parse_lines(bytes: &[u8]) -> ParsedLines<'_> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct OutboxInspection {
-    /// Number of newline-terminated lines: rows queued and not yet drained.
+    /// Number of complete lines excluding a correctly laid-out first generation header.
     pub pending: usize,
     /// Size of a final segment with no terminating newline, or zero.
     pub torn_bytes: usize,
@@ -1346,6 +1569,7 @@ pub struct OutboxInspection {
 /// Tagged rows receive layout and canonical-body checks only. Inspection never
 /// authenticates tags or checks coordinates, row kinds, or the commitment.
 /// Untagged rows receive only the entry deserialization check.
+/// A valid first generation header is excluded from pending rows without authentication.
 ///
 /// A missing outbox reports nothing pending. The result describes the file
 /// as read and may already be stale when it returns: a drain or an append in
@@ -1366,6 +1590,11 @@ pub fn inspect_outbox(log_path: &Path) -> io::Result<OutboxInspection> {
         .iter()
         .enumerate()
         .filter(|(index, line)| {
+            match generation_at(line, index + 1) {
+                Ok(Some(_)) => return false,
+                Err(_) => return true,
+                Ok(None) => {}
+            }
             if is_tagged(line) {
                 tagged_layout(line)
                     .and_then(|row| canonical_entry(row.body, index + 1).ok())
@@ -1377,21 +1606,79 @@ pub fn inspect_outbox(log_path: &Path) -> io::Result<OutboxInspection> {
         .map(|(index, _)| index + 1)
         .collect();
     Ok(OutboxInspection {
-        pending: parsed.lines.len(),
+        pending: parsed.lines.len()
+            - usize::from(
+                parsed
+                    .lines
+                    .first()
+                    .is_some_and(|line| generation_layout(line).is_some()),
+            ),
         torn_bytes: parsed.torn_bytes,
         unparseable_lines,
     })
 }
 
-/// Test-only fault seam that makes the next append to one outbox write part of
-/// its line and then fail.
+/// Test-only codec adapters and append fault injection.
 ///
-/// Keyed by the outbox path, so tests running in parallel threads never see
-/// or clear one another's fault.
+/// Append faults are keyed by the outbox path so parallel tests stay isolated.
 #[cfg(any(test, feature = "test-helpers"))]
 pub mod test_seam {
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
+
+    /// Creates owner evidence for a cutover state.
+    pub fn owner_value(g: u64, legacy: Option<&super::OutboxState>) -> String {
+        super::OutboxOwnerState::new(g, legacy).to_keyring_value()
+    }
+
+    /// Records a delivered batch in an owner value.
+    ///
+    /// # Errors
+    /// Returns an error for an unusable owner value.
+    pub fn owner_after_delivery(
+        raw: &str,
+        g: u64,
+        rows: &[(u8, [u8; 32])],
+    ) -> Result<String, super::TipAnchorStoreError> {
+        let mut owner = super::OutboxOwnerState::parse(raw)?;
+        owner.record_delivery(g, rows);
+        Ok(owner.to_keyring_value())
+    }
+
+    /// Reads the evidence flag and digest of a canonically encoded row.
+    ///
+    /// # Errors
+    /// Returns an error for invalid layout or body bytes.
+    pub fn delivered_row_digest(line: &[u8]) -> Result<(u8, [u8; 32]), super::WriterError> {
+        let row = super::tagged_layout(line)
+            .ok_or_else(|| super::tagged_refusal(1, "tagged record that does not parse"))?;
+        let entry = super::canonical_entry(row.body, 1)?;
+        Ok((row.r, super::row_digest(row.g, row.s, row.r, &entry)?))
+    }
+
+    /// Encodes a generation header, including its newline.
+    pub fn generation_line(key: &[u8; 32], g: u64) -> Vec<u8> {
+        super::encode_generation_line(key, g)
+    }
+
+    /// Authenticates generation headers in complete lines without newlines.
+    ///
+    /// # Errors
+    /// Returns an error for invalid layout, placement, or authentication.
+    pub fn queue_generation(
+        lines: &[&[u8]],
+        key: Option<&[u8; 32]>,
+    ) -> Result<u64, super::WriterError> {
+        super::authenticated_generation(lines, key)
+    }
+
+    /// Checks the next queue generation before mutation.
+    ///
+    /// # Errors
+    /// Returns an error when the generation overflows.
+    pub fn next_generation(g: u64) -> Result<u64, super::WriterError> {
+        super::advance_generation(g)
+    }
 
     static PARTIAL_WRITES: Mutex<Vec<(PathBuf, usize)>> = Mutex::new(Vec::new());
 
@@ -1629,6 +1916,342 @@ mod tests {
             crate::hex::encode(&mac.finalize().into_bytes())
         )
         .into_bytes()
+    }
+
+    #[test]
+    fn owner_item_vector_and_limits() {
+        use test_seam::owner_value;
+        let empty = r#"{"v":1,"g":0,"closed":null,"legacy":null,"recent":[]}"#;
+        assert_eq!(owner_value(0, None), empty);
+        assert_eq!(
+            OutboxOwnerState::parse(empty).unwrap().to_keyring_value(),
+            empty
+        );
+        assert_eq!(
+            owner_value(7, Some(&OutboxState::default())),
+            r#"{"v":1,"g":7,"closed":null,"legacy":"387c35402193ea541c6ff3160f4562acb59217234b135901f5944ffa9a6822a3","recent":[]}"#
+        );
+        let maximum = |count| {
+            format!(
+                r#"{{"v":1,"g":{0},"closed":{{"g":{0},"n":{0},"batch":"{1}"}},"legacy":"{2}","recent":[{3}]}}"#,
+                u64::MAX,
+                "ab".repeat(32),
+                "cd".repeat(32),
+                vec![format!(r#""{}""#, "ef".repeat(32)); count].join(",")
+            )
+        };
+        let full = maximum(15);
+        assert_eq!(full.len(), 1260);
+        assert_eq!(
+            OutboxOwnerState::parse(&full).unwrap().to_keyring_value(),
+            full
+        );
+        assert_eq!(maximum(16).len(), 1327);
+        assert!(full.encode_utf16().count() * 2 <= 2560);
+        assert!(maximum(16).encode_utf16().count() * 2 > 2560);
+        let refuse = |raw: &str| {
+            assert_eq!(
+                OutboxOwnerState::parse(raw).unwrap_err().detail,
+                "outbox owner state is unusable",
+                "{raw}"
+            );
+        };
+        refuse(&maximum(16));
+        refuse(&full.replacen("\"v\":1", "\"v\":1,\"v\":1", 1));
+        refuse(&full.replacen("\"v\":1", "\"v\":1,\"delivered\":0", 1));
+        refuse(&full.replacen("\"n\":", "\"extra\":0,\"n\":", 1));
+        refuse(&full.replacen("\"batch\":", "\"n\":0,\"batch\":", 1));
+        let malformed = [
+            format!(" {full}"),
+            format!("{full}\n"),
+            full.replace(',', ", "),
+            empty.replace("\"v\":1,\"g\":0", "\"g\":0,\"v\":1"),
+            full.replace(
+                &format!("\"g\":{0},\"n\":{0}", u64::MAX),
+                &format!("\"n\":{0},\"g\":{0}", u64::MAX),
+            ),
+            full.replacen("ab", r"\u0061b", 1),
+            format!("{full}x"),
+            empty.replace("\"closed\":null", "\"closed\":0"),
+            empty.replace("\"legacy\":null", "\"legacy\":1"),
+            empty.replace("\"recent\":[]", "\"recent\":null"),
+            empty.replace("\"recent\":[]", "\"recent\":[1]"),
+        ];
+        for raw in malformed {
+            refuse(&raw);
+        }
+        for raw in ["", "null", "[]", "{}", "private-marker"] {
+            refuse(raw);
+        }
+        let value: serde_json::Value = serde_json::from_str(&full).unwrap();
+        for field in ["v", "g", "closed", "legacy", "recent"] {
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            refuse(&missing.to_string());
+        }
+        for field in ["g", "n", "batch"] {
+            let mut missing = value.clone();
+            missing["closed"].as_object_mut().unwrap().remove(field);
+            refuse(&missing.to_string());
+        }
+        for version in ["0", "2", "256", "-1", "1.0", "\"1\""] {
+            refuse(&full.replacen("\"v\":1", &format!("\"v\":{version}"), 1));
+        }
+        for number in ["-1", "1.0", "18446744073709551616", "\"1\"", "null"] {
+            for prefix in ["\"g\":", "\"n\":"] {
+                refuse(&full.replace(
+                    &format!("{prefix}{}", u64::MAX),
+                    &format!("{prefix}{number}"),
+                ));
+            }
+        }
+        for hash in [
+            "AB".repeat(32),
+            "a".repeat(63),
+            "a".repeat(65),
+            "gg".repeat(32),
+            format!("sha256:{}", "ab".repeat(32)),
+        ] {
+            for original in ["ab".repeat(32), "cd".repeat(32), "ef".repeat(32)] {
+                refuse(&full.replace(&original, &hash));
+            }
+        }
+    }
+
+    #[test]
+    fn recent_keeps_only_fifteen_requested_digests() {
+        let rows: Vec<_> = (1..=40)
+            .map(|s| {
+                let line = encode_tagged_row(&ROW_KEY, 7, s, (s % 2) as u8, &fixed_row()).unwrap();
+                test_seam::delivered_row_digest(&line).unwrap()
+            })
+            .collect();
+        let first =
+            test_seam::owner_after_delivery(&test_seam::owner_value(8, None), 7, &rows[..20])
+                .unwrap();
+        let final_value = test_seam::owner_after_delivery(&first, 7, &rows[20..]).unwrap();
+        let owner = OutboxOwnerState::parse(&final_value).unwrap();
+        let expected: Vec<_> = (11..=39)
+            .step_by(2)
+            .map(|s| row_digest(7, s, 1, &fixed_row()).unwrap())
+            .collect();
+        assert_eq!(owner.recent, expected);
+        assert_eq!(owner.recent.len(), 15);
+        assert_eq!(owner.g, 8);
+        assert_eq!(owner.closed.as_ref().unwrap().g, 7);
+        assert_eq!(owner.closed.as_ref().unwrap().n, 20);
+        let unchanged = test_seam::owner_after_delivery(&final_value, 8, &[(0, [0; 32])]).unwrap();
+        assert_eq!(
+            OutboxOwnerState::parse(&unchanged).unwrap().recent,
+            expected
+        );
+    }
+
+    #[test]
+    fn owner_batch_hashes_ordered_binary_row_digests() {
+        let rows: Vec<_> = [0, 1]
+            .into_iter()
+            .map(|r| {
+                test_seam::delivered_row_digest(
+                    &encode_tagged_row(&ROW_KEY, 0, 1, r, &fixed_row()).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let value =
+            test_seam::owner_after_delivery(&test_seam::owner_value(1, None), 0, &rows).unwrap();
+        let owner = OutboxOwnerState::parse(&value).unwrap();
+        let closed = owner.closed.unwrap();
+        assert_eq!(closed.g, 0);
+        assert_eq!(closed.n, 2);
+        assert_eq!(
+            crate::hex::encode(&closed.batch),
+            "b92d22c240f13e919f04f18c992a10a5f3b4cb8885105ee1525219fd0dfc2a43"
+        );
+        assert_eq!(owner.recent, vec![rows[1].1]);
+    }
+
+    #[test]
+    fn generation_line_vector_binds_generation_and_domain() {
+        for (g, tag) in [
+            (
+                0,
+                "a9100ad8986f84004dba3a37d49d22b163821c500dfc106b869098b40dbbd759",
+            ),
+            (
+                7,
+                "bf5a617010a112b0460fa0fe499d38dcbc7070f56cd9cfbb66b63c5544692684",
+            ),
+            (
+                u64::MAX,
+                "8f1e49dbfd8f9785c28955595e0fb413a5e0d4e76e9cf4845b65199e15bbd3ba",
+            ),
+        ] {
+            let line = test_seam::generation_line(&ROW_KEY, g);
+            assert_eq!(
+                line,
+                format!("{{\"k\":\"gen\",\"g\":{g},\"tag\":\"{tag}\"}}\n").as_bytes()
+            );
+            let line = line.strip_suffix(b"\n").unwrap();
+            assert_eq!(
+                test_seam::queue_generation(&[line], Some(&ROW_KEY)).unwrap(),
+                g
+            );
+            let upper = std::str::from_utf8(line)
+                .unwrap()
+                .replace(tag, &tag.to_uppercase());
+            assert!(matches!(
+                test_seam::queue_generation(&[upper.as_bytes()], Some(&ROW_KEY)),
+                Err(WriterError::OutboxUnusable {
+                    reason: "tagged record that does not parse",
+                    ..
+                })
+            ));
+            let changed = std::str::from_utf8(line)
+                .unwrap()
+                .replace(&format!("\"g\":{g}"), "\"g\":9");
+            assert!(matches!(
+                test_seam::queue_generation(&[changed.as_bytes()], Some(&ROW_KEY)),
+                Err(WriterError::OutboxUnusable {
+                    reason: "tagged record whose tag does not verify",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn generation_codec_refusals_are_exact() {
+        let header = test_seam::generation_line(&ROW_KEY, 7);
+        let line = header.strip_suffix(b"\n").unwrap();
+        let check = |lines: &[&[u8]], key, number, reason| {
+            let error = test_seam::queue_generation(lines, key).unwrap_err();
+            assert_eq!(
+                format!("{error:?}"),
+                format!("{:?}", tagged_refusal(number, reason))
+            );
+        };
+        assert_eq!(test_seam::queue_generation(&[], None).unwrap(), 0);
+        assert_eq!(
+            test_seam::queue_generation(&[VECTOR_BODY.as_bytes()], None).unwrap(),
+            0
+        );
+        check(&[line], None, 1, "tagged record without an audit key");
+        check(
+            &[line],
+            Some(&[0; 32]),
+            1,
+            "tagged record whose tag does not verify",
+        );
+        check(
+            &[line, line],
+            Some(&ROW_KEY),
+            2,
+            "generation line out of place",
+        );
+        check(
+            &[b"{}", b"{}", line],
+            Some(&ROW_KEY),
+            3,
+            "generation line out of place",
+        );
+        let raw = std::str::from_utf8(line).unwrap();
+        for malformed in [
+            raw.replace("\"g\":7", "\"g\":07"),
+            raw.replace("\"g\":7", "\"g\":-1"),
+            raw.replace("\"g\":7", "\"g\":7.0"),
+            raw.replace("\"g\":7", "\"g\":18446744073709551616"),
+            raw.replace("\"g\":7", "\"g\":\"7\""),
+            raw.replace("\"g\":7", "\"g\":7,\"extra\":0"),
+            raw.replace("\"k\":\"gen\",\"g\":7", "\"g\":7,\"k\":\"gen\""),
+            raw.replace(',', ", "),
+            raw.replace("\"tag\":", "\"missing\":"),
+            raw.replace("bf5a", "zzz"),
+            format!("{raw}\n"),
+            "{\"k\":\"gen\"".to_owned(),
+        ] {
+            check(
+                &[malformed.as_bytes()],
+                None,
+                1,
+                "tagged record that does not parse",
+            );
+        }
+        assert_eq!(test_seam::next_generation(0).unwrap(), 1);
+        assert_eq!(test_seam::next_generation(u64::MAX - 1).unwrap(), u64::MAX);
+        assert_eq!(
+            format!("{:?}", test_seam::next_generation(u64::MAX).unwrap_err()),
+            format!("{:?}", unusable("queue generation overflows"))
+        );
+    }
+
+    #[test]
+    fn generation_inspection_counts_rows_and_file_lines() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("generation.jsonl");
+        let header = format!(
+            "{{\"k\":\"gen\",\"g\":7,\"tag\":\"{}\"}}\n",
+            "00".repeat(32)
+        );
+        let mut bytes = header.as_bytes().to_vec();
+        for s in 0..64 {
+            bytes.extend(encode_tagged_row(&ROW_KEY, 99, s, 0, &fixed_row()).unwrap());
+            bytes.push(b'\n');
+        }
+        bytes.extend_from_slice(b"bad\n");
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(b"torn");
+        fs::write(outbox_path(&path), &bytes).unwrap();
+        assert_eq!(
+            inspect_outbox(&path).unwrap(),
+            OutboxInspection {
+                pending: 66,
+                torn_bytes: 4,
+                unparseable_lines: vec![66, 67],
+            }
+        );
+        fs::write(outbox_path(&path), header.replace("\"g\":7", "\"g\":07")).unwrap();
+        assert_eq!(
+            inspect_outbox(&path).unwrap(),
+            OutboxInspection {
+                pending: 1,
+                torn_bytes: 0,
+                unparseable_lines: vec![1],
+            }
+        );
+        fs::write(outbox_path(&path), format!("{VECTOR_BODY}\n{header}")).unwrap();
+        assert_eq!(
+            inspect_outbox(&path).unwrap(),
+            OutboxInspection {
+                pending: 2,
+                torn_bytes: 0,
+                unparseable_lines: vec![2],
+            }
+        );
+        fs::write(outbox_path(&path), &header).unwrap();
+        assert_eq!(inspect_outbox(&path).unwrap(), OutboxInspection::default());
+    }
+
+    #[test]
+    fn a_generation_header_alone_is_clean_to_inspect_but_refuses_the_drain() {
+        let (_dir, path, store, mut writer) = keyed_fixture();
+        let header = test_seam::generation_line(&ROW_KEY, 7);
+        fs::write(outbox_path(&path), &header).unwrap();
+        commit_every_line(&path, &store);
+        assert_eq!(
+            inspect_outbox(&path).unwrap(),
+            OutboxInspection {
+                pending: 0,
+                torn_bytes: 0,
+                unparseable_lines: vec![],
+            }
+        );
+        assert_eq!(
+            writer.drain_outbox().unwrap_err().to_string(),
+            "audit.outbox_unusable: line 1 of the audit outbox is unusable \
+             (tagged record that does not parse at column 1); the outbox is left unchanged"
+        );
+        assert_eq!(outbox_bytes(&path), header);
     }
 
     #[test]
