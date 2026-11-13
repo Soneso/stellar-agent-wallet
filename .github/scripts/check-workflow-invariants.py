@@ -233,8 +233,14 @@ WORKFLOWS = ("release.yml", "publish.yml", "notarize-smoke.yml", "labels.yml", "
              "triage-review.yml", "triage-sweep.yml", "welcome.yml", "coverage.yml", "release-rehearsal.yml",
              "ci.yml", "vendored-wasm.yml", "changelog.yml")
 CHANGELOG_CONDITION = "github.event_name == 'pull_request' && github.base_ref == 'mainnet-write'"
-CHANGELOG_GUARD = ('python3 .github/scripts/changelog.py guard --base "$BASE_SHA" '
-                   '--head "$HEAD_SHA" --main-ref refs/remotes/origin/main')
+CHANGELOG_ARGS = 'guard --base "$BASE_SHA" --head "$HEAD_SHA" --main-ref refs/remotes/origin/main'
+CHANGELOG_GUARD = ('set -euo pipefail\n'
+                   'GUARD_ENTRY=$(git ls-tree "$BASE_SHA" -- .github/scripts/changelog.py)\n'
+                   'if [ -n "$GUARD_ENTRY" ]; then\n'
+                   '  git show "$BASE_SHA:.github/scripts/changelog.py" | python3 - ' + CHANGELOG_ARGS + '\n'
+                   'else\n'
+                   '  python3 .github/scripts/changelog.py ' + CHANGELOG_ARGS + '\n'
+                   'fi')
 CHANGELOG_FETCH = "git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main"
 PENDING_FRAGMENTS = ('set -euo pipefail\n'
                      'PENDING=$(find changelog.d -mindepth 1 -maxdepth 1 ! -name README.md -print)\n'

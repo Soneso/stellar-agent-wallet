@@ -6,6 +6,7 @@ from contextlib import redirect_stderr, redirect_stdout
 import io
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -64,12 +65,12 @@ def scenarios(*values):
 class History:
     """Keep real commit graphs in scratch repositories without working files."""
 
-    def __init__(self):
+    def __init__(self, body=b"- Initial.\n"):
         scratch = SCRIPT.resolve().parents[2] / "target" / "tmp"
         scratch.mkdir(parents=True, exist_ok=True)
         self.root = Path(tempfile.mkdtemp(prefix="changelog-guard-", dir=scratch))
         self.git("init", "--bare", "--initial-branch=main")
-        self.initial = self.commit(b"- Initial.\n")
+        self.initial = self.commit(body)
         self.git("update-ref", "refs/remotes/origin/main", self.initial)
 
     def git(self, *args, data=None):
@@ -79,11 +80,11 @@ class History:
                                 capture_output=True, env=env, check=True)
         return result.stdout.decode("ascii").strip()
 
-    def commit(self, body, *parents, note=b"Note.\n", blob=None):
+    def commit(self, body, *parents, note=b"Note.\n", blob=None, mode="100644", path="CHANGELOG.md", extra=""):
         blob = blob or self.git("hash-object", "-w", "--stdin", data=body)
         other = self.git("hash-object", "-w", "--stdin", data=note)
         tree = self.git("mktree", "--missing", data=(
-            f"100644 blob {blob}\tCHANGELOG.md\n100644 blob {other}\tnote.md\n").encode())
+            f"{mode} blob {blob}\t{path}\n100644 blob {other}\tnote.md\n{extra}").encode())
         args = [arg for parent in parents for arg in ("-p", parent)]
         return self.git("commit-tree", tree, *args, data=b"Fixture commit.\n")
 
@@ -101,6 +102,27 @@ class History:
         for commit in refused:
             require(commit + ": CHANGELOG.md edit is refused." in err
                     and "remove edits from branch history" in err, "guard must name every refused commit and its remedy")
+        return err
+
+
+MERGE_BASE = b"- First.\n\n### Middle\n\n- Middle.\n\n### Last\n\n- Last.\n"
+MERGE_OURS = MERGE_BASE.replace(b"- First.", b"- First.\n- Integration.")
+MERGE_THEIRS = MERGE_BASE.replace(b"- Last.", b"- Last.\n- Main.")
+MERGE_BOTH = MERGE_OURS.replace(b"- Last.", b"- Last.\n- Main.")
+
+
+def sync_history():
+    h = History(MERGE_BASE)
+    base = h.commit(MERGE_OURS, h.initial)
+    main = h.commit(MERGE_THEIRS, h.initial)
+    h.main(main)
+    return h, base, main
+
+
+def document_texts():
+    for path in scenarios("CONTRIBUTING.md", "changelog.d/README.md", "docs/maintainers/releasing.md"):
+        text = (SCRIPT.resolve().parents[2] / path).read_text()
+        yield " ".join(text.split())
 
 
 class MemoryPath:
@@ -449,19 +471,16 @@ def cases(mod):
         h.assert_guard(mod, topic, main)
 
     def g05():
-        h = History()
-        base = h.commit(b"- Integration.\n", h.initial)
-        main = h.commit(b"- Release.\n", h.initial)
-        h.main(main)
-        merge = h.commit(b"- Release.\n", base, main)
+        h, base, main = sync_history()
+        merge = h.commit(MERGE_BOTH, base, main)
+        before = {p.relative_to(h.root): p.read_bytes() for p in h.root.rglob("*") if p.is_file()}
         h.assert_guard(mod, base, merge)
+        after = {p.relative_to(h.root): p.read_bytes() for p in h.root.rglob("*") if p.is_file()}
+        require(before == after, "guard must leave all repository files and objects unchanged")
 
     def g06():
-        h = History()
-        base = h.commit(b"- Integration.\n", h.initial)
-        main = h.commit(b"- Release.\n", h.initial)
-        h.main(main)
-        merge = h.commit(b"- Release.\n- Own edit.\n", base, main)
+        h, base, main = sync_history()
+        merge = h.commit(MERGE_BOTH + b"- Own edit.\n", base, main)
         h.assert_guard(mod, base, merge, 1, [merge])
 
     def g07():
@@ -473,14 +492,19 @@ def cases(mod):
 
     def g08():
         h = History()
-        base = h.commit(b"- Integration.\n", h.initial)
+        base = h.commit(b"- Initial.\n", h.initial, note=b"Topic.\n")
         side = h.commit(b"- Side.\n", h.initial)
         other = h.commit(b"- Release.\n", h.initial)
         main = h.commit(b"- Main.\n", side, other)
         h.main(main)
-        merge = h.commit(b"- Release.\n", base, side, other)
+        merge = h.commit(b"- Side.\n", base, side, other)
         subcase()
-        h.assert_guard(mod, base, merge)
+        h.assert_guard(mod, base, merge, 1, [merge])
+        fourth = h.commit(b"- Fourth.\n", main)
+        h.main(fourth)
+        octopus = h.commit(b"- Side.\n", base, side, other, fourth)
+        subcase()
+        h.assert_guard(mod, base, octopus, 1, [octopus])
         third = h.commit(b"- Third.\n", h.initial)
         mixed = h.commit(b"- Release.\n", base, other, third)
         subcase()
@@ -521,6 +545,159 @@ def cases(mod):
         h.git("clone", "--no-local", "--depth=1", str(h.root), str(shallow))
         h.root = shallow
         h.assert_guard(mod, head, head, 1)
+
+    def g14():
+        h, base, main = sync_history()
+        merge = h.commit(MERGE_THEIRS, base, main)
+        h.assert_guard(mod, base, merge, 1, [merge])
+
+    def g15():
+        h = History()
+        older = h.commit(b"- Older.\n", h.initial)
+        main = h.commit(b"- Main.\n", older)
+        base = h.commit(b"- Integration.\n", main)
+        h.main(main)
+        for parent, body in scenarios((older, b"- Older.\n"), (h.initial, b"- Initial.\n")):
+            merge = h.commit(body, base, parent)
+            with patch.object(mod, "clean_changelog_merge", wraps=mod.clean_changelog_merge) as clean:
+                h.assert_guard(mod, base, merge, 1, [merge])
+                require(not clean.called, "already-contained parents must be refused before content merging")
+
+    def g16():
+        h = History()
+        base = h.commit(b"- Integration.\n", h.initial)
+        main = h.commit(b"- Main.\n", h.initial)
+        h.main(main)
+        for body in scenarios(b"- Main.\n", b"- Hand resolution.\n", b"- Integration.\n"):
+            merge = h.commit(body, base, main)
+            err = h.assert_guard(mod, base, merge, 1, [merge])
+            require("a maintainer resolves and merges it" in err,
+                    "conflict refusal must say a maintainer resolves and merges it")
+
+    def g17():
+        h = History(MERGE_BASE)
+        base = h.commit(MERGE_OURS, h.initial)
+        main = h.commit(MERGE_BASE, h.initial, note=b"Main work.\n")
+        h.main(main)
+        merge = h.commit(MERGE_OURS, base, main)
+        h.assert_guard(mod, base, merge)
+
+    def g18():
+        h, base, main = sync_history()
+        merge = h.commit(MERGE_OURS, base, main)
+        h.assert_guard(mod, base, merge, 1, [merge])
+
+    def g19():
+        for mode, path, body in scenarios(("100644", "OLD.md", MERGE_BOTH),
+                                          ("120000", "CHANGELOG.md", b"note.md"),
+                                          ("100755", "CHANGELOG.md", MERGE_BOTH)):
+            h, base, main = sync_history()
+            for parents in scenarios((base,), (base, main)):
+                edit = h.commit(body, *parents, mode=mode, path=path)
+                h.assert_guard(mod, base, edit, 1, [edit])
+
+    def g20():
+        h, base, main = sync_history()
+        merge = h.commit(MERGE_BOTH, base, main)
+        real = mod.git
+        for command, output, expected in scenarios(
+                (("rev-parse", "--is-shallow-repository"), b"unknown\n", 1),
+                (("rev-parse", "--verify"), b"nonsense\n", 2),
+                (("rev-list", f"{base}..{merge}"), b"nonsense\n", 2),
+                (("rev-list", "--parents"), b"\n", 2),
+                (("diff-tree", "-r"), b"OTHER.md\n", 2),
+                (("merge-base", "--is-ancestor"), b"true\n", 2),
+                (("ls-tree", "-z"), b"unexpected\n", 1)):
+            def unexpected(root, *args, **kwargs):
+                result = real(root, *args, **kwargs)
+                if args[:2] == command:
+                    result.stdout = output
+                return result
+            with patch.object(mod, "git", unexpected):
+                h.assert_guard(mod, base, merge, expected)
+
+    def g21():
+        h, base, main = sync_history()
+        left = h.commit(MERGE_BOTH, base, main)
+        right = h.commit(MERGE_BOTH, main, base, note=b"Other merge.\n")
+        h.main(right)
+        merge = h.commit(MERGE_BOTH + b"- Edit.\n", left, right)
+        err = h.assert_guard(mod, left, merge, 1, [merge])
+        require("ambiguous merge bases" in err, "multiple merge bases must fail closed")
+
+    def g22():
+        h = History()
+
+        def fragments(names):
+            entries = []
+            for name in names:
+                blob = h.git("hash-object", "-w", "--stdin", data=("- " + name + ".\n").encode())
+                entries.append(f"100644 blob {blob}\t{name}.fixed.md\n")
+            if not entries:
+                return ""
+            tree = h.git("mktree", data="".join(entries).encode())
+            return f"040000 tree {tree}\tchangelog.d\n"
+
+        shared = h.commit(b"- Initial.\n", h.initial, extra=fragments(["released"]))
+        base = h.commit(b"- Initial.\n", shared, extra=fragments(["pending", "released"]))
+        main = h.commit(b"- Released.\n", shared)
+        h.main(main)
+        tree = h.git("merge-tree", "--write-tree", base, main)
+        paths = h.git("ls-tree", "-r", "--name-only", tree).splitlines()
+        require("changelog.d/released.fixed.md" not in paths,
+                "sync merge must delete the unchanged folded fragment")
+        require("changelog.d/pending.fixed.md" in paths,
+                "sync merge must preserve the new unreleased fragment")
+
+    def g23():
+        h = History()
+        result = subprocess.run([sys.executable, "-", "guard", "--base", h.initial,
+                                 "--head", h.initial, "--main-ref", "refs/remotes/origin/main"],
+                                input=SCRIPT.read_bytes(), cwd=h.root, capture_output=True)
+        require(result.returncode == 0 and b"integration guard passes" in result.stderr,
+                "the piped base script must use the current repository without changing arguments")
+
+    def d01():
+        for path in scenarios("CONTRIBUTING.md", "changelog.d/README.md"):
+            text = (SCRIPT.resolve().parents[2] / path).read_text()
+            require("Lowercase it and replace every character outside `a-z`, `0-9`, and `-` with `-`." in text,
+                    "slug instructions must match the accepted character grammar")
+            require("`fix/Login_v2.1` becomes `fix-login-v2-1`" in text,
+                    "slug instructions must include the normalized mixed-character example")
+        slug = re.sub("[^a-z0-9-]", "-", "fix/Login_v2.1".lower())
+        require(mod.validate_fragment_name(slug + ".fixed.md") == "Fixed", "documented slug must validate")
+
+    def d02():
+        for text in document_texts():
+            require("Never edit an existing fragment. Add a new file for a further entry." in text,
+                    "fragment instructions must forbid edits and require a new file")
+            require("Each fragment file belongs to one pull request and is never reused." in text,
+                    "fragment instructions must prohibit reuse between pull requests")
+
+    def d03():
+        for text in document_texts():
+            require("A sync merge deletes fragments that `main` folds and deletes." in text,
+                    "fragment instructions must explain folded fragment deletion")
+            require("It never deletes a fragment that holds an unreleased entry under this rule." in text,
+                    "fragment instructions must preserve unreleased entries")
+
+    def d04():
+        for text in document_texts():
+            require("exactly two parents" in text and "preserving both sides' lines" in text,
+                    "sync instructions must preserve both sides in a two-parent merge")
+            require("a maintainer resolves and merges them" in text and "never accepts hand-resolved" in text,
+                    "sync instructions must assign conflicts to a maintainer")
+
+    def d05():
+        text = " ".join((SCRIPT.resolve().parents[2] / "docs/maintainers/releasing.md").read_text().split())
+        require("Only release preparation pull requests to `main` change the compiled changelog; reviewers enforce this policy on `main`." in text,
+                "release instructions must state the review policy for main pull requests")
+
+    def d06():
+        text = (SCRIPT.resolve().parents[2] / "CONTRIBUTING.md").read_text()
+        section = text.split("## Changelog entries\n", 1)[1].split("\n## ", 1)[0]
+        require(all(len(line) <= 80 for line in section.splitlines()),
+                "contributor changelog instructions must wrap within 80 columns")
 
     def a01():
         for mode in ("check", "preview", "release", "guard"):
@@ -608,7 +785,7 @@ CONSTANT_SUBJECTS = {
     "fold_section": ["C13", "C14", "R13"],
     "section_bounds": ["C14", "R13"],
     "main": ["A01", "A02"],
-    "guard": [f"G{i:02}" for i in range(1, 14)],
+    "guard": [f"G{i:02}" for i in range(1, 22)],
 }
 
 
@@ -658,7 +835,8 @@ def main(argv):
                         print(f"{label}: constant {subject}={value!r} fails: {actual[label]}")
                         covered.add(label)
                         count += 1
-        require(covered == set(all_cases), "constant controls must cover every case")
+        require(covered == {name for name in all_cases if name not in {"G22", "G23"} and not name.startswith("D")},
+                "constant controls must cover every in-process utility case")
         print(f"{count} constant controls fail; {len(covered)} cases covered")
     if argv == ["--mutations"]:
         for name, (old, new) in MUTATIONS.items():
@@ -668,7 +846,8 @@ def main(argv):
             expected = {"C04": {"C04", "C14"}, "C09": {"C08", "C09"},
                         "R02": {"R02", "R16"}, "R08": {"R07", "R08"},
                         "R12": {"C14", "R12"},
-                        "A01": {"A01", "G13", *(f"G{i:02}" for i in range(1, 10))}}.get(name, {name})
+                        "A01": {"A01", "G13", *(f"G{i:02}" for i in range(1, 10)),
+                                *(f"G{i:02}" for i in range(14, 22))}}.get(name, {name})
             require(set(actual) == expected, f"{name}: actual failing IDs {actual}")
             require(not run(module(source)), f"{name}: restored control fails")
             print(f"{name}: parses; failures {sorted(actual)}: {actual[name]}; restored {len(all_cases)}/{len(all_cases)}")

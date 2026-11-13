@@ -41,9 +41,21 @@ TESTNET = ".github/workflows/testnet.yml"
 CHANGELOG = ".github/workflows/changelog.yml"
 CHANGELOG_CONDITION = "github.event_name == 'pull_request' && github.base_ref == 'mainnet-write'"
 CHANGELOG_IF = f"        if: {CHANGELOG_CONDITION}\n"
-CHANGELOG_COMMAND = ('python3 .github/scripts/changelog.py guard --base "$BASE_SHA" '
-                     '--head "$HEAD_SHA" --main-ref refs/remotes/origin/main')
-CHANGELOG_RUN = "        run: " + CHANGELOG_COMMAND + "\n"
+CHANGELOG_ARGS = 'guard --base "$BASE_SHA" --head "$HEAD_SHA" --main-ref refs/remotes/origin/main'
+CHANGELOG_COMMAND = ('set -euo pipefail\n'
+                     'GUARD_ENTRY=$(git ls-tree "$BASE_SHA" -- .github/scripts/changelog.py)\n'
+                     'if [ -n "$GUARD_ENTRY" ]; then\n'
+                     '  git show "$BASE_SHA:.github/scripts/changelog.py" | python3 - ' + CHANGELOG_ARGS + '\n'
+                     'else\n'
+                     '  python3 .github/scripts/changelog.py ' + CHANGELOG_ARGS + '\n'
+                     'fi')
+
+
+def changelog_run(command):
+    return "        run: |\n" + "".join("          " + line + "\n" for line in command.splitlines())
+
+
+CHANGELOG_RUN = changelog_run(CHANGELOG_COMMAND)
 CHANGELOG_FETCH = ("      - name: Fetch main for changelog protection\n        shell: bash\n"
                    "        run: git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main\n")
 CHANGELOG_CHECK = ("      - name: Check changelog fragments\n"
@@ -97,13 +109,18 @@ CHANGELOG_VARIANTS = {
              CHANGELOG_IF.replace("'pull_request'", "'push'"), CHANGELOG_IF.rstrip() + " && false\n")],
     "W14": [changelog_edit("HEAD_SHA: ${{ github.event.pull_request.head.sha }}", "HEAD_SHA: ${{ github.sha }}"),
              changelog_edit("BASE_SHA: ${{ github.event.pull_request.base.sha }}", "BASE_SHA: ${{ github.sha }}")],
-    "W15": [changelog_edit(CHANGELOG_RUN, "        run: " + value + "\n") for value in (
+    "W15": [changelog_edit(CHANGELOG_RUN, changelog_run(value)) for value in (
              CHANGELOG_COMMAND.replace(" --main-ref refs/remotes/origin/main", ""),
              CHANGELOG_COMMAND.replace("changelog.py", "other.py"),
              CHANGELOG_COMMAND.replace("$BASE_SHA", "$HEAD_SHA"),
              CHANGELOG_COMMAND.replace(" guard ", " check "),
+             CHANGELOG_COMMAND.replace('python3 - guard', 'python3 - check'),
+             CHANGELOG_COMMAND.replace('python3 .github/scripts/changelog.py guard', 'true # guard'),
+             CHANGELOG_COMMAND.replace('git show "$BASE_SHA:', 'git show "$HEAD_SHA:'),
+             CHANGELOG_COMMAND.replace('if [ -n', 'if [ -z'),
+             CHANGELOG_COMMAND.replace('set -euo pipefail', 'set -eu'),
              CHANGELOG_COMMAND + " || true", "echo '" + CHANGELOG_COMMAND + "'",
-             "|\n          # " + CHANGELOG_COMMAND)],
+             "\n".join("# " + line for line in CHANGELOG_COMMAND.splitlines()))],
     "W16": [changelog_edit(CHANGELOG_GUARD, CHANGELOG_GUARD + "        continue-on-error: true\n"),
              changelog_edit(CHANGELOG_GUARD, CHANGELOG_GUARD.replace("shell: bash", "shell: sh"))],
     "W18": [changelog_edit(PENDING_STEP, "", RELEASE),
@@ -140,13 +157,34 @@ def changelog_behavior(root, label):
     steps = doc["jobs"]["changelog"]["steps"]
     guard = next(step for step in steps if step.get("name") == "Protect integration changelog")
     if label == "W15 main-only changelog changes pass":
-        for commits, status in (("main", 0), ("topic", 1), ("error", 2)):
-            fake = ('python3() { [[ "$*" == ".github/scripts/changelog.py guard --base base --head head --main-ref refs/remotes/origin/main" ]] '
-                    '|| return 9; return "$STATUS"; }; '
-                    f'STATUS={status}; BASE_SHA=base; HEAD_SHA=head; ')
+        for present, probe, show, status in ((1, 0, 0, 0), (1, 0, 0, 1), (1, 0, 0, 2),
+                                            (0, 0, 0, 0), (0, 0, 0, 1), (0, 0, 0, 2),
+                                            (1, 2, 0, 2), (1, 0, 2, 2)):
+            fake = r'''
+git() {
+  if [[ "$*" == "ls-tree base -- .github/scripts/changelog.py" ]]; then
+    if (( PRESENT )); then printf '100644 blob fixture\t.github/scripts/changelog.py\n'; fi
+    return "$PROBE"
+  fi
+  [[ "$*" == "show base:.github/scripts/changelog.py" ]] || return 9
+  printf 'base script\n'
+  return "$SHOW"
+}
+python3() {
+  if (( PRESENT )); then
+    [[ "$*" == "- guard --base base --head head --main-ref refs/remotes/origin/main" ]] || return 9
+    read -r source
+    [[ "$source" == "base script" ]] || return 9
+  else
+    [[ "$*" == ".github/scripts/changelog.py guard --base base --head head --main-ref refs/remotes/origin/main" ]] || return 9
+  fi
+  return "$STATUS"
+}
+'''
+            fake += f'PRESENT={present}; PROBE={probe}; SHOW={show}; STATUS={status}; BASE_SHA=base; HEAD_SHA=head;\n'
             result = subprocess.run(["bash", "-c", fake + guard["run"]], capture_output=True, check=False)
             if result.returncode != status:
-                problems.append(f"main reachability: {commits}: exit {result.returncode}, expected {status}")
+                problems.append(f"base script selection: {present}, {probe}, {show}: exit {result.returncode}, expected {status}")
     if label == "W17":
         condition = guard["if"].strip()
         condition = condition[3:-2].strip() if condition.startswith("${{") else condition

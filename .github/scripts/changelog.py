@@ -201,35 +201,87 @@ def git(root, *args, allowed=(0,)):
     result = subprocess.run(["git", "--no-replace-objects", "--no-optional-locks", *args],
                             cwd=root, capture_output=True, check=False)
     if result.returncode not in allowed:
-        raise OSError(f"guard: git {args[0]} fails; restore complete history and retry")
+        raise OSError(f"guard: git {args[0]} fails; check Git support, restore complete history, and retry")
     return result
 
 
+def object_ids(output):
+    if not re.fullmatch(rb"(?:[0-9a-f]{40}(?:[0-9a-f]{24})?\n)*", output):
+        raise OSError("guard: unexpected object list; restore complete history and retry")
+    return output.decode("ascii").splitlines()
+
+
+def changelog_blob(root, commit):
+    entry = git(root, "ls-tree", "-z", commit, "--", "CHANGELOG.md").stdout
+    match = re.fullmatch(rb"100644 blob ([0-9a-f]{40}(?:[0-9a-f]{24})?)\tCHANGELOG.md\0", entry)
+    if not match:
+        raise Invalid("use a regular CHANGELOG.md with mode 100644 and its original path")
+    oid = match[1].decode("ascii")
+    return oid, git(root, "cat-file", "blob", oid).stdout
+
+
+def ancestor(root, older, newer):
+    result = git(root, "merge-base", "--is-ancestor", older, newer, allowed=(0, 1))
+    if result.stdout or result.stderr:
+        raise OSError("guard: unexpected ancestry output; restore complete history and retry")
+    return result.returncode == 0
+
+
+def clean_changelog_merge(root, parents, commit):
+    bases = object_ids(git(root, "merge-base", "--all", *parents).stdout)
+    if len(bases) != 1:
+        raise Invalid("a maintainer resolves and merges ambiguous merge bases")
+    ours, original, theirs, actual = [changelog_blob(root, ref)
+                                     for ref in (*parents[:1], bases[0], parents[1], commit)]
+    # Object input and stdout avoid writes to files, the index, and the object store.
+    # merge-file uses Git's built-in text merge without attributes or merge drivers.
+    merged = git(root, "-c", "merge.conflictStyle=merge", "merge-file", "-p", "--object-id",
+                 ours[0], original[0], theirs[0], allowed=tuple(range(128)))
+    if merged.returncode:
+        raise Invalid("CHANGELOG.md conflicts; a maintainer resolves and merges it")
+    if merged.stderr:
+        raise OSError("guard: unexpected merge output; check Git support and retry")
+    return actual[1] == merged.stdout
+
+
 def guard(root, base, head, main_ref):
-    if git(root, "rev-parse", "--is-shallow-repository").stdout.strip() != b"false":
+    if git(root, "rev-parse", "--is-shallow-repository").stdout != b"false\n":
         raise Invalid("guard: shallow history; supply complete history and retry")
-    base, head, main = [git(root, "rev-parse", "--verify", "--end-of-options", ref + "^{commit}")
-                        .stdout.decode("ascii").strip() for ref in (base, head, main_ref)]
-    commits = git(root, "rev-list", f"{base}..{head}", "--not", main).stdout.decode("ascii").split()
+    refs = [object_ids(git(root, "rev-parse", "--verify", "--end-of-options", ref + "^{commit}").stdout)
+            for ref in (base, head, main_ref)]
+    if any(len(ids) != 1 for ids in refs):
+        raise OSError("guard: unexpected ref output; restore complete history and retry")
+    base, head, main = [ids[0] for ids in refs]
+    commits = object_ids(git(root, "rev-list", f"{base}..{head}", "--not", main).stdout)
     refused = []
     checked = 0
     for commit in commits:
-        changed = git(root, "diff-tree", "--root", "-m", "-r", "--no-renames",
-                      "--no-commit-id", "--name-only", commit, "--", "CHANGELOG.md").stdout
-        if not changed:
-            continue
-        checked += 1
-        parents = git(root, "rev-list", "--parents", "-n", "1", commit).stdout.decode("ascii").split()[1:]
-        allowed = len(parents) > 1
-        for parent in parents[1:]:
-            ancestor = git(root, "merge-base", "--is-ancestor", parent, main, allowed=(0, 1))
-            allowed = allowed and ancestor.returncode == 0
-        if allowed:
-            content = git(root, "show", f"{commit}:CHANGELOG.md").stdout
-            versions = [git(root, "show", f"{parent}:CHANGELOG.md").stdout for parent in parents[1:]]
-            allowed = content in versions
-        if not allowed:
-            refused.append(f"{commit}: CHANGELOG.md edit is refused. Move entries to fragments and remove edits from branch history; sync merges take the main-side file.")
+        try:
+            row = git(root, "rev-list", "--parents", "-n", "1", commit).stdout
+            family = object_ids(row.replace(b" ", b"\n"))
+            if not family or family[0] != commit:
+                raise OSError("guard: unexpected parents; restore complete history and retry")
+            parents = family[1:]
+            comparison = [parents[0], commit] if parents else ["--root", commit]
+            changed = git(root, "diff-tree", "-r", "--no-renames", "--no-commit-id",
+                          "--name-only", *comparison, "--", "CHANGELOG.md").stdout
+            if changed not in (b"", b"CHANGELOG.md\n"):
+                raise OSError("guard: unexpected diff output; restore complete history and retry")
+            if not changed:
+                # A sync merge cannot silently discard incoming main entries.
+                if (len(parents) != 2 or not ancestor(root, parents[1], main)
+                        or ancestor(root, parents[1], parents[0])):
+                    continue
+            checked += 1
+            allowed = (len(parents) == 2 and ancestor(root, parents[1], main)
+                       and not ancestor(root, parents[1], parents[0]))
+            if not allowed or not clean_changelog_merge(root, parents, commit):
+                raise Invalid("use a two-parent sync merge that preserves the clean merge result")
+        except Invalid as error:
+            refused.append(f"{commit}: CHANGELOG.md edit is refused. {error}. "
+                           "Move entries to new fragments and remove edits from branch history.")
+        except OSError as error:
+            raise OSError(f"{commit}: {error}") from error
     if refused:
         raise Invalid("\n".join(refused))
     print(f"{checked} changelog commits checked; integration guard passes", file=sys.stderr)
@@ -241,7 +293,8 @@ def main(argv=None):
     modes = parser.add_subparsers(dest="mode", required=True)
     for mode in ("check", "preview", "release", "guard"):
         sub = modes.add_parser(mode)
-        sub.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[2])
+        default_root = Path.cwd() if __file__ == "<stdin>" else Path(__file__).resolve().parents[2]
+        sub.add_argument("--root", type=Path, default=default_root)
         if mode == "release":
             sub.add_argument("--version", required=True)
         if mode == "guard":

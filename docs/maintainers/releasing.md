@@ -28,8 +28,12 @@ dispatch.
    preparation pull request.
    Rerun release mode when pending fragments remain, including fragments that
    arrive during preparation.
-   Resolve a fragment modify/delete conflict in favor of deletion; the release
-   section contains that entry.
+   Never edit an existing fragment. Add a new file for a further entry.
+   Each fragment file belongs to one pull request and is never reused.
+   A sync merge deletes fragments that `main` folds and deletes.
+   It never deletes a fragment that holds an unreleased entry under this rule.
+   If a fragment violates this rule, preserve every unreleased item in a new
+   file before accepting deletion.
 2. Wait for CI to pass on that `main` commit.
 3. From a checkout of that commit, check the workspace members on crates.io:
 
@@ -55,6 +59,13 @@ The tag push starts `.github/workflows/release.yml`. Tag only a commit on
 same script with `--warn`, annotates the run with one warning per missing
 member, and the release proceeds.
 
+An eligible sync merge has exactly two parents and brings new ancestry from
+`main` through its second parent.
+Its `CHANGELOG.md` equals the clean three-way merge over the parents' merge
+base, preserving both sides' lines.
+The guard refuses conflicts; a maintainer resolves and merges them.
+The guard never accepts hand-resolved changelog bytes.
+
 ## What the release preflight refuses
 
 The `preflight` job runs before any build. It stops the release when any of
@@ -78,7 +89,8 @@ these holds:
 after the version header check.
 When it fails, rerun release mode during preparation, review the fold, and
 merge the prepared version before tagging.
-Release preparation is the only procedure that changes the compiled changelog.
+Only release preparation pull requests to `main` change the compiled
+changelog; reviewers enforce this policy on `main`.
 The release workflow reads the folded entries and leaves the tagged tree
 unchanged.
 
