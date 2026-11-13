@@ -208,6 +208,11 @@ runs the function.
 - ``skill-archive``: ``release-contracts`` can be bypassed, or its skill
   archive step is missing, duplicated, allowed to fail, uses another command,
   or has a condition that differs from ``SKILL_ARCHIVE_CONDITION``.
+  Its effective shell must be unset or ``bash``.
+- ``apt-retries``: an ``apt-get`` call in any workflow's ``run:`` block lacks
+  ``-o Acquire::Retries=3``. Each call is checked separately; comments are ignored.
+- ``ci-triggers``: ``ci.yml`` lacks ``push`` or a ``pull_request`` branch list
+  containing ``main``, or adds an event that requires re-evaluating the archive condition.
 """
 
 import fnmatch
@@ -529,6 +534,8 @@ CROSS_CALL = re.compile(COMMAND_WORD.format("cross") + r"(?:[ \t]+\+[^ \t]+)?[ \
 # command substitution or subshell, or a comment.
 ARGUMENTS_END = re.compile(r"[;&|)`]|(?<![^ \t])#")
 ALLOWED_CARGO = {"metadata", "-V", "--version"}
+APT_GET_CALL = re.compile(COMMAND_WORD.format("apt-get") + r"(?=[ \t]|$)")
+APT_RETRIES = re.compile(r"(?:^|[ \t])-o[ \t]+Acquire::Retries=3(?=[ \t]|$)")
 NO_VERIFY_CARGO = {"package", "publish"}
 # A shell operator on a line that holds a check, which could chain the check,
 # skip it, or discard its result.
@@ -1084,13 +1091,17 @@ class Checker:
                 depth -= 1
         return -1, None
 
-    def step_position(self, workflow, name, index, step, command, rule):
-        """Returns where step index of a job runs command unconditionally
-        under errexit, or -1, and reports syntax the check does not model."""
+    def effective_shell(self, workflow, name, step):
+        """The step shell overrides job defaults, which override workflow defaults."""
         job = self.job(workflow, name) or {}
         defaults = [((owner.get("defaults") or {}).get("run") or {}).get("shell")
                     for owner in (job, self.docs[workflow])]
-        shell = step.get("shell") or defaults[0] or defaults[1]
+        return step.get("shell") or defaults[0] or defaults[1]
+
+    def step_position(self, workflow, name, index, step, command, rule):
+        """Returns where step index of a job runs command unconditionally
+        under errexit, or -1, and reports syntax the check does not model."""
+        shell = self.effective_shell(workflow, name, step)
         position, problem = self.runs_line(step.get("run"), command)
         where = f"{workflow}:{name} step {index + 1}"
         if problem and (where, problem) not in self.unmodelled:
@@ -1462,12 +1473,45 @@ class Checker:
             self.report("ci.yml", "skill-archive", "expected exactly one skill archive step")
             return
         step = steps[0]
-        if self.may_skip(job) or "continue-on-error" in step:
+        shell = self.effective_shell("ci.yml", "release-contracts", step)
+        if self.may_skip(job) or "continue-on-error" in step or shell not in (None, "bash"):
             self.report("ci.yml", "skill-archive", "skill archive check can be bypassed")
         if self.unwrap_expression(step.get("if", "")) != SKILL_ARCHIVE_CONDITION:
             self.report("ci.yml", "skill-archive", "skill archive condition differs from the integration branch exception")
         if self.run_text(step).strip() != ".github/scripts/package-skill.sh --check":
             self.report("ci.yml", "skill-archive", "skill archive command differs from package-skill.sh --check")
+
+    def check_ci_triggers(self):
+        doc = self.docs.get("ci.yml", {})
+        triggers = doc.get("on", doc.get(True))
+        if not isinstance(triggers, dict):
+            self.report("ci.yml", "ci-triggers", "expected push and pull_request triggers with branch filters")
+            return
+        for event in sorted(set(triggers) - {"push", "pull_request"}):
+            self.report("ci.yml", "ci-triggers",
+                        f"archive condition must be re-evaluated for the new event: {event}")
+        if "push" not in triggers:
+            self.report("ci.yml", "ci-triggers", "push trigger is absent")
+        pull_request = triggers.get("pull_request")
+        branches = pull_request.get("branches") if isinstance(pull_request, dict) else None
+        if not isinstance(branches, list) or "main" not in branches:
+            self.report("ci.yml", "ci-triggers", "pull_request branches must include main")
+
+    def check_apt_retries(self):
+        directory = self.root / WORKFLOW_DIR
+        for path in sorted([*directory.glob("*.yml"), *directory.glob("*.yaml")]):
+            doc = self.docs.get(path.name) if path.name in WORKFLOWS else self.load(WORKFLOW_DIR / path.name)
+            if not isinstance(doc, dict):
+                continue
+            for name, job in (doc.get("jobs") or {}).items():
+                for index, step in enumerate(job.get("steps", [])):
+                    for line in self.logical_lines(self.run_text(step)):
+                        line = re.split(r"(?<![^ \t])#", line, maxsplit=1)[0]
+                        for match in APT_GET_CALL.finditer(line):
+                            arguments = ARGUMENTS_END.split(line[match.end():], maxsplit=1)[0]
+                            if not APT_RETRIES.search(arguments):
+                                self.report(f"{path.name}:{name} step {index + 1}", "apt-retries",
+                                            "apt-get call lacks -o Acquire::Retries=3")
 
     def check_release_checks(self):
         self.check_shared_build()
@@ -1481,6 +1525,7 @@ class Checker:
         self.check_release_toolchain()
         self.check_ci_feature_jobs()
         self.check_skill_archive()
+        self.check_ci_triggers()
 
     def check_workflow(self, workflow):
         doc = self.load(pathlib.PurePosixPath(".github/workflows") / workflow)
@@ -1578,6 +1623,7 @@ class Checker:
     def run(self):
         for workflow in WORKFLOWS:
             self.check_workflow(workflow)
+        self.check_apt_retries()
         self.check_composite_expressions()
         self.check_release_checks()
         self.check_release_vars()

@@ -2,7 +2,7 @@ name: CI
 
 # Every pull request to main or mainnet-write runs the offline gate suite,
 # including docs changes. Pushes to those branches use the paths filter below.
-# Skill changes run the archive checks.
+# Skill changes run the archive checks on main.
 # The suite covers format, lint, rustdoc, offline tests, dependencies, and licenses.
 # Coverage runs in coverage.yml.
 # Live testnet tests run in a separate workflow.
@@ -12,7 +12,7 @@ on:
     branches: [main, mainnet-write]
     # Documentation, the license, and the plugin manifest cannot change a gate
     # result, so pushes skip them.
-    # Skill changes run CI because release-contracts verifies the archive.
+    # Skill changes run CI because release-contracts verifies the archive on main.
     paths:
       - '**'
       - '!**/*.md'
@@ -345,6 +345,7 @@ jobs:
         run: .github/scripts/test-publish-crates-check.sh
       - name: Check the publish tiers
         run: .github/scripts/publish-crates.sh --check
+      # Many open pull requests conflict in the binary archive on the integration branch; the pull request into main runs the check.
       - name: Check the skill archive
         if: github.base_ref != 'mainnet-write' && github.ref != 'refs/heads/mainnet-write'
         run: .github/scripts/package-skill.sh --check
