@@ -5,10 +5,11 @@ for build configuration, admitted operations, and exclusions.
 
 This guide is for maintainers and contributors building the `stellar-agent-wallet`
 workspace and running the gates that apply to each change. The workspace is a Cargo
-workspace of `stellar-agent-*` crates that produces two binaries: `stellar-agent`
-(the CLI, from crate `stellar-agent-cli`) and `stellar-agent-mcp` (the MCP stdio
-server, from crate `stellar-agent-mcp`). For the crate layout and dependency
-layering, see [architecture.md](architecture.md).
+workspace of `stellar-agent-*` crates that produces one executable,
+`stellar-agent`, from crate `stellar-agent-cli`. It runs the CLI and the MCP
+stdio server of the `stellar-agent-mcp` library crate; the release delivers it
+under a second name, `stellar-agent-mcp`, as a byte-equal copy. For the crate
+layout and dependency layering, see [architecture.md](architecture.md).
 
 ## Prerequisites
 
@@ -75,10 +76,10 @@ rustup component add llvm-tools-preview
 
 The `mainnet-write` Cargo feature controls authorization representation,
 enabled-policy checks, and build reporting. `stellar-agent-cli` and
-`stellar-agent-mcp` enable it by default; the library crates leave it off.
-`stellar-agent` and `stellar-agent-mcp` report its state as
+`stellar-agent-mcp` enable it by default; the other library crates leave it
+off. The `stellar-agent` executable reports its state as
 `STELLAR_AGENT_BUILD_MAINNET_WRITE=off` or `=on` on the second line of
-`--version` and `-V` output.
+`--version` and `-V` output, under either name.
 
 Build the whole workspace:
 
@@ -86,8 +87,10 @@ Build the whole workspace:
 cargo build
 ```
 
-`cargo build` builds both binaries with `mainnet-write` on;
-`cargo build --no-default-features` builds them with it off.
+`cargo build` builds `stellar-agent` with `mainnet-write` on;
+`cargo build --no-default-features` builds it with the feature off. To run the
+server under its second name, copy the executable:
+`cp target/debug/stellar-agent target/debug/stellar-agent-mcp`.
 
 For maintainer release validation:
 
@@ -554,8 +557,10 @@ actionlint
 ```
 
 The install surface check covers the documented install commands, version
-pins, and secret-seed procedures, and the binstall metadata of both wallet
-crates; its header defines each rule. Its self-test runs the check on copies of
+pins, and secret-seed procedures, the binstall metadata of the CLI crate, and
+the library-only shape of the MCP crate, which names no executable target and
+no binstall table and is never an install target; its header defines each
+rule. Its self-test runs the check on copies of
 the tree, with one violation injected per case. The docs style check applies
 the writing rules of CONTRIBUTING.md to the tracked Markdown files; its header
 defines each rule and the baseline. The Python scripts need Python 3.11 or
@@ -692,6 +697,16 @@ is enabled per crate. For example:
 ```bash
 cargo test -p stellar-agent-mcp --no-default-features --features testnet-acceptance \
   --test sep43_sign_and_submit_transaction_testnet_acceptance
+```
+
+The MCP suites that compile the shared `tests/common` module start the
+`stellar-agent` executable as a server child. Before such a suite, build the
+CLI and MCP tests together with the same flags; `run-testnet-acceptance.sh`
+runs this prebuild for them:
+
+```bash
+cargo test -p stellar-agent-cli -p stellar-agent-mcp --no-default-features \
+  --features testnet-acceptance --no-run
 ```
 
 ```bash
@@ -1226,16 +1241,23 @@ Each error message names its rule:
 - D1: the `mainnet-write` declarations and the `default = ["mainnet-write"]`
   of `stellar-agent-cli` and `stellar-agent-mcp` that the checker pins hold,
   and no other feature, no other `default`, and no normal dependency
-  declaration reaches `mainnet-write`.
+  declaration reaches `mainnet-write`. Both packages keep that default: the
+  CLI package builds the executable, and the MCP library's default serves
+  its direct dependents.
 - D2: no dev or build dependency declaration requests a feature that reaches
-  `mainnet-write`. A declaration that keeps a binary package's default
-  reaches it, so each one, the MCP self dev-dependency included, sets
+  `mainnet-write`. A declaration that keeps the default of the CLI or MCP
+  package reaches it, so each one, the MCP self dev-dependency included, sets
   `default-features = false`.
 - D3: every cargo and cross call of the workflows and of the scripts they name
   matches the reviewed inventory in the checker, and each resolved graph has
-  `mainnet-write` in the state its record relies on. A record relies on the
+  `mainnet-write` in the state its record relies on. The only executable
+  target of the queried packages is `stellar-agent` of the CLI package, and
+  the metadata must list exactly that one; its graph view includes the MCP
+  closure. The paired CLI and MCP prebuild of the testnet driver has one
+  reviewed record per job and feature state. A record relies on the
   feature when its feature list names `mainnet-write`, or when it keeps the
-  default features and selects the workspace or a binary package. A
+  default features and selects the workspace, the CLI package, or the MCP
+  package. A
   `--config` word anywhere in a call, a `+toolchain` word after `cargo` or
   `cross`, and an option before the subcommand other than `-V`, `--version`,
   `-v`, `-vv`, `--verbose`, `-q`, `--quiet`, `--locked`, `--frozen`,
@@ -1331,10 +1353,12 @@ statement-content validation, workflow guards and resolved graphs, and packaged
 binary markers. Package and registry-install rows retain marker evidence;
 their packaged or registry source graphs are outside this check.
 
-`check-host.sh` builds the release binaries for the host target through
-`build.sh` and checks both markers, then builds each binary package alone with
-`cargo build --locked -p` and checks that marker too; the preflight row
-`release-shape` runs it.
+`check-host.sh` builds the release executable for the host target through
+`build.sh`, which copies it to `stellar-agent-mcp`, compares the two files and
+checks both markers. It then builds the CLI package alone with
+`cargo build --locked -p stellar-agent-cli`, copies the debug executable to
+`target/tmp/host-alias/stellar-agent-mcp`, compares the bytes and checks the
+marker under both names; the preflight row `release-shape` runs it.
 It installs nothing, and it stops in these cases:
 
 - On Linux without libudev, it prints the install command and exits 2. The
@@ -1346,7 +1370,7 @@ It installs nothing, and it stops in these cases:
   `build.sh` builds through `cross`, which needs `cross` and a container
   engine.
 
-The release rehearsal checks both binaries from every packed archive on a
+The release rehearsal checks both executable names from every packed archive on a
 native runner, including Rosetta for the Intel macOS archive. Its crate job
 packages with the publish toolchain and checks fresh package-verification
 outputs. Live acceptance runs with `mainnet-write` off: the runner passes

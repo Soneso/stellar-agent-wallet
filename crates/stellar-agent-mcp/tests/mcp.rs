@@ -1,4 +1,9 @@
 //! Offline integration tests for the MCP server.
+//!
+//! The suites that start a server child run the `stellar-agent` executable of
+//! `stellar-agent-cli` under its `stellar-agent-mcp` alias. Build both packages
+//! together first, with this run's `--target` and feature flags:
+//! `cargo test -p stellar-agent-cli -p stellar-agent-mcp --no-run`.
 
 #[path = "common/mod.rs"]
 #[allow(

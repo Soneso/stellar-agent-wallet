@@ -10,7 +10,7 @@
 # reads no secret itself: the wrappers prompt on the terminal. The record
 # directory must not exist; each measurement writes one entry file there.
 #
-# Entries: account, ownership, refusal-64, refusal-65, keychain-unlock,
+# Entries: account, ownership, binary-identity, refusal-64, refusal-65, keychain-unlock,
 # keychain-lock, keychain-unlock-again, provisioning-order,
 # platform-read-write, refusal-66, mcp-stdio, cross-user-file-denial,
 # cross-user-keyring-denial, approval-round-trip, and daemon-reuse.
@@ -23,6 +23,9 @@
 # the wallet account's bus, after this run enrolled the signer item. Any
 # other failure, such as a missing socket, an authentication error, or a
 # D-Bus autolaunch failure, records inconclusive with its text.
+#
+# After every entry, the script exits 1 when the binary-identity entry is
+# not ok, with a line that names both installed paths and the repair.
 set -euo pipefail
 
 # Fixed values.
@@ -191,6 +194,30 @@ skipped() {
   note "status: skipped (no $1 given)"
 }
 
+# Records whether the two installed names hold one executable: both exist
+# as regular files and cmp finds equal bytes. A missing file or a failed or
+# unequal cmp records failed.
+binary_identity() {
+  local canonical="$PREFIX/bin/stellar-agent" alias="$PREFIX/bin/stellar-agent-mcp" output rc=0
+  note "command: cmp $canonical $alias"
+  if [ ! -f "$canonical" ] || [ ! -f "$alias" ]; then
+    note "status: failed (an installed name is missing)"
+    note "identity: failed"
+    return 0
+  fi
+  output=$(cmp -- "$canonical" "$alias" 2>&1) || rc=$?
+  note "exit: $rc"
+  note "output:"
+  printf '%s\n' "$output" | sed 's/^/  /' >>"$ENTRY"
+  if [ "$rc" -eq 0 ]; then
+    note "status: ok (equal bytes)"
+    note "identity: ok"
+  else
+    note "status: failed (the installed names differ or cmp failed)"
+    note "identity: failed"
+  fi
+}
+
 # Asks the operator a question on the terminal and sets ANSWER. The answer
 # is never a secret.
 ask() {
@@ -213,6 +240,10 @@ step ls -ld "$HOME_DIR"
 step ls -ld "$PREFIX" "$PREFIX/bin"
 step ls -l "$PREFIX" "$PREFIX/bin"
 step ls -l "$PROJECT_FILE" "$SUDOERS_FILE"
+
+entry binary-identity
+binary_identity
+PAIR_IDENTITY=$(tail -n 1 "$ENTRY")
 
 entry refusal-64
 step wallet cli-launch profile show --profile other
@@ -353,3 +384,8 @@ else
 fi
 
 printf 'validate-linux.sh: %s entries in %s\n' "$ENTRY_INDEX" "$RECORD"
+# An unequal installed pair fails the run after every entry is recorded.
+if [ "$PAIR_IDENTITY" != "identity: ok" ]; then
+  echo "validate-linux.sh: $PREFIX/bin/stellar-agent and $PREFIX/bin/stellar-agent-mcp are not one executable; run bootstrap again with the same --cli source" >&2
+  exit 1
+fi

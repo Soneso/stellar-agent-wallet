@@ -5,38 +5,17 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "MCP stdio server for the Stellar agent wallet. Tools are registered at link time via the #[mcp_tool_router]/#[mcp_tool_item] macro pair (stellar-agent-mcp-macros) with inventory-based discovery."
+description = "MCP stdio server library for the Stellar agent wallet, run by the stellar-agent executable of stellar-agent-cli. Tools are registered at link time via the #[mcp_tool_router]/#[mcp_tool_item] macro pair (stellar-agent-mcp-macros) with inventory-based discovery."
 readme = "README.md"
 keywords = ["stellar", "mcp", "ai-agent", "wallet", "soroban"]
 categories = ["cryptography::cryptocurrencies", "command-line-utilities"]
+# The package is a library; the stellar-agent executable of stellar-agent-cli
+# runs the server. No file in src/ becomes an executable target.
+autobins = false
 
 [lib]
 name = "stellar_agent_mcp"
 path = "src/lib.rs"
-
-[[bin]]
-name = "stellar-agent-mcp"
-path = "src/main.rs"
-
-# `cargo binstall stellar-agent-mcp` support. The CLI and MCP binaries share a
-# single release archive; `{ bin }` resolves to `stellar-agent-mcp` here via the
-# `[[bin]]` declaration above. binstall installs this repository's release
-# archive for the host's target, or for a compatible target the host runs, such
-# as the x86_64 Windows archive under emulation. `disabled-strategies`, read by
-# cargo-binstall 1.8.0 and later, turns off the third-party binary host and the
-# source build, so binstall fails when no such archive exists; `cargo install
-# --locked` or a source build applies there. binstall checks the download over
-# TLS only, with no signature; docs/verifying-releases.md covers
-# signature and provenance checks.
-[package.metadata.binstall]
-pkg-url = "{ repo }/releases/download/v{ version }/stellar-agent-{ version }-{ target }.tar.xz"
-pkg-fmt = "txz"
-bin-dir = "stellar-agent-{ version }-{ target }/{ bin }{ binary-ext }"
-disabled-strategies = ["quick-install", "compile"]
-
-[package.metadata.binstall.overrides.'cfg(target_os = "windows")']
-pkg-url = "{ repo }/releases/download/v{ version }/stellar-agent-{ version }-{ target }.zip"
-pkg-fmt = "zip"
 
 [dependencies]
 stellar-agent-core       = { workspace = true }
@@ -108,7 +87,8 @@ stellar-strkey = { workspace = true }
 
 # MCP server framework. The default IntoTransport adapter is not used; the
 # transport is an AsyncRwTransport constructed with an explicit
-# JsonRpcMessageCodec::new_with_max_length (1 MiB) at the transport site in main.rs.
+# JsonRpcMessageCodec::new_with_max_length (1 MiB) in transport.rs, which
+# entry.rs serves through.
 rmcp      = { workspace = true }
 schemars  = { workspace = true }
 
@@ -274,8 +254,9 @@ mainnet-write = [
     "stellar-agent-x402-identity/mainnet-write",
 ]
 
-# Exposes call_stellar_* test helpers used by the integration tests and the
-# binary smoke-test harness. Must NOT be enabled in production builds.
+# Exposes call_stellar_* test helpers used by the integration tests and by the
+# server-child tests, which run the stellar-agent executable built with them.
+# Must NOT be enabled in production builds.
 test-helpers = ["stellar-agent-network/test-hooks",
     # Enable GatedInvokeParams override fields (approval_dir_override,
     # grant_store_path_override) used by the toolsets.rs test-helpers block.

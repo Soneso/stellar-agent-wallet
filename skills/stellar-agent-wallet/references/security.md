@@ -20,7 +20,7 @@ This file describes the security
 model an operator should understand and the safe-operation rules an agent must
 follow. For the tool list and argument shapes see `./mcp-tools.md`.
 
-After name reconciliation, both binaries compare keyring entries with sibling
+After name reconciliation, the CLI and the MCP server compare keyring entries with sibling
 profile files in the same profiles directory. Mainnet conflicts refuse with
 `profile.key_scope_conflict`; testnet conflicts warn and keep the verb's behavior.
 The check includes wallet keys, provider credentials and derived entries.

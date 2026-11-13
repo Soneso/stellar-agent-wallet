@@ -617,6 +617,10 @@ for member, manifest in manifests.items():
     except (AttributeError, TypeError) as error:
         fail(f"cannot read {member}/Cargo.toml: {error}")
 selected = owners + sorted(dependents - set(owners))
+# The MCP tests start the stellar-agent executable of the CLI package, so a
+# selection with the MCP package builds the CLI too.
+if "stellar-agent-mcp" in selected and "stellar-agent-cli" not in selected:
+    selected.append("stellar-agent-cli")
 declared = set()
 for member, manifest in manifests.items():
     if names[member] in selected:

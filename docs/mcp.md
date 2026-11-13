@@ -50,8 +50,10 @@ submission checks. See
 
 ## What it is
 
-- One process: the `stellar-agent-mcp` binary, built from the
-  `stellar-agent-mcp` crate.
+- One process: the `stellar-agent` executable of the `stellar-agent-cli`
+  crate, started as `stellar-agent mcp serve` or under the file name
+  `stellar-agent-mcp`. The server code is the `stellar-agent-mcp` library
+  crate.
 - Transport: MCP JSON-RPC over stdio. The client spawns the binary as a
   subprocess and exchanges newline-delimited JSON-RPC on the subprocess
   stdin/stdout.
@@ -72,25 +74,36 @@ This alpha does not offer an HTTP or SSE transport. stdio is the only transport.
 
 ### Availability
 
-This is a public alpha. Install with
-`cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-mcp@0.1.0-alpha.13`
+This is a public alpha. Install the one package with
+`cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.13`
 (prebuilt binary from the tagged GitHub release, resolved through crates.io),
-with `cargo install --locked stellar-agent-mcp@0.1.0-alpha.13` (built from the
+with `cargo install --locked stellar-agent-cli@0.1.0-alpha.13` (built from the
 published sources and their `Cargo.lock`), or build from source. While
 crates.io holds only prerelease versions, the version must be spelled out. A
-bare crate name matches stable versions only. See
-[the CLI reference](./cli-reference/) and the repository README for build
-instructions; the build that produces `stellar-agent` produces
-`stellar-agent-mcp` alongside it.
+bare crate name matches stable versions only.
+
+Each of these installs `stellar-agent` only, which also runs the server. The
+stanzas below start
+`stellar-agent-mcp`, so copy the executable to that name next to it:
+
+```bash
+cp ~/.cargo/bin/stellar-agent ~/.cargo/bin/stellar-agent-mcp
+```
+
+A source build copies `target/release/stellar-agent` the same way. The direct
+release archives already hold both names as byte-equal files. Repeat the copy
+after each upgrade. See [Install](./getting-started.md#install) for the Windows
+command and the build steps.
 
 ## Launching the server
 
-The server is started by running the binary. Configuration comes from the
-selected profile.
+The server is started by running the executable under its server name, or with
+the `mcp serve` subcommand. Configuration comes from the selected profile.
 
 ```bash
 stellar-agent-mcp                    # profile `default`
 stellar-agent-mcp --profile alice    # profile `alice`
+stellar-agent mcp serve --profile alice
 ```
 
 The profile is selected by `--profile <NAME>` (also spelled

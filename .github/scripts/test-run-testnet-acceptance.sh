@@ -13,6 +13,10 @@
 #     first suite, with a message that names the variable; (d2) the empty
 #     value is such a value;
 # (e) run_suite passes the feature list of suite_features to cargo;
+# (j) the MCP suites that compile the shared child driver first run the
+#     paired CLI and MCP prebuild with the suite's flags in both feature
+#     states, a failed prebuild stops the suite with status 3, and every
+#     other suite keeps its single cargo call;
 # (i) STELLAR_AGENT_TEST_KEYRING: unset keeps the headless default with a
 #     fresh key and a preset backend; platform leaves both keyring variables
 #     unset; any other value fails the run before the first suite, with a
@@ -167,6 +171,72 @@ expect_cargo() {
 }
 expect_cargo on mainnet-write,testnet-acceptance
 expect_cargo off testnet-acceptance
+# (j) The paired prebuild. CHILD_DRIVER_SUITES lists exactly the MCP live
+# suites that compile the shared tests/common module.
+expected_children=$(grep -lE '^mod common;' crates/stellar-agent-mcp/tests/*testnet*.rs \
+  | xargs -n1 basename | sed 's/\.rs$//' | sort | tr '\n' ' ')
+listed_children=$(printf '%s\n' "${CHILD_DRIVER_SUITES[@]}" | sort | tr '\n' ' ')
+if [ -n "$expected_children" ] && [ "$listed_children" = "$expected_children" ]; then
+  pass "(j) CHILD_DRIVER_SUITES lists the suites that compile tests/common: $listed_children"
+else
+  fail "(j) CHILD_DRIVER_SUITES is '$listed_children', the suites that compile tests/common are '$expected_children'"
+fi
+# Each feature state runs the broad paired build, then the suite's own
+# selection with the same flags.
+expect_prebuild() {
+  local mainnet_write="$1" want="$2" target="$3" args rc expected
+  : > "$STUB/args"
+  (MAINNET_WRITE="$mainnet_write" PATH="$STUB:$PATH" \
+    run_suite stellar-agent-mcp testnet-acceptance "$target" > /dev/null 2>&1)
+  rc=$?
+  args=$(cat "$STUB/args")
+  expected="test -p stellar-agent-cli -p stellar-agent-mcp --no-default-features --features $want --no-run
+test -p stellar-agent-mcp --no-default-features --features $want --test $target -- --include-ignored --test-threads=1 --nocapture"
+  if [ "$rc" -eq 0 ] && [ "$args" = "$expected" ]; then
+    pass "(j) MAINNET_WRITE=$mainnet_write $target runs the paired prebuild, then the suite"
+  else
+    fail "(j) MAINNET_WRITE=$mainnet_write $target: exit $rc, cargo calls '$args', expected '$expected'"
+  fi
+}
+for target in "${CHILD_DRIVER_SUITES[@]}"; do
+  expect_prebuild on mainnet-write,testnet-acceptance "$target"
+  expect_prebuild off testnet-acceptance "$target"
+done
+# Suites outside the list keep their single cargo call.
+for entry in "stellar-agent-mcp pay_commit_testnet_acceptance" "stellar-agent-cli claim_testnet_acceptance" \
+  "stellar-agent-network fee_bump_testnet"; do
+  read -r crate target <<< "$entry"
+  : > "$STUB/args"
+  (MAINNET_WRITE=off PATH="$STUB:$PATH" run_suite "$crate" testnet-acceptance "$target" > /dev/null 2>&1)
+  rc=$?
+  args=$(cat "$STUB/args")
+  if [ "$rc" -eq 0 ] && [ "$args" = "test -p $crate --no-default-features --features testnet-acceptance --test $target -- --include-ignored --test-threads=1 --nocapture" ]; then
+    pass "(j) $crate/$target runs without a prebuild"
+  else
+    fail "(j) $crate/$target: exit $rc, cargo calls '$args'"
+  fi
+done
+# A failed prebuild returns the deterministic status and never runs the suite.
+cat > "$STUB/cargo" <<'STUB_EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$(dirname "$0")/args"
+case " $* " in
+  *' --no-run '*) echo 'error: could not compile `fixture`'; exit 101 ;;
+esac
+echo "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out"
+STUB_EOF
+for mainnet_write in on off; do
+  : > "$STUB/args"
+  (MAINNET_WRITE="$mainnet_write" PATH="$STUB:$PATH" \
+    run_suite stellar-agent-mcp testnet-acceptance "${CHILD_DRIVER_SUITES[0]}" > /dev/null 2>&1)
+  rc=$?
+  calls=$(wc -l < "$STUB/args" | tr -d ' ')
+  if [ "$rc" -eq 3 ] && [ "$calls" -eq 1 ] && grep -q -- '--no-run' "$STUB/args"; then
+    pass "(j) MAINNET_WRITE=$mainnet_write a failed prebuild returns 3 before the suite"
+  else
+    fail "(j) MAINNET_WRITE=$mainnet_write failed prebuild: exit $rc after $calls cargo call(s)"
+  fi
+done
 # (f) Cargo and sleep stubs exercise attempts without network or waiting.
 cat > "$STUB/cargo" <<'STUB_EOF'
 #!/usr/bin/env bash

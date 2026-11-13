@@ -56,9 +56,10 @@ def write_tar(path, entries, mode="w"):
 
 
 def both(cli=None, mcp=None):
+    """Both members; each defaults to the same executable bytes."""
     return [
-        regular("stellar-agent", cli if cli is not None else macho(body=b"cli")),
-        regular("stellar-agent-mcp", mcp if mcp is not None else macho(body=b"mcp")),
+        regular("stellar-agent", cli if cli is not None else macho(body=b"binary")),
+        regular("stellar-agent-mcp", mcp if mcp is not None else macho(body=b"binary")),
     ]
 
 
@@ -66,6 +67,10 @@ CASES = [
     # name, entries, arch, expected exit, message fragment, tar mode
     ("valid arm64 archive", both(), "arm64", 0, "validated", "w"),
     ("valid x86_64 archive", both(macho(X86_64), macho(X86_64)), "x86_64", 0, "validated", "w"),
+    ("valid headers, different bodies of one length",
+     both(macho(body=b"cli"), macho(body=b"mcp")), "arm64", 1, "differ", "w"),
+    ("valid headers, different body lengths",
+     both(macho(body=b"cli"), macho(body=b"cli" * 2)), "arm64", 1, "differ", "w"),
     ("symlink member", [link("stellar-agent", "/etc/passwd", tarfile.SYMTYPE), both()[1]],
      "arm64", 1, "not a regular file", "w"),
     ("hard link member", [both()[1], link("stellar-agent", "stellar-agent-mcp", tarfile.LNKTYPE)],

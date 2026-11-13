@@ -47,10 +47,12 @@ use stellar_xdr::{
 
 use crate::server::{WalletServer, X402AuthenticatedPaymentArgs};
 use crate::tools::common::tests::mainnet::{
-    Fixture, HookGuard, ReadOnlyDir, RpcControl, assert_cleanup_found_the_claim,
-    assert_names_the_transmitted_ledger, authorizations, ledger, mount_rpc, observe, put, refusals,
-    require_approval_rules, routed_fixture_with, stored_approval, wire, x402_authorized_rows,
+    Fixture, RpcControl, assert_cleanup_found_the_claim, assert_names_the_transmitted_ledger,
+    authorizations, ledger, mount_rpc, observe, put, refusals, require_approval_rules,
+    routed_fixture_with, stored_approval, wire, x402_authorized_rows,
 };
+#[cfg(unix)]
+use crate::tools::common::tests::mainnet::{HookGuard, ReadOnlyDir};
 use crate::tools::common::{GatedApprovalKind, verify_attestation_subject_gate, x402_value_leg};
 
 const TOOL: &str = "stellar_x402_authenticated_payment";
@@ -1398,6 +1400,10 @@ async fn a_resimulation_failure_names_the_transmitted_authorization() {
 /// the payment at terminal approval, and the reply and the
 /// `x402_payment_authorized` row name the signature expiration ledger of the
 /// entry the primary received.
+///
+/// Unix only: the consume failure comes from [`ReadOnlyDir`], a Unix
+/// directory mode.
+#[cfg(unix)]
 #[tokio::test]
 #[serial_test::serial(keyring)]
 async fn a_terminal_approval_failure_names_the_transmitted_authorization() {

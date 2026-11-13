@@ -19,8 +19,8 @@ name: Publish to crates.io
 #   `cargo publish --no-verify`. It authenticates through crates.io Trusted
 #   Publishing (GitHub OIDC, no long-lived registry token).
 # - verify-install holds no credential and runs only after publish. It
-#   installs both binaries of the tag's version from crates.io and checks
-#   their markers.
+#   installs stellar-agent-cli of the tag's version from crates.io, derives
+#   stellar-agent-mcp, and checks both names.
 # verify and publish refuse a tag whose commit is not an ancestor of
 # origin/main. The verify, publish, and verify-install jobs check out the tag
 # by its full ref in `src/` and run this workflow's scripts from the dispatched

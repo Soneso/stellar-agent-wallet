@@ -240,12 +240,83 @@ prepare_account() {
 }
 # --- shared wrapper checks: end ---
 
+# The bootstrap lock beside the prefix. A bootstrap run holds it exclusively
+# while it replaces the two installed names.
+LOCK_FILE="${PREFIX%/*}/.stellar-agent-bootstrap.lock"
+
+# Refuses the pair with 65 in one line that names both installed paths, the
+# reason $1, and the repair.
+refuse_pair() {
+  refuse 65 "$CLI and $MCP: $1; run bootstrap again with the same --cli source"
+}
+
+# Prints why installed name $1 is no regular file, or nothing when it is one.
+name_problem() {
+  if [ -L "$1" ]; then
+    printf '%s is a link' "$1"
+  elif [ -d "$1" ]; then
+    printf '%s is a directory' "$1"
+  elif [ ! -e "$1" ]; then
+    printf '%s is missing' "$1"
+  elif [ ! -f "$1" ]; then
+    printf '%s is not a regular file' "$1"
+  fi
+}
+
+# Refuses a pair that is unequal at the moment of this check. Both names
+# must be regular files that are no links, with equal bytes.
+# The check runs under a shared lock on the bootstrap lock file, held on
+# descriptor 8 until the exec of the server. So it never reads a pair that a
+# bootstrap run is replacing.
+# The server runs one installed name, and bootstrap replaces each name by an
+# atomic rename. So a started server always runs one complete version.
+# A server that passed the check keeps running the file it started from.
+# A bootstrap run after the check proceeds, as for a server started earlier.
+# While a bootstrap run holds the lock, the check waits up to five seconds,
+# then refuses as busy with 66.
+# Its cost is one comparison of two files of the executable's size.
+require_equal_pair() {
+  local rc=0 problem name
+  command -v perl >/dev/null 2>&1 || refuse_pair "perl is not available"
+  command -v cmp >/dev/null 2>&1 || refuse_pair "cmp is not available"
+  if [ -L "$LOCK_FILE" ] || [ ! -f "$LOCK_FILE" ] || [ ! -r "$LOCK_FILE" ]; then
+    refuse_pair "the bootstrap lock file $LOCK_FILE is missing, a link, or unreadable"
+  fi
+  if ! { exec 8<"$LOCK_FILE"; } 2>/dev/null; then
+    refuse_pair "the bootstrap lock file $LOCK_FILE cannot be opened"
+  fi
+  perl -e 'use Fcntl qw(:flock); open(my $lock, "<&=", 8) or exit 2;
+    for (1 .. 50) { exit 0 if flock($lock, LOCK_SH | LOCK_NB); exit 2 unless $!{EWOULDBLOCK};
+      select(undef, undef, undef, 0.1) } exit 1' 2>/dev/null || rc=$?
+  case "$rc" in
+    0) ;;
+    1) refuse 66 "a bootstrap run holds the installation of $CLI and $MCP; run mcp-launch again after it ends" ;;
+    *) refuse_pair "the bootstrap lock cannot be taken" ;;
+  esac
+  for name in "$CLI" "$MCP"; do
+    problem=$(name_problem "$name")
+    [ -z "$problem" ] || refuse_pair "$problem"
+  done
+  rc=0
+  cmp -s -- "$CLI" "$MCP" 2>/dev/null || rc=$?
+  case "$rc" in
+    0) ;;
+    1) refuse_pair "the two files differ" ;;
+    *) refuse_pair "the comparison failed" ;;
+  esac
+}
+
 if [ "$#" -ne 0 ]; then
   refuse 64 "the form is not one of the listed forms"
 fi
 prepare_account
 require_tier R
 refuse_while_running "$CLI_PATTERN" "a wallet CLI process"
+require_equal_pair
 require_eligible Y
+# The server does not inherit the shared lock of descriptor 8. Descriptor 8
+# closes in a step of its own: bash 3.2 keeps a copy of a descriptor that a
+# redirection on the exec command closes, and the server would inherit it.
+exec 8<&-
 # Mainnet requires the explicit profile selection.
 exec_native "$MCP" --profile "$PROFILE"

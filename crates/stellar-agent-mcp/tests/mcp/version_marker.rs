@@ -6,10 +6,10 @@
     reason = "test assertions require a running binary"
 )]
 mod tests {
-    use std::process::Command;
+    use crate::common::server_binary::server_command;
 
     fn assert_version(flag: &str) {
-        let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent-mcp"))
+        let output = server_command()
             .arg(flag)
             .output()
             .expect("MCP binary runs");
@@ -44,7 +44,7 @@ mod tests {
 
     #[test]
     fn help_keeps_package_version_without_marker() {
-        let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent-mcp"))
+        let output = server_command()
             .arg("--help")
             .output()
             .expect("MCP binary runs");

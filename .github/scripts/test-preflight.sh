@@ -54,7 +54,7 @@ FIXTURE="$TMP/fixture"
 CASES="docs-only upstream-base origin-base synced-fork-base install-surface-doc deleted-install-surface-doc welcome-workflow release-workflow
 release-rehearsal-workflow vendored-wasm-workflow
 triage-workflow triage-review-workflow triage-sweep-workflow
-ci-yml-only python-check-script proof-matrix-only shell-check-script testnet-driver-script deploy-scripts deploy-scripts-run skill inbox-web enroll-web bridge-web one-crate two-owners
+ci-yml-only python-check-script proof-matrix-only shell-check-script testnet-driver-script deploy-scripts deploy-scripts-run skill inbox-web enroll-web bridge-web one-crate sep43-through-mcp two-owners
 target-specific-edge dev-dependency-edge optional-dependency-edge root-manifest lockfile toolchain
 unowned-rust-path
 wallet-manifest removed-member untracked-test-file fixture-markdown crate-sources-select-proof-matrix
@@ -321,7 +321,7 @@ expect_list() {
   fi
   local extra=() argument
   case "$CASE_NAME" in
-    deleted-install-surface-doc | welcome-workflow | release-workflow | release-rehearsal-workflow | vendored-wasm-workflow | triage-workflow | triage-review-workflow | triage-sweep-workflow | ci-yml-only | python-check-script | proof-matrix-only | shell-check-script | one-crate | two-owners | target-specific-edge | dev-dependency-edge | optional-dependency-edge | root-manifest | lockfile | wallet-manifest | removed-member | untracked-test-file | crate-sources-select-proof-matrix | staged-rename-record | spaces-and-an-apostrophe | action-script | invariants-helper | release-build-scripts | duplicate-triggers | changed-self-test | deleted-shell-script | deleted-self-test | the-preflight-itself)
+    deleted-install-surface-doc | welcome-workflow | release-workflow | release-rehearsal-workflow | vendored-wasm-workflow | triage-workflow | triage-review-workflow | triage-sweep-workflow | ci-yml-only | python-check-script | proof-matrix-only | shell-check-script | one-crate | sep43-through-mcp | two-owners | target-specific-edge | dev-dependency-edge | optional-dependency-edge | root-manifest | lockfile | wallet-manifest | removed-member | untracked-test-file | crate-sources-select-proof-matrix | staged-rename-record | spaces-and-an-apostrophe | action-script | invariants-helper | release-build-scripts | duplicate-triggers | changed-self-test | deleted-shell-script | deleted-self-test | the-preflight-itself)
       extra+=(feature-discipline self-test:test-check-feature-discipline.py)
       ;;
   esac
@@ -394,6 +394,9 @@ dependents = sorted(
     if directory not in owners and uses(directory, manifest) & set(owners)
 )
 selection = [name[directory] for directory in owners] + dependents
+# The MCP tests run the CLI executable, so the MCP package brings the CLI.
+if "stellar-agent-mcp" in selection and "stellar-agent-cli" not in selection:
+    selection.append("stellar-agent-cli")
 declared = set()
 for directory, manifest in manifests.items():
     if name[directory] in selection:
@@ -1198,7 +1201,18 @@ case_bridge_web() {
 case_one_crate() {
   start_case
   edit crates/stellar-agent-sep7/src/lib.rs
-  pin_packages "stellar-agent-sep7 stellar-agent-mcp" test-helpers crates/stellar-agent-sep7/src/lib.rs
+  pin_packages "stellar-agent-sep7 stellar-agent-mcp stellar-agent-cli" test-helpers crates/stellar-agent-sep7/src/lib.rs
+  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" proof-matrix proof-matrix:feature-on
+}
+
+# SEP-43 selects its direct dependents MCP, MPP, and x402. The MCP tests run
+# the CLI executable, so the CLI follows them; the CLI has no SEP-43 edge.
+case_sep43_through_mcp() {
+  start_case
+  mkdir -p crates/stellar-agent-sep43/src
+  edit crates/stellar-agent-sep43/src/lib.rs
+  pin_packages "stellar-agent-sep43 stellar-agent-mcp stellar-agent-mpp stellar-agent-x402 stellar-agent-cli" test-helpers \
+    crates/stellar-agent-sep43/src/lib.rs
   expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" proof-matrix proof-matrix:feature-on
 }
 
@@ -1243,7 +1257,7 @@ case_optional_dependency_edge() {
   start_case
   mkdir -p crates/stellar-agent-sep48/src
   edit crates/stellar-agent-sep48/src/lib.rs
-  pin_packages "stellar-agent-sep48 stellar-agent-mcp stellar-agent-smart-account-acceptance" test-helpers \
+  pin_packages "stellar-agent-sep48 stellar-agent-mcp stellar-agent-smart-account-acceptance stellar-agent-cli" test-helpers \
     crates/stellar-agent-sep48/src/lib.rs
   expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" proof-matrix proof-matrix:feature-on
 }
@@ -1299,7 +1313,7 @@ case_untracked_test_file() {
   start_case
   printf '#[test]\nfn new_case() {}\n' >crates/stellar-agent-sep7/tests/new_case.rs
   assert_changed crates/stellar-agent-sep7/tests/new_case.rs
-  pin_packages "stellar-agent-sep7 stellar-agent-mcp" test-helpers crates/stellar-agent-sep7/tests/new_case.rs
+  pin_packages "stellar-agent-sep7 stellar-agent-mcp stellar-agent-cli" test-helpers crates/stellar-agent-sep7/tests/new_case.rs
   expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" proof-matrix proof-matrix:feature-on
 }
 
@@ -1309,7 +1323,7 @@ case_fixture_markdown() {
   mkdir -p crates/stellar-agent-sep7/tests/fixtures
   printf '# Fixture\n' >crates/stellar-agent-sep7/tests/fixtures/notes.md
   assert_changed crates/stellar-agent-sep7/tests/fixtures/notes.md
-  pin_packages "stellar-agent-sep7 stellar-agent-mcp" test-helpers \
+  pin_packages "stellar-agent-sep7 stellar-agent-mcp stellar-agent-cli" test-helpers \
     crates/stellar-agent-sep7/tests/fixtures/notes.md
   expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" proof-matrix proof-matrix:feature-on
 }
@@ -1320,7 +1334,7 @@ case_crate_sources_select_proof_matrix() {
   edit crates/stellar-agent-sep7/src/lib.rs
   printf '#[test]\nfn renamed_case() {}\n' >crates/stellar-agent-sep7/tests/renamed_case.rs
   assert_changed crates/stellar-agent-sep7/tests/renamed_case.rs
-  pin_packages "stellar-agent-sep7 stellar-agent-mcp" test-helpers crates/stellar-agent-sep7/src/lib.rs \
+  pin_packages "stellar-agent-sep7 stellar-agent-mcp stellar-agent-cli" test-helpers crates/stellar-agent-sep7/src/lib.rs \
     crates/stellar-agent-sep7/tests/renamed_case.rs
   expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" proof-matrix proof-matrix:feature-on
 }

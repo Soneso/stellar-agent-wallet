@@ -25,8 +25,59 @@ impl Binary {
 
     pub(super) fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(&self.path);
+        command.args(args);
+        self.isolate(&mut command);
         command
-            .args(args)
+    }
+
+    /// Runs the copy with `args` on a main thread whose stack is at most
+    /// [`MAIN_STACK_KIB`].
+    ///
+    /// On Windows the main thread gets the stack the executable's PE header
+    /// reserves, and the run first checks that the reserve is at most that
+    /// size. On Unix a shell lowers the stack limit and then executes the
+    /// copy; a limit it cannot set fails the run. The shell's exec meets the same busy-file window as a direct
+    /// start, so a run whose exec reports a busy text file is retried as
+    /// [`Self::retry_start`] retries, at most 50 tries, 20 ms apart.
+    fn run_on_small_main_stack(&self, args: &[&str]) -> Output {
+        #[cfg(unix)]
+        {
+            let mut attempts = 0;
+            loop {
+                attempts += 1;
+                let mut command = Command::new("sh");
+                command
+                    .arg("-c")
+                    .arg(format!("ulimit -s {MAIN_STACK_KIB} && exec \"$0\" \"$@\""))
+                    .arg(&self.path)
+                    .args(args);
+                self.isolate(&mut command);
+                let output = command.output().expect("shell runs");
+                let busy = output.stdout.is_empty()
+                    && String::from_utf8_lossy(&output.stderr).contains("Text file busy");
+                if !busy || attempts >= 50 {
+                    return output;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        #[cfg(windows)]
+        {
+            let reserve = pe_stack_reserve(&std::fs::read(&self.path).expect("read the copy"));
+            assert!(
+                reserve <= u64::from(MAIN_STACK_KIB) * 1024,
+                "the executable reserves {reserve} bytes for its main thread"
+            );
+            let mut command = Command::new(&self.path);
+            command.args(args);
+            self.isolate(&mut command);
+            Self::output(&mut command).expect("copied executable runs")
+        }
+    }
+
+    /// Points the command at the scratch home and the test keyring.
+    fn isolate(&self, command: &mut Command) {
+        command
             .current_dir(self.home.path())
             .env("STELLAR_AGENT_HOME", self.home.path())
             .env(
@@ -41,7 +92,6 @@ impl Binary {
                 "STELLAR_AGENT_HEADLESS_KEYRING_KEY",
                 "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
             );
-        command
     }
 
     fn retry_start<T>(mut start: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
@@ -161,6 +211,88 @@ fn mcp_serve_only_as_first_two_args() {
             serde_json::from_slice(&output.stdout).expect("usage envelope");
         assert_eq!(envelope["ok"], false);
         assert_eq!(envelope["error"]["code"], code);
+    }
+}
+
+/// Main-thread stack, in KiB, that every role must run on: the stack Windows
+/// gives the main thread of the executable.
+const MAIN_STACK_KIB: u32 = 1024;
+
+/// The main-thread stack reserve, in bytes, that the PE image `image`
+/// declares.
+///
+/// The file offset of the `PE\0\0` signature sits at `0x3C`. The optional
+/// header follows the signature and the 20-byte COFF header and holds
+/// `SizeOfStackReserve` at offset 72: 8 bytes in a PE32+ image (magic
+/// `0x20B`), 4 bytes in a PE32 image (magic `0x10B`).
+fn pe_stack_reserve(image: &[u8]) -> u64 {
+    let field = |at: usize, len: usize| {
+        image
+            .get(at..at + len)
+            .expect("the image holds the PE header field")
+    };
+    let signature = usize::try_from(u32::from_le_bytes(
+        field(0x3C, 4).try_into().expect("4 bytes"),
+    ))
+    .expect("signature offset fits usize");
+    assert_eq!(field(signature, 4), b"PE\0\0", "PE signature");
+    let optional = signature + 4 + 20;
+    let magic = u16::from_le_bytes(field(optional, 2).try_into().expect("2 bytes"));
+    assert!(
+        magic == 0x20B || magic == 0x10B,
+        "optional header magic {magic:#x}"
+    );
+    if magic == 0x20B {
+        u64::from_le_bytes(field(optional + 72, 8).try_into().expect("8 bytes"))
+    } else {
+        u64::from(u32::from_le_bytes(
+            field(optional + 72, 4).try_into().expect("4 bytes"),
+        ))
+    }
+}
+
+#[test]
+fn pe_stack_reserve_reads_both_optional_header_forms() {
+    let image = |magic: u16, reserve: &[u8]| {
+        let signature = 0x80_usize;
+        let optional = signature + 24;
+        let mut image = vec![0_u8; optional + 72 + 8];
+        image[0x3C..0x40].copy_from_slice(&u32::try_from(signature).unwrap().to_le_bytes());
+        image[signature..signature + 4].copy_from_slice(b"PE\0\0");
+        image[optional..optional + 2].copy_from_slice(&magic.to_le_bytes());
+        image[optional + 72..optional + 72 + reserve.len()].copy_from_slice(reserve);
+        image
+    };
+    assert_eq!(
+        pe_stack_reserve(&image(0x20B, &0x0010_0000_u64.to_le_bytes())),
+        0x0010_0000
+    );
+    assert_eq!(
+        pe_stack_reserve(&image(0x10B, &0x0020_0000_u32.to_le_bytes())),
+        0x0020_0000
+    );
+    let mut unsigned = image(0x20B, &[0; 8]);
+    unsigned[0x80] = b'X';
+    assert!(std::panic::catch_unwind(|| pe_stack_reserve(&unsigned)).is_err());
+    assert!(std::panic::catch_unwind(|| pe_stack_reserve(&[0; 0x40])).is_err());
+}
+
+#[test]
+#[serial]
+fn every_role_runs_on_a_windows_sized_main_stack() {
+    for (name, args, display_name) in [
+        ("stellar-agent", &["--version"][..], "stellar-agent"),
+        (
+            "wallet-x",
+            &["mcp", "serve", "--version"][..],
+            "stellar-agent-mcp",
+        ),
+        ("stellar-agent-mcp", &["--version"][..], "stellar-agent-mcp"),
+    ] {
+        version(
+            &Binary::new(name).run_on_small_main_stack(args),
+            display_name,
+        );
     }
 }
 

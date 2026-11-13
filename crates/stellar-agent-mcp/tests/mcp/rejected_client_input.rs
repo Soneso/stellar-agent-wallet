@@ -350,7 +350,7 @@ fn the_startup_log_holds_no_rejected_message() {
         ),
     )
     .unwrap();
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_stellar-agent-mcp"))
+    let mut child = crate::common::server_binary::server_command()
         .args(["--profile", "default"])
         .env("STELLAR_AGENT_HOME", home.path())
         .env("STELLAR_AGENT_LOG", "trace")

@@ -484,40 +484,42 @@ jobs:
         shell: bash
         run: "timeout 600 cargo test -p stellar-agent-mcp --no-default-features --lib -- tools::rules:: tools::rule_create::"
       # 5. MCP shutdown on Windows console events. Each test starts the
-      #    native server binary in a pseudoconsole of its own. It sends a real
-      #    Ctrl-Break or closes that pseudoconsole, then checks the exit drain. Both
-      #    feature states build the binary and run the three tests: feature
-      #    off with --no-default-features, feature on with the default set,
-      #    which carries mainnet-write. The log check requires all three to
-      #    run and pass. In each state a second run covers the pseudoconsole
-      #    driver: one process test and three environment block tests.
+      #    native stellar-agent executable under its stellar-agent-mcp alias
+      #    in a pseudoconsole of its own. It sends a real Ctrl-Break or closes
+      #    that pseudoconsole, then checks the exit drain. Both feature states
+      #    first build the CLI and MCP tests together, so the executable
+      #    carries the test features of both packages, and run the three
+      #    tests: feature off with --no-default-features, feature on with the
+      #    default set, which carries mainnet-write. The narrowed runs select
+      #    the same two packages and flags. The log check requires all three
+      #    to run and pass. In each state a second run covers the
+      #    pseudoconsole driver: one process test and three environment block
+      #    tests.
       - name: MCP binary and console-event tests, feature off (unbounded compile phase)
         shell: bash
         run: |
-          cargo build -p stellar-agent-mcp --bin stellar-agent-mcp --target x86_64-pc-windows-msvc --no-default-features
-          cargo test -p stellar-agent-mcp --target x86_64-pc-windows-msvc --no-default-features --features test-helpers --test mcp --no-run
+          cargo test -p stellar-agent-cli -p stellar-agent-mcp --target x86_64-pc-windows-msvc --no-default-features --features test-helpers --no-run
       - name: MCP console-event shutdown tests, feature off
         shell: bash
         run: |
           set -o pipefail
-          timeout 600 cargo test -p stellar-agent-mcp --target x86_64-pc-windows-msvc --no-default-features --features test-helpers --test mcp -- halt_integration::windows_ 2>&1 | tee windows-console-events-off.log
+          timeout 600 cargo test -p stellar-agent-cli -p stellar-agent-mcp --target x86_64-pc-windows-msvc --no-default-features --features test-helpers --test mcp -- halt_integration::windows_ 2>&1 | tee windows-console-events-off.log
           grep -q 'test result: ok. 3 passed' windows-console-events-off.log
-          timeout 600 cargo test -p stellar-agent-mcp --target x86_64-pc-windows-msvc --no-default-features --features test-helpers --test mcp -- common::child_process::windows_tests:: common::child_process::pseudo_console::tests:: 2>&1 | tee windows-driver-off.log
+          timeout 600 cargo test -p stellar-agent-cli -p stellar-agent-mcp --target x86_64-pc-windows-msvc --no-default-features --features test-helpers --test mcp -- common::child_process::windows_tests:: common::child_process::pseudo_console::tests:: 2>&1 | tee windows-driver-off.log
           grep -q 'test result: ok. 4 passed' windows-driver-off.log
           test "$(grep -c '^test common::child_process::windows_tests::.* \.\.\. ok' windows-driver-off.log)" -eq 1
           test "$(grep -c '^test common::child_process::pseudo_console::tests::.* \.\.\. ok' windows-driver-off.log)" -eq 3
       - name: MCP binary and console-event tests, feature on (unbounded compile phase)
         shell: bash
         run: |
-          cargo build -p stellar-agent-mcp --bin stellar-agent-mcp --target x86_64-pc-windows-msvc
-          cargo test -p stellar-agent-mcp --target x86_64-pc-windows-msvc --features test-helpers --test mcp --no-run
+          cargo test -p stellar-agent-cli -p stellar-agent-mcp --target x86_64-pc-windows-msvc --features test-helpers --no-run
       - name: MCP console-event shutdown tests, feature on
         shell: bash
         run: |
           set -o pipefail
-          timeout 600 cargo test -p stellar-agent-mcp --target x86_64-pc-windows-msvc --features test-helpers --test mcp -- halt_integration::windows_ 2>&1 | tee windows-console-events-on.log
+          timeout 600 cargo test -p stellar-agent-cli -p stellar-agent-mcp --target x86_64-pc-windows-msvc --features test-helpers --test mcp -- halt_integration::windows_ 2>&1 | tee windows-console-events-on.log
           grep -q 'test result: ok. 3 passed' windows-console-events-on.log
-          timeout 600 cargo test -p stellar-agent-mcp --target x86_64-pc-windows-msvc --features test-helpers --test mcp -- common::child_process::windows_tests:: common::child_process::pseudo_console::tests:: 2>&1 | tee windows-driver-on.log
+          timeout 600 cargo test -p stellar-agent-cli -p stellar-agent-mcp --target x86_64-pc-windows-msvc --features test-helpers --test mcp -- common::child_process::windows_tests:: common::child_process::pseudo_console::tests:: 2>&1 | tee windows-driver-on.log
           grep -q 'test result: ok. 4 passed' windows-driver-on.log
           test "$(grep -c '^test common::child_process::windows_tests::.* \.\.\. ok' windows-driver-on.log)" -eq 1
           test "$(grep -c '^test common::child_process::pseudo_console::tests::.* \.\.\. ok' windows-driver-on.log)" -eq 3

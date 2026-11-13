@@ -1,12 +1,13 @@
 name: macOS sign and notarize
 description: >-
-  Signs both release binaries with the Developer ID identity, notarizes them,
-  verifies the signatures, and packs the release archive. Reads binaries only
-  from the binary-dir input and runs every tool by absolute path.
+  Signs the stellar-agent executable with the Developer ID identity, delivers
+  it under both names as byte-equal copies, notarizes them, verifies both
+  signatures, and packs the release archive. Reads binaries only from the
+  binary-dir input and runs every tool by absolute path.
 
 inputs:
   binary-dir:
-    description: Directory holding the validated stellar-agent and stellar-agent-mcp binaries
+    description: Directory holding the validated stellar-agent executable and its equal stellar-agent-mcp copy
     required: true
   target:
     description: Target triple, aarch64-apple-darwin or x86_64-apple-darwin
