@@ -103,6 +103,7 @@ enum NetworkAnswer {
 /// What the mock observed, shared with the test.
 #[derive(Default)]
 struct Observed {
+    signed_entries_sha256: Vec<[u8; 32]>,
     /// `x402_payment_authorized` rows in the log when each signed
     /// re-simulation arrived.
     authorized_rows_at_resimulation: Vec<usize>,
@@ -122,6 +123,7 @@ struct X402Rpc {
     log_path: PathBuf,
     first: FirstSimulate,
     simulation_ledger: u32,
+    health_ledger: u32,
     resimulation: Resimulation,
     network: NetworkAnswer,
     /// Bytes the unsigned simulate writes over the log, once: a rollback that
@@ -145,6 +147,7 @@ impl X402Rpc {
             log_path,
             first: FirstSimulate::Ok,
             simulation_ledger: LEDGER,
+            health_ledger: LEDGER,
             resimulation: Resimulation::Ok,
             network: NetworkAnswer::Passphrase(TESTNET_PASSPHRASE),
             roll_back_to: Arc::new(Mutex::new(None)),
@@ -260,7 +263,7 @@ impl Respond for X402Rpc {
                     req_id,
                     serde_json::json!({
                         "status": "healthy",
-                        "latestLedger": LEDGER,
+                        "latestLedger": self.health_ledger,
                         "oldestLedger": 1,
                         "ledgerRetentionWindow": 17_280,
                     }),
@@ -293,6 +296,14 @@ impl Respond for X402Rpc {
         };
         let signed_entries = host.auth.to_vec();
         let signed = !signed_entries.is_empty();
+        if signed {
+            use sha2::{Digest, Sha256};
+            self.observed
+                .lock()
+                .unwrap()
+                .signed_entries_sha256
+                .push(Sha256::digest(host.auth.to_xdr(Limits::none()).unwrap()).into());
+        }
         self.observed.lock().unwrap().signed.push(signed);
         if let Some(entry) = host.auth.first()
             && let SorobanCredentials::Address(credentials) = &entry.credentials
@@ -397,7 +408,7 @@ impl Respond for X402Rpc {
                     "transactionData": TRANSACTION_DATA,
                     "minResourceFee": "1000",
                     "results": [{"auth": [], "xdr": void_xdr()}],
-                    "latestLedger": 1000,
+                    "latestLedger": self.health_ledger,
                 }),
             ),
             Resimulation::RpcError => simulate_result(
@@ -658,6 +669,1406 @@ fn x402_rows(profile: &Profile) -> (Vec<serde_json::Value>, Vec<serde_json::Valu
         .cloned()
         .collect();
     (authorized, withheld)
+}
+
+type PayerBarrier = Arc<(Mutex<usize>, std::sync::Condvar)>;
+
+struct ApprovedFixture {
+    fixture: Fixture,
+    nonce: String,
+    attestation: String,
+    store_path: PathBuf,
+    signer_reads: Arc<std::sync::atomic::AtomicUsize>,
+    signer_barrier: Arc<Mutex<Option<PayerBarrier>>>,
+    requirements: String,
+}
+
+async fn approval_fixture(tool: Tool, configure: impl FnOnce(&mut X402Rpc)) -> ApprovedFixture {
+    approval_fixture_with_terms(tool, payment_required(), configure).await
+}
+
+async fn approval_fixture_with_terms(
+    tool: Tool,
+    requirements: String,
+    configure: impl FnOnce(&mut X402Rpc),
+) -> ApprovedFixture {
+    let name = format!("approval-{}", uuid::Uuid::new_v4().simple());
+    let signer_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reads = signer_reads.clone();
+    let signer_barrier = Arc::new(Mutex::new(None::<PayerBarrier>));
+    let rendezvous = signer_barrier.clone();
+    let mut fixture = build_fixture(
+        &name,
+        [0x91; 32],
+        configure,
+        |_| {},
+        move |payer| {
+            keyring_mock::install_with_read_hooks(vec![keyring_mock::ReadHook::new(
+                SIGNER_SERVICE,
+                payer,
+                Arc::new(move || {
+                    let index = reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let barrier = rendezvous.lock().unwrap().clone();
+                    if let Some(barrier) = barrier
+                        && index < 2
+                    {
+                        let mut arrived = barrier.0.lock().unwrap();
+                        *arrived += 1;
+                        barrier.1.notify_all();
+                        let (arrived, timeout) = barrier
+                            .1
+                            .wait_timeout_while(
+                                arrived,
+                                std::time::Duration::from_secs(60),
+                                |arrived| *arrived < 2,
+                            )
+                            .unwrap();
+                        assert!(
+                            !timeout.timed_out() && *arrived == 2,
+                            "both proofs verify before either payer read completes"
+                        );
+                    }
+                }),
+            )])
+            .unwrap();
+        },
+    )
+    .await;
+    let directory = fixture._home.path().join("approvals");
+    fixture.server.set_approval_dir_for_test(directory.clone());
+    fixture.server.set_policy_engine_for_test(Arc::new(
+        crate::common::policy_mock::MockPolicyEngine::require_approval(),
+    ));
+    let queued = proof_call(
+        &fixture,
+        tool,
+        (None, None),
+        requirements.clone(),
+        None,
+        "merchant.example",
+    )
+    .await;
+    let value = result_json(&queued);
+    assert_ne!(queued.is_error, Some(true), "{value}");
+    assert!(fixture.rpc.observed.lock().unwrap().transmitted.is_empty());
+    assert!(x402_rows(&fixture.profile).0.is_empty());
+    let nonce = value["data"]["approval"]["approval_nonce"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let store_path = directory.join(format!("{name}.toml"));
+    let attestation = attest_pending(&fixture, &store_path, &nonce);
+    ApprovedFixture {
+        fixture,
+        nonce,
+        attestation,
+        store_path,
+        signer_reads,
+        signer_barrier,
+        requirements,
+    }
+}
+
+fn attest_pending(fixture: &Fixture, store_path: &std::path::Path, nonce: &str) -> String {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use stellar_agent_core::approval::{
+        AttestationBinding, AttestedApprover, ConsentAuthorization, PendingApprovalStore,
+        attest::{ConsentAudit, Surface, attest_and_persist},
+    };
+    let name = stellar_agent_core::profile::name::profile_name_for_approval(&fixture.profile);
+    let key = [0x5a; 32];
+    keyring_core::Entry::new(
+        &fixture.profile.attestation_key_id.service,
+        &fixture.profile.attestation_key_id.account,
+    )
+    .unwrap()
+    .set_password(&URL_SAFE_NO_PAD.encode(key))
+    .unwrap();
+    let mut store = PendingApprovalStore::open(store_path.to_path_buf()).unwrap();
+    let entry = store.get(nonce).unwrap().clone();
+    let outbox = stellar_agent_core::audit_log::AuditOutbox::for_log(
+        &fixture.profile.audit_log_path,
+        stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
+            &fixture.profile.audit_log_hash_chain_key_id,
+            &fixture.profile.audit_log_path,
+        ),
+    );
+    let access = stellar_agent_network::keyring::keyed_audit_access(
+        &fixture.profile,
+        &name,
+        stellar_agent_core::audit_log::BindingCheck::Enforce,
+    )
+    .unwrap();
+    let _writer = stellar_agent_core::audit_log::AuditWriterRegistry::get_or_open_keyed(
+        &name,
+        &fixture.profile.audit_log_path,
+        access,
+    )
+    .unwrap();
+    attest_and_persist(
+        &mut store,
+        &entry,
+        &key,
+        &AttestationBinding::new(&name, "stellar:testnet"),
+        Surface::Cli,
+        ConsentAudit::Outbox(&outbox),
+        ConsentAuthorization::Standard(&AttestedApprover::Local),
+        |_, _| Err("no grant".to_owned()),
+    )
+    .unwrap();
+    let attestation = store
+        .get(nonce)
+        .unwrap()
+        .attestation_blob_b64
+        .clone()
+        .unwrap();
+    drop(store);
+    attestation
+}
+
+async fn proof_call(
+    fixture: &Fixture,
+    tool: Tool,
+    proof: (Option<&str>, Option<&str>),
+    requirements: String,
+    address: Option<String>,
+    domain: &str,
+) -> rmcp::model::CallToolResult {
+    proof_call_server(&fixture.server, tool, proof, requirements, address, domain).await
+}
+
+async fn proof_call_server(
+    server: &WalletServer,
+    tool: Tool,
+    proof: (Option<&str>, Option<&str>),
+    requirements: String,
+    address: Option<String>,
+    domain: &str,
+) -> rmcp::model::CallToolResult {
+    match tool {
+        Tool::CreatePayment => server
+            .call_stellar_x402_create_payment(X402CreatePaymentArgs {
+                approval_nonce: proof.0.map(str::to_owned),
+                approval_attestation: proof.1.map(str::to_owned),
+                chain_id: "stellar:testnet".to_owned(),
+                payment_required: requirements,
+                address,
+                business_id: None,
+            })
+            .await
+            .unwrap(),
+        Tool::AuthenticatedPayment => server
+            .call_stellar_x402_authenticated_payment(X402AuthenticatedPaymentArgs {
+                approval_nonce: proof.0.map(str::to_owned),
+                approval_attestation: proof.1.map(str::to_owned),
+                chain_id: "stellar:testnet".to_owned(),
+                payment_required: requirements,
+                address,
+                business_id: None,
+                home_domain: domain.to_owned(),
+            })
+            .await
+            .unwrap(),
+    }
+}
+
+impl ApprovedFixture {
+    fn pair(&self) -> (Option<&str>, Option<&str>) {
+        (Some(&self.nonce), Some(&self.attestation))
+    }
+
+    fn entry(&self) -> stellar_agent_core::approval::PendingApproval {
+        stellar_agent_core::approval::PendingApprovalStore::open(self.store_path.clone())
+            .unwrap()
+            .get(&self.nonce)
+            .unwrap()
+            .clone()
+    }
+
+    async fn pay(&self, tool: Tool) -> rmcp::model::CallToolResult {
+        proof_call(
+            &self.fixture,
+            tool,
+            self.pair(),
+            self.requirements.clone(),
+            None,
+            "merchant.example",
+        )
+        .await
+    }
+}
+
+fn assert_same_refusal(left: &serde_json::Value, right: &serde_json::Value) {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    for value in [&mut left, &mut right] {
+        let id = value["request_id"].as_str().unwrap();
+        assert_eq!(uuid::Uuid::parse_str(id).unwrap().get_version_num(), 4);
+        value["request_id"] = serde_json::Value::Null;
+    }
+    assert_eq!(left, right);
+}
+
+fn assert_approval_refusal(result: &rmcp::model::CallToolResult) {
+    let value = result_json(result);
+    assert_eq!(
+        value["error"]["code"], "policy.approval_required",
+        "{value}"
+    );
+    assert!(value["data"].get("paymentSignature").is_none());
+}
+
+#[tokio::test]
+#[serial]
+async fn approved_payment_pays_and_records_the_approval() {
+    for tool in [Tool::CreatePayment, Tool::AuthenticatedPayment] {
+        for payee in [
+            PAY_TO.to_owned(),
+            stellar_strkey::Contract([3; 32]).to_string().to_string(),
+            stellar_strkey::ed25519::MuxedAccount {
+                ed25519: [0x41; 32],
+                id: 19,
+            }
+            .to_string()
+            .to_string(),
+            stellar_strkey::MuxedContract {
+                contract_id: [3; 32],
+                id: 19,
+            }
+            .to_string()
+            .to_string(),
+        ] {
+            let terms = payment_required_with(|r| r["payTo"] = payee.into());
+            let approved = approval_fixture_with_terms(tool, terms, |rpc| {
+                rpc.network = NetworkAnswer::Protocols(vec![30])
+            })
+            .await;
+            let entry = approved.entry();
+            let result = approved.pay(tool).await;
+            let value = result_json(&result);
+            assert_ne!(result.is_error, Some(true), "{value}");
+            assert!(value["data"]["paymentSignature"].is_string(), "{value}");
+            let observed = approved.fixture.rpc.observed.lock().unwrap();
+            assert_eq!(observed.transmitted.len(), 1);
+            assert_eq!(observed.authorized_rows_at_resimulation, vec![1]);
+            let stellar_agent_core::approval::ApprovalKind::X402Payment {
+                root_invocation_xdr,
+                ..
+            } = entry.kind
+            else {
+                panic!("x402 intent");
+            };
+            let root =
+                SorobanAuthorizedInvocation::from_xdr_base64(root_invocation_xdr, Limits::none())
+                    .unwrap();
+            assert_eq!(
+                root.function,
+                SorobanAuthorizedFunction::ContractFn(observed.transmitted[0].2.clone())
+            );
+            assert_eq!(
+                x402_rows(&approved.fixture.profile).0[0]["policy_decision"],
+                "require_approval"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn spent_approval_pays_nothing_again() {
+    for tool in [Tool::CreatePayment, Tool::AuthenticatedPayment] {
+        for resimulation in [Resimulation::Ok, Resimulation::RpcError] {
+            let approved = approval_fixture(tool, |rpc| rpc.resimulation = resimulation).await;
+            let result = approved.pay(tool).await;
+            assert_eq!(
+                result.is_error == Some(true),
+                resimulation != Resimulation::Ok,
+                "{}",
+                result_json(&result)
+            );
+            let stellar_agent_core::approval::ApprovalKind::Consumed { tx_hash, .. } =
+                approved.entry().kind
+            else {
+                panic!("signed transmission must spend the approval");
+            };
+            assert_eq!(
+                tx_hash,
+                stellar_agent_core::hex::encode(
+                    &approved
+                        .fixture
+                        .rpc
+                        .observed
+                        .lock()
+                        .unwrap()
+                        .signed_entries_sha256[0],
+                )
+            );
+            let retry = approved.pay(tool).await;
+            assert_eq!(
+                result_json(&retry)["error"]["code"],
+                "policy.approval_consumed"
+            );
+            assert_eq!(
+                approved
+                    .fixture
+                    .rpc
+                    .observed
+                    .lock()
+                    .unwrap()
+                    .transmitted
+                    .len(),
+                1
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn approved_payment_audit_row_records_require_approval() {
+    for tool in [Tool::CreatePayment, Tool::AuthenticatedPayment] {
+        let approved = approval_fixture(tool, |_| {}).await;
+        let result = approved.pay(tool).await;
+        assert_ne!(result.is_error, Some(true), "{}", result_json(&result));
+        assert_eq!(
+            x402_rows(&approved.fixture.profile).0[0]["policy_decision"],
+            "require_approval"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn unverified_proof_signs_nothing() {
+    for tool in [Tool::CreatePayment, Tool::AuthenticatedPayment] {
+        let mut approved =
+            approval_fixture(tool, |rpc| rpc.network = NetworkAnswer::Protocols(vec![30])).await;
+        let original = format!("{:?}", approved.entry());
+        for (field, changed) in [
+            ("amount", "20000000".to_owned()),
+            ("payTo", gstrkey_for_seed([0x92; 32])),
+            (
+                "payTo",
+                stellar_strkey::Contract([4; 32]).to_string().to_string(),
+            ),
+            (
+                "asset",
+                stellar_strkey::Contract([0x93; 32]).to_string().to_string(),
+            ),
+            (
+                "payTo",
+                stellar_strkey::ed25519::MuxedAccount {
+                    ed25519: [0; 32],
+                    id: 42,
+                }
+                .to_string()
+                .to_string(),
+            ),
+        ] {
+            let mut requirements: serde_json::Value =
+                serde_json::from_str(&payment_required()).unwrap();
+            requirements[field] = changed.into();
+            assert_approval_refusal(
+                &proof_call(
+                    &approved.fixture,
+                    tool,
+                    approved.pair(),
+                    requirements.to_string(),
+                    None,
+                    "merchant.example",
+                )
+                .await,
+            );
+        }
+        let queued = call(&approved.fixture, tool).await;
+        let queued = result_json(&queued);
+        let other_nonce = queued["data"]["approval"]["approval_nonce"]
+            .as_str()
+            .unwrap();
+        let other_attestation =
+            attest_pending(&approved.fixture, &approved.store_path, other_nonce);
+        for pair in [
+            (
+                Some(approved.nonce.as_str()),
+                Some(other_attestation.as_str()),
+            ),
+            (Some(approved.nonce.as_str()), Some("forged")),
+            (Some("absent"), Some(approved.attestation.as_str())),
+            (Some(approved.nonce.as_str()), None),
+            (None, Some(approved.attestation.as_str())),
+        ] {
+            assert_approval_refusal(
+                &proof_call(
+                    &approved.fixture,
+                    tool,
+                    pair,
+                    payment_required(),
+                    None,
+                    "merchant.example",
+                )
+                .await,
+            );
+        }
+        if matches!(tool, Tool::AuthenticatedPayment) {
+            assert_approval_refusal(
+                &proof_call(
+                    &approved.fixture,
+                    tool,
+                    approved.pair(),
+                    payment_required(),
+                    None,
+                    "another.example",
+                )
+                .await,
+            );
+        }
+        let original_profile = approved.fixture.profile.clone();
+        let mut changed = original_profile.clone();
+        changed.mcp_signer_default.account = gstrkey_for_seed([0x92; 32]);
+        let mut changed_server = WalletServer::new(changed).unwrap();
+        changed_server.set_approval_dir_for_test(approved.store_path.parent().unwrap().to_owned());
+        changed_server.set_policy_engine_for_test(Arc::new(
+            crate::common::policy_mock::MockPolicyEngine::require_approval(),
+        ));
+        let original_server = std::mem::replace(&mut approved.fixture.server, changed_server);
+        assert_approval_refusal(&approved.pay(tool).await);
+        approved.fixture.server = original_server;
+        assert!(
+            approved
+                .fixture
+                .rpc
+                .observed
+                .lock()
+                .unwrap()
+                .methods
+                .is_empty()
+        );
+        assert!(x402_rows(&approved.fixture.profile).0.is_empty());
+        assert_eq!(format!("{:?}", approved.entry()), original);
+        assert_eq!(
+            approved
+                .signer_reads
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "refused proof reads no payer key"
+        );
+        let w = stellar_strkey::MuxedContract {
+            contract_id: [5; 32],
+            id: 42,
+        }
+        .to_string()
+        .to_string();
+        let result = proof_call(
+            &approved.fixture,
+            tool,
+            approved.pair(),
+            payment_required_with(|r| r["payTo"] = w.into()),
+            None,
+            "merchant.example",
+        )
+        .await;
+        assert_approval_refusal(&result);
+        assert_eq!(
+            approved.fixture.rpc.observed.lock().unwrap().methods,
+            vec!["getNetwork"]
+        );
+        assert_eq!(
+            approved
+                .signer_reads
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        let result = approved.pay(tool).await;
+        assert_ne!(result.is_error, Some(true), "{}", result_json(&result));
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn failure_before_the_transmit_gate_keeps_the_approval() {
+    for tool in [Tool::CreatePayment, Tool::AuthenticatedPayment] {
+        for fault in 0..3 {
+            let approved = approval_fixture(tool, |rpc| match fault {
+                0 => rpc.first = FirstSimulate::Error,
+                1 => rpc.network = NetworkAnswer::Passphrase(FUTURENET_PASSPHRASE),
+                _ => {}
+            })
+            .await;
+            let coordinate = &approved.fixture.profile.mcp_signer_default;
+            if fault == 2 {
+                keyring_core::Entry::new(&coordinate.service, &coordinate.account)
+                    .unwrap()
+                    .set_password(&sstrkey_for_seed([0x92; 32]))
+                    .unwrap();
+            }
+            let result = approved.pay(tool).await;
+            assert_eq!(result.is_error, Some(true));
+            assert!(matches!(
+                approved.entry().kind,
+                stellar_agent_core::approval::ApprovalKind::X402Payment { .. }
+            ));
+            assert!(
+                approved
+                    .fixture
+                    .rpc
+                    .observed
+                    .lock()
+                    .unwrap()
+                    .transmitted
+                    .is_empty()
+            );
+            approved.fixture.mock.reset().await;
+            let mut rpc = approved.fixture.rpc.clone();
+            rpc.first = FirstSimulate::Ok;
+            rpc.network = NetworkAnswer::Protocols(vec![30]);
+            keyring_core::Entry::new(&coordinate.service, &coordinate.account)
+                .unwrap()
+                .set_password(&sstrkey_for_seed([0x91; 32]))
+                .unwrap();
+            Mock::given(method("POST"))
+                .respond_with(rpc)
+                .mount(&approved.fixture.mock)
+                .await;
+            let result = approved.pay(tool).await;
+            assert_ne!(result.is_error, Some(true), "{}", result_json(&result));
+        }
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn approved_cross_check_failure_keeps_the_approval() {
+    for tool in [Tool::CreatePayment, Tool::AuthenticatedPayment] {
+        let mut approved = approval_fixture(tool, |_| {}).await;
+        let oracle = MockServer::start().await;
+        let mut rpc = approved.fixture.rpc.clone();
+        rpc.first = FirstSimulate::OtherAmount;
+        Mock::given(method("POST"))
+            .respond_with(rpc)
+            .mount(&oracle)
+            .await;
+        let mut profile = approved.fixture.profile.clone();
+        profile.oracle_provider_url = Some(oracle.uri().parse().unwrap());
+        profile.cross_check_thresholds =
+            stellar_agent_core::cross_check::CrossCheckThresholds::new(
+                [(
+                    stellar_agent_core::asset_id::CanonicalAsset::contract(ASSET).unwrap(),
+                    PAYMENT_AMOUNT,
+                )]
+                .into_iter()
+                .collect(),
+            )
+            .unwrap();
+        let mut server = WalletServer::new(profile).unwrap();
+        server.set_approval_dir_for_test(approved.store_path.parent().unwrap().to_owned());
+        server.set_policy_engine_for_test(Arc::new(
+            crate::common::policy_mock::MockPolicyEngine::require_approval(),
+        ));
+        server.set_x402_identity_session_for_test("jwt".into(), gstrkey_for_seed([1; 32]), vec![]);
+        approved.fixture.server = server;
+        let result = approved.pay(tool).await;
+        assert_eq!(
+            result_json(&result)["error"]["code"],
+            "simulation.divergence",
+            "{}",
+            result_json(&result)
+        );
+        assert!(matches!(
+            approved.entry().kind,
+            stellar_agent_core::approval::ApprovalKind::X402Payment { .. }
+        ));
+        assert!(
+            approved
+                .fixture
+                .rpc
+                .observed
+                .lock()
+                .unwrap()
+                .transmitted
+                .is_empty()
+        );
+        assert!(x402_rows(&approved.fixture.profile).0.is_empty());
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn x402_audit_failure_after_spend_prevents_retry_release() {
+    for tool in [Tool::CreatePayment, Tool::AuthenticatedPayment] {
+        let approved = approval_fixture(tool, |_| {}).await;
+        *approved.fixture.rpc.roll_back_to.lock().unwrap() = Some(Vec::new());
+        let result = approved.pay(tool).await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(matches!(
+            approved.entry().kind,
+            stellar_agent_core::approval::ApprovalKind::Consumed { .. }
+        ));
+        assert!(
+            approved
+                .fixture
+                .rpc
+                .observed
+                .lock()
+                .unwrap()
+                .transmitted
+                .is_empty()
+        );
+        let result = approved.pay(tool).await;
+        assert_eq!(
+            result_json(&result)["error"]["code"],
+            "policy.approval_consumed"
+        );
+        assert!(
+            approved
+                .fixture
+                .rpc
+                .observed
+                .lock()
+                .unwrap()
+                .transmitted
+                .is_empty()
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn proof_with_a_foreign_network_answers_approval_required() {
+    for tool in [Tool::CreatePayment, Tool::AuthenticatedPayment] {
+        let mut approved = approval_fixture(tool, |_| {}).await;
+        for allow in [false, true] {
+            if allow {
+                approved.fixture.server.set_policy_engine_for_test(Arc::new(
+                    crate::common::policy_mock::MockPolicyEngine::allow(),
+                ));
+            }
+            for (field, value) in [
+                ("network", "stellar:pubnet"),
+                ("asset", "invalid"),
+                ("amount", "0"),
+                ("amount", "9999999999999999999999999999999999999999"),
+                ("payTo", "invalid"),
+            ] {
+                let mut requirements: serde_json::Value =
+                    serde_json::from_str(&payment_required()).unwrap();
+                requirements[field] = value.into();
+                if field == "network" {
+                    requirements["scheme"] = "invalid".into();
+                    requirements["extra"]["areFeesSponsored"] = false.into();
+                    requirements["maxTimeoutSeconds"] = 0.into();
+                }
+                let stored = proof_call(
+                    &approved.fixture,
+                    tool,
+                    approved.pair(),
+                    requirements.to_string(),
+                    None,
+                    "merchant.example",
+                )
+                .await;
+                let absent = proof_call(
+                    &approved.fixture,
+                    tool,
+                    (Some("absent"), Some(&approved.attestation)),
+                    requirements.to_string(),
+                    None,
+                    "merchant.example",
+                )
+                .await;
+                assert_approval_refusal(&stored);
+                assert_same_refusal(&result_json(&stored), &result_json(&absent));
+            }
+        }
+        assert!(
+            approved
+                .fixture
+                .rpc
+                .observed
+                .lock()
+                .unwrap()
+                .methods
+                .is_empty()
+        );
+        assert_eq!(
+            approved
+                .signer_reads
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        for (field, value, code) in [
+            (
+                "scheme",
+                serde_json::json!("invalid"),
+                "x402.unsupported_scheme",
+            ),
+            (
+                "extra",
+                serde_json::json!({"areFeesSponsored":false}),
+                "x402.fees_not_sponsored",
+            ),
+            (
+                "maxTimeoutSeconds",
+                serde_json::json!(0),
+                "x402.invalid_payment_required",
+            ),
+        ] {
+            let result = proof_call(
+                &approved.fixture,
+                tool,
+                approved.pair(),
+                payment_required_with(|r| r[field] = value),
+                None,
+                "merchant.example",
+            )
+            .await;
+            assert_eq!(
+                result_json(&result)["error"]["code"],
+                code,
+                "{}",
+                result_json(&result)
+            );
+        }
+        assert!(matches!(
+            approved.entry().kind,
+            stellar_agent_core::approval::ApprovalKind::X402Payment { .. }
+        ));
+        let valid = payment_required_with(|r| {
+            r["maxTimeoutSeconds"] = 17.into();
+            r["extra"]["retained"] = true.into();
+        });
+        let result = proof_call(
+            &approved.fixture,
+            tool,
+            (Some("arbitrary"), Some("arbitrary")),
+            valid.clone(),
+            None,
+            "merchant.example",
+        )
+        .await;
+        assert_ne!(result.is_error, Some(true), "{}", result_json(&result));
+        use base64::Engine as _;
+        let payload = base64::engine::general_purpose::STANDARD
+            .decode(
+                result_json(&result)["data"]["paymentSignature"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(
+            payload["accepted"],
+            serde_json::from_str::<serde_json::Value>(&valid).unwrap()
+        );
+        assert!(matches!(
+            approved.entry().kind,
+            stellar_agent_core::approval::ApprovalKind::X402Payment { .. }
+        ));
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn proof_with_a_foreign_payer_address_answers_approval_required() {
+    for tool in [Tool::CreatePayment, Tool::AuthenticatedPayment] {
+        let approved = approval_fixture(tool, |_| {}).await;
+        let mut envelopes = Vec::new();
+        for nonce in [&approved.nonce, &"absent".to_owned()] {
+            let result = proof_call(
+                &approved.fixture,
+                tool,
+                (Some(nonce), Some(&approved.attestation)),
+                payment_required(),
+                Some(gstrkey_for_seed([0x94; 32])),
+                "merchant.example",
+            )
+            .await;
+            assert_approval_refusal(&result);
+            envelopes.push(result_json(&result));
+        }
+        assert_same_refusal(&envelopes[0], &envelopes[1]);
+        assert!(
+            approved
+                .fixture
+                .rpc
+                .observed
+                .lock()
+                .unwrap()
+                .methods
+                .is_empty()
+        );
+        assert!(matches!(
+            approved.entry().kind,
+            stellar_agent_core::approval::ApprovalKind::X402Payment { .. }
+        ));
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn proof_with_an_invalid_home_domain_answers_approval_required() {
+    let approved = approval_fixture(Tool::AuthenticatedPayment, |_| {}).await;
+    let mut envelopes = Vec::new();
+    for nonce in [&approved.nonce, &"absent".to_owned()] {
+        let result = proof_call(
+            &approved.fixture,
+            Tool::AuthenticatedPayment,
+            (Some(nonce), Some(&approved.attestation)),
+            payment_required(),
+            None,
+            "INVALID.example",
+        )
+        .await;
+        assert_approval_refusal(&result);
+        envelopes.push(result_json(&result));
+    }
+    assert_same_refusal(&envelopes[0], &envelopes[1]);
+    assert!(
+        approved
+            .fixture
+            .rpc
+            .observed
+            .lock()
+            .unwrap()
+            .methods
+            .is_empty()
+    );
+    assert!(matches!(
+        approved.entry().kind,
+        stellar_agent_core::approval::ApprovalKind::X402Payment { .. }
+    ));
+}
+
+#[tokio::test]
+#[serial]
+async fn proof_with_unsupported_w_payee_answers_approval_required() {
+    for tool in [Tool::CreatePayment, Tool::AuthenticatedPayment] {
+        let approved =
+            approval_fixture(tool, |rpc| rpc.network = NetworkAnswer::Protocols(vec![29])).await;
+        let mut requirements: serde_json::Value =
+            serde_json::from_str(&payment_required()).unwrap();
+        requirements["payTo"] = stellar_strkey::MuxedContract {
+            contract_id: [0x55; 32],
+            id: 42,
+        }
+        .to_string()
+        .to_string()
+        .into();
+        let result = proof_call(
+            &approved.fixture,
+            tool,
+            approved.pair(),
+            requirements.to_string(),
+            None,
+            "merchant.example",
+        )
+        .await;
+        assert_approval_refusal(&result);
+        for pair in [
+            (None, None),
+            (Some(approved.nonce.as_str()), None),
+            (None, Some(approved.attestation.as_str())),
+        ] {
+            let result = proof_call(
+                &approved.fixture,
+                tool,
+                pair,
+                requirements.to_string(),
+                None,
+                "merchant.example",
+            )
+            .await;
+            assert_eq!(
+                result_json(&result)["error"]["code"],
+                "x402.muxed_contract_protocol_unsupported"
+            );
+        }
+        assert!(
+            approved
+                .fixture
+                .rpc
+                .observed
+                .lock()
+                .unwrap()
+                .transmitted
+                .is_empty()
+        );
+        assert!(x402_rows(&approved.fixture.profile).0.is_empty());
+        assert!(matches!(
+            approved.entry().kind,
+            stellar_agent_core::approval::ApprovalKind::X402Payment { .. }
+        ));
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn x402_wait_uses_the_paying_calls_ledger() {
+    for tool in [Tool::CreatePayment, Tool::AuthenticatedPayment] {
+        let approved = approval_fixture(tool, |_| {}).await;
+        let mut requirements: serde_json::Value =
+            serde_json::from_str(&payment_required()).unwrap();
+        requirements["maxTimeoutSeconds"] = 0.into();
+        let result = proof_call(
+            &approved.fixture,
+            tool,
+            approved.pair(),
+            requirements.to_string(),
+            None,
+            "merchant.example",
+        )
+        .await;
+        assert_eq!(result.is_error, Some(true));
+        requirements["maxTimeoutSeconds"] = 45.into();
+        requirements["extra"]["areFeesSponsored"] = false.into();
+        assert_eq!(
+            proof_call(
+                &approved.fixture,
+                tool,
+                approved.pair(),
+                requirements.to_string(),
+                None,
+                "merchant.example"
+            )
+            .await
+            .is_error,
+            Some(true)
+        );
+        assert!(matches!(
+            approved.entry().kind,
+            stellar_agent_core::approval::ApprovalKind::X402Payment { .. }
+        ));
+        approved.fixture.mock.reset().await;
+        let mut rpc = approved.fixture.rpc.clone();
+        rpc.simulation_ledger = 2000;
+        rpc.health_ledger = 2000;
+        Mock::given(method("POST"))
+            .respond_with(rpc)
+            .mount(&approved.fixture.mock)
+            .await;
+        requirements["extra"]["areFeesSponsored"] = true.into();
+        let result = proof_call(
+            &approved.fixture,
+            tool,
+            approved.pair(),
+            requirements.to_string(),
+            None,
+            "merchant.example",
+        )
+        .await;
+        assert_ne!(result.is_error, Some(true), "{}", result_json(&result));
+        assert_eq!(
+            approved.fixture.rpc.observed.lock().unwrap().transmitted[0].0,
+            2009
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn proof_absent_wrong_terms_keep_their_errors() {
+    for tool in [Tool::CreatePayment, Tool::AuthenticatedPayment] {
+        for allow in [false, true] {
+            let mut approved = approval_fixture(tool, |_| {}).await;
+            if allow {
+                approved.fixture.server.set_policy_engine_for_test(Arc::new(
+                    crate::common::policy_mock::MockPolicyEngine::allow(),
+                ));
+            }
+            let mut terms: serde_json::Value = serde_json::from_str(&payment_required()).unwrap();
+            terms["network"] = "stellar:pubnet".into();
+            let result = proof_call(
+                &approved.fixture,
+                tool,
+                (None, None),
+                terms.to_string(),
+                None,
+                "merchant.example",
+            )
+            .await;
+            assert_eq!(
+                result_json(&result)["error"]["code"],
+                "x402.network_passphrase_mismatch"
+            );
+            let result = proof_call(
+                &approved.fixture,
+                tool,
+                (None, None),
+                payment_required(),
+                Some(gstrkey_for_seed([0x95; 32])),
+                "merchant.example",
+            )
+            .await;
+            assert_eq!(
+                result_json(&result)["error"]["code"],
+                if allow {
+                    "x402.invalid_payment_required"
+                } else {
+                    "policy.approval_required_unsupported"
+                }
+            );
+            if matches!(tool, Tool::AuthenticatedPayment) {
+                let mut server = WalletServer::new(approved.fixture.profile.clone()).unwrap();
+                server
+                    .set_approval_dir_for_test(approved.store_path.parent().unwrap().to_path_buf());
+                server.set_policy_engine_for_test(if allow {
+                    Arc::new(crate::common::policy_mock::MockPolicyEngine::allow())
+                } else {
+                    Arc::new(crate::common::policy_mock::MockPolicyEngine::require_approval())
+                });
+                let result = server
+                    .call_stellar_x402_authenticated_payment(X402AuthenticatedPaymentArgs {
+                        approval_nonce: None,
+                        approval_attestation: None,
+                        chain_id: "stellar:testnet".into(),
+                        payment_required: payment_required(),
+                        address: None,
+                        home_domain: "INVALID.example".into(),
+                        business_id: None,
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    result_json(&result)["error"]["code"],
+                    "identity.home_domain_invalid"
+                );
+            }
+            assert!(
+                approved
+                    .fixture
+                    .rpc
+                    .observed
+                    .lock()
+                    .unwrap()
+                    .transmitted
+                    .is_empty()
+            );
+        }
+    }
+}
+
+#[test]
+fn x402_approval_docs_match_the_tool_contract() {
+    for schema in [
+        serde_json::to_value(schemars::schema_for!(X402CreatePaymentArgs)).unwrap(),
+        serde_json::to_value(schemars::schema_for!(X402AuthenticatedPaymentArgs)).unwrap(),
+    ] {
+        let properties = &schema["properties"];
+        assert!(
+            properties["approval_nonce"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("when the policy requires approval, on either network."),
+            "approval nonce schema covers both networks"
+        );
+        assert!(
+            properties["approval_attestation"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Required alongside `approval_nonce` when the policy requires approval."),
+            "approval attestation schema follows policy"
+        );
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for path in [
+        "docs/mcp.md",
+        "docs/protocols.md",
+        "docs/getting-started.md",
+        "docs/agents.md",
+        "docs/cli-reference/profile-and-governance.md",
+        "docs/maintainers/security-internals.md",
+        "skills/stellar-agent-wallet/references/mcp-tools.md",
+        "skills/stellar-agent-wallet/references/protocols.md",
+        "skills/stellar-agent-wallet/references/troubleshooting.md",
+        "skills/stellar-agent-wallet/references/approvals-and-audit.md",
+        "skills/stellar-agent-wallet/references/cli-reference.md",
+    ] {
+        let doc = std::fs::read_to_string(root.join(path)).unwrap();
+        let text = doc.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            text.contains("Supply `approval_nonce` with `approval_attestation` when the policy requires approval, on either network."),
+            "{path}: approval arguments follow policy on either network"
+        );
+        assert!(
+            text.contains("approval_nonce") && text.contains("approval_attestation"),
+            "{path}"
+        );
+        assert!(
+            text.contains("Allow without") && text.contains("one call"),
+            "{path}"
+        );
+        assert!(
+            !text.contains("payment tools also require approval under an Allow rule"),
+            "{path}"
+        );
+        assert!(
+            !text.contains("Testnet approval escalation returns"),
+            "{path}"
+        );
+        assert!(
+            !text.contains("x402 payments use two calls with mandatory approval"),
+            "{path}"
+        );
+    }
+}
+
+async fn approved_protocol_change(tool: Tool) {
+    let mut terms: serde_json::Value = serde_json::from_str(&payment_required()).unwrap();
+    terms["payTo"] = stellar_strkey::MuxedContract {
+        contract_id: [0x55; 32],
+        id: 42,
+    }
+    .to_string()
+    .to_string()
+    .into();
+    let approved = approval_fixture_with_terms(tool, terms.to_string(), |rpc| {
+        rpc.network = NetworkAnswer::Protocols(vec![30, 30, 29]);
+    })
+    .await;
+    let result = proof_call(
+        &approved.fixture,
+        tool,
+        approved.pair(),
+        terms.to_string(),
+        None,
+        "merchant.example",
+    )
+    .await;
+    assert_eq!(
+        result_json(&result)["error"]["code"],
+        "x402.muxed_contract_protocol_unsupported",
+        "post-dispatch protocol refusal retains its x402 code"
+    );
+    let observed = approved.fixture.rpc.observed.lock().unwrap();
+    assert!(observed.transmitted.is_empty());
+    assert_eq!(observed.methods, ["getNetwork", "getNetwork", "getNetwork"]);
+    assert!(x402_rows(&approved.fixture.profile).1.is_empty());
+    assert!(matches!(
+        approved.entry().kind,
+        stellar_agent_core::approval::ApprovalKind::X402Payment { .. }
+    ));
+}
+
+#[tokio::test]
+#[serial]
+async fn approved_create_protocol_change_keeps_x402_error() {
+    approved_protocol_change(Tool::CreatePayment).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn approved_authenticated_protocol_change_keeps_x402_error() {
+    approved_protocol_change(Tool::AuthenticatedPayment).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn concurrent_approved_calls_release_one_payment() {
+    for tool in [Tool::CreatePayment, Tool::AuthenticatedPayment] {
+        let mut approved = approval_fixture(tool, |_| {}).await;
+        let replacement = WalletServer::new(approved.fixture.profile.clone()).unwrap();
+        let server = Arc::new(std::mem::replace(&mut approved.fixture.server, replacement));
+        approved
+            .signer_reads
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        *approved.signer_barrier.lock().unwrap() =
+            Some(Arc::new((Mutex::new(0), std::sync::Condvar::new())));
+        let pay = |server: Arc<WalletServer>| {
+            let nonce = approved.nonce.clone();
+            let attestation = approved.attestation.clone();
+            async move {
+                proof_call_server(
+                    &server,
+                    tool,
+                    (Some(&nonce), Some(&attestation)),
+                    payment_required(),
+                    None,
+                    "merchant.example",
+                )
+                .await
+            }
+        };
+        let (first, second) =
+            tokio::join!(tokio::spawn(pay(server.clone())), tokio::spawn(pay(server)));
+        let (first, second) = (first.unwrap(), second.unwrap());
+        assert_eq!(
+            [&first, &second]
+                .iter()
+                .filter(|result| result.is_error != Some(true))
+                .count(),
+            1
+        );
+        assert_eq!(
+            approved
+                .fixture
+                .rpc
+                .observed
+                .lock()
+                .unwrap()
+                .transmitted
+                .len(),
+            1
+        );
+    }
+}
+
+struct RecipientRecorder {
+    inner: stellar_agent_core::PolicyEngineV1,
+    classes: Arc<Mutex<Vec<Option<stellar_agent_core::policy::v1::criteria::counterparty_allowlist::RecipientClass>>>>,
+}
+
+impl stellar_agent_core::PolicyEngine for RecipientRecorder {
+    fn window_state_store(
+        &self,
+    ) -> Option<&stellar_agent_core::policy::v1::criteria::state_store::PolicyStateStore> {
+        self.inner.window_state_store()
+    }
+    fn evaluate(
+        &self,
+        tool: &stellar_agent_core::policy::ToolDescriptor,
+        args: &serde_json::Value,
+        profile: &Profile,
+        account: Option<&dyn stellar_agent_core::policy::v1::AccountReservesView>,
+        identity: Option<&dyn stellar_agent_core::policy::v1::AccountIdentityView>,
+        counterparty: Option<&dyn stellar_agent_core::policy::v1::CounterpartyCacheView>,
+        sep10: Option<&dyn stellar_agent_core::policy::v1::Sep10SessionView>,
+        sep45: Option<&dyn stellar_agent_core::policy::v1::Sep45SessionView>,
+        now: u64,
+    ) -> Result<stellar_agent_core::policy::Decision, stellar_agent_core::policy::PolicyError> {
+        self.inner.evaluate(
+            tool,
+            args,
+            profile,
+            account,
+            identity,
+            counterparty,
+            sep10,
+            sep45,
+            now,
+        )
+    }
+
+    fn evaluate_with_value_full(
+        &self,
+        tool: &stellar_agent_core::policy::ToolDescriptor,
+        args: &serde_json::Value,
+        profile: &Profile,
+        value: stellar_agent_core::policy::v1::ValueClass,
+        account: Option<&dyn stellar_agent_core::policy::v1::AccountReservesView>,
+        identity: Option<&dyn stellar_agent_core::policy::v1::AccountIdentityView>,
+        counterparty: Option<&dyn stellar_agent_core::policy::v1::CounterpartyCacheView>,
+        sep10: Option<&dyn stellar_agent_core::policy::v1::Sep10SessionView>,
+        sep45: Option<&dyn stellar_agent_core::policy::v1::Sep45SessionView>,
+        now: u64,
+    ) -> Result<stellar_agent_core::policy::Evaluation, stellar_agent_core::policy::PolicyError>
+    {
+        self.inner.evaluate_with_value_full(
+            tool,
+            args,
+            profile,
+            value,
+            account,
+            identity,
+            counterparty,
+            sep10,
+            sep45,
+            now,
+        )
+    }
+
+    fn record_confirmed(
+        &self,
+        tool: &stellar_agent_core::policy::ToolDescriptor,
+        profile: &Profile,
+        value: &stellar_agent_core::policy::v1::ValueClass,
+    ) -> Result<
+        Vec<stellar_agent_core::policy::v1::criteria::state_store::WindowEntry>,
+        stellar_agent_core::policy::PolicyError,
+    > {
+        let stellar_agent_core::policy::v1::ValueClass::Value(effects) = value else {
+            panic!("payment value");
+        };
+        self.classes.lock().unwrap().push(effects.recipient_class());
+        self.inner.record_confirmed(tool, profile, value)
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn approved_x402_records_governing_value_effects() {
+    use stellar_agent_core::policy::v1::criteria::counterparty_allowlist::{
+        CounterpartyAllowlistCriterion, CounterpartyKind, RecipientClass,
+    };
+    use stellar_agent_core::policy::{ApprovalRequest, Decision};
+    use stellar_agent_core::{PolicyDocument, PolicyEngineV1, PolicyRule, RuleMatch, ScopeId};
+    for tool in [Tool::CreatePayment, Tool::AuthenticatedPayment] {
+        let mut approved = approval_fixture(tool, |rpc| rpc.first = FirstSimulate::Error).await;
+        let classes = Arc::new(Mutex::new(Vec::new()));
+        let name =
+            stellar_agent_core::profile::name::profile_name_for_approval(&approved.fixture.profile);
+        let inner = PolicyEngineV1::new(
+            PolicyDocument {
+                version: 1,
+                scope: ScopeId::AllProfiles,
+                signature: None,
+                rules: vec![PolicyRule {
+                    r#match: RuleMatch {
+                        tool: "*".into(),
+                        chain: "*".into(),
+                    },
+                    criteria: vec![Box::new(CounterpartyAllowlistCriterion::new(
+                        vec![CounterpartyKind::GAccount],
+                        vec![PAY_TO.into()],
+                    )), Box::new(stellar_agent_core::policy::v1::criteria::per_period_cap::PerPeriodCapCriterion::new(
+                        ASSET.into(), stellar_agent_core::policy::v1::criteria::per_period_cap::Window::parse("1d").unwrap(), 100_000_000,
+                    ))],
+                    decision: Decision::RequireApproval(ApprovalRequest::new("reason".into(), 120)),
+                    allow_opaque_signing: false,
+                }],
+            },
+            name.clone(),
+        );
+        approved
+            .fixture
+            .server
+            .set_policy_engine_for_test(Arc::new(RecipientRecorder {
+                inner,
+                classes: classes.clone(),
+            }));
+        let queued = call(&approved.fixture, tool).await;
+        assert_ne!(queued.is_error, Some(true));
+        assert!(
+            classes.lock().unwrap().is_empty(),
+            "queueing records no spend"
+        );
+        let result = approved.pay(tool).await;
+        assert_eq!(result.is_error, Some(true), "{}", result_json(&result));
+        assert_eq!(*classes.lock().unwrap(), vec![Some(RecipientClass::Listed)]);
+        assert_eq!(
+            window_state(&approved.fixture.profile, &name),
+            (10_000_000, 1)
+        );
+        assert!(matches!(
+            approved.entry().kind,
+            stellar_agent_core::approval::ApprovalKind::X402Payment { .. }
+        ));
+        approved.fixture.mock.reset().await;
+        let mut rpc = approved.fixture.rpc.clone();
+        rpc.first = FirstSimulate::Ok;
+        Mock::given(method("POST"))
+            .respond_with(rpc)
+            .mount(&approved.fixture.mock)
+            .await;
+        let result = approved.pay(tool).await;
+        assert_ne!(result.is_error, Some(true), "{}", result_json(&result));
+        assert_eq!(
+            *classes.lock().unwrap(),
+            vec![Some(RecipientClass::Listed); 2]
+        );
+        assert_eq!(
+            window_state(&approved.fixture.profile, &name),
+            (20_000_000, 2)
+        );
+    }
 }
 
 /// A signer-load failure a case puts at the payer's signer coordinate.

@@ -900,10 +900,9 @@ Arguments:
 Both payment tools accept G, C, M and W payees and retain mux ids throughout
 the payment. W requires protocol 30 or later and a facilitator that accepts it.
 The W endpoint check runs before policy, business records, approvals and SEP-10.
-Both tools preserve `x402.muxed_contract_protocol_unsupported` on refusal.
+Without a complete testnet proof, both tools preserve `x402.muxed_contract_protocol_unsupported` on refusal.
 The authenticated tool compares M anchoring by its base G; C and W remain
-`unknown`. Mainnet approval covers the full address and id. Testnet approval
-escalation returns `policy.approval_required_unsupported` for every form.
+`unknown`. Mainnet approval covers the full address and id. Testnet RequireApproval queues an intent for owner approval.
 
 | Tool | Purpose | Gating |
 | --- | --- | --- |
@@ -1214,3 +1213,44 @@ An open intent without an authenticated purpose permanently blocks reset for thi
 Retained intents close only through the profile's stored secondary endpoint. Add one to the profile.
 
 The profile's stored endpoint configuration is unreadable. Retained intents close only through stored endpoints that load.
+
+### x402 owner approval
+
+Supply `approval_nonce` with `approval_attestation` when the policy requires approval, on either network.
+On testnet, a clock reading before approval creation refuses the approval without consuming it.
+
+When the policy requires approval, the tool queues the payment and returns
+`data.approval` with the approval nonce. Nothing is signed.
+The owner approves with `stellar-agent approve`. The repeated call with
+`approval_nonce` and `approval_attestation` pays.
+Queueing reads no key and runs no SEP-10 exchange.
+
+The approval binds the network, asset, payer, payee including its mux id, and amount.
+The authenticated tool also binds the home domain.
+A call with changed terms or an expired approval answers `policy.approval_required`
+and signs nothing. Final verification follows attestation and payer-key reads,
+immediately before the signing primitive, with no intervening I/O or await.
+
+An approval releases at most one signed authorization.
+A failed or interrupted call can spend it without returning a payment payload.
+A repeated proof with a live spent tombstone answers `policy.approval_consumed`.
+An expired or pruned tombstone can answer `policy.approval_required`.
+The authorization expires within 60 ledgers of the paying call's simulation ledger.
+The protocol estimates five seconds per ledger.
+
+On mainnet, Allow without approval arguments pays in one call under policy authority.
+A supplied proof must verify, even under Allow.
+On testnet, Allow pays without owner approval and ignores supplied approval arguments for valid terms.
+Owner approval is required only when the policy requires it.
+
+Before testnet dispatch, a complete approval pair answers `policy.approval_required` for invalid network,
+asset, amount, or payee terms, including a W payee on an unsupported protocol.
+A later protocol refusal keeps `x402.muxed_contract_protocol_unsupported`.
+Without approval arguments, an address mismatch under RequireApproval answers
+`policy.approval_required_unsupported`. Nothing is queued or signed.
+
+The CLI labels spent x402 approvals with `payment digest`.
+On mainnet, this hashes the final envelope's base64 text.
+On testnet, this hashes the XDR vector of signed authorization entries.
+Testnet spends approval inside the transmit gate before its authorized audit row and signed RPC request.
+Mainnet retains its consumption after payload release authorization.

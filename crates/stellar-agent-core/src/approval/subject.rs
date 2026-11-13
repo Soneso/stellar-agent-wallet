@@ -137,7 +137,7 @@ pub(crate) fn x402_kind_subject(intent_digest: &[u8; 32], home_domain: Option<&s
 ///
 /// `approval.attestation_invalid` when the invocation does not decode or its
 /// digest differs from `intent_digest`.
-pub(crate) fn verified_x402_subject(
+pub fn verified_x402_subject(
     intent_digest: &[u8; 32],
     root_invocation_xdr: &str,
     home_domain: Option<&str>,

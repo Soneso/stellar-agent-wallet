@@ -1381,6 +1381,31 @@ impl KeyringSignHandle {
         self.sign_bytes(payload.as_bytes()).await
     }
 
+    /// Checks consent after loading the payer key, immediately before signing.
+    ///
+    /// The returned guard stays alive through the signing primitive.
+    ///
+    /// # Errors
+    ///
+    /// Returns payload binding, keyring, key mismatch, or caller check errors.
+    pub async fn sign_soroban_address_auth_payload_checked<G: Send>(
+        &self,
+        payload: &SorobanAuthPayload,
+        check: impl FnOnce() -> Result<G, WalletError> + Send,
+    ) -> Result<[u8; 64], WalletError> {
+        payload.check_mainnet_binding(self).await?;
+        let entry = open_entry(&self.entry_ref)?;
+        let secret = Zeroizing::new(entry.get_password().map_err(|error| {
+            map_keyring_operation_error(&error, KeyringOperation::Read, &self.entry_ref.service)
+        })?);
+        sign_payload_verifying_pubkey_checked(
+            secret,
+            payload.as_bytes(),
+            &self.cached_pubkey_bytes,
+            check,
+        )
+    }
+
     /// Signs a SEP-53 message digest using the keyring-stored seed.
     ///
     /// The same zeroise sequence, host-swap public-key verification, and
@@ -1999,10 +2024,9 @@ fn wallet_error_kind(err: &WalletError) -> &'static str {
 
 /// Inner helper: parse, verify public key against cached bytes, then sign.
 ///
-/// Owns steps 2-6 of the zeroisation sequence from the module-level doc,
+/// Owns steps 2-6 of the zeroization sequence from the module-level doc,
 /// with an added host-swap check before constructing the per-call signer.
-/// Called from `KeyringSignHandle::sign_bytes` ONLY; that caller owns step 1
-/// (loading the secret into `Zeroizing<String>`).
+/// Called from `KeyringSignHandle::sign_bytes`, which loads the secret into `Zeroizing<String>`.
 ///
 /// All `Zeroizing<T>` wrappers fire their `Drop` on every exit path including
 /// panic.
@@ -2011,7 +2035,18 @@ async fn sign_payload_verifying_pubkey(
     payload: &[u8; 32],
     expected_pubkey_bytes: &[u8; 32],
 ) -> Result<[u8; 64], WalletError> {
-    // Step 2: parse the S-strkey.
+    sign_payload_verifying_pubkey_checked(s_strkey, payload, expected_pubkey_bytes, || Ok(()))
+}
+
+/// Verifies the key, runs the caller check, and signs while retaining its guard.
+/// Called from `sign_bytes` with an accepting check and from `sign_soroban_address_auth_payload_checked`.
+fn sign_payload_verifying_pubkey_checked<G>(
+    s_strkey: Zeroizing<String>,
+    payload: &[u8; 32],
+    expected_pubkey_bytes: &[u8; 32],
+    check: impl FnOnce() -> Result<G, WalletError>,
+) -> Result<[u8; 64], WalletError> {
+    // The seed and derived public key verify before the caller's final check.
     let mut private_key =
         stellar_strkey::ed25519::PrivateKey::from_string(&s_strkey).map_err(|_| {
             WalletError::Auth(AuthError::KeyringNotFound {
@@ -2070,6 +2105,7 @@ async fn sign_payload_verifying_pubkey(
     let signer = SoftwareSigningKey::new_from_zeroizing(seed_bytes);
 
     // Step 7: sign; `signer` drops at end of scope.
+    let _guard = check()?;
     let sig = signer.sign_raw(payload);
     // `signer` drops here; SecretBox::drop zeroes the heap allocation.
     Ok(sig)

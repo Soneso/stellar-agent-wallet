@@ -1192,13 +1192,9 @@ pub(crate) fn rule_proposal_consumed_error() -> rmcp::model::CallToolResult {
 /// Returns the fail-closed wire error for a `RequireApproval` verdict on a
 /// single-shot sign tool.
 ///
-/// Single-shot sign tools (SEP-43 `signMessage`, `signTransaction`,
-/// `signAuthEntry`, `signAndSubmitTransaction`; SEP-53 `sign_message`; x402
-/// `create_payment`, `authenticated_payment`) have no simulate→commit split, so
-/// the full two-phase approval flow cannot be honoured.  When the policy engine
-/// returns `Decision::RequireApproval` for one of these tools, the call is
-/// rejected fail-closed with this error rather than silently downgrading the
-/// policy verdict to `Allow` and signing.
+/// SEP-43 signing verbs, SEP-53 `sign_message`, and the DeFi tools refuse approval requirements.
+/// The x402 payment tools use this error for an address mismatch without proof
+/// under RequireApproval. They queue or verify approval for valid payer arguments.
 ///
 /// # Security
 ///
@@ -2508,7 +2504,6 @@ pub(crate) enum GatedApprovalKind {
     /// Trustline changes.
     Trustline,
     /// Plain x402 payment intent.
-    #[cfg(feature = "mainnet-write")]
     X402,
 }
 
@@ -2522,7 +2517,6 @@ impl GatedApprovalKind {
             Self::Payment => ApprovedKind::Payment,
             Self::Claim => ApprovedKind::Claim,
             Self::Trustline => ApprovedKind::Trustline,
-            #[cfg(feature = "mainnet-write")]
             Self::X402 => ApprovedKind::X402Payment,
         };
         ApprovalExpectation { kind, subject }
@@ -2813,7 +2807,7 @@ pub(crate) async fn verify_attestation_subject_gate(
         }
     };
 
-    // 5. Confirm not expired.
+    // 5. Confirm the approval's clock interval.
     let now_ms_attest = server.clock.now_unix_ms().map_err(|e| {
         tracing::debug!(error = %e, tool = tool_name, "clock error for expiry check");
         approval_required_indistinguishable(&profile_name)
@@ -2822,7 +2816,10 @@ pub(crate) async fn verify_attestation_subject_gate(
     let rule_expires_at_unix_ms = entry
         .created_at_unix_ms
         .saturating_add(dispatch_outcome.governing_ttl_ms());
-    if entry.is_expired(now_ms_attest) || rule_expires_at_unix_ms <= now_ms_attest {
+    if (!server.context.chain_id.is_mainnet() && now_ms_attest < entry.created_at_unix_ms)
+        || entry.is_expired(now_ms_attest)
+        || rule_expires_at_unix_ms <= now_ms_attest
+    {
         tracing::debug!(
             nonce = %approval_nonce_str,
             tool = tool_name,
@@ -2912,7 +2909,7 @@ pub(crate) async fn verify_attestation_subject_gate(
         });
     }
 
-    // 6. The tool accepts only its own envelope approval kind.
+    // The tool accepts only its own approval kind and subject.
     let stored_sha256_hex = match &entry.kind {
         stellar_agent_core::approval::ApprovalKind::PaymentSimulated {
             envelope_sha256_hex,
@@ -2931,6 +2928,29 @@ pub(crate) async fn verify_attestation_subject_gate(
             ..
         } if expected.kind == stellar_agent_core::approval::witness::ApprovedKind::Trustline => {
             envelope_sha256_hex.clone()
+        }
+        stellar_agent_core::approval::ApprovalKind::X402Payment {
+            intent_digest,
+            root_invocation_xdr,
+            home_domain,
+            ..
+        } if expected.kind == stellar_agent_core::approval::witness::ApprovedKind::X402Payment => {
+            match stellar_agent_core::approval::subject::verified_x402_subject(
+                intent_digest,
+                root_invocation_xdr,
+                home_domain.as_deref(),
+                server.context.network_passphrase(),
+            ) {
+                Ok(subject) => hash_to_lower_hex(&Hash(subject)),
+                Err(error) => {
+                    tracing::debug!(
+                        code = error.code(),
+                        tool = tool_name,
+                        "stored x402 approval refused"
+                    );
+                    return Err(approval_required_indistinguishable(&profile_name));
+                }
+            }
         }
         other => {
             tracing::debug!(
@@ -3371,9 +3391,62 @@ pub(crate) mod tests {
         clippy::unwrap_used,
         clippy::expect_used,
         clippy::panic,
-        reason = "test-only; panics acceptable in unit tests"
+        reason = "test assertions"
     )]
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn expired_x402_proof_keeps_the_entry() {
+        crate::tools::x402_create_payment::approval_tests::subject_gate_case(true).await;
+    }
 
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn x402_approval_subjects_do_not_cross_tools_or_networks() {
+        crate::tools::x402_create_payment::approval_tests::subject_gate_case(false).await;
+    }
+
+    #[test]
+    fn public_x402_subject_preserves_the_stored_root() {
+        use sha2::{Digest, Sha256};
+        use stellar_agent_core::approval::subject::{
+            approval_subject_x402, approval_subject_x402_authenticated, soroban_intent_digest,
+            verified_x402_subject,
+        };
+        use stellar_xdr::{Limits, WriteXdr};
+        let passphrase = "Test SDF Network ; September 2015";
+        let terms = serde_json::from_value(serde_json::json!({
+            "scheme":"exact", "network":"stellar:testnet", "asset":"CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
+            "amount":"10000000", "payTo":"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+            "maxTimeoutSeconds":300, "extra":{"areFeesSponsored":true}
+        })).unwrap();
+        let root = stellar_agent_x402::exact::payment_root(
+            &terms,
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        )
+        .unwrap();
+        let digest =
+            soroban_intent_digest(&Sha256::digest(passphrase.as_bytes()).into(), &root).unwrap();
+        let xdr = root.to_xdr_base64(Limits::none()).unwrap();
+        assert_eq!(
+            verified_x402_subject(&digest, &xdr, None, passphrase).unwrap(),
+            approval_subject_x402(&digest)
+        );
+        assert_eq!(
+            verified_x402_subject(&digest, &xdr, Some("merchant.example"), passphrase).unwrap(),
+            approval_subject_x402_authenticated(&digest, "merchant.example")
+        );
+        assert!(verified_x402_subject(&[0; 32], &xdr, None, passphrase).is_err());
+        assert!(verified_x402_subject(&digest, "invalid", None, passphrase).is_err());
+        assert!(
+            verified_x402_subject(
+                &digest,
+                &xdr,
+                None,
+                "Public Global Stellar Network ; September 2015"
+            )
+            .is_err()
+        );
+    }
     use super::*;
     use std::sync::{
         Arc,
@@ -5590,7 +5663,6 @@ pub(crate) mod tests {
         let holder = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned();
         let uid = process_uid_for_attestation().unwrap();
         match kind {
-            #[cfg(feature = "mainnet-write")]
             GatedApprovalKind::X402 => panic!("classic fixture requires a classic kind"),
             GatedApprovalKind::Payment => PendingApproval::new_payment_pending(
                 "AAAA".to_owned(),

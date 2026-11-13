@@ -121,8 +121,10 @@ The scope table defines mainnet admission for each build configuration. Public S
   - Targets x402 v2, not v3.x.
   - Both tools preserve the full G, C, M or W payee, including mux ids. W requires protocol 30 or later and a facilitator that accepts W. The released `@x402/stellar` 2.30.0 facilitator accepts G, C and M only.
   - W eligibility runs before policy admission, operation records, approvals and SEP-10. Endpoint identity and the mainnet supported-protocol range apply first; a supported endpoint below 30 returns `x402.muxed_contract_protocol_unsupported`.
+    Before dispatch, a complete testnet approval pair maps this refusal to `policy.approval_required`.
+    A later protocol refusal keeps `x402.muxed_contract_protocol_unsupported`.
   - Simulation decides whether the C asset accepts W. A transfer error identifies the W payee form and simulation phase under `x402.rpc_simulate_failed`.
-  - Mainnet M and eligible W follow the rule's Allow or two-call RequireApproval flow. Testnet approval escalation returns `policy.approval_required_unsupported` for every payee form. An unlisted `budget` can admit payments within its shared cap.
+  - Mainnet M and eligible W follow the rule's Allow or two-call RequireApproval flow. Testnet RequireApproval queues an intent for owner approval. An unlisted `budget` can admit payments within its shared cap.
   - Authenticated anchoring compares M by its base G. A matching account is `anchored`, an absent account in a non-empty list is `not_anchored`, and an empty list is `unknown`. C and W remain `unknown`.
   - Before signing, the first simulation must return exactly one authorization entry. It carries legacy `Address` credentials for the payer, a zero expiration ledger, and no signature.
   - That entry's root invocation must equal the SAC `transfer` the wallet built, contract and every argument included, with no nested calls. Any other answer refuses before signing.
@@ -245,3 +247,14 @@ integration review of the rebuilt protocol.
 - [DeFi and pool commands](cli-reference/defi-and-pool.md): `trade`, `vault`, and channel-account pool commands.
 - [MCP server](mcp.md): the `stellar-agent-mcp` stdio server and its tool catalog.
 - [Toolsets](toolsets.md): how toolset-routed capabilities reach signing-adjacent tools under the first-invoke gate and per-action approval.
+
+### x402 owner approval
+
+Supply `approval_nonce` with `approval_attestation` when the policy requires approval, on either network.
+On testnet, a clock reading before approval creation refuses the approval without consuming it.
+
+When the policy requires approval, the x402 tools queue the payment and return
+`data.approval`. The owner approves with `stellar-agent approve`.
+Repeat with `approval_nonce` and `approval_attestation` to pay once.
+Queueing signs nothing, reads no key, and runs no SEP-10.
+On mainnet, Allow without proof pays in one call; a supplied proof must verify.

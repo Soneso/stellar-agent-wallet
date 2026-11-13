@@ -990,6 +990,49 @@ that `stellar_sep24_interactive_url` consumes; it has no standalone tool. See
 
 ### x402
 
+Supply `approval_nonce` with `approval_attestation` when the policy requires approval, on either network.
+On testnet, a clock reading before approval creation refuses the approval without consuming it.
+
+When the policy requires approval, the tool queues the payment and returns
+`data.approval` with the approval nonce. Nothing is signed.
+The owner approves with `stellar-agent approve`. The repeated call with
+`approval_nonce` and `approval_attestation` pays.
+Queueing reads no key and runs no SEP-10 exchange.
+
+The approval binds the network, asset, payer, payee including its mux id, and amount.
+The authenticated tool also binds the home domain.
+A call with changed terms or an expired approval answers `policy.approval_required`
+and signs nothing. Final verification follows attestation and payer-key reads,
+immediately before the signing primitive, with no intervening I/O or await.
+
+An approval releases at most one signed authorization.
+A failed or interrupted call can spend it without returning a payment payload.
+A repeated proof with a live spent tombstone answers `policy.approval_consumed`.
+An expired or pruned tombstone can answer `policy.approval_required`.
+The authorization expires within 60 ledgers of the paying call's simulation ledger.
+The protocol estimates five seconds per ledger.
+
+On mainnet, Allow without approval arguments pays in one call under policy authority.
+A supplied proof must verify, even under Allow.
+On testnet, Allow pays without owner approval and ignores supplied approval arguments for valid terms.
+Owner approval is required only when the policy requires it.
+
+Before testnet dispatch, a complete approval pair answers `policy.approval_required` for invalid network,
+asset, amount, or payee terms, including a W payee on an unsupported protocol.
+A later protocol refusal keeps `x402.muxed_contract_protocol_unsupported`.
+Without approval arguments, an address mismatch under RequireApproval answers
+`policy.approval_required_unsupported`. Nothing is queued or signed.
+
+Rejected consent respects the owner's refusal. Expiry bounds consent lifetime.
+Store, clock, and audit failures withhold authority.
+A crash after spending keeps the approval spent, even before transmission.
+The store, audit log, and RPC share no atomic transaction.
+A spent approval does not prove the RPC receives a signature.
+The counterparty can stop honoring requirements while the owner waits.
+Account-reserve and account-identity criteria lack account-view inputs and fail closed.
+SEP-43, SEP-53, and DeFi approval refusals keep their existing behavior.
+
+
 | Tool | Purpose | Gating |
 | --- | --- | --- |
 | `stellar_x402_create_payment` | Construct and sign an x402 v2 Exact Stellar `PAYMENT-SIGNATURE` from a `PaymentRequirements` object; obtain the cross-check witness before signing; return the payment signature, its fields, and `cross_check`. The wallet does not submit. On an admitted mainnet server, an Allow rule releases the authorized payment payload in one call. Under RequireApproval, call 1 returns approval instructions, and call 2 verifies approval and releases the payload. | Signs the payment authorization entry; does not submit. |
@@ -1088,7 +1131,7 @@ carries the signed entries. A returned payload ends the attempt as
 the failure's code. A failure after it, or a withheld payload, ends it as
 `sent_outcome_unknown`.
 `approval_nonce` is optional in the schema. Omit it with `approval_attestation`
-for mainnet call 1. Under RequireApproval, supply both for call 2, which
+for the queueing call. Under RequireApproval, supply both for call 2, which
 requires the CLI-issued attestation alongside its approval nonce. Supplying
 only one approval argument returns `policy.approval_required`.
 

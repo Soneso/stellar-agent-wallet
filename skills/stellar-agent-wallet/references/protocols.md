@@ -23,7 +23,7 @@ or transaction-write authority.
 - `chain_id` is the CAIP-2 chain id (`"stellar:testnet"` or `"stellar:mainnet"`) and is **required** by most tools. SEP-43 `get_address`/`get_network` accept it as optional and fall back to the active profile's chain; the WalletConnect host passes `{}`. (Note: x402 uses the distinct wire-network string `stellar:pubnet` for mainnet in its `network` field; that is not a `chain_id` value.)
 - Asset format: `"native"`/`"XLM"`, or `"CODE:GISSUER"`. Amounts are strings, never JSON numbers, encoded per protocol. Classic payment amounts carry a unit, e.g. `"10 XLM"`. An x402 requirement `amount` is an atomic-unit integer string. The SEP-24 `deposit_hint` is a unitless decimal string such as `"100.50"`.
 - A `chain_id` that does not match the active profile is rejected by the dispatch gate as a JSON-RPC-level error before any signing. The x402 payment tools decode and validate `payment_required` first, so an `x402.*` requirement error comes before a chain mismatch.
-- The generic signing tools (the SEP-43 sign verbs and SEP-53 `sign_message`) are single-shot. If the policy engine returns `RequireApproval`, the tool is fail-closed with wire code `policy.approval_required_unsupported` (message mentions "single-shot") and **no signature is produced**. Two-phase approval is not supported on these single-shot signing tools. On testnet, the x402 payment tools answer `RequireApproval` the same way. In a feature-enabled build, mainnet x402 payments use two calls with mandatory approval.
+- The generic signing tools (the SEP-43 sign verbs and SEP-53 `sign_message`) are single-shot. If the policy engine returns `RequireApproval`, the tool is fail-closed with wire code `policy.approval_required_unsupported` (message mentions "single-shot") and **no signature is produced**. Two-phase approval is not supported on these single-shot signing tools. The x402 payment tools queue RequireApproval on both networks. Mainnet Allow without proof pays in one call.
 
 ## SEP support matrix
 
@@ -207,8 +207,8 @@ Payer-side construction and signing of a `PAYMENT-SIGNATURE` payload for the x40
 | `payment_required` | string | yes | base64 `PAYMENT-REQUIRED` or raw JSON `PaymentRequirements` |
 | `chain_id` | string | yes | CAIP-2 `stellar:testnet` or `stellar:mainnet`; validated against the profile after the requirements |
 | `address` | string | no | signer G-strkey; must match the active signer if given |
-| `approval_nonce` | string | no | optional in the schema; omit it with `approval_attestation` for mainnet call 1; under RequireApproval, supply both for call 2 |
-| `approval_attestation` | string | no | optional in the schema; under RequireApproval, mainnet call 2 requires the CLI-issued attestation alongside its approval nonce |
+| `approval_nonce` | string | no | optional in the schema; omit it with `approval_attestation` for the queueing call; under RequireApproval, supply both for call 2 |
+| `approval_attestation` | string | no | optional in the schema; under RequireApproval, the repeated call requires the CLI-issued attestation alongside its approval nonce |
 
 Testnet flow: validate the requirements and check W eligibility, then admit the payment through the policy and the spending window. Before the signer load, the cross-check rule decides whether the payment needs the witness. It uses the amount in the asset's atomic units and the profile's thresholds and oracle. A required witness builds the oracle client without a request. Check the endpoint identity with `getNetwork`, the first request on the payment's primary client. Build the SAC transfer, simulate, and check restoration, fees, exactly one result, and the simulated authorization. When the witness is required, the oracle simulates the same unsigned transfer and the answers are compared. Read `getHealth` and check the ledger bounds. Sign the auth entry and write the `x402_payment_authorized` audit row, which records the signature expiration ledger. Re-simulate, check restoration, fees, the re-simulated authorization, and the ledger bounds, then serialize. The re-simulation sends the signed authorization to the profile's RPC, so the row is written first; if it cannot be written, the tool answers the `audit.*` code and the signature never leaves the wallet. A failure after the row adds an `x402_authorization_withheld` row with the same request id. Returns `{ paymentSignature, payer, asset, amount, payTo, network, cross_check }`. The `paymentSignature` is the standard-base64 `PAYMENT-SIGNATURE` header value, and `asset` is the SAC C-strkey. The `amount` is the atomic-unit string from `PaymentRequirements`, and `cross_check` is the witness outcome. The `x402_payment_authorized` row carries a passed witness when the payment required one. Errors carry per-variant codes `x402.<reason>` (for example `x402.invalid_payment_required`, `x402.unsupported_scheme`, `x402.rpc_simulate_failed`, `x402.unexpected_auth_entries`, `x402.transmit_gate_refused`) in the standard `{ok:false, error:{code, message}, request_id}` envelope with `is_error` set. A witness refusal keeps its own code: `simulation.divergence`, `network.witness_unavailable`, `network.rpc_credential_refused`, or the oracle credential read's keyring code (`auth.keyring_*`). Header fields named in an error are escaped and cut at 200 characters. A header that does not decode reports the JSON error class and position, not its values.
 
@@ -258,7 +258,7 @@ The W check runs before records, approvals, spending admission and SEP-10.
 Endpoint identity and the mainnet range gate precede it. Simulation decides
 whether the asset accepts a muxed contract payee.
 Mainnet M and eligible W follow Allow or the two-call RequireApproval flow.
-Testnet approval escalation refuses for every address form; an unlisted
+Testnet RequireApproval queues every supported address form; an unlisted
 `budget` admits only within its caps. M anchoring compares its base G with
 SEP-1 `ACCOUNTS`; C, W and empty account lists give `unknown`.
 
@@ -293,3 +293,44 @@ Unsupported: mainnet, unsponsored, push, smart-account payer, automatic
 transport/retry, channels, and toolset routing. The wallet never sends the paid
 request or submits the server-sponsored transaction. The configured RPC sees
 the signed authorization during mandatory re-simulation.
+
+### x402 owner approval
+
+Supply `approval_nonce` with `approval_attestation` when the policy requires approval, on either network.
+On testnet, a clock reading before approval creation refuses the approval without consuming it.
+
+When the policy requires approval, the tool queues the payment and returns
+`data.approval` with the approval nonce. Nothing is signed.
+The owner approves with `stellar-agent approve`. The repeated call with
+`approval_nonce` and `approval_attestation` pays.
+Queueing reads no key and runs no SEP-10 exchange.
+
+The approval binds the network, asset, payer, payee including its mux id, and amount.
+The authenticated tool also binds the home domain.
+A call with changed terms or an expired approval answers `policy.approval_required`
+and signs nothing. Final verification follows attestation and payer-key reads,
+immediately before the signing primitive, with no intervening I/O or await.
+
+An approval releases at most one signed authorization.
+A failed or interrupted call can spend it without returning a payment payload.
+A repeated proof with a live spent tombstone answers `policy.approval_consumed`.
+An expired or pruned tombstone can answer `policy.approval_required`.
+The authorization expires within 60 ledgers of the paying call's simulation ledger.
+The protocol estimates five seconds per ledger.
+
+On mainnet, Allow without approval arguments pays in one call under policy authority.
+A supplied proof must verify, even under Allow.
+On testnet, Allow pays without owner approval and ignores supplied approval arguments for valid terms.
+Owner approval is required only when the policy requires it.
+
+Before testnet dispatch, a complete approval pair answers `policy.approval_required` for invalid network,
+asset, amount, or payee terms, including a W payee on an unsupported protocol.
+A later protocol refusal keeps `x402.muxed_contract_protocol_unsupported`.
+Without approval arguments, an address mismatch under RequireApproval answers
+`policy.approval_required_unsupported`. Nothing is queued or signed.
+
+The CLI labels spent x402 approvals with `payment digest`.
+On mainnet, this hashes the final envelope's base64 text.
+On testnet, this hashes the XDR vector of signed authorization entries.
+Testnet spends approval inside the transmit gate before its authorized audit row and signed RPC request.
+Mainnet retains its consumption after payload release authorization.

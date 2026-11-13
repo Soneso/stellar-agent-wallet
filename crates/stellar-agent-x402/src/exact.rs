@@ -576,6 +576,7 @@ pub async fn create_payment_authorized(
         passphrase,
         identity_deadline,
         before_transmit,
+        None,
         Some((&mut proofs, consumer, value)),
         Some(hooks),
     )
@@ -716,6 +717,7 @@ impl Drop for OpenAuthorization<'_> {
 ///    `identity_deadline`. The status is `healthy`, `L` is above zero, `L` is
 ///    at most one ledger ahead of the health ledger `H`, and `H` lies before
 ///    the expiration ledger.
+///    [`create_payment_with_pre_sign`] then runs its optional payer check.
 /// 6. Set `signature_expiration_ledger` on the payer's credentials and sign
 ///    the built `transfer` invocation via
 ///    `stellar_agent_sep43::sign_soroban_auth_entry` (the single auth-signing
@@ -818,6 +820,42 @@ pub async fn create_payment(
     identity_deadline: Instant,
     before_transmit: impl FnOnce(&AuthorizationToTransmit<'_>) -> Result<(), X402Error>,
 ) -> Result<CreatedPayment, X402Error> {
+    create_payment_with_pre_sign(
+        requirements,
+        signer,
+        client,
+        cross_check,
+        profile_passphrase,
+        identity_deadline,
+        None,
+        before_transmit,
+    )
+    .await
+}
+
+/// Runs a caller check before signing a payment without mainnet authority.
+/// An error returns at once, unchanged, and nothing is signed.
+pub type BeforePayerSign<'h> = Box<dyn FnOnce() -> Result<(), X402Error> + Send + 'h>;
+
+/// Constructs a payment and runs the caller check after preparation, before signing.
+///
+/// # Errors
+///
+/// Returns every error of [`create_payment`] or the caller check.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the callback accompanies the payment inputs"
+)]
+pub async fn create_payment_with_pre_sign(
+    requirements: &PaymentRequirements,
+    signer: &(dyn Signer + Send + Sync),
+    client: &StellarRpcClient,
+    cross_check: &SorobanCrossCheck,
+    profile_passphrase: &str,
+    identity_deadline: Instant,
+    before_payer_sign: Option<BeforePayerSign<'_>>,
+    before_transmit: impl FnOnce(&AuthorizationToTransmit<'_>) -> Result<(), X402Error>,
+) -> Result<CreatedPayment, X402Error> {
     validate_requirements(requirements, profile_passphrase, client.url())?;
     create_payment_inner(
         requirements,
@@ -827,6 +865,7 @@ pub async fn create_payment(
         profile_passphrase,
         identity_deadline,
         before_transmit,
+        before_payer_sign,
         #[cfg(feature = "mainnet-write")]
         None,
         #[cfg(feature = "mainnet-write")]
@@ -861,6 +900,7 @@ async fn create_payment_inner(
     profile_passphrase: &str,
     identity_deadline: Instant,
     before_transmit: impl FnOnce(&AuthorizationToTransmit<'_>) -> Result<(), X402Error>,
+    before_payer_sign: Option<BeforePayerSign<'_>>,
     #[cfg(feature = "mainnet-write")] mut mainnet: Option<(
         &mut X402MainnetProofs<'_>,
         stellar_agent_network::mainnet::MainnetConsumer,
@@ -1190,6 +1230,9 @@ async fn create_payment_inner(
                 .await
         }
     };
+    if let Some(check) = before_payer_sign {
+        check()?;
+    }
     #[cfg(feature = "mainnet-write")]
     let signature = if let Some(authorization) = authorization {
         let result = if let Some(admission) = &admission {

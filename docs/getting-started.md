@@ -867,15 +867,14 @@ set pinned and verified by the release.
 | `mainnet-write` on, classic CLI | Authorizes each supported action before signing and submission. Reports `STELLAR_AGENT_BUILD_MAINNET_WRITE=on`. | Full-mode `pay`, `claim`, sponsored `accounts create`, and `trustline`. | Build-only, sign-only, submit-only, Friendbot creation, `accounts create --generate`, relayer paths, and the excluded surfaces below. | Requires an explicit nondefault mainnet profile, matching stored configuration, enrolled identities, enablement, an owner-signed v2 policy with approval credentials, valid pin and audit state, and required witness. Allow signs without a passkey ceremony; RequireApproval runs one. Sealed authorization remains required. |
 | `mainnet-write` on, classic MCP | Authorizes each supported commit before signing and submission. | `stellar_pay_commit`, `stellar_claim_commit`, `stellar_create_account_commit`, and `stellar_trustline_commit`. | Other generic signing tools, toolset signing actions, and the excluded surfaces below. | Requires the same installation and policy checks, plus approval bound to the action. Both prepare and commit policy names need matching rules. |
 | Classic failure classification | Reports the boundary that refused the action. | No admission follows from an error code. | A policy decision alone does not authorize signing. | Structural and context refusals use `network.mainnet_write_forbidden`. CLI engine construction preserves enablement errors and wraps other failures as `policy.engine_unavailable` or `trustline.policy_engine_unavailable`. Resolver setup gaps use `network.mainnet_authorization_refused`. Policy evaluation denials retain `policy.deny.*`. CLI resolver denials under approval retain `policy.deny.*`; under policy authority, they use `network.mainnet_authorization_refused` and log the refused precondition. |
-| `mainnet-write` on, x402 | Releases an authorized payment payload through the supported flow. | `stellar_x402_create_payment`; `stellar_x402_authenticated_payment`, including its bound SEP-10 identity operation. | Generic SEP-10 signing, generic message signing, and unrelated Soroban operations. | Requires installation binding, signed policy, payment approval, required witness, authorized signing, and authorized payload release. Authenticated payments also bind the identity operation. |
+| `mainnet-write` on, x402 | Releases an authorized payment payload through the supported flow. | `stellar_x402_create_payment`; `stellar_x402_authenticated_payment`, including its bound SEP-10 identity operation. | Generic SEP-10 signing, generic message signing, and unrelated Soroban operations. | Requires installation binding, signed policy, policy or approval authority, required witness, authorized signing, and authorized payload release. Authenticated payments also bind the identity operation. |
 | `mainnet-write` on, excluded operation | Refuses the operation on mainnet. | None. | Smart-account deployment and writes; rules, signers, policies, execute, multicall, migration-submit, and timelock writes; DeFi; pool submission; MPP; public SEP-43 signing; generic SEP-45/53 signing; fee bumps; idempotent mainnet submission. | Ceremony, policy, and approval do not admit these operations. MPP uses `mpp.network_forbidden`. Wallet and library interfaces retain their documented refusal codes. |
 | Either build, read or local operation | Applies the operation's profile, policy, audit, and protocol requirements. | No transaction-write admission follows from a read or local operation. | Read-only classification does not override a protocol refusal. | Mainnet selection and key-scope checks apply. Noop allows mainnet reads and refuses destructive actions with `policy.engine_required`. |
 
 On an admitted mainnet MCP server, the four classic prepare and commit pairs
 require approval even when the matching rule allows the action. Both x402
-payment tools also require approval under an Allow rule. On mainnet, their first
-call returns pending approval without a payment payload. Repeat the call with
-both approval arguments after CLI approval. The server
+payment tools pay in one call under Allow without proof. RequireApproval queues the payment.
+A supplied proof verifies under either decision. The server
 loads the mainnet write context at startup when the selected profile has a
 verified enablement record. If enablement or policy fails startup checks, the
 server does not start.
@@ -972,3 +971,14 @@ payment settled, before paying again.
 - [MCP server](mcp.md): running `stellar-agent-mcp` as an MCP stdio server.
 - [Profiles](profiles.md): the full profile schema and the key-rotation
   ceremony.
+
+### x402 owner approval
+
+Supply `approval_nonce` with `approval_attestation` when the policy requires approval, on either network.
+On testnet, a clock reading before approval creation refuses the approval without consuming it.
+
+When the policy requires approval, the x402 tools queue the payment and return
+`data.approval`. The owner approves with `stellar-agent approve`.
+Repeat with `approval_nonce` and `approval_attestation` to pay once.
+Queueing signs nothing, reads no key, and runs no SEP-10.
+On mainnet, Allow without proof pays in one call; a supplied proof must verify.

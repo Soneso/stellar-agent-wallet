@@ -215,13 +215,10 @@ pub struct X402AuthenticatedPaymentArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
 
-    /// Wallet-issued approval nonce from the mainnet preparation call's
-    /// `approval` block.
+    /// Wallet-issued approval nonce from the queueing call's `data.approval` block.
     ///
-    /// Required only on mainnet, where the first call without approval
-    /// arguments returns a pending approval. When present, the payment call
-    /// verifies the HMAC-SHA256 attestation blob and confirms the approved
-    /// payment intent and home domain before the SEP-10 authentication.
+    /// Supply it with `approval_attestation` when the policy requires approval, on either network.
+    /// The call verifies the attestation and the approved payment intent and home domain before the SEP-10 authentication.
     #[serde(default)]
     pub approval_nonce: Option<String>,
 
@@ -232,7 +229,8 @@ pub struct X402AuthenticatedPaymentArgs {
     /// call re-computes and constant-time-compares the HMAC against the stored
     /// attestation key before the SEP-10 authentication.
     ///
-    /// Required alongside `approval_nonce` on mainnet. An absent or invalid
+    /// Required alongside `approval_nonce` when the policy requires approval.
+    /// An absent or invalid
     /// attestation returns `policy.approval_required`, the same wire code for
     /// every failure mode, so the modes stay indistinguishable.
     #[serde(default)]
@@ -426,8 +424,17 @@ impl WalletServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         use std::sync::Arc;
 
+        use crate::tools::common::{
+            DispatchOutcome, GatedApprovalKind, approval_required_indistinguishable,
+            verify_attestation_subject_gate,
+        };
+        use crate::tools::x402_create_payment::{
+            ApprovalView, X402ApprovalProof, X402ApprovalSpend, X402CheckedSigner,
+            approval_response, presented_x402_terms_refusal, x402_address_mismatch,
+            x402_approval_callback, x402_protocol_refusal,
+        };
         use stellar_agent_network::keyring::enrolled_keyring_signer;
-        use stellar_agent_x402::exact::{create_payment, validate_requirements};
+        use stellar_agent_x402::exact::{create_payment_with_pre_sign, validate_requirements};
         use stellar_agent_x402::wire::encode_payment_signature;
 
         // Mainnet: this tool returns a payment authorization the MCP host
@@ -477,6 +484,10 @@ impl WalletServer {
             Ok(r) => r,
             Err(ref err) => return Ok(x402_error_to_tool_result(err)),
         };
+        let complete_proof = args.approval_nonce.is_some() && args.approval_attestation.is_some();
+        if complete_proof && let Some(result) = presented_x402_terms_refusal(self, &requirements) {
+            return Ok(result);
+        }
         let amount = match validate_requirements(
             &requirements,
             self.context.network_passphrase(),
@@ -492,7 +503,7 @@ impl WalletServer {
         )
         .await
         {
-            return Ok(result);
+            return Ok(x402_protocol_refusal(self, result, complete_proof));
         }
         // Off mainnet a supplied id is validated here and echoed. A mainnet
         // call takes its own path and checks its id at its record lookup,
@@ -523,10 +534,8 @@ impl WalletServer {
 
         // The gate performs registry lookup, chain validation, and policy evaluation.
         // Value criteria use the supplied value_leg.
-        // Single-shot sign tool: RequireApproval is fail-closed. The two-phase
-        // approval flow is not supported on this surface. `account_view` /
-        // `identity_view` are `None`: the `minimum_reserve` / `home_domain`
-        // criteria fail closed on this tool pending account-view wiring.
+        // Approval requirements queue an intent or verify the presented proof.
+        // Account-reserve and account-identity criteria fail closed without views.
         let dispatch_outcome = match self
             .dispatch_gate_with_value(
                 "stellar_x402_authenticated_payment",
@@ -541,14 +550,120 @@ impl WalletServer {
             Ok(o) => o,
             Err(e) => return e.into_result(),
         };
-        let value_for_record = match dispatch_outcome {
-            crate::tools::common::DispatchOutcome::Allow(outcome) => outcome
-                .value_effects
-                .map_or(ValueClass::single(value_leg_for_record), ValueClass::Value),
-            crate::tools::common::DispatchOutcome::RequireApproval(_) => {
-                return Ok(crate::tools::common::single_shot_require_approval_error());
-            }
+        let audit_decision = dispatch_outcome.audit_decision();
+        let (value_for_record, approval) = match &dispatch_outcome {
+            DispatchOutcome::Allow(outcome) => (
+                outcome
+                    .value_effects
+                    .clone()
+                    .map_or(ValueClass::single(value_leg_for_record), ValueClass::Value),
+                None,
+            ),
+            DispatchOutcome::RequireApproval(outcome) => (
+                outcome
+                    .value_effects
+                    .clone()
+                    .map_or(ValueClass::single(value_leg_for_record), ValueClass::Value),
+                Some(outcome),
+            ),
         };
+        let mut approval_proof = None;
+        if let Some(approval) = approval {
+            let profile_name = self.profile_name_for_approval();
+            let payer = self.profile.mcp_signer_default.account.as_str();
+            if let Err(error) =
+                stellar_agent_network::counterparty::fetch::validate_home_domain(&args.home_domain)
+            {
+                if complete_proof {
+                    return Ok(approval_required_indistinguishable(&profile_name));
+                }
+                let detail = match error {
+                    stellar_agent_network::counterparty::CounterpartyError::HomeDomainInvalid {
+                        detail,
+                    } => detail,
+                    other => other.to_string(),
+                };
+                return Ok(identity_error_to_tool_result(
+                    &IdentityError::HomeDomainInvalid { detail },
+                ));
+            }
+            if let Some(result) = x402_address_mismatch(args.address.as_deref(), payer) {
+                return Ok(if complete_proof {
+                    approval_required_indistinguishable(&profile_name)
+                } else if args.approval_nonce.is_none() && args.approval_attestation.is_none() {
+                    crate::tools::common::single_shot_require_approval_error()
+                } else {
+                    result
+                });
+            }
+            let root = match stellar_agent_x402::exact::payment_root(&requirements, payer) {
+                Ok(root) => root,
+                Err(error) => return Ok(x402_error_to_tool_result(&error)),
+            };
+            let digest = match stellar_agent_x402::exact::intent_digest(&requirements, payer) {
+                Ok(digest) => digest,
+                Err(error) => return Ok(x402_error_to_tool_result(&error)),
+            };
+            if args.approval_nonce.is_none() && args.approval_attestation.is_none() {
+                let entry = match self.write_x402_pending_approval(
+                    &root,
+                    Some(args.home_domain.clone()),
+                    approval,
+                    || {
+                        self.clock.now_unix_ms().map_err(|error| {
+                            stellar_agent_core::WalletError::WalletState(
+                                stellar_agent_core::error::WalletStateError::clock_error(&error),
+                            )
+                        })
+                    },
+                ) {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        return Ok(crate::tools::common::business_error_result(
+                            error.code(),
+                            error.message(),
+                        ));
+                    }
+                };
+                return Ok(approval_response(&ApprovalView {
+                    entry: &entry,
+                    profile: &profile_name,
+                    chain_id: &args.chain_id,
+                    endpoint_host: None,
+                    signer: payer,
+                    requirements: &requirements,
+                    business_id: business_id.as_ref(),
+                }));
+            }
+            let subject =
+                stellar_agent_core::approval::subject::approval_subject_x402_authenticated(
+                    &digest,
+                    &args.home_domain,
+                );
+            if let Err(result) = verify_attestation_subject_gate(
+                self,
+                &dispatch_outcome,
+                GatedApprovalKind::X402.expectation(subject),
+                args.approval_nonce.as_deref(),
+                args.approval_attestation.as_deref(),
+                "stellar_x402_authenticated_payment",
+            )
+            .await
+            {
+                return Ok(result);
+            }
+            if let (Some(nonce), Some(attestation)) =
+                (&args.approval_nonce, &args.approval_attestation)
+            {
+                approval_proof = Some(X402ApprovalProof {
+                    nonce: nonce.clone(),
+                    attestation: attestation.clone(),
+                    expected_subject: subject,
+                    governing_ttl_ms: approval.governing_ttl_ms,
+                });
+            }
+        }
+        let approval_refusal = std::sync::Mutex::new(None);
 
         // ── Audit pre-flight (fail-closed) ────────────────────────────────────
         // Runs AFTER the dispatch gate: a policy denial or approval escalation
@@ -615,15 +730,8 @@ impl WalletServer {
         // `requirements` was decoded above (before the gate), alongside
         // `value_leg` — not re-decoded here.
         let account = self.profile.mcp_signer_default.account.as_str();
-        if let Some(ref requested_addr) = args.address
-            && requested_addr != account
-        {
-            // The refused argument stays out of the detail; the profile
-            // signer is the configured reference of the check.
-            let err = stellar_agent_x402::X402Error::InvalidPaymentRequired {
-                detail: format!("the address argument does not match the profile signer {account}"),
-            };
-            return Ok(x402_error_to_tool_result(&err));
+        if let Some(result) = x402_address_mismatch(args.address.as_deref(), account) {
+            return Ok(result);
         }
 
         // ── Cross-check requirement, before the signer is read ───────────────
@@ -649,14 +757,21 @@ impl WalletServer {
         };
 
         // ── Step 3: Load signer from keyring ─────────────────────────────────
-        let signer_handle = match enrolled_keyring_signer(
-            &self.profile_name_for_approval(),
-            &self.profile,
-            account,
-            self.established_owner().as_ref(),
-        )
-        .await
-        {
+        let signer_result = if approval_proof.is_some() {
+            crate::tools::x402_create_payment::x402_mainnet_signing_handle(
+                &self.profile.mcp_signer_default,
+                account,
+            )
+        } else {
+            enrolled_keyring_signer(
+                &self.profile_name_for_approval(),
+                &self.profile,
+                account,
+                self.established_owner().as_ref(),
+            )
+            .await
+        };
+        let signer_handle = match signer_result {
             Ok(h) => h,
             Err(err) => {
                 if matches!(&err, stellar_agent_core::error::WalletError::Auth(_)) {
@@ -690,7 +805,12 @@ impl WalletServer {
 
         // ── Step 5: Dispatch to stellar_agent_x402::create_payment ───────────
         let signer: Arc<dyn stellar_agent_network::signing::Signer + Send + Sync> =
-            Arc::new(signer_handle);
+            Arc::new(X402CheckedSigner {
+                inner: signer_handle,
+                server: self,
+                proof: &approval_proof,
+                refusal: &approval_refusal,
+            });
 
         // Shared-window admission precedes signing and the signed RPC
         // re-simulation. A failure after it, an endpoint identity refusal
@@ -712,18 +832,28 @@ impl WalletServer {
             args.chain_id.as_str(),
             audit_leg,
         );
+        if let Some(proof) = &approval_proof {
+            audit = audit
+                .with_decision(audit_decision)
+                .with_approval_spend(X402ApprovalSpend {
+                    server: self,
+                    nonce: proof.nonce.clone(),
+                    governing_ttl_ms: proof.governing_ttl_ms,
+                });
+        }
         // The identity check runs under the profile's submit timeout, resolved
         // here; the requirement's `maxTimeoutSeconds` bounds the signed
         // authorization, never this deadline.
         let identity_deadline =
             tokio::time::Instant::now() + crate::tools::common::submit_timeout(&self.profile);
-        let created = create_payment(
+        let created = create_payment_with_pre_sign(
             &requirements,
             signer.as_ref(),
             &client,
             &cross_check,
             network_passphrase,
             identity_deadline,
+            x402_approval_callback(self, &approval_proof, &approval_refusal),
             |authorization| audit.before_transmit(authorization),
         )
         .await;
@@ -735,6 +865,13 @@ impl WalletServer {
                 );
                 // An audit refusal at the transmit gate answers its own
                 // `audit.*` code; it is not a payment-build failure.
+                if let Some(refusal) = approval_refusal
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    return Ok(refusal);
+                }
                 if let Some(refusal) = audit.refusal_result() {
                     return Ok(refusal);
                 }
@@ -848,6 +985,14 @@ impl WalletServer {
         home_domain: &str,
         network_passphrase: &str,
     ) -> Result<stellar_agent_x402_identity::VerifiedCounterpartySession, IdentityError> {
+        #[cfg(test)]
+        IDENTITY_CALLS.with(|count| count.set(count.get() + 1));
+        #[cfg(test)]
+        if IDENTITY_FAILURE.with(std::cell::Cell::get) {
+            return Err(IdentityError::HomeDomainUnresolvable {
+                authority: home_domain.to_owned(),
+            });
+        }
         #[cfg(any(test, feature = "test-helpers"))]
         if let Some((jwt, sub, accounts)) = &self.x402_identity_session_override {
             return Ok(stellar_agent_x402_identity::VerifiedCounterpartySession {
@@ -895,7 +1040,6 @@ impl WalletServer {
             require_terminal_consumption,
         };
         use stellar_agent_core::approval::subject::approval_subject_x402_authenticated;
-        use stellar_agent_core::approval::{PendingApproval, user_id::process_uid_for_attestation};
         use stellar_agent_network::mainnet::MainnetConsumer;
         use stellar_agent_network::mainnet::audit_readiness::audit_readiness;
         use stellar_agent_network::mainnet::authority::{AuthorityRefusal, MainnetAuthority};
@@ -1021,10 +1165,6 @@ impl WalletServer {
             Ok(outcome) => outcome,
             Err(error) => return error.into_result(),
         };
-        let network_id: [u8; 32] = {
-            use sha2::{Digest, Sha256};
-            Sha256::digest(guard.context.network_passphrase().as_bytes()).into()
-        };
         // An `Allow` without a proof pays in this call under policy
         // authority. An approval requirement without a proof writes the
         // pending approval and returns it. A proof verifies through the gate.
@@ -1050,30 +1190,12 @@ impl WalletServer {
                 let DispatchOutcome::RequireApproval(approval) = &dispatch else {
                     return Ok(approval_required_indistinguishable(name));
                 };
-                let entry = (|| {
-                    let uid = process_uid_for_attestation().map_err(|error| {
-                        stellar_agent_core::approval::attest::record_error(&error)
-                    })?;
-                    let entry = PendingApproval::new_x402_pending(
-                        &network_id,
-                        &root,
-                        Some(args.home_domain.clone()),
-                        uid,
-                        approval.governing_ttl_ms,
-                    )
-                    .map_err(|error| stellar_agent_core::approval::attest::record_error(&error))?
-                    .with_policy_request(&approval.request);
-                    let mut store = self.x402_approval_store()?;
-                    store
-                        .insert(
-                            entry.clone(),
-                            stellar_agent_network::mainnet::clock::now_ms()?,
-                        )
-                        .map_err(|error| {
-                            stellar_agent_core::approval::attest::record_error(&error)
-                        })?;
-                    Ok::<_, stellar_agent_core::WalletError>(entry)
-                })();
+                let entry = self.write_x402_pending_approval(
+                    &root,
+                    Some(args.home_domain.clone()),
+                    approval,
+                    stellar_agent_network::mainnet::clock::now_ms,
+                );
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(error) => {
@@ -1084,7 +1206,7 @@ impl WalletServer {
                     entry: &entry,
                     profile: name,
                     chain_id: &args.chain_id,
-                    endpoint_host: guard.enablement.endpoint_host(),
+                    endpoint_host: Some(guard.enablement.endpoint_host()),
                     signer: &payer,
                     requirements: &requirements,
                     business_id: business_id.as_ref(),
@@ -1113,7 +1235,10 @@ impl WalletServer {
         let intent = stellar_agent_network::mainnet::resolve::SorobanIntent {
             consumer: MainnetConsumer::X402Authenticated,
             root_invocation: &root,
-            network_id,
+            network_id: {
+                use sha2::{Digest, Sha256};
+                Sha256::digest(guard.context.network_passphrase().as_bytes()).into()
+            },
         };
         let identity_audit = match audit_readiness(profile, name) {
             Ok(readiness) => readiness,
@@ -1154,11 +1279,13 @@ impl WalletServer {
             Ok(readiness) => readiness,
             Err(error) => return Ok(endpoint_refusal_result(&error)),
         };
-        let handle =
-            match crate::tools::x402_create_payment::x402_mainnet_signing_handle(&signer, &payer) {
-                Ok(handle) => handle,
-                Err(result) => return Ok(result),
-            };
+        let handle = match crate::tools::x402_create_payment::x402_mainnet_signing_handle(
+            signer.seed_entry(),
+            &payer,
+        ) {
+            Ok(handle) => handle,
+            Err(error) => return Ok(endpoint_refusal_result(&error)),
+        };
         let asset = match x402_canonical_asset(&requirements) {
             Ok(asset) => asset,
             Err(result) => return Ok(result),
@@ -1448,6 +1575,43 @@ impl WalletServer {
 // ─────────────────────────────────────────────────────────────────────────────
 // Unit tests
 // ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static IDENTITY_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static IDENTITY_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+mod approval_boundary_tests {
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn x402_queue_reads_no_signer_and_runs_no_identity_gate() {
+        crate::tools::x402_create_payment::approval_tests::queue_key_case(true).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn authenticated_x402_queue_skips_sep10() {
+        crate::tools::x402_create_payment::approval_tests::queue_key_case(true).await;
+    }
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn approval_expiring_during_preparation_signs_nothing() {
+        crate::tools::x402_create_payment::approval_tests::expiry_case(true, false).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn key_read_crossing_expiry_signs_nothing() {
+        crate::tools::x402_create_payment::approval_tests::expiry_case(true, true).await;
+    }
+}
+
+#[cfg(test)]
+pub(super) fn identity_calls_on_this_thread() -> u64 {
+    IDENTITY_CALLS.with(std::cell::Cell::get)
+}
 
 #[cfg(test)]
 mod tests {
@@ -1759,13 +1923,15 @@ mod tests {
 
     fn make_require_approval_server() -> crate::server::WalletServer {
         use std::sync::Arc;
-        let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
-            .with_noop_engine()
-            .build();
-        // No audit chain key is seeded at this profile's coordinate: gate
-        // verdicts (RequireApproval here) precede the audit pre-flight, so
-        // this scenario must complete without one — the test's assertion on
-        // the fail-closed approval error doubles as the ordering pin.
+        let profile = Profile::builder_testnet(
+            "svc",
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+            "n-svc",
+            "n-acct",
+        )
+        .with_noop_engine()
+        .build();
+        // Queueing requires no signer, attestation, or audit key.
         let mut server = crate::server::WalletServer::new(profile)
             .expect("WalletServer::new must not fail in tests");
         server.policy_engine = Arc::new(RequireApprovalEngine);
@@ -1837,41 +2003,50 @@ mod tests {
         );
     }
 
-    /// Security regression: a `RequireApproval` policy verdict on
-    /// `stellar_x402_authenticated_payment` must return fail-closed `ErrorData`
-    /// with wire code `policy.approval_required_unsupported` and MUST NOT produce
-    /// a signed payment or request a SEP-10 session.
+    /// Queueing requires no keys and persists the complete payment intent.
     #[tokio::test]
     #[serial_test::serial(keyring)]
-    async fn require_approval_verdict_is_fail_closed_no_signature_produced() {
-        stellar_agent_test_support::keyring_mock::install().ok();
-        let server = make_require_approval_server();
-        let args = X402AuthenticatedPaymentArgs {
-            chain_id: "stellar:testnet".to_owned(),
-            home_domain: "example.com".to_owned(),
-            payment_required: sample_requirements_json(),
-            address: None,
-            approval_nonce: None,
-            approval_attestation: None,
-            business_id: None,
+    async fn require_approval_verdict_queues_the_payment_and_signs_nothing() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let mut server = make_require_approval_server();
+        server.set_approval_dir_for_test(home.path().join("approvals"));
+        let result = server
+            .call_stellar_x402_authenticated_payment(X402AuthenticatedPaymentArgs {
+                approval_nonce: None,
+                approval_attestation: None,
+                chain_id: "stellar:testnet".to_owned(),
+                address: None,
+                business_id: None,
+                payment_required: sample_requirements_json(),
+                home_domain: "example.com".to_owned(),
+            })
+            .await
+            .unwrap();
+        let text = &result.content[0].as_text().unwrap().text;
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_ne!(result.is_error, Some(true), "{value}");
+        let approval = &value["data"]["approval"];
+        assert!(approval.get("endpoint_host").is_none());
+        assert!(!text.contains("paymentSignature"));
+        let requirements: serde_json::Value =
+            serde_json::from_str(&sample_requirements_json()).unwrap();
+        for field in ["payTo", "amount", "asset"] {
+            assert_eq!(approval["summary"][field], requirements[field]);
+        }
+        let store = server.x402_approval_store().unwrap();
+        let entry = store
+            .get(approval["approval_nonce"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(entry.expires_at_unix_ms, entry.created_at_unix_ms + 120_000);
+        let stellar_agent_core::approval::ApprovalKind::X402Payment { home_domain, .. } =
+            &entry.kind
+        else {
+            panic!("queue must persist an x402 approval");
         };
-        let result = server.call_stellar_x402_authenticated_payment(args).await;
-        let result = result.expect(
-            "RequireApproval must return Ok(is_error) envelope, not a protocol error or a signature",
-        );
-        let (code, message, text) = crate::tools::common::assert_business_envelope(&result);
-        assert_eq!(
-            code, "policy.approval_required_unsupported",
-            "wire code must be policy.approval_required_unsupported"
-        );
-        assert!(
-            message.contains("single-shot"),
-            "error message must mention single-shot; got: {message}"
-        );
-        assert!(
-            !text.contains("\"paymentSignature\"") && !text.contains("\"signature\""),
-            "fail-closed approval refusal must not produce a signature; got: {text}"
-        );
+        assert_eq!(home_domain.as_deref(), Some("example.com"));
+        assert!(!server.profile.audit_log_path.exists());
     }
 
     /// A home domain the identity gate refuses for its form aborts before any

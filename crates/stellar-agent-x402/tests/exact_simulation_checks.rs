@@ -1136,6 +1136,98 @@ async fn an_honest_simulation_signs_the_built_transfer_once() {
     assert_eq!(signed.root_invocation, invocation_of(built_transfer()));
 }
 
+#[tokio::test]
+async fn pre_sign_callback_refusal_signs_nothing() {
+    struct ObservedRpc {
+        rpc: PaymentRpc,
+        health: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl Respond for ObservedRpc {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let value: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let response = self.rpc.respond(request);
+            if value["method"] == "getHealth" {
+                self.health.store(true, Ordering::SeqCst);
+            }
+            response
+        }
+    }
+    for refuse in [true, false] {
+        let scenario = Scenario::honest();
+        let health = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ObservedRpc {
+                health: health.clone(),
+                rpc: PaymentRpc {
+                    network: scenario.network,
+                    health: scenario.health,
+                    first: scenario.first,
+                    resimulation: scenario.resimulation,
+                    simulate_delay: Duration::ZERO,
+                    network_requests: AtomicUsize::new(0),
+                    health_requests: AtomicUsize::new(0),
+                    received_signed: Arc::new(Mutex::new(Vec::new())),
+                },
+            })
+            .mount(&server)
+            .await;
+        let client = StellarRpcClient::new(&server.uri()).unwrap();
+        let signer = CountingSigner::new();
+        let calls = AtomicUsize::new(0);
+        let gate = AtomicUsize::new(0);
+        let result = stellar_agent_x402::exact::create_payment_with_pre_sign(
+            &requirements(),
+            &signer,
+            &client,
+            &SorobanCrossCheck::NotRequired,
+            TESTNET_PASSPHRASE,
+            tokio::time::Instant::now() + GENEROUS_DEADLINE,
+            Some(Box::new(|| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                assert!(
+                    health.load(Ordering::SeqCst),
+                    "health precedes the pre-sign callback"
+                );
+                if refuse {
+                    Err(X402Error::TransmitGateRefused {
+                        detail: "caller refusal".into(),
+                    })
+                } else {
+                    Ok(())
+                }
+            })),
+            |_| {
+                gate.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the callback runs once");
+        if refuse {
+            assert!(
+                matches!(result, Err(X402Error::TransmitGateRefused {ref detail}) if detail == "caller refusal")
+            );
+            assert!(
+                signer.address_auth_digests.lock().unwrap().is_empty(),
+                "refusal signs no address authorization"
+            );
+            assert_eq!(signer.other_signing_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(gate.load(Ordering::SeqCst), 0);
+            assert_eq!(server.received_requests().await.unwrap().iter().filter(|request| {
+                serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["method"] == "simulateTransaction"
+            }).count(), 1);
+        } else {
+            let payment = result.unwrap();
+            let ordinary = run(Scenario::honest()).await.result.unwrap();
+            assert_eq!(
+                serde_json::to_value(payment.payload).unwrap(),
+                serde_json::to_value(ordinary).unwrap()
+            );
+        }
+    }
+}
+
 // ── (b) Refused first simulations ────────────────────────────────────────────
 
 #[tokio::test]

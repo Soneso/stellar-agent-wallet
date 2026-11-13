@@ -100,9 +100,11 @@ use crate::tools::value_audit::{
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(crate = "rmcp::serde")]
 pub struct X402CreatePaymentArgs {
-    /// Pending mainnet payment approval returned by the preparation call.
+    /// Wallet-issued approval nonce from the queueing call's `data.approval` block.
+    /// Supply it with `approval_attestation` when the policy requires approval, on either network.
     pub approval_nonce: Option<String>,
     /// URL-safe base64 without padding of the 32-byte operator attestation.
+    /// Required alongside `approval_nonce` when the policy requires approval.
     pub approval_attestation: Option<String>,
     /// Base64-encoded `PAYMENT-REQUIRED` header value OR raw JSON
     /// `PaymentRequirements` object.
@@ -266,8 +268,17 @@ impl WalletServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         use std::sync::Arc;
 
+        use crate::tools::common::{
+            DispatchOutcome, GatedApprovalKind, approval_required_indistinguishable,
+            verify_attestation_subject_gate,
+        };
+        use crate::tools::x402_create_payment::{
+            ApprovalView, X402ApprovalProof, X402ApprovalSpend, X402CheckedSigner,
+            approval_response, presented_x402_terms_refusal, x402_address_mismatch,
+            x402_approval_callback, x402_protocol_refusal,
+        };
         use stellar_agent_network::keyring::enrolled_keyring_signer;
-        use stellar_agent_x402::exact::{create_payment, validate_requirements};
+        use stellar_agent_x402::exact::{create_payment_with_pre_sign, validate_requirements};
 
         if self.context.chain_id.is_mainnet() {
             let guard = match self.mainnet_write_admission(
@@ -297,6 +308,10 @@ impl WalletServer {
             Ok(r) => r,
             Err(ref err) => return Ok(x402_error_to_tool_result(err)),
         };
+        let complete_proof = args.approval_nonce.is_some() && args.approval_attestation.is_some();
+        if complete_proof && let Some(result) = presented_x402_terms_refusal(self, &requirements) {
+            return Ok(result);
+        }
         let amount = match validate_requirements(
             &requirements,
             self.context.network_passphrase(),
@@ -312,7 +327,7 @@ impl WalletServer {
         )
         .await
         {
-            return Ok(result);
+            return Ok(x402_protocol_refusal(self, result, complete_proof));
         }
         // Off mainnet a supplied id is validated here and echoed. A mainnet
         // call takes its own path and checks its id at its record lookup,
@@ -342,10 +357,8 @@ impl WalletServer {
 
         // The gate performs registry lookup, chain validation, and policy evaluation.
         // Value criteria use the supplied value_leg.
-        // Single-shot sign tool: RequireApproval is fail-closed. The two-phase
-        // approval flow is not supported on this surface. `account_view` /
-        // `identity_view` are `None`: the `minimum_reserve` / `home_domain`
-        // criteria fail closed on this tool pending account-view wiring.
+        // Approval requirements queue an intent or verify the presented proof.
+        // Account-reserve and account-identity criteria fail closed without views.
         let dispatch_outcome = match self
             .dispatch_gate_with_value(
                 "stellar_x402_create_payment",
@@ -360,14 +373,90 @@ impl WalletServer {
             Ok(o) => o,
             Err(e) => return e.into_result(),
         };
-        let value_for_record = match dispatch_outcome {
-            crate::tools::common::DispatchOutcome::Allow(outcome) => outcome
-                .value_effects
-                .map_or(ValueClass::single(value_leg_for_record), ValueClass::Value),
-            crate::tools::common::DispatchOutcome::RequireApproval(_) => {
-                return Ok(crate::tools::common::single_shot_require_approval_error());
-            }
+        let audit_decision = dispatch_outcome.audit_decision();
+        let (value_for_record, approval) = match &dispatch_outcome {
+            DispatchOutcome::Allow(outcome) => (
+                outcome
+                    .value_effects
+                    .clone()
+                    .map_or(ValueClass::single(value_leg_for_record), ValueClass::Value),
+                None,
+            ),
+            DispatchOutcome::RequireApproval(outcome) => (
+                outcome
+                    .value_effects
+                    .clone()
+                    .map_or(ValueClass::single(value_leg_for_record), ValueClass::Value),
+                Some(outcome),
+            ),
         };
+        let mut approval_proof = None;
+        if let Some(approval) = approval {
+            let profile_name = self.profile_name_for_approval();
+            let payer = self.profile.mcp_signer_default.account.as_str();
+            if let Some(result) = x402_address_mismatch(args.address.as_deref(), payer) {
+                return Ok(if complete_proof {
+                    approval_required_indistinguishable(&profile_name)
+                } else if args.approval_nonce.is_none() && args.approval_attestation.is_none() {
+                    crate::tools::common::single_shot_require_approval_error()
+                } else {
+                    result
+                });
+            }
+            let root = match stellar_agent_x402::exact::payment_root(&requirements, payer) {
+                Ok(root) => root,
+                Err(error) => return Ok(x402_error_to_tool_result(&error)),
+            };
+            let digest = match stellar_agent_x402::exact::intent_digest(&requirements, payer) {
+                Ok(digest) => digest,
+                Err(error) => return Ok(x402_error_to_tool_result(&error)),
+            };
+            if args.approval_nonce.is_none() && args.approval_attestation.is_none() {
+                let entry = match self.write_x402_pending_approval(&root, None, approval, || {
+                    self.clock.now_unix_ms().map_err(|error| {
+                        stellar_agent_core::WalletError::WalletState(
+                            stellar_agent_core::error::WalletStateError::clock_error(&error),
+                        )
+                    })
+                }) {
+                    Ok(entry) => entry,
+                    Err(error) => return Ok(business_error_result(error.code(), error.message())),
+                };
+                return Ok(approval_response(&ApprovalView {
+                    entry: &entry,
+                    profile: &profile_name,
+                    chain_id: &args.chain_id,
+                    endpoint_host: None,
+                    signer: payer,
+                    requirements: &requirements,
+                    business_id: business_id.as_ref(),
+                }));
+            }
+            let subject = stellar_agent_core::approval::subject::approval_subject_x402(&digest);
+            if let Err(result) = verify_attestation_subject_gate(
+                self,
+                &dispatch_outcome,
+                GatedApprovalKind::X402.expectation(subject),
+                args.approval_nonce.as_deref(),
+                args.approval_attestation.as_deref(),
+                "stellar_x402_create_payment",
+            )
+            .await
+            {
+                return Ok(result);
+            }
+            if let (Some(nonce), Some(attestation)) =
+                (&args.approval_nonce, &args.approval_attestation)
+            {
+                approval_proof = Some(X402ApprovalProof {
+                    nonce: nonce.clone(),
+                    attestation: attestation.clone(),
+                    expected_subject: subject,
+                    governing_ttl_ms: approval.governing_ttl_ms,
+                });
+            }
+        }
+        let approval_refusal = std::sync::Mutex::new(None);
 
         // ── Audit pre-flight (fail-closed) ────────────────────────────────────
         // Runs AFTER the dispatch gate: a policy denial or approval escalation
@@ -394,15 +483,8 @@ impl WalletServer {
 
         // ── Validate optional address arg matches profile signer ──────────────
         let account = self.profile.mcp_signer_default.account.as_str();
-        if let Some(ref requested_addr) = args.address
-            && requested_addr != account
-        {
-            // The refused argument stays out of the detail; the profile
-            // signer is the configured reference of the check.
-            let err = stellar_agent_x402::X402Error::InvalidPaymentRequired {
-                detail: format!("the address argument does not match the profile signer {account}"),
-            };
-            return Ok(x402_error_to_tool_result(&err));
+        if let Some(result) = x402_address_mismatch(args.address.as_deref(), account) {
+            return Ok(result);
         }
 
         // ── Cross-check requirement, before the signer is read ───────────────
@@ -428,14 +510,18 @@ impl WalletServer {
         };
 
         // ── Load signer from keyring ──────────────────────────────────────────
-        let signer_handle = match enrolled_keyring_signer(
-            &self.profile_name_for_approval(),
-            &self.profile,
-            account,
-            self.established_owner().as_ref(),
-        )
-        .await
-        {
+        let signer_result = if approval_proof.is_some() {
+            x402_mainnet_signing_handle(&self.profile.mcp_signer_default, account)
+        } else {
+            enrolled_keyring_signer(
+                &self.profile_name_for_approval(),
+                &self.profile,
+                account,
+                self.established_owner().as_ref(),
+            )
+            .await
+        };
+        let signer_handle = match signer_result {
             Ok(h) => h,
             Err(err) => {
                 if matches!(&err, stellar_agent_core::error::WalletError::Auth(_)) {
@@ -470,7 +556,12 @@ impl WalletServer {
 
         // ── Dispatch to stellar_agent_x402::create_payment ───────────────────
         let signer: Arc<dyn stellar_agent_network::signing::Signer + Send + Sync> =
-            Arc::new(signer_handle);
+            Arc::new(X402CheckedSigner {
+                inner: signer_handle,
+                server: self,
+                proof: &approval_proof,
+                refusal: &approval_refusal,
+            });
 
         // Shared-window admission precedes signing and the signed RPC
         // re-simulation. A failure after it, an endpoint identity refusal
@@ -492,19 +583,29 @@ impl WalletServer {
             args.chain_id.as_str(),
             audit_leg,
         );
+        if let Some(proof) = &approval_proof {
+            audit = audit
+                .with_decision(audit_decision)
+                .with_approval_spend(X402ApprovalSpend {
+                    server: self,
+                    nonce: proof.nonce.clone(),
+                    governing_ttl_ms: proof.governing_ttl_ms,
+                });
+        }
         // The identity check runs under the profile's submit timeout, resolved
         // here; the requirement's `maxTimeoutSeconds` bounds the signed
         // authorization, never this deadline. Admission above stays when the
         // check refuses.
         let identity_deadline =
             tokio::time::Instant::now() + crate::tools::common::submit_timeout(&self.profile);
-        let created = create_payment(
+        let created = create_payment_with_pre_sign(
             &requirements,
             signer.as_ref(),
             &client,
             &cross_check,
             profile_passphrase,
             identity_deadline,
+            x402_approval_callback(self, &approval_proof, &approval_refusal),
             |authorization| audit.before_transmit(authorization),
         )
         .await;
@@ -516,6 +617,13 @@ impl WalletServer {
                     error_class = %classify_x402_error(err),
                     "x402_create_payment: create_payment failed",
                 );
+                if let Some(refusal) = approval_refusal
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    return Ok(refusal);
+                }
                 if let Some(refusal) = audit.refusal_result() {
                     return Ok(refusal);
                 }
@@ -549,7 +657,6 @@ impl WalletServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         use crate::tools::common::{DispatchOutcome, approval_required_indistinguishable};
         use stellar_agent_core::approval::subject::approval_subject_x402;
-        use stellar_agent_core::approval::{PendingApproval, user_id::process_uid_for_attestation};
         use stellar_agent_network::mainnet::authority::{AuthorityRefusal, MainnetAuthority};
         use stellar_agent_x402::exact::{
             X402MainnetProofs, create_payment_authorized, intent_digest, payment_root,
@@ -673,33 +780,12 @@ impl WalletServer {
                 let DispatchOutcome::RequireApproval(approval) = &dispatch else {
                     return Ok(approval_required_indistinguishable(name));
                 };
-                let entry = (|| {
-                    use sha2::{Digest, Sha256};
-                    let network_id =
-                        Sha256::digest(guard.context.network_passphrase().as_bytes()).into();
-                    let uid = process_uid_for_attestation().map_err(|error| {
-                        stellar_agent_core::approval::attest::record_error(&error)
-                    })?;
-                    let entry = PendingApproval::new_x402_pending(
-                        &network_id,
-                        &root,
-                        None,
-                        uid,
-                        approval.governing_ttl_ms,
-                    )
-                    .map_err(|error| stellar_agent_core::approval::attest::record_error(&error))?
-                    .with_policy_request(&approval.request);
-                    let mut store = self.x402_approval_store()?;
-                    store
-                        .insert(
-                            entry.clone(),
-                            stellar_agent_network::mainnet::clock::now_ms()?,
-                        )
-                        .map_err(|error| {
-                            stellar_agent_core::approval::attest::record_error(&error)
-                        })?;
-                    Ok::<_, stellar_agent_core::WalletError>(entry)
-                })();
+                let entry = self.write_x402_pending_approval(
+                    &root,
+                    None,
+                    approval,
+                    stellar_agent_network::mainnet::clock::now_ms,
+                );
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(error) => {
@@ -710,7 +796,7 @@ impl WalletServer {
                     entry: &entry,
                     profile: name,
                     chain_id: &args.chain_id,
-                    endpoint_host: guard.enablement.endpoint_host(),
+                    endpoint_host: Some(guard.enablement.endpoint_host()),
                     signer: &payer,
                     requirements: &requirements,
                     business_id: business_id.as_ref(),
@@ -734,9 +820,9 @@ impl WalletServer {
                 Ok(readiness) => readiness,
                 Err(error) => return Ok(crate::tools::common::endpoint_refusal_result(&error)),
             };
-        let handle = match x402_mainnet_signing_handle(&signer, &payer) {
+        let handle = match x402_mainnet_signing_handle(signer.seed_entry(), &payer) {
             Ok(handle) => handle,
-            Err(result) => return Ok(result),
+            Err(error) => return Ok(crate::tools::common::endpoint_refusal_result(&error)),
         };
         let store = self.window_store.clone();
         let asset = match x402_canonical_asset(&requirements) {
@@ -876,7 +962,10 @@ impl WalletServer {
         steps.released();
         Ok(response)
     }
+}
 
+impl WalletServer {
+    /// Opens the locked approval store for this profile.
     pub(super) fn x402_approval_store(
         &self,
     ) -> Result<stellar_agent_core::approval::PendingApprovalStore, stellar_agent_core::WalletError>
@@ -896,13 +985,364 @@ impl WalletServer {
     }
 }
 
-/// The approval-required view of a mainnet preparation call.
-#[cfg(feature = "mainnet-write")]
+impl WalletServer {
+    /// Writes the pending approval of an x402 payment intent.
+    pub(super) fn write_x402_pending_approval(
+        &self,
+        root: &stellar_xdr::SorobanAuthorizedInvocation,
+        home_domain: Option<String>,
+        approval: &crate::tools::common::ApprovalOutcome,
+        now_ms: impl FnOnce() -> Result<u64, stellar_agent_core::WalletError>,
+    ) -> Result<stellar_agent_core::approval::PendingApproval, stellar_agent_core::WalletError>
+    {
+        use sha2::{Digest, Sha256};
+        use stellar_agent_core::approval::{
+            PendingApproval, attest::record_error, user_id::process_uid_for_attestation,
+        };
+        let network_id = Sha256::digest(self.context.network_passphrase().as_bytes()).into();
+        let uid = process_uid_for_attestation().map_err(|error| record_error(&error))?;
+        let entry = PendingApproval::new_x402_pending(
+            &network_id,
+            root,
+            home_domain,
+            uid,
+            approval.governing_ttl_ms,
+        )
+        .map_err(|error| record_error(&error))?
+        .with_policy_request(&approval.request);
+        let mut store = self.x402_approval_store()?;
+        let now = now_ms()?;
+        store
+            .insert(entry.clone(), now)
+            .map_err(|error| record_error(&error))?;
+        Ok(entry)
+    }
+}
+
+/// Returns the live attested entry without modifying it.
+fn live_attested_x402_entry(
+    store: &stellar_agent_core::approval::PendingApprovalStore,
+    nonce: &str,
+    now_ms: u64,
+    governing_ttl_ms: u64,
+    profile_name: &str,
+) -> Result<stellar_agent_core::approval::PendingApproval, CallToolResult> {
+    use crate::tools::common::{
+        approval_consumed_error, approval_rejected_error, approval_required_indistinguishable,
+    };
+    use stellar_agent_core::approval::ApprovalKind;
+    let required = || approval_required_indistinguishable(profile_name);
+    let entry = store.get(nonce).ok_or_else(required)?;
+    let expired = now_ms < entry.created_at_unix_ms
+        || entry.is_expired(now_ms)
+        || entry.created_at_unix_ms.saturating_add(governing_ttl_ms) <= now_ms;
+    match &entry.kind {
+        ApprovalKind::Consumed { .. } => Err(approval_consumed_error()),
+        ApprovalKind::Rejected { .. } if !expired => Err(approval_rejected_error()),
+        _ if expired => Err(required()),
+        ApprovalKind::X402Payment { .. } if entry.attestation_blob_b64.is_some() => {
+            Ok(entry.clone())
+        }
+        _ => Err(required()),
+    }
+}
+
+/// Spends one live approval before its signed authorization leaves the wallet.
+pub(super) fn spend_x402_approval(
+    server: &WalletServer,
+    nonce: &str,
+    governing_ttl_ms: u64,
+    signed_entries_sha256: &[u8; 32],
+) -> Result<(), CallToolResult> {
+    let profile = server.profile_name_for_approval();
+    let required = || crate::tools::common::approval_required_indistinguishable(&profile);
+    let mut store = server.x402_approval_store().map_err(|_| required())?;
+    let now = server.clock.now_unix_ms().map_err(|_| required())?;
+    live_attested_x402_entry(&store, nonce, now, governing_ttl_ms, &profile)?;
+    let digest = stellar_agent_core::hex::encode(signed_entries_sha256);
+    match store.consume(
+        nonce,
+        &digest,
+        stellar_agent_core::approval::ConsumedOutcome::Unknown,
+    ) {
+        Ok(true) => Ok(()),
+        _ => Err(required()),
+    }
+}
+
+#[cfg(test)]
+fn x402_crash_boundary(boundary: &str) {
+    if std::env::var("X402_CRASH_AFTER").as_deref() == Ok(boundary) {
+        std::process::exit(73);
+    }
+}
+
+pub(super) struct X402ApprovalSpend<'a> {
+    pub(super) server: &'a WalletServer,
+    pub(super) nonce: String,
+    pub(super) governing_ttl_ms: u64,
+}
+
+/// The exact proof revalidated before signing.
+#[derive(Clone)]
+pub(super) struct X402ApprovalProof {
+    pub(super) nonce: String,
+    pub(super) attestation: String,
+    pub(super) expected_subject: [u8; 32],
+    pub(super) governing_ttl_ms: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    static PRE_SIGN_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static TRANSMIT_GATE_ENTRIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn pre_sign_checks_on_this_thread() -> u64 {
+    PRE_SIGN_CHECKS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(super) fn transmit_gate_entries_on_this_thread() -> u64 {
+    TRANSMIT_GATE_ENTRIES.with(std::cell::Cell::get)
+}
+
+/// Verifies consent after all key reads and retains the store through signing.
+fn x402_pre_sign_guard(
+    server: &WalletServer,
+    proof: &X402ApprovalProof,
+) -> Result<stellar_agent_core::approval::PendingApprovalStore, CallToolResult> {
+    use base64::Engine as _;
+    use stellar_agent_core::approval::{ApprovalKind, AttestationBinding, verify_attestation};
+    let profile = server.profile_name_for_approval();
+    let required = || crate::tools::common::approval_required_indistinguishable(&profile);
+    let store = server.x402_approval_store().map_err(|_| required())?;
+    let key =
+        crate::tools::common::load_attestation_key(&server.profile).map_err(|_| required())?;
+    let now = server.clock.now_unix_ms().map_err(|_| required())?;
+    let entry =
+        live_attested_x402_entry(&store, &proof.nonce, now, proof.governing_ttl_ms, &profile)?;
+    let ApprovalKind::X402Payment {
+        intent_digest,
+        root_invocation_xdr,
+        home_domain,
+        ..
+    } = &entry.kind
+    else {
+        return Err(required());
+    };
+    let subject = stellar_agent_core::approval::subject::verified_x402_subject(
+        intent_digest,
+        root_invocation_xdr,
+        home_domain.as_deref(),
+        server.context.network_passphrase(),
+    )
+    .map_err(|_| required())?;
+    if subject != proof.expected_subject {
+        return Err(required());
+    }
+    let bytes: [u8; 32] = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(&proof.attestation)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(required)?;
+    let scope = entry.attestation_scope().ok_or_else(required)?;
+    if !verify_attestation(
+        &key,
+        &AttestationBinding::new(&profile, server.context.chain_id.caip2_str()),
+        &proof.nonce,
+        &proof.expected_subject,
+        &entry.process_uid,
+        &scope,
+        &bytes,
+    ) {
+        return Err(required());
+    }
+    Ok(store)
+}
+
+/// Revalidates the proof after payment preparation without spending it.
+pub(super) fn x402_pre_sign_check(
+    server: &WalletServer,
+    proof: &X402ApprovalProof,
+) -> Result<(), CallToolResult> {
+    #[cfg(test)]
+    PRE_SIGN_CHECKS.with(|count| count.set(count.get() + 1));
+    x402_pre_sign_guard(server, proof).map(|_| ())
+}
+
+/// Retains the exact approval proof through the payer's final key read.
+pub(super) struct X402CheckedSigner<'a> {
+    pub(super) inner: stellar_agent_network::keyring::KeyringSignHandle,
+    pub(super) server: &'a WalletServer,
+    pub(super) proof: &'a Option<X402ApprovalProof>,
+    pub(super) refusal: &'a std::sync::Mutex<Option<CallToolResult>>,
+}
+
+#[async_trait::async_trait]
+impl stellar_agent_network::signing::Signer for X402CheckedSigner<'_> {
+    async fn public_key(
+        &self,
+    ) -> Result<stellar_strkey::ed25519::PublicKey, stellar_agent_core::WalletError> {
+        Ok(self.inner.public_key())
+    }
+
+    async fn sign_tx_payload(
+        &self,
+        payload: &stellar_agent_network::signing::TxSigningPayload,
+    ) -> Result<[u8; 64], stellar_agent_core::WalletError> {
+        self.inner.sign_tx_payload(payload).await
+    }
+
+    async fn sign_auth_digest(
+        &self,
+        payload: &stellar_agent_network::signing::SmartAccountAuthDigest,
+    ) -> Result<[u8; 64], stellar_agent_core::WalletError> {
+        self.inner.sign_auth_digest(payload).await
+    }
+
+    async fn sign_message(
+        &self,
+        payload: &stellar_agent_network::signing::MessagePayload,
+    ) -> Result<[u8; 64], stellar_agent_core::WalletError> {
+        self.inner.sign_message(payload).await
+    }
+
+    async fn sign_webauthn_assertion(
+        &self,
+        payload: &stellar_agent_network::signing::SmartAccountAuthDigest,
+        id: &[u8],
+    ) -> Result<stellar_agent_network::signing::WebAuthnAssertion, stellar_agent_core::WalletError>
+    {
+        self.inner.sign_webauthn_assertion(payload, id).await
+    }
+
+    async fn sign_soroban_address_auth_payload(
+        &self,
+        payload: &stellar_agent_network::signing::SorobanAuthPayload,
+    ) -> Result<[u8; 64], stellar_agent_core::WalletError> {
+        let Some(proof) = self.proof else {
+            return self.inner.sign_soroban_address_auth_payload(payload).await;
+        };
+        // Approval preparation precedes both enrollment and signing key reads.
+        let name = self.server.profile_name_for_approval();
+        let profile = self.server.profile.clone();
+        let payer = self.inner.public_key().to_string().to_string();
+        let owner = self.server.established_owner();
+        let signer = tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current().block_on(
+                stellar_agent_network::keyring::enrolled_keyring_signer(
+                    &name,
+                    &profile,
+                    &payer,
+                    owner.as_ref(),
+                ),
+            )
+        })
+        .await
+        .map_err(
+            |_| stellar_agent_core::error::InternalError::UnexpectedState {
+                detail: "the x402 signer load does not complete".into(),
+            },
+        )??;
+        signer
+            .sign_soroban_address_auth_payload_checked(payload, || {
+                x402_pre_sign_guard(self.server, proof).map_err(|result| {
+                    *self
+                        .refusal
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
+                    stellar_agent_core::WalletError::Approval(
+                        stellar_agent_core::error::ApprovalFailure::AttestationInvalid {
+                            detail: "the x402 approval is not valid at signing".to_owned(),
+                        },
+                    )
+                })
+            })
+            .await
+    }
+}
+
+/// Builds the preparation callback only for an approved payment.
+pub(super) fn x402_approval_callback<'a>(
+    server: &'a WalletServer,
+    proof: &'a Option<X402ApprovalProof>,
+    refusal: &'a std::sync::Mutex<Option<CallToolResult>>,
+) -> Option<stellar_agent_x402::exact::BeforePayerSign<'a>> {
+    proof.as_ref().map(|proof| {
+        Box::new(move || {
+            x402_pre_sign_check(server, proof).map_err(|result| {
+                *refusal
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
+                stellar_agent_x402::X402Error::TransmitGateRefused {
+                    detail: "the x402 approval is not valid at signing".to_owned(),
+                }
+            })
+        }) as stellar_agent_x402::exact::BeforePayerSign<'a>
+    })
+}
+
+/// Refuses invalid payment terms before ordinary non-term validation.
+pub(super) fn presented_x402_terms_refusal(
+    server: &WalletServer,
+    requirements: &stellar_agent_x402::wire::PaymentRequirements,
+) -> Option<CallToolResult> {
+    let mut terms = requirements.clone();
+    terms.scheme = "exact".to_owned();
+    terms.extra = json!({"areFeesSponsored": true});
+    terms.max_timeout_seconds = terms.max_timeout_seconds.max(1);
+    stellar_agent_x402::exact::validate_requirements_for_payment(
+        &terms,
+        server.context.network_passphrase(),
+    )
+    .err()
+    .map(|_| {
+        crate::tools::common::approval_required_indistinguishable(
+            &server.profile_name_for_approval(),
+        )
+    })
+}
+
+/// Maps unsupported W protocols uniformly when a complete proof is present.
+pub(super) fn x402_protocol_refusal(
+    server: &WalletServer,
+    result: CallToolResult,
+    complete_proof: bool,
+) -> CallToolResult {
+    let unsupported = result
+        .content
+        .iter()
+        .filter_map(|content| content.as_text())
+        .filter_map(|text| serde_json::from_str::<serde_json::Value>(&text.text).ok())
+        .any(|value| value["error"]["code"] == "x402.muxed_contract_protocol_unsupported");
+    if complete_proof && unsupported {
+        crate::tools::common::approval_required_indistinguishable(
+            &server.profile_name_for_approval(),
+        )
+    } else {
+        result
+    }
+}
+
+pub(super) fn x402_address_mismatch(
+    address: Option<&str>,
+    account: &str,
+) -> Option<CallToolResult> {
+    address.filter(|address| *address != account).map(|_| {
+        x402_error_to_tool_result(&stellar_agent_x402::X402Error::InvalidPaymentRequired {
+            detail: format!("the address argument does not match the profile signer {account}"),
+        })
+    })
+}
+
+/// The approval-required view of a preparation call.
 pub(super) struct ApprovalView<'a> {
     pub(super) entry: &'a stellar_agent_core::approval::PendingApproval,
     pub(super) profile: &'a str,
     pub(super) chain_id: &'a str,
-    pub(super) endpoint_host: &'a str,
+    pub(super) endpoint_host: Option<&'a str>,
     pub(super) signer: &'a str,
     pub(super) requirements: &'a stellar_agent_x402::wire::PaymentRequirements,
     /// The business id that names the payment's operation.
@@ -914,15 +1354,13 @@ pub(super) struct ApprovalView<'a> {
 /// It adds the enabled endpoint host, the enrolled signer and the approval
 /// instructions. `data.business_id` names the operation. It carries no
 /// payment payload.
-#[cfg(feature = "mainnet-write")]
 pub(super) fn approval_response(view: &ApprovalView<'_>) -> CallToolResult {
-    let approval = json!({
+    let mut approval = json!({
         "approval_nonce": view.entry.approval_nonce,
         "profile": view.profile,
         "chain_id": view.chain_id,
         "expires_at_unix_ms": view.entry.expires_at_unix_ms,
         "reason": view.entry.reason,
-        "endpoint_host": view.endpoint_host,
         "signer": view.signer,
         "summary": {
             "payTo": view.requirements.pay_to,
@@ -935,6 +1373,9 @@ pub(super) fn approval_response(view: &ApprovalView<'_>) -> CallToolResult {
             stellar_agent_core::approval::approve_hint(&view.entry.approval_nonce, view.profile)
         ),
     });
+    if let Some(host) = view.endpoint_host {
+        approval["endpoint_host"] = json!(host);
+    }
     let mut data = json!({ "approval": approval });
     crate::tools::business_entry::echo_business_id(&mut data, view.business_id);
     let text = stellar_agent_core::envelope::Envelope::ok(data)
@@ -1010,19 +1451,16 @@ pub(super) fn require_terminal_consumption(
     }
 }
 
-/// The keyring handle that signs a mainnet x402 payment for `payer`.
+/// The keyring handle that signs an x402 payment for `payer`.
 ///
-/// The handle reads the seed only inside authorized signing, after every gate
-/// of the payment passed; the testnet paths keep the enrollment helper. Both
-/// mainnet x402 tools build their handle here, so the seed is read in one
-/// place for either payment.
-#[cfg(feature = "mainnet-write")]
+/// Mainnet and approved testnet payments share this lazy handle factory.
+/// Approved testnet payments verify enrollment after the preparation callback.
+/// The handle reads the seed inside signing, after the preparation gates pass.
 pub(super) fn x402_mainnet_signing_handle(
-    signer: &stellar_agent_network::keyring::EnrolledSigner,
+    entry: &stellar_agent_core::profile::KeyringEntryRef,
     payer: &str,
-) -> Result<stellar_agent_network::keyring::KeyringSignHandle, CallToolResult> {
-    stellar_agent_network::keyring::lazy_signer_from_keyring(signer.seed_entry(), payer)
-        .map_err(|error| crate::tools::common::endpoint_refusal_result(&error))
+) -> Result<stellar_agent_network::keyring::KeyringSignHandle, stellar_agent_core::WalletError> {
+    stellar_agent_network::keyring::lazy_signer_from_keyring(entry, payer)
 }
 
 /// Every mainnet x402 error reply after the transmit gate passes appends this
@@ -1205,6 +1643,8 @@ pub(super) struct X402AuthorizationAudit<'a> {
     /// authorized row records; `None` off mainnet.
     provenance: Option<stellar_agent_core::mainnet::decision::MainnetProvenance>,
     pub(super) refusal: Option<stellar_agent_core::error::WalletError>,
+    spend: Option<X402ApprovalSpend<'a>>,
+    approval_refusal: Option<CallToolResult>,
 }
 
 impl<'a> X402AuthorizationAudit<'a> {
@@ -1231,12 +1671,18 @@ impl<'a> X402AuthorizationAudit<'a> {
             decision: PolicyDecision::Allow,
             provenance: None,
             refusal: None,
+            spend: None,
+            approval_refusal: None,
         }
     }
 
-    #[cfg(feature = "mainnet-write")]
     pub(super) fn with_decision(mut self, decision: PolicyDecision) -> Self {
         self.decision = decision;
+        self
+    }
+
+    pub(super) fn with_approval_spend(mut self, spend: X402ApprovalSpend<'a>) -> Self {
+        self.spend = Some(spend);
         self
     }
 
@@ -1270,7 +1716,27 @@ impl<'a> X402AuthorizationAudit<'a> {
         &mut self,
         authorization: &stellar_agent_x402::exact::AuthorizationToTransmit<'_>,
     ) -> Result<(), stellar_agent_x402::X402Error> {
+        #[cfg(test)]
+        TRANSMIT_GATE_ENTRIES.with(|count| count.set(count.get() + 1));
+        if let Some(spend) = &self.spend
+            && let Err(result) = spend_x402_approval(
+                spend.server,
+                &spend.nonce,
+                spend.governing_ttl_ms,
+                &authorization.signed_entries_sha256,
+            )
+        {
+            tracing::debug!(tool = self.tool, nonce = %spend.nonce, "x402 approval spend refused");
+            self.approval_refusal = Some(result);
+            return Err(stellar_agent_x402::X402Error::TransmitGateRefused {
+                detail: "the x402 approval is not available to spend".to_owned(),
+            });
+        }
         self.network = authorization.network.to_owned();
+        #[cfg(test)]
+        if self.spend.is_some() {
+            x402_crash_boundary("spend");
+        }
         self.scheme = authorization.scheme.to_owned();
         let entry = self.authorized_row(
             authorization.network,
@@ -1287,6 +1753,10 @@ impl<'a> X402AuthorizationAudit<'a> {
         );
         match result {
             Ok(()) => {
+                #[cfg(test)]
+                if self.spend.is_some() {
+                    x402_crash_boundary("audit");
+                }
                 self.gate_passed = true;
                 #[cfg(feature = "mainnet-write")]
                 {
@@ -1331,6 +1801,9 @@ impl<'a> X402AuthorizationAudit<'a> {
     /// The tool result for the gate's own refusal, carrying the wallet error's
     /// code, or `None` when the gate did not refuse.
     pub(super) fn refusal_result(&mut self) -> Option<CallToolResult> {
+        if let Some(refusal) = self.approval_refusal.take() {
+            return Some(refusal);
+        }
         self.refusal
             .take()
             .map(|error| business_error_result(error.code(), error.to_string()))
@@ -1491,6 +1964,1313 @@ impl WalletServer {
         args: X402CreatePaymentArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         self.stellar_x402_create_payment(Parameters(args)).await
+    }
+}
+
+#[cfg(test)]
+pub(super) mod approval_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        reason = "test assertions"
+    )]
+    mod review_tests {
+        include!("x402_approval_review_tests.rs");
+    }
+    use super::*;
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use sha2::Digest as _;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    };
+    use stellar_agent_core::approval::{ApprovalKind, PendingApproval};
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    const DATA: &str = "AAAAAAAAAAIAAAAGAAAAAcwD/nT9D7Dc2LxRdab+2vEUF8B+XoN7mQW21oxPT8ALAAAAFAAAAAEAAAAHy8vNUZ8vyZ2ybPHW0XbSrRtP7gEWsJ6zDzcfY9P8z88AAAABAAAABgAAAAHMA/50/Q+w3Ni8UXWm/trxFBfAfl6De5kFttaMT0/ACwAAABAAAAABAAAAAgAAAA8AAAAHQ291bnRlcgAAAAASAAAAAAAAAAAg4dbAxsGAGICfBG3iT2cKGYQ6hK4sJWzZ6or1C5v6GAAAAAEAHfKyAAAFiAAAAIgAAAAAAAAAAw==";
+
+    struct Clock(Arc<AtomicU64>);
+    impl stellar_agent_core::timefmt::Clock for Clock {
+        fn now_unix_ms(&self) -> Result<u64, stellar_agent_core::wallet::WalletLifecycleError> {
+            Ok(self.0.load(Ordering::SeqCst))
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn authenticated_identity_failure_keeps_the_approval() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let fixture = crate::tools::message_signing_tests::Fixture::new();
+        fixture.seed_signer();
+        fixture.seed_audit();
+        let mut server = fixture.server();
+        server.policy_engine = super::tests::make_require_approval_server().policy_engine;
+        server.set_approval_dir_for_test(fixture.dir.path().join("approvals"));
+        server.set_x402_identity_session_for_test("jwt".into(), fixture.account.clone(), vec![]);
+        let queued = call(&server, true, None).await;
+        let nonce = value(&queued)["data"]["approval"]["approval_nonce"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let proof = attest(&server, &nonce);
+        crate::tools::x402_authenticated_payment::IDENTITY_FAILURE.with(|flag| flag.set(true));
+        let before = transmit_gate_entries_on_this_thread();
+        let identity_before =
+            crate::tools::x402_authenticated_payment::identity_calls_on_this_thread();
+        let result = call(&server, true, Some(&proof)).await;
+        crate::tools::x402_authenticated_payment::IDENTITY_FAILURE.with(|flag| flag.set(false));
+        assert_eq!(result.is_error, Some(true), "{}", value(&result));
+        assert_eq!(transmit_gate_entries_on_this_thread(), before);
+        assert_eq!(
+            crate::tools::x402_authenticated_payment::identity_calls_on_this_thread(),
+            identity_before + 1
+        );
+        assert_eq!(
+            value(&result)["error"]["code"],
+            "identity.home_domain_unresolvable"
+        );
+        let entry = server
+            .x402_approval_store()
+            .unwrap()
+            .get(&nonce)
+            .unwrap()
+            .clone();
+        assert!(matches!(entry.kind, ApprovalKind::X402Payment { .. }));
+        assert!(entry.attestation_blob_b64.is_some());
+    }
+
+    struct FailingClock;
+    impl stellar_agent_core::timefmt::Clock for FailingClock {
+        fn now_unix_ms(&self) -> Result<u64, stellar_agent_core::wallet::WalletLifecycleError> {
+            Err(
+                stellar_agent_core::wallet::WalletLifecycleError::ClockError {
+                    detail: "clock unavailable".into(),
+                    source: None,
+                },
+            )
+        }
+    }
+
+    fn requirements() -> String {
+        json!({"scheme":"exact", "network":"stellar:testnet",
+            "asset":"CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
+            "amount":"10000000", "payTo":"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+            "maxTimeoutSeconds":300, "extra":{"areFeesSponsored":true}})
+        .to_string()
+    }
+
+    pub(super) async fn call(
+        server: &WalletServer,
+        auth: bool,
+        proof: Option<&X402ApprovalProof>,
+    ) -> CallToolResult {
+        call_requirements(server, auth, proof, requirements()).await
+    }
+
+    async fn call_requirements(
+        server: &WalletServer,
+        auth: bool,
+        proof: Option<&X402ApprovalProof>,
+        requirements: String,
+    ) -> CallToolResult {
+        let nonce = proof.map(|proof| proof.nonce.clone());
+        let attestation = proof.map(|proof| proof.attestation.clone());
+        if auth {
+            server
+                .call_stellar_x402_authenticated_payment(
+                    crate::server::X402AuthenticatedPaymentArgs {
+                        approval_nonce: nonce,
+                        approval_attestation: attestation,
+                        chain_id: "stellar:testnet".into(),
+                        payment_required: requirements.clone(),
+                        address: None,
+                        business_id: None,
+                        home_domain: "merchant.example".into(),
+                    },
+                )
+                .await
+                .unwrap()
+        } else {
+            server
+                .call_stellar_x402_create_payment(X402CreatePaymentArgs {
+                    approval_nonce: nonce,
+                    approval_attestation: attestation,
+                    chain_id: "stellar:testnet".into(),
+                    payment_required: requirements.clone(),
+                    address: None,
+                    business_id: None,
+                })
+                .await
+                .unwrap()
+        }
+    }
+
+    fn value(result: &CallToolResult) -> serde_json::Value {
+        serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap()
+    }
+
+    fn attest(server: &WalletServer, nonce: &str) -> X402ApprovalProof {
+        crate::tools::value_audit::require_value_audit_writer(
+            &server.profile,
+            &server.profile_name_for_approval(),
+            server.audit_binding,
+        )
+        .unwrap();
+        use stellar_agent_core::approval::{
+            AttestationBinding, AttestedApprover, ConsentAuthorization,
+            attest::{ConsentAudit, Surface, attest_and_persist},
+        };
+        let key = [0x5a; 32];
+        let coord = &server.profile.attestation_key_id;
+        keyring_core::Entry::new(&coord.service, &coord.account)
+            .unwrap()
+            .set_password(&URL_SAFE_NO_PAD.encode(key))
+            .unwrap();
+        let mut store = server.x402_approval_store().unwrap();
+        let entry = store.get(nonce).unwrap().clone();
+        let outbox = stellar_agent_core::audit_log::AuditOutbox::for_log(
+            &server.profile.audit_log_path,
+            stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
+                &server.profile.audit_log_hash_chain_key_id,
+                &server.profile.audit_log_path,
+            ),
+        );
+        attest_and_persist(
+            &mut store,
+            &entry,
+            &key,
+            &AttestationBinding::new(&server.profile_name_for_approval(), "stellar:testnet"),
+            Surface::Cli,
+            ConsentAudit::Outbox(&outbox),
+            ConsentAuthorization::Standard(&AttestedApprover::Local),
+            |_, _| Err("no grant".into()),
+        )
+        .unwrap();
+        let entry = store.get(nonce).unwrap();
+        let ApprovalKind::X402Payment {
+            intent_digest,
+            root_invocation_xdr,
+            home_domain,
+            ..
+        } = &entry.kind
+        else {
+            panic!("x402");
+        };
+        X402ApprovalProof {
+            nonce: nonce.to_owned(),
+            attestation: entry.attestation_blob_b64.clone().unwrap(),
+            expected_subject: stellar_agent_core::approval::subject::verified_x402_subject(
+                intent_digest,
+                root_invocation_xdr,
+                home_domain.as_deref(),
+                server.context.network_passphrase(),
+            )
+            .unwrap(),
+            governing_ttl_ms: 120_000,
+        }
+    }
+
+    struct Rpc {
+        payer: stellar_xdr::ScAddress,
+        clock: Arc<AtomicU64>,
+        health_expiry: Arc<AtomicU64>,
+        simulations: Arc<AtomicUsize>,
+    }
+    impl Respond for Rpc {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            use stellar_xdr::*;
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let result = match body["method"].as_str().unwrap() {
+                "getNetwork" => {
+                    json!({"passphrase":"Test SDF Network ; September 2015","protocolVersion":30})
+                }
+                "getHealth" => {
+                    let expiry = self.health_expiry.load(Ordering::SeqCst);
+                    if expiry != 0 {
+                        self.clock.store(expiry, Ordering::SeqCst);
+                    }
+                    json!({"status":"healthy","latestLedger":1000,"oldestLedger":1,"ledgerRetentionWindow":17280})
+                }
+                "simulateTransaction" => {
+                    self.simulations.fetch_add(1, Ordering::SeqCst);
+                    let TransactionEnvelope::Tx(envelope) = TransactionEnvelope::from_xdr_base64(
+                        body["params"]["transaction"].as_str().unwrap(),
+                        Limits::none(),
+                    )
+                    .unwrap() else {
+                        panic!("v1");
+                    };
+                    let OperationBody::InvokeHostFunction(host) = &envelope.tx.operations[0].body
+                    else {
+                        panic!("invoke");
+                    };
+                    let HostFunction::InvokeContract(invoke) = &host.host_function else {
+                        panic!("contract");
+                    };
+                    let auth: Vec<String> = if host.auth.is_empty() {
+                        vec![
+                            SorobanAuthorizationEntry {
+                                credentials: SorobanCredentials::Address(
+                                    SorobanAddressCredentials {
+                                        address: self.payer.clone(),
+                                        nonce: 7,
+                                        signature_expiration_ledger: 0,
+                                        signature: ScVal::Void,
+                                    },
+                                ),
+                                root_invocation: SorobanAuthorizedInvocation {
+                                    function: SorobanAuthorizedFunction::ContractFn(invoke.clone()),
+                                    sub_invocations: VecM::default(),
+                                },
+                            }
+                            .to_xdr_base64(Limits::none())
+                            .unwrap(),
+                        ]
+                    } else {
+                        if let Ok(path) = std::env::var("X402_CHILD_TRANSMISSION") {
+                            std::fs::write(path, b"signed").unwrap();
+                        }
+                        vec![]
+                    };
+                    json!({"transactionData":DATA,"minResourceFee":"1000","latestLedger":1000,
+                        "results":[{"auth":auth,"xdr":ScVal::Void.to_xdr_base64(Limits::none()).unwrap()}]})
+                }
+                other => panic!("unexpected RPC {other}"),
+            };
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"jsonrpc":"2.0","id":body["id"],"result":result}))
+        }
+    }
+
+    pub(crate) async fn expiry_case(auth: bool, key_read: bool) {
+        for governing in [false, true] {
+            for attestation_read in [false, true] {
+                let mut fixture = crate::tools::message_signing_tests::Fixture::new();
+                let now = Arc::new(AtomicU64::new(0));
+                let expiry = Arc::new(AtomicU64::new(0));
+                let reads = Arc::new(AtomicUsize::new(0));
+                let active = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let coord = if attestation_read {
+                    &fixture.profile.attestation_key_id
+                } else {
+                    &fixture.profile.mcp_signer_default
+                };
+                let (read_counter, active_hook, time, expires) =
+                    (reads.clone(), active.clone(), now.clone(), expiry.clone());
+                stellar_agent_test_support::keyring_mock::install_with_read_hooks(vec![
+                    stellar_agent_test_support::keyring_mock::ReadHook::new(
+                        &coord.service,
+                        &coord.account,
+                        Arc::new(move || {
+                            let index = read_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                            if key_read
+                                && active_hook.load(Ordering::SeqCst)
+                                && index == if attestation_read { 3 } else { 2 }
+                            {
+                                let time = time.clone();
+                                let expires = expires.clone();
+                                let (send, receive) = std::sync::mpsc::channel();
+                                let thread = std::thread::spawn(move || {
+                                    time.store(expires.load(Ordering::SeqCst), Ordering::SeqCst);
+                                    send.send(()).unwrap();
+                                });
+                                receive.recv().unwrap();
+                                thread.join().unwrap();
+                            }
+                        }),
+                    ),
+                ])
+                .unwrap();
+                fixture.seed_signer();
+                fixture.seed_audit();
+                let mock = MockServer::start().await;
+                fixture.profile.rpc_url = mock.uri();
+                let mut server = fixture.server();
+                server.policy_engine = super::tests::make_require_approval_server().policy_engine;
+                server.set_approval_dir_for_test(fixture.dir.path().join("approvals"));
+                server.set_x402_identity_session_for_test(
+                    "jwt".into(),
+                    fixture.account.clone(),
+                    vec![],
+                );
+                let queued = call(&server, auth, None).await;
+                let data = value(&queued);
+                assert_ne!(queued.is_error, Some(true), "{data}");
+                let nonce = data["data"]["approval"]["approval_nonce"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let mut store = server.x402_approval_store().unwrap();
+                let mut entry = store.get(&nonce).unwrap().clone();
+                expiry.store(entry.expires_at_unix_ms, Ordering::SeqCst);
+                if governing {
+                    entry.expires_at_unix_ms += 120_000;
+                    drop(store);
+                    server
+                        .set_approval_dir_for_test(fixture.dir.path().join("governing-approvals"));
+                    store = server.x402_approval_store().unwrap();
+                    store
+                        .insert(entry.clone(), entry.created_at_unix_ms)
+                        .unwrap();
+                }
+                drop(store);
+                let proof = attest(&server, &nonce);
+                now.store(entry.created_at_unix_ms + 1, Ordering::SeqCst);
+                server.clock = Arc::new(Clock(now.clone()));
+                let simulations = Arc::new(AtomicUsize::new(0));
+                let public =
+                    stellar_strkey::ed25519::PublicKey::from_string(&fixture.account).unwrap();
+                Mock::given(wiremock::matchers::method("POST"))
+                    .respond_with(Rpc {
+                        payer: stellar_xdr::ScAddress::Account(stellar_xdr::AccountId(
+                            stellar_xdr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256(
+                                public.0,
+                            )),
+                        )),
+                        clock: now,
+                        health_expiry: if key_read {
+                            Arc::new(AtomicU64::new(0))
+                        } else {
+                            expiry
+                        },
+                        simulations: simulations.clone(),
+                    })
+                    .mount(&mock)
+                    .await;
+                reads.store(0, Ordering::SeqCst);
+                active.store(true, Ordering::SeqCst);
+                let before = transmit_gate_entries_on_this_thread();
+                let result = call(&server, auth, Some(&proof)).await;
+                let data = value(&result);
+                if !key_read && !attestation_read {
+                    assert_eq!(
+                        reads.load(Ordering::SeqCst),
+                        0,
+                        "a refusing preparation callback reads no payer key"
+                    );
+                }
+                assert_eq!(data["error"]["code"], "policy.approval_required", "{data}");
+                assert_eq!(
+                    transmit_gate_entries_on_this_thread() - before,
+                    0,
+                    "expired approval signs nothing"
+                );
+                assert_eq!(simulations.load(Ordering::SeqCst), 1);
+                let store = server.x402_approval_store().unwrap();
+                assert!(matches!(
+                    store.get(&proof.nonce).unwrap().kind,
+                    ApprovalKind::X402Payment { .. }
+                ));
+                assert!(
+                    store
+                        .get(&proof.nonce)
+                        .unwrap()
+                        .attestation_blob_b64
+                        .is_some()
+                );
+                let log =
+                    std::fs::read_to_string(&server.profile.audit_log_path).unwrap_or_default();
+                assert!(!log.contains("x402_payment_authorized"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn approval_expiring_during_preparation_signs_nothing() {
+        expiry_case(false, false).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn key_read_crossing_expiry_signs_nothing() {
+        expiry_case(false, true).await;
+    }
+
+    pub(crate) async fn subject_gate_case(expired: bool) {
+        use crate::tools::common::{
+            ApprovalOutcome, DispatchOutcome, GatedApprovalKind, verify_attestation_subject_gate,
+        };
+        for auth in [false, true] {
+            for governing in [false, true] {
+                stellar_agent_test_support::keyring_mock::install().unwrap();
+                let fixture = crate::tools::message_signing_tests::Fixture::new();
+                let reads = Arc::new(AtomicUsize::new(0));
+                let count = reads.clone();
+                let coord = &fixture.profile.mcp_signer_default;
+                stellar_agent_test_support::keyring_mock::install_with_read_hooks(vec![
+                    stellar_agent_test_support::keyring_mock::ReadHook::new(
+                        &coord.service,
+                        &coord.account,
+                        Arc::new(move || {
+                            count.fetch_add(1, Ordering::SeqCst);
+                        }),
+                    ),
+                ])
+                .unwrap();
+                fixture.seed_signer();
+                fixture.seed_audit();
+                let mut server = fixture.server();
+                server.policy_engine = super::tests::make_require_approval_server().policy_engine;
+                server.set_approval_dir_for_test(fixture.dir.path().join("approvals"));
+                let queued = call(&server, auth, None).await;
+                let nonce = value(&queued)["data"]["approval"]["approval_nonce"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let mut store = server.x402_approval_store().unwrap();
+                let mut entry = store.get(&nonce).unwrap().clone();
+                if governing {
+                    entry.expires_at_unix_ms += 120_000;
+                    drop(store);
+                    server
+                        .set_approval_dir_for_test(fixture.dir.path().join("governing-approvals"));
+                    store = server.x402_approval_store().unwrap();
+                    store
+                        .insert(entry.clone(), entry.created_at_unix_ms)
+                        .unwrap();
+                }
+                drop(store);
+                let proof = attest(&server, &nonce);
+                server.clock = Arc::new(Clock(Arc::new(AtomicU64::new(
+                    entry.created_at_unix_ms + if expired { 120_000 } else { 1 },
+                ))));
+                let expected = if expired {
+                    proof.expected_subject
+                } else {
+                    let ApprovalKind::X402Payment { intent_digest, .. } = &entry.kind else {
+                        panic!("x402");
+                    };
+                    if auth {
+                        stellar_agent_core::approval::subject::approval_subject_x402(intent_digest)
+                    } else {
+                        stellar_agent_core::approval::subject::approval_subject_x402_authenticated(
+                            intent_digest,
+                            "merchant.example",
+                        )
+                    }
+                };
+                let outcome = DispatchOutcome::RequireApproval(ApprovalOutcome::from(
+                    stellar_agent_core::policy::ApprovalRequest::new("reason".into(), 120),
+                ));
+                reads.store(0, Ordering::SeqCst);
+                let refusal = verify_attestation_subject_gate(
+                    &server,
+                    &outcome,
+                    GatedApprovalKind::X402.expectation(expected),
+                    Some(&nonce),
+                    Some(&proof.attestation),
+                    "stellar_x402_create_payment",
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(value(&refusal)["error"]["code"], "policy.approval_required");
+                assert_eq!(
+                    reads.load(Ordering::SeqCst),
+                    0,
+                    "the refused subject reads no payer key"
+                );
+                if !expired {
+                    use stellar_xdr::ReadXdr as _;
+                    let ApprovalKind::X402Payment {
+                        root_invocation_xdr,
+                        home_domain,
+                        ..
+                    } = &entry.kind
+                    else {
+                        panic!("x402");
+                    };
+                    let root = stellar_xdr::SorobanAuthorizedInvocation::from_xdr_base64(
+                        root_invocation_xdr,
+                        stellar_xdr::Limits::none(),
+                    )
+                    .unwrap();
+                    let network = sha2::Sha256::digest(
+                        stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE.as_bytes(),
+                    )
+                    .into();
+                    let digest = stellar_agent_core::approval::subject::soroban_intent_digest(
+                        &network, &root,
+                    )
+                    .unwrap();
+                    let foreign_subject = match home_domain {
+                        Some(domain) => stellar_agent_core::approval::subject::approval_subject_x402_authenticated(&digest, domain),
+                        None => stellar_agent_core::approval::subject::approval_subject_x402(&digest),
+                    };
+                    let outcome = DispatchOutcome::RequireApproval(ApprovalOutcome::from(
+                        stellar_agent_core::policy::ApprovalRequest::new("reason".into(), 120),
+                    ));
+                    let result = verify_attestation_subject_gate(
+                        &server,
+                        &outcome,
+                        GatedApprovalKind::X402.expectation(foreign_subject),
+                        Some(&nonce),
+                        Some(&proof.attestation),
+                        "stellar_x402_create_payment",
+                    )
+                    .await
+                    .unwrap_err();
+                    assert_eq!(value(&result)["error"]["code"], "policy.approval_required");
+                }
+                assert!(matches!(
+                    server
+                        .x402_approval_store()
+                        .unwrap()
+                        .get(&nonce)
+                        .unwrap()
+                        .kind,
+                    ApprovalKind::X402Payment { .. }
+                ));
+            }
+        }
+        #[cfg(feature = "mainnet-write")]
+        if !expired {
+            use crate::tools::common::tests::mainnet::{Fixture, require_approval_rules};
+            let fixture = Fixture::new(|raw| {
+                require_approval_rules(&raw, &["stellar_x402_create_payment"], 600)
+            });
+            let terms = fixture.requirements();
+            let root =
+                stellar_agent_x402::exact::payment_root(&terms, fixture.envelope.source()).unwrap();
+            let mainnet_id =
+                sha2::Sha256::digest(fixture.server.context.network_passphrase().as_bytes()).into();
+            let entry = PendingApproval::new_x402_pending(
+                &mainnet_id,
+                &root,
+                None,
+                stellar_agent_core::approval::process_uid_for_attestation().unwrap(),
+                600_000,
+            )
+            .unwrap();
+            let blob = fixture.attest(&entry);
+            let outcome = fixture
+                .server
+                .dispatch_preparation(
+                    "stellar_x402_create_payment",
+                    &json!({"chain_id":"stellar:mainnet"}),
+                    "stellar:mainnet",
+                    ValueClass::single(x402_value_leg(&terms, 10)),
+                    stellar_agent_core::mainnet::decision::EvaluationScope::Classic,
+                )
+                .await
+                .unwrap();
+            let testnet_id = sha2::Sha256::digest(
+                stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE.as_bytes(),
+            )
+            .into();
+            let digest =
+                stellar_agent_core::approval::subject::soroban_intent_digest(&testnet_id, &root)
+                    .unwrap();
+            let result = verify_attestation_subject_gate(
+                &fixture.server,
+                &outcome,
+                GatedApprovalKind::X402.expectation(
+                    stellar_agent_core::approval::subject::approval_subject_x402(&digest),
+                ),
+                Some(&entry.approval_nonce),
+                Some(&blob),
+                "stellar_x402_create_payment",
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(value(&result)["error"]["code"], "policy.approval_required");
+            assert!(matches!(
+                fixture
+                    .server
+                    .x402_approval_store()
+                    .unwrap()
+                    .get(&entry.approval_nonce)
+                    .unwrap()
+                    .kind,
+                ApprovalKind::X402Payment { .. }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn x402_writer_reads_insert_clock_after_open() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let fixture = crate::tools::message_signing_tests::Fixture::new();
+        let mut server = fixture.server();
+        server.set_approval_dir_for_test(fixture.dir.path().join("approvals"));
+        let terms = serde_json::from_str(&requirements()).unwrap();
+        let root = stellar_agent_x402::exact::payment_root(&terms, &fixture.account).unwrap();
+        let approval = crate::tools::common::ApprovalOutcome::from(
+            stellar_agent_core::policy::ApprovalRequest::new("reason".into(), 120),
+        );
+        let calls = std::cell::Cell::new(0);
+        let store = server.x402_approval_store().unwrap();
+        let result = server.write_x402_pending_approval(&root, None, &approval, || {
+            calls.set(calls.get() + 1);
+            Ok(0)
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            calls.get(),
+            0,
+            "store acquisition precedes the insert clock"
+        );
+        drop(store);
+        let mut old = pending(&server);
+        old.created_at_unix_ms = 1;
+        old.expires_at_unix_ms = 2;
+        server
+            .x402_approval_store()
+            .unwrap()
+            .insert(old.clone(), 1)
+            .unwrap();
+        let entry = server
+            .write_x402_pending_approval(&root, None, &approval, || {
+                calls.set(calls.get() + 1);
+                Ok(3)
+            })
+            .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert!(entry.created_at_unix_ms > 3);
+        let store = server.x402_approval_store().unwrap();
+        assert!(store.get(&old.approval_nonce).is_none());
+        assert!(store.get(&entry.approval_nonce).is_some());
+        drop(store);
+        #[cfg(feature = "mainnet-write")]
+        {
+            use crate::tools::common::tests::mainnet::{Fixture, require_approval_rules};
+            let mut fixture = Fixture::new(|raw| {
+                require_approval_rules(&raw, &["stellar_x402_create_payment"], 600)
+            });
+            fixture.server.clock = Arc::new(FailingClock);
+            let result = fixture
+                .server
+                .call_stellar_x402_create_payment(X402CreatePaymentArgs {
+                    payment_required: serde_json::to_string(&fixture.requirements()).unwrap(),
+                    chain_id: "stellar:mainnet".into(),
+                    address: None,
+                    approval_nonce: None,
+                    approval_attestation: None,
+                    business_id: Some(crate::tools::common::tests::fresh_business_id()),
+                })
+                .await
+                .unwrap();
+            assert_ne!(
+                result.is_error,
+                Some(true),
+                "mainnet insertion uses its own clock: {}",
+                value(&result)
+            );
+            assert!(value(&result)["data"]["approval"]["approval_nonce"].is_string());
+            assert!(value(&result)["data"].get("paymentSignature").is_none());
+        }
+    }
+
+    pub(crate) async fn queue_key_case(auth: bool) {
+        let mut fixture = crate::tools::message_signing_tests::Fixture::new();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let hooks = [
+            &fixture.profile.mcp_signer_default,
+            &fixture.profile.attestation_key_id,
+            &fixture.profile.audit_log_hash_chain_key_id,
+        ]
+        .iter()
+        .map(|coord| {
+            let reads = reads.clone();
+            stellar_agent_test_support::keyring_mock::ReadHook::new(
+                &coord.service,
+                &coord.account,
+                Arc::new(move || {
+                    reads.fetch_add(1, Ordering::SeqCst);
+                }),
+            )
+        })
+        .collect();
+        stellar_agent_test_support::keyring_mock::install_with_read_hooks(hooks).unwrap();
+        fixture.seed_signer();
+        fixture.seed_audit();
+        let coord = &fixture.profile.attestation_key_id;
+        keyring_core::Entry::new(&coord.service, &coord.account)
+            .unwrap()
+            .set_password(&URL_SAFE_NO_PAD.encode([0x5a; 32]))
+            .unwrap();
+        let mock = MockServer::start().await;
+        fixture.profile.rpc_url = mock.uri();
+        Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc":"2.0", "id":1,
+                "result":{"passphrase":"Test SDF Network ; September 2015","protocolVersion":30}
+            })))
+            .mount(&mock)
+            .await;
+        let mut server = fixture.server();
+        server.policy_engine = super::tests::make_require_approval_server().policy_engine;
+        server.set_approval_dir_for_test(fixture.dir.path().join("approvals"));
+        server.set_x402_identity_session_for_test("jwt".into(), fixture.account.clone(), vec![]);
+        let identity = crate::tools::x402_authenticated_payment::identity_calls_on_this_thread();
+        reads.store(0, Ordering::SeqCst);
+        for payee in [
+            stellar_strkey::ed25519::PublicKey([0; 32])
+                .to_string()
+                .to_string(),
+            stellar_strkey::Contract([3; 32]).to_string().to_string(),
+            stellar_strkey::ed25519::MuxedAccount {
+                ed25519: [0; 32],
+                id: 7,
+            }
+            .to_string()
+            .to_string(),
+            stellar_strkey::MuxedContract {
+                contract_id: [3; 32],
+                id: 7,
+            }
+            .to_string()
+            .to_string(),
+        ] {
+            let mut requirements: serde_json::Value =
+                serde_json::from_str(&requirements()).unwrap();
+            requirements["payTo"] = payee.into();
+            let result = call_requirements(&server, auth, None, requirements.to_string()).await;
+            assert_ne!(result.is_error, Some(true), "{}", value(&result));
+        }
+        assert_eq!(reads.load(Ordering::SeqCst), 0, "queueing reads no keys");
+        assert_eq!(
+            crate::tools::x402_authenticated_payment::identity_calls_on_this_thread(),
+            identity
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn x402_queue_reads_no_signer_and_runs_no_identity_gate() {
+        queue_key_case(false).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn pre_sign_check_is_absent_without_an_approval_requirement() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let mut fixture = crate::tools::message_signing_tests::Fixture::new();
+        fixture.seed_signer();
+        fixture.seed_audit();
+        let mock = MockServer::start().await;
+        fixture.profile.rpc_url = mock.uri();
+        let server = fixture.server();
+        let public = stellar_strkey::ed25519::PublicKey::from_string(&fixture.account).unwrap();
+        Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(Rpc {
+                payer: stellar_xdr::ScAddress::Account(stellar_xdr::AccountId(
+                    stellar_xdr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256(public.0)),
+                )),
+                clock: Arc::new(AtomicU64::new(0)),
+                health_expiry: Arc::new(AtomicU64::new(0)),
+                simulations: Arc::new(AtomicUsize::new(0)),
+            })
+            .mount(&mock)
+            .await;
+        for proof in [
+            None,
+            Some(X402ApprovalProof {
+                nonce: "ignored".into(),
+                attestation: "ignored".into(),
+                expected_subject: [0; 32],
+                governing_ttl_ms: 0,
+            }),
+        ] {
+            let before = pre_sign_checks_on_this_thread();
+            let result = call(&server, false, proof.as_ref()).await;
+            assert_ne!(result.is_error, Some(true), "{}", value(&result));
+            assert_eq!(pre_sign_checks_on_this_thread() - before, 0);
+        }
+        for (source, signature) in [
+            (
+                include_str!("x402_create_payment.rs"),
+                concat!("async fn ", "mainnet_x402_payment("),
+            ),
+            (
+                include_str!("x402_authenticated_payment.rs"),
+                concat!("async fn ", "mainnet_authenticated_payment("),
+            ),
+        ] {
+            stellar_agent_test_support::source_order::assert_not_called(
+                "x402",
+                source,
+                signature,
+                &["create_payment_with_pre_sign("],
+            );
+            stellar_agent_test_support::source_order::assert_not_called(
+                "x402",
+                source,
+                signature,
+                &["x402_pre_sign_check("],
+            );
+        }
+    }
+
+    fn child_server() -> Option<WalletServer> {
+        let profile = std::env::var("X402_CHILD_PROFILE").ok()?;
+        let profile = serde_json::from_str(&profile).unwrap();
+        let mut server = WalletServer::new(profile).unwrap();
+        server.set_approval_dir_for_test(std::env::var_os("X402_CHILD_APPROVALS").unwrap().into());
+        Some(server)
+    }
+
+    #[test]
+    #[ignore = "child helper requires an isolated approval fixture"]
+    fn x402_spend_child() {
+        let server = child_server().expect("child fixture");
+        let nonce = std::env::var("X402_CHILD_NONCE").unwrap();
+        let digit: u8 = std::env::var("X402_CHILD_DIGEST").unwrap().parse().unwrap();
+        let result = spend_x402_approval(&server, &nonce, 120_000, &[digit; 32]);
+        std::process::exit(if result.is_ok() { 0 } else { 17 });
+    }
+
+    #[tokio::test]
+    #[ignore = "child helper requires an isolated approval fixture"]
+    async fn x402_crash_child() {
+        let server = child_server().expect("child fixture");
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let coord = &server.profile.audit_log_hash_chain_key_id;
+        keyring_core::Entry::new(&coord.service, &coord.account)
+            .unwrap()
+            .set_password(&URL_SAFE_NO_PAD.encode([0x41; 32]))
+            .unwrap();
+        crate::tools::value_audit::require_value_audit_writer(
+            &server.profile,
+            &server.profile_name_for_approval(),
+            server.audit_binding,
+        )
+        .unwrap();
+        let terms: stellar_agent_x402::wire::PaymentRequirements =
+            serde_json::from_str(&requirements()).unwrap();
+        let leg = ValueLegRecord::from(&x402_value_leg(&terms, 10_000_000));
+        let mut audit = X402AuthorizationAudit::new(
+            &server,
+            "stellar_x402_create_payment",
+            "stellar:testnet",
+            leg,
+        )
+        .with_approval_spend(X402ApprovalSpend {
+            server: &server,
+            nonce: std::env::var("X402_CHILD_NONCE").unwrap(),
+            governing_ttl_ms: 120_000,
+        });
+        let mock = MockServer::start().await;
+        let public = stellar_strkey::ed25519::PublicKey::from_string(
+            &server.profile.mcp_signer_default.account,
+        )
+        .unwrap();
+        Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(Rpc {
+                payer: stellar_xdr::ScAddress::Account(stellar_xdr::AccountId(
+                    stellar_xdr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256(public.0)),
+                )),
+                clock: Arc::new(AtomicU64::new(0)),
+                health_expiry: Arc::new(AtomicU64::new(0)),
+                simulations: Arc::new(AtomicUsize::new(0)),
+            })
+            .mount(&mock)
+            .await;
+        let signer = stellar_agent_network::signing::SoftwareSigningKey::new_from_zeroizing(
+            zeroize::Zeroizing::new([0x63; 32]),
+        );
+        let client = stellar_agent_network::StellarRpcClient::new(&mock.uri()).unwrap();
+        let _ = stellar_agent_x402::exact::create_payment(
+            &terms,
+            &signer,
+            &client,
+            &SorobanCrossCheck::NotRequired,
+            server.context.network_passphrase(),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+            |authorization| audit.before_transmit(authorization),
+        )
+        .await;
+        panic!("the crash boundary must terminate the child");
+    }
+
+    fn crash_case(boundary: &str) {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let fixture = crate::tools::message_signing_tests::Fixture::new();
+        let mut server = fixture.server();
+        server.set_approval_dir_for_test(fixture.dir.path().join("approvals"));
+        let entry = pending(&server);
+        server
+            .x402_approval_store()
+            .unwrap()
+            .insert(entry.clone(), entry.created_at_unix_ms)
+            .unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "tools::x402_create_payment::approval_tests::x402_crash_child",
+            ])
+            .env(
+                "X402_CHILD_PROFILE",
+                serde_json::to_string(&server.profile).unwrap(),
+            )
+            .env(
+                "X402_CHILD_APPROVALS",
+                server.resolve_approval_dir().unwrap(),
+            )
+            .env("X402_CHILD_NONCE", &entry.approval_nonce)
+            .env("X402_CRASH_AFTER", boundary)
+            .env(
+                "X402_CHILD_TRANSMISSION",
+                fixture.dir.path().join("transmitted"),
+            )
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(73));
+        assert!(
+            !fixture.dir.path().join("transmitted").exists(),
+            "a crash sends no signed RPC request"
+        );
+        let store = server.x402_approval_store().unwrap();
+        let ApprovalKind::Consumed { tx_hash, .. } =
+            &store.get(&entry.approval_nonce).unwrap().kind
+        else {
+            panic!("crash retains the durable spend");
+        };
+        assert_eq!(tx_hash.len(), 64);
+        assert!(
+            tx_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        );
+        drop(store);
+        let log = std::fs::read_to_string(&server.profile.audit_log_path).unwrap_or_default();
+        assert_eq!(log.contains("x402_payment_authorized"), boundary == "audit");
+        assert!(
+            !spawn_spend(&server, &entry.approval_nonce, 2)
+                .wait()
+                .unwrap()
+                .success()
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(keyring)]
+    fn x402_crash_after_spend_prevents_retry_release() {
+        crash_case("spend");
+    }
+
+    #[test]
+    #[serial_test::serial(keyring)]
+    fn x402_crash_after_audit_prevents_retry_release() {
+        crash_case("audit");
+    }
+
+    fn spawn_spend(server: &WalletServer, nonce: &str, digit: u8) -> std::process::Child {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("tools::x402_create_payment::approval_tests::x402_spend_child")
+            .env(
+                "X402_CHILD_PROFILE",
+                serde_json::to_string(&server.profile).unwrap(),
+            )
+            .env(
+                "X402_CHILD_APPROVALS",
+                server.resolve_approval_dir().unwrap(),
+            )
+            .env("X402_CHILD_NONCE", nonce)
+            .env("X402_CHILD_DIGEST", digit.to_string())
+            .spawn()
+            .unwrap()
+    }
+
+    #[test]
+    #[serial_test::serial(keyring)]
+    fn one_x402_approval_has_one_spend_winner() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let fixture = crate::tools::message_signing_tests::Fixture::new();
+        for processes in [false, true] {
+            let mut server = fixture.server();
+            server.set_approval_dir_for_test(fixture.dir.path().join(format!("race-{processes}")));
+            let entry = pending(&server);
+            server
+                .x402_approval_store()
+                .unwrap()
+                .insert(entry.clone(), entry.created_at_unix_ms)
+                .unwrap();
+            let results = if processes {
+                let mut first = spawn_spend(&server, &entry.approval_nonce, 1);
+                let mut second = spawn_spend(&server, &entry.approval_nonce, 2);
+                [
+                    first.wait().unwrap().success(),
+                    second.wait().unwrap().success(),
+                ]
+            } else {
+                let barrier = std::sync::Barrier::new(2);
+                std::thread::scope(|scope| {
+                    let first = scope.spawn(|| {
+                        barrier.wait();
+                        spend_x402_approval(&server, &entry.approval_nonce, 120_000, &[1; 32])
+                            .is_ok()
+                    });
+                    let second = scope.spawn(|| {
+                        barrier.wait();
+                        spend_x402_approval(&server, &entry.approval_nonce, 120_000, &[2; 32])
+                            .is_ok()
+                    });
+                    [first.join().unwrap(), second.join().unwrap()]
+                })
+            };
+            assert_eq!(
+                results.iter().filter(|ok| **ok).count(),
+                1,
+                "one approval has one spend winner"
+            );
+            let store = server.x402_approval_store().unwrap();
+            let ApprovalKind::Consumed { tx_hash, .. } =
+                &store.get(&entry.approval_nonce).unwrap().kind
+            else {
+                panic!("durable spend");
+            };
+            assert_eq!(
+                tx_hash,
+                &stellar_agent_core::hex::encode(&[if results[0] { 1 } else { 2 }; 32])
+            );
+            drop(store);
+            assert!(
+                spend_x402_approval(&server, &entry.approval_nonce, 120_000, &[3; 32]).is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "child helper requires an isolated approval fixture"]
+    async fn x402_private_directory_child() {
+        let directory = std::env::var("X402_QUEUE_DIRECTORY").expect("child fixture");
+        let home = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let mut server = super::tests::make_require_approval_server();
+        server.set_approval_dir_for_test(directory.clone().into());
+        assert!(!std::path::Path::new(&directory).exists());
+        let result = call(&server, false, None).await;
+        assert_ne!(result.is_error, Some(true), "{}", value(&result));
+        assert!(value(&result)["data"]["approval"]["approval_nonce"].is_string());
+        assert!(value(&result)["data"].get("paymentSignature").is_none());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        #[cfg(feature = "mainnet-write")]
+        {
+            use crate::tools::common::tests::mainnet::{Fixture, require_approval_rules};
+            let mut fixture = Fixture::new(|raw| {
+                require_approval_rules(&raw, &["stellar_x402_create_payment"], 600)
+            });
+            let path = std::path::Path::new(&directory).with_file_name("mainnet-approvals");
+            assert!(!path.exists());
+            fixture.server.set_approval_dir_for_test(path.clone());
+            let result = fixture
+                .server
+                .call_stellar_x402_create_payment(X402CreatePaymentArgs {
+                    payment_required: serde_json::to_string(&fixture.requirements()).unwrap(),
+                    chain_id: "stellar:mainnet".into(),
+                    address: None,
+                    approval_nonce: None,
+                    approval_attestation: None,
+                    business_id: Some(crate::tools::common::tests::fresh_business_id()),
+                })
+                .await
+                .unwrap();
+            assert_ne!(result.is_error, Some(true), "{}", value(&result));
+            assert!(value(&result)["data"]["approval"]["approval_nonce"].is_string());
+            assert!(value(&result)["data"].get("paymentSignature").is_none());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(
+                    std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    0o700
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn x402_queue_creates_a_private_approval_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = tempfile::tempdir().unwrap();
+        let directory = home.path().join("nested").join("approvals");
+        let status = std::process::Command::new("sh")
+            .args(["-c", "umask 0; exec \"$@\"", "x402"])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "tools::x402_create_payment::approval_tests::x402_private_directory_child",
+            ])
+            .env("X402_QUEUE_DIRECTORY", &directory)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            std::fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    fn pending(server: &WalletServer) -> PendingApproval {
+        let requirements = serde_json::from_str(&requirements()).unwrap();
+        let root = stellar_agent_x402::exact::payment_root(
+            &requirements,
+            &server.profile.mcp_signer_default.account,
+        )
+        .unwrap();
+        let mut entry = PendingApproval::new_x402_pending(
+            &sha2::Sha256::digest(server.context.network_passphrase().as_bytes()).into(),
+            &root,
+            None,
+            stellar_agent_core::approval::process_uid_for_attestation().unwrap(),
+            120_000,
+        )
+        .unwrap();
+        entry.attestation_blob_b64 = Some(URL_SAFE_NO_PAD.encode([0x5a; 32]));
+        entry
+    }
+
+    #[test]
+    #[serial_test::serial(keyring)]
+    fn spend_refuses_a_spent_approval() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let fixture = crate::tools::message_signing_tests::Fixture::new();
+        let mut server = fixture.server();
+        server.set_approval_dir_for_test(fixture.dir.path().join("approvals"));
+        let entry = pending(&server);
+        server
+            .x402_approval_store()
+            .unwrap()
+            .insert(entry.clone(), entry.created_at_unix_ms)
+            .unwrap();
+        spend_x402_approval(&server, &entry.approval_nonce, 120_000, &[1; 32]).unwrap();
+        let refusal =
+            spend_x402_approval(&server, &entry.approval_nonce, 120_000, &[2; 32]).unwrap_err();
+        assert_eq!(value(&refusal)["error"]["code"], "policy.approval_consumed");
+        let store = server.x402_approval_store().unwrap();
+        let ApprovalKind::Consumed { tx_hash, .. } =
+            &store.get(&entry.approval_nonce).unwrap().kind
+        else {
+            panic!("spent");
+        };
+        assert_eq!(tx_hash, &stellar_agent_core::hex::encode(&[1; 32]));
+    }
+
+    #[test]
+    #[serial_test::serial(keyring)]
+    fn spend_refuses_what_is_not_a_live_attested_x402_approval() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let fixture = crate::tools::message_signing_tests::Fixture::new();
+        for case in 0..8 {
+            let mut server = fixture.server();
+            server.set_approval_dir_for_test(fixture.dir.path().join(format!("approvals-{case}")));
+            let mut entry = pending(&server);
+            let time = entry.created_at_unix_ms + 120_000;
+            server.clock = Arc::new(Clock(Arc::new(AtomicU64::new(time))));
+            if case == 0 {
+                entry.expires_at_unix_ms = time + 120_000;
+            }
+            if case == 2 {
+                entry.attestation_blob_b64 = None;
+                entry.expires_at_unix_ms = time + 120_000;
+            }
+            if case == 6 {
+                entry.kind = ApprovalKind::TrustlineClawbackOptIn {
+                    network: "stellar:testnet".into(),
+                    code: "USD".into(),
+                    issuer: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".into(),
+                };
+                entry.expires_at_unix_ms = time + 120_000;
+            }
+            let ttl = if case == 0 { 120_000 } else { 240_000 };
+            let mut store = server.x402_approval_store().unwrap();
+            if case != 3 {
+                store
+                    .insert(entry.clone(), entry.created_at_unix_ms)
+                    .unwrap();
+            }
+            if case == 4 || case == 5 {
+                store
+                    .reject(
+                        &entry.approval_nonce,
+                        entry.created_at_unix_ms,
+                        if case == 4 { 240_000 } else { 120_000 },
+                    )
+                    .unwrap();
+            }
+            drop(store);
+            if case == 7 {
+                server.clock = Arc::new(FailingClock);
+            }
+            let refusal =
+                spend_x402_approval(&server, &entry.approval_nonce, ttl, &[1; 32]).unwrap_err();
+            assert_eq!(
+                value(&refusal)["error"]["code"],
+                if case == 4 {
+                    "policy.approval_rejected"
+                } else {
+                    "policy.approval_required"
+                }
+            );
+            let store = server.x402_approval_store().unwrap();
+            assert!(
+                !store
+                    .get(&entry.approval_nonce)
+                    .is_some_and(|entry| matches!(entry.kind, ApprovalKind::Consumed { .. }))
+            );
+        }
+
+        let mut server = fixture.server();
+        server.set_approval_dir_for_test(fixture.dir.path().join("persistence"));
+        let entry = pending(&server);
+        let mut locked = server.x402_approval_store().unwrap();
+        locked
+            .insert(entry.clone(), entry.created_at_unix_ms)
+            .unwrap();
+        let refusal =
+            spend_x402_approval(&server, &entry.approval_nonce, 120_000, &[1; 32]).unwrap_err();
+        assert_eq!(value(&refusal)["error"]["code"], "policy.approval_required");
+        assert!(matches!(
+            locked.get(&entry.approval_nonce).unwrap().kind,
+            ApprovalKind::X402Payment { .. }
+        ));
+        drop(locked);
+        struct RenameFailureClock {
+            path: std::path::PathBuf,
+            preserved: std::path::PathBuf,
+            now: u64,
+        }
+        impl stellar_agent_core::timefmt::Clock for RenameFailureClock {
+            fn now_unix_ms(&self) -> Result<u64, stellar_agent_core::wallet::WalletLifecycleError> {
+                std::fs::rename(&self.path, &self.preserved).unwrap();
+                std::fs::create_dir(&self.path).unwrap();
+                Ok(self.now)
+            }
+        }
+        let path = server
+            .resolve_approval_dir()
+            .unwrap()
+            .join(format!("{}.toml", server.profile_name_for_approval()));
+        let preserved = path.with_extension("preserved");
+        server.clock = Arc::new(RenameFailureClock {
+            path,
+            preserved: preserved.clone(),
+            now: entry.created_at_unix_ms + 1,
+        });
+        let refusal =
+            spend_x402_approval(&server, &entry.approval_nonce, 120_000, &[1; 32]).unwrap_err();
+        assert_eq!(value(&refusal)["error"]["code"], "policy.approval_required");
+        let store = stellar_agent_core::approval::PendingApprovalStore::open(preserved).unwrap();
+        assert!(matches!(
+            store.get(&entry.approval_nonce).unwrap().kind,
+            ApprovalKind::X402Payment { .. }
+        ));
     }
 }
 
@@ -1999,15 +3779,17 @@ mod tests {
         }
     }
 
-    fn make_require_approval_server() -> crate::server::WalletServer {
+    pub(super) fn make_require_approval_server() -> crate::server::WalletServer {
         use std::sync::Arc;
-        let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
-            .with_noop_engine()
-            .build();
-        // No audit chain key is seeded at this profile's coordinate: gate
-        // verdicts (RequireApproval here) precede the audit pre-flight, so
-        // this scenario must complete without one — the test's assertion on
-        // the fail-closed approval error doubles as the ordering pin.
+        let profile = Profile::builder_testnet(
+            "svc",
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+            "n-svc",
+            "n-acct",
+        )
+        .with_noop_engine()
+        .build();
+        // Queueing requires no signer, attestation, or audit key.
         let mut server = crate::server::WalletServer::new(profile)
             .expect("WalletServer::new must not fail in tests");
         server.policy_engine = Arc::new(RequireApprovalEngine);
@@ -2075,52 +3857,61 @@ mod tests {
         );
     }
 
-    /// Security regression: a `RequireApproval` policy verdict on
-    /// `stellar_x402_create_payment` must return fail-closed `ErrorData` with
-    /// wire code `policy.approval_required_unsupported` and MUST NOT produce a
-    /// signed payment.
+    /// Queueing requires no keys and persists the complete payment intent.
     #[tokio::test]
     #[serial_test::serial(keyring)]
-    async fn require_approval_verdict_is_fail_closed_no_signature_produced() {
-        stellar_agent_test_support::keyring_mock::install().ok();
-        let server = make_require_approval_server();
-        let args = X402CreatePaymentArgs {
-            approval_nonce: None,
-            approval_attestation: None,
-            chain_id: "stellar:testnet".to_owned(),
-            payment_required: sample_requirements_json(),
-            address: None,
-            business_id: None,
+    async fn require_approval_verdict_queues_the_payment_and_signs_nothing() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let mut server = make_require_approval_server();
+        server.set_approval_dir_for_test(home.path().join("approvals"));
+        let result = server
+            .call_stellar_x402_create_payment(X402CreatePaymentArgs {
+                approval_nonce: None,
+                approval_attestation: None,
+                chain_id: "stellar:testnet".to_owned(),
+                address: None,
+                business_id: None,
+                payment_required: sample_requirements_json(),
+            })
+            .await
+            .unwrap();
+        let text = &result.content[0].as_text().unwrap().text;
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_ne!(result.is_error, Some(true), "{value}");
+        let approval = &value["data"]["approval"];
+        assert!(approval.get("endpoint_host").is_none());
+        assert!(!text.contains("paymentSignature"));
+        let requirements: serde_json::Value =
+            serde_json::from_str(&sample_requirements_json()).unwrap();
+        for field in ["payTo", "amount", "asset"] {
+            assert_eq!(approval["summary"][field], requirements[field]);
+        }
+        let store = server.x402_approval_store().unwrap();
+        let entry = store
+            .get(approval["approval_nonce"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(entry.expires_at_unix_ms, entry.created_at_unix_ms + 120_000);
+        let stellar_agent_core::approval::ApprovalKind::X402Payment { home_domain, .. } =
+            &entry.kind
+        else {
+            panic!("queue must persist an x402 approval");
         };
-        let result = server.call_stellar_x402_create_payment(args).await;
-        let result = result.expect(
-            "RequireApproval must return Ok(is_error) envelope, not a protocol error or a signature",
-        );
-        let (code, message, text) = crate::tools::common::assert_business_envelope(&result);
-        assert_eq!(
-            code, "policy.approval_required_unsupported",
-            "wire code must be policy.approval_required_unsupported"
-        );
-        assert!(
-            message.contains("single-shot"),
-            "error message must mention single-shot; got: {message}"
-        );
-        assert!(
-            !text.contains("\"paymentSignature\"") && !text.contains("\"signature\""),
-            "fail-closed approval refusal must not produce a signature; got: {text}"
-        );
+        assert_eq!(home_domain.as_deref(), None);
+        assert!(!server.profile.audit_log_path.exists());
     }
 
-    /// Supplied approval arguments change nothing on testnet: a
-    /// `RequireApproval` verdict still refuses the single-shot payment, absent,
-    /// partial or complete.
+    /// Half proofs refuse without creating an approval.
     #[tokio::test]
     #[serial_test::serial(keyring)]
-    async fn require_approval_verdict_with_supplied_approval_arguments_stays_unsupported() {
+    async fn require_approval_half_proof_is_refused() {
         stellar_agent_test_support::keyring_mock::install().ok();
-        let server = make_require_approval_server();
+        let home = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let mut server = make_require_approval_server();
+        server.set_approval_dir_for_test(home.path().join("approvals"));
         for (nonce, attestation) in [
-            (Some("approval-nonce"), Some("approval-attestation")),
             (Some("approval-nonce"), None),
             (None, Some("approval-attestation")),
         ] {
@@ -2136,8 +3927,9 @@ mod tests {
                 .await
                 .unwrap();
             let (code, _message, text) = crate::tools::common::assert_business_envelope(&result);
-            assert_eq!(code, "policy.approval_required_unsupported", "{text}");
+            assert_eq!(code, "policy.approval_required", "{text}");
             assert!(!text.contains("\"paymentSignature\""), "{text}");
+            assert!(server.x402_approval_store().unwrap().is_empty());
         }
     }
 

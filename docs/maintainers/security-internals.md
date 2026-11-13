@@ -540,7 +540,8 @@ On the ordinary path, the tool prepares the cross-check witness before the signe
 
 On mainnet the oracle bounds the ledger of every payment, not only of a payment that requires the witness. Below the threshold, `obtain_soroban_witness_bound` has the oracle answer the mainnet identity and then `getLatestLedger`. The answer goes through the witness read's retry policy and refusals and the same two ledger checks: it trails the primary's simulation ledger by at most two and lies before the signature expiration. The outcome stays `not_required`. The independent ledger bound limits the expiration window despite an inflated primary answer. A mainnet profile without `oracle_provider_url` refuses every x402 payment with `network.witness_unavailable` (`OracleNotConfigured`) before signing. The expiration still derives from the primary's simulation ledger.
 
-The transmit gate writes the row under the writer guard and requires a current anchor before and after it. Mainnet `x402_payment_authorized` rows record `RequireApproval`, the payment value leg, network, scheme, any required witness, and `signature_expiration_ledger`, the last ledger at which the signed authorization is valid. Every mainnet x402 error reply after the transmit gate passes appends a sentence that names that ledger. The signed authorization may have reached the configured RPC, and the host accepts it through that ledger whatever the wallet does next. A failure withholds the authorization with the mapped audit refusal. A failure after the row adds an `x402_authorization_withheld` row with the same `request_id` and a `failure_stage` label. The labels are `anchor_unavailable`, `resimulation`, `response_processing`, `encoding`, `payload_release`, and `terminal_approval`. On testnet, the anchor stage precedes transmission and keeps admitted spend. On mainnet, it precedes intent consumption, and the claimed intent keeps its spend counted. A missing or undecodable re-simulation result is stage `resimulation`, and so are a re-simulation that asks for a restoration, breaks the fee bounds, or reports a ledger outside the bounds. Re-simulated entries other than the signed entries are stage `response_processing`. On mainnet, a refused intent consumption after the gate is also stage `response_processing`; the signed authorization has not reached the RPC then. `payload_release` marks a refused release consumption, and `terminal_approval` a pending approval that could not be consumed after it. That row is best-effort, and a failure to write it is logged at `error`.
+The transmit gate writes the row under the writer guard and requires a current anchor before and after it. The `x402_payment_authorized` rows record the governing Allow or RequireApproval decision, the payment value leg, network, scheme, any required witness, and `signature_expiration_ledger`.
+That ledger bounds the signed authorization's validity. Every mainnet x402 error reply after the transmit gate passes appends a sentence that names that ledger. The signed authorization may have reached the configured RPC, and the host accepts it through that ledger whatever the wallet does next. A failure withholds the authorization with the mapped audit refusal. A failure after the row adds an `x402_authorization_withheld` row with the same `request_id` and a `failure_stage` label. The labels are `anchor_unavailable`, `resimulation`, `response_processing`, `encoding`, `payload_release`, and `terminal_approval`. On testnet, the anchor stage precedes transmission and keeps admitted spend. On mainnet, it precedes intent consumption, and the claimed intent keeps its spend counted. A missing or undecodable re-simulation result is stage `resimulation`. The same stage covers restoration requests and results outside the fee or ledger bounds. Re-simulated entries other than the signed entries are stage `response_processing`. On mainnet, a refused intent consumption after the gate is also stage `response_processing`; the signed authorization has not reached the RPC then. `payload_release` marks a refused release consumption, and `terminal_approval` a pending approval that could not be consumed after it. That row is best-effort, and a failure to write it is logged at `error`.
 
 The payment intent authorization binds the entry's nonce and signature expiration ledger beside the intent digest, in memory; the ledger record binds the intent digest. `check_preimage_against_authorization` refuses another nonce with `entry_nonce` and another expiration ledger with `entry_expiration`. `sign_soroban_auth_entry_authorized` takes the authorization by value and returns the signature with a `MainnetSignedSorobanIntent`, the only value `consume_soroban_intent` accepts, so one authorization signs one entry.
 
@@ -552,7 +553,7 @@ On mainnet, after release authorization is consumed, the tool consumes the pendi
 | --- | --- | --- |
 | MCP | `stellar_pay_commit`, `stellar_create_account_commit`, `stellar_claim_commit`, `stellar_trustline_commit` | `value_action_pending` (sized legs) |
 | MCP | `stellar_dex_trade`, `stellar_defindex_vault_deposit`, `stellar_defindex_vault_withdraw` | `value_action_pending` (sized legs) before the send; `sa_raw_invocation` on submit failure |
-| MCP | `stellar_x402_create_payment`, `stellar_x402_authenticated_payment` | `x402_payment_authorized` (its own `EventKind` carrying legs, network, and scheme, plus a passed witness when the payment required one), fatal, before the signed re-simulation. `x402_authorization_withheld` follows a later failure, at a stage the paragraphs above list. Mainnet `x402_payment_authorized` rows record `RequireApproval` before signed re-simulation. Later withholding rows identify the failed stage with the same request identifier. |
+| MCP | `stellar_x402_create_payment`, `stellar_x402_authenticated_payment` | `x402_payment_authorized` (its own `EventKind` carrying legs, network, and scheme, plus a passed witness when the payment required one), fatal, before the signed re-simulation. `x402_authorization_withheld` follows a later failure, at a stage the paragraphs above list. Mainnet `x402_payment_authorized` rows record the governing Allow or RequireApproval decision before signed re-simulation. Later withholding rows identify the failed stage with the same request identifier. |
 | MCP | `stellar_sep43_sign_and_submit_transaction` | `value_action_pending` (empty legs for an envelope the policy could not size) |
 | CLI | `pay`, `claim`, `accounts create` (sponsored mode only), `trustline` | `value_action_pending` (sized legs) |
 | CLI | `trade`, `vault deposit`, `vault withdraw` | `value_action_pending` (sized legs) before the send; `sa_raw_invocation` on submit failure |
@@ -2152,3 +2153,44 @@ Audit and policy wire output never carry secrets or raw argument maps:
 On the classic and x402 paths, server-derived text that the wallet does not validate to a fixed shape passes through `quote_server_text` or `escape_server_text`. Values validated to a fixed shape (an LDH endpoint host, strkeys, the network, amounts) are printed as validated. The scrub applies before the text reaches an error, a tool result, or a log line, and covers RPC errors, the simulation `error`, SEP-10 and stellar.toml answers, and x402 header fields. Each URL keeps its host and port, and each whitespace run becomes one space. Other control characters and non-ASCII characters become `\u{...}` escapes, and the text is cut at 200 characters. An error quotes the text. A SEP-10 answer with a non-2xx status reports the method and the status; its body is not read. A stellar.toml syntax error reports its line and column, not the line itself.
 
 Smart-account audit constructors require their strkey and hash fields to be pre-redacted at the call site (first-5-last-5 for addresses, first-8-last-8 for hashes) before the entry is built; the constructors do not redact internally. Policy `DenyReason` strkey/contract-id fields are redacted to first-5-last-5 at the MCP boundary, and the `_commit` verifier collapses `Expired` / `NotFound` / `AlreadyAttested` into the single wire code `policy.approval_required` so the caller cannot distinguish those internal states.
+
+### x402 owner approval
+
+Supply `approval_nonce` with `approval_attestation` when the policy requires approval, on either network.
+On testnet, a clock reading before approval creation refuses the approval without consuming it.
+
+When the policy requires approval, the tool queues the payment and returns
+`data.approval` with the approval nonce. Nothing is signed.
+The owner approves with `stellar-agent approve`. The repeated call with
+`approval_nonce` and `approval_attestation` pays.
+Queueing reads no key and runs no SEP-10 exchange.
+
+The approval binds the network, asset, payer, payee including its mux id, and amount.
+The authenticated tool also binds the home domain.
+A call with changed terms or an expired approval answers `policy.approval_required`
+and signs nothing. Final verification follows attestation and payer-key reads,
+immediately before the signing primitive, with no intervening I/O or await.
+
+An approval releases at most one signed authorization.
+A failed or interrupted call can spend it without returning a payment payload.
+A repeated proof with a live spent tombstone answers `policy.approval_consumed`.
+An expired or pruned tombstone can answer `policy.approval_required`.
+The authorization expires within 60 ledgers of the paying call's simulation ledger.
+The protocol estimates five seconds per ledger.
+
+On mainnet, Allow without approval arguments pays in one call under policy authority.
+A supplied proof must verify, even under Allow.
+On testnet, Allow pays without owner approval and ignores supplied approval arguments for valid terms.
+Owner approval is required only when the policy requires it.
+
+Before testnet dispatch, a complete approval pair answers `policy.approval_required` for invalid network,
+asset, amount, or payee terms, including a W payee on an unsupported protocol.
+A later protocol refusal keeps `x402.muxed_contract_protocol_unsupported`.
+Without approval arguments, an address mismatch under RequireApproval answers
+`policy.approval_required_unsupported`. Nothing is queued or signed.
+
+The CLI labels spent x402 approvals with `payment digest`.
+On mainnet, this hashes the final envelope's base64 text.
+On testnet, this hashes the XDR vector of signed authorization entries.
+Testnet spends approval inside the transmit gate before its authorized audit row and signed RPC request.
+Mainnet retains its consumption after payload release authorization.

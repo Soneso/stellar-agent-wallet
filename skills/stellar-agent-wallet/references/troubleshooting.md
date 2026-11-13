@@ -131,7 +131,7 @@ engine is first-match, default-deny over signed, typed criteria.
 | `policy.deny.unsizable_value_effect` | A value rule matched a tool whose value cannot be sized, including the raw signing tools. | Size the call through a supported verb, or ask the operator to set `allow_opaque_signing = true` on the matched rule if raw signing is intended. |
 | `trustline.clawback_opt_in_required` | Trusting a clawback-enabled issuer requires a recorded operator opt-in. | Ask the operator to run the printed `stellar-agent approve --id <nonce> --profile <name>` opt-in, then re-invoke. |
 | `policy.approval_required` | A two-phase signing verb reached its commit step without a valid operator approval, or the attestation was absent, invalid, or expired. This single code intentionally covers every approval-path failure mode (missing, expired, wrong-kind, hash mismatch, HMAC mismatch) so callers cannot probe which. | Ask the operator to run `stellar-agent approve --id <nonce> --profile <name>`, then re-submit the commit with the returned `approval_nonce` and `approval_attestation`. Use the approval nonce from simulation, which checks both tool names. If the request expires or no request exists, simulate again and review the new response. |
-| `policy.approval_required_unsupported` | The policy returned RequireApproval for a single-shot sign tool (no simulate/commit split: SEP-43 sign verbs, `stellar_sep43_sign_and_submit_transaction`, SEP-53 `sign_message`, and on testnet x402 `create_payment` / `authenticated_payment`). The wallet refuses fail-closed rather than sign without approval. | Cannot proceed via the agent. Ask the operator to either adjust policy so this operation does not require approval, or perform it through a two-phase tool (`stellar_pay`, `stellar_create_account`, `stellar_trustline`, `stellar_claim`, `stellar_rule_create` and their `*_commit`). On an admitted mainnet server, x402 payments use two calls. Call without approval arguments. After terminal CLI approval, repeat with both approval arguments. The operator approves with `stellar-agent approve --id <nonce> --profile <name>`. Only CLI approval attests x402 payments. |
+| `policy.approval_required_unsupported` | The policy requires approval for a tool without an approval flow: SEP-43 sign verbs, `stellar_sep43_sign_and_submit_transaction`, or SEP-53 `sign_message`. An x402 address mismatch without proof under RequireApproval also uses this refusal. The wallet refuses fail-closed rather than sign without approval. | Cannot proceed via the agent. Ask the operator to either adjust policy so this operation does not require approval, or perform it through a two-phase tool (`stellar_pay`, `stellar_create_account`, `stellar_trustline`, `stellar_claim`, `stellar_rule_create` and their `*_commit`). On mainnet, Allow without proof pays in one call. RequireApproval without proof queues. After owner approval, repeat with both approval arguments. The operator approves with `stellar-agent approve --id <nonce> --profile <name>`. Testnet x402 approvals use the terminal command. |
 | `policy.engine_required` | The active engine cannot decide the call. Fires for the Noop engine on a destructive tool on `stellar:mainnet`, and for V1 engine errors such as a missing or unverifiable policy document. | Report the refusal to the operator. The profile needs a valid V1 policy and admitted context. Do not switch networks. |
 | `policy.unexpected_decision` | Forward-compatibility catch-all for an engine decision the gate does not recognize. Fail-closed. | Treat as a hard refusal. Report to the operator; do not retry. |
 
@@ -459,7 +459,7 @@ again.
 | `submission.hash_mismatch` | The endpoint reported a transaction hash that does not describe the transaction that was sent. `details` carries both hashes. | Reconcile `details.tx_hash`. Report the mismatch to the operator: the endpoint is not describing what it was handed. |
 | `submission.record_unavailable` | A receipt, spending-window, or audit-record failure. Before submission, this means that attempt sent nothing; a pending-row anchor failure carries `audit.tip_anchor_unavailable` in the message. During status recovery, it concerns an existing submission and does not establish whether it was sent. | Report to the operator. After repair, repeat `stellar_transaction_status` for an existing submission; do not rebuild or resubmit it. Retry submission only when the failure is known to precede the send. |
 | `submission.tx_malformed` | The endpoint refused the transaction outright, reporting a validation error for the envelope (for example the fee was below the current floor). The wallet never sends those bytes again. A reported failure or missing transaction does not release possible spending: the record stays `pending`. The reservation keeps counting through its accounting horizon or, without a time bound, until the operator clears it with both acknowledgement flags. On a mainnet profile a refusal is reported as `submission.tx_timeout` instead, because no second endpoint confirms it. | Call `stellar_transaction_status` with `details.tx_hash`. Once the accounting horizon has passed or the operator has cleared the record, a fresh attempt must still pass the spending window's duplicate and cap checks. Do not resubmit the same bytes. |
-| `policy.approval_consumed` | The approval presented was already spent. A classic approval was spent on a submission. A consumed x402 approval cannot be replayed. Its stored digest identifies the final envelope, not a chain transaction. | Do not re-present the same approval. For a classic approval, check that transaction's status before asking for the action again. For an x402 payment, request a new payment intent with call 1 and a fresh approval. |
+| `policy.approval_consumed` | The approval presented was already spent. A classic approval was spent on a submission. A consumed x402 approval cannot be replayed. Its stored digest identifies the final envelope on mainnet or signed authorization entries on testnet. It is not a chain transaction hash. | Do not re-present the same approval. For a classic approval, check that transaction's status before asking for the action again. For an x402 payment, request a new payment intent with call 1 and a fresh approval. |
 
 What `stellar_transaction_status` reports, and what it means:
 
@@ -857,7 +857,7 @@ sub-code. A rotation-spanning outage can require `audit reanchor` after restart.
 | `x402.invalid_asset_address` | The requirement's `asset` is not a contract address (C-strkey). | Do not pay with this requirement. Pick another `accepts[]` element, or report the requirement to the operator. |
 | `x402.fees_not_sponsored` | The requirement's `extra.areFeesSponsored` is not the JSON boolean `true`. | Do not pay with this requirement. Pick another `accepts[]` element with sponsored fees, or report the requirement to the operator. |
 | `x402.amount_conversion` | The requirement's `amount` is not a positive integer, or does not fit in a signed 128-bit integer. | Do not pay with this requirement. Pick another `accepts[]` element, or report the requirement to the operator. |
-| `x402.muxed_contract_protocol_unsupported` | The W payee requires protocol 30 or later; the checked endpoint reports an older protocol. | Choose an eligible requirement or wait for the network upgrade. Preserve the full payee and id. |
+| `x402.muxed_contract_protocol_unsupported` | The W payee requires protocol 30 or later; the checked endpoint reports an older protocol. Before dispatch, a complete testnet approval pair answers `policy.approval_required`. A later protocol refusal keeps its x402 code. | Choose an eligible requirement or wait for the network upgrade. Preserve the full payee and id. |
 | `x402.keyring_load_failed` | The signer cannot be loaded, for a reason that has no `auth.*` code of its own. | Do not retry. Ask the operator to check the profile's signer entry. |
 | `x402.auth_entry_sign_failed` | `stellar_x402_create_payment` cannot sign the payer's authorization entry. `stellar_x402_authenticated_payment` reports this as `x402.payment_build_failed`. | Do not retry in a loop. Report it to the operator. |
 | `x402.transaction_build_failed` | `stellar_x402_create_payment` cannot assemble the payment, for example because the re-simulation data does not decode. `stellar_x402_authenticated_payment` reports this as `x402.payment_build_failed`. | Do not retry in a loop. Report it to the operator. |
@@ -969,3 +969,44 @@ Snapshots containing signed intents or intent links use version 9. Records missi
 An unavailable observation leaves retained charges unchanged while the policy check continues. Read only tools and preparation requests acquire no charge closure witnesses.
 
 Signing through a supplied secondary endpoint does not give that endpoint authority to close retained intents.
+
+### x402 owner approval
+
+Supply `approval_nonce` with `approval_attestation` when the policy requires approval, on either network.
+On testnet, a clock reading before approval creation refuses the approval without consuming it.
+
+When the policy requires approval, the tool queues the payment and returns
+`data.approval` with the approval nonce. Nothing is signed.
+The owner approves with `stellar-agent approve`. The repeated call with
+`approval_nonce` and `approval_attestation` pays.
+Queueing reads no key and runs no SEP-10 exchange.
+
+The approval binds the network, asset, payer, payee including its mux id, and amount.
+The authenticated tool also binds the home domain.
+A call with changed terms or an expired approval answers `policy.approval_required`
+and signs nothing. Final verification follows attestation and payer-key reads,
+immediately before the signing primitive, with no intervening I/O or await.
+
+An approval releases at most one signed authorization.
+A failed or interrupted call can spend it without returning a payment payload.
+A repeated proof with a live spent tombstone answers `policy.approval_consumed`.
+An expired or pruned tombstone can answer `policy.approval_required`.
+The authorization expires within 60 ledgers of the paying call's simulation ledger.
+The protocol estimates five seconds per ledger.
+
+On mainnet, Allow without approval arguments pays in one call under policy authority.
+A supplied proof must verify, even under Allow.
+On testnet, Allow pays without owner approval and ignores supplied approval arguments for valid terms.
+Owner approval is required only when the policy requires it.
+
+Before testnet dispatch, a complete approval pair answers `policy.approval_required` for invalid network,
+asset, amount, or payee terms, including a W payee on an unsupported protocol.
+A later protocol refusal keeps `x402.muxed_contract_protocol_unsupported`.
+Without approval arguments, an address mismatch under RequireApproval answers
+`policy.approval_required_unsupported`. Nothing is queued or signed.
+
+The CLI labels spent x402 approvals with `payment digest`.
+On mainnet, this hashes the final envelope's base64 text.
+On testnet, this hashes the XDR vector of signed authorization entries.
+Testnet spends approval inside the transmit gate before its authorized audit row and signed RPC request.
+Mainnet retains its consumption after payload release authorization.
