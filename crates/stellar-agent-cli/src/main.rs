@@ -588,9 +588,10 @@ fn run_profile_startup_advisory(
 
 /// Whether `command` skips the startup advisory.
 ///
-/// `profile init` and `profile enable-mainnet` write their spending preview
-/// to stderr before their first write. An advisory scan ahead of them could
-/// write an audit row and stderr text first, so both skip it.
+/// `profile init`, `profile enable-mainnet`, and the `profile policy` verbs
+/// write their spending preview to stderr before their first write. An
+/// advisory scan ahead of them could write an audit row and stderr text
+/// first, so they skip it.
 fn defers_startup_advisory(command: &Commands) -> bool {
     matches!(
         command,
@@ -599,6 +600,7 @@ fn defers_startup_advisory(command: &Commands) -> bool {
                 args.subcommand,
                 commands::profile::ProfileSubcommand::Init(_)
                     | commands::profile::ProfileSubcommand::EnableMainnet(_)
+                    | commands::profile::ProfileSubcommand::Policy(_)
             )
     )
 }
@@ -752,6 +754,24 @@ mod tests {
     fn advisory_profile_flag(argv: &[&str]) -> Option<String> {
         let cli = Cli::try_parse_from(argv).expect("argv must parse");
         cli.command.profile_flag().map(str::to_owned)
+    }
+
+    /// `profile policy add-counterparty` requires its flag and reports it.
+    #[test]
+    fn profile_policy_reports_its_flag() {
+        assert_eq!(
+            advisory_profile_flag(&[
+                "stellar-agent",
+                "profile",
+                "policy",
+                "add-counterparty",
+                "--profile",
+                "alice",
+                "--recipient",
+                "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+            ]),
+            Some("alice".to_owned())
+        );
     }
 
     /// A verb that resolves the environment variable reports no flag when none

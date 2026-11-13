@@ -559,6 +559,15 @@ mod tests {
             ][..],
             &["profile", "enable-mainnet", "--profile", "operator"][..],
             &["profile", "init", "--profile", "operator"][..],
+            &[
+                "profile",
+                "policy",
+                "add-counterparty",
+                "--profile",
+                "operator",
+                "--recipient",
+                "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+            ][..],
         ] {
             let result = run(args);
             assert!(result.triggered_rule_ids.is_empty(), "{args:?}");

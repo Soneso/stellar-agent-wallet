@@ -1071,6 +1071,10 @@ decides `allow`, and sets `allow_opaque_signing = false`.
   `C_ACCOUNT` with `allowlist = []`. G, M, and C recipients share that one
   list, and no listed recipient is paid until one is added. A G address
   also covers its M addresses; an M entry covers only its own mux ID.
+  `profile policy add-counterparty` adds a G, M, C, or W recipient and the
+  kind a list needs. An entry admits the address under the policy; it does
+  not change which destination forms a payment command accepts. A W entry
+  takes effect when the wallet pays W destinations.
 - A chosen unlisted budget writes the same `unlisted` table on every payment
   rule. Equal tables share one counter per asset, so one budget of `U` per
   rolling day, at most `P/2` per payment, bounds the four payment tools

@@ -670,6 +670,7 @@ Mainnet selection requires an explicit flag.
 `resume` accept exactly one selector:
 a positional name or `--profile`, without a default.
 `list` takes none. `enable-mainnet` requires an explicit nondefault profile.
+`policy add-counterparty` requires `--profile <NAME>`, without a default.
 `reset-mpp-state` requires `--acknowledge`; `enable-mainnet` offers `--check` and
 `--rotate`. These commands operate on local configuration and keyring state.
 
@@ -685,6 +686,7 @@ a positional name or `--profile`, without a default.
 | `halt <NAME>` | `profile halt default --reason "agent sent unexpected payments"` | State-changing (writes the halt marker and one audit row). Operator-only. See [Profile halt and resume](#profile-halt-and-resume). |
 | `resume <NAME>` | `profile resume default` | State-changing (writes one audit row and removes the halt marker). Operator-only. |
 | `sign-policy` | `profile sign-policy --profile default --secret-env WALLET_OWNER_SK` | State-changing (writes the policy file, atomic). Signs `<state_dir>/policies/<profile>.toml` (or `--file`) with the owner seed and writes the `[signature]` table. The authoring guard holds `<policy_path>.authoring.lock` from read through replacement and binds no earlier preview. Lock refusals use `sign_policy.authoring_lock_busy` or `sign_policy.authoring_lock_io`. Older base64 entries refuse with `sign_policy.owner_key_older_form`; enroll the owner public key again. Mismatch errors identify enrolled bytes by fingerprint. Requires the enrolled seed, or `--previous-owner-secret-env VAR` to authorize the new owner with the previous seed. That seed must match the pinned owner, or the enrolled owner when no pin exists. |
+| `policy add-counterparty` | `profile policy add-counterparty --profile <NAME> --recipient <ADDRESS>` | State-changing (writes the policy file, atomic). Adds one G, M, C, or W recipient to every address list of the target payment rules, after a stderr preview. Edits a draft without a seed; a signed policy is signed again after a hidden seed prompt. See [`profile policy add-counterparty`](#profile-policy-add-counterparty). |
 
 With an enrolled owner, the profile's `[policy] engine` must match the verified
 signed policy's top-level `engine`. An omitted signed selector means `v1`.
@@ -769,7 +771,7 @@ write nothing, except that a policy file is kept when the profile write fails.
 Refusals after the preview carry it at `error.details.preview`. A failed
 profile write exits `1` with an internal error.
 
-`enroll-signer` reads the signer seed from the shell environment. `enroll-owner-key`, `sign-policy`, and `bind-signer` read the owner seed from that environment. The operator supplies each seed as [Pass a secret seed](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/getting-started.md#pass-a-secret-seed) shows, only for those commands, and unsets it afterward. Of the policy owner key, the MCP server holds only the enrolled public key. It reads no seed from its environment.
+`enroll-signer` reads the signer seed from the shell environment. `enroll-owner-key`, `sign-policy`, and `bind-signer` read the owner seed from that environment. The operator supplies each seed as [Pass a secret seed](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/getting-started.md#pass-a-secret-seed) shows, only for those commands, and unsets it afterward. `policy add-counterparty` prompts for the owner seed on the terminal without echo. It does not read the owner seed from an environment variable. Of the policy owner key, the MCP server holds only the enrolled public key. It reads no seed from its environment.
 
 ### `profile bind-signer`
 
@@ -823,6 +825,75 @@ A present mainnet table receives bootstrap validation: origin and pin must appea
 Stdout carries one JSON envelope. Valid input exits 0.
 With `--origin`, valid input declaring an origin exits 3, signed or unsigned.
 Invalid input exits 65 with its policy code. Profile access and input errors exit 1.
+
+### `profile policy add-counterparty`
+
+Syntax, with placeholders in angle brackets and optional repeated parts in
+square brackets:
+
+```text
+stellar-agent profile policy add-counterparty --profile <NAME> --recipient <ADDRESS> [--tool <TOOL>]...
+```
+
+Adds one payment recipient to `<state_dir>/policies/<profile>.toml`.
+`--recipient` takes a G, M, C, or W address; another form refuses with
+`profile.policy_recipient_invalid` before any read, without repeating it.
+`--tool` selects a payment tool and repeats; without it every payment tool is
+selected. A value outside the payment tools refuses with `validation.usage_error`.
+
+A body without a root `signature` key is a draft; any `signature` value selects
+the signed path. Each selected tool targets its first matching rule, and every
+address list of those rules gains the recipient and, when missing, its kind.
+A list that also selects `HOME_DOMAIN` splits off an address list. The refusals
+keep the core codes: `profile.policy_recipient_list_missing`,
+`profile.policy_recipient_kind_conflict`, `profile.policy_recipient_list_unsupported`
+for a `KNOWN_ISSUER` list or a domain list with `unlisted`,
+`profile.policy_network_unknown`, and `profile.policy_counterparty_ambiguous`.
+An ambiguity adds one hint about `--tool`.
+
+A recipient every target list already covers, directly or through its G or C
+base, exits `0` with `changed = false` and `covered_by`; nothing is signed,
+prompted, locked, or written. An entry admits the address under the policy; it
+does not change which destination forms a payment command accepts. A W entry
+takes effect when the wallet pays W destinations, and stderr and
+`destination_note` say so.
+
+Before the guard, the prompt, and any write, stderr carries one JSON preview
+line with `spending_summary` and `edit_scope`, one `{rule, tools, wildcard}`
+object per edited rule. An unwritable preview refuses with
+`profile.spending_preview_unwritable`. Later refusals carry the preview at
+`error.details.preview`.
+
+Signed path: the body must verify against the enrolled owner (its `policy.*`
+code otherwise; review the body, then run `profile sign-policy`). A pending
+owner rotation refuses with `profile.policy_owner_rotation_pending`, a body
+without `version = 2` with `profile.policy_version_required`, and a body below
+or forking the pin with `policy.sequence_rollback` or `policy.sequence_fork`.
+Every `sign-policy` check follows. Without a terminal it refuses with
+`profile.policy_owner_prompt_required`; `profile sign-policy --secret-env`
+covers unattended signing. Under the authoring guard it rereads the file, the
+profile, the pin, and the prepared body; a difference refuses with
+`profile.policy_changed_during_edit` before the prompt. It then prompts
+`Policy owner seed (hidden): ` and repeats those checks before it signs. It
+verifies the rendered text and reloads the profile. Under the policy-state lock
+it compares the pin, rereads the file, and replaces it. The lock order is the
+authoring lock, then the policy-state lock. Ctrl-C at the prompt can leave echo
+off; `stty sane` restores it. It does not read the owner seed from an
+environment variable.
+
+Draft path: no keyring, pin, seed, or terminal. The edited draft must pass the
+unsigned loader checks (`sign_policy.policy_body_invalid` otherwise), keeps its
+sequence, and gains no signature. Under the guard it rereads the file and the
+profile before the replace. Stderr and `next_steps` name
+`stellar-agent profile sign-policy --profile <NAME> --secret-env <VAR>`.
+
+Output: `profile`, `recipient`, `kind`, `changed`, `signed`, `policy_path`,
+`updated_rules`, `kinds_added`, `split_rules`, `edit_scope`, `ungated_tools`,
+`denied_tools`, `spending_summary`, and `warnings`. A signed change adds
+`owner_address`, `previous_sequence`, `sequence`, and `digest`. Before the
+replace the file is unchanged; after it the change is complete. The pin,
+window counters, keyring, and audit log stay untouched. A stdout failure after
+the replace exits `1` with the change written.
 
 ### `profile apply-fragment`
 
@@ -997,7 +1068,7 @@ Missing pin uses `enroll_signer.repair_unpinned`; conflicts use
 
 `profile halt <NAME> [--reason <REASON>]` is the operator's emergency stop. It loads the profile, then writes `profiles/<name>.halt` in the data directory with `halted_at` and the reason, and records a `profile_halted` audit row. A profile that does not load is refused with the profile's load or reconciliation code and gets no marker; the reason is examined only after the profile loads. The marker is written before the row, so the halt holds even when the row cannot be written; `audit_row` in the result reports `written`, `queued`, or `not_written`. Halting again rewrites the marker. A blank `--reason` refuses with `validation.reason_empty`; one over 128 characters or with a control character refuses with `validation.reason_invalid`. A marker write or removal failure refuses with `io.halt_marker`.
 
-While the profile is halted, these refuse with `profile.halted` (exit `1`), before reading a signer or sending a request: `pay` and `claim` (each except `--build-only`), `accounts create` in both modes, `accounts deploy-c`, `trustline`, `trade`, `vault deposit` and `withdraw`, `mpp charge authorize`, `pool init`, `smart-account multicall` and `execute`, the `rules` and `signers` write verbs, `migrate-verifier` (except `--dry-run`), the four `deploy-*` commands, and `timelock schedule`, `cancel`, and `execute`. The MCP server refuses every tool that is not read-only from its next call. Read-only commands, `profile show`, `audit verify`, `profile sign-policy`, the `enroll-*` and `rotate-*` subcommands, `approve`, and the verbs that only record or reconcile local state (`mpp receipt record`, `mpp settlement reconcile`, `mpp state prune`, `tx status`) keep working. An unreadable marker refuses the same actions with `profile.halt_unreadable`.
+While the profile is halted, these refuse with `profile.halted` (exit `1`), before reading a signer or sending a request: `pay` and `claim` (each except `--build-only`), `accounts create` in both modes, `accounts deploy-c`, `trustline`, `trade`, `vault deposit` and `withdraw`, `mpp charge authorize`, `pool init`, `smart-account multicall` and `execute`, the `rules` and `signers` write verbs, `migrate-verifier` (except `--dry-run`), the four `deploy-*` commands, and `timelock schedule`, `cancel`, and `execute`. The MCP server refuses every tool that is not read-only from its next call. Read-only commands, `profile show`, `audit verify`, `profile sign-policy`, `profile policy add-counterparty`, the `enroll-*` and `rotate-*` subcommands, `approve`, and the verbs that only record or reconcile local state (`mpp receipt record`, `mpp settlement reconcile`, `mpp state prune`, `tx status`) keep working. An unreadable marker refuses the same actions with `profile.halt_unreadable`.
 
 `profile resume <NAME>` loads the profile, reads the marker, appends a `profile_resumed` row, and removes the marker only after the row is committed. On a halted profile a marker that cannot be read, such as a directory at its path, refuses with `profile.halt_unreadable` and writes no row; the operator repairs the file or removes the path by hand. A row that cannot be appended refuses with its audit code and keeps the marker. A marker that cannot be removed after the row refuses with `io.halt_marker` and keeps the halt; fix the file and run `profile resume` again. A `profile_resumed` row records that the command ran; the marker file decides the state, and exit `1` means the profile is still halted. Resuming a profile that is not halted exits `0` with `halted: false` and `was_halted: false`.
 

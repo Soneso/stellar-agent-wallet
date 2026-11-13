@@ -259,7 +259,9 @@ Flags:
 Signing commands read a secret seed from the environment variable that
 `--secret-env` names. Read the seed without echo, export it only for the
 commands that need it, and unset it afterward. A seed typed into a command line
-lands in the shell history file.
+lands in the shell history file. `profile policy add-counterparty` prompts for
+the owner seed on the terminal without echo. It does not read the owner seed
+from an environment variable.
 
 In bash or zsh, run this line on its own, paste the seed when prompted, and
 press Enter. It prints nothing while you paste:
@@ -628,8 +630,11 @@ preset to `policies/<NAME>.toml`, after it previews the bounds on stderr.
 Review it before you sign it with `profile sign-policy`:
 
 - Recipients: each payment rule lists G, M, and C recipients in one
-  `allowlist`, which starts empty. Add each recipient's address to the
-  `allowlist` of all four payment rules before signing.
+  `allowlist`, which starts empty. Before signing, run
+  `profile policy add-counterparty --profile <NAME> --recipient <ADDRESS>`
+  on the draft for each recipient; it edits every payment rule's list. On a
+  signed policy, the same command adds a recipient later and signs the change
+  after a seed prompt.
 - Unlisted recipients: with `--unlisted-budget yes`, an api preset pays
   recipients outside the list from one budget per rolling day, shared by
   CLI `pay` and the MCP payment tools. A payment beyond it is denied.
