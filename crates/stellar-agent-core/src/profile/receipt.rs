@@ -395,6 +395,71 @@ pub struct AccountingExpiryProjection<'a> {
     pub decision_id: &'a str,
 }
 
+/// The receipt of one checked recovery decision, built by the caller from
+/// authenticated window state.
+///
+/// [`ReceiptStore::replace_checked`] writes it. The receipt is display data,
+/// and its decision identifier names the committed decision without
+/// supplying settlement authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckedReceiptProjection {
+    /// The receipt the projection writes, keyed by its `envelope_hash`.
+    pub receipt: SubmissionReceipt,
+    /// The committed decision's identifier, in lowercase hex.
+    pub decision_id: String,
+}
+
+impl CheckedReceiptProjection {
+    /// Builds the receipt of one checked decision.
+    ///
+    /// The receipt is submitted, not recovered from a reservation, and carries
+    /// no approval consumption and no reorg bookkeeping. An `Ambiguous` status
+    /// carries [`ReleaseEvidence::ReleasedOnEvidence`]. The decision
+    /// identifier is stored in [`SubmissionReceipt::settlement_decision_id`].
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the receipt identity is built atomically"
+    )]
+    pub fn new(
+        envelope_hash: String,
+        tx_hash: String,
+        source: String,
+        sequence: i64,
+        max_time: u64,
+        recorded_at_ledger: u32,
+        status: ReceiptStatus,
+        ledger: Option<u32>,
+        approval_nonce: Option<String>,
+        decision_id: String,
+    ) -> Self {
+        let release_code =
+            (status == ReceiptStatus::Ambiguous).then_some(ReleaseEvidence::ReleasedOnEvidence);
+        let receipt = SubmissionReceipt {
+            envelope_hash,
+            tx_hash,
+            source,
+            sequence,
+            status,
+            ledger,
+            recorded_at_ledger,
+            max_time,
+            prior_ledger: None,
+            reorg_pending_at_ledger: None,
+            submitted: true,
+            approval_nonce,
+            approval_consumed: false,
+            recovered_from_reservation: false,
+            release_code,
+            settlement_decision_id: Some(decision_id.clone()),
+        };
+        Self {
+            receipt,
+            decision_id,
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // SubmissionReceipt
 // ─────────────────────────────────────────────────────────────────────────────
@@ -597,11 +662,11 @@ pub struct SubmissionReceipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_code: Option<ReleaseEvidence>,
 
-    /// The identifier of the authenticated accounting decision projected onto
-    /// this receipt.
+    /// The identifier of the authenticated decision projected onto this
+    /// receipt: an accounting expiry, or a checked recovery decision.
     ///
-    /// This display identifier locates an authenticated accounting decision.
-    /// The identifier alone supplies no settlement authority.
+    /// This display identifier locates an authenticated decision. The
+    /// identifier alone supplies no settlement authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settlement_decision_id: Option<String>,
 }
@@ -1575,6 +1640,55 @@ impl ReceiptStore {
         persist_locked(&mut session.guard)
     }
 
+    /// Replaces the receipt `projection` names with the receipt of its checked
+    /// decision.
+    ///
+    /// Under the receipt write lock, a stored `ClearedByOperator` status and a
+    /// stored `approval_consumed = true` survive; every other field comes from
+    /// the projection. A merged receipt equal to the stored one is not
+    /// rewritten: the store confirms the file and its directory durable
+    /// instead. Otherwise the receipt is replaced and the indexes rebuilt.
+    ///
+    /// A checked projection takes precedence over reconciliation and
+    /// accounting expiry writes. The receipt stays display data and grants no
+    /// retry or settlement.
+    ///
+    /// # Errors
+    ///
+    /// - [`ReceiptStoreError::MutexPoisoned`] if the lock is poisoned.
+    /// - [`ReceiptStoreError::WriterLocked`] if another process holds the
+    ///   sidecar lock for the whole retry window.
+    /// - [`ReceiptStoreError::Io`] or [`ReceiptStoreError::Json`] on read,
+    ///   persist or durability failure. A failure after the rename leaves the
+    ///   complete replacement readable.
+    ///
+    /// # Panics
+    ///
+    /// Never panics.
+    pub fn replace_checked(
+        &self,
+        projection: &CheckedReceiptProjection,
+    ) -> Result<(), ReceiptStoreError> {
+        let mut session = self.write_session()?;
+        let key = projection.receipt.envelope_hash.as_str();
+        let mut merged = projection.receipt.clone();
+        if let Some(existing) = session.guard.map.get(key) {
+            if existing.status == ReceiptStatus::ClearedByOperator {
+                merged.status = ReceiptStatus::ClearedByOperator;
+                merged.ledger = None;
+            }
+            if existing.approval_consumed {
+                merged.approval_consumed = true;
+            }
+            if *existing == merged {
+                return confirm_durable(&session.guard);
+            }
+        }
+        session.guard.map.insert(key.to_owned(), merged);
+        session.guard.rebuild_indexes();
+        persist_locked(&mut session.guard)
+    }
+
     /// The shared body of [`Self::finalize`] and [`Self::finalize_released`].
     ///
     /// `evidence` is `Some` only with `status == Ambiguous`.
@@ -2226,6 +2340,8 @@ fn check_transition(from: &ReceiptStatus, to: &ReceiptStatus) -> Result<(), Rece
 ///
 /// Must be called with the guard already held.
 fn persist_locked(guard: &mut MutexGuard<'_, StoreState>) -> Result<(), ReceiptStoreError> {
+    #[cfg(test)]
+    tests::PERSIST_CALLS.set(tests::PERSIST_CALLS.get() + 1);
     let json = serde_json::to_string_pretty(&guard.map).map_err(|_| ReceiptStoreError::Json {
         path: guard.file_path.clone(),
         detail: "could not be serialised".to_owned(),
@@ -2264,6 +2380,34 @@ fn persist_locked(guard: &mut MutexGuard<'_, StoreState>) -> Result<(), ReceiptS
             source: e.error,
         })?;
 
+    sync_directory(dir)
+}
+
+/// Confirms that the stored file and its directory are durable without
+/// rewriting the file.
+fn confirm_durable(guard: &StoreState) -> Result<(), ReceiptStoreError> {
+    std::fs::File::open(&guard.file_path)
+        .and_then(|file| file.sync_all())
+        .map_err(|source| ReceiptStoreError::Io {
+            path: guard.file_path.clone(),
+            source,
+        })?;
+    let dir = guard
+        .file_path
+        .parent()
+        .unwrap_or(std::path::Path::new("."));
+    sync_directory(dir)
+}
+
+/// Syncs the store directory, so a completed rename survives a crash.
+fn sync_directory(dir: &Path) -> Result<(), ReceiptStoreError> {
+    #[cfg(test)]
+    if tests::DIRECTORY_SYNC_FAILS.get() {
+        return Err(ReceiptStoreError::Io {
+            path: dir.to_path_buf(),
+            source: io::Error::other("injected directory sync failure"),
+        });
+    }
     #[cfg(unix)]
     std::fs::File::open(dir)
         .and_then(|directory| directory.sync_all())
@@ -2271,7 +2415,8 @@ fn persist_locked(guard: &mut MutexGuard<'_, StoreState>) -> Result<(), ReceiptS
             path: dir.to_path_buf(),
             source,
         })?;
-
+    #[cfg(not(unix))]
+    let _ = dir;
     Ok(())
 }
 
@@ -2326,6 +2471,145 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = ReceiptStore::open_at(dir.path(), "test").unwrap();
         (dir, store)
+    }
+
+    thread_local! {
+        /// The `persist_locked` calls on this thread.
+        pub(super) static PERSIST_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// Whether a directory sync on this thread fails.
+        pub(super) static DIRECTORY_SYNC_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// The checked projection of a decision on `HASH_A` with `status`.
+    fn checked(status: ReceiptStatus, ledger: Option<u32>) -> CheckedReceiptProjection {
+        CheckedReceiptProjection::new(
+            HASH_A.to_owned(),
+            TX_HASH_A.to_owned(),
+            SOURCE_A.to_owned(),
+            SEQ_A,
+            1_700,
+            90,
+            status,
+            ledger,
+            Some("nonce-a".to_owned()),
+            "0123456789abcdef0123456789abcdef".to_owned(),
+        )
+    }
+
+    /// The constructor fixes the receipt flags and linkage. A checked
+    /// replacement repairs a missing and an edited receipt with its indexes,
+    /// excludes its nonce, and an equal replacement persists nothing.
+    #[test]
+    fn replace_checked_preserves_identity_indexes_and_noop() {
+        let (_dir, store) = open_temp_store();
+        let success = checked(ReceiptStatus::Success, Some(120));
+        assert!(success.receipt.submitted);
+        assert!(!success.receipt.recovered_from_reservation);
+        assert!(!success.receipt.approval_consumed);
+        assert_eq!(success.receipt.release_code, None);
+        assert_eq!(
+            success.receipt.settlement_decision_id.as_deref(),
+            Some(success.decision_id.as_str())
+        );
+        let ambiguous = checked(ReceiptStatus::Ambiguous, None);
+        assert_eq!(
+            ambiguous.receipt.release_code,
+            Some(ReleaseEvidence::ReleasedOnEvidence)
+        );
+
+        store.replace_checked(&success).unwrap();
+        assert_eq!(store.get(HASH_A).unwrap(), Some(success.receipt.clone()));
+
+        // An edited receipt: another identity, still pending at another pair.
+        std::fs::remove_file(store.file_path().unwrap()).unwrap();
+        store
+            .begin_submission(HASH_A, TX_HASH_B, SOURCE_B, SEQ_B, 0, 1)
+            .unwrap();
+        assert!(
+            store
+                .find_pending_by_source_sequence(SOURCE_B, SEQ_B)
+                .unwrap()
+                .is_some()
+        );
+        store.replace_checked(&success).unwrap();
+        let repaired = store.get(HASH_A).unwrap().unwrap();
+        assert_eq!(repaired, success.receipt);
+        assert_eq!(store.find_by_tx_hash(TX_HASH_A).unwrap(), Some(repaired));
+        assert!(store.find_by_tx_hash(TX_HASH_B).unwrap().is_none());
+        assert!(
+            store
+                .find_pending_by_source_sequence(SOURCE_B, SEQ_B)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .find_by_approval_nonce("nonce-a")
+                .unwrap()
+                .map(|receipt| receipt.envelope_hash),
+            Some(HASH_A.to_owned())
+        );
+        assert!(matches!(
+            store
+                .begin_submission_with_approval(
+                    HASH_C,
+                    TX_HASH_C,
+                    SOURCE_A,
+                    99,
+                    0,
+                    1,
+                    Some("nonce-a")
+                )
+                .unwrap(),
+            BeginSubmissionOutcome::DuplicateApproval(_)
+        ));
+
+        let bytes = std::fs::read(store.file_path().unwrap()).unwrap();
+        PERSIST_CALLS.set(0);
+        store.replace_checked(&success).unwrap();
+        assert_eq!(
+            PERSIST_CALLS.get(),
+            0,
+            "an equal replacement persists nothing"
+        );
+        assert_eq!(std::fs::read(store.file_path().unwrap()).unwrap(), bytes);
+    }
+
+    /// A directory-sync failure after the rename leaves the complete
+    /// replacement readable and refuses. An equal replacement keeps refusing
+    /// while the sync fails, then confirms durability without a rewrite.
+    #[test]
+    fn replace_checked_retries_postrename_sync_failure() {
+        struct Disarm;
+        impl Drop for Disarm {
+            fn drop(&mut self) {
+                DIRECTORY_SYNC_FAILS.set(false);
+            }
+        }
+        let (_dir, store) = open_temp_store();
+        let projection = checked(
+            ReceiptStatus::Failed {
+                code: "ledger.insufficient_balance".to_owned(),
+            },
+            Some(120),
+        );
+        let disarm = Disarm;
+        DIRECTORY_SYNC_FAILS.set(true);
+        assert!(matches!(
+            store.replace_checked(&projection),
+            Err(ReceiptStoreError::Io { .. })
+        ));
+        assert_eq!(store.get(HASH_A).unwrap(), Some(projection.receipt.clone()));
+        PERSIST_CALLS.set(0);
+        assert!(
+            store.replace_checked(&projection).is_err(),
+            "an equal replacement still confirms durability"
+        );
+        assert_eq!(PERSIST_CALLS.get(), 0);
+        drop(disarm);
+        store.replace_checked(&projection).unwrap();
+        assert_eq!(PERSIST_CALLS.get(), 0, "durability needs no rewrite");
+        assert_eq!(store.get(HASH_A).unwrap(), Some(projection.receipt));
     }
 
     /// A store file that fails its schema reports the category and position

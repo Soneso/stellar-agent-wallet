@@ -1,6 +1,8 @@
 //! The submission flow after the policy gate shared by the CLI and MCP server.
 //! Each binary renders the results in its own wire form.
 
+pub(crate) mod recovery;
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -308,10 +310,16 @@ pub enum ReconcilePass {
     /// The pass refuses; every open reservation stands.
     Failed(WindowStoreError),
     /// The legacy stage completes and the recovery stage then refuses.
+    ///
+    /// The refusal can follow committed sequence work and other completed
+    /// receipt projections. A sequence-stage refusal takes precedence. A
+    /// checked receipt repair refusal alone is a store refusal. Its detail
+    /// states that sequence recovery completed and names the repaired and
+    /// refused decisions, each refusal with its code and detail.
     RecoveryFailed {
         /// The completed legacy report.
         legacy: ReconcileReport,
-        /// The recovery refusal; no recovery commit applies.
+        /// The first recovery refusal; completed commits stand.
         error: crate::policy_state::RecoveryError,
     },
 }
@@ -357,16 +365,29 @@ pub fn finish_reconciliation(
             "window reconcile: pass failed; open reservations stand"
         ),
     }
-    if let ReconcilePass::RecoveryFailed { error, .. } = pass {
-        tracing::warn!(
+    match pass {
+        ReconcilePass::RecoveryFailed {
+            error: crate::policy_state::RecoveryError::Store(WindowStoreError::Invalid { detail }),
+            ..
+        } if detail.starts_with(SEQUENCES_RECOVERED) => tracing::warn!(
+            profile = %profile_name,
+            detail = %detail,
+            "recovery: checked receipt repair refused after sequence recovery; completed work remains committed"
+        ),
+        ReconcilePass::RecoveryFailed { error, .. } => tracing::warn!(
             profile = %profile_name,
             code = error.code(),
             error = %error,
             "recovery: the stage refused; every sequence stays held"
-        );
+        ),
+        _ => {}
     }
     drain_accounting_obligations(window, profile, profile_name, receipts, writer)
 }
+
+/// The prefix of a recovery refusal detail whose sequence stage completed
+/// before checked receipt repair refused.
+const SEQUENCES_RECOVERED: &str = "sequence recovery completed; ";
 
 /// Runs the bounded dispatch-time reconciliation pass.
 ///
@@ -378,6 +399,11 @@ pub fn finish_reconciliation(
 /// A completed pass maps to [`ReconcilePass::Completed`]; a refusal of the
 /// window store maps to [`ReconcilePass::Failed`] and leaves every open
 /// reservation in place.
+///
+/// After a completed legacy stage, the recovery stage runs the sequence
+/// stage, then repairs the receipt of every retained committed recovery
+/// decision when `receipts` and the writer are available. Idle passes repair
+/// too. Accounting obligations drain in [`finish_reconciliation`].
 pub async fn reconcile_pass(
     profile: &Profile,
     window: &PersistedWindowStore,
@@ -403,8 +429,9 @@ pub async fn reconcile_pass(
 /// Runs [`reconcile_pass`] without its recovery stage.
 ///
 /// An invocation whose business id is already stored replays or conflicts
-/// before it builds anything, so it sends no recovery request and changes no
-/// recovery state. The expiry edges and the legacy stage run unchanged.
+/// before it builds anything, so it sends no recovery request, changes no
+/// recovery state and repairs no checked receipt. The expiry edges and the
+/// legacy stage run unchanged.
 pub async fn reconcile_legacy_pass(
     profile: &Profile,
     window: &PersistedWindowStore,
@@ -480,23 +507,36 @@ async fn reconcile_stages(
     }
     #[cfg(test)]
     RECOVERY_STAGE_TRACE.with_borrow_mut(|trace| trace.push("recovery"));
-    if let Some(writer) = writer
-        && let ReconcilePass::Completed(report) = &legacy
-        && let Err(error) = crate::policy_state::recover_sequences(
-            window,
-            profile,
-            crate::policy_state::EndpointPair::from_clients(client, oracle),
-            &writer,
-            None,
-        )
-        .await
-    {
-        return ReconcilePass::RecoveryFailed {
+    let (Some(writer), ReconcilePass::Completed(report)) = (writer, &legacy) else {
+        return legacy;
+    };
+    // The sequence stage completes first; a projection refusal never starves it.
+    let sequences = crate::policy_state::recover_sequences(
+        window,
+        profile,
+        crate::policy_state::EndpointPair::from_clients(client, oracle),
+        &writer,
+        None,
+    )
+    .await;
+    #[cfg(test)]
+    recovery::tests::trace("sequences");
+    let repaired = receipts.map_or(Ok(()), |receipts| {
+        recovery::repair_committed_receipts(window, profile, receipts, &writer, None)
+    });
+    match (sequences, repaired) {
+        (Err(error), _) => ReconcilePass::RecoveryFailed {
             legacy: report.clone(),
             error,
-        };
+        },
+        (Ok(_), Err(refused)) => ReconcilePass::RecoveryFailed {
+            legacy: report.clone(),
+            error: crate::policy_state::RecoveryError::Store(WindowStoreError::Invalid {
+                detail: format!("{SEQUENCES_RECOVERED}{refused}"),
+            }),
+        },
+        (Ok(_), Ok(())) => legacy,
     }
-    legacy
 }
 
 #[cfg(test)]
@@ -605,7 +645,9 @@ pub enum StatusFailure {
     ReconcileRefused(WindowStoreError),
     /// Resolving the approval store directory fails.
     ApprovalDirUnavailable(StateDirError),
-    /// Repairing approval consumption refuses.
+    /// Repairing approval consumption, or the receipt acknowledgement of that
+    /// consumption, refuses. A checked outcome projection refusal is logged
+    /// and refuses no status lookup.
     RepairRefused(WalletError),
     /// Querying the chain fails.
     ChainQueryFailed(NetworkError),
@@ -613,6 +655,11 @@ pub enum StatusFailure {
 
 /// Reconciles one transaction and reads its resulting receipt and reservation.
 /// Mainnet recovery and accounting delivery use the caller's audit writer.
+///
+/// On a mainnet profile, after accounting delivery, the lookup repairs the
+/// checked receipt of the transaction's committed recovery decision. A
+/// repair refusal is logged with its code and detail, and the lookup
+/// continues. Approval repair then reads the receipt again.
 ///
 /// # Errors
 /// Returns the typed failure at the step that refuses the status lookup.
@@ -681,11 +728,14 @@ pub async fn transaction_status(
             }
         }
     }
+    let mut sequences = "not run";
     if profile.chain_id.is_mainnet()
         && status_recovery_enabled()
         && let Ok(hash) = stellar_agent_core::hex::decode_hex32(tx_hash)
         && let Ok(writer) = writer()
-        && let Err(error) = crate::policy_state::recover_sequences(
+    {
+        sequences = "completed";
+        if let Err(error) = crate::policy_state::recover_sequences(
             window,
             profile,
             crate::policy_state::EndpointPair::from_clients(client, oracle),
@@ -693,20 +743,42 @@ pub async fn transaction_status(
             Some(&hash),
         )
         .await
-    {
-        // The status answer stands; the drain below runs as on the refused
-        // reconciliation path.
-        tracing::warn!(
-            profile = %profile_name,
-            code = error.code(),
-            error = %error,
-            "transaction status: recovery refused; every sequence stays held"
-        );
+        {
+            sequences = "refused";
+            // The status answer stands; the drain below runs as on the
+            // refused reconciliation path.
+            tracing::warn!(
+                profile = %profile_name,
+                code = error.code(),
+                error = %error,
+                "transaction status: recovery refused; every sequence stays held"
+            );
+        }
     }
     // The status answer does not depend on the drain: a refusal is logged by
     // the drain and leaves the obligations owed for a later call.
     let _ = drain_accounting_obligations(window, profile, profile_name, Some(&receipts), &writer);
-    if let Some(record) = &receipt
+    if profile.chain_id.is_mainnet()
+        && let Ok(hash) = stellar_agent_core::hex::decode_hex32(tx_hash)
+        && let Ok(writer) = writer()
+        && let Err(refused) =
+            recovery::repair_committed_receipts(window, profile, &receipts, &writer, Some(&hash))
+    {
+        // The status answer stands; a later call repeats the refused repair.
+        tracing::warn!(
+            profile = %profile_name,
+            code = refused.code(),
+            sequence_recovery = sequences,
+            detail = %refused,
+            "transaction status: checked receipt repair refused; completed work remains committed"
+        );
+    }
+    // Approval repair reads the receipt after projection, so a restored
+    // nonce is consumed in this call.
+    let projected = receipts
+        .find_by_tx_hash(tx_hash)
+        .map_err(StatusFailure::ReceiptStoreRead)?;
+    if let Some(record) = &projected
         && record.approval_nonce.is_some()
     {
         let approval_dir = approval_dir().map_err(StatusFailure::ApprovalDirUnavailable)?;

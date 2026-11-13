@@ -1558,6 +1558,8 @@ impl WalletSubmissionRecorder<'_> {
                             receipt: intent.envelope_hash.clone(),
                         },
                         pre_exposure_ledger: self.pre_exposure_ledger,
+                        source: Some(intent.source.clone()),
+                        submission_ledger: Some(intent.submission_ledger),
                         audit: &mut *guard,
                         request_id: &self.request_id,
                     },
