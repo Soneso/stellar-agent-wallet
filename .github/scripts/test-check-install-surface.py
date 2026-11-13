@@ -73,6 +73,24 @@ def add_tracked(tree: pathlib.Path, relative: str, text: str) -> None:
     subprocess.run(["git", "add", "--", relative], cwd=tree, check=True)
 
 
+def remove_binstall(tree: pathlib.Path, relative: str) -> None:
+    """Remove the binstall table and its override from a manifest."""
+    path = tree / relative
+    text = path.read_text(encoding="utf-8")
+    start = text.index("[package.metadata.binstall]")
+    end = text.index("[dependencies]", start)
+    path.write_text(text[:start] + text[end:], encoding="utf-8")
+
+
+def implicit_executable(tree: pathlib.Path, relative: str) -> None:
+    """Turn automatic executable discovery on in the MCP manifest and add a
+    source file Cargo would build as an executable."""
+    replace(tree, MCP_MANIFEST, "autobins = false\n", "")
+    path = tree / pathlib.PurePosixPath(MCP_MANIFEST).parent / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("fn main() {}\n", encoding="utf-8")
+
+
 def fenced(language: str, body: str) -> str:
     return f"```{language}\n{body}\n```\n"
 
@@ -158,8 +176,8 @@ def cases(version: str) -> list[Case]:
             lambda tree: replace(
                 tree,
                 "docs/mcp.md",
-                "--disable-strategies quick-install,compile stellar-agent-mcp@",
-                "--disable-strategies quick-install stellar-agent-mcp@",
+                "--disable-strategies quick-install,compile stellar-agent-cli@",
+                "--disable-strategies quick-install stellar-agent-cli@",
             ),
         ),
         Case(
@@ -193,7 +211,7 @@ def cases(version: str) -> list[Case]:
             lambda tree: append(
                 tree,
                 "docs/mcp.md",
-                f"Or run `cargo install\nstellar-agent-mcp@{version}` by hand.\n",
+                f"Or run `cargo install\nstellar-agent-cli@{version}` by hand.\n",
             ),
         ),
         Case(
@@ -335,8 +353,8 @@ def cases(version: str) -> list[Case]:
             lambda tree: replace(
                 tree,
                 "docs/mcp.md",
-                f"cargo install --locked stellar-agent-mcp@{version}",
-                "cargo install --locked stellar-agent-mcp@0.0.1",
+                f"cargo install --locked stellar-agent-cli@{version}",
+                "cargo install --locked stellar-agent-cli@0.0.1",
             ),
         ),
         Case(
@@ -742,10 +760,101 @@ def cases(version: str) -> list[Case]:
             ),
         ),
         Case(
-            "rule 4: violation in the MCP manifest only",
+            "rule 4: missing CLI binstall table",
+            "4",
+            CLI_MANIFEST,
+            lambda tree: remove_binstall(tree, CLI_MANIFEST),
+        ),
+        Case(
+            "rule 4: binstall metadata in the MCP manifest",
             "4",
             MCP_MANIFEST,
-            lambda tree: replace(tree, MCP_MANIFEST, 'pkg-fmt = "txz"', 'pkg-fmt = "tgz"'),
+            lambda tree: append(
+                tree,
+                MCP_MANIFEST,
+                "[package.metadata.binstall]\n"
+                'pkg-url = "{ repo }/releases/download/v{ version }/'
+                'stellar-agent-{ version }-{ target }.tar.xz"\n',
+            ),
+        ),
+        Case(
+            "rule 4: explicit MCP executable target",
+            "4",
+            MCP_MANIFEST,
+            lambda tree: append(
+                tree, MCP_MANIFEST, '[[bin]]\nname = "stellar-agent-mcp"\npath = "src/main.rs"\n'
+            ),
+        ),
+        Case(
+            "rule 4: implicit MCP executable source",
+            "4",
+            MCP_MANIFEST,
+            lambda tree: implicit_executable(tree, "src/main.rs"),
+        ),
+        Case(
+            "rule 4: implicit MCP executable directory",
+            "4",
+            MCP_MANIFEST,
+            lambda tree: implicit_executable(tree, "src/bin/stellar-agent-mcp.rs"),
+        ),
+        Case(
+            "rule 1: install of the MCP package",
+            "1",
+            "docs/onboarding.md",
+            lambda tree: append(
+                tree,
+                "docs/onboarding.md",
+                fenced("bash", f"cargo install --locked stellar-agent-mcp@{version}"),
+            ),
+        ),
+        Case(
+            "rule 1: binstall of the MCP package",
+            "1",
+            "docs/onboarding.md",
+            lambda tree: append(
+                tree,
+                "docs/onboarding.md",
+                fenced(
+                    "bash",
+                    "cargo binstall --locked --disable-strategies quick-install,compile "
+                    f"stellar-agent-mcp@{version}",
+                ),
+            ),
+        ),
+        Case(
+            "rule 1: install naming both packages",
+            "1",
+            "docs/onboarding.md",
+            lambda tree: append(
+                tree,
+                "docs/onboarding.md",
+                f"Run `cargo install --locked stellar-agent-cli@{version} "
+                f"stellar-agent-mcp@{version}`.\n",
+            ),
+        ),
+        Case(
+            "rule 1: binstall naming both packages",
+            "1",
+            "docs/onboarding.md",
+            lambda tree: append(
+                tree,
+                "docs/onboarding.md",
+                fenced(
+                    "bash",
+                    "cargo binstall --locked --disable-strategies quick-install,compile "
+                    f"stellar-agent-cli@{version} stellar-agent-mcp@{version}",
+                ),
+            ),
+        ),
+        Case(
+            "rule 1: path install of the MCP package",
+            "1",
+            "docs/onboarding.md",
+            lambda tree: append(
+                tree,
+                "docs/onboarding.md",
+                fenced("bash", "cargo install --locked --path crates/stellar-agent-mcp"),
+            ),
         ),
         Case(
             "rule 4: crate-level repository",
@@ -779,8 +888,9 @@ def near_misses(tree: pathlib.Path) -> None:
         tree,
         "docs/maintainers/building.md",
         "## Near-miss fixture\n\n"
-        "A placeholder pin: "
-        "`cargo install --locked stellar-agent-cli@<version> stellar-agent-mcp@<version>`.\n"
+        "A placeholder pin: `cargo install --locked stellar-agent-cli@<version>`.\n"
+        "Copy the installed executable: "
+        "`cp ~/.cargo/bin/stellar-agent ~/.cargo/bin/stellar-agent-mcp`.\n"
         "Run cargo install for each tool the gates use.\n"
         "Run cargo install other-stellar-agent-cli@0.0.1 for an unrelated tool.\n"
         f"The current release is stellar-agent-cli@{version}.\n"
@@ -802,9 +912,11 @@ def near_misses(tree: pathlib.Path) -> None:
             "cargo binstall --locked --disable-strategies quick-install "
             f"--disable-strategies=compile stellar-agent-cli@{version}\n"
             'cargo binstall --locked --disable-strategies "quick-install,compile" '
-            f"stellar-agent-mcp@{version}\n"
+            f"stellar-agent-cli@{version}\n"
+            f"cargo install --locked stellar-agent-cli@{version} && "
+            "cp ~/.cargo/bin/stellar-agent ~/.cargo/bin/stellar-agent-mcp\n"
             f'cargo install stellar-agent-cli@{version} --root "./a #b" --locked\n'
-            f"cargo install stellar-agent-mcp@{version} --root './a #c' --locked\n"
+            f"cargo install stellar-agent-cli@{version} --root './a #c' --locked\n"
             f"cargo install stellar-agent-cli@{version} --root ./a#d --locked",
         )
         + "\n"

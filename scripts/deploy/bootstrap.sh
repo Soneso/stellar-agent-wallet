@@ -1,15 +1,18 @@
 #!/bin/bash
 # Sets up the dedicated wallet account and its sudo wrappers on this host.
 #
-# Usage: bootstrap.sh --operator <account> --project <name> --cli <path> --mcp <path>
+# Usage: bootstrap.sh --operator <account> --project <name> --cli <path> [--mcp <path>]
 #
 #   --operator <account>  the existing account that may run the wrappers
 #   --project <name>      the project name the wallet processes run under
-#   --cli <path>          the stellar-agent release binary to install
-#   --mcp <path>          the stellar-agent-mcp release binary to install
+#   --cli <path>          the stellar-agent release executable to install
+#                         under both names, stellar-agent and stellar-agent-mcp
+#   --mcp <path>          optional: the release archive's stellar-agent-mcp
+#                         file, which must pass the same checks and hold the
+#                         bytes of --cli; it is compared and never installed
 #
 # Runs as root, once per host and again for an upgrade. It takes no secret
-# and executes neither binary. Each step runs as root for a reason:
+# and executes no binary. Each step runs as root for a reason:
 #
 #   R1  creates the non-admin account without a password argument, because
 #       only root writes the user database;
@@ -18,11 +21,18 @@
 #   R3  creates the home, <home>/run, <home>/tmp, the data root, and its
 #       parents, each account-owned with mode 0700, because handing a
 #       directory in a root-owned parent to another account needs root;
-#   R4  installs the wrappers and binaries root-owned with mode 0755 under
-#       the prefix, so the wallet cannot write its own executables;
+#   R4  installs the wrappers and the executable under both names
+#       root-owned with mode 0755 under the prefix, so the wallet cannot
+#       write its own executables;
 #   R5  writes the root-owned project file;
 #   R6  renders the sudoers file, checks it with visudo, and installs it
 #       root-owned with mode 0440.
+#
+# One run at a time holds the bootstrap lock beside the prefix; a second run
+# refuses while it is held. After the install, the two installed names must
+# hold equal bytes, or the run refuses and names both paths. A run that ends
+# between the two renames leaves a pair the next validation records as
+# failed; a rerun with the same --cli source installs both names again.
 #
 # A rerun converges (R7). It verifies that the existing account is a
 # non-admin account with the fixed home, then applies R2 to R6 again. R3
@@ -82,7 +92,7 @@ refuse() {
 }
 
 usage() {
-  echo "usage: bootstrap.sh --operator <account> --project <name> --cli <path> --mcp <path>" >&2
+  echo "usage: bootstrap.sh --operator <account> --project <name> --cli <path> [--mcp <path>]" >&2
   exit 64
 }
 
@@ -185,6 +195,33 @@ install_staged() {
   if ! perl -e 'rename($ARGV[0], $ARGV[1]) or exit 1' "$1" "$3" 2>/dev/null; then
     refuse 65 "$3 was not replaced, and the installed file is unchanged"
   fi
+}
+
+# Takes the bootstrap lock for the rest of the run: an flock on the
+# root-owned file .stellar-agent-bootstrap.lock beside the prefix, held
+# through descriptor 9 of this shell until it exits. The file stays readable
+# for mcp-launch, which holds a shared lock on it while it compares the two
+# installed names. The wait for the lock lasts up to five seconds. A second
+# run then refuses while the first holds it, so two runs never interleave
+# their installs. A lock call that fails for another reason, such as a file
+# system without locking, refuses with that reason.
+take_lock() {
+  local directory reason rc=0
+  directory=$(dirname "$PREFIX")
+  LOCK_FILE="$directory/.stellar-agent-bootstrap.lock"
+  mkdir -p -- "$directory"
+  if [ -L "$LOCK_FILE" ]; then
+    refuse 65 "$LOCK_FILE is a symlink"
+  fi
+  exec 9>>"$LOCK_FILE"
+  reason=$(perl -e 'use Fcntl qw(:flock); open(my $lock, ">&=", 9) or do { print "$!"; exit 2 };
+    for (1 .. 50) { exit 0 if flock($lock, LOCK_EX | LOCK_NB);
+      do { print "$!"; exit 2 } unless $!{EWOULDBLOCK}; select(undef, undef, undef, 0.1) } exit 1') || rc=$?
+  case "$rc" in
+    0) ;;
+    1) refuse 65 "another bootstrap run holds $LOCK_FILE; run bootstrap again after it ends" ;;
+    *) refuse 65 "the bootstrap lock $LOCK_FILE could not be taken: ${reason:-perl exited $rc}" ;;
+  esac
 }
 
 # Prints the home directory the user database records for the account.
@@ -295,9 +332,12 @@ create_directories() {
   )
 }
 
-# R4: the binaries and the rendered wrappers, root-owned with mode 0755.
+# R4: the executable under both names and the rendered wrappers, root-owned
+# with mode 0755. The --cli source is staged and checked once; the second
+# staged file is a copy of that staged file, compared with it before either
+# name is installed.
 install_executables() {
-  local directory wrapper
+  local directory wrapper canonical
   say "R4 installs the wrappers and binaries under $PREFIX"
   for directory in "$PREFIX" "$PREFIX/bin"; do
     if [ -L "$directory" ]; then
@@ -310,11 +350,17 @@ install_executables() {
   stage_in "$PREFIX/bin"
   cp -- "$CLI_SOURCE" "$STAGED"
   check_binary "$STAGED" "the --cli binary"
-  install_staged "$STAGED" 755 "$PREFIX/bin/stellar-agent"
+  canonical=$STAGED
   stage_in "$PREFIX/bin"
-  cp -- "$MCP_SOURCE" "$STAGED"
-  check_binary "$STAGED" "the --mcp binary"
+  cp -- "$canonical" "$STAGED"
+  if ! cmp -s -- "$canonical" "$STAGED"; then
+    refuse 65 "the staged copies of the --cli binary differ"
+  fi
+  install_staged "$canonical" 755 "$PREFIX/bin/stellar-agent"
   install_staged "$STAGED" 755 "$PREFIX/bin/stellar-agent-mcp"
+  if ! cmp -s -- "$PREFIX/bin/stellar-agent" "$PREFIX/bin/stellar-agent-mcp"; then
+    refuse 65 "$PREFIX/bin/stellar-agent and $PREFIX/bin/stellar-agent-mcp differ; run bootstrap again with the same --cli source"
+  fi
   for wrapper in mcp-launch cli-launch provision; do
     stage_in "$PREFIX"
     render "$SOURCE_DIR/$wrapper" "$STAGED"
@@ -369,7 +415,7 @@ main() {
     esac
     shift 2
   done
-  if [ -z "$OPERATOR" ] || [ -z "$PROJECT" ] || [ -z "$CLI_SOURCE" ] || [ -z "$MCP_SOURCE" ]; then
+  if [ -z "$OPERATOR" ] || [ -z "$PROJECT" ] || [ -z "$CLI_SOURCE" ]; then
     usage
   fi
   case "$HOST_SYSTEM" in
@@ -398,19 +444,25 @@ main() {
   if ! valid_project "$PROJECT"; then
     refuse 64 "the project name holds whitespace, a quote, or a control character"
   fi
-  for source in "$CLI_SOURCE" "$MCP_SOURCE"; do
+  for source in "$CLI_SOURCE" ${MCP_SOURCE:+"$MCP_SOURCE"}; do
     if [ ! -f "$source" ]; then
       refuse 64 "$source is not a file"
     fi
   done
   check_binary "$CLI_SOURCE" "the --cli binary"
-  check_binary "$MCP_SOURCE" "the --mcp binary"
+  if [ -n "$MCP_SOURCE" ]; then
+    check_binary "$MCP_SOURCE" "the --mcp binary"
+    if ! cmp -s -- "$CLI_SOURCE" "$MCP_SOURCE"; then
+      refuse 65 "the --mcp binary differs from the --cli binary; both names install one executable"
+    fi
+  fi
   for value in "$ACCOUNT" "$OPERATOR" "$HOME_DIR" "$DATA_ROOT" "$PROFILE" "$PREFIX" "$PREFIX_RE" \
     "$PROJECT_FILE" "$WRAPPER_PATH" "$TTY_PATH" "$SECURITY_TOOL" "$DBUS_DAEMON_TOOL" "$GNOME_KEYRING_DAEMON_TOOL" \
     "$ENV_TOOL"; do
     require_plain_value "$value"
   done
 
+  take_lock
   if id -u "$ACCOUNT" >/dev/null 2>&1; then
     say "R7 verifies the existing account $ACCOUNT"
   else

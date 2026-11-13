@@ -306,19 +306,75 @@ impl Commands {
     }
 }
 
+/// Stack size of the thread that runs the body of either role.
+///
+/// The main thread's stack is set by the platform: 1 MiB on Windows, 8 MiB on
+/// Linux and macOS. Parsing the command line and polling the command futures
+/// take more than 1 MiB in a debug build, whose frames and future state
+/// machines are not compacted. Each role therefore runs on a thread with this
+/// stack, the size the Linux and macOS main thread provides, so every
+/// platform and build profile runs the body with the same stack.
+const BODY_STACK_SIZE: usize = 8 * 1024 * 1024;
+
 /// Selects the process role before either role initializes its runtime.
 ///
 /// The tool hardens while still single-threaded and exits if hardening fails.
+/// Each role's body then runs on a thread of [`BODY_STACK_SIZE`] bytes.
 fn main() {
     match role::select(&std::env::args_os().collect::<Vec<_>>(), cfg!(windows)) {
         role::Role::Server { skip, display_name } => {
-            stellar_agent_mcp::entry::run_server_process(display_name, std::env::args().skip(skip))
+            #[allow(
+                clippy::expect_used,
+                reason = "no thread means no server, as no runtime does in run_server_process"
+            )]
+            let code = on_body_thread(move || -> i32 {
+                stellar_agent_mcp::entry::run_server_process(
+                    display_name,
+                    std::env::args().skip(skip),
+                )
+            })
+            .expect("Failed starting the server thread");
+            std::process::exit(code)
         }
         role::Role::Tool => std::process::exit(process_hardening::guarded_start(
             process_hardening::harden_process,
-            run,
+            || on_body_thread(run).unwrap_or_else(|err| render_runtime_unavailable(&err)),
         )),
     }
+}
+
+/// Runs `body` on a thread with a [`BODY_STACK_SIZE`] stack and returns its
+/// result once the thread ends.
+///
+/// The thread is named `main`, so a panic or stack-overflow report names the
+/// thread as it would on the main thread. A panic in `body` resumes on the
+/// calling thread without a second report, and the process ends with the
+/// panic exit code. A `std::process::exit` inside `body` ends the process
+/// directly.
+///
+/// # Errors
+///
+/// The operating system's error when the thread cannot be created.
+fn on_body_thread<T: Send + 'static>(
+    body: impl FnOnce() -> T + Send + 'static,
+) -> std::io::Result<T> {
+    let thread = std::thread::Builder::new()
+        .name("main".to_owned())
+        .stack_size(BODY_STACK_SIZE)
+        .spawn(body)?;
+    Ok(thread
+        .join()
+        .unwrap_or_else(|payload| std::panic::resume_unwind(payload)))
+}
+
+/// Renders the refusal for a command whose runtime could not be started and
+/// returns the exit code `1`.
+fn render_runtime_unavailable(err: &dyn std::fmt::Display) -> i32 {
+    common::render::render_json(&stellar_agent_core::envelope::Envelope::<()>::err_raw(
+        "wallet.runtime_unavailable",
+        format!("the async runtime could not be started ({err}); the command did not run"),
+    ));
+    1
 }
 
 /// Builds the multi-thread runtime and runs [`async_main`] on it, returning
@@ -337,13 +393,7 @@ fn run() -> i32 {
             runtime.shutdown_background();
             exit_code
         }
-        Err(err) => {
-            common::render::render_json(&stellar_agent_core::envelope::Envelope::<()>::err_raw(
-                "wallet.runtime_unavailable",
-                format!("the async runtime could not be started ({err}); the command did not run"),
-            ));
-            1
-        }
+        Err(err) => render_runtime_unavailable(&err),
     }
 }
 

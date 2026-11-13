@@ -47,7 +47,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --release --locked --target aarch64-apple-darwin --bin stellar-agent --bin stellar-agent-mcp
+          cargo build --release --locked --target aarch64-apple-darwin --bin stellar-agent
+          release=target/aarch64-apple-darwin/release
+          . .github/scripts/release/copy-alias.sh
+          copy_alias "$release/stellar-agent" "$release/stellar-agent-mcp"
+          cmp "$release/stellar-agent" "$release/stellar-agent-mcp"
 
       - name: Pack unsigned binaries
         shell: bash
@@ -131,7 +135,8 @@ jobs:
           asc-issuer-id: ${{ secrets.APPLE_ASC_ISSUER_ID }}
 
       # The packed archive must hold the release layout and executable
-      # binaries, each signed by a Developer ID Application identity.
+      # binaries, each signed by a Developer ID Application identity, with
+      # equal bytes under both names.
       - name: Confirm the archive
         env:
           ARCHIVE: ${{ steps.sign.outputs.archive }}
@@ -161,6 +166,7 @@ jobs:
             fi
             printf '%s\n' "$info" | /usr/bin/grep '^TeamIdentifier='
           done
+          /usr/bin/cmp "$CHECK/$NAME/stellar-agent" "$CHECK/$NAME/stellar-agent-mcp"
 
       # The keychain measurement installs this archive; the upload runs only
       # on request and after the archive passes the checks above.

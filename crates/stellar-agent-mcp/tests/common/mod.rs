@@ -1,5 +1,6 @@
 pub mod child_process;
 pub mod policy_mock;
+pub mod server_binary;
 pub mod source_contracts;
 pub mod v1_engine_mock;
 

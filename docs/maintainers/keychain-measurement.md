@@ -14,10 +14,12 @@ Measure each channel on its own, in its own dedicated user account:
   [notarization smoke](releasing.md#run-the-notarization-smoke) with the
   `export_archive` input, download the artifact
   `signed-aarch64-apple-darwin-smoke` from that run, and unpack the archive it
-  holds. Both binaries carry a Developer ID Application signature.
-- A `cargo install` build. Install both binaries from crates.io as the
-  [README](../../README.md#cargo-install-from-cratesio) shows. These binaries
-  carry the ad hoc signature of the local build.
+  holds. Its two names are byte-equal copies of one executable with a
+  Developer ID Application signature and one CDHash.
+- A `cargo install` build. Install the `stellar-agent-cli` package from
+  crates.io as the [README](../../README.md#cargo-install-from-cratesio) shows,
+  and copy `stellar-agent` to `stellar-agent-mcp`. The copy carries the ad hoc
+  signature of the local build, with the CDHash of the original.
 
 ## Host
 

@@ -8,14 +8,13 @@
 //!
 //! # Test isolation
 //!
-//! Tests use `tempfile::tempdir()` to provide a profile-less environment so
-//! the server falls back to the testnet default profile (as documented in
-//! `loader::load_default_or_testnet_fallback`).
+//! The shared server command sets `STELLAR_AGENT_HOME` to an empty scratch
+//! home, so the profile-less server falls back to the testnet default profile
+//! (as documented in `loader::load_default_or_testnet_fallback`) and never
+//! reaches the default state directory.
 //!
-//! The child inherits this process's environment, and other tests in this
-//! target override `STELLAR_AGENT_HOME` while they hold the `#[serial]` lock.
-//! Every test that spawns the server is `#[serial]` as well, so a child never
-//! starts under another test's data root.
+//! Every test that spawns the server is `#[serial]`, like the tests in this
+//! target that override `STELLAR_AGENT_HOME` in this process.
 //!
 //! # Covered scenarios
 //!
@@ -38,20 +37,10 @@
     reason = "test-only; panics acceptable in integration tests"
 )]
 
-use std::process::Command;
-
 use serial_test::serial;
 
 use crate::common::child_process::ChildDriver;
-
-/// Returns the path to the `stellar-agent-mcp` binary built by Cargo.
-///
-/// `env!("CARGO_BIN_EXE_stellar-agent-mcp")` is resolved by Cargo at compile
-/// time and is guaranteed to point at the binary produced for this crate, so
-/// the binary is always built before tests run.
-fn mcp_binary() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_BIN_EXE_stellar-agent-mcp"))
-}
+use crate::common::server_binary::server_command;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper: the binary under the shared child-process driver
@@ -61,7 +50,7 @@ fn mcp_binary() -> std::path::PathBuf {
 /// sends JSON lines, waits a bounded time for each response by id, and kills
 /// the child on drop.
 fn spawn_server() -> ChildDriver {
-    let mut command = Command::new(mcp_binary());
+    let mut command = server_command();
     command.env("STELLAR_AGENT_LOG", "off");
     ChildDriver::spawn(command)
 }

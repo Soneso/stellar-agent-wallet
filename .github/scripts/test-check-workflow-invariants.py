@@ -142,12 +142,42 @@ CI_OFF_JOBS = {
              "cargo test --workspace --no-default-features --features test-helpers,"),
 }
 COVERAGE_OFF_RUN = "        run: cargo llvm-cov --workspace --no-default-features --features test-helpers,"
-# The host recipe lines that build each binary package alone and check its
-# marker.
+# The host recipe lines that build the CLI package alone, and the lines that
+# derive its debug alias, compare the bytes and check both markers.
+HOST_ALIAS = "target/tmp/host-alias/stellar-agent-mcp"
 HOST_SINGLE_CLI = ("cargo build --locked -p stellar-agent-cli\n"
-                   "bash .github/scripts/check-binary-marker.sh target/debug/stellar-agent on\n")
-HOST_SINGLE_MCP = ("cargo build --locked -p stellar-agent-mcp\n"
-                   "bash .github/scripts/check-binary-marker.sh target/debug/stellar-agent-mcp on\n")
+                   "mkdir -p target/tmp/host-alias\n")
+HOST_ALIAS_COPY = f"copy_alias target/debug/stellar-agent {HOST_ALIAS}\n"
+HOST_ALIAS_STEPS = (". .github/scripts/release/copy-alias.sh\n"
+                    + HOST_ALIAS_COPY
+                    + f"cmp target/debug/stellar-agent {HOST_ALIAS}\n"
+                    "bash .github/scripts/check-binary-marker.sh target/debug/stellar-agent on\n"
+                    f"bash .github/scripts/check-binary-marker.sh {HOST_ALIAS} on\n")
+HOST_RELEASE_CMP = 'cmp "target/$target/release/stellar-agent" "target/$target/release/stellar-agent-mcp"\n'
+# The copy and comparison lines of build.sh and of the smoke build step, a
+# plain copy and mv in their place, and the rename line of the copy helper.
+BUILD_COPY = 'copy_alias "$release/stellar-agent$suffix" "$release/stellar-agent-mcp$suffix"\n'
+BUILD_PLAIN_MV = ('cp -p "$release/stellar-agent$suffix" "$release/.stellar-agent-mcp.tmp"\n'
+                  'mv -f "$release/.stellar-agent-mcp.tmp" "$release/stellar-agent-mcp$suffix"\n')
+BUILD_CMP = 'cmp "$release/stellar-agent$suffix" "$release/stellar-agent-mcp$suffix"\n'
+SMOKE_COPY = '          copy_alias "$release/stellar-agent" "$release/stellar-agent-mcp"\n'
+SMOKE_PLAIN_MV = ('          cp -p "$release/stellar-agent" "$release/.stellar-agent-mcp.tmp"\n'
+                  '          mv -f "$release/.stellar-agent-mcp.tmp" "$release/stellar-agent-mcp"\n')
+SMOKE_CMP = '          cmp "$release/stellar-agent" "$release/stellar-agent-mcp"\n'
+COPY_HELPER = ".github/scripts/release/copy-alias.sh"
+COPY_RENAME = ("    ! perl -e 'rename($ARGV[0], $ARGV[1]) or die \"copy_alias: $ARGV[1]: $!\\n\"' "
+               '"$temp" "$destination"; then\n')
+COPY_CHECK = 'if [ -L "$destination" ] || { [ -e "$destination" ] && [ ! -f "$destination" ]; }; then\n'
+# The signing, verification and derivation lines of sign-notarize.sh.
+SIGN_CANONICAL = ('/usr/bin/codesign --force --options runtime --timestamp \\\n'
+                  '  --keychain "$KEYCHAIN" --sign "$IDENTITY" "$BINARY_DIR/stellar-agent"\n')
+SIGN_DERIVE = "/bin/bash \"${BASH_SOURCE[0]%/*}/derive-alias.sh\" \"$BINARY_DIR\" ''\n"
+DERIVE_SCRIPT = ".github/actions/macos-sign-notarize/derive-alias.sh"
+DERIVE_RENAME = ("/usr/bin/perl -e 'rename($ARGV[0], $ARGV[1]) or die \"derive-alias: $ARGV[1]: $!\\n\"' "
+                 '"$temp" "$alias"\n')
+DERIVE_CHECK = 'if [ -L "$alias" ] || { [ -e "$alias" ] && [ ! -f "$alias" ]; }; then\n'
+SIGN_VERIFY_BOTH = ('for bin in stellar-agent stellar-agent-mcp; do\n'
+                    '  /usr/bin/codesign --verify --strict --verbose=2 "$BINARY_DIR/$bin"\ndone\n')
 
 
 def archive_block(suffix):
@@ -1144,6 +1174,47 @@ CASES = [
         (RELEASE, RELEASE_PERL_STEP, RELEASE_BUILD_STEP + RELEASE_PERL_STEP, 1)], 1),
     ("build guard removed", "release-shared-scripts", "environment guard is not", [
         (BUILD_SCRIPT, ' --env-guard', ' --help', 1)]),
+    ("build without the alias comparison", "release-shared-scripts",
+     "build.sh: release-shared-scripts: build operations differ from BUILD_BODY", [
+        (BUILD_SCRIPT, BUILD_CMP, "", 1)]),
+    ("build that ignores the alias comparison", "release-shared-scripts",
+     "build.sh: release-shared-scripts: build operations differ from BUILD_BODY", [
+        (BUILD_SCRIPT, BUILD_CMP, BUILD_CMP.strip() + " || true\n", 1)]),
+    ("build with a plain copy and mv", "release-shared-scripts",
+     "build.sh: release-shared-scripts: build operations differ from BUILD_BODY", [
+        (BUILD_SCRIPT, BUILD_COPY, BUILD_PLAIN_MV, 1)]),
+    ("copy helper with a plain mv", "release-shared-scripts",
+     "copy-alias.sh: release-shared-scripts: copy operations differ from COPY_HELPER_BODY", [
+        (COPY_HELPER, COPY_RENAME, '    ! mv -f -- "$temp" "$destination"; then\n', 1)]),
+    ("copy helper without the destination check", "release-shared-scripts",
+     "copy-alias.sh: release-shared-scripts: copy operations differ from COPY_HELPER_BODY", [
+        (COPY_HELPER, "  " + COPY_CHECK, "  if false; then\n", 1)]),
+    ("smoke build without the alias comparison", "release-shared-scripts",
+     "notarize-smoke.yml: release-shared-scripts: smoke build operations differ from SMOKE_BUILD", [
+        (SMOKE, SMOKE_CMP, "", 1)]),
+    ("smoke build with a plain copy and mv", "release-shared-scripts",
+     "notarize-smoke.yml: release-shared-scripts: smoke build operations differ from SMOKE_BUILD", [
+        (SMOKE, SMOKE_COPY, SMOKE_PLAIN_MV, 1)]),
+    ("signing of the alias name too", "signing-order",
+     "sign-notarize.sh: signing-order: a codesign call signs another file than stellar-agent", [
+        (SIGN_SCRIPT, SIGN_DERIVE, SIGN_DERIVE + SIGN_CANONICAL.replace(
+            '"$BINARY_DIR/stellar-agent"', '"$BINARY_DIR/stellar-agent-mcp"'), 1)]),
+    ("derivation before signing", "signing-order",
+     "sign-notarize.sh: signing-order: signing, derivation and packing differ from SIGN_BLOCK", [
+        (SIGN_SCRIPT, SIGN_DERIVE, "", 1),
+        (SIGN_SCRIPT, SIGN_CANONICAL, SIGN_DERIVE + SIGN_CANONICAL, 1)]),
+    ("derivation skipped by a condition", "signing-order",
+     "sign-notarize.sh: signing-order: signing, derivation and packing differ from SIGN_BLOCK", [
+        (SIGN_SCRIPT, SIGN_DERIVE, "if false; then\n  " + SIGN_DERIVE + "fi\n", 1)]),
+    ("final verification of both names removed", "signing-order",
+     "sign-notarize.sh: signing-order: the script does not end by verifying both signatures", [
+        (SIGN_SCRIPT, SIGN_VERIFY_BOTH, "", 1)]),
+    ("derivation with a plain mv", "signing-order",
+     "derive-alias.sh: signing-order: derivation operations differ from DERIVE_BODY", [
+        (DERIVE_SCRIPT, DERIVE_RENAME, '/bin/mv -f "$temp" "$alias"\n', 1)]),
+    ("derivation without the alias check", "signing-order",
+     "derive-alias.sh: signing-order: derivation operations differ from DERIVE_BODY", [
+        (DERIVE_SCRIPT, DERIVE_CHECK, "if false; then\n", 1)]),
     ("packaged dependency removed", "release-packaged-gate", "hashes must need verify-packaged", [
         (RELEASE, 'needs: [preflight, vendored-wasm, build, sign-macos, verify-packaged]',
          'needs: [preflight, vendored-wasm, build, sign-macos]', 1)]),
@@ -1345,15 +1416,35 @@ CASES = [
     ("host recipe without the single CLI build", "ci-feature-jobs",
      ".github/scripts/release/check-host.sh: ci-feature-jobs: does not run unconditionally: "
      "cargo build --locked -p stellar-agent-cli", [
-        (HOST_SCRIPT, HOST_SINGLE_CLI, "bash .github/scripts/check-binary-marker.sh target/debug/stellar-agent on\n", 1)]),
-    ("host recipe that expects the single MCP binary off", "ci-feature-jobs",
+        (HOST_SCRIPT, HOST_SINGLE_CLI, "mkdir -p target/tmp/host-alias\n", 1)]),
+    ("host recipe that expects the debug alias off", "ci-feature-jobs",
      ".github/scripts/release/check-host.sh: ci-feature-jobs: does not run unconditionally: "
-     "bash .github/scripts/check-binary-marker.sh target/debug/stellar-agent-mcp on", [
-        (HOST_SCRIPT, "target/debug/stellar-agent-mcp on\n", "target/debug/stellar-agent-mcp off\n", 1)]),
-    ("host recipe with the single builds in a condition", "ci-feature-jobs",
+     f"bash .github/scripts/check-binary-marker.sh {HOST_ALIAS} on", [
+        (HOST_SCRIPT, f"{HOST_ALIAS} on\n", f"{HOST_ALIAS} off\n", 1)]),
+    ("host recipe with the alias steps in a condition", "ci-feature-jobs",
      ".github/scripts/release/check-host.sh: ci-feature-jobs: does not run unconditionally: "
-     "cargo build --locked -p stellar-agent-mcp", [
-        (HOST_SCRIPT, HOST_SINGLE_MCP, "if false; then\n" + HOST_SINGLE_MCP + "fi\n", 1)]),
+     f"cmp target/debug/stellar-agent {HOST_ALIAS}", [
+        (HOST_SCRIPT, HOST_ALIAS_STEPS, "if false; then\n" + HOST_ALIAS_STEPS + "fi\n", 1)]),
+    ("host recipe without the debug alias copy", "ci-feature-jobs",
+     ".github/scripts/release/check-host.sh: ci-feature-jobs: does not run unconditionally: "
+     + HOST_ALIAS_COPY.strip(), [
+        (HOST_SCRIPT, HOST_ALIAS_COPY, "", 1)]),
+    ("host recipe with a plain copy and mv", "ci-feature-jobs",
+     ".github/scripts/release/check-host.sh: ci-feature-jobs: does not run unconditionally: "
+     + HOST_ALIAS_COPY.strip(), [
+        (HOST_SCRIPT, HOST_ALIAS_COPY,
+         "cp -p target/debug/stellar-agent target/tmp/host-alias/.stellar-agent-mcp.tmp\n"
+         f"mv -f target/tmp/host-alias/.stellar-agent-mcp.tmp {HOST_ALIAS}\n", 1)]),
+    ("host recipe without the debug comparison", "ci-feature-jobs",
+     ".github/scripts/release/check-host.sh: ci-feature-jobs: does not run unconditionally: "
+     f"cmp target/debug/stellar-agent {HOST_ALIAS}", [
+        (HOST_SCRIPT, f"cmp target/debug/stellar-agent {HOST_ALIAS}\n", "", 1)]),
+    ("host recipe that ignores the release comparison", "ci-feature-jobs",
+     ".github/scripts/release/check-host.sh: ci-feature-jobs: unmodelled shell syntax around " + HOST_RELEASE_CMP.strip(), [
+        (HOST_SCRIPT, HOST_RELEASE_CMP, HOST_RELEASE_CMP.strip() + " || true\n", 1)]),
+    ("host recipe without the release comparison", "ci-feature-jobs",
+     ".github/scripts/release/check-host.sh: ci-feature-jobs: does not run unconditionally: " + HOST_RELEASE_CMP.strip(), [
+        (HOST_SCRIPT, HOST_RELEASE_CMP, "", 1)]),
 ] + [
     (f"conditional {job}", "ci-feature-jobs", f"ci.yml: ci-feature-jobs: {job} can be bypassed", [
         (CI, header, header + "    if: false\n", 1)])

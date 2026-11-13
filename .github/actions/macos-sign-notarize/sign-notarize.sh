@@ -1,9 +1,11 @@
 #!/bin/bash
-# Signs stellar-agent and stellar-agent-mcp in BINARY_DIR with the Developer
-# ID Application identity (hardened runtime, secure timestamp), verifies both
-# signatures, and submits them to Apple's notary service, which must accept
-# them. Bare executables cannot carry a stapled ticket, so Gatekeeper checks
-# notarization online on first run.
+# Signs stellar-agent in BINARY_DIR with the Developer ID Application
+# identity (hardened runtime, secure timestamp) and verifies the signature.
+# derive-alias.sh then replaces stellar-agent-mcp with a byte-equal copy of
+# the signed file, so both names carry one signature. Both files go to
+# Apple's notary service, which must accept them, and both signatures are
+# verified again. Bare executables cannot carry a stapled ticket, so
+# Gatekeeper checks notarization online on first run.
 #
 # Inputs come from the environment: BINARY_DIR, TARGET, VERSION, P12_B64,
 # P12_PASSWORD, ASC_KEY_B64, ASC_KEY_ID, ASC_ISSUER_ID, and RUNNER_TEMP. The
@@ -49,11 +51,10 @@ if [ -z "$IDENTITY" ]; then
   fail "no Developer ID Application identity in the imported keychain"
 fi
 
-for bin in stellar-agent stellar-agent-mcp; do
-  /usr/bin/codesign --force --options runtime --timestamp \
-    --keychain "$KEYCHAIN" --sign "$IDENTITY" "$BINARY_DIR/$bin"
-  /usr/bin/codesign --verify --strict --verbose=2 "$BINARY_DIR/$bin"
-done
+/usr/bin/codesign --force --options runtime --timestamp \
+  --keychain "$KEYCHAIN" --sign "$IDENTITY" "$BINARY_DIR/stellar-agent"
+/usr/bin/codesign --verify --strict --verbose=2 "$BINARY_DIR/stellar-agent"
+/bin/bash "${BASH_SOURCE[0]%/*}/derive-alias.sh" "$BINARY_DIR" ''
 
 /usr/bin/zip -j "$SUBMIT_ZIP" "$BINARY_DIR/stellar-agent" "$BINARY_DIR/stellar-agent-mcp"
 printf '%s' "$ASC_KEY_B64" | /usr/bin/base64 -d >"$ASC_KEY"

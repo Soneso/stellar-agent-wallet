@@ -219,11 +219,11 @@ fn balances_args_value() -> serde_json::Value {
 #[serial]
 fn keyringless_profiles_serve_reads_and_refuse_signing() {
     use std::io::{BufRead, BufReader, Write};
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
     for named in [false, true] {
         let home = TempDir::new().unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_stellar-agent-mcp"));
+        let mut command = crate::common::server_binary::server_command();
         if named {
             std::fs::create_dir(home.path().join("profiles")).unwrap();
             std::fs::write(
@@ -877,7 +877,11 @@ decision = "allow"
     );
     let signed = sign_policy_toml(&body, &sk, "GABCDE");
 
-    let policy_dir = TempDir::new().unwrap();
+    // One scratch home holds the policy directory and, through
+    // STELLAR_AGENT_HOME, the policy-window state the engine opens.
+    let home = TempDir::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+    let policy_dir = TempDir::new_in(home.path()).unwrap();
     let policy_filename = format!("{profile_name}.toml");
     write_policy_file(&policy_dir, &policy_filename, &signed);
     install_owner_key_in_mock_keyring(suffix, &pk);

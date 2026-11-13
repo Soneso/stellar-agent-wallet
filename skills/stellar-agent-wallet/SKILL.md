@@ -2,7 +2,7 @@
 name: stellar-agent-wallet
 description: Operate the Stellar Agent Wallet through MCP tools for agent payments, account creation, trustlines, and claims with two-phase operator approval. Use the CLI for reads, setup, and operator ceremonies; CLI signing exceptions have separate policy and on-chain checks. Use when an agent needs Stellar account state, XLM or asset payments, smart-account governance, DeFi, SEP, x402, or sponsored MPP charges. Covers signed policy limits, shell access and approval authority, chain_id, the JSON result envelope, and configured mainnet authorization. The audit log records submissions, signed authorizations, approvals, and explicit key-management and lifecycle events. Testnet approval is available through the operator's CLI, local inbox, or remote approver; mainnet consent requires an owner-pinned passkey through the local browser or signed-origin HTTPS listener.
 license: Apache-2.0
-compatibility: Requires the stellar-agent CLI and stellar-agent-mcp server (v0.1.0-alpha.13 public alpha; install from crates.io with a pinned version, for example cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.13 stellar-agent-mcp@0.1.0-alpha.13, or build from source). Targets Stellar testnet (default) and mainnet.
+compatibility: Requires the stellar-agent executable, which also runs the stellar-agent-mcp server (v0.1.0-alpha.13 public alpha; install from crates.io with a pinned version, for example cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.13, or build from source). Targets Stellar testnet (default) and mainnet.
 metadata:
   version: "0.4.11"
   wallet_version: "0.1.0-alpha.13"
@@ -66,25 +66,35 @@ a central server.
 
 ## Installation
 
-This is a public alpha. Install the two binaries from crates.io — while only
+This is a public alpha. Install the one package from crates.io. While only
 prerelease versions are published, the version must be spelled out:
 
 ```bash
-# Prebuilt binaries (fetched from the GitHub release archive):
-cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.13 stellar-agent-mcp@0.1.0-alpha.13
+# Prebuilt binary (fetched from the GitHub release archive):
+cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.13
 # Or build from the published sources:
-cargo install --locked stellar-agent-cli@0.1.0-alpha.13 stellar-agent-mcp@0.1.0-alpha.13
+cargo install --locked stellar-agent-cli@0.1.0-alpha.13
 ```
 
-`--locked` builds with the `Cargo.lock` published in each crate. With the
+`--locked` builds with the `Cargo.lock` published in the crate. With the
 strategy flag, binstall installs only this repository's release archive and
 fails on a host for which none exists; use `cargo install --locked` there.
 
-Building from a clone of the release tag also works
-(`cargo build --release --locked -p stellar-agent-cli -p stellar-agent-mcp`
-produces `target/release/stellar-agent` and `target/release/stellar-agent-mcp`).
+Both commands install the `stellar-agent` executable, which also runs the MCP
+server: as `stellar-agent mcp serve`, or when it runs under the file name
+`stellar-agent-mcp`. The stanza below starts that name, so copy the
+executable next to the installed one:
 
-Point your MCP client at the server binary:
+```bash
+cp ~/.cargo/bin/stellar-agent ~/.cargo/bin/stellar-agent-mcp
+```
+
+Building from a clone of the release tag also works:
+`cargo build --release --locked -p stellar-agent-cli` produces
+`target/release/stellar-agent`; copy it to `target/release/stellar-agent-mcp`
+the same way. The direct release archives already hold both names.
+
+Point your MCP client at the server name:
 
 ```json
 {

@@ -1660,7 +1660,7 @@ mod windows_tests {
     /// second kill returns `Ok` too.
     #[test]
     fn a_hosted_kill_after_the_exit_is_ok() {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_stellar-agent-mcp"));
+        let mut command = crate::common::server_binary::server_command();
         command.arg("--no-such-flag");
         let mut driver = ChildDriver::spawn_in_pseudo_console(command).unwrap();
         let status = driver.wait_for_exit(EXIT_DEADLINE);
@@ -1966,7 +1966,7 @@ mod tests {
     #[test]
     fn the_wait_reports_an_early_child_exit() {
         const NEVER_PRINTED: &str = "a line the refused server never prints";
-        let mut command = Command::new(env!("CARGO_BIN_EXE_stellar-agent-mcp"));
+        let mut command = crate::common::server_binary::server_command();
         command.arg("--no-such-flag");
         let mut driver = ChildDriver::spawn(command);
         let started = Instant::now();

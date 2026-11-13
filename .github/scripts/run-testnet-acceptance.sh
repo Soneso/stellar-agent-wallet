@@ -121,6 +121,21 @@ is_browser_suite() {
   printf '%s\n' "${BROWSER_SUITE_TARGETS[@]}" | grep -qxF "$target"
 }
 
+# MCP suites that compile the shared tests/common module, whose child-driver
+# tests start the stellar-agent executable of stellar-agent-cli. Before such a
+# suite, the driver builds the tests of both packages with the suite's feature
+# list, so that executable exists with the features of this run.
+CHILD_DRIVER_SUITES=(
+  "create_account_testnet_acceptance"
+  "trustline_classic_testnet_acceptance"
+  "policy_value_descriptor_testnet_acceptance"
+)
+
+needs_server_child() {
+  local crate="$1" target="$2"
+  [ "$crate" = stellar-agent-mcp ] && printf '%s\n' "${CHILD_DRIVER_SUITES[@]}" | grep -qxF "$target"
+}
+
 # Completeness guard: every live test file on disk, a *testnet* file or a
 # *_browser_acceptance file, must be listed in SUITES below. The per-suite
 # zero-tests guard cannot catch a file that is never invoked at all, so an
@@ -282,12 +297,27 @@ in_share() {
 # Every suite builds with --no-default-features and the list suite_features
 # prints, so mainnet-write is on only under MAINNET_WRITE=on and only for a
 # crate that declares the feature.
+#
+# A suite of CHILD_DRIVER_SUITES first runs the paired prebuild of the CLI
+# and MCP tests with the same flags. A failed prebuild returns 3 before the
+# suite runs.
 run_suite() {
   local crate="$1" feature="$2" target="$3" features log status summary executed deterministic tmp_root start
   features=$(suite_features "$crate" "$feature")
   tmp_root=${TMPDIR:-/tmp}
   log=$(mktemp "${tmp_root%/}/run-testnet-acceptance.XXXXXX")
   start=$SECONDS
+  LAST_SKIPS=0
+  if needs_server_child "$crate" "$target"; then
+    cargo test -p stellar-agent-cli -p "$crate" --no-default-features --features "$features" --no-run 2>&1 | tee "$log"
+    status=${PIPESTATUS[0]}
+    if [ "$status" -ne 0 ]; then
+      LAST_SECONDS=$((SECONDS - start))
+      rm -f "$log"
+      echo "error: the paired prebuild for $crate/$target failed with status $status" >&2
+      return 3
+    fi
+  fi
   cargo test -p "$crate" --no-default-features --features "$features" --test "$target" \
     -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$log"
   status=${PIPESTATUS[0]}

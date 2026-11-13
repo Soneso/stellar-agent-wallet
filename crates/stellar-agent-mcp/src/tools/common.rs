@@ -7625,8 +7625,13 @@ pub(crate) mod tests {
 
         /// Makes a directory read-only while it lives, so nothing can be
         /// created or replaced in it.
+        ///
+        /// Unix only: the fault is a Unix directory mode, and Windows does not
+        /// refuse file creation in a directory for its read-only attribute.
+        #[cfg(unix)]
         pub(crate) struct ReadOnlyDir(std::path::PathBuf);
 
+        #[cfg(unix)]
         impl ReadOnlyDir {
             pub(crate) fn new(path: &std::path::Path) -> Self {
                 use std::os::unix::fs::PermissionsExt as _;
@@ -7635,6 +7640,7 @@ pub(crate) mod tests {
             }
         }
 
+        #[cfg(unix)]
         impl Drop for ReadOnlyDir {
             fn drop(&mut self) {
                 use std::os::unix::fs::PermissionsExt as _;
@@ -7643,6 +7649,7 @@ pub(crate) mod tests {
         }
 
         /// A guard a hook creates at the moment it runs, dropped by the test.
+        #[cfg(unix)]
         pub(crate) type HookGuard = Arc<std::sync::Mutex<Option<ReadOnlyDir>>>;
 
         /// What the RPC double answers, switched by a test, and what it saw.
@@ -10214,6 +10221,9 @@ pub(crate) mod tests {
             }
         }
 
+        /// Unix only: the failed tombstone write comes from [`ReadOnlyDir`],
+        /// a Unix directory mode.
+        #[cfg(unix)]
         #[tokio::test]
         #[serial_test::serial(keyring)]
         async fn mainnet_classic_receipt_held_approval_refuses_a_replay() {
@@ -11245,6 +11255,9 @@ pub(crate) mod tests {
             assert_eq!(run.simulations(), 1, "no signed simulation");
         }
 
+        /// Unix only: the failed tombstone write comes from [`ReadOnlyDir`],
+        /// a Unix directory mode.
+        #[cfg(unix)]
         #[tokio::test]
         #[serial_test::serial(keyring)]
         async fn mainnet_x402_tombstone_failure_keeps_both_records_used() {

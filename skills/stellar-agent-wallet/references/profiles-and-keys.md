@@ -35,10 +35,10 @@ was given and no `default.toml` exists yet, both fall back to an in-memory
 testnet configuration — the MCP server so it can still serve read-only
 requests, the CLI so `pay`, `claim`, and `accounts create` work before any
 profile is authored. This fallback is never written to disk, and a profile that
-WAS named but has no file is refused by both binaries rather than replaced by
+WAS named but has no file is refused by the CLI and the MCP server rather than replaced by
 it.
 
-A profile name becomes a path component, so both binaries validate it before the
+A profile name becomes a path component, so the CLI and the MCP server validate it before the
 path is built: 1 to 64 printable ASCII characters; no `/`, `\`, `:`, or `..`; no
 leading `-`; and not a Windows reserved device name (`CON`, `PRN`, `AUX`, `NUL`,
 `COM1`-`COM9`, `LPT1`-`LPT9`, in any letter case). Windows cuts a name at the
@@ -57,8 +57,8 @@ under a valid name, or rename the file, correct its
 `profile enroll-owner-key` and `profile sign-policy` under the new name.
 
 A profile file is bound to its name by its keyring coordinates. Renaming or
-copying `<a>.toml` to `<b>.toml` does not create profile `b`; both binaries
-refuse it under the new name with `profile.name_mismatch` — the MCP server at
+copying `<a>.toml` to `<b>.toml` does not create profile `b`; the CLI and the
+MCP server refuse it under the new name with `profile.name_mismatch` — the MCP server at
 startup, the CLI at every command that loads a profile. Use `profile init` for
 a second profile, or correct the file's `policy_owner_key_id.service` to
 `stellar-agent-owner-<name>`. `profile show <name>` still displays a
@@ -81,7 +81,7 @@ Every value-moving signing command requires the audit key on either engine,
 refusing `audit.chain_key_unavailable` until it exists. See
 [Approvals and audit](approvals-and-audit.md#fail-closed-on-an-unminted-audit-key).
 
-After name reconciliation, both binaries compare keyring entries with sibling
+After name reconciliation, the CLI and the MCP server compare keyring entries with sibling
 profile files in the same profiles directory. Mainnet conflicts refuse with
 `profile.key_scope_conflict`; testnet conflicts warn and keep the verb's behavior.
 The check includes wallet keys, provider credentials and derived entries.

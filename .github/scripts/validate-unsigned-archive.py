@@ -7,8 +7,9 @@ The archive comes from a build job that ran dependency build scripts, so its
 content is untrusted. The archive must be an uncompressed tar holding exactly
 two regular-file members named ``stellar-agent`` and ``stellar-agent-mcp``.
 Each member must be a thin 64-bit Mach-O executable for ``<arch>``
-(``arm64`` or ``x86_64``); the script refuses a fat binary, and it refuses a
-damaged tar before it writes anything. It writes the members into
+(``arm64`` or ``x86_64``), and the two complete members must hold equal bytes,
+because the build copies one executable to the second name. The script
+refuses a fat binary, and it refuses a damaged tar before it writes anything. It writes the members into
 ``<out-dir>``, which must not exist yet, with mode 0755. It executes nothing
 and does not use tarfile's own extraction, so member paths, links, and owners
 never reach the file system.
@@ -64,7 +65,22 @@ def checked_members(archive, cputype):
         if member.size > MAX_MEMBER_BYTES:
             raise Refusal(f"{member.name}: {member.size} bytes exceeds {MAX_MEMBER_BYTES}")
         check_macho(member.name, archive.extractfile(member).read(32), cputype)
+    if not equal_bodies(archive, members):
+        raise Refusal(f"{' and '.join(EXPECTED_MEMBERS)} differ; both names must hold one executable")
     return members
+
+
+def equal_bodies(archive, members):
+    """Whether the two member bodies are byte-equal, read in full."""
+    if members[0].size != members[1].size:
+        return False
+    first, second = (archive.extractfile(member) for member in members)
+    while True:
+        chunk = first.read(CHUNK)
+        if chunk != second.read(CHUNK):
+            return False
+        if not chunk:
+            return True
 
 
 def validate(tar_path, out_dir, arch):

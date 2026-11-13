@@ -60,17 +60,21 @@ Errors use typed results; output uses JSON envelopes and redacting logs.
 Scoped allowances document necessary exceptions.
 The [lint gate](building.md#lint) enforces these rules.
 
-## The two binaries
+## The one executable
 
 `stellar-agent-cli` builds `stellar-agent` from `src/main.rs`.
 The external-command convention also makes it discoverable as `stellar agent ...`.
-`stellar-agent-mcp` builds the MCP server, with a library entry point used by integration tests.
+It selects the server role before tool startup: `stellar-agent mcp serve`, or a
+run under the file name `stellar-agent-mcp`, enters the public server entry of
+the `stellar-agent-mcp` library. That library has no executable target.
+Releases and the deployment install the executable under both names as
+byte-equal copies.
 
 MCP directly links `sep7`, `sep43`, `sep48`, `sep53`, `anchor`, `x402`, and `x402-identity`.
-Both binaries link `mpp`, which uses `sep43`.
-`sep10` reaches MCP through `x402-identity`; neither binary links `sep45`.
+The CLI and MCP crates both link `mpp`, which uses `sep43`.
+`sep10` reaches MCP through `x402-identity`; the executable does not link `sep45`.
 
-Both binaries share the release archive referenced by their `package.metadata.binstall` blocks.
+The CLI's `package.metadata.binstall` block installs `stellar-agent` from the release archive, which holds both names.
 See [Getting started](../getting-started.md) for installation and [Building](building.md#building) for source builds.
 
 ## Per-crate responsibility
@@ -110,8 +114,8 @@ See [Getting started](../getting-started.md) for installation and [Building](bui
 | `stellar-agent-x402-identity` | SEP-10 counterparty-identity pre-payment gate for x402, returning a JWT Bearer companion bound at the HTTP layer; never mutates the payment XDR. It also holds the authorized mainnet gate that binds the authentication to the approved payment and returns the receipt continuation. |
 | `stellar-agent-mpp` | Strict testnet sponsored MPP charge parsing, request binding, simulation, one-shot payer authorization, durable lifecycle, credential encoding, receipt observation, and ledger reconciliation; shared by CLI and MCP. |
 | `stellar-agent-mcp-macros` | Proc-macro crate exporting `#[mcp_tool_router]`, which scans `#[mcp_tool_item(...)]` markers and emits `inventory::submit!` tool-registry entries. |
-| `stellar-agent-mcp` | MCP stdio server library and binary: `WalletServer`, the bounded stdio transport, per-family tool modules, and the inventory-collected tool registry feeding the policy engine. |
-| `stellar-agent-cli` | The `stellar-agent` CLI binary (discovered as `stellar agent ...`); a clap dispatch layer over the library crates. |
+| `stellar-agent-mcp` | MCP stdio server library, run by the `stellar-agent` executable: `WalletServer`, the bounded stdio transport, per-family tool modules, and the inventory-collected tool registry feeding the policy engine. |
+| `stellar-agent-cli` | The `stellar-agent` executable (discovered as `stellar agent ...`): a clap dispatch layer over the library crates, and the MCP server under `mcp serve` or the `stellar-agent-mcp` name. |
 | `stellar-agent-test-support` | Dev-only harness: log-capture and secret-leakage assertions, in-memory keyring mock, XDR and strkey fixtures, HTTP and contract doubles, live-network testnet helpers. |
 | `stellar-agent-smart-account-acceptance` | Unpublished member holding the smart-account live testnet suites that drive a browser, the MCP server, the WebAuthn bridge, or the SEP-48, DeFi, and DeFindex crates. Its `testnet-integration` feature activates every dependency, so offline builds compile an empty library. |
 

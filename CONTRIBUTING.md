@@ -12,8 +12,11 @@ source before relying on a behavior.
 ## Getting set up
 
 Stellar Agent Wallet is a Cargo workspace of `stellar-agent-*` crates that builds
-two binaries: `stellar-agent` (the CLI, from crate `stellar-agent-cli`) and
-`stellar-agent-mcp` (the MCP stdio server, from crate `stellar-agent-mcp`).
+one executable, `stellar-agent`, from crate `stellar-agent-cli`. It runs the CLI,
+and it runs the MCP stdio server of the `stellar-agent-mcp` library crate as
+`stellar-agent mcp serve` or under the file name `stellar-agent-mcp`. The MCP
+integration tests start that server child, so build both packages first:
+`cargo test -p stellar-agent-cli -p stellar-agent-mcp --no-run`.
 
 The toolchain channel is `stable` (pinned in `rust-toolchain.toml`, with the
 `rustfmt` and `clippy` components) and the workspace targets Rust edition 2024. See
