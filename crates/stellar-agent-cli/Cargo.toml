@@ -150,7 +150,7 @@ stellar-baselib = { workspace = true }
 reqwest = { workspace = true }
 # #[tokio::test] async runtime for the claim testnet-acceptance test (the
 # production [dependencies] entry only enables rt-multi-thread).
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 # parse_capability_value_pub + CapabilitySet in tests.
 stellar-agent-toolsets = { path = "../stellar-agent-toolsets", features = ["test-helpers"] }
 # build_attestation_preimage in the install tests.

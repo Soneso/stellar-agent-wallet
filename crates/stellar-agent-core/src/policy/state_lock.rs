@@ -1,22 +1,40 @@
-//! The exclusive lock over one window-state keyring entry.
+//! The exclusive and shared lock over one window-state keyring entry.
 //!
 //! The HMAC key, the generation commitment, and the policy pin that the
 //! window store, its authorization ledger, and the pin operations read and
 //! write are named by a profile's window-state keyring entry, not by a file
-//! path. They therefore share one OFD-advisory exclusive lock named by that
-//! entry: `policy-state-<digest>.lock` in the directory of the window-state
-//! file, which gives one lock file per entry in the policy-state directory
-//! whatever store path a handle names. Holding the guard is what makes a
-//! read-verify-write sequence over any of them atomic with respect to every
-//! other process on the host: the store's own transitions take it, and a
-//! caller that reads, compares, and writes the pin holds one guard across all
-//! three steps.
+//! path. They therefore share one OFD-advisory lock named by that entry:
+//! `policy-state-<digest>.lock` in the directory of the window-state file.
+//! That gives one lock file per entry in the policy-state directory, whatever
+//! store path a handle names.
 //!
-//! The guard is not reentrant. A second acquisition of the same lock, in the
-//! same process or another, answers
-//! [`StateLockError::WriterLocked`](crate::policy::state_lock::StateLockError::WriterLocked)
-//! at once,
-//! so a holder never calls an operation that acquires the lock itself.
+//! The exclusive guard,
+//! [`WindowStoreLock`](crate::policy::state_lock::WindowStoreLock), makes a
+//! read-verify-write sequence over any of them atomic with respect to every
+//! other process on the host. The store's own transitions take it, and a
+//! caller that reads, compares, and writes the pin holds one exclusive guard
+//! across all three steps.
+//!
+//! A reader that compares the pin and writes nothing holds the shared guard,
+//! [`WindowStoreReadLock`](crate::policy::state_lock::WindowStoreReadLock).
+//! Shared guards coexist, in one process or in several. An exclusive
+//! acquisition conflicts with any held guard, and a shared acquisition
+//! conflicts with a held exclusive guard. No writer changes an entry while a
+//! reader holds a guard of it.
+//!
+//! A guard is never upgraded. A holder that must write drops its shared guard
+//! before it acquires the exclusive one, so another writer can run in between.
+//! That holder therefore reads the pin again under the exclusive guard.
+//!
+//! A conflict answers
+//! [`StateLockError::WriterLocked`](crate::policy::state_lock::StateLockError::WriterLocked).
+//! [`WindowStoreLock::acquire_for`](crate::policy::state_lock::WindowStoreLock::acquire_for)
+//! answers it at once. Every acquisition whose name ends in `_with_retry`
+//! makes [`LOCK_ATTEMPTS`](crate::policy::state_lock::LOCK_ATTEMPTS) attempts
+//! [`LOCK_RETRY_DELAY`](crate::policy::state_lock::LOCK_RETRY_DELAY) apart.
+//! It answers the conflict when the final attempt conflicts. A holder never
+//! acquires a guard that conflicts with one it holds, since that acquisition
+//! conflicts until the holder drops its own guard.
 
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
@@ -30,7 +48,8 @@ use crate::profile::schema::{KeyringEntryRef, keyring_entry_alias};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum StateLockError {
-    /// Another process or task holds the exclusive lock.
+    /// A conflicting guard is held: any guard for an exclusive acquisition,
+    /// an exclusive guard for a shared one.
     #[error("policy window-state store writer is locked by another process")]
     WriterLocked,
 
@@ -164,8 +183,8 @@ impl WindowStoreLock {
     ///
     /// # Errors
     ///
-    /// - [`StateLockError::WriterLocked`] when another process or task holds
-    ///   the exclusive lock.
+    /// - [`StateLockError::WriterLocked`] at once when any guard of the lock
+    ///   is held, exclusive or shared.
     /// - [`StateLockError::Io`] when the lock file could not be created or
     ///   opened.
     pub fn acquire_for(
@@ -196,10 +215,10 @@ impl WindowStoreLock {
     /// its lock file exists, retrying contention like
     /// [`WindowStoreLock::acquire_for_with_retry`].
     ///
-    /// A reader that writes nothing uses this acquisition, so it creates
-    /// neither the lock file nor its directory. An absent lock file returns
-    /// `Ok(None)` without inspecting the keyring. An advancing load recreates
-    /// the lock and checks any existing pin.
+    /// A writer that must not establish a new store uses this acquisition, so
+    /// it creates neither the lock file nor its directory. An absent lock file
+    /// returns `Ok(None)` without inspecting the keyring. An advancing load
+    /// recreates the lock and checks any existing pin.
     ///
     /// # Errors
     ///
@@ -233,24 +252,7 @@ impl WindowStoreLock {
         window_key: Option<KeyringEntryRef>,
         create: bool,
     ) -> Result<Self, StateLockError> {
-        let mut options = OpenOptions::new();
-        options.create(create).write(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        let file = options
-            .open(path)
-            .map_err(|e| StateLockError::Io { kind: e.kind() })?;
-
-        let file = HeldFileLock::try_lock(file).map_err(|e| match e {
-            std::fs::TryLockError::WouldBlock => StateLockError::WriterLocked,
-            std::fs::TryLockError::Error(io_err) => StateLockError::Io {
-                kind: io_err.kind(),
-            },
-        })?;
-
+        let file = HeldFileLock::try_lock(open_lock_file(path, create)?).map_err(lock_error)?;
         Ok(Self {
             _file: file,
             path: path.to_path_buf(),
@@ -270,6 +272,118 @@ impl WindowStoreLock {
     pub fn guards(&self, window_path: &Path, window_key: &KeyringEntryRef) -> bool {
         self.path == window_lock_path(window_path, window_key)
             && self.window_key.as_ref() == Some(window_key)
+    }
+}
+
+/// A shared OFD-advisory lock over one window-state keyring entry.
+///
+/// A reader that compares the policy pin and writes nothing holds this guard.
+/// Readers hold it together; a [`WindowStoreLock`] of the same entry excludes
+/// it and is excluded by it. The pin read accepts this guard, and every write
+/// requires a [`WindowStoreLock`].
+pub struct WindowStoreReadLock {
+    /// The guard explicitly releases the lock on drop.
+    _file: HeldFileLock,
+    /// The lock file this guard holds.
+    path: PathBuf,
+    /// The window-state key coordinate the guard was acquired for.
+    window_key: KeyringEntryRef,
+}
+
+impl std::fmt::Debug for WindowStoreReadLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WindowStoreReadLock")
+            .finish_non_exhaustive()
+    }
+}
+
+impl WindowStoreReadLock {
+    /// Takes the shared lock of the keyring entry `window_key` in the
+    /// directory of `window_path`, the file [`window_lock_path`] names,
+    /// retrying contention with [`LOCK_ATTEMPTS`] attempts
+    /// [`LOCK_RETRY_DELAY`] apart. The lock file is created with mode `0o600`
+    /// when absent; its directory must exist.
+    ///
+    /// # Errors
+    ///
+    /// The first I/O error, or [`StateLockError::WriterLocked`] when an
+    /// exclusive guard stays held through the final attempt.
+    pub fn acquire_for_with_retry(
+        window_path: &Path,
+        window_key: &KeyringEntryRef,
+    ) -> Result<Self, StateLockError> {
+        let path = window_lock_path(window_path, window_key);
+        with_retry(|| Self::open_and_lock(&path, window_key, true))
+    }
+
+    /// Takes the shared lock of [`WindowStoreReadLock::acquire_for_with_retry`]
+    /// only when its lock file exists, so it creates neither the lock file nor
+    /// its directory. An absent lock file returns `Ok(None)`.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`WindowStoreReadLock::acquire_for_with_retry`], except
+    /// that a missing lock file or directory is `Ok(None)`.
+    pub fn acquire_existing_for_with_retry(
+        window_path: &Path,
+        window_key: &KeyringEntryRef,
+    ) -> Result<Option<Self>, StateLockError> {
+        let path = window_lock_path(window_path, window_key);
+        match with_retry(|| Self::open_and_lock(&path, window_key, false)) {
+            Ok(lock) => Ok(Some(lock)),
+            Err(StateLockError::Io {
+                kind: std::io::ErrorKind::NotFound,
+            }) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn open_and_lock(
+        path: &Path,
+        window_key: &KeyringEntryRef,
+        create: bool,
+    ) -> Result<Self, StateLockError> {
+        let file =
+            HeldFileLock::try_lock_shared(open_lock_file(path, create)?).map_err(lock_error)?;
+        Ok(Self {
+            _file: file,
+            path: path.to_path_buf(),
+            window_key: window_key.clone(),
+        })
+    }
+
+    /// Whether this guard holds the lock that [`window_lock_path`] names for
+    /// `window_path` and `window_key`, acquired for that coordinate.
+    #[must_use]
+    pub fn guards(&self, window_path: &Path, window_key: &KeyringEntryRef) -> bool {
+        self.path == window_lock_path(window_path, window_key) && self.window_key == *window_key
+    }
+}
+
+/// Opens the lock file for writing with mode `0o600`, creating it when
+/// `create` is set. The lock is taken on the open handle before any content
+/// check: a check made before the lock is a time-of-check race.
+fn open_lock_file(path: &Path, create: bool) -> Result<std::fs::File, StateLockError> {
+    let mut options = OpenOptions::new();
+    options.create(create).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options
+        .open(path)
+        .map_err(|e| StateLockError::Io { kind: e.kind() })
+}
+
+/// Maps a failed non-blocking lock attempt: contention is
+/// [`StateLockError::WriterLocked`], anything else keeps its I/O kind.
+fn lock_error(error: std::fs::TryLockError) -> StateLockError {
+    match error {
+        std::fs::TryLockError::WouldBlock => StateLockError::WriterLocked,
+        std::fs::TryLockError::Error(io_err) => StateLockError::Io {
+            kind: io_err.kind(),
+        },
     }
 }
 
@@ -415,5 +529,68 @@ mod tests {
         drop(scoped);
         let bare = WindowStoreLock::acquire(&window_lock_path(&window, &key)).unwrap();
         assert!(!bare.guards(&window, &key));
+    }
+
+    /// Read guards of one entry coexist, an exclusive guard waits for every
+    /// one of them, and a held exclusive guard refuses a reader.
+    #[test]
+    fn readers_share_the_lock_and_exclude_a_writer() {
+        let dir = TempDir::new().unwrap();
+        let window = dir.path().join("main.window");
+        let key = KeyringEntryRef::new("stellar-agent-policy-window-main", "default");
+        let first = WindowStoreReadLock::acquire_for_with_retry(&window, &key).unwrap();
+        let second = WindowStoreReadLock::acquire_existing_for_with_retry(&window, &key)
+            .unwrap()
+            .unwrap();
+        assert!(first.guards(&window, &key));
+        assert!(second.guards(&dir.path().join("other.window"), &key));
+        assert_eq!(
+            WindowStoreLock::acquire_for(&window, &key).err(),
+            Some(StateLockError::WriterLocked)
+        );
+        drop(first);
+        assert_eq!(
+            WindowStoreLock::acquire_for(&window, &key).err(),
+            Some(StateLockError::WriterLocked)
+        );
+        drop(second);
+        let writer = WindowStoreLock::acquire_for(&window, &key).unwrap();
+        assert_eq!(
+            WindowStoreReadLock::acquire_for_with_retry(&window, &key).err(),
+            Some(StateLockError::WriterLocked)
+        );
+        drop(writer);
+        assert!(WindowStoreReadLock::acquire_for_with_retry(&window, &key).is_ok());
+    }
+
+    /// The existing-only read acquisition creates nothing and answers `None`
+    /// for an absent lock file, in an absent directory or in a present one;
+    /// the creating one leaves the file behind.
+    #[test]
+    fn a_read_guard_creates_the_lock_file_only_when_asked() {
+        let dir = TempDir::new().unwrap();
+        let window = dir.path().join("absent").join("main.window");
+        let key = KeyringEntryRef::new("stellar-agent-policy-window-main", "default");
+        assert!(
+            WindowStoreReadLock::acquire_existing_for_with_retry(&window, &key)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!dir.path().join("absent").exists());
+        let present = dir.path().join("main.window");
+        assert!(
+            WindowStoreReadLock::acquire_existing_for_with_retry(&present, &key)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!window_lock_path(&present, &key).exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        drop(WindowStoreReadLock::acquire_for_with_retry(&present, &key).unwrap());
+        assert!(window_lock_path(&present, &key).exists());
+        let other_key = KeyringEntryRef::new("stellar-agent-policy-window-other", "default");
+        let guard = WindowStoreReadLock::acquire_existing_for_with_retry(&present, &key)
+            .unwrap()
+            .unwrap();
+        assert!(!guard.guards(&present, &other_key));
     }
 }

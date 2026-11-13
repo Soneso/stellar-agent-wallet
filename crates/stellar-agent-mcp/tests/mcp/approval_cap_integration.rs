@@ -9,9 +9,8 @@
 
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicI64, Ordering},
+    atomic::{AtomicI64, AtomicUsize, Ordering},
 };
-use std::time::Duration;
 
 use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey};
@@ -34,6 +33,7 @@ use stellar_agent_mcp::server::{
 use stellar_agent_network::policy_state::PersistedWindowStore;
 use stellar_agent_test_support::{
     keyring_mock,
+    timing::{ClockHold, drive_call, wait_until},
     xdr_fixtures::{account_entry_xdr_with_seq, account_ledger_key_xdr},
 };
 use tempfile::TempDir;
@@ -154,11 +154,19 @@ struct Harness {
     source: String,
     outcomes: Arc<Mutex<Outcome>>,
     sends: Arc<Mutex<Vec<WindowSnapshot>>>,
+    polls: Arc<AtomicUsize>,
     signer_reads: Arc<AtomicI64>,
     policy_dir: TempDir,
     approval_dir: TempDir,
     rpc: MockServer,
     _root: crate::common::IsolatedDataRoot,
+    _clock: ClockHold,
+}
+
+impl Drop for Harness {
+    fn drop(&mut self) {
+        tokio::time::resume();
+    }
 }
 
 impl Harness {
@@ -229,6 +237,8 @@ decision = "allow"
         crate::common::store_signer_identity("svc", name, [0x61; 32]);
         seed_key("n-svc", "n-acct", &[7; 32]);
         let rpc = MockServer::start().await;
+        tokio::time::pause();
+        let clock = ClockHold::new();
         let mut profile = crate::common::timeout_profile(&rpc.uri(), name);
         profile.policy.engine = PolicyEngineKind::V1;
         seed_key(
@@ -268,6 +278,8 @@ decision = "allow"
 
         let outcomes = Arc::new(Mutex::new(outcome));
         let sends = Arc::new(Mutex::new(Vec::new()));
+        let polls = Arc::new(AtomicUsize::new(0));
+        let observed_polls = polls.clone();
         let response_outcome = outcomes.clone();
         let observations = sends.clone();
         let response_profile = profile.clone();
@@ -280,6 +292,7 @@ decision = "allow"
                 observations.lock().unwrap().push(snapshot(&response_profile, &response_name));
             }
             if body["method"] == "getTransaction" {
+                observed_polls.fetch_add(1, Ordering::SeqCst);
                 let status = match *response_outcome.lock().unwrap() {
                     Outcome::Success => { sequence.store(43, Ordering::SeqCst); "SUCCESS" }, Outcome::Timeout => "NOT_FOUND", Outcome::Failed => { sequence.store(43, Ordering::SeqCst); "FAILED" },
                 };
@@ -317,11 +330,13 @@ decision = "allow"
             source,
             outcomes,
             sends,
+            polls,
             signer_reads,
             policy_dir,
             approval_dir,
             rpc,
             _root: root,
+            _clock: clock,
         }
     }
 
@@ -397,13 +412,28 @@ decision = "allow"
     }
 
     async fn commit_pay(&self, args: StellarPayCommitArgs) -> Value {
+        let expires = matches!(*self.outcomes.lock().unwrap(), Outcome::Timeout);
+        let polls_before = self.polls.load(Ordering::SeqCst);
         result_json(
-            &tokio::time::timeout(
-                Duration::from_secs(5),
+            &drive_call(
                 self.server.call_stellar_pay_commit(args),
+                |probe| async move {
+                    if expires {
+                        wait_until("the first confirmation poll", || {
+                            self.polls.load(Ordering::SeqCst) > polls_before
+                        })
+                        .await;
+                        assert!(!probe.finished(), "the commit waits for confirmation");
+                        // Tokio rounds a timer deadline up to the next
+                        // millisecond, so the clock moves 1 ms past the timeout.
+                        tokio::time::advance(
+                            self.profile.submit_timeout() + std::time::Duration::from_millis(1),
+                        )
+                        .await;
+                    }
+                },
             )
             .await
-            .expect("commit is bounded around its one-second poll deadline")
             .unwrap(),
         )
     }
@@ -1163,11 +1193,12 @@ async fn allowed_submission_ignores_an_unverified_approval_nonce() {
 #[tokio::test]
 #[serial]
 async fn rule_ttl_bounds_toolset_queued_approval_at_commit() {
+    const RULE_TTL_SECS: u64 = 600;
     let mut h = Harness::with_approval_fields(
         "cap-toolset-rule-ttl",
         "require_approval",
         Outcome::Success,
-        "ttl_secs = 1",
+        &format!("ttl_secs = {RULE_TTL_SECS}"),
     )
     .await;
     let tools = tempfile::tempdir().unwrap();
@@ -1247,7 +1278,7 @@ async fn rule_ttl_bounds_toolset_queued_approval_at_commit() {
         let nonce = queued[0].approval_nonce.clone();
         let now = now_unix_ms().unwrap();
         let mut entry = store.get(&nonce).unwrap().clone();
-        entry.created_at_unix_ms = now - 2_000;
+        entry.created_at_unix_ms = now - 2 * RULE_TTL_SECS * 1_000;
         assert!(!entry.is_expired(now), "the stored expiry remains live");
         assert!(store.remove(&nonce).unwrap());
         store.insert(entry, now).unwrap();

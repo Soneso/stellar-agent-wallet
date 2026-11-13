@@ -68,6 +68,7 @@ use std::sync::{Arc, Mutex};
 
 use stellar_agent_core::approval::error::ApprovalError;
 use stellar_agent_core::approval::presence::MAINNET_CHAIN_ID;
+use stellar_agent_core::approval::presence_policy::PolicyAdmission;
 use stellar_agent_core::approval::{
     ApprovalKind, ApproverIdentity, AttestedApprover, ConsentAudit, ConsentAuthorization,
     DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, PendingApprovalStore, RemoteApprovalAuthority,
@@ -225,6 +226,38 @@ pub trait RevocationAccess: Send + Sync {
         origin: Surface,
         attribution: Option<&str>,
     ) -> Result<RevocationView, RevocationFailure>;
+
+    /// [`Self::revoke`] for a request that holds `lock`, the exclusive
+    /// policy-state guard. An adapter whose write takes that lock writes
+    /// under `lock` instead. The default suits an adapter that takes no
+    /// policy-state lock.
+    ///
+    /// # Errors
+    /// As [`Self::revoke`].
+    fn revoke_held(
+        &self,
+        nonce: &str,
+        origin: Surface,
+        attribution: Option<&str>,
+        lock: &stellar_agent_core::policy::state_lock::WindowStoreLock,
+    ) -> Result<RevocationView, RevocationFailure> {
+        let _ = lock;
+        self.revoke(nonce, origin, attribution)
+    }
+}
+
+/// The current policy, read through `admission` when the request holds one.
+fn current_policy(
+    ctx: &DecisionContext,
+    admission: Option<&PolicyAdmission>,
+) -> Result<stellar_agent_core::approval::CurrentMainnetApprovalPolicy, WalletError> {
+    let authority = ctx.mainnet_authority.as_ref().ok_or(WalletError::Approval(
+        stellar_agent_core::ApprovalFailure::PresencePolicyUnavailable,
+    ))?;
+    match admission {
+        Some(admission) => authority.load_admitted(admission),
+        None => authority.load_current_compare_only(),
+    }
 }
 
 /// The immutable inputs [`apply_decision`] needs to act on the store.
@@ -413,6 +446,10 @@ pub(crate) fn presence_refusal(error: &WalletError) -> Option<Outcome> {
             "The current owner-signed mainnet approval policy cannot be verified; restore a \
              valid policy and start a new approval ceremony."
         }
+        F::PresencePolicyBusy => {
+            "The owner-signed mainnet approval policy is in use by another request; retry the \
+             request."
+        }
         F::PresenceBrowserRequired => {
             "Mainnet consent requires a local browser with WebAuthn user verification; no \
              approval is recorded."
@@ -482,7 +519,7 @@ pub fn shown_view_digest(body: &[u8]) -> Option<[u8; 32]> {
 
 /// The mainnet presence refusals, each with the stable code
 /// [`presence_refusal`] answers it with.
-fn presence_refusals() -> [stellar_agent_core::ApprovalFailure; 12] {
+fn presence_refusals() -> [stellar_agent_core::ApprovalFailure; 13] {
     use stellar_agent_core::ApprovalFailure as F;
     [
         F::PresenceRequired,
@@ -491,6 +528,7 @@ fn presence_refusals() -> [stellar_agent_core::ApprovalFailure; 12] {
         F::PresenceExpired,
         F::PresenceConsumed,
         F::PresencePolicyUnavailable,
+        F::PresencePolicyBusy,
         F::PresenceBrowserRequired,
         F::PresenceUnavailable,
         F::PresenceCanceled,
@@ -557,13 +595,46 @@ pub fn apply_decision(
         Decision::Approve {
             nonce,
             shown_view_digest,
-        } => apply_approve(ctx, &nonce, shown_view_digest, requester),
-        Decision::Reject { nonce } => apply_reject(ctx, &nonce, &requester),
-        Decision::Revoke { nonce } => apply_revoke(ctx, &nonce, &requester),
+        } => apply_approve(ctx, &nonce, shown_view_digest, requester, None),
+        Decision::Reject { nonce } => apply_reject(ctx, &nonce, &requester, None),
+        Decision::Revoke { nonce } => apply_revoke(ctx, &nonce, &requester, None),
     }
 }
 
-fn apply_revoke(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity) -> Outcome {
+/// [`apply_decision`] for a request that holds `admission`, from
+/// [`stellar_agent_core::approval::MainnetApprovalAuthority::admit`] or,
+/// for a revocation,
+/// [`stellar_agent_core::approval::MainnetApprovalAuthority::admit_exclusive`].
+///
+/// Every policy read of the decision runs through the guard, and a
+/// revocation writes its durable record under the exclusive guard. The
+/// decision takes no policy-state lock itself.
+pub(crate) fn apply_admitted_decision(
+    ctx: &DecisionContext,
+    decision: Decision,
+    requester: RequestIdentity,
+    admission: &PolicyAdmission,
+) -> Outcome {
+    match decision {
+        Decision::Approve {
+            nonce,
+            shown_view_digest,
+        } => apply_approve(ctx, &nonce, shown_view_digest, requester, Some(admission)),
+        Decision::Reject { nonce } => apply_reject(ctx, &nonce, &requester, Some(admission)),
+        Decision::Revoke { nonce } => apply_revoke(ctx, &nonce, &requester, Some(admission)),
+    }
+}
+
+/// Revokes `nonce` under one exclusive policy-state guard, taken before the
+/// pending store. A request that holds `admission` passes it; otherwise a
+/// mainnet decision takes its own. The policy read and the durable write both
+/// run under that guard, so the lock is taken once and held throughout.
+fn apply_revoke(
+    ctx: &DecisionContext,
+    nonce: &str,
+    requester: &RequestIdentity,
+    admission: Option<&PolicyAdmission>,
+) -> Outcome {
     let Some(access) = &ctx.revocation else {
         return Outcome::Unavailable;
     };
@@ -576,6 +647,25 @@ fn apply_revoke(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity)
     let resolved = match resolve_requester(requester) {
         Ok(value) => value,
         Err(outcome) => return outcome,
+    };
+    #[cfg(any(test, feature = "test-helpers"))]
+    revoke_hook::fire();
+    let owned;
+    let admission = match (admission, &ctx.mainnet_authority) {
+        (Some(admission), _) => Some(admission),
+        (None, Some(authority)) => match authority.admit_exclusive() {
+            Ok(admission) => {
+                owned = admission;
+                Some(&owned)
+            }
+            Err(error) => return presence_refusal(&error).unwrap_or(Outcome::Unavailable),
+        },
+        (None, None) => None,
+    };
+    let lock = match admission.map(PolicyAdmission::exclusive) {
+        Some(Some(lock)) => Some(lock),
+        Some(None) => return Outcome::Unavailable,
+        None => None,
     };
     let store = match open_store(ctx, "revoke") {
         Ok(store) => store,
@@ -596,18 +686,9 @@ fn apply_revoke(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity)
         if ctx.context.chain_id != MAINNET_CHAIN_ID || presence.approval_nonce() != nonce {
             return Outcome::BindingMismatch;
         }
-        let checked = ctx
-            .mainnet_authority
-            .as_ref()
-            .ok_or(WalletError::Approval(
-                stellar_agent_core::ApprovalFailure::PresencePolicyUnavailable,
-            ))
-            .and_then(
-                stellar_agent_core::approval::MainnetApprovalAuthority::load_current_compare_only,
-            )
-            .and_then(|current| {
-                presence.revalidate_rejection(&store, &ctx.context.binding(), current.policy())
-            });
+        let checked = current_policy(ctx, admission).and_then(|current| {
+            presence.revalidate_rejection(&store, &ctx.context.binding(), current.policy())
+        });
         if let Err(error) = checked {
             return presence_refusal(&error).unwrap_or_else(|| entry_outcome(&error));
         }
@@ -625,9 +706,46 @@ fn apply_revoke(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity)
     if !view.permits_inbox_revocation() {
         return Outcome::Unauthorized;
     }
-    match access.revoke(nonce, resolved.surface, attribution.as_deref()) {
+    let revoked = match lock {
+        Some(lock) => access.revoke_held(nonce, resolved.surface, attribution.as_deref(), lock),
+        None => access.revoke(nonce, resolved.surface, attribution.as_deref()),
+    };
+    match revoked {
         Ok(view) => Outcome::Revocation(view),
         Err(error) => Outcome::RevocationRefused(error),
+    }
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod revoke_hook {
+    //! Runs a test action inside a revocation, after a signed-origin route
+    //! consumed the challenge and recorded the counter, before the decision
+    //! opens the pending store, reads the policy, and writes the durable
+    //! record. The action runs on the thread that serves the request, so it
+    //! is process-wide.
+
+    use std::sync::Mutex;
+
+    type Action = Box<dyn FnOnce() + Send>;
+
+    static HOOK: Mutex<Option<Action>> = Mutex::new(None);
+
+    /// Installs `action` for the next revocation that reaches that point.
+    ///
+    /// # Panics
+    ///
+    /// When a previous action panicked while the hook was locked.
+    #[allow(clippy::unwrap_used, reason = "test seam")]
+    pub fn install(action: impl FnOnce() + Send + 'static) {
+        *HOOK.lock().unwrap() = Some(Box::new(action));
+    }
+
+    #[allow(clippy::unwrap_used, reason = "test seam")]
+    pub(super) fn fire() {
+        let action = HOOK.lock().unwrap().take();
+        if let Some(action) = action {
+            action();
+        }
     }
 }
 
@@ -813,6 +931,7 @@ fn apply_approve(
     nonce: &str,
     shown_view_digest: Option<[u8; 32]>,
     requester: RequestIdentity,
+    admission: Option<&PolicyAdmission>,
 ) -> Outcome {
     if ctx.context.chain_id == MAINNET_CHAIN_ID
         && matches!(requester, RequestIdentity::Remote { .. })
@@ -940,16 +1059,7 @@ fn apply_approve(
     let grant_override = ctx.grant_store_path_override.clone();
     let profile_name = ctx.context.profile_name.as_str();
     let current = if presence_bearing {
-        let loaded = ctx
-            .mainnet_authority
-            .as_ref()
-            .ok_or(WalletError::Approval(
-                stellar_agent_core::ApprovalFailure::PresencePolicyUnavailable,
-            ))
-            .and_then(
-                stellar_agent_core::approval::MainnetApprovalAuthority::load_current_compare_only,
-            );
-        match loaded {
+        match current_policy(ctx, admission) {
             Ok(current) => Some(current),
             Err(error) => return presence_refusal(&error).unwrap_or(Outcome::Unavailable),
         }
@@ -961,9 +1071,16 @@ fn apply_approve(
             let Some(current) = &current else {
                 return Outcome::Unavailable;
             };
-            ConsentAuthorization::Mainnet {
-                presence,
-                policy: current.policy(),
+            match admission {
+                Some(admission) => ConsentAuthorization::MainnetAdmitted {
+                    presence,
+                    policy: current.policy(),
+                    admission,
+                },
+                None => ConsentAuthorization::Mainnet {
+                    presence,
+                    policy: current.policy(),
+                },
             }
         }
         _ => ConsentAuthorization::Standard(&resolved.approver),
@@ -1057,7 +1174,12 @@ fn audit_event_kind(operator_credential_id: Option<&str>, approve: bool) -> &'st
     }
 }
 
-fn apply_reject(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity) -> Outcome {
+fn apply_reject(
+    ctx: &DecisionContext,
+    nonce: &str,
+    requester: &RequestIdentity,
+    admission: Option<&PolicyAdmission>,
+) -> Outcome {
     // A signed-origin reject stands on the assertion that verified for this
     // entry; one for another entry or off mainnet decides nothing.
     if let RequestIdentity::SignedOrigin(presence) = requester {
@@ -1167,18 +1289,9 @@ fn apply_reject(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity)
         return outcome;
     }
     if let RequestIdentity::SignedOrigin(presence) = requester {
-        let checked = ctx
-            .mainnet_authority
-            .as_ref()
-            .ok_or(WalletError::Approval(
-                stellar_agent_core::ApprovalFailure::PresencePolicyUnavailable,
-            ))
-            .and_then(
-                stellar_agent_core::approval::MainnetApprovalAuthority::load_current_compare_only,
-            )
-            .and_then(|current| {
-                presence.revalidate_rejection(&store, &ctx.context.binding(), current.policy())
-            });
+        let checked = current_policy(ctx, admission).and_then(|current| {
+            presence.revalidate_rejection(&store, &ctx.context.binding(), current.policy())
+        });
         if let Err(error) = checked {
             return presence_refusal(&error).unwrap_or_else(|| entry_outcome(&error));
         }

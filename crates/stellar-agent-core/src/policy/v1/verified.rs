@@ -11,7 +11,7 @@ use crate::{
     policy::{
         PolicyError,
         pin::{self, Pin, PinScope, PinState},
-        state_lock::{StateLockError, WindowStoreLock},
+        state_lock::{StateLockError, WindowStoreLock, WindowStoreReadLock},
     },
     profile::{
         loader::{ThresholdIdentityConflict, threshold_identity_conflict},
@@ -27,15 +27,20 @@ pub enum PinMode {
     /// Persist a first or newer v2 policy after all body checks pass.
     ///
     /// The load creates the store's lock file when it is absent, in a
-    /// directory that must exist, and holds the lock across the pin read, the
-    /// comparison, and the write.
+    /// directory that must exist, and compares the pin under the shared lock.
+    /// A policy that advances the pin then takes the exclusive lock, reads
+    /// and compares the pin again, and writes it under that lock, so a pin
+    /// another writer changed in between is compared before anything is
+    /// written. A load that leaves the pin unchanged never takes the
+    /// exclusive lock.
     Advance,
     /// Compare freshness without changing the pin or creating any file.
     ///
-    /// An existing lock is held across the pin read and the comparison. An
-    /// absent lock file or window-state directory reads as an absent pin.
-    /// A pin left behind after its lock file was removed is therefore not
-    /// compared until a load in [`PinMode::Advance`] recreates the lock.
+    /// An existing lock is held shared across the pin read and the
+    /// comparison. An absent lock file or window-state directory reads as an
+    /// absent pin. A pin left behind after its lock file was removed is
+    /// therefore not compared until a load in [`PinMode::Advance`] recreates
+    /// the lock.
     CompareOnly,
 }
 
@@ -327,28 +332,41 @@ pub fn acquire_existing_state_lock(
 }
 
 /// Reads the pin without creating the lock file or its directory. It runs
-/// `compare` on the pin while the lock it was read under is still held, so no
-/// writer can change the pin between the read and the comparison. An absent
-/// lock file passes an absent pin and holds no lock.
+/// `compare` on the pin while the shared lock it was read under is still
+/// held, so no writer can change the pin between the read and the
+/// comparison, while other readers compare at the same time. An absent lock
+/// file passes an absent pin and holds no lock.
 ///
 /// # Errors
-/// Refuses lock contention, lock-file I/O other than absence, and an
+/// Refuses a held exclusive lock, lock-file I/O other than absence, and an
 /// unreadable or malformed pin.
 pub fn with_pin_without_creating<T>(
     window_path: &Path,
     profile: &Profile,
     compare: impl FnOnce(PinState) -> T,
 ) -> Result<T, PolicyError> {
-    match acquire_existing_state_lock(window_path, profile)? {
-        Some(lock) => {
-            let state = pin::read(&lock, &PinScope::for_profile(window_path, profile))
-                .map_err(PolicyError::from)?;
-            let outcome = compare(state);
-            drop(lock);
-            Ok(outcome)
-        }
+    match WindowStoreReadLock::acquire_existing_for_with_retry(
+        window_path,
+        &profile.policy_window_state_key_id,
+    )
+    .map_err(state_lock_error)?
+    {
+        Some(lock) => compare_under(&lock, window_path, profile, compare),
         None => Ok(compare(PinState::Absent)),
     }
+}
+
+/// Runs `compare` on the pin read under the shared `lock`, before the lock
+/// is released.
+fn compare_under<T>(
+    lock: &WindowStoreReadLock,
+    window_path: &Path,
+    profile: &Profile,
+    compare: impl FnOnce(PinState) -> T,
+) -> Result<T, PolicyError> {
+    let state = pin::read_shared(lock, &PinScope::for_profile(window_path, profile))
+        .map_err(PolicyError::from)?;
+    Ok(compare(state))
 }
 
 /// Reads the pin without creating the lock file or its directory: an absent
@@ -548,40 +566,117 @@ pub fn load_verified_policy(
     let signed = read_signed(load, None)?;
     let body = check_body(load, &signed)?;
     let owner = *load.owner_pubkey;
+    let compare = |state: &PinState| {
+        advances(
+            state,
+            body.sequence,
+            body.digest,
+            owner,
+            &signed.raw,
+            load.profile,
+        )
+    };
     match pin_mode {
         PinMode::Advance => {
-            let lock = acquire_state_lock(load.window_path, load.profile)?;
-            let scope = PinScope::for_profile(load.window_path, load.profile);
-            let state = pin::read(&lock, &scope).map_err(PolicyError::from)?;
-            let advance = advances(
-                &state,
-                body.sequence,
-                body.digest,
-                owner,
-                &signed.raw,
-                load.profile,
-            )?;
-            check_engine_selection(load, &signed.doc)?;
+            let shared = WindowStoreReadLock::acquire_for_with_retry(
+                load.window_path,
+                &load.profile.policy_window_state_key_id,
+            )
+            .map_err(state_lock_error)?;
+            let advance = compare_under(&shared, load.window_path, load.profile, |state| {
+                let advance = compare(&state)?;
+                check_engine_selection(load, &signed.doc)?;
+                Ok::<_, PolicyError>(advance)
+            })??;
+            drop(shared);
             if advance {
-                let pin = Pin::new(body.sequence, body.digest, owner).map_err(PolicyError::from)?;
-                pin::write(&lock, &scope, &pin).map_err(PolicyError::from)?;
+                #[cfg(any(test, feature = "test-helpers"))]
+                advance_gap_hook::fire();
+                let lock = acquire_state_lock(load.window_path, load.profile)?;
+                let scope = PinScope::for_profile(load.window_path, load.profile);
+                let state = pin::read(&lock, &scope).map_err(PolicyError::from)?;
+                if compare(&state)? {
+                    let pin =
+                        Pin::new(body.sequence, body.digest, owner).map_err(PolicyError::from)?;
+                    pin::write(&lock, &scope, &pin).map_err(PolicyError::from)?;
+                }
             }
         }
         PinMode::CompareOnly => {
             with_pin_without_creating(load.window_path, load.profile, |state| {
-                advances(
-                    &state,
-                    body.sequence,
-                    body.digest,
-                    owner,
-                    &signed.raw,
-                    load.profile,
-                )?;
+                compare(&state)?;
                 check_engine_selection(load, &signed.doc)
             })??;
         }
     }
     Ok(into_verified(load, signed.document, body, window_state))
+}
+
+/// Runs the checks [`load_verified_policy`] runs before it takes the lock:
+/// the policy file's signature, the owner source, the minimum restrictions,
+/// and the body. Reads no pin and takes no lock.
+///
+/// # Errors
+/// The read, signature and body errors of [`load_verified_policy`].
+pub fn check_signed_policy(load: &PolicyLoad<'_>) -> Result<(), PolicyError> {
+    let signed = read_signed(load, None)?;
+    check_body(load, &signed).map(|_| ())
+}
+
+/// Verifies a policy as [`load_verified_policy`] does in
+/// [`PinMode::CompareOnly`], against `pin`. The caller read `pin` under a
+/// policy-state guard it still holds, so this load takes no lock.
+///
+/// # Errors
+/// The errors of [`load_verified_policy`] in [`PinMode::CompareOnly`],
+/// except lock errors.
+pub fn load_verified_policy_against(
+    load: &PolicyLoad<'_>,
+    window_state: PolicyStateStore,
+    pin: &PinState,
+) -> Result<VerifiedPolicy, PolicyError> {
+    let signed = read_signed(load, None)?;
+    let body = check_body(load, &signed)?;
+    advances(
+        pin,
+        body.sequence,
+        body.digest,
+        *load.owner_pubkey,
+        &signed.raw,
+        load.profile,
+    )?;
+    check_engine_selection(load, &signed.doc)?;
+    Ok(into_verified(load, signed.document, body, window_state))
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod advance_gap_hook {
+    //! Runs a test action inside an advancing load on this thread, after the
+    //! load drops its shared guard and before it acquires the exclusive one.
+    //! The action stands in for another writer that runs in that gap.
+
+    use std::cell::RefCell;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    /// Installs `action` for the next advancing load on this thread that
+    /// reaches the gap.
+    pub fn install(action: impl FnOnce() + 'static) {
+        HOOK.with(|hook| *hook.borrow_mut() = Some(Box::new(action)));
+    }
+
+    /// Removes an installed action that no load has run.
+    pub fn clear() {
+        HOOK.with(|hook| *hook.borrow_mut() = None);
+    }
+
+    pub(super) fn fire() {
+        if let Some(action) = HOOK.with(|hook| hook.borrow_mut().take()) {
+            action();
+        }
+    }
 }
 
 /// Checks selection after freshness and before any pin advancement.
@@ -726,6 +821,49 @@ mod tests {
             self.load(&self.body(1), &self.old, PinMode::Advance)
                 .unwrap();
         }
+    }
+
+    /// While a reader holds the policy-state lock, a compare-only load and an
+    /// advance that leaves the pin unchanged both complete, and an advance
+    /// that writes the pin refuses as busy without writing. Once the reader
+    /// is gone, that advance writes the pin.
+    #[test]
+    #[serial]
+    fn loads_beside_a_reader_take_the_exclusive_lock_only_to_write() {
+        let f = Fixture::new();
+        f.seed_pin();
+        let window = f.dir.path().join("state.window");
+        let before = f.pin();
+        let [same_compare, same_advance, newer_compare, newer_advance] =
+            with_pin_without_creating(&window, &f.profile, |state| {
+                assert_eq!(state, before);
+                [
+                    (1, PinMode::CompareOnly),
+                    (1, PinMode::Advance),
+                    (2, PinMode::CompareOnly),
+                    (2, PinMode::Advance),
+                ]
+                .map(|(sequence, mode)| {
+                    f.load(&f.body(sequence), &f.old, mode)
+                        .map(|verified| verified.sequence())
+                })
+            })
+            .unwrap();
+        assert_eq!(same_compare.unwrap(), 1);
+        assert_eq!(same_advance.unwrap(), 1);
+        assert_eq!(newer_compare.unwrap(), 2);
+        assert!(
+            matches!(newer_advance, Err(PolicyError::StateLockBusy)),
+            "{newer_advance:?}"
+        );
+        assert_eq!(f.pin(), before);
+        assert_eq!(
+            f.load(&f.body(2), &f.old, PinMode::Advance)
+                .unwrap()
+                .sequence(),
+            2
+        );
+        assert!(matches!(f.pin(), PinState::Present(pin) if pin.sequence() == 2));
     }
 
     #[test]

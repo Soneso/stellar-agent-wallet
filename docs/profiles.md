@@ -1303,6 +1303,7 @@ Other build failures use `policy.engine_unavailable` or `trustline.policy_engine
 | `profile.reset_window_state_open_authorizations` | Effective open authorizations prevent reset. |
 | `approval.presence_required` | Mainnet consent requires a verified assertion from an approval credential in the owner-signed policy; use the local passkey approval page. |
 | `approval.presence_policy_unavailable` | The current owner-signed mainnet policy cannot be verified, lists no approval credential, or changed since the consent was recorded. |
+| `approval.presence_policy_busy` | The required policy-state lock stays busy through the retries. Freshness cannot be checked; retry the operation. A writer causes it, and so does a reader when the load must advance the pin. The signature and body checks may already have passed. The approval listener returns HTTP 503 `store_busy`. No busy answer grants a session, a consent, or a pin change. |
 | `approval.listener_policy_stale` | The approval listener serves an earlier owner-signed mainnet policy; restart it under the current policy. |
 | `approval.origin_signed_remote` | The owner-signed policy serves mainnet consent at its approval origin; approve there. |
 | `approval.mainnet_remote_unsupported` | Remote mainnet approval requires a signed approval origin. |

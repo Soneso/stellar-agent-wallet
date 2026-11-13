@@ -5,6 +5,7 @@
     reason = "synthetic consent assertions"
 )]
 use super::*;
+use crate::decision::apply_decision;
 use axum::{
     body::{Body, to_bytes},
     http::Request,
@@ -1146,6 +1147,7 @@ fn refusal_statuses_follow_the_variant() {
             F::PresencePolicyUnavailable,
             StatusCode::SERVICE_UNAVAILABLE,
         ),
+        (F::PresencePolicyBusy, StatusCode::SERVICE_UNAVAILABLE),
         (F::PresenceUnavailable, StatusCode::SERVICE_UNAVAILABLE),
     ] {
         let code = failure.code();
@@ -1636,6 +1638,15 @@ impl SignedOrigin {
         name: &str,
         access: Option<Arc<dyn crate::decision::RevocationAccess>>,
     ) -> Self {
+        Self::with_gate(name, access, |gate| gate)
+    }
+
+    /// The inbox over the gate `wrap` makes of the session's gate.
+    fn with_gate<G: ConsentSessionGate>(
+        name: &str,
+        access: Option<Arc<dyn crate::decision::RevocationAccess>>,
+        wrap: impl FnOnce(HttpsSessionGate) -> G,
+    ) -> Self {
         let mut fixture = MainnetConsentFixture::new(name);
         fixture.sign_signed_origin_policy(&[&fixture_authenticator()], &SIGNED_CERT_SPKI_SHA256);
         let entry = fixture.payment(600_000);
@@ -1656,7 +1667,7 @@ impl SignedOrigin {
             },
             identity,
             SIGNED_ORIGIN,
-            Arc::new(gate),
+            Arc::new(wrap(gate)),
         )
         .unwrap()
         .into_parts();
@@ -2231,4 +2242,434 @@ async fn signed_origin_reject_requires_an_action_assertion() {
     let (status, late) = so.post("assertion", &assertion).await;
     assert_eq!(status, StatusCode::CONFLICT, "{late}");
     assert_eq!(late["error"], "approval.presence_consumed");
+}
+
+/// The exclusive policy-state guard of `fixture`'s window-state entry.
+fn policy_writer(
+    fixture: &MainnetConsentFixture,
+) -> stellar_agent_core::policy::state_lock::WindowStoreLock {
+    stellar_agent_core::policy::state_lock::WindowStoreLock::acquire_for(
+        &stellar_agent_core::profile::schema::default_policy_window_state_path_for(fixture.name()),
+        &fixture.profile().policy_window_state_key_id,
+    )
+    .unwrap()
+}
+
+/// The consent page, challenge and assertion load the policy themselves.
+/// While a policy-state writer holds the lock, each answers the retriable
+/// busy body and records nothing. After the writer releases, the page and
+/// the challenge succeed, and a fresh assertion attests.
+#[tokio::test]
+#[serial_test::serial]
+async fn signed_consent_policy_loads_answer_busy_beside_a_writer() {
+    let so = SignedOrigin::new("signed-busy");
+    let page = so.page().await;
+    let challenge = json!({"consent_view_digest": page["consent_view_digest"]});
+    let assertion = SignedOrigin::signed(&so.challenge().await, 3);
+    let busy = json!({"error": "store_busy", "retriable": true});
+
+    let writer = policy_writer(&so.fixture);
+    let response = so
+        .send("GET", &format!("/approval/{}", so.nonce()), None)
+        .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let bytes = to_bytes(response.into_body(), 16384).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+        busy
+    );
+    for (action, body) in [("challenge", &challenge), ("assertion", &assertion)] {
+        let (status, refused) = so.post(action, body).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{action}: {refused}"
+        );
+        assert_eq!(refused, busy, "{action}");
+    }
+    assert!(so.stored().attestation_blob_b64.is_none());
+    assert!(so.rows("approval_attested").is_empty());
+    drop(writer);
+
+    assert_eq!(
+        so.page().await["consent_view_digest"],
+        page["consent_view_digest"]
+    );
+    let (status, body) = so
+        .post("assertion", &SignedOrigin::signed(&so.challenge().await, 4))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "attested");
+}
+
+/// The same consent routes keep their answers for an invalid policy: the
+/// challenge refuses as an unavailable policy, not as busy.
+#[tokio::test]
+#[serial_test::serial]
+async fn signed_consent_keeps_its_answer_for_an_invalid_policy() {
+    let so = SignedOrigin::new("signed-invalid");
+    let page = so.page().await;
+    let policy_path = so.fixture.policy_path();
+    let signed = std::fs::read_to_string(&policy_path).unwrap();
+    std::fs::write(&policy_path, "not a policy").unwrap();
+    let (status, refused) = so
+        .post(
+            "challenge",
+            &json!({"consent_view_digest": page["consent_view_digest"]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{refused}");
+    assert_eq!(refused["error"], "approval.presence_policy_unavailable");
+    std::fs::write(&policy_path, signed).unwrap();
+    so.challenge().await;
+}
+
+/// A gate that admits the mutation and answers `status` when the route reads
+/// its session again, as the listener does when the policy-state lock turns
+/// busy between the two reads.
+struct SecondReadGate(StatusCode);
+
+impl ConsentSessionGate for SecondReadGate {
+    type Session = ();
+
+    fn session(&self, _headers: &HeaderMap) -> Result<(), Response> {
+        Err(self.0.into_response())
+    }
+
+    fn authorize_mutation(&self, _headers: &HeaderMap, _nonce: &str) -> Result<(), Response> {
+        Ok(())
+    }
+
+    fn session_key(&self, _session: &()) -> String {
+        String::new()
+    }
+
+    fn csrf(&self, _session: &(), _nonce: &str) -> String {
+        String::new()
+    }
+}
+
+/// A busy second session read refuses as a busy policy, which answers the
+/// retriable busy body; any other refusal there is a consumed challenge.
+#[test]
+fn a_busy_second_session_read_passes_through() {
+    let headers = HeaderMap::new();
+    let busy =
+        session_again(&SecondReadGate(StatusCode::SERVICE_UNAVAILABLE), &headers).unwrap_err();
+    assert_eq!(busy.code(), "approval.presence_policy_busy");
+    let response = error_response(&busy);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let gone = session_again(&SecondReadGate(StatusCode::NOT_FOUND), &headers).unwrap_err();
+    assert_eq!(gone.code(), "approval.presence_consumed");
+    assert_eq!(error_response(&gone).status(), StatusCode::CONFLICT);
+}
+
+/// The retriable busy body of a busy policy-state lock.
+fn busy_body() -> serde_json::Value {
+    json!({"error": "store_busy", "retriable": true})
+}
+
+/// A writer that holds the lock before the admission of a consent
+/// assertion, a rejection or a revocation makes it answer the busy body.
+/// The challenge, the entry, the audit log and the revocation adapter stay
+/// unchanged. The same body succeeds after the release, and a replay fails.
+#[tokio::test]
+#[serial_test::serial]
+async fn signed_actions_answer_busy_at_admission_then_succeed() {
+    use std::sync::atomic::Ordering;
+    for action in ["assertion", "reject", "revoke"] {
+        let access = Arc::new(crate::tests::CountingRevocations::new());
+        let so = SignedOrigin::with_revocation("signed-admission", Some(access.clone()));
+        let body = SignedOrigin::signed(&so.challenge().await, 3);
+        let stored = serde_json::to_value(so.stored()).unwrap();
+        let calls = access.calls.load(Ordering::SeqCst);
+
+        let writer = policy_writer(&so.fixture);
+        let (status, refused) = so.post(action, &body).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{action}");
+        assert_eq!(refused, busy_body(), "{action}");
+        assert_eq!(
+            serde_json::to_value(so.stored()).unwrap(),
+            stored,
+            "{action}"
+        );
+        assert!(so.rows("approval_attested").is_empty(), "{action}");
+        assert!(so.rows("approval_rejected").is_empty(), "{action}");
+        assert_eq!(access.calls.load(Ordering::SeqCst), calls, "{action}");
+        drop(writer);
+
+        let (status, done) = so.post(action, &body).await;
+        assert_eq!(status, StatusCode::OK, "{action}: {done}");
+        match action {
+            "assertion" => {
+                assert_eq!(done["status"], "attested");
+                assert!(so.stored().attestation_blob_b64.is_some());
+                assert_eq!(so.rows("approval_attested").len(), 1);
+            }
+            "reject" => {
+                assert_eq!(done["status"], "rejected");
+                assert_eq!(so.rows("approval_rejected").len(), 1);
+                assert!(so.stored().attestation_blob_b64.is_none());
+            }
+            _ => {
+                assert_eq!(done["view"]["state"], "revoked");
+                assert_eq!(access.calls.load(Ordering::SeqCst), calls + 2);
+                assert!(so.rows("approval_attested").is_empty());
+            }
+        }
+        let (status, replay) = so.post(action, &body).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{action}: {replay}");
+    }
+}
+
+/// A gate whose check of a verified presence runs a policy-state writer on
+/// another thread and records whether it took the lock.
+struct WriterProbeGate {
+    inner: HttpsSessionGate,
+    writer: Arc<dyn Fn() -> bool + Send + Sync>,
+    took: Arc<Mutex<Vec<bool>>>,
+}
+
+impl ConsentSessionGate for WriterProbeGate {
+    type Session = test_support::HttpsGateSession;
+
+    fn session(&self, headers: &HeaderMap) -> Result<Self::Session, Response> {
+        self.inner.session(headers)
+    }
+
+    fn authorize_mutation(&self, headers: &HeaderMap, nonce: &str) -> Result<(), Response> {
+        self.inner.authorize_mutation(headers, nonce)
+    }
+
+    fn session_key(&self, session: &Self::Session) -> String {
+        self.inner.session_key(session)
+    }
+
+    fn csrf(&self, session: &Self::Session, nonce: &str) -> String {
+        self.inner.csrf(session, nonce)
+    }
+
+    fn verified(&self, _presence: &VerifiedMainnetPresence) -> Result<(), WalletError> {
+        let writer = self.writer.clone();
+        let took = std::thread::spawn(move || writer()).join().unwrap();
+        self.took.lock().unwrap().push(took);
+        Ok(())
+    }
+}
+
+/// A writer that arrives after the admission of a consent assertion or a
+/// rejection, once the challenge is consumed, cannot take the lock. The
+/// request completes with 200, and the writer then takes the lock.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_writer_after_consent_admission_waits_for_the_decision() {
+    for action in ["assertion", "reject"] {
+        let took = Arc::new(Mutex::new(Vec::new()));
+        let seen = took.clone();
+        let name = "signed-probe";
+        // The fixture's home is set when the gate is made, so both paths
+        // resolve under it.
+        let so = SignedOrigin::with_gate(name, None, move |inner| {
+            let window =
+                stellar_agent_core::profile::schema::default_policy_window_state_path_for(name);
+            assert!(std::env::var_os("STELLAR_AGENT_HOME").is_some());
+            let key = stellar_agent_core::profile::loader::load_from_dir_without_overlays(
+                name,
+                &stellar_agent_core::profile::schema::default_profile_dir().unwrap(),
+                None,
+            )
+            .unwrap()
+            .policy_window_state_key_id;
+            WriterProbeGate {
+                inner,
+                writer: Arc::new(move || {
+                    stellar_agent_core::policy::state_lock::WindowStoreLock::acquire_for_with_retry(
+                        &window, &key,
+                    )
+                    .is_ok()
+                }),
+                took: seen,
+            }
+        });
+        let body = SignedOrigin::signed(&so.challenge().await, 3);
+        let (status, done) = so.post(action, &body).await;
+        assert_eq!(status, StatusCode::OK, "{action}: {done}");
+        assert_eq!(*took.lock().unwrap(), vec![false], "{action}");
+        drop(policy_writer(&so.fixture));
+    }
+}
+
+/// The decision path reads the policy again before it approves, rejects or
+/// revokes. A writer that holds the lock refuses each as busy, and an
+/// invalid policy refuses each as unavailable, also under the writer. None
+/// records consent, a rejection or a revocation.
+#[tokio::test]
+#[serial_test::serial]
+async fn decision_loads_answer_busy_and_unavailable_apart() {
+    use std::sync::atomic::Ordering;
+    let access = Arc::new(crate::tests::CountingRevocations::new());
+    let so = SignedOrigin::with_revocation("signed-decision-loads", Some(access.clone()));
+    let presence = || {
+        let policy = so.fixture.current_policy();
+        let identity = ListenerIdentity::capture(&policy).unwrap();
+        let pending = issue_mainnet_intent_presence(
+            &so.entry,
+            &so.fixture.binding(),
+            &policy,
+            PresenceListener::SignedOrigin(&identity),
+            None,
+            now_ms().unwrap(),
+            Instant::now(),
+        )
+        .unwrap();
+        let assertion = MainnetConsentFixture::sign_issued(&fixture_authenticator(), &pending);
+        verify_mainnet_presence(
+            pending,
+            MainnetConsentFixture::input(&assertion),
+            now_ms().unwrap(),
+            Instant::now(),
+        )
+        .unwrap()
+    };
+    let presences: Vec<_> = (0..6).map(|_| presence()).collect();
+    let mut presences = presences.into_iter();
+    let nonce = so.nonce().to_owned();
+    let mut decide = |action: &str| {
+        let decision = match action {
+            "approve" => Decision::Approve {
+                nonce: nonce.clone(),
+                shown_view_digest: Some(
+                    approval_view_digest(&so.entry, &so.fixture.binding()).unwrap(),
+                ),
+            },
+            "reject" => Decision::Reject {
+                nonce: nonce.clone(),
+            },
+            _ => Decision::Revoke {
+                nonce: nonce.clone(),
+            },
+        };
+        outcome_to_response(apply_decision(
+            &so.context,
+            decision,
+            RequestIdentity::SignedOrigin(presences.next().unwrap()),
+        ))
+    };
+    let stored = serde_json::to_value(so.stored()).unwrap();
+    let calls = access.calls.load(Ordering::SeqCst);
+    let writer = policy_writer(&so.fixture);
+    let path = so.fixture.policy_path();
+    let signed = std::fs::read_to_string(&path).unwrap();
+    for action in ["approve", "reject", "revoke"] {
+        let response = decide(action);
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{action}"
+        );
+        let bytes = to_bytes(response.into_body(), 16384).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body, busy_body(), "{action}");
+    }
+    std::fs::write(&path, "not a policy").unwrap();
+    for action in ["approve", "reject", "revoke"] {
+        let response = decide(action);
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{action}"
+        );
+        let bytes = to_bytes(response.into_body(), 16384).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["error"], "approval.presence_policy_unavailable",
+            "{action}"
+        );
+    }
+    drop(writer);
+    std::fs::write(&path, signed).unwrap();
+    assert_eq!(serde_json::to_value(so.stored()).unwrap(), stored);
+    assert!(so.rows("approval_attested").is_empty());
+    assert!(so.rows("approval_rejected").is_empty());
+    assert_eq!(access.calls.load(Ordering::SeqCst), calls);
+}
+
+/// The detail page of an attested trustline clawback opt-in first loads the
+/// policy for its attestation key. A writer that holds the lock makes it
+/// answer the busy body, and an invalid policy answers unavailable, also
+/// under the writer. The page renders after both.
+#[tokio::test]
+#[serial_test::serial]
+async fn the_reshow_load_answers_busy_and_unavailable_apart() {
+    let mut h = Harness::named("reshow");
+    let entry = PendingApproval::new_trustline_clawback_opt_in_pending(
+        "stellar:mainnet".to_owned(),
+        "USDC".to_owned(),
+        "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".to_owned(),
+        process_uid_for_attestation().unwrap(),
+        600_000,
+    )
+    .unwrap();
+    h.replace_entry(entry);
+    let options = h.challenge().await;
+    let (status, body) = h.post("assertion", h.signed(&options, 5), "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let nonce = h.entry.approval_nonce.clone();
+    assert!(
+        PendingApprovalStore::open(h.fixture.store_path())
+            .unwrap()
+            .get(&nonce)
+            .unwrap()
+            .attestation_blob_b64
+            .is_some()
+    );
+    let mut writer = Some(policy_writer(&h.fixture));
+    let (status, body) = page_text(detail(&h.state, &h.session, &nonce)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+        busy_body()
+    );
+    let path = h.fixture.policy_path();
+    let signed = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, "not a policy").unwrap();
+    for held in ["held", "released"] {
+        let (status, body) = page_text(detail(&h.state, &h.session, &nonce)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{held}: {body}");
+        assert!(
+            body.contains("approval.presence_policy_unavailable"),
+            "{held}: {body}"
+        );
+        drop(writer.take());
+    }
+    std::fs::write(&path, signed).unwrap();
+    let (status, body) = page_text(detail(&h.state, &h.session, &nonce)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// A writer that holds the lock before the startup load of a mainnet inbox
+/// refuses the start as a busy policy, not as an unavailable one. The inbox
+/// starts once the writer releases.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_busy_inbox_start_keeps_the_busy_refusal() {
+    let fixture = MainnetConsentFixture::new("inbox-start-busy");
+    let start = || {
+        crate::start_serve(crate::ServeConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            Harness::context_of(&fixture),
+            tokio::sync::mpsc::unbounded_channel().0,
+            false,
+        ))
+    };
+    let writer = policy_writer(&fixture);
+    let Err(error) = start().await else {
+        panic!("the inbox started beside a policy-state writer");
+    };
+    assert_eq!(
+        error.presence_failure().map(|failure| failure.code()),
+        Some("approval.presence_policy_busy")
+    );
+    drop(writer);
+    start().await.unwrap().shutdown().await.unwrap();
 }

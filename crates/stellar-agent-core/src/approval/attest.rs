@@ -479,6 +479,16 @@ pub enum ConsentAuthorization<'a> {
         /// The current verified policy.
         policy: &'a VerifiedPolicy,
     },
+    /// [`Self::Mainnet`] for a request that holds `admission`: the attester
+    /// reads the current policy through its guard and takes no lock.
+    MainnetAdmitted {
+        /// The verified ceremony, consumed by the attestation.
+        presence: VerifiedMainnetPresence,
+        /// The current verified policy.
+        policy: &'a VerifiedPolicy,
+        /// The policy-state guard the request holds.
+        admission: &'a super::presence_policy::PolicyAdmission,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -582,7 +592,27 @@ pub fn attest_and_persist(
         ConsentAuthorization::Mainnet { presence, policy } => {
             let gated_tool = mainnet_gated_tool(&entry.kind)?;
             return attest_mainnet_presence(
-                store, entry, key_bytes, binding, surface, &mut audit, presence, policy, gated_tool,
+                store, entry, key_bytes, binding, surface, &mut audit, presence, policy,
+                gated_tool, None,
+            );
+        }
+        ConsentAuthorization::MainnetAdmitted {
+            presence,
+            policy,
+            admission,
+        } => {
+            let gated_tool = mainnet_gated_tool(&entry.kind)?;
+            return attest_mainnet_presence(
+                store,
+                entry,
+                key_bytes,
+                binding,
+                surface,
+                &mut audit,
+                presence,
+                policy,
+                gated_tool,
+                Some(admission),
             );
         }
     };
@@ -1078,6 +1108,7 @@ pub fn attest_mainnet_confirmation(
         presence,
         policy,
         gated_tool,
+        None,
     )
     .map(|_| ())
 }
@@ -1127,7 +1158,7 @@ fn mainnet_gated_tool(kind: &ApprovalKind) -> Result<&'static str, WalletError> 
 /// passkey approver and the receipt.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the store, entry, key, binding, surface, sink, proof, policy and tool are each explicit"
+    reason = "the store, entry, key, binding, surface, sink, proof, policy, tool and admission are each explicit"
 )]
 fn attest_mainnet_presence(
     store: &mut PendingApprovalStore,
@@ -1139,6 +1170,7 @@ fn attest_mainnet_presence(
     presence: VerifiedMainnetPresence,
     policy: &VerifiedPolicy,
     gated_tool: &str,
+    admission: Option<&super::presence_policy::PolicyAdmission>,
 ) -> Result<Option<String>, WalletError> {
     let parts = presence.into_parts();
     // A remote surface records mainnet consent only from the listener of the
@@ -1178,9 +1210,12 @@ fn attest_mainnet_presence(
         .cloned()
         .ok_or_else(|| record_error(&ApprovalError::NotFound))?;
 
-    let loaded =
-        super::presence_policy::MainnetApprovalAuthority::for_profile(binding.profile_name)?
-            .load_current_compare_only()?;
+    let authority =
+        super::presence_policy::MainnetApprovalAuthority::for_profile(binding.profile_name)?;
+    let loaded = match admission {
+        Some(admission) => authority.load_admitted(admission)?,
+        None => authority.load_current_compare_only()?,
+    };
     if let Some((pin, listener_digest)) = listener {
         let current = loaded.policy();
         let current_pin = current
@@ -2725,6 +2760,67 @@ mod tests {
                 "{kind}: nothing is queued and no outbox is created"
             );
         }
+    }
+
+    /// The mainnet attester reads the current policy before it persists. A
+    /// writer that holds the policy-state lock through the retries refuses it
+    /// as busy, and an invalid policy file refuses it as unavailable, also
+    /// under the writer. Neither stores an attestation; it attests after both.
+    #[test]
+    #[serial_test::serial]
+    fn mainnet_attestation_load_answers_busy_and_unavailable_apart() {
+        use crate::approval::mainnet_fixtures::{ATTESTATION_KEY, MainnetConsentFixture};
+        let fixture = MainnetConsentFixture::new("attest-busy");
+        let entry = fixture.payment(DEFAULT_TTL_MS);
+        let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
+        store
+            .insert(entry.clone(), crate::timefmt::now_unix_ms().unwrap())
+            .unwrap();
+        let policy = fixture.current_policy();
+        let attest = |store: &mut PendingApprovalStore| {
+            let mut audit = fixture.audit_writer();
+            attest_and_persist(
+                store,
+                &entry,
+                &ATTESTATION_KEY,
+                &fixture.binding(),
+                Surface::Cli,
+                ConsentAudit::Writer(&mut audit),
+                ConsentAuthorization::Mainnet {
+                    presence: fixture.presence(&entry, &policy),
+                    policy: &policy,
+                },
+                |_, _| Err("no toolset grant in a mainnet consent".to_owned()),
+            )
+            .err()
+            .map(|error| error.code().to_owned())
+        };
+        let busy = Some("approval.presence_policy_busy".to_owned());
+        let unavailable = Some("approval.presence_policy_unavailable".to_owned());
+        let writer = crate::policy::state_lock::WindowStoreLock::acquire_for(
+            &crate::profile::schema::default_policy_window_state_path_for(fixture.name()),
+            &fixture.profile().policy_window_state_key_id,
+        )
+        .unwrap();
+        assert_eq!(attest(&mut store), busy);
+        let path = fixture.policy_path();
+        let signed = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, "not a policy").unwrap();
+        assert_eq!(attest(&mut store), unavailable);
+        drop(writer);
+        assert_eq!(attest(&mut store), unavailable);
+        let stored = store.get(&entry.approval_nonce).unwrap();
+        assert!(stored.attestation_blob_b64.is_none());
+        assert!(stored.mainnet_presence.is_none());
+        std::fs::write(&path, signed).unwrap();
+        assert_eq!(attest(&mut store), None);
+        assert!(
+            store
+                .get(&entry.approval_nonce)
+                .unwrap()
+                .attestation_blob_b64
+                .is_some()
+        );
     }
 
     /// Through the prepared mainnet sink write, a full outbox and an
