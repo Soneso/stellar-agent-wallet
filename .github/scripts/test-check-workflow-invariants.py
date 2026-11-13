@@ -18,6 +18,7 @@ mutations that name it.
 
 import ast
 import pathlib
+import pickle
 import re
 import shutil
 import subprocess
@@ -40,8 +41,8 @@ TESTNET = ".github/workflows/testnet.yml"
 CHANGELOG = ".github/workflows/changelog.yml"
 CHANGELOG_CONDITION = "github.event_name == 'pull_request' && github.base_ref == 'mainnet-write'"
 CHANGELOG_IF = f"        if: {CHANGELOG_CONDITION}\n"
-CHANGELOG_COMMAND = ('set -euo pipefail; CHANGES=$(git log --format=%H "$BASE_SHA..$HEAD_SHA" '
-                     '--not refs/remotes/origin/main -- CHANGELOG.md); test -z "$CHANGES"')
+CHANGELOG_COMMAND = ('python3 .github/scripts/changelog.py guard --base "$BASE_SHA" '
+                     '--head "$HEAD_SHA" --main-ref refs/remotes/origin/main')
 CHANGELOG_RUN = "        run: " + CHANGELOG_COMMAND + "\n"
 CHANGELOG_FETCH = ("      - name: Fetch main for changelog protection\n        shell: bash\n"
                    "        run: git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main\n")
@@ -97,10 +98,10 @@ CHANGELOG_VARIANTS = {
     "W14": [changelog_edit("HEAD_SHA: ${{ github.event.pull_request.head.sha }}", "HEAD_SHA: ${{ github.sha }}"),
              changelog_edit("BASE_SHA: ${{ github.event.pull_request.base.sha }}", "BASE_SHA: ${{ github.sha }}")],
     "W15": [changelog_edit(CHANGELOG_RUN, "        run: " + value + "\n") for value in (
-             CHANGELOG_COMMAND.replace(" --not refs/remotes/origin/main", ""),
-             CHANGELOG_COMMAND.replace("CHANGELOG.md", "README.md"),
-             CHANGELOG_COMMAND.replace("$BASE_SHA..", "$BASE_SHA..."),
-             CHANGELOG_COMMAND.replace("set -euo pipefail; ", ""),
+             CHANGELOG_COMMAND.replace(" --main-ref refs/remotes/origin/main", ""),
+             CHANGELOG_COMMAND.replace("changelog.py", "other.py"),
+             CHANGELOG_COMMAND.replace("$BASE_SHA", "$HEAD_SHA"),
+             CHANGELOG_COMMAND.replace(" guard ", " check "),
              CHANGELOG_COMMAND + " || true", "echo '" + CHANGELOG_COMMAND + "'",
              "|\n          # " + CHANGELOG_COMMAND)],
     "W16": [changelog_edit(CHANGELOG_GUARD, CHANGELOG_GUARD + "        continue-on-error: true\n"),
@@ -128,6 +129,7 @@ def changelog_rule(label):
 
 
 BASE_DOCUMENTS = {}
+YAML_DUMPS = {}
 
 
 def changelog_behavior(root, label):
@@ -138,11 +140,10 @@ def changelog_behavior(root, label):
     steps = doc["jobs"]["changelog"]["steps"]
     guard = next(step for step in steps if step.get("name") == "Protect integration changelog")
     if label == "W15 main-only changelog changes pass":
-        for commits, status in (("main", 0), ("topic", 1), ("error", 7)):
-            fake = ('git() { if [ "$COMMITS" = error ]; then return 7; fi; '
-                    'if [ "$COMMITS" = main ] && [[ " $* " == *" --not refs/remotes/origin/main "* ]]; '
-                    'then return 0; fi; printf "%s\\n" change; }; '
-                    f'COMMITS={commits}; BASE_SHA=base; HEAD_SHA=head; ')
+        for commits, status in (("main", 0), ("topic", 1), ("error", 2)):
+            fake = ('python3() { [[ "$*" == ".github/scripts/changelog.py guard --base base --head head --main-ref refs/remotes/origin/main" ]] '
+                    '|| return 9; return "$STATUS"; }; '
+                    f'STATUS={status}; BASE_SHA=base; HEAD_SHA=head; ')
             result = subprocess.run(["bash", "-c", fake + guard["run"]], capture_output=True, check=False)
             if result.returncode != status:
                 problems.append(f"main reachability: {commits}: exit {result.returncode}, expected {status}")
@@ -1700,8 +1701,8 @@ MUTATIONS = {
     "W14": ('if guard.get("env") != expected_env:',
             'if guard.get("env") not in (expected_env, {**expected_env, "HEAD_SHA": "${{ github.sha }}"}):', ["W14"]),
     "W15": ('if self.run_text(guard).strip() != CHANGELOG_GUARD:',
-            'if self.run_text(guard).strip().replace(" --not refs/remotes/origin/main", "") '
-            '!= CHANGELOG_GUARD.replace(" --not refs/remotes/origin/main", ""):', ["W15"]),
+            'if self.run_text(guard).strip().replace(" --main-ref refs/remotes/origin/main", "") '
+            '!= CHANGELOG_GUARD.replace(" --main-ref refs/remotes/origin/main", ""):', ["W15"]),
     "W16": ('if "continue-on-error" in guard or guard.get("shell") != "bash":',
             'if guard.get("shell") != "bash":', ["W16"]),
     "W17": ('condition = self.unwrap_expression(guard.get("if", ""))', 'condition = guard.get("if", "")', ["W17"]),
@@ -1884,6 +1885,16 @@ def changelog_group(label, script):
     checker = types.ModuleType("workflow_checker")
     exec(compile(source, str(script), "exec"), checker.__dict__)
     original = pathlib.Path.read_text
+    dump = yaml.safe_dump
+
+    def memory_dump(data, *args, **kwargs):
+        # Reuse serialization by complete contents and options across cases.
+        # Every checker rule still runs for each variant and mutation.
+        key = pickle.dumps((data, args, kwargs))
+        if key not in YAML_DUMPS:
+            YAML_DUMPS[key] = dump(data, *args, **kwargs)
+        return YAML_DUMPS[key]
+
     problems = []
     for edits in CHANGELOG_VARIANTS[label]:
         texts = {}
@@ -1906,7 +1917,8 @@ def changelog_group(label, script):
                 BASE_DOCUMENTS[path] = load(instance, relative)
             return BASE_DOCUMENTS[path]
 
-        with patch.object(checker.Checker, "load", memory_load):
+        with patch.object(checker.Checker, "load", memory_load), \
+                patch.object(yaml, "safe_dump", memory_dump):
             violations = checker.Checker(ROOT).run()
         case = (label, changelog_rule(label), CHANGELOG_MESSAGES[label], [])
         if not violations:

@@ -257,17 +257,34 @@ Use a topic slug for generic branch names such as `main` or `patch-1`.
 Use lowercase letters, digits, and hyphens; omit the pull request number.
 Categories are `added`, `changed`, `deprecated`, `removed`, `fixed`, and `security`.
 Each top-level entry starts with `- ` and contains text.
-Indented continuations and nested lists follow an entry; headings and metadata are invalid.
+Indented continuations and nested lists follow an entry; headings and metadata
+are invalid.
 
-Keep `CHANGELOG.md` and the fragment README unchanged in contributing pull requests.
-An open pull request with a changelog hunk moves its entries into fragments and drops that hunk.
-The integration guard permits changelog changes from commits that `main` holds.
+For example, `changelog.d/account-timeouts.fixed.md` contains:
+
+```markdown
+- Retry an account lookup after a network timeout.
+```
+
+Keep `CHANGELOG.md` and the fragment README unchanged in contributing pull
+requests. Move any direct changelog entries into fragments.
+Remove the `CHANGELOG.md` edits from the branch history.
+For example, use an interactive rebase that drops or amends those commits.
+A later revert commit still fails the integration guard.
+Commits that `main` holds are exempt.
+Other changelog edits pass only in sync merges whose non-first parents all
+belong to `main` history.
+The merge's `CHANGELOG.md` must equal that file in one of those parents, byte
+for byte. A sync merge takes the file from `main`.
 Distinct fragment filenames avoid changelog conflicts between pull requests.
-Rename one fragment when two files share a filename and produce an add/add conflict.
+Rename one fragment when two files share a filename and produce an add/add
+conflict.
 
 Run `python3 .github/scripts/changelog.py check` to validate your fragments.
-Run `python3 .github/scripts/changelog.py preview` to read the folded Unreleased section without changing files.
-See [Fragment format](changelog.d/README.md) and [Release preparation](docs/maintainers/releasing.md#cut-a-release-tag).
+Run `python3 .github/scripts/changelog.py preview` to read the folded
+Unreleased section without changing files.
+See [Fragment format](changelog.d/README.md) and
+[Release preparation](docs/maintainers/releasing.md#cut-a-release-tag).
 
 ## Commit and pull request conventions
 

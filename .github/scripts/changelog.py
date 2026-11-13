@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Validate pending entries, preview Unreleased, or fold a prepared release."""
+"""Validate entries, preview or fold a release, and guard integration history."""
 
 import argparse
 from collections import namedtuple
 from pathlib import Path
 import re
+import subprocess
 import sys
 import uuid
 
@@ -29,7 +30,8 @@ def validate_fragment_body(text):
     if not text.strip():
         raise Invalid("line 1: empty fragment")
     seen = False
-    for number, line in enumerate(text.splitlines(), 1):
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    for number, line in enumerate(text.split("\n"), 1):
         if not line.strip():
             continue
         if line[0].isspace():
@@ -75,8 +77,13 @@ def load_fragments(root):
     return fragments
 
 
+def lf_lines(text):
+    lines = text.split("\n")
+    return [line + "\n" for line in lines[:-1]] + ([lines[-1]] if lines[-1] else [])
+
+
 def section_bounds(text, label):
-    lines = text.splitlines(keepends=True)
+    lines = lf_lines(text)
     heading = re.compile(r"^## \[" + re.escape(label) + r"\](?:[^\S\n].*)?\n?$")
     starts = [i for i, line in enumerate(lines) if heading.fullmatch(line)]
     if len(starts) != 1:
@@ -105,14 +112,14 @@ def category_positions(lines):
 
 
 def fold_section(text, fragments):
-    lines = text.splitlines(keepends=True)
+    lines = lf_lines(text)
     category_positions(lines)
     for category in CATEGORIES:
         incoming = [fragment.body for fragment in fragments if fragment.category == category]
         if not incoming:
             continue
         positions = category_positions(lines)
-        payload = "".join(incoming).splitlines(keepends=True)
+        payload = lf_lines("".join(incoming))
         if category in positions:
             start = positions[category]
             end = min((i for i in positions.values() if i > start), default=len(lines))
@@ -125,6 +132,9 @@ def fold_section(text, fragments):
             if insertion and not lines[insertion - 1].endswith("\n"):
                 lines[insertion - 1] += "\n"
             lines[insertion:insertion] = payload
+            following = insertion + len(payload)
+            if following < len(lines) and lines[following].startswith("### "):
+                lines[following:following] = ["\n"]
         else:
             later = [i for name, i in positions.items() if CATEGORIES.index(name) > CATEGORIES.index(category)]
             insertion = min(later, default=len(lines))
@@ -187,17 +197,61 @@ def release(root, version):
     return 0
 
 
+def git(root, *args, allowed=(0,)):
+    result = subprocess.run(["git", "--no-replace-objects", "--no-optional-locks", *args],
+                            cwd=root, capture_output=True, check=False)
+    if result.returncode not in allowed:
+        raise OSError(f"guard: git {args[0]} fails; restore complete history and retry")
+    return result
+
+
+def guard(root, base, head, main_ref):
+    if git(root, "rev-parse", "--is-shallow-repository").stdout.strip() != b"false":
+        raise Invalid("guard: shallow history; supply complete history and retry")
+    base, head, main = [git(root, "rev-parse", "--verify", "--end-of-options", ref + "^{commit}")
+                        .stdout.decode("ascii").strip() for ref in (base, head, main_ref)]
+    commits = git(root, "rev-list", f"{base}..{head}", "--not", main).stdout.decode("ascii").split()
+    refused = []
+    checked = 0
+    for commit in commits:
+        changed = git(root, "diff-tree", "--root", "-m", "-r", "--no-renames",
+                      "--no-commit-id", "--name-only", commit, "--", "CHANGELOG.md").stdout
+        if not changed:
+            continue
+        checked += 1
+        parents = git(root, "rev-list", "--parents", "-n", "1", commit).stdout.decode("ascii").split()[1:]
+        allowed = len(parents) > 1
+        for parent in parents[1:]:
+            ancestor = git(root, "merge-base", "--is-ancestor", parent, main, allowed=(0, 1))
+            allowed = allowed and ancestor.returncode == 0
+        if allowed:
+            content = git(root, "show", f"{commit}:CHANGELOG.md").stdout
+            versions = [git(root, "show", f"{parent}:CHANGELOG.md").stdout for parent in parents[1:]]
+            allowed = content in versions
+        if not allowed:
+            refused.append(f"{commit}: CHANGELOG.md edit is refused. Move entries to fragments and remove edits from branch history; sync merges take the main-side file.")
+    if refused:
+        raise Invalid("\n".join(refused))
+    print(f"{checked} changelog commits checked; integration guard passes", file=sys.stderr)
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     modes = parser.add_subparsers(dest="mode", required=True)
-    for mode in ("check", "preview", "release"):
+    for mode in ("check", "preview", "release", "guard"):
         sub = modes.add_parser(mode)
         sub.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[2])
         if mode == "release":
             sub.add_argument("--version", required=True)
+        if mode == "guard":
+            for argument in ("base", "head", "main-ref"):
+                sub.add_argument("--" + argument, required=True)
     args = parser.parse_args(argv)
     root = args.root
     try:
+        if args.mode == "guard":
+            return guard(root, args.base, args.head, args.main_ref)
         if args.mode == "release":
             return release(root, args.version)
         return {"check": check, "preview": preview}[args.mode](root)
