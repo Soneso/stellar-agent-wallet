@@ -93,10 +93,12 @@ pub use redact::{
 
 pub use account::{
     AccountView, AssetView, BASE_RESERVE_STROOPS, BalanceView, SignerView, ThresholdsView,
-    fetch_account, fetch_data_entry, fetch_trustline_entry,
+    fetch_account, fetch_account_observed, fetch_data_entry, fetch_trustline_entry,
 };
 pub use builder::{Asset, ClassicOpBuilder};
-pub use client::{PreparedSigningLedgerRead, StellarRpcClient, TransactionStatusView};
+pub use client::{
+    ObservedTransaction, PreparedSigningLedgerRead, StellarRpcClient, TransactionStatusView,
+};
 pub use context::{MainnetEndpointFlags, MainnetWriteContext, NetworkContext};
 pub use endpoint_identity::{
     EndpointIdentity, MUXED_CONTRACT_MIN_PROTOCOL, MainnetOracle, SUPPORTED_PROTOCOL_VERSIONS,

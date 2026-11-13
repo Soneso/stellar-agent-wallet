@@ -1312,19 +1312,30 @@ impl OracleVeto {
 ///
 /// # Errors
 ///
-/// The refusal of the clear, when the oracle does not report the mainnet
-/// passphrase or cannot answer, and when it reports a status `veto` refuses.
-/// A `NOT_FOUND` from the oracle refuses nothing: the acknowledgement and
-/// reconciliation decide.
+/// The refusal of the clear. An oracle identity that is read and names
+/// another network or an unsupported protocol gives evidence against the
+/// clear: `submission.not_clearable`. So does a transaction status `veto`
+/// refuses. An identity or transaction read that fails in transport or does
+/// not answer by `deadline` is an unreachable endpoint and keeps its cause:
+/// `network.rpc_unreachable`. A `NOT_FOUND` from the oracle refuses nothing:
+/// the acknowledgement and reconciliation decide.
 async fn oracle_precheck<'o>(
     oracle: &'o stellar_agent_network::StellarRpcClient,
     tx_hash: &str,
     deadline: tokio::time::Instant,
     veto: OracleVeto,
 ) -> Result<MainnetOracle<'o>, Envelope<()>> {
-    let oracle = match MainnetOracle::verify(oracle, deadline).await {
+    use stellar_agent_core::error::{NetworkError, WalletError, WitnessUnavailableReason};
+    let client = oracle;
+    let oracle = match MainnetOracle::verify(client, deadline).await {
         Ok(oracle) => oracle,
-        Err(e) => {
+        Err(
+            e @ WalletError::Network(NetworkError::WitnessUnavailable {
+                reason:
+                    WitnessUnavailableReason::IdentityNetworkMismatch { .. }
+                    | WitnessUnavailableReason::IdentityProtocolUnsupported { .. },
+            }),
+        ) => {
             return Err(Envelope::<()>::err_raw(
                 "submission.not_clearable",
                 format!(
@@ -1333,6 +1344,22 @@ async fn oracle_precheck<'o>(
                 ),
             ));
         }
+        Err(
+            e @ WalletError::Network(NetworkError::WitnessUnavailable {
+                reason: WitnessUnavailableReason::IdentityUnavailable { .. },
+            }),
+        ) => {
+            return Err(Envelope::<()>::err(&WalletError::Network(
+                NetworkError::RpcUnreachable {
+                    url: stellar_agent_network::redact_url_authority(client.url()),
+                    reason: format!(
+                        "the oracle's identity could not be read, so the submission cannot be \
+                         cleared: {e}"
+                    ),
+                },
+            )));
+        }
+        Err(e) => return Err(Envelope::<()>::err(&e)),
     };
     let answer =
         match tokio::time::timeout_at(deadline, oracle.client().get_transaction_status(tx_hash))
@@ -1340,19 +1367,20 @@ async fn oracle_precheck<'o>(
         {
             Ok(Ok(answer)) => answer,
             Ok(Err(e)) => {
-                return Err(Envelope::<()>::err_raw(
-                    "submission.not_clearable",
-                    format!(
-                        "the oracle could not say what became of this transaction, so the \
-                     submission cannot be cleared: {e}"
-                    ),
+                return Err(Envelope::<()>::err(
+                    &stellar_agent_core::error::WalletError::Network(e),
                 ));
             }
             Err(_) => {
-                return Err(Envelope::<()>::err_raw(
-                    "submission.not_clearable",
-                    "the oracle did not say what became of this transaction in time, so the \
-                 submission cannot be cleared",
+                return Err(Envelope::<()>::err(
+                    &stellar_agent_core::error::WalletError::Network(
+                        stellar_agent_core::error::NetworkError::RpcUnreachable {
+                            url: stellar_agent_network::redact_url_authority(oracle.client().url()),
+                            reason: "getTransaction did not answer in time, before the \
+                                     command's deadline, so the submission cannot be cleared"
+                                .to_owned(),
+                        },
+                    ),
                 ));
             }
         };
@@ -2587,10 +2615,70 @@ mod tests {
             )
             .await,
         );
-        assert_eq!(code, "submission.not_clearable");
+        assert_eq!(code, "network.rpc_unreachable");
         assert!(
-            message.starts_with("the oracle did not establish that it serves mainnet"),
+            message.contains("the oracle's identity could not be read"),
             "{message}"
+        );
+    }
+
+    /// An oracle whose identity answer arrives after the deadline is an
+    /// unreachable endpoint: the clear refuses with `network.rpc_unreachable`
+    /// at the deadline, and its transaction is never asked.
+    #[tokio::test]
+    async fn an_identity_read_past_the_deadline_reports_the_unreachable_oracle() {
+        use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getNetwork" }),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": stellar_agent_test_support::signed_envelope::get_network_result(
+                            MAINNET_PASSPHRASE
+                        ),
+                    }))
+                    .set_delay(std::time::Duration::from_secs(30)),
+            )
+            .mount(&server)
+            .await;
+        let oracle = stellar_agent_network::StellarRpcClient::new(&server.uri()).expect("client");
+
+        let started = std::time::Instant::now();
+        let (code, message) = oracle_refusal_error(
+            oracle_precheck(
+                &oracle,
+                &"af".repeat(32),
+                tokio::time::Instant::now() + DEADLINE,
+                OracleVeto::SuccessAndFailure,
+            )
+            .await,
+        );
+        let elapsed = started.elapsed();
+
+        assert_eq!(code, "network.rpc_unreachable", "{message}");
+        assert!(
+            message.contains("the oracle's identity could not be read"),
+            "{message}"
+        );
+        assert!(
+            elapsed < DEADLINE + std::time::Duration::from_secs(2),
+            "the deadline ends the identity read: {elapsed:?}"
+        );
+        let asked = server.received_requests().await.expect("recorded");
+        assert!(
+            asked.iter().all(|request| {
+                !String::from_utf8_lossy(&request.body).contains("getTransaction")
+            }),
+            "the transaction is never asked"
         );
     }
 
@@ -2653,7 +2741,7 @@ mod tests {
         let elapsed = started.elapsed();
 
         let (code, message) = oracle_refusal_error(checked);
-        assert_eq!(code, "submission.not_clearable");
+        assert_eq!(code, "network.rpc_unreachable");
         assert!(message.contains("in time"), "{message}");
         assert!(
             elapsed < DEADLINE + std::time::Duration::from_secs(1),
@@ -3089,13 +3177,66 @@ mod tests {
             );
         }
 
-        /// The reconciliation the clear runs under the audit writer ends its
-        /// oracle reads by the command's deadline. The pre-check's
-        /// `NOT_FOUND` arrives at once and the reconciliation's transaction
-        /// answer stalls past a one-second submit timeout: the clear refuses
-        /// by then, with the submission as it was and the audit writer free.
-        /// The oracle checked by the pre-check is the one reconciliation asks,
-        /// so its identity is read once.
+        /// A mainnet `tx status` whose primary reports a valid success while
+        /// the oracle reports no inclusion decides nothing. The record stays
+        /// pending, the reservation stays open, and no settlement or release
+        /// code is recorded.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn mainnet_status_keeps_pending_before_recovery_integration() {
+            let fixture = Spec::new("status-mainnet-primary-success")
+                .primary(answering("SUCCESS"))
+                .oracle(answering("NOT_FOUND"))
+                .build()
+                .await;
+            seed_submission(&fixture, now_secs() - 10);
+            crate::common::render::take_rendered_for_test();
+
+            let code = crate::commands::tx::status::run(&crate::commands::tx::status::StatusArgs {
+                tx_hash: TX_HASH.to_owned(),
+                profile: Some(fixture.name.to_owned()),
+                output: OutputFormat::Json,
+            })
+            .await;
+            let envelope = last_rendered();
+
+            assert_eq!(code, 0, "{envelope}");
+            assert_eq!(
+                envelope["data"]["record"]["status"], "pending",
+                "{envelope}"
+            );
+            assert!(
+                envelope["data"]["record"]["release_code"].is_null(),
+                "{envelope}"
+            );
+            assert!(envelope["data"]["settled"].is_null(), "{envelope}");
+            assert_eq!(
+                fixture.pending_reservations(),
+                1,
+                "the reservation stays open"
+            );
+            assert_eq!(receipt_status(&fixture), ReceiptStatus::Pending);
+            assert!(fixture.audit_rows("value_action_submitted").is_empty());
+            assert!(
+                fixture
+                    .audit_rows("submission_accounting_expired")
+                    .is_empty()
+            );
+            assert!(
+                fixture
+                    .primary_methods()
+                    .await
+                    .iter()
+                    .any(|method| method == "getTransaction"),
+                "the diagnostic read reaches the primary"
+            );
+        }
+
+        /// The clear ends its oracle reads by the command's deadline. The
+        /// pre-check's transaction answer, the last oracle request, stalls
+        /// past a one-second submit timeout. The clear refuses by then; the
+        /// submission stays as it is and the audit writer is free. The
+        /// oracle's identity is read once.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
         async fn a_stalled_oracle_does_not_hold_the_audit_writer_past_the_deadline() {
@@ -3108,7 +3249,7 @@ mod tests {
                 .build()
                 .await;
             seed_submission(&fixture, 0);
-            oracle.stall_after("getTransaction", 1, std::time::Duration::from_secs(30));
+            oracle.stall_after("getTransaction", 0, std::time::Duration::from_secs(30));
             let asked_before = fixture.oracle_methods().await.len();
 
             let started = std::time::Instant::now();
@@ -3122,8 +3263,8 @@ mod tests {
             );
             assert_eq!(
                 fixture.oracle_methods().await[asked_before..],
-                ["getNetwork", "getTransaction", "getTransaction"],
-                "one identity read, the pre-check's question, reconciliation's question"
+                ["getNetwork", "getTransaction"],
+                "one identity read and the pre-check's question"
             );
             let writer = crate::commands::value_audit::require_value_audit_writer_for_origin(
                 &fixture.profile(),
@@ -3222,10 +3363,10 @@ mod tests {
             .await;
         }
 
-        /// A sent untimed submission below the oracle's retention floor is
-        /// reconciled to `ambiguous` with its reservation kept. Its bytes can
-        /// still apply, so its clear needs the unbounded acknowledgement as a
-        /// pending one does.
+        /// A sent untimed submission below the oracle's retention floor stays
+        /// `pending` with its reservation kept, because the mainnet pass runs
+        /// no chain settlement. Its bytes can still apply, so its clear needs
+        /// the unbounded acknowledgement.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
         async fn an_untimed_submission_past_retention_needs_the_unbounded_acknowledgement() {
@@ -3238,7 +3379,7 @@ mod tests {
 
             assert_clear_needs_the_unbounded_acknowledgement(
                 &fixture,
-                ReceiptStatus::Ambiguous,
+                ReceiptStatus::Pending,
                 None,
             )
             .await;
@@ -3269,9 +3410,9 @@ mod tests {
         }
 
         /// An untimed hold whose receipt records a failure that the endpoint
-        /// now reports as a success keeps the recorded failure through
-        /// reconciliation and clears the same way, its row carrying the
-        /// reported success as evidence.
+        /// now reports as a success keeps the recorded failure, because the
+        /// mainnet pass settles no chain answer, and clears the same way
+        /// with no evidence on its row.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
         async fn an_untimed_failure_the_endpoint_now_reports_successful_is_cleared() {
@@ -3286,12 +3427,7 @@ mod tests {
             };
             record_receipt_status(&fixture, failed.clone());
 
-            assert_clear_needs_the_unbounded_acknowledgement(
-                &fixture,
-                failed,
-                Some("submission.reported_success"),
-            )
-            .await;
+            assert_clear_needs_the_unbounded_acknowledgement(&fixture, failed, None).await;
         }
 
         /// A clear of an untimed hold interrupted after its row, before the

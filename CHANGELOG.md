@@ -350,6 +350,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Missing destinations, unverified domains, reserved kinds, gated-inflow
   failures, and opaque signing keep their refusals in every mode.
 
+- On mainnet, `tx status` and `stellar_transaction_status` settle no
+  submission from one endpoint's answer. Before its accounting horizon, a
+  submission with an unknown outcome stays `pending` with its reservation
+  open, even when the primary endpoint reports `SUCCESS`. After the horizon,
+  the accounting expiry makes a `pending` or `ambiguous` receipt `ambiguous`
+  with `submission.accounting_expired`, and the chain outcome stays unknown.
+  Only a checked recovery decision, the same answer from the primary endpoint
+  and the oracle in one pass, settles the chain outcome. The receipt records
+  no `retention_expired` mark, and a clear row carries no reported evidence.
+- On mainnet, the `tx receipt clear` pre-check sends `getTransaction` to the
+  primary endpoint, then `getNetwork` and `getTransaction` to the oracle.
+  Reconciliation sends no chain request on mainnet. An oracle that cannot be
+  reached, or does not answer by the verb's deadline, refuses with
+  `network.rpc_unreachable` and the cause. An oracle that reports another
+  network or an unsupported protocol still refuses with
+  `submission.not_clearable`.
+- A `not_included` mainnet operation refuses a further attempt with
+  `recovery.retry_refused` until the checked decision of its last attempt is
+  projected onto that attempt's receipt. The new attempt keeps its
+  predecessor's policy.
 - On mainnet, CLI `pay`, `claim`, `trustline`, and sponsored `accounts create`
   sign actions the signed policy allows without a passkey ceremony. An approval
   rule requires a passkey ceremony.
@@ -945,9 +965,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per reservation and one for the oracle's identity. `reconcile_one_within` reconciles one submission
   against an oracle the caller already checked, a `MainnetOracle`, and ends every read of
   that oracle by the caller's deadline. `ReconcileFailure` gains
-  `kind`, a `ReconcileFailureKind` (`Unreachable`, `OracleNotConfigured`,
-  `OracleNetworkMismatch`, `OracleProtocolUnsupported` or
-  `OracleIdentityUnavailable`); code that constructs it must set the field.
+  `kind`, a `ReconcileFailureKind` (`Unreachable` or `OracleNotConfigured`);
+  code that constructs it must set the field.
   `NetworkContext::oracle_client` and `MainnetWriteContext::oracle_client`
   build the oracle client a profile names, and `MainnetOracle::verify` returns
   that client once its endpoint reports the mainnet passphrase.

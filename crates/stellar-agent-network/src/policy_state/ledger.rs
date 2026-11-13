@@ -523,6 +523,37 @@ pub(super) struct WireAuthorization {
     /// The release row of the authorization's native reservation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) native_release: Option<ReleaseRow>,
+    /// The native amounts the authorization reserves; absent for a record
+    /// minted without them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) native_reservation: Option<NativeReservation>,
+}
+
+/// The native amounts one authorization reserves against the account
+/// balance, counted once per authorization whatever its buckets and epochs.
+///
+/// Both amounts come from the authenticated action facts. The debit is the
+/// action's native amount, zero for a non-native action. The fee is the
+/// envelope's fee cap, zero for an x402 authorization.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeReservation {
+    /// The native amount the action debits, in stroops.
+    pub debit_stroops: i64,
+    /// The fee the envelope may charge, in stroops.
+    pub fee_stroops: i64,
+}
+
+impl NativeReservation {
+    /// The reserved total in stroops: the debit plus the fee.
+    #[must_use]
+    pub fn total_stroops(self) -> i128 {
+        i128::from(self.debit_stroops) + i128::from(self.fee_stroops)
+    }
+
+    fn well_formed(self) -> bool {
+        self.debit_stroops >= 0 && self.fee_stroops >= 0
+    }
 }
 
 impl WireAuthorization {
@@ -690,6 +721,14 @@ pub(super) fn validate(wire: &WireFile) -> Result<(), WindowStoreError> {
     for auth in &wire.authorizations {
         if !ids.insert(auth.id) {
             return Err(invalid("an authorization identity repeats".to_owned()));
+        }
+        if auth
+            .native_reservation
+            .is_some_and(|amounts| !amounts.well_formed())
+        {
+            return Err(invalid(
+                "an authorization's native amounts are negative".to_owned(),
+            ));
         }
         if auth.binding.domain() != auth.domain
             || auth.content_digest != auth.binding.content_digest()
@@ -1010,6 +1049,9 @@ pub struct MintRequest {
     /// The operation attempt the authorization serves; the operation must
     /// be retained and open. Absent for a mint outside an operation.
     pub operation: Option<OperationLink>,
+    /// The native amounts the authorization reserves, stored with the
+    /// record whether or not it holds window entries.
+    pub native_reservation: Option<NativeReservation>,
 }
 
 /// How a mint inside an operation step relaxes the stand-alone rules.
@@ -1823,6 +1865,7 @@ pub(super) fn mint_into(
         operation: request.operation,
         disposition: None,
         native_release: None,
+        native_reservation: request.native_reservation,
     });
     Ok(MintedRecord {
         bindings_digest,
@@ -1980,6 +2023,12 @@ impl PersistedWindowStore {
         )?;
         check(
             HoldKind::of(domain).is_some() || request.holds.is_empty(),
+            P::HoldsMismatch,
+        )?;
+        check(
+            request
+                .native_reservation
+                .is_none_or(NativeReservation::well_formed),
             P::HoldsMismatch,
         )?;
         check(
@@ -2507,6 +2556,7 @@ mod tests {
                 holds,
                 parent: None,
                 operation: None,
+                native_reservation: None,
             }
         }
 
@@ -4980,6 +5030,7 @@ mod tests {
             operation: None,
             disposition: None,
             native_release: None,
+            native_reservation: None,
         }
     }
 
@@ -6871,6 +6922,237 @@ mod tests {
         assert!(record.consent.as_ref().unwrap().payload.is_some());
         assert_eq!(after.authorizations[0].id, minted.id);
         assert_eq!(after.authorizations[0].operation, request.operation);
+    }
+
+    const NATIVE: NativeReservation = NativeReservation {
+        debit_stroops: 25,
+        fee_stroops: 300,
+    };
+
+    /// A mint persists its native amounts with or without window entries,
+    /// zero amounts included, and refuses negative amounts unwritten.
+    #[test]
+    #[serial]
+    fn mint_persists_native_amounts_including_zero_buckets() {
+        let l = Ledger::new();
+        let mut bucketless = l.request(tx(1), vec![]);
+        bucketless.native_reservation = Some(NativeReservation {
+            debit_stroops: 0,
+            fee_stroops: 300,
+        });
+        let first = l.mint(&bucketless).unwrap();
+        let mut held = l.request(tx(2), vec![hold(25), hold_in("other", 25)]);
+        held.native_reservation = Some(NATIVE);
+        let second = l.mint(&held).unwrap();
+        let mut x402 = l.request(soroban(3), vec![hold(5)]);
+        x402.native_reservation = Some(NativeReservation::default());
+        let third = l.mint(&x402).unwrap();
+        assert!(first.reservation.is_none());
+        assert_eq!(
+            l.record(first.id).native_reservation,
+            bucketless.native_reservation
+        );
+        assert_eq!(l.record(second.id).native_reservation, Some(NATIVE));
+        assert_eq!(
+            l.record(third.id).native_reservation,
+            Some(NativeReservation::default())
+        );
+        let stored = serde_json::to_string(&l.record(third.id)).unwrap();
+        assert!(
+            stored.contains(r#""native_reservation":{"debit_stroops":0,"fee_stroops":0}"#),
+            "{stored}"
+        );
+        assert!(l.wire().version >= WIRE_VERSION_POLICY_AUTHORITY);
+
+        let before = l.bytes();
+        for (debit, fee) in [(-1, 0), (0, -1)] {
+            let mut negative = l.request(tx(9), vec![]);
+            negative.native_reservation = Some(NativeReservation {
+                debit_stroops: debit,
+                fee_stroops: fee,
+            });
+            assert_eq!(
+                refusal(l.mint(&negative)),
+                MainnetPrecondition::HoldsMismatch
+            );
+        }
+        assert_eq!(l.bytes(), before);
+        let mut wire = l.wire();
+        wire.authorizations[0].native_reservation = Some(NativeReservation {
+            debit_stroops: -5,
+            fee_stroops: 0,
+        });
+        assert!(validate(&wire).is_err());
+    }
+
+    /// Each authorization's amounts count once across its buckets and
+    /// epochs. A row releases only at or past its bound. `used` alone
+    /// releases nothing, and an absent observation keeps bounded rows.
+    #[test]
+    #[serial]
+    fn native_amounts_count_once_per_reservation() {
+        use super::super::operations::{
+            ReleaseBound, ReleaseClass, ReleaseRow, WindowObservation, native_reserved,
+        };
+        let l = Ledger::new();
+        let mut request = l.request(
+            tx(1),
+            vec![hold(25), hold_in("other", 25), hold_in("third", 25)],
+        );
+        request.native_reservation = Some(NATIVE);
+        let minted = l.mint(&request).unwrap();
+        let mut plain = l.request(tx(2), vec![hold(1)]);
+        plain.native_reservation = None;
+        l.mint(&plain).unwrap();
+        let wire = l.wire();
+        assert_eq!(native_reserved(&wire, None), 325);
+        let at = |ledger: u32, close: u64| WindowObservation {
+            ledger,
+            close_time_floor_ms: close,
+            observed_at_ms: T0,
+        };
+        let commit = super::super::operations::CommitId::from_bytes([1; 16]);
+        let cases = [
+            (ReleaseBound::Always, None, 0),
+            (ReleaseBound::Ledger(50), None, 325),
+            (ReleaseBound::Ledger(50), Some(at(49, u64::MAX)), 325),
+            (ReleaseBound::Ledger(50), Some(at(50, 0)), 0),
+            (
+                ReleaseBound::CloseTime(9_000),
+                Some(at(u32::MAX, 8_999)),
+                325,
+            ),
+            (ReleaseBound::CloseTime(9_000), Some(at(0, 9_000)), 0),
+        ];
+        for (bound, observation, expected) in cases {
+            let mut released = wire.clone();
+            let auth = released
+                .authorizations
+                .iter_mut()
+                .find(|auth| auth.id == minted.id)
+                .unwrap();
+            auth.native_release = Some(ReleaseRow {
+                class: ReleaseClass::Settled,
+                bound,
+                observed_ledger: None,
+                commit_id: commit,
+            });
+            assert_eq!(
+                native_reserved(&released, observation.as_ref()),
+                expected,
+                "{bound:?} at {observation:?}"
+            );
+        }
+        let mut used = wire;
+        let auth = used
+            .authorizations
+            .iter_mut()
+            .find(|auth| auth.id == minted.id)
+            .unwrap();
+        auth.state = AuthorizationState::Used;
+        auth.disposition = Some(Disposition::Used);
+        assert_eq!(native_reserved(&used, Some(&at(u32::MAX, u64::MAX))), 325);
+    }
+
+    /// Consumption keeps the authorization's native amounts and writes no
+    /// release row.
+    #[test]
+    #[serial]
+    fn consumption_keeps_native_amounts() {
+        let l = Ledger::new();
+        let mut request = l.request(tx(1), vec![hold(25)]);
+        request.native_reservation = Some(NATIVE);
+        let minted = l.mint(&request).unwrap();
+        l.claim(&request, &minted).unwrap();
+        l.consume(&request, &minted, &consumption_of(&request.binding))
+            .unwrap();
+        let record = l.record(minted.id);
+        assert_eq!(record.state, AuthorizationState::Used);
+        assert_eq!(record.native_reservation, Some(NATIVE));
+        assert_eq!(record.native_release, None);
+        assert_eq!(
+            super::super::operations::native_reserved(&l.wire(), None),
+            325
+        );
+    }
+
+    /// A remint under the same operation stores the successor's amounts and
+    /// leaves the retired record's amounts beside it.
+    #[test]
+    #[serial]
+    fn remint_carries_native_amounts() {
+        use super::super::approvals::tests::Fx;
+        use super::super::operations::{ReleaseClass, ReleaseRow, native_reserved};
+        let mut fx = Fx::new(300_000);
+        fx.open();
+        fx.consent();
+        let mut request = fx.mint_request();
+        request.native_reservation = Some(NATIVE);
+        let now = fx.payload.receipt.verified_at_unix_ms();
+        let mut wire = fx.wire();
+        mint_into(
+            &mut wire,
+            fx.fixture.profile(),
+            &request,
+            now,
+            now + 1,
+            MintOptions::default(),
+        )
+        .unwrap();
+        let first = &mut wire.authorizations[0];
+        first.state = AuthorizationState::Expired;
+        first.settled_ms = Some(now + 1);
+        first.disposition = Some(Disposition::Unused);
+        first.native_release = Some(ReleaseRow::always(
+            ReleaseClass::RetiredUnused,
+            super::super::operations::CommitId::from_bytes([1; 16]),
+        ));
+        let mut successor = request.clone();
+        successor.native_reservation = Some(NativeReservation {
+            debit_stroops: 25,
+            fee_stroops: 400,
+        });
+        mint_into(
+            &mut wire,
+            fx.fixture.profile(),
+            &successor,
+            now + 1,
+            now + 100,
+            MintOptions {
+                exempt_cap: true,
+                lineage: Some(fx.operation),
+            },
+        )
+        .unwrap();
+        assert_eq!(wire.authorizations.len(), 2);
+        assert_eq!(wire.authorizations[0].native_reservation, Some(NATIVE));
+        assert_eq!(
+            wire.authorizations[1].native_reservation,
+            successor.native_reservation
+        );
+        assert_eq!(native_reserved(&wire, None), 425);
+    }
+
+    /// A record minted without amounts keeps them absent: its bytes hold no
+    /// amount field, round-trip unchanged and select no newer version.
+    #[test]
+    #[serial]
+    fn legacy_authorization_without_amounts_keeps_its_bytes() {
+        let l = Ledger::new();
+        let request = l.request(tx(1), vec![hold(25)]);
+        assert_eq!(request.native_reservation, None);
+        let minted = l.mint(&request).unwrap();
+        let record = l.record(minted.id);
+        assert_eq!(record.native_reservation, None);
+        let bytes = serde_json::to_string(&record).unwrap();
+        assert!(!bytes.contains("native_reservation"), "{bytes}");
+        let back: WireAuthorization = serde_json::from_str(&bytes).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), bytes);
+        assert!(l.wire().version < WIRE_VERSION_POLICY_AUTHORITY);
+        assert_eq!(
+            super::super::operations::native_reserved(&l.wire(), None),
+            0
+        );
     }
 
     #[test]

@@ -163,6 +163,10 @@ name = "recovery_transition_one"
 required-features = ["mainnet-write", "test-helpers"]
 
 [[test]]
+name = "recovery_outcomes"
+required-features = ["mainnet-write", "test-helpers"]
+
+[[test]]
 name = "fee_bump_testnet"
 required-features = ["testnet-acceptance"]
 

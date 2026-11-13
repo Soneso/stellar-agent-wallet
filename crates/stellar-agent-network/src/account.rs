@@ -37,6 +37,7 @@ pub use stellar_agent_core::BASE_RESERVE_STROOPS;
 use stellar_agent_core::amount::StellarAmount;
 use stellar_agent_core::error::{NetworkError, ProtocolError, ValidationError, WalletError};
 pub(crate) use stellar_agent_core::observability::redact_strkey_first5_last5 as redact_account_id;
+use stellar_agent_core::policy::v1::ObservedAccount;
 use stellar_rpc_client::Error as RpcError;
 use stellar_xdr::{
     AccountEntry, AccountId, LedgerEntryData, LedgerKey, LedgerKeyAccount, LedgerKeyData,
@@ -600,6 +601,71 @@ pub async fn fetch_account(
     account_id: &str,
     trustline_assets: &[Asset],
 ) -> Result<AccountView, WalletError> {
+    fetch_account_at(client, account_id, trustline_assets)
+        .await
+        .map(|(view, _latest_ledger)| view)
+}
+
+/// Reads `account_id` with one `getLedgerEntries` request and keeps the
+/// answer's coverage beside the view.
+///
+/// The observation carries the answer's latest ledger and the host time read
+/// after the answer returns. Its close-time floor is that of `report`, the
+/// same endpoint's readiness report before the read.
+///
+/// # Errors
+///
+/// - [`NetworkError::AccountLedgerRegressed`] when the answer's latest
+///   ledger is below `report.latest_ledger`.
+/// - [`NetworkError::RpcResponseMalformed`] when the answer's latest ledger
+///   is not a positive 32-bit ledger number.
+/// - `wallet.clock_error` when the host clock cannot time the answer.
+/// - Every error of [`fetch_account`].
+pub async fn fetch_account_observed(
+    client: &StellarRpcClient,
+    account_id: &str,
+    report: &crate::operational::OperationalReport,
+) -> Result<ObservedAccount<AccountView>, WalletError> {
+    let (view, latest_ledger) = fetch_account_at(client, account_id, &[]).await?;
+    let observed_at_ms = crate::mainnet::clock::now_ms()?;
+    let latest_ledger = account_coverage(latest_ledger, report.latest_ledger)?;
+    Ok(ObservedAccount::new(
+        view,
+        latest_ledger,
+        observed_at_ms,
+        report.close_time_unix.saturating_mul(1_000),
+    ))
+}
+
+fn account_malformed(detail: &str) -> WalletError {
+    WalletError::Network(NetworkError::RpcResponseMalformed {
+        method: "getLedgerEntries".to_owned(),
+        detail: detail.to_owned(),
+    })
+}
+
+/// Checks an account answer's latest ledger against the readiness ledger of
+/// the same endpoint: it is a positive `u32` at or above `readiness_ledger`.
+fn account_coverage(latest_ledger: i64, readiness_ledger: u32) -> Result<u32, WalletError> {
+    let latest = u32::try_from(latest_ledger)
+        .ok()
+        .filter(|ledger| *ledger > 0)
+        .ok_or_else(|| account_malformed("latestLedger is not a positive ledger number"))?;
+    if latest < readiness_ledger {
+        return Err(WalletError::Network(NetworkError::AccountLedgerRegressed {
+            latest_ledger: latest,
+            readiness_ledger,
+        }));
+    }
+    Ok(latest)
+}
+
+/// The body of [`fetch_account`], returning the answer's latest ledger too.
+async fn fetch_account_at(
+    client: &StellarRpcClient,
+    account_id: &str,
+    trustline_assets: &[Asset],
+) -> Result<(AccountView, i64), WalletError> {
     // Parse the account_id into the XDR AccountId for key construction. The
     // event below names only an account that passed this parse.
     let pk_bytes = stellar_strkey::ed25519::PublicKey::from_string(account_id).map_err(|e| {
@@ -639,6 +705,7 @@ pub async fn fetch_account(
         .await
         .map_err(|e| map_rpc_error_generic(&e, &client.url))?;
 
+    let latest_ledger = response.latest_ledger;
     let entries = response.entries.unwrap_or_default();
 
     // Decode each response key XDR exactly once and classify entries (Account
@@ -747,7 +814,7 @@ pub async fn fetch_account(
         }
     }
 
-    Ok(view)
+    Ok((view, latest_ledger))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1402,6 +1469,71 @@ mod tests {
     use crate::redact::rpc_error_fixtures::{
         ENDPOINT, ENDPOINT_AUTHORITY, ERROR_OBJECTS, assert_scrubbed, call_error, xdr_error,
     };
+
+    /// An account answer keeps an equal or later latest ledger, refuses a
+    /// regressed one with its own code, and refuses a missing or invalid
+    /// one as malformed. Each read sends exactly one request.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn account_coverage_missing_invalid_equal_and_regressed() {
+        use stellar_agent_core::policy::v1::AccountReservesView;
+        use stellar_agent_test_support::xdr_fixtures::{
+            account_entry_xdr_with_seq, account_ledger_key_xdr,
+        };
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer};
+        const OWNER: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+        let report = crate::operational::OperationalReport {
+            latest_ledger: 100,
+            close_time_unix: 1_700_000_000,
+            close_lag_seconds: 0,
+        };
+        let cases = [
+            (serde_json::json!(100), Ok(100)),
+            (serde_json::json!(101), Ok(101)),
+            (serde_json::json!(99), Err("account.ledger_regressed")),
+            (serde_json::json!(0), Err("network.rpc_response_malformed")),
+            (serde_json::json!(-1), Err("network.rpc_response_malformed")),
+            (
+                serde_json::json!(u64::from(u32::MAX) + 1),
+                Err("network.rpc_response_malformed"),
+            ),
+            (serde_json::Value::Null, Err("network.rpc_unreachable")),
+        ];
+        for (latest, expected) in cases {
+            let server = MockServer::start().await;
+            let mut body = serde_json::json!({
+                "entries": [{
+                    "key": account_ledger_key_xdr(OWNER),
+                    "xdr": account_entry_xdr_with_seq(OWNER, 50_000_000, 0, 41),
+                    "lastModifiedLedgerSeq": 6,
+                }],
+            });
+            if !latest.is_null() {
+                body["latestLedger"] = latest.clone();
+            }
+            Mock::given(method("POST"))
+                .respond_with(stellar_agent_test_support::EchoIdResponder::new(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = StellarRpcClient::new(&server.uri()).unwrap();
+            let before = crate::mainnet::clock::now_ms().unwrap();
+            let read = fetch_account_observed(&client, OWNER, &report).await;
+            match (read, expected) {
+                (Ok(observed), Ok(ledger)) => {
+                    let observation = observed.observation().unwrap();
+                    assert_eq!(observation.ledger_sequence, ledger, "{latest}");
+                    assert_eq!(observation.close_time_floor_ms, 1_700_000_000_000);
+                    assert!(observation.observed_at_ms >= before);
+                    assert_eq!(observed.view().sequence_number, 41);
+                }
+                (Err(error), Err(code)) => assert_eq!(error.code(), code, "{latest}"),
+                (read, expected) => panic!("{latest}: {read:?} against {expected:?}"),
+            }
+            server.verify().await;
+        }
+    }
 
     /// A refused account or data key reaches no query event and no request;
     /// a pair that passed its checks still gets the event.

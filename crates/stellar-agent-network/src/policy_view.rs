@@ -164,6 +164,19 @@ impl AccountReservesView for AccountViewAdapter<'_> {
     }
 }
 
+/// An owned account view, the form an
+/// [`ObservedAccount`](stellar_agent_core::policy::v1::ObservedAccount) keeps
+/// after one live read. Each fact delegates to [`AccountViewAdapter`].
+impl AccountReservesView for AccountView {
+    fn reserves_stroops(&self, base_reserve_stroops: i64) -> i64 {
+        AccountViewAdapter(self).reserves_stroops(base_reserve_stroops)
+    }
+
+    fn balance_stroops(&self) -> Result<i64, AccountReserveLookupError> {
+        AccountViewAdapter(self).balance_stroops()
+    }
+}
+
 impl AccountIdentityView for AccountViewAdapter<'_> {
     /// Returns the account's `home_domain` field, delegating to
     /// `AccountView.home_domain`.
@@ -201,6 +214,57 @@ mod tests {
     use super::*;
     use crate::{AssetView, BalanceView, ThresholdsView};
     use stellar_agent_core::BASE_RESERVE_STROOPS;
+
+    /// The observed account answers from its one read: the owned view's
+    /// facts equal the adapter's, and the observation is the read's own.
+    #[tokio::test]
+    async fn observed_account_view_keeps_one_read() {
+        use stellar_agent_test_support::xdr_fixtures::{account_entry_xdr, account_ledger_key_xdr};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer};
+        const OWNER: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(stellar_agent_test_support::EchoIdResponder::new(
+                serde_json::json!({
+                    "entries": [{
+                        "key": account_ledger_key_xdr(OWNER),
+                        "xdr": account_entry_xdr(OWNER, 70_000_000, 3),
+                        "lastModifiedLedgerSeq": 6,
+                    }],
+                    "latestLedger": 300,
+                }),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = crate::StellarRpcClient::new(&server.uri()).unwrap();
+        let report = crate::operational::OperationalReport {
+            latest_ledger: 299,
+            close_time_unix: 1_700_000_100,
+            close_lag_seconds: 1,
+        };
+        let observed = crate::fetch_account_observed(&client, OWNER, &report)
+            .await
+            .unwrap();
+        let adapter = AccountViewAdapter::new(observed.view());
+        assert_eq!(observed.balance_stroops().unwrap(), 70_000_000);
+        assert_eq!(
+            observed.balance_stroops().unwrap(),
+            adapter.balance_stroops().unwrap()
+        );
+        assert_eq!(
+            observed.reserves_stroops(BASE_RESERVE_STROOPS),
+            adapter.reserves_stroops(BASE_RESERVE_STROOPS)
+        );
+        assert_eq!(observed.view().balance_stroops().unwrap(), 70_000_000);
+        let observation = observed.observation().unwrap();
+        assert_eq!(observation.ledger_sequence, 300);
+        assert_eq!(observation.close_time_floor_ms, 1_700_000_100_000);
+        assert_eq!(observed.view().observation(), None);
+        server.verify().await;
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
 
     fn make_view(balance: &str, subentry_count: u32) -> AccountView {
         AccountView::new(

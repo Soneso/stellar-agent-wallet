@@ -44,7 +44,11 @@ and `next`. With `--output table` it prints one line instead. `next` is `none`
 once the operation ended and `wait` while it is prepared, sending or of unknown
 outcome. It is `approve` while it awaits approval and `retry` while it is
 authorized or not included. A sent attempt reads `sent_outcome_unknown` with
-its transaction hash until reconciliation settles it. The run exits `0` for a
+its transaction hash until a checked recovery decision settles it. `tx status`
+alone leaves it unknown. A `not_included` operation admits a further attempt
+only once the checked decision of its last attempt is projected onto that
+attempt's receipt. Before that projection, the run refuses with
+`recovery.retry_refused` and sends nothing. The run exits `0` for a
 succeeded operation and `1` otherwise. On another network a supplied id is
 validated and echoed in `data.business_id`, and no record exists; without an
 id the output is unchanged.
@@ -663,9 +667,10 @@ pending receipt holds the wallet's duplicate check.
 
 ### `stellar-agent tx status <HASH> [flags]`
 
-Asks the endpoint what became of `<HASH>` and records a reported success on
-the receipt, unless the receipt of an untimed hold already records another
-network answer. A reported success writes no submitted row. A reported failure
+Asks the endpoint what became of `<HASH>`. On testnet it records a reported
+success on the receipt, unless the receipt of an untimed hold already records
+another network answer. Mainnet follows the rule below. A reported success
+writes no submitted row. A reported failure
 preserves the existing receipt status. So does a missing transaction while the
 endpoint retains the submission's ledger; beyond that retention it marks a
 `pending` or `ambiguous` receipt `ambiguous`. No reported answer releases the
@@ -685,12 +690,19 @@ What it changes:
 - `FAILED` reports failure and releases no possible spending.
 - `NOT_FOUND` reports absence. Sequence and ledger-time observations cannot prove a failed outcome or authorize a refund.
 
-On a mainnet profile the primary endpoint's `FAILED` and `NOT_FOUND` settle
-nothing on their own. The verb asks the oracle named by `oracle_provider_url`
-about the same transaction and checks the oracle's mainnet identity. Endpoint
-answers are reports about that transaction. Success preserves conservative
-accounting. Failure, consumed sequence, and absence establish no definitive
-failure audit fact.
+On a mainnet profile no single endpoint answer settles a submission. Before
+its accounting horizon, a submission with an unknown outcome stays `pending`
+with its reservation open, even when the primary endpoint reports `SUCCESS`.
+The verb still reads the primary endpoint and shows its answer as
+`chain_status`, but records nothing from it on the receipt. Only a checked
+recovery decision settles the chain outcome: the primary endpoint and the
+oracle named by `oracle_provider_url` give the same answer in one pass.
+
+Once the accounting horizon passes, the verb commits the accounting expiry and
+projects it onto the receipt. A `pending` or `ambiguous` receipt becomes
+`ambiguous`, with `release_code` `submission.accounting_expired` and the
+decision identifier as `settlement_decision_id`. A missing receipt is restored
+in that form. The chain outcome stays unknown.
 
 Classic mainnet envelopes carry a deadline 120 seconds after they are built,
 covered by the operator's consent. Deadline expiry ends future execution;
@@ -784,9 +796,13 @@ A `FAILED` answer without a held reservation is an unauthenticated report, so
 the clear proceeds on the acknowledgement. An endpoint that cannot answer is
 refused under the same code: a transaction still in flight is exactly the case
 in which an operator's decision can be wrong. On mainnet, the verb also asks
-its configured oracle. It refuses with `submission.not_clearable` when the
-oracle cannot answer or does not report the mainnet passphrase. It also refuses
-`SUCCESS`, and `FAILED` for a held reservation. On a mainnet profile without an
+its configured oracle, first for its network identity and then about the
+transaction. An oracle that cannot be reached, or does not answer by the
+verb's deadline, refuses with `network.rpc_unreachable`, and the message names
+the cause. An oracle that answers with another network or an unsupported
+protocol refuses with `submission.not_clearable`. The verb also refuses an
+oracle's `SUCCESS`, and its `FAILED` for a held reservation, with
+`submission.not_clearable`. On a mainnet profile without an
 oracle nothing confirms the endpoint's `FAILED`, so the clear proceeds on the
 acknowledgement; the endpoint's `SUCCESS` is still refused. A reservation with
 a time bound whose receipt is missing is cleared only when the endpoint reports
@@ -814,8 +830,7 @@ does, and decides:
 |---|---|
 | The reconciled outcome could not be recorded on its receipt | Refused with `submission.record_unavailable`, naming the receipt-store error. Run `stellar-agent tx status` again. |
 | The receipt disagrees with its reconciliation or with the verified accounting decision | Refused with `submission.record_unavailable`. Run `stellar-agent tx status` again. |
-| A reconciliation read of the endpoint or the oracle failed, a ledger-time read failed for a sent submission whose hold or receipt carries a time bound, and the reservation stood | Refused with `network.rpc_unreachable`. Nothing changes. |
-| A reconciliation read of the oracle was still open at the verb's oracle deadline, and the reservation stood | Refused with `network.rpc_unreachable`. Nothing changes. |
+| On testnet, a reconciliation read of the endpoint failed, a ledger-time read failed for a sent submission whose hold or receipt carries a time bound, and the reservation stood | Refused with `network.rpc_unreachable`. Nothing changes. |
 | An authenticated hold without a time bound, whatever its receipt records, without `--acknowledge-unbounded` | Refused with `submission.unbounded_exposure`. Pass both acknowledgement flags to clear and record the exposure. |
 | An authenticated hold without a time bound, with both acknowledgement flags | The receipt is cleared and the hold released, whatever the endpoint or the oracle reported. A receipt that records a network answer keeps it until the clear, and an endpoint answer reconciliation did not record is the row's `evidence`. |
 | Authenticated accounting expiry, identified by its decision identifier. | Accounting expiry leaves the chain outcome unknown. Its audit event uses the authenticated decision identifier. The expiry commits the accounting disposition before the clear, and the clear row records the acknowledgement. |
@@ -824,11 +839,19 @@ does, and decides:
 | `ambiguous` without evidence (retention window closed), `ambiguous` with a `release_code` the spending window does not bear out, `failed` with no held reservation and either never sent or with a passed time bound or none, `pending` with a passed time bound or none, or `pending`, never sent and with no held reservation, each with the required acknowledgement flags | The receipt is cleared. A bounded hold keeps counting through its accounting horizon, so the output and the row carry `reservation_released: false`. |
 
 Every oracle read of the verb ends by one deadline: the profile's
-`submit_timeout_seconds`, counted from the oracle's identity read. A stalled
-oracle therefore cannot hold the audit writer past it. Reconciliation asks the
-oracle the verb already found serving mainnet and does not read its identity
-again, so an oracle identity failure refuses before the acknowledgement, with
-`submission.not_clearable`, and never during reconciliation.
+`submit_timeout_seconds`, counted from the oracle's identity read. On mainnet
+the pre-check sends three kinds of request. It sends `getTransaction` to the
+primary endpoint, then `getNetwork` to the oracle, retried until the deadline,
+then `getTransaction` to the oracle. Reconciliation sends no chain request on
+mainnet, so every oracle failure refuses before the acknowledgement. An
+identity read that fails or times out reports `network.rpc_unreachable`, and
+so does an oracle `getTransaction` past the deadline. An identity the oracle
+reports but the wallet refuses reports `submission.not_clearable`.
+
+On mainnet, reconciliation settles no chain answer, so the clear row carries
+no `evidence`. Before the accounting horizon a `pending` receipt stays
+`pending`. A `failed` receipt keeps its failure when the endpoint now reports
+`SUCCESS`.
 
 During reconciliation, `SUCCESS` on a bounded hold prevents operator clear, and
 `FAILED` retains exposure. A passed execution bound does not lift the refusal

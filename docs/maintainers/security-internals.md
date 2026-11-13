@@ -1736,6 +1736,27 @@ last exposed attempt's release row of class `unknown` in the same commit: an
 `Always` row for an exposure without `max_time`, or a `CloseTime` row at
 `max_time` in milliseconds for one with it.
 
+A `sent_outcome_unknown` attempt settles only through a checked recovery
+decision. The primary endpoint and the oracle must agree in one pass on the
+inclusion, or both prove that the transaction never applies. One commit holds
+the new state, the agreed outcome or non-inclusion proof, the accounting
+disposition, the native release row and one transition audit row. The audit
+row names the evidence digest and both deciding ledgers. A decision after the
+attempt's accounting expiry commits too: expired rows stay expired and are
+neither charged again nor released twice.
+
+Disagreement, a pending answer or one endpoint's failed read decides nothing.
+The answers that were read stay on the attempt as evidence with a
+diagnostic. An endpoint whose transaction retention starts after the
+attempt's pre-exposure ledger marks the attempt's history incomplete. That
+mark is sticky, and no history non-inclusion is decided on it.
+
+A further attempt needs the last attempt's checked non-inclusion, projected
+onto its receipt; otherwise it refuses with `recovery.retry_refused`. The new
+attempt's authorization must carry the predecessor's policy digest and
+sequence, whether it is minted with the attempt or linked earlier. Another
+policy refuses with `internal.unexpected_state`.
+
 A new record refuses with `operation.capacity` when its envelope, intent slot
 or record exceeds its bound, when 16 records wait, or when the committed file
 reached 1,179,648 bytes. One record stays within 184,365 bytes. Free text is

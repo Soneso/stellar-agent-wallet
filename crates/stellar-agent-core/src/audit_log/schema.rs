@@ -3433,6 +3433,20 @@ pub enum EventKind {
         step: String,
         /// The commit identifier: 16 random bytes as lowercase hexadecimal.
         commit_id: String,
+        /// The SHA-256 of the ordered endpoint answers that decide a
+        /// recovery transition, as lowercase hexadecimal; absent otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence_digest: Option<String>,
+        /// The primary endpoint's deciding ledger, with a recovery decision.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        primary_ledger: Option<u32>,
+        /// The oracle's deciding ledger, with a recovery decision.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        witness_ledger: Option<u32>,
+        /// The receipt release code the decision projects, such as
+        /// `accounting.released_on_evidence` for non-inclusion.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        release_code: Option<String>,
     },
 
     /// A mainnet operation committed recovery evidence or its first
@@ -4016,6 +4030,79 @@ impl std::fmt::Display for TipAnchorReason {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, reason = "test-only")]
     use super::*;
+
+    /// A transition row without a recovery decision keeps its stored bytes,
+    /// and the decision fields serialize after `commit_id` and round-trip.
+    #[test]
+    fn transition_row_fields_are_additive() {
+        use sha2::{Digest, Sha256};
+        let old = br#"{"kind":"operation_transition","operation_id":"0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a","attempt_index":1,"from_state":"authorized","step":"sending","commit_id":"0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"}"#;
+        let kind: EventKind = serde_json::from_slice(old).unwrap();
+        let EventKind::OperationTransition {
+            evidence_digest,
+            primary_ledger,
+            witness_ledger,
+            release_code,
+            ..
+        } = &kind
+        else {
+            panic!("an operation transition row: {kind:?}");
+        };
+        assert_eq!(
+            (
+                evidence_digest,
+                primary_ledger,
+                witness_ledger,
+                release_code
+            ),
+            (&None, &None, &None, &None)
+        );
+        let encoded = serde_json::to_vec(&kind).unwrap();
+        assert_eq!(encoded, old);
+        assert_eq!(Sha256::digest(&encoded), Sha256::digest(old));
+
+        let decided = crate::audit_log::AuditEntry::new_operation_transition(
+            "pay",
+            "stellar:pubnet",
+            "0a".repeat(16),
+            Some(1),
+            Some("sent_outcome_unknown".to_owned()),
+            "not_included",
+            "0c".repeat(16),
+            "request-1",
+        )
+        .with_recovery_decision(
+            "0d".repeat(32),
+            (120, 121),
+            Some("accounting.released_on_evidence"),
+        );
+        assert_eq!(decided.request_id, "request-1");
+        let json = serde_json::to_string(&decided.event_kind).unwrap();
+        let tail = format!(
+            r#""commit_id":"{}","evidence_digest":"{}","primary_ledger":120,"witness_ledger":121,"release_code":"accounting.released_on_evidence"}}"#,
+            "0c".repeat(16),
+            "0d".repeat(32)
+        );
+        assert!(json.ends_with(&tail), "{json}");
+        assert!(!json.contains("request"), "{json}");
+        assert!(!json.contains("http"), "{json}");
+        let back: EventKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, decided.event_kind);
+
+        let untouched = crate::audit_log::AuditEntry::new_operation_evidence(
+            "pay",
+            "stellar:pubnet",
+            "0a".repeat(16),
+            1,
+            Vec::new(),
+            None,
+            "0c".repeat(16),
+            "request-1",
+        );
+        let before = serde_json::to_vec(&untouched.event_kind).unwrap();
+        let after = untouched.with_recovery_decision("0d".repeat(32), (1, 2), None);
+        assert_eq!(serde_json::to_vec(&after.event_kind).unwrap(), before);
+    }
 
     #[test]
     fn evidence_row_kind_is_optional_and_old_rows_keep_their_bytes() {

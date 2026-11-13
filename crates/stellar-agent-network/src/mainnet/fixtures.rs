@@ -171,6 +171,7 @@ pub(crate) fn mint_header(header: &mut Header, binding: &DomainBinding, holds: &
                 holds: holds.to_vec(),
                 parent: None,
                 operation: None,
+                native_reservation: None,
             },
         )
         .unwrap();
@@ -640,6 +641,7 @@ impl LedgerFixture {
                     holds: holds.to_vec(),
                     parent: None,
                     operation,
+                    native_reservation: None,
                 },
             )
             .unwrap();

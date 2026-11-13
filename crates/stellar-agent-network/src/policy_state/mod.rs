@@ -219,23 +219,25 @@ pub use approvals::{
 };
 pub use ledger::{
     ClaimExpect, ConsumeExpect, ConsumeReceipt, ConsumptionBinding, DomainBinding, FeeBumpFacts,
-    MAX_OPEN_AUTHORIZATIONS, MintAuthority, MintRequest, MintedRecord, OpenAuthorization,
-    PolicyAuthorityBinding, SubmissionBinding, WindowReservation,
+    MAX_OPEN_AUTHORIZATIONS, MintAuthority, MintRequest, MintedRecord, NativeReservation,
+    OpenAuthorization, PolicyAuthorityBinding, SubmissionBinding, WindowReservation,
 };
 pub use operations::{
     AdmissibleFloors, AgreedOutcome, AttemptAuthorization, AttemptEnvelope, AttemptRequest,
     AttemptStarted, BoundedText, BusinessId, CapacityDetail, ClearForm, CommitBinding, CommitId,
-    CommitTarget, ConsumptionExposure, EndpointCoverage, EvidenceAnswer, EvidenceAuditFacts,
-    EvidenceClassification, EvidenceEndpoint, EvidenceInput, EvidenceRowInput,
+    CommitTarget, CommittedDecision, ConsumptionExposure, EndpointCoverage, EvidenceAnswer,
+    EvidenceAuditFacts, EvidenceClassification, EvidenceEndpoint, EvidenceInput, EvidenceRowInput,
     EvidenceSequenceClass, EvidenceVerdict, ExposureIdentity, IntentSlot, LookupOutcome,
-    NotIncludedProof, OpenOutcome, OpenRequest, OperationAudit, OperationAuthority,
+    NotIncludedProof, ObligationKind, OpenOutcome, OpenRequest, OperationAudit, OperationAuthority,
     OperationHandle, OperationId, OperationKind, OperationLink, OperationRecorder, OperationResult,
     OperationState, OperationStatus, OperationTool, OperationView, RecoveryUpdate,
-    SequenceReleaseInput, SlotKind, TransitionEvidence, WindowObservation, X402Intent,
+    ReleaseObligation, SequenceReleaseInput, SlotKind, TransitionEvidence, WindowObservation,
+    X402Intent,
 };
 pub use recovery::{
-    EndpointPair, LedgerAnswer, RecoveryError, RecoveryReport, RecoveryRequests,
-    SubmissionObservation, recover_sequences, submission_observation,
+    AccountAnswer, CheckedRecoveryDecision, DecidedTransition, EndpointPair, LedgerAnswer,
+    OutcomeAnswer, RecoveryError, RecoveryReport, RecoveryRequests, SubmissionObservation,
+    recover_outcomes, recover_sequences, submission_observation,
 };
 pub use store::{
     AccountingDecision, ChainScope, DeliveryReport, MintOutcome, OwedAccountingExpiries,
@@ -615,6 +617,11 @@ pub enum WindowStoreError {
         detail: String,
     },
 
+    /// A successor attempt lacks its predecessor's committed non-inclusion
+    /// proof or the projection marker of that decision. Nothing is written.
+    #[error("recovery.retry_refused: the operation has no committed and projected non-inclusion")]
+    RetryRefused,
+
     /// An operation record reached a state its rules exclude: an edge
     /// outside the state table, or a commit identifier beyond the record's
     /// allowance. Nothing is written.
@@ -666,8 +673,8 @@ impl WindowStoreError {
     }
 
     /// The wallet refusal an operation store failure names, when it names
-    /// one: the business id, capacity, attempt, reset, audit and state-rule
-    /// refusals of the operation section.
+    /// one: the business id, capacity, attempt, retry, reset, audit and
+    /// state-rule refusals of the operation section.
     #[must_use]
     pub fn operation_error(&self) -> Option<stellar_agent_core::error::WalletError> {
         use stellar_agent_core::error::{InternalError, SubmissionError, ValidationError};
@@ -680,6 +687,7 @@ impl WindowStoreError {
             .into(),
             Self::AttemptOpen => SubmissionError::OperationAttemptOpen.into(),
             Self::AttemptLimit => SubmissionError::OperationAttemptLimit.into(),
+            Self::RetryRefused => SubmissionError::RecoveryRetryRefused.into(),
             Self::OperationsOpen { open } => {
                 ValidationError::ResetOperationsOpen { open: *open }.into()
             }
