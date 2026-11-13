@@ -675,7 +675,7 @@ a positional name or `--profile`, without a default.
 
 | Verb | Form | Notes |
 |---|---|---|
-| `init` | `profile init --profile default --network testnet` | Writes a profile; see below. |
+| `init` | `profile init --profile default --network testnet` | Writes a profile, and on mainnet V1 the policy body of a spending preset after a stderr preview; see below. |
 | `list` | `profile list` | Read-only. Returns known profile names sorted as a JSON array. Takes no profile selector. |
 | `show <NAME>` | `profile show default` | Read-only. URL fields (`rpc_url`, `secondary_rpc_url`, `oracle_provider_url`) show scheme, host, and port only. Resolved config; keyring refs appear as opaque `{service, account}`, secrets never read. Exits `1` with `validation.profile_not_found` when the profile does not exist. A mainnet file without `rpc_url` exits with `validation.mainnet_rpc_url_required`. An invalid provider attestation exits with `validation.provider_attestation_invalid`; correct the named field in the profile file. An endpoint URL that breaks the endpoint rule, an unsupported schema version, or another unreadable file exits with `validation.config_invalid`. Also reports `halted`, `halted_at`, and `halt_reason`; an unreadable halt marker shows `halted: true` and `halt_marker_error`. |
 | `migrate <NAME>` | `profile migrate default` | State-changing (atomic temp+rename). No-op if already current (`status:"no_op"`); else `status:"migrated"` with `from_version`/`to_version`/`path`. A refused migration exits `1`, writes nothing, and leaves the v1 file unchanged. A missing profile file: `validation.profile_not_found`. A v1 mainnet file without `rpc_url`: `validation.mainnet_rpc_url_required`, because mainnet has no default endpoint; add `rpc_url` to the v1 file and run the command again. An endpoint URL that breaks the endpoint rule, or a file that cannot be read: `validation.config_invalid`. |
@@ -729,15 +729,45 @@ Mint the audit key with `profile rotate-audit-key` before
 `profile enroll-signer` so enrollment writes its audit row. Then run
 `profile rotate-nonce-key` before MCP payment simulation.
 
+On `--network mainnet --engine v1`, `init` also writes the unsigned
+`version = 2` policy body of a spending preset to `policies/<NAME>.toml`:
+
+- `--preset <NAME>` defaults to `api-day`; each `-week` preset fits an agent
+  left unattended for a week.
+- `--asset <USDC|XLM>` defaults to `USDC`. XLM takes `--tolerated-loss` and
+  `--typical-payment`.
+- `--unlisted-budget <yes|no>` lets an api preset pay unlisted recipients from
+  one budget shared by all payment tools.
+- `--total-budget <yes|no>` defaults to `yes`.
+- `--output <FORMAT>` sets the stderr preview to `json` (default) or `table`.
+
+Elsewhere, these flags refuse with `validation.usage_error`. At a terminal,
+`init` asks for a missing XLM amount, unlisted choice, or total budget choice.
+Without one, the total budget is chosen and other missing inputs refuse with
+`profile.preset_input_required`. The payment rules list G, M, and C
+recipients in one empty list.
+
+Before any write, `init` writes the preview to stderr: the draft
+`spending_summary` and the funding `plan`. The policy file follows, then the
+profile. The envelope's `data` adds both. An existing policy file of equal
+bytes is kept, so a rerun continues; other content refuses with
+`profile.policy_already_exists`. The mainnet next step reads
+`Review the generated policy file policies/<NAME>.toml`.
+
 The flag parser refuses a malformed or credential-bearing `--rpc-url` with
-exit `1` and `validation.usage_error`. Later refusals also exit `1` and write
-nothing. In order, these are an unsafe profile name
-(`validation.config_invalid`), a missing mainnet endpoint
-(`validation.mainnet_rpc_url_required`), and an existing profile
-(`validation.profile_already_exists`). An endpoint that breaks the URL rule
-then refuses with `validation.config_invalid`. The rule requires `http` or
-`https`, and on mainnet `https` with no username or password. A failed write
-exits `1` with an internal error.
+exit `1` and `validation.usage_error`. Later refusals also exit `1`. In order,
+these are an unsafe profile name (`validation.config_invalid`), a missing
+mainnet endpoint (`validation.mainnet_rpc_url_required`), and an existing
+profile (`validation.profile_already_exists`). An endpoint that breaks the URL
+rule then refuses with `validation.config_invalid`. The rule requires `http`
+or `https`, and on mainnet `https` with no username or password. Then come a
+preset flag outside mainnet V1 (`validation.usage_error`), a refused preset
+input (`profile.preset_invalid`, `profile.preset_input_required`), an
+unwritable preview (`profile.spending_preview_unwritable`), and the policy
+file (`profile.policy_already_exists`, `profile.preset_write_failed`). These
+write nothing, except that a policy file is kept when the profile write fails.
+Refusals after the preview carry it at `error.details.preview`. A failed
+profile write exits `1` with an internal error.
 
 `enroll-signer` reads the signer seed from the shell environment. `enroll-owner-key`, `sign-policy`, and `bind-signer` read the owner seed from that environment. The operator supplies each seed as [Pass a secret seed](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/getting-started.md#pass-a-secret-seed) shows, only for those commands, and unsets it afterward. Of the policy owner key, the MCP server holds only the enrolled public key. It reads no seed from its environment.
 
@@ -835,6 +865,9 @@ and its freshness check does not read the oracle fields. It refuses mainnet
 writes for a removed oracle from its next start. Before the first nonce is written, a signed v2 policy
 establishes the pin with its verified sequence, digest, and owner.
 Create and sign that policy before running the ceremony; it may omit `[mainnet]`.
+On mainnet V1, `profile init` writes it from a spending preset.
+`--check` adds `spending_summary` for the installed signed policy, marked
+`verified` when the verified load passed and `unavailable` otherwise.
 A v1 policy refuses with `profile.enable_mainnet_precondition` and
 `sign a v2 policy before enabling mainnet`; an unsigned policy refuses with
 `policy.policy_file_parse_failed`. Neither writes a nonce, pin, or audit row.
@@ -842,8 +875,15 @@ An existing pin stays in place, including during nonce rotation.
 The ceremony records `mainnet_enablement_minted` through the
 strict audit writer, stores an installation nonce, then atomically rewrites
 the policy with the profile, normalized endpoint host, and nonce digest.
-The operator supplies the fee cap, optional authorization
-TTL, and thresholds, then signs the policy as the output's `next` list directs.
+A full binding writes `classic_max_fee_per_op_stroops = 10000` when the
+policy states none, and keeps an authored one. Before its first write, the
+ceremony writes the spending preview to stderr as one JSON line, with
+`authority_status = "requires_signature"`. It summarizes the body
+`profile sign-policy` signs from the written file. An unwritable preview refuses with
+`profile.spending_preview_unwritable` and writes nothing. Later refusals carry
+the preview at `error.details.preview`. The operator reviews the fee cap,
+sets the optional authorization TTL and thresholds, then signs the policy as
+the output's `next` list directs.
 
 See [the policy schema and minimum](profiles-and-keys.md#mainnet-policy-body) for
 required signed fields and rules. After enablement, complete and sign the

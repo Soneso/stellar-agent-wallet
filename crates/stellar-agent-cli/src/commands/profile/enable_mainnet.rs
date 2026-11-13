@@ -9,7 +9,8 @@
 //! Refusals use `profile.enable_mainnet_profile_flag_required`,
 //! `profile.enable_mainnet_default_refused`, `profile.enable_mainnet_not_mainnet`,
 //! `profile.mainnet_oracle_required`, `profile.enable_mainnet_precondition`,
-//! `profile.enable_mainnet_nonce_exists`, and `policy.pin_absent`. The pin
+//! `profile.enable_mainnet_nonce_exists`, `profile.spending_preview_unwritable`,
+//! and `policy.pin_absent`. The pin
 //! step returns its `policy.*` verification error, such as
 //! `policy.owner_signature_invalid` or `policy.state_lock_busy`.
 //! Strict audit errors retain their own codes.
@@ -19,15 +20,33 @@
 //! `--state` reads only nonce presence after profile and backend checks.
 //! It exits 0 for enabled, 3 for absent, and 1 for unreadable.
 //! It exposes no nonce bytes or backend error text.
-//! `--check` reports every check as `passed`, `failed`, or `not_evaluated`,
-//! reads the prerequisite state, keyring entries included, and writes no
-//! nonce, pin, policy change, or audit row; a missing oracle is a failed check
-//! there.
+//! `--check` reports every check as `passed`, `failed`, or `not_evaluated`.
+//! It reads the prerequisite state, keyring entries included, and writes no
+//! nonce, pin, policy change, or audit row. A missing oracle is a failed
+//! check there. Its `spending_summary` states the bounds of the installed signed
+//! body, `verified` when the verified load passed and `unavailable`
+//! otherwise, and `null` when no signed body was read. `--check` and
+//! `--state` write no preview.
+//!
+//! The ceremony writes the spending preview to stderr as one JSON line
+//! before its first write: the bounds of the rebound body with
+//! `authority_status = "requires_signature"`. It summarizes the bytes
+//! `sign-policy` signs from the written body, with the sequence signing
+//! assigns against the pin the ceremony leaves. A preview that cannot be
+//! written refuses with `profile.spending_preview_unwritable` and writes
+//! nothing. Every later refusal carries the preview at
+//! `error.details.preview`, and the result repeats it as `spending_summary`.
+//! A full binding writes `classic_max_fee_per_op_stroops = 10000` into
+//! `[mainnet]` when the body states no fee cap, and keeps an authored one.
 
-use super::sign_policy::atomic_write_string;
+use super::sign_policy::{SequenceRefusal, assign_signing_sequence, atomic_write_string};
 use crate::{
     commands::value_audit::emit_value_audit_row_strict,
-    common::{profile_access::load_profile_reconciled, render},
+    common::{
+        profile_access::load_profile_reconciled,
+        render,
+        spending_preview::{SpendingPreview, with_shown_preview},
+    },
 };
 use clap::Args;
 use serde::Serialize;
@@ -39,7 +58,7 @@ use stellar_agent_core::{
         entry::NewToolInvocation,
         schema::{EventKind, PolicyDecision},
     },
-    envelope::Envelope,
+    envelope::{Envelope, OutputFormat},
     mainnet::{
         enablement::{
             has_enablement_nonce, normalize_endpoint_host, read_enablement_nonce, verify_enablement,
@@ -52,6 +71,7 @@ use stellar_agent_core::{
         v1::{
             PolicyStateStore,
             mainnet_minimum::{self, RequirementStatus},
+            presets::{AuthorityStatus, PRESET_FEE_PER_OPERATION_STROOPS, summarize},
             verified::{OwnerKeySource, PolicyInspection, PolicyLoad, inspect_verified_policy},
         },
     },
@@ -191,6 +211,8 @@ fn run_with_keyring(
     args: &EnableMainnetArgs,
     init_keyring: impl FnOnce() -> Result<(), stellar_agent_core::error::WalletError>,
 ) -> i32 {
+    let mut stderr = std::io::stderr();
+    let mut preview = SpendingPreview::new(&mut stderr);
     let result = (|| {
         let name = args.profile.as_deref().ok_or_else(|| {
             (
@@ -230,14 +252,27 @@ fn run_with_keyring(
                     .map_err(|e| (e.code(), e.to_string()))
             },
             atomic_write_string,
+            &mut preview,
         )
     })();
     let status = exit_code(&result);
     match result {
         Ok(data) => render::render_json(&Envelope::ok(data)),
-        Err((code, detail)) => render::render_json(&Envelope::<()>::err_raw(code, detail)),
+        Err((code, detail)) => {
+            render::render_json(&failure_envelope(code, detail, preview.shown()));
+        }
     }
     status
+}
+
+/// The envelope of a refusal, with the spending preview at
+/// `error.details.preview` once one was shown.
+fn failure_envelope(
+    code: &str,
+    detail: String,
+    preview: Option<&serde_json::Value>,
+) -> Envelope<()> {
+    with_shown_preview(Envelope::<()>::err_raw(code, detail), preview)
 }
 
 /// 1 for a refusal, a failed check, or an unreadable nonce; 3 for an absent nonce; 0 otherwise.
@@ -260,8 +295,9 @@ fn exit_code(result: &Result<serde_json::Value, Failure>) -> i32 {
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "the command binds disk paths, an injectable strict audit emitter, and an \
-              injectable policy writer"
+    reason = "the command binds disk paths, an injectable strict audit emitter, an \
+              injectable policy writer, and the spending preview it shows before its first \
+              write"
 )]
 pub(super) fn execute(
     args: &EnableMainnetArgs,
@@ -272,6 +308,7 @@ pub(super) fn execute(
     window: &PersistedWindowStore,
     emit: impl FnOnce(AuditEntry) -> Result<(), Failure>,
     write_policy: impl FnOnce(&Path, &str) -> std::io::Result<()>,
+    preview: &mut SpendingPreview<'_>,
 ) -> Result<serde_json::Value, Failure> {
     if args.profile.as_deref() != Some(name) {
         return Err((
@@ -405,6 +442,18 @@ pub(super) fn execute(
                     state,
                 )
             });
+        // The installed body's bounds, labeled by the outcome of its
+        // verified load; `null` when no signed body was read.
+        let spending_summary = inspection.as_ref().ok().and_then(|inspection| {
+            inspection.document.as_ref().map(|document| {
+                let status = if inspection.verified.is_ok() {
+                    AuthorityStatus::Verified
+                } else {
+                    AuthorityStatus::Unavailable
+                };
+                summarize(document, &profile.network_passphrase, status)
+            })
+        });
         checks.extend(inspection_checks(&inspection, name, profile, profile_dir));
         checks.push(oracle_check(profile));
         let valid = checks.iter().all(|c| c.status != Status::Failed);
@@ -412,6 +461,7 @@ pub(super) fn execute(
             "profile": name,
             "valid": valid,
             "checks": checks,
+            "spending_summary": spending_summary,
         }));
     }
     if let Some(failed) = checks.iter().find(|check| check.status == Status::Failed) {
@@ -421,6 +471,28 @@ pub(super) fn execute(
             failed.detail.as_deref().unwrap_or("failed")
         )));
     }
+    // The signed body the installation holds, read as the check branch reads
+    // it; the preview summarizes the bound body only when one was read.
+    let installed = {
+        let state = PolicyStateStore::new();
+        match (window.load_into(name, profile, &state), owner.as_ref()) {
+            (Ok(()), Ok(owner)) => {
+                inspect_verified_policy(
+                    &PolicyLoad {
+                        path: policy_path,
+                        profile,
+                        profile_name: name,
+                        owner_pubkey: owner,
+                        owner_source: OwnerKeySource::Keyring,
+                        window_path: window.path(),
+                    },
+                    state,
+                )
+                .document
+            }
+            _ => None,
+        }
+    };
     let raw = std::fs::read_to_string(policy_path)
         .map_err(|e| precondition(format!("policy_file: {e}")))?;
     let body = parse_policy_body(&raw)?;
@@ -448,6 +520,20 @@ pub(super) fn execute(
     let nonce = zeroize::Zeroizing::new(stellar_agent_core::hex::encode(random.as_ref()));
     let digest = stellar_agent_core::hex::encode(&sha2::Sha256::digest(nonce.as_bytes()));
     let rewritten = rewrite_policy(&body, name, &host, &digest, args.rotate)?;
+    // The bounds of the bytes the owner signs next, before the first write:
+    // the rebound body with the sequence signing assigns it.
+    let spending_summary = match installed {
+        Some(_) => {
+            let pin = signing_pin(name, profile, window.path(), &body)?;
+            Some(summarize(
+                &parse_policy_body(&signing_body(&rewritten, pin)?)?,
+                &profile.network_passphrase,
+                AuthorityStatus::RequiresSignature,
+            ))
+        }
+        None => None,
+    };
+    preview.show(spending_summary.as_ref(), None, OutputFormat::Json)?;
     ensure_policy_pin(name, profile, policy_path, window.path(), &body)?;
     let mut audit = AuditEntry::new_tool_invocation(NewToolInvocation::new(
         "mainnet_enablement_minted",
@@ -473,8 +559,8 @@ pub(super) fn execute(
     write_policy(policy_path, &rewritten)
         .map_err(|e| precondition(format!("policy rewrite: {e}")))?;
     let mut next = vec![
-        "Set [mainnet].classic_max_fee_per_op_stroops, optional authorization_ttl_seconds, \
-         and cross_check_thresholds."
+        "Review [mainnet].classic_max_fee_per_op_stroops (10000 when absent), and set optional \
+         authorization_ttl_seconds and cross_check_thresholds."
             .to_owned(),
         format!(
             "Enroll an approval credential with stellar-agent approve credential enroll \
@@ -493,6 +579,7 @@ pub(super) fn execute(
         "policy_needs_signature": true,
         "rotated": args.rotate,
         "next": next,
+        "spending_summary": spending_summary,
     }))
 }
 
@@ -513,15 +600,13 @@ fn refuse_absent_pin(
     nonce: &KeyringEntryRef,
 ) -> Result<(), Failure> {
     use stellar_agent_core::policy::{pin, v1::verified::read_pin_without_creating};
-    let state = read_pin_without_creating(window_path, profile)
-        .map_err(|e| (e.wire_code(), e.to_string()))?;
+    let state =
+        read_pin_without_creating(window_path, profile).map_err(|e| pin_read_failure(name, e))?;
     if let PinState::Present(_) = state {
         return Ok(());
     }
-    let pin_entry = pin::entry_present(&profile.policy_window_state_key_id).map_err(|e| {
-        let e = PolicyError::from(e);
-        (e.wire_code(), e.to_string())
-    })?;
+    let pin_entry = pin::entry_present(&profile.policy_window_state_key_id)
+        .map_err(|e| pin_read_failure(name, PolicyError::from(e)))?;
     if pin_entry {
         return Err((
             PolicyError::PinAbsent.wire_code(),
@@ -550,6 +635,60 @@ fn missing_pin_lock_detail(name: &str) -> String {
     )
 }
 
+/// The refusal of a pin read before the first write. An unusable pin names
+/// the profile, that nothing was written, and the recovery. A malformed pin
+/// has no repair command, because a replacement could lower the recorded
+/// sequence the replay protection keeps. Every other failure keeps its own
+/// message.
+fn pin_read_failure(name: &str, error: PolicyError) -> Failure {
+    let code = error.wire_code();
+    match error {
+        PolicyError::PinUnusable { detail } => (
+            code,
+            format!(
+                "the policy pin of profile '{name}' cannot be used ({detail}); nothing was \
+                 written. Rerun this command once the keyring is reachable if it was \
+                 unavailable. No command repairs a malformed pin in this release, since a \
+                 replacement could lower its recorded sequence; create a profile under a new \
+                 name."
+            ),
+        ),
+        other => (code, other.to_string()),
+    }
+}
+
+/// The pinned sequence `sign-policy` reads after this ceremony: the
+/// existing pin, which [`ensure_policy_pin`] preserves, or else the sequence
+/// of the signed `body` it pins.
+fn signing_pin(
+    name: &str,
+    profile: &Profile,
+    window_path: &Path,
+    body: &toml_edit::DocumentMut,
+) -> Result<Option<i64>, Failure> {
+    use stellar_agent_core::policy::v1::verified::read_pin_without_creating;
+    match read_pin_without_creating(window_path, profile).map_err(|e| pin_read_failure(name, e))? {
+        PinState::Present(pin) => Ok(Some(pin.sequence())),
+        PinState::Absent => Ok(body.get("sequence").and_then(toml_edit::Item::as_integer)),
+    }
+}
+
+/// The bytes `sign-policy` signs from the rebound body `rewritten` when the
+/// installation pins `pin`: the body with the sequence signing assigns.
+fn signing_body(rewritten: &str, pin: Option<i64>) -> Result<String, Failure> {
+    let mut body = parse_policy_body(rewritten)?;
+    match assign_signing_sequence(&mut body, pin) {
+        Ok(Some(_)) => Ok(body.to_string()),
+        Ok(None) => Ok(rewritten.to_owned()),
+        Err(SequenceRefusal::Invalid) => Err(precondition(
+            "policy_file: the sequence must be in 1..=i64::MAX",
+        )),
+        Err(SequenceRefusal::Exhausted) => Err(precondition(
+            "policy_file: the sequence cannot advance past i64::MAX",
+        )),
+    }
+}
+
 /// Preserves an existing pin or pins a signed v2 body before storing a nonce.
 /// The caller refuses installations with a nonce and no pin.
 /// Provisioning verification repeats that refusal under the lock.
@@ -564,7 +703,9 @@ fn ensure_policy_pin(
         pin_provisioning_policy, read_pin_without_creating,
     };
     let error = |e: PolicyError| (e.wire_code(), e.to_string());
-    if let PinState::Present(_) = read_pin_without_creating(window_path, profile).map_err(error)? {
+    if let PinState::Present(_) =
+        read_pin_without_creating(window_path, profile).map_err(|e| pin_read_failure(name, e))?
+    {
         return Ok(());
     }
     if let Some(parent) = window_path.parent() {
@@ -753,7 +894,10 @@ fn inspection_checks(
 ///
 /// A first ceremony, and a rotation of a body without a `[mainnet]` table,
 /// bind in full: version 2, the profile, the endpoint host, and the nonce
-/// digest. A rotation of a bound body replaces only the nonce digest.
+/// digest. A full binding also writes the preset fee cap,
+/// `classic_max_fee_per_op_stroops = 10000`, when the body states none, and
+/// keeps an authored cap. A rotation of a bound body replaces only the nonce
+/// digest.
 fn rewrite_policy(
     body: &toml_edit::DocumentMut,
     name: &str,
@@ -783,6 +927,11 @@ fn rewrite_policy(
             .ok_or_else(|| precondition("mainnet_table"))?;
         table.insert("profile", toml_edit::value(name));
         table.insert("endpoint_host", toml_edit::value(host));
+        if !table.contains_key("classic_max_fee_per_op_stroops") {
+            let fee = i64::try_from(PRESET_FEE_PER_OPERATION_STROOPS)
+                .map_err(|_| precondition("classic_max_fee_per_op_stroops"))?;
+            table.insert("classic_max_fee_per_op_stroops", toml_edit::value(fee));
+        }
     }
     let table = body
         .get_mut("mainnet")
@@ -846,6 +995,8 @@ mod tests {
         args: EnableMainnetArgs,
         owner: SigningKey,
         window: std::path::PathBuf,
+        /// What the ceremony wrote as its spending preview.
+        preview: RefCell<Vec<u8>>,
     }
     impl Fixture {
         fn new() -> Self {
@@ -945,6 +1096,7 @@ mod tests {
                 },
                 owner,
                 window,
+                preview: RefCell::new(Vec::new()),
             };
             fixture.sign(&body.to_string());
             fixture
@@ -969,6 +1121,26 @@ mod tests {
             emit: impl FnOnce(AuditEntry) -> Result<(), Failure>,
             write_policy: impl FnOnce(&Path, &str) -> std::io::Result<()>,
         ) -> Result<serde_json::Value, Failure> {
+            let mut buffer = self.preview.borrow_mut();
+            self.execute_into(&mut *buffer, emit, write_policy)
+        }
+        /// Runs the ceremony with its preview written to `out`.
+        fn run_into(&self, out: &mut dyn std::io::Write) -> Result<serde_json::Value, Failure> {
+            self.execute_into(
+                out,
+                |entry| {
+                    self.append_audit(&entry);
+                    Ok(())
+                },
+                atomic_write_string,
+            )
+        }
+        fn execute_into(
+            &self,
+            out: &mut dyn std::io::Write,
+            emit: impl FnOnce(AuditEntry) -> Result<(), Failure>,
+            write_policy: impl FnOnce(&Path, &str) -> std::io::Result<()>,
+        ) -> Result<serde_json::Value, Failure> {
             execute(
                 &self.args,
                 "operator",
@@ -978,6 +1150,7 @@ mod tests {
                 &PersistedWindowStore::at_path(self.window.clone()),
                 emit,
                 write_policy,
+                &mut SpendingPreview::new(out),
             )
         }
         fn run(&self) -> Result<serde_json::Value, Failure> {
@@ -1543,6 +1716,65 @@ mod tests {
                     audit
                 );
                 assert_eq!(fixture.listing(), listing, "{missing}, {rotate}");
+            }
+        }
+    }
+    /// A malformed pin refuses both forms of the ceremony, with and without
+    /// a nonce, with `policy.pin_unusable`. The message names the profile,
+    /// that nothing was written, and the recovery. The ceremony writes no
+    /// nonce, pin, audit row, policy, or file.
+    #[test]
+    #[serial]
+    fn an_unusable_pin_refuses_with_its_recovery_and_writes_nothing() {
+        for nonce_present in [true, false] {
+            let mut fixture = Fixture::new();
+            fixture.run().unwrap();
+            fixture.sign_rewritten_and_verify(2);
+            let pin = stellar_agent_core::profile::schema::policy_pin_entry_ref(
+                &fixture.profile.policy_window_state_key_id,
+            );
+            put(&pin, "not a pin");
+            if !nonce_present {
+                let nonce = fixture.nonce_ref();
+                keyring_core::Entry::new(&nonce.service, &nonce.account)
+                    .unwrap()
+                    .delete_credential()
+                    .unwrap();
+            }
+            let nonce = get(&fixture.nonce_ref());
+            let policy = std::fs::read(fixture.path()).unwrap();
+            let audit = std::fs::read(fixture.dir.path().join("audit.jsonl")).unwrap();
+            let listing = fixture.listing();
+            for rotate in [false, true] {
+                fixture.args.rotate = rotate;
+                let case = format!("nonce {nonce_present}, rotate {rotate}");
+                let (code, detail) = fixture.run().unwrap_err();
+                assert_eq!(code, "policy.pin_unusable", "{case}: {detail}");
+                assert!(
+                    detail.starts_with("the policy pin of profile 'operator' cannot be used ("),
+                    "{case}: {detail}"
+                );
+                assert!(
+                    detail.contains("); nothing was written. "),
+                    "{case}: {detail}"
+                );
+                assert!(
+                    detail.ends_with(
+                        "No command repairs a malformed pin in this release, since a \
+                         replacement could lower its recorded sequence; create a profile \
+                         under a new name."
+                    ),
+                    "{case}: {detail}"
+                );
+                assert_eq!(get(&pin).as_deref(), Some("not a pin"), "{case}");
+                assert_eq!(get(&fixture.nonce_ref()), nonce, "{case}");
+                assert_eq!(std::fs::read(fixture.path()).unwrap(), policy, "{case}");
+                assert_eq!(
+                    std::fs::read(fixture.dir.path().join("audit.jsonl")).unwrap(),
+                    audit,
+                    "{case}"
+                );
+                assert_eq!(fixture.listing(), listing, "{case}");
             }
         }
     }
@@ -2363,6 +2595,7 @@ mod tests {
                 &PersistedWindowStore::at_path(fixture.window.clone()),
                 |_| Ok(()),
                 atomic_write_string,
+                &mut SpendingPreview::new(&mut std::io::sink()),
             )
             .unwrap_err()
             .0,
@@ -2441,7 +2674,17 @@ mod tests {
             let nonce = get(&fixture.nonce_ref());
             let result = fixture.run();
             assert_eq!(exit_code(&result), i32::from(failed));
-            let envelope = Envelope::ok_with_request_id(result.unwrap(), "fixed-id".into());
+            let mut data = result.unwrap();
+            let summary = data
+                .as_object_mut()
+                .unwrap()
+                .remove("spending_summary")
+                .unwrap();
+            assert_eq!(
+                summary["authority_status"],
+                if failed { "unavailable" } else { "verified" }
+            );
+            let envelope = Envelope::ok_with_request_id(data, "fixed-id".into());
             let mut bytes = Vec::new();
             render::render_json_to(&mut bytes, &envelope).unwrap();
             assert_eq!(bytes, format!("{expected}\n").as_bytes());
@@ -2450,6 +2693,284 @@ mod tests {
             assert_eq!(get(&fixture.nonce_ref()), nonce);
         }
     }
+    /// `--check` summarizes the installed signed body and writes nothing:
+    /// no preview, nonce, pin, policy change, or audit row; `--state`
+    /// writes no preview either.
+    #[test]
+    #[serial]
+    fn enable_check_summarizes_without_writes() {
+        let mut fixture = Fixture::new();
+        fixture.run().unwrap();
+        fixture.signed_body(7);
+        fixture.preview.borrow_mut().clear();
+        fixture.args.check = true;
+        let before = persisted(&fixture);
+        let pin = fixture.pin();
+        let nonce = get(&fixture.nonce_ref());
+        let output = fixture.run().unwrap();
+        let summary = &output["spending_summary"];
+        assert_eq!(summary["authority_status"], "verified");
+        assert_eq!(summary["sequence"], 7);
+        assert_eq!(summary["fee_cap_status"], "signed");
+        assert!(fixture.preview.borrow().is_empty());
+        assert_eq!(persisted(&fixture), before);
+        assert_eq!(fixture.pin(), pin);
+        assert_eq!(get(&fixture.nonce_ref()), nonce);
+
+        fixture.args.check = false;
+        fixture.args.state = true;
+        assert_eq!(fixture.run().unwrap()["state"], "enabled");
+        assert!(fixture.preview.borrow().is_empty());
+        assert_eq!(persisted(&fixture), before);
+    }
+
+    /// A body whose verified load fails is summarized as `unavailable`, and
+    /// a file that yields no signed body as `null`.
+    #[test]
+    #[serial]
+    fn enable_unverified_never_labeled_verified() {
+        let mut fixture = Fixture::new();
+        fixture.run().unwrap();
+        fixture.signed_body(7);
+        fixture.args.check = true;
+        fixture.put_pin(9);
+        let output = fixture.run().unwrap();
+        assert_eq!(check_of(&output, "verified_policy").0, "failed");
+        assert_eq!(
+            output["spending_summary"]["authority_status"],
+            "unavailable"
+        );
+        assert_eq!(output["spending_summary"]["sequence"], 7);
+
+        let raw = std::fs::read_to_string(fixture.path()).unwrap();
+        let unsigned = raw.split("\n[signature]").next().unwrap().to_owned();
+        std::fs::write(fixture.path(), unsigned).unwrap();
+        let output = fixture.run().unwrap();
+        assert_eq!(check_of(&output, "verified_policy").0, "failed");
+        assert!(output["spending_summary"].is_null(), "{output}");
+    }
+
+    /// The ceremony previews the rebound body: the signature it requires,
+    /// the fee cap the rewrite signs, and no plan; the result repeats it.
+    #[test]
+    #[serial]
+    fn enable_preview_shows_bound_body() {
+        let fixture = Fixture::new();
+        let result = fixture.run().unwrap();
+        let text = String::from_utf8(fixture.preview.borrow().clone()).unwrap();
+        assert_eq!(text.lines().count(), 1, "{text}");
+        let preview: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(preview["phase"], "before_write");
+        assert!(preview.get("plan").is_none(), "{preview}");
+        let summary = &preview["spending_summary"];
+        assert_eq!(summary["authority_status"], "requires_signature");
+        assert_eq!(summary["fee_cap_status"], "signed");
+        let rewritten = std::fs::read_to_string(fixture.path())
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        let fee = rewritten["mainnet"]["classic_max_fee_per_op_stroops"]
+            .as_integer()
+            .unwrap();
+        assert_eq!(fee, 10_000);
+        assert_eq!(summary["classic_max_fee_per_op_stroops"], fee);
+        assert_eq!(result["spending_summary"], *summary);
+    }
+
+    /// The preview summarizes the bytes `sign-policy` signs from the rebound
+    /// body. With the pin the ceremony leaves, signing prepares exactly the
+    /// previewed body, and the previewed summary equals the summary of the
+    /// signed bytes field by field. A rotation of a bound body is signed
+    /// without an edit, so its written body is signed as it stands.
+    #[test]
+    #[serial]
+    fn enable_preview_is_the_signed_body() {
+        let mut fixture = Fixture::new();
+        fixture.run().unwrap();
+        let first: serde_json::Value = serde_json::from_slice(&fixture.preview.borrow()).unwrap();
+        // The installed body holds sequence 1; signing assigns 2.
+        assert_eq!(first["spending_summary"]["sequence"], 2);
+
+        fixture.sign_rewritten_and_verify(2);
+        fixture.args.rotate = true;
+        fixture.preview.borrow_mut().clear();
+        fixture.run().unwrap();
+        let shown: serde_json::Value = serde_json::from_slice(&fixture.preview.borrow()).unwrap();
+        let written = std::fs::read_to_string(fixture.path()).unwrap();
+        let PinState::Present(pin) = fixture.pin() else {
+            panic!("the ceremony leaves a pin");
+        };
+        let signed = super::super::sign_policy::prepare_policy(
+            &written,
+            &fixture.profile,
+            "operator",
+            &fixture.path(),
+            &fixture.window,
+        )
+        .unwrap();
+        assert_eq!(
+            signing_body(&written, Some(pin.sequence())).unwrap(),
+            signed.raw
+        );
+        let summary = serde_json::to_value(summarize(
+            &parse_policy_body(&signed.raw).unwrap(),
+            &fixture.profile.network_passphrase,
+            AuthorityStatus::RequiresSignature,
+        ))
+        .unwrap();
+        let shown = shown["spending_summary"].as_object().unwrap();
+        let summary = summary.as_object().unwrap();
+        assert_eq!(
+            shown.keys().collect::<Vec<_>>(),
+            summary.keys().collect::<Vec<_>>()
+        );
+        for (field, value) in summary {
+            assert_eq!(&shown[field], value, "{field}");
+        }
+        assert_eq!(shown["sequence"], 3);
+    }
+
+    /// A stderr writer that records, at each write and flush, whether the
+    /// pin, the nonce, or the audit row exists yet.
+    struct WriteWatch<'f> {
+        fixture: &'f Fixture,
+        seen: Vec<(bool, bool, bool)>,
+    }
+
+    impl WriteWatch<'_> {
+        fn record(&mut self) {
+            self.seen.push((
+                matches!(self.fixture.pin(), PinState::Present(_)),
+                get(&self.fixture.nonce_ref()).is_some(),
+                self.fixture.dir.path().join("audit.jsonl").exists(),
+            ));
+        }
+    }
+
+    impl std::io::Write for WriteWatch<'_> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.record();
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.record();
+            Ok(())
+        }
+    }
+
+    /// The preview reaches stderr before the pin, the audit row, and the
+    /// nonce exist.
+    #[test]
+    #[serial]
+    fn enable_preview_precedes_pin_write() {
+        let fixture = Fixture::new();
+        assert!(matches!(fixture.pin(), PinState::Absent));
+        let mut watch = WriteWatch {
+            fixture: &fixture,
+            seen: Vec::new(),
+        };
+        fixture.run_into(&mut watch).unwrap();
+        let seen = watch.seen;
+        assert!(seen.len() >= 2, "{seen:?}");
+        assert!(seen.iter().all(|s| *s == (false, false, false)), "{seen:?}");
+        assert!(matches!(fixture.pin(), PinState::Present(_)));
+        assert!(get(&fixture.nonce_ref()).is_some());
+    }
+
+    /// A preview that cannot be written refuses with its code before any
+    /// write.
+    #[test]
+    #[serial]
+    fn enable_preview_failure_prevents_writes() {
+        for writer in [render::FailingWriter::Write, render::FailingWriter::Flush] {
+            let fixture = Fixture::new();
+            let before = persisted(&fixture);
+            let mut out = writer;
+            let (code, detail) = fixture.run_into(&mut out).unwrap_err();
+            assert_eq!(code, "profile.spending_preview_unwritable", "{writer:?}");
+            assert!(detail.ends_with("; nothing was written"), "{detail}");
+            assert_eq!(persisted(&fixture), before, "{writer:?}");
+            assert!(matches!(fixture.pin(), PinState::Absent), "{writer:?}");
+            assert!(get(&fixture.nonce_ref()).is_none(), "{writer:?}");
+        }
+    }
+
+    /// A refusal after the preview carries it at `error.details.preview`;
+    /// one before it carries none.
+    #[test]
+    #[serial]
+    fn failure_envelope_carries_preview() {
+        let fixture = Fixture::new();
+        let (code, detail) = fixture
+            .run_with(
+                |_| Err(("audit.write_failed", "the audit row failed".into())),
+                atomic_write_string,
+            )
+            .unwrap_err();
+        let shown: serde_json::Value = serde_json::from_slice(&fixture.preview.borrow()).unwrap();
+        let envelope = serde_json::to_value(failure_envelope(code, detail, Some(&shown))).unwrap();
+        assert_eq!(envelope["error"]["code"], "audit.write_failed");
+        assert_eq!(envelope["error"]["message"], "the audit row failed");
+        assert_eq!(envelope["error"]["details"]["preview"], shown);
+        assert_eq!(
+            envelope["error"]["details"]["preview"]["spending_summary"]["authority_status"],
+            "requires_signature"
+        );
+        let envelope = serde_json::to_value(failure_envelope(
+            "profile.enable_mainnet_precondition",
+            "nonce".into(),
+            None,
+        ))
+        .unwrap();
+        assert!(envelope["error"]["details"].is_null(), "{envelope}");
+    }
+
+    /// A full binding fills the preset fee cap when the body states none and
+    /// keeps an authored one; a rotation of a bound body leaves the fee alone.
+    #[test]
+    #[serial]
+    fn enablement_fills_absent_fee_keeps_authored() {
+        let fee = |rewritten: &str| {
+            rewritten.parse::<toml_edit::DocumentMut>().unwrap()["mainnet"]
+                .get("classic_max_fee_per_op_stroops")
+                .and_then(toml_edit::Item::as_integer)
+        };
+        let digest = "0".repeat(64);
+        let unbound = "version = 2\nscope = \"profile:operator\"\nsequence = 1\n";
+        let authored = format!("{unbound}\n[mainnet]\nclassic_max_fee_per_op_stroops = 500\n");
+        let bound = format!(
+            "{unbound}\n[mainnet]\nprofile = \"operator\"\nendpoint_host = \"rpc.example.invalid\"\n\
+             installation_nonce_sha256 = \"{}\"\n",
+            "1".repeat(64)
+        );
+        let rewrite = |raw: &str, rotate: bool| {
+            rewrite_policy(
+                &raw.parse().unwrap(),
+                "operator",
+                "rpc.example.invalid",
+                &digest,
+                rotate,
+            )
+            .unwrap()
+        };
+        for rotate in [false, true] {
+            assert_eq!(fee(&rewrite(unbound, rotate)), Some(10_000), "{rotate}");
+        }
+        assert_eq!(fee(&rewrite(&authored, false)), Some(500));
+        let rotated = rewrite(&bound, true);
+        assert_eq!(fee(&rotated), None);
+        assert!(rotated.contains(&digest));
+        assert_eq!(fee(&rewrite(&bound, false)), Some(10_000));
+
+        let fixture = Fixture::new();
+        fixture.run().unwrap();
+        assert_eq!(
+            fee(&std::fs::read_to_string(fixture.path()).unwrap()),
+            Some(10_000)
+        );
+    }
+
     fn unbound_body(remote: bool) -> String {
         let raw = if remote {
             include_str!(

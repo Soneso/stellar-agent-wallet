@@ -517,6 +517,63 @@ mod tests {
         assert_eq!(std::fs::read(&default_path).unwrap(), default_bytes);
     }
 
+    /// `profile init` and `profile enable-mainnet` skip the startup scan. No
+    /// startup advisory precedes the spending preview, and no advisory row
+    /// precedes their first write. Every other command still scans.
+    #[test]
+    #[serial_test::serial]
+    fn startup_advisory_skips_preview_commands() {
+        use clap::Parser as _;
+        use stellar_agent_core::profile::{loader, schema::Profile};
+        use stellar_agent_test_support::StellarAgentHomeGuard;
+
+        let dir = TempDir::new().unwrap();
+        let _home = StellarAgentHomeGuard::new(dir.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let path = dir.path().join("operator-audit.jsonl");
+        let profile = Profile::builder_testnet_named("operator", "signer", "test", "nonce", "test")
+            .audit_log_path(&path)
+            .build();
+        loader::save("operator", &profile).unwrap();
+        let writer = open_writer(path.clone());
+        write_context_rule_created(&writer, 4, "CDABC...12345", vec![h(0xee)]);
+        drop(writer);
+        let before = std::fs::read(&path).unwrap();
+
+        let run = |args: &[&str]| {
+            let cli = crate::Cli::try_parse_from(
+                std::iter::once("stellar-agent").chain(args.iter().copied()),
+            )
+            .unwrap_or_else(|error| panic!("{args:?} parses: {error}"));
+            crate::startup_advisory_for(&cli.command, |path, open_writer| {
+                run_startup_advisory(path, open_writer)
+            })
+        };
+        for args in [
+            &[
+                "profile",
+                "enable-mainnet",
+                "--profile",
+                "operator",
+                "--check",
+            ][..],
+            &["profile", "enable-mainnet", "--profile", "operator"][..],
+            &["profile", "init", "--profile", "operator"][..],
+        ] {
+            let result = run(args);
+            assert!(result.triggered_rule_ids.is_empty(), "{args:?}");
+            assert_eq!(std::fs::read(&path).unwrap(), before, "{args:?}");
+        }
+
+        let result = run(&["profile", "show", "operator"]);
+        assert_eq!(result.triggered_rule_ids, vec![4]);
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("sa_verifier_allowlist_advisory")
+        );
+    }
+
     /// A finding acquires the profile's keyed writer and records its binding.
     /// A changed binding refuses the row while the scan still reports findings.
     #[test]

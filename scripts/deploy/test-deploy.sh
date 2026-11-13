@@ -845,6 +845,12 @@ case_predicate_exempt_forms_run_with_unreadable_nonce() {
       for code in 1 2 101 0 3; do
         run_form "$platform" "$line" "$code"
         expect_admitted
+        case "$FORM_ARGS" in
+          "profile init "*)
+            # The default preset without an unlisted budget.
+            expect_native "stellar-agent $FORM_ARGS --profile mainnet --unlisted-budget no"
+            ;;
+        esac
       done
     done <<<"$FORMS"
   done

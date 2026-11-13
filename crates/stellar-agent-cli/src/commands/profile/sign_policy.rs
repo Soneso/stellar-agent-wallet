@@ -445,10 +445,47 @@ where
     0
 }
 
+/// Why a version 2 body cannot take a signing sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SequenceRefusal {
+    /// The body's `sequence` is not an integer in `1..=i64::MAX`.
+    Invalid,
+    /// The sequence cannot advance past `i64::MAX`.
+    Exhausted,
+}
+
+/// Assigns a version 2 body the sequence signing gives it: one past the
+/// larger of the body's own sequence and the installation's pinned
+/// sequence `pin`. Every signature thus advances past both. An absent body
+/// sequence counts as 0.
+///
+/// Returns the assigned sequence and the one it advances past. A body of
+/// another version keeps its text and returns `None`.
+pub(super) fn assign_signing_sequence(
+    body: &mut toml_edit::DocumentMut,
+    pin: Option<i64>,
+) -> Result<Option<(i64, i64)>, SequenceRefusal> {
+    if body.get("version").and_then(toml_edit::Item::as_integer) != Some(2) {
+        return Ok(None);
+    }
+    let previous_body = match body.get("sequence") {
+        None => 0,
+        Some(value) => value
+            .as_integer()
+            .filter(|n| *n >= 1)
+            .ok_or(SequenceRefusal::Invalid)?,
+    };
+    let previous = pin.unwrap_or(0).max(previous_body);
+    let sequence = previous.checked_add(1).ok_or(SequenceRefusal::Exhausted)?;
+    body["sequence"] = toml_edit::value(sequence);
+    Ok(Some((sequence, previous)))
+}
+
 /// A policy body that passed every check signing applies, with its assigned
 /// sequence and canonical bytes.
-struct PreparedPolicy {
-    raw: String,
+pub(super) struct PreparedPolicy {
+    /// The body signing signs, `[signature]` aside.
+    pub(super) raw: String,
     /// The owner the installation's pin names, when a pin exists.
     pinned_owner: Option<[u8; 32]>,
     sequence: Option<i64>,
@@ -491,7 +528,7 @@ struct PreparedPolicy {
 ///
 /// Every refusal except the parse and canonicalization failures states that
 /// no file was written.
-fn prepare_policy(
+pub(super) fn prepare_policy(
     raw: &str,
     profile: &Profile,
     name: &str,
@@ -561,25 +598,17 @@ fn prepare_policy(
         previous_sequence: None,
         warnings: Vec::new(),
     };
-    if body.get("version").and_then(toml_edit::Item::as_integer) == Some(2) {
-        let previous_body = match body.get("sequence") {
-            None => 0,
-            Some(value) => value
-                .as_integer()
-                .filter(|n| *n >= 1)
-                .ok_or_else(|| body_invalid(&"sequence must be in 1..=i64::MAX"))?,
-        };
-        let previous = pin.unwrap_or(0).max(previous_body);
-        let sequence = previous.checked_add(1).ok_or_else(|| {
-            (
-                "sign_policy.sequence_exhausted",
-                format!(
-                    "the sequence of policy file {path} cannot advance past i64::MAX. No file \
-                     was written."
-                ),
-            )
-        })?;
-        body["sequence"] = toml_edit::value(sequence);
+    let assigned = assign_signing_sequence(&mut body, pin).map_err(|refusal| match refusal {
+        SequenceRefusal::Invalid => body_invalid(&"sequence must be in 1..=i64::MAX"),
+        SequenceRefusal::Exhausted => (
+            "sign_policy.sequence_exhausted",
+            format!(
+                "the sequence of policy file {path} cannot advance past i64::MAX. No file was \
+                 written."
+            ),
+        ),
+    })?;
+    if let Some((sequence, previous)) = assigned {
         result.sequence = Some(sequence);
         result.previous_sequence = Some(previous);
         result.raw = body.to_string();

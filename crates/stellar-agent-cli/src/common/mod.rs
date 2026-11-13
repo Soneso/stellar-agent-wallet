@@ -17,6 +17,8 @@
 //! - [`signer_ceremony`] — `resolve_software_signer_from_env`, the single
 //!   mlock-protected secret-env signer ceremony shared by every write
 //!   subcommand that accepts a `--*-secret-env <VAR>` flag.
+//! - `spending_preview`: the spending bounds `profile init` and
+//!   `profile enable-mainnet` write to stderr before their first write.
 //!
 //! # Free helpers
 //!
@@ -60,6 +62,7 @@ pub(crate) mod refusal_log_fixture;
 pub mod render;
 pub mod served_pages;
 pub mod signer_ceremony;
+pub(crate) mod spending_preview;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub(crate) mod tty;
