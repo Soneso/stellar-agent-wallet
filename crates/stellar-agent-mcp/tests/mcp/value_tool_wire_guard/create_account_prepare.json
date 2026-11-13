@@ -5,7 +5,7 @@
     "expires_at_unix_ms": "EXPIRES_AT_UNIX_MS",
     "nonce": "NONCE",
     "operational": {
-      "close_lag_seconds": 0,
+      "close_lag_seconds": "CLOSE_LAG_SECONDS",
       "close_time_unix": "CLOSE_TIME_UNIX",
       "latest_ledger": 1001
     },

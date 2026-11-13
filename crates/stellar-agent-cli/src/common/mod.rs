@@ -36,6 +36,8 @@
 //!   to use as a path component (no path traversal, no special characters).
 
 pub(crate) mod business_entry;
+#[cfg(test)]
+mod capture_isolation;
 pub(crate) mod consent;
 #[cfg(test)]
 pub(crate) mod identity_fixture;

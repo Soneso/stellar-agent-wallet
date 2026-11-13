@@ -2981,18 +2981,33 @@ mod tests {
     /// fires.
     #[test]
     fn corrupt_hmac_secret_stays_out_of_the_decode_event() {
-        let logs = stellar_agent_test_support::log_capture::with_captured_trace_logs(|| {
+        let writer = CaptureWriter::new();
+        let subscriber = json_capture_subscriber(writer.clone());
+        let _inert = stellar_agent_test_support::log_capture::inert_dispatcher();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
             assert_eq!(
                 decode_secret_32("~").err().unwrap().code(),
                 "internal.unexpected_state"
             );
         });
-        assert!(
-            logs.contains("chain-root HMAC key base64 decode failed"),
+        let logs = writer.captured_str();
+        let events: Vec<serde_json::Value> = logs
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 1, "{logs}");
+        // The byte value of '~' is 126. Decoder byte and offset details must
+        // not enter the event, regardless of numeric tracing metadata. The
+        // flattened event holds only the formatter's metadata and the message.
+        let event = events[0].as_object().expect("event object");
+        assert_eq!(
+            event["message"], "chain-root HMAC key base64 decode failed",
             "{logs}"
         );
-        assert!(!logs.contains("Invalid symbol"), "{logs}");
-        assert!(!logs.contains("126"), "{logs}");
+        let mut keys: Vec<&str> = event.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["level", "message", "target", "timestamp"], "{logs}");
     }
 
     // ── Audit-log tip anchor ─────────────────────────────────────────────────

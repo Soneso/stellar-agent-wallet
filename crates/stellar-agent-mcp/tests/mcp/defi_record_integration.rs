@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use serial_test::serial;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use stellar_agent_core::policy::v1::criteria::state_store::{PolicyStateStore, StateKey};
 use stellar_agent_core::policy::{
@@ -35,6 +35,7 @@ use stellar_agent_network::{envelope_hash_hex, policy_state::PersistedWindowStor
 use stellar_agent_test_support::{
     keyring_mock,
     signed_envelope::{account_id_for_seed, send_transaction_hash_hex},
+    timing::{ClockHold, drive_call, wait_until},
 };
 use stellar_xdr::{
     ContractDataDurability, ContractDataEntry, ContractExecutable, ContractId, ExtensionPoint,
@@ -118,6 +119,8 @@ struct Rpc {
     entries: Vec<(String, String)>,
     confirming: Arc<AtomicBool>,
     sent: Arc<Mutex<Vec<(String, String)>>>,
+    /// The number of confirmation polls received.
+    polls: Arc<AtomicUsize>,
 }
 
 impl Respond for Rpc {
@@ -157,7 +160,10 @@ impl Respond for Rpc {
                 let envelope = body["params"]["transaction"].as_str().unwrap();
                 self.sent.lock().unwrap().push((send_transaction_hash_hex(&body, PASSPHRASE), envelope_hash_hex(envelope)));
             }
-            "getNetwork" | "getFeeStats" | "getLedgerEntries" | "getTransaction" => {}
+            "getTransaction" => {
+                self.polls.fetch_add(1, Ordering::SeqCst);
+            }
+            "getNetwork" | "getFeeStats" | "getLedgerEntries" => {}
             other => panic!("unexpected RPC method: {other}"),
         }
         delegate.respond(request)
@@ -314,7 +320,16 @@ fn secret_strkey(seed: [u8; 32]) -> String {
         .to_string()
 }
 
+/// Runs `tool` against the fixture endpoint and checks its record.
+///
+/// The settling tests run on a paused clock that this holds still, so the
+/// pre-submit deadline and the confirmation deadline both start at the
+/// instant the call starts, however long the reads, simulations, and
+/// signatures take in real time. A timeout case moves the clock by the submit
+/// timeout only once the send and the first confirmation poll have reached
+/// the endpoint.
 async fn exercise(tool: Tool, initially_confirmed: bool, fault: Option<SignerFault>) {
+    let _hold = ClockHold::new();
     let _root = crate::common::isolated_data_root();
     keyring_mock::install().unwrap();
     install_test_nonce_key();
@@ -347,6 +362,7 @@ async fn exercise(tool: Tool, initially_confirmed: bool, fault: Option<SignerFau
     let mock = MockServer::start().await;
     let confirming = Arc::new(AtomicBool::new(initially_confirmed));
     let sent = Arc::new(Mutex::new(Vec::new()));
+    let polls = Arc::new(AtomicUsize::new(0));
     let router = ScAddress::Contract(ContractId(Hash(
         stellar_strkey::Contract::from_string(SOROSWAP_ROUTER_ADDRESS_TESTNET)
             .unwrap()
@@ -370,6 +386,7 @@ async fn exercise(tool: Tool, initially_confirmed: bool, fault: Option<SignerFau
             ],
             confirming: Arc::clone(&confirming),
             sent: Arc::clone(&sent),
+            polls: Arc::clone(&polls),
         })
         .mount(&mock)
         .await;
@@ -400,7 +417,21 @@ async fn exercise(tool: Tool, initially_confirmed: bool, fault: Option<SignerFau
         },
         profile_name.clone(),
     )));
-    let result = tool.call(&server).await;
+    let result = if initially_confirmed || fault.is_some() {
+        tool.call(&server).await
+    } else {
+        let submit_timeout = profile.submit_timeout();
+        // The joined run is bounded in real time, so a deadline the advance
+        // does not reach fails rather than leaving the call pending.
+        drive_call(tool.call(&server), |_probe| async {
+            wait_until("the send and the first confirmation poll", || {
+                !sent.lock().unwrap().is_empty() && polls.load(Ordering::SeqCst) > 0
+            })
+            .await;
+            tokio::time::advance(submit_timeout).await;
+        })
+        .await
+    };
     let response = result_json(&result);
     let sent = sent.lock().unwrap().clone();
     if let Some(fault) = fault {
@@ -570,32 +601,32 @@ async fn exercise(tool: Tool, initially_confirmed: bool, fault: Option<SignerFau
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 #[serial]
 async fn trade_timeout_retains_and_settles_record() {
     exercise(Tool::Trade, false, None).await;
 }
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 #[serial]
 async fn deposit_timeout_retains_and_settles_record() {
     exercise(Tool::Deposit, false, None).await;
 }
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 #[serial]
 async fn withdraw_timeout_retains_and_settles_record() {
     exercise(Tool::Withdraw, false, None).await;
 }
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 #[serial]
 async fn trade_confirmation_settles_record() {
     exercise(Tool::Trade, true, None).await;
 }
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 #[serial]
 async fn deposit_confirmation_settles_record() {
     exercise(Tool::Deposit, true, None).await;
 }
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 #[serial]
 async fn withdraw_confirmation_settles_record() {
     exercise(Tool::Withdraw, true, None).await;

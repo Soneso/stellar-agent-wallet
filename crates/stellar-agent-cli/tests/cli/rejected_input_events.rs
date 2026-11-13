@@ -655,8 +655,29 @@ async fn missing_rule_refusal_holds_no_rule_id() {
         "--rule-id must identify a rule on the smart account; run 'smart-account list-rules' to \
          list the rules"
     );
+    let mut envelope = envelope_of(&output);
+    // The request ID is metadata; the refusal contains only its code and message.
+    envelope
+        .as_object_mut()
+        .expect("envelope")
+        .remove("request_id");
+    assert_eq!(
+        envelope,
+        json!({
+            "ok": false,
+            "error": {
+                "code": "validation.address_invalid",
+                "message": error["message"],
+            },
+        })
+    );
+    // The envelope is the only stdout output, so no other line holds the id.
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(!stdout.contains("4242424"), "{stdout}");
+    assert_eq!(
+        stdout.lines().filter(|l| !l.trim().is_empty()).count(),
+        1,
+        "{stdout}"
+    );
 }
 
 /// A rule id the account does not hold stays out of the spending-limit submit

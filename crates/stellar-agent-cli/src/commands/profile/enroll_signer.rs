@@ -1000,33 +1000,7 @@ mod tests {
         .build()
     }
 
-    /// RAII env-var guard; `#[serial]` on every test using it prevents
-    /// concurrent env access.
-    struct EnvGuard {
-        var: String,
-    }
-    impl EnvGuard {
-        #[allow(
-            unsafe_code,
-            reason = "test-only env mutation; #[serial] prevents concurrent access"
-        )]
-        fn set(var: String, value: &str) -> Self {
-            // SAFETY: serialised by #[serial]; no concurrent env access.
-            unsafe {
-                std::env::set_var(&var, value);
-            }
-            Self { var }
-        }
-    }
-    impl Drop for EnvGuard {
-        #[allow(unsafe_code, reason = "test-only env cleanup")]
-        fn drop(&mut self) {
-            // SAFETY: same as set(); serialised by #[serial].
-            unsafe {
-                std::env::remove_var(&self.var);
-            }
-        }
-    }
+    use crate::common::test_support::EnvGuard;
 
     fn args(secret_env: &str, expected: Option<&str>, force: bool) -> EnrollSignerArgs {
         EnrollSignerArgs {

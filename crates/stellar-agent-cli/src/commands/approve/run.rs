@@ -2891,13 +2891,21 @@ mod tests {
             assert!(!text.contains("Amount:"));
         }
     }
+    /// Fixes the nonce and the clock-derived times, so the summary text
+    /// depends only on the fixture's terms.
+    fn pin_summary_metadata(entry: &mut PendingApproval) {
+        entry.approval_nonce = "A".repeat(22);
+        entry.created_at_unix_ms = 1_700_000_000_000;
+        entry.expires_at_unix_ms = 1_700_000_000_000 + DEFAULT_TTL_MS;
+    }
+
     /// The claim transaction names the balance by id only, so the summary
     /// says that its asset and amount are not part of it, whatever the
     /// stored summary holds.
     #[test]
     fn claim_summary_says_asset_and_amount_are_not_signed() {
         for value in [None, Some(("XLM", 1_000_000))] {
-            let entry = fixtures::claim_pending(
+            let mut entry = fixtures::claim_pending(
                 SOURCE_G,
                 [0x0a; 32],
                 value,
@@ -2906,6 +2914,7 @@ mod tests {
                 "1000".into(),
                 DEFAULT_TTL_MS,
             );
+            pin_summary_metadata(&mut entry);
             let mut output = Vec::new();
             write_summary(&entry, &test_context(), &mut output).unwrap();
             let text = String::from_utf8(output).unwrap();
@@ -2913,6 +2922,13 @@ mod tests {
                 text.matches("not part of the signed claim transaction")
                     .count(),
                 2,
+                "{text}"
+            );
+            assert_eq!(
+                text.lines()
+                    .filter(|line| line.trim_start().starts_with("Amount:"))
+                    .collect::<Vec<_>>(),
+                [format!("  Amount:            {CLAIM_VALUE_NOTE}")],
                 "{text}"
             );
             assert!(!text.contains("1000000"), "{text}");
@@ -2958,6 +2974,7 @@ mod tests {
             DEFAULT_TTL_MS,
         );
         edit_stored_payment(&mut entry);
+        pin_summary_metadata(&mut entry);
         let mut sink = Vec::new();
         write_summary(&entry, &test_context(), &mut sink).unwrap();
         let text = String::from_utf8(sink).unwrap();
@@ -2975,6 +2992,13 @@ mod tests {
             );
         }
         assert!(!text.contains(OTHER_G), "{text}");
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.trim_start().starts_with("Amount:"))
+                .collect::<Vec<_>>(),
+            ["  Amount:            500000000 stroops"],
+            "{text}"
+        );
         assert!(!text.contains("10000"), "{text}");
         assert!(!text.contains("refund"), "{text}");
     }
@@ -3194,6 +3218,7 @@ mod tests {
         "untrusted-payee".clone_into(payee);
         "999".clone_into(amount);
         "untrusted-asset".clone_into(asset);
+        pin_summary_metadata(&mut entry);
         let mut output = Vec::new();
         write_summary(&entry, &test_context(), &mut output).unwrap();
         let text = String::from_utf8(output).unwrap();
@@ -3209,7 +3234,14 @@ mod tests {
         assert!(!text.contains('\u{1b}'));
         assert!(!text.contains('\u{7}'));
         assert!(!text.contains("untrusted-payee"));
-        assert!(!text.contains("999"));
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.trim_start().starts_with("Amount:"))
+                .collect::<Vec<_>>(),
+            ["  Amount: 123"],
+            "{text}"
+        );
+        assert!(!text.contains("999"), "{text}");
         assert!(text.contains(&stellar_strkey::Contract([3; 32]).to_string().to_string()));
         assert!(!text.contains("untrusted-asset"));
     }

@@ -78,6 +78,8 @@ pub mod source_order;
 #[cfg(feature = "testnet-helpers")]
 pub mod testnet_helpers;
 pub mod testnet_strkeys;
+#[cfg(any(feature = "test-helpers", feature = "testnet-helpers"))]
+pub mod timing;
 #[cfg(feature = "verifier-registry")]
 pub mod verifier_registry;
 #[cfg(feature = "test-helpers")]

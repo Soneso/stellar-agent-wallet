@@ -684,20 +684,17 @@ mod tests {
         }
     }
 
-    /// Another socket on `[::1]` at the requested port makes the bridge
-    /// refuse with the IPv6 family named, and the refusal leaves nothing
-    /// bound on `127.0.0.1`.
+    /// A held port makes the bridge refuse with the pair's refusal as
+    /// `BridgeStartError::LoopbackPair`, unchanged.
+    ///
+    /// The test holds `127.0.0.1:<port>` for the whole call, and the pair
+    /// binds IPv4 first, so the refusal names IPv4 whatever other sockets
+    /// hold. The tests of `stellar_agent_loopback_http::loopback_pair` prove
+    /// the pair's IPv6 refusal and its release of the IPv4 listener.
     #[tokio::test]
-    async fn the_bridge_refuses_when_ipv6_is_held() {
-        let (competitor, port) = (0..64)
-            .find_map(|_| {
-                let held = std::net::TcpListener::bind("[::1]:0").unwrap();
-                let port = held.local_addr().unwrap().port();
-                std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port))
-                    .is_ok()
-                    .then_some((held, port))
-            })
-            .expect("a port free on 127.0.0.1 among 64 held on ::1");
+    async fn the_bridge_refuses_when_its_port_is_held() {
+        let competitor = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = competitor.local_addr().unwrap().port();
         let (store, _dir) = test_store();
         let err = start_bridge_register_only(
             store,
@@ -705,19 +702,18 @@ mod tests {
             PageIdentity::neutral(),
         )
         .await
-        .expect_err("the bridge must refuse while [::1] is held");
+        .expect_err("the bridge must refuse while 127.0.0.1 is held");
         match err {
             BridgeStartError::LoopbackPair(pair) => assert_eq!(
                 pair,
                 PairBindError::PortUnavailable {
                     port,
-                    family: LoopbackFamily::V6,
+                    family: LoopbackFamily::V4,
                     kind: std::io::ErrorKind::AddrInUse,
                 }
             ),
             other => panic!("expected a loopback pair refusal, got: {other}"),
         }
-        assert!(std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok());
         drop(competitor);
     }
 

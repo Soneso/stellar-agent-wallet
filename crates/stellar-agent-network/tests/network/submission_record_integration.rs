@@ -40,6 +40,7 @@ use stellar_agent_test_support::keyring_mock;
 use stellar_agent_test_support::signed_envelope::{
     SignedTestEnvelope, TESTNET_PASSPHRASE, get_network_result,
 };
+use stellar_agent_test_support::timing::Stamp;
 use stellar_agent_test_support::{EchoIdResponder, rpc_request_count};
 use tempfile::TempDir;
 use wiremock::matchers::{body_partial_json, method, path};
@@ -66,16 +67,24 @@ enum Call {
 struct RecordingRecorder<'a> {
     inner: WalletSubmissionRecorder<'a>,
     calls: Arc<Mutex<Vec<Call>>>,
+    /// When the first pre-send call returned; the send deadline is armed
+    /// after it with no await between.
+    pre_send_returned: Stamp,
+    /// When the first outcome call started.
+    outcome_started: Stamp,
 }
 
 #[async_trait]
 impl SubmissionRecorder for RecordingRecorder<'_> {
     async fn pre_send(&self, intent: &SubmissionIntent) -> Result<(), WalletError> {
         self.calls.lock().unwrap().push(Call::PreSend);
-        self.inner.pre_send(intent).await
+        let recorded = self.inner.pre_send(intent).await;
+        self.pre_send_returned.mark();
+        recorded
     }
 
     async fn outcome(&self, intent: &SubmissionIntent, outcome: &SubmissionOutcome) {
+        self.outcome_started.mark();
         self.calls
             .lock()
             .unwrap()
@@ -188,6 +197,8 @@ impl Fixture {
                 now_ms(),
             ),
             calls: Arc::clone(calls),
+            pre_send_returned: Stamp::default(),
+            outcome_started: Stamp::default(),
         }
     }
 
@@ -226,6 +237,8 @@ impl Fixture {
                 now_ms(),
             ),
             calls: Arc::clone(calls),
+            pre_send_returned: Stamp::default(),
+            outcome_started: Stamp::default(),
         }
     }
 
@@ -1386,6 +1399,8 @@ impl Fixture {
                 now_ms(),
             ),
             calls: Arc::clone(calls),
+            pre_send_returned: Stamp::default(),
+            outcome_started: Stamp::default(),
         }
     }
 }
@@ -2230,9 +2245,9 @@ async fn a_resend_after_a_lost_receipt_is_refused_before_the_send() {
 /// request left to run would overrun it by seconds.
 const HANG: Duration = Duration::from_secs(10);
 
-/// What a deadline exit may add to the deadline: the timeout record and
-/// scheduling. Smaller than the one-second overrun of an unclamped
-/// two-second poll sleep.
+/// What the wake-up at the deadline may add before the exit reports the
+/// timeout: scheduling alone. Smaller than the one-second overrun of an
+/// unclamped two-second poll sleep.
 const DEADLINE_MARGIN: Duration = Duration::from_millis(500);
 
 /// Answers like `inner`, after `delay`.
@@ -2249,8 +2264,13 @@ impl<R: wiremock::Respond> wiremock::Respond for Delayed<R> {
 
 /// Submits `envelope` under [`TIMEOUT_DEADLINE`] against `server`, which must
 /// answer the reads before the send and the send itself, and checks that the
-/// submission ended at the deadline with the timeout outcome and its record
-/// standing.
+/// submission reported the timeout at the deadline, with the timeout outcome
+/// and its record standing.
+///
+/// The deadline is armed when the pre-send record returns, so the span from
+/// that return to the start of the timeout report holds the send, the poll,
+/// and the wake-up at the deadline. The reads and the record writes before
+/// and after it spend no part of the timeout.
 async fn assert_timeout_at_the_deadline(
     fx: &Fixture,
     envelope: &SignedTestEnvelope,
@@ -2260,7 +2280,6 @@ async fn assert_timeout_at_the_deadline(
     let recorder = fx.recorder(&calls);
     let client = StellarRpcClient::new(&server.uri()).unwrap();
 
-    let started = std::time::Instant::now();
     let err = tokio::time::timeout(
         HANG,
         submit_transaction_and_wait(
@@ -2275,11 +2294,16 @@ async fn assert_timeout_at_the_deadline(
     .await
     .expect("the submission must end before the held-open request would")
     .expect_err("a submission that never confirms must report a timeout");
-    let elapsed = started.elapsed();
 
+    let elapsed = recorder.outcome_started.get("the timeout report")
+        - recorder.pre_send_returned.get("the pre-send record");
+    assert!(
+        elapsed >= TIMEOUT_DEADLINE,
+        "no timeout is reported before the {TIMEOUT_DEADLINE:?} deadline; elapsed {elapsed:?}"
+    );
     assert!(
         elapsed < TIMEOUT_DEADLINE + DEADLINE_MARGIN,
-        "the submission must end at its {TIMEOUT_DEADLINE:?} deadline; elapsed {elapsed:?}"
+        "the timeout is reported at its {TIMEOUT_DEADLINE:?} deadline; elapsed {elapsed:?}"
     );
     match &err {
         WalletError::Submission(SubmissionError::TxTimeout { tx_hash, .. }) => {
