@@ -432,6 +432,40 @@ enum EnrollmentEnd {
     Unavailable,
 }
 
+#[cfg(test)]
+mod enroll_trace {
+    use std::{cell::Cell, time::Instant};
+
+    thread_local! {
+        static ARMED: Cell<Option<Instant>> = const { Cell::new(None) };
+        static PROMPTED: Cell<bool> = const { Cell::new(false) };
+        static DECIDED: Cell<Option<(tokio::time::Instant, &'static str)>> = const { Cell::new(None) };
+    }
+    pub(super) fn reset() {
+        ARMED.set(None);
+        PROMPTED.set(false);
+        DECIDED.set(None);
+    }
+    pub(super) fn arm(deadline: Instant) {
+        ARMED.set(Some(deadline));
+    }
+    pub(super) fn armed() -> Option<Instant> {
+        ARMED.get()
+    }
+    pub(super) fn prompt() {
+        PROMPTED.set(true);
+    }
+    pub(super) fn prompted() -> bool {
+        PROMPTED.get()
+    }
+    pub(super) fn decide(branch: &'static str) {
+        DECIDED.set(Some((tokio::time::Instant::now(), branch)));
+    }
+    pub(super) fn decided() -> Option<(tokio::time::Instant, &'static str)> {
+        DECIDED.get()
+    }
+}
+
 /// Delivers the ceremony URL, waits for registration, then asks for the page's code.
 ///
 /// Private mode gives `opener` a redirect file's URL; operator mode prints the
@@ -463,12 +497,18 @@ where
         }
     };
     let deadline = Instant::now() + timeout;
+    #[cfg(test)]
+    enroll_trace::arm(deadline);
     let interrupt = interrupted(interrupt);
     tokio::pin!(interrupt);
     let staged = tokio::select! {
         result = handle.await_completion_until(deadline) => Some(result),
         () = &mut interrupt => None,
     };
+    #[cfg(test)]
+    if matches!(staged, Some(Err(OperatorEnrollAwaitError::Timeout))) {
+        enroll_trace::decide("registration");
+    }
     stop(handle).await;
     if let Err(error) = handoff.map(private_open::PrivateOpen::close).transpose() {
         tracing::debug!(
@@ -487,6 +527,8 @@ where
         None => return EnrollmentEnd::Canceled,
     };
     print_confirmation_prompt(pending.label());
+    #[cfg(test)]
+    enroll_trace::prompt();
     let typed = tokio::select! {
         typed = tokio::time::timeout_at(tokio::time::Instant::from_std(pending.deadline()), read_code()) => typed,
         () = &mut interrupt => return EnrollmentEnd::Canceled,
@@ -494,7 +536,11 @@ where
     let line = match typed {
         Ok(Ok(Some(line))) => line,
         Ok(Ok(None) | Err(_)) => return EnrollmentEnd::Canceled,
-        Err(_elapsed) => return EnrollmentEnd::Expired,
+        Err(_elapsed) => {
+            #[cfg(test)]
+            enroll_trace::decide("prompt");
+            return EnrollmentEnd::Expired;
+        }
     };
     match pending
         .confirm(&line, Instant::now())
@@ -747,11 +793,18 @@ pub(crate) mod tests {
             std::future::pending(),
             read_code,
         );
-        let (end, ()) = tokio::time::timeout(Duration::from_secs(60), async {
-            tokio::join!(ceremony, driver)
-        })
-        .await
-        .expect("the enrollment ends");
+        let end = if matches!(typing, Typing::Nothing)
+            && mode == crate::common::mainnet_presence::OpenMode::Operator
+        {
+            expire_enrollment(ceremony, driver, "prompt").await
+        } else {
+            let (end, ()) = tokio::time::timeout(Duration::from_secs(60), async {
+                tokio::join!(ceremony, driver)
+            })
+            .await
+            .expect("the enrollment ends");
+            end
+        };
         assert!(
             std::net::TcpStream::connect(addr).is_err(),
             "the server stopped"
@@ -879,50 +932,166 @@ pub(crate) mod tests {
         operator_enrollment().await;
     }
 
-    pub(crate) async fn operator_expiry_and_cancellation() {
-        use crate::common::mainnet_presence::OpenMode;
-        let (end, _, _) = case_with_mode(
-            Typing::Nothing,
-            Duration::from_millis(200),
-            OpenMode::Operator,
+    async fn expire_enrollment(
+        ceremony: impl Future<Output = EnrollmentEnd>,
+        driver: impl Future<Output = ()>,
+        branch: &'static str,
+    ) -> EnrollmentEnd {
+        use std::{future::poll_fn, task::Poll};
+        use stellar_agent_test_support::timing::{ClockHold, drive_call, let_io_run, wait_until};
+        use tokio::time::Instant as RuntimeInstant;
+
+        enroll_trace::reset();
+        tokio::time::pause();
+        let _clock = ClockHold::new();
+        let mut ceremony = std::pin::pin!(ceremony);
+        let i0 = Instant::now();
+        assert!(
+            poll_fn(|cx| Poll::Ready(ceremony.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        let i1 = Instant::now();
+        let armed = enroll_trace::armed().expect("the enrollment deadline is armed");
+        assert!(
+            armed >= i0 + Duration::from_millis(200),
+            "the enrollment deadline is not shortened"
+        );
+        assert!(
+            armed <= i1 + Duration::from_millis(200),
+            "the enrollment deadline is not extended"
+        );
+        if branch == "prompt" {
+            drive_call(
+                poll_fn(|cx| {
+                    assert!(ceremony.as_mut().poll(cx).is_pending());
+                    if enroll_trace::prompted() {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                }),
+                |_| async {
+                    driver.await;
+                    wait_until("the code prompt", enroll_trace::prompted).await;
+                },
+            )
+            .await;
+        } else {
+            driver.await;
+            assert!(!enroll_trace::prompted());
+        }
+        let before = RuntimeInstant::from_std(armed) - Duration::from_millis(1);
+        tokio::time::advance(before.duration_since(RuntimeInstant::now())).await;
+        let_io_run(Duration::from_millis(20)).await;
+        assert!(
+            poll_fn(|cx| Poll::Ready(ceremony.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        assert_eq!(
+            enroll_trace::decided(),
+            None,
+            "enrollment is pending before the armed tick"
+        );
+        let at = RuntimeInstant::from_std(armed) + Duration::from_nanos(999_999);
+        tokio::time::advance(at.duration_since(RuntimeInstant::now())).await;
+        let polled = poll_fn(|cx| Poll::Ready(ceremony.as_mut().poll(cx))).await;
+        wait_until("enrollment is decided at the armed tick", || {
+            enroll_trace::decided().is_some()
+        })
+        .await;
+        assert_eq!(enroll_trace::decided(), Some((at, branch)));
+        let end = drive_call(
+            async {
+                match polled {
+                    Poll::Ready(end) => end,
+                    Poll::Pending => ceremony.await,
+                }
+            },
+            |_| async {},
         )
         .await;
+        tokio::time::resume();
         assert!(matches!(end, EnrollmentEnd::Expired));
+        end
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn operator_enrollment_expires_at_its_deadline() {
+        for registration in [false, true] {
+            // Each std deadline starts on an unadvanced runtime.
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        use crate::common::mainnet_presence::OpenMode;
+                        if registration {
+                            let (end, _, _) = case_with_mode(
+                                Typing::Nothing,
+                                Duration::from_millis(200),
+                                OpenMode::Operator,
+                            )
+                            .await;
+                            assert!(matches!(end, EnrollmentEnd::Expired));
+                        } else {
+                            let (handle, _, _) = start().await;
+                            let addr = handle.local_addr();
+                            let end = expire_enrollment(
+                                enroll_until_done(
+                                    handle,
+                                    OpenMode::Operator,
+                                    |_| panic!("no opener"),
+                                    Duration::from_millis(200),
+                                    std::future::pending(),
+                                    || async { panic!("no terminal prompt before registration") },
+                                ),
+                                async {},
+                                "registration",
+                            )
+                            .await;
+                            assert!(matches!(end, EnrollmentEnd::Expired));
+                            assert!(
+                                std::net::TcpStream::connect(addr).is_err(),
+                                "the server stopped"
+                            );
+                            assert!(!enroll_trace::prompted());
+                        }
+                    });
+            })
+            .join()
+            .unwrap();
+        }
+    }
+
+    pub(crate) async fn operator_mismatch_and_cancellation() {
+        use crate::common::mainnet_presence::OpenMode;
         let (end, _, _) = case_with_mode(
             Typing::OtherCode,
-            Duration::from_secs(5),
+            Duration::from_secs(600),
             OpenMode::Operator,
         )
         .await;
         assert!(matches!(end, EnrollmentEnd::Mismatch));
-        for cancel in [false, true] {
-            let (handle, _, _) = start().await;
-            let addr = handle.local_addr();
-            let result = tokio::time::timeout(
-                Duration::from_secs(2),
-                enroll_until_done(
-                    handle,
-                    OpenMode::Operator,
-                    |_| panic!("no opener"),
-                    Duration::from_millis(200),
-                    async {
-                        if cancel {
-                            Ok(())
-                        } else {
-                            std::future::pending().await
-                        }
-                    },
-                    || async { panic!("no terminal prompt before registration") },
-                ),
-            )
-            .await
-            .expect("enrollment deadline and interruption remain bounded");
-            assert!(matches!(
-                (cancel, result),
-                (true, EnrollmentEnd::Canceled) | (false, EnrollmentEnd::Expired)
-            ));
-            assert!(std::net::TcpStream::connect(addr).is_err());
-        }
+        let (handle, _, _) = start().await;
+        let addr = handle.local_addr();
+        let result = stellar_agent_test_support::timing::drive_call(
+            enroll_until_done(
+                handle,
+                OpenMode::Operator,
+                |_| panic!("no opener"),
+                Duration::from_secs(600),
+                async { Ok(()) },
+                || async { panic!("no terminal prompt before registration") },
+            ),
+            |_| async {},
+        )
+        .await;
+        assert!(matches!(result, EnrollmentEnd::Canceled));
+        assert!(std::net::TcpStream::connect(addr).is_err());
     }
 
     /// The rendered envelope of `end`, with the exit code.

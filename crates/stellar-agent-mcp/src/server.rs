@@ -1269,6 +1269,12 @@ impl WalletServer {
 
 #[cfg(any(test, feature = "test-helpers"))]
 impl WalletServer {
+    /// Sets the clock used by the attestation lifetime gate.
+    #[doc(hidden)]
+    pub fn set_clock_for_test(&mut self, clock: Arc<dyn Clock>) {
+        self.clock = clock;
+    }
+
     /// Constructs a selected server with host-bound test transports.
     ///
     /// Routes preserve the stored HTTPS endpoint identities and every proof check.
