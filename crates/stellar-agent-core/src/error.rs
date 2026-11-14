@@ -1630,6 +1630,13 @@ pub enum ValidationError {
         detail: String,
     },
 
+    /// The consent evidence files do not match the trusted owner state.
+    #[error("{detail}")]
+    AuditOutboxEvidenceUnusable {
+        /// Diagnostic led by the evidence code; it names only a static reason.
+        detail: String,
+    },
+
     /// An outbox-loss acknowledgement finds no committed loss.
     #[error("{detail}")]
     AuditOutboxLossNotFound {
@@ -2469,6 +2476,7 @@ impl ValidationError {
             Self::AuditOutboxRowsMissing { .. } => "audit.outbox_rows_missing",
             Self::AuditOutboxFull { .. } => "audit.outbox_full",
             Self::AuditOutboxRowTooLarge { .. } => "audit.outbox_row_too_large",
+            Self::AuditOutboxEvidenceUnusable { .. } => "audit.outbox_evidence_unusable",
             Self::AuditOutboxLossNotFound { .. } => "audit.outbox_loss_not_found",
             // Same wire code as the two variants above by design — see this
             // variant's doc comment for why the code stays unified while the
@@ -4570,6 +4578,12 @@ mod tests {
                 "audit.outbox_row_too_large",
             ),
             (
+                ValidationError::AuditOutboxEvidenceUnusable {
+                    detail: "owner rollback".to_owned(),
+                },
+                "audit.outbox_evidence_unusable",
+            ),
+            (
                 ValidationError::AuditOutboxLossNotFound {
                     detail: "no queued-row loss".to_owned(),
                 },
@@ -4943,6 +4957,11 @@ mod tests {
                 },
                 ValidationError::AuditOutboxRowTooLarge { detail } => {
                     ValidationError::AuditOutboxRowTooLarge {
+                        detail: detail.clone(),
+                    }
+                }
+                ValidationError::AuditOutboxEvidenceUnusable { detail } => {
+                    ValidationError::AuditOutboxEvidenceUnusable {
                         detail: detail.clone(),
                     }
                 }

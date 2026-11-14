@@ -476,6 +476,15 @@ pub trait TipAnchorStore: std::any::Any + std::fmt::Debug + Send + Sync {
         ))
     }
 
+    /// The scope that binds consent evidence images to this store's owner
+    /// coordinate. It never depends on the audit key or a carrier generation.
+    ///
+    /// # Errors
+    /// The default refuses: such a store never commits evidence.
+    fn outbox_evidence_scope(&self) -> Result<[u8; 32], TipAnchorStoreError> {
+        Err(TipAnchorStoreError::new("outbox evidence is unsupported"))
+    }
+
     /// Reads the audit MAC key again from the coordinate the store was built
     /// for, without writing anything.
     ///
@@ -935,6 +944,8 @@ struct InMemoryAnchorState {
     item_accesses: usize,
     /// Successful commitment and owner-state writes, in order.
     item_writes: Vec<(&'static str, u64)>,
+    /// The evidence scope a test sets; `None` is the fixture scope.
+    evidence_scope: Option<[u8; 32]>,
     /// The scripted result of the next audit-key reloads.
     reload: Option<Result<Option<[u8; 32]>, String>>,
     reloads: usize,
@@ -989,6 +1000,16 @@ impl InMemoryTipAnchorStore {
         let mut state = self.state.lock().expect("in-memory anchor store mutex");
         state.owner_fail_reads = reads;
         state.owner_fail_writes = writes;
+    }
+
+    /// Sets the evidence scope this store reports.
+    ///
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_evidence_scope(&self, scope: [u8; 32]) {
+        #[allow(clippy::expect_used, reason = "test seam; poison means a failed test")]
+        let mut state = self.state.lock().expect("in-memory anchor store mutex");
+        state.evidence_scope = Some(scope);
     }
 
     /// Refuses every commitment and owner-state read and write while
@@ -1187,6 +1208,16 @@ impl TipAnchorStore for InMemoryTipAnchorStore {
             .insert(carrier_generation, value.to_owned());
         state.item_writes.push(("owner", carrier_generation));
         Ok(())
+    }
+
+    fn outbox_evidence_scope(&self) -> Result<[u8; 32], TipAnchorStoreError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| TipAnchorStoreError::new("store mutex"))?;
+        Ok(state
+            .evidence_scope
+            .unwrap_or_else(|| super::consent_evidence::evidence_scope("in-memory", "fixture")))
     }
 
     fn reload_audit_key(&self) -> Result<Option<Zeroizing<[u8; 32]>>, TipAnchorStoreError> {

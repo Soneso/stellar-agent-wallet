@@ -137,6 +137,7 @@
 pub mod binding;
 mod carriers;
 pub mod chain;
+mod consent_evidence;
 pub mod entry;
 pub mod health;
 mod lock;
@@ -161,6 +162,7 @@ pub use carriers::CarrierBindingReport;
 pub use chain::{
     EntryTagCheck, EntryTagKey, check_entry_tag, compute_entry_tag, derive_entry_tag_key,
 };
+pub use consent_evidence::{MAX_EVIDENCE_ENTRIES, OutboxEvidence, evidence_scope};
 pub use entry::{AuditEntry, NewToolInvocation};
 pub use health::{AuditWriterHealth, AuditWriterHealthHandle};
 pub use lock::Carrier;

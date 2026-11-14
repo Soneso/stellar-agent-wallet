@@ -1735,6 +1735,54 @@ mod tests {
         profile
     }
 
+    /// A profile with initialized consent evidence refuses the rotation with
+    /// the evidence code before the key write; the key and both evidence
+    /// files stay as they are.
+    #[tokio::test]
+    #[serial]
+    async fn rotate_audit_key_refuses_initialized_evidence_with_its_code() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let name = "rotate-evidence";
+        let profile = tagged_profile(name, dir.path());
+        open_locked_audit_writer(&profile, name, BindingHistory::NotRecorded)
+            .expect("open the writer")
+            .initialize_consent_evidence()
+            .expect("initialize consent evidence");
+        let key_before = load_audit_hmac_key(&profile, name).expect("load the key");
+        let outbox = stellar_agent_core::audit_log::outbox_path(&profile.audit_log_path);
+        let slots = || {
+            [".evidence.0", ".evidence.1"].map(|suffix| {
+                let mut slot = outbox.clone().into_os_string();
+                slot.push(suffix);
+                std::fs::read(slot).expect("read an evidence file")
+            })
+        };
+        let images = slots();
+        let args = RotateAuditKeyArgs {
+            name: Some(name.to_owned()),
+            profile: None,
+        };
+        let cloned_profile = profile.clone();
+        let error = match rotate(&args, move |_name| Ok(cloned_profile.clone()), || Ok(())).await {
+            Err(RotateRefusal::Wallet(error)) => error,
+            Err(RotateRefusal::Integrity(e)) => panic!("unexpected integrity refusal: {e}"),
+            Err(RotateRefusal::ProfileAccess(e)) => panic!("unexpected profile refusal: {e}"),
+            Ok(_) => panic!("initialized evidence must refuse the rotation"),
+        };
+        assert_eq!(error.code(), "audit.outbox_evidence_unusable", "{error}");
+        assert!(
+            error.message().contains("evidence re-tag unavailable"),
+            "{error}"
+        );
+        let key_after = load_audit_hmac_key(&profile, name).expect("load the key again");
+        assert_eq!(*key_before, *key_after, "the key stays");
+        assert_eq!(slots(), images, "both evidence files stay");
+    }
+
     /// The rotation appends `audit_entry_tags_rekeyed { cause: rotation }`
     /// and then its `keyring_key_written` row, both tagged under the new key:
     /// keyed verify under the new key checks every tag and reports the rekey

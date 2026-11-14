@@ -267,6 +267,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
+use super::consent_evidence::{self, EvidenceImage, EvidenceRecord, OutboxEvidence, Selected};
 use super::entry::AuditEntry;
 use super::lock::{AuditWriterLock, BoundCarrierLock, Carrier};
 use super::schema::EventKind;
@@ -344,6 +345,14 @@ pub struct OutboxOwnerState {
     closed: Option<ClosedBatch>,
     legacy: Option<[u8; 32]>,
     recent: Vec<[u8; 32]>,
+    e: Option<EvidenceCommitment>,
+}
+
+/// The evidence generation and head a v2 owner value commits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EvidenceCommitment {
+    g: u64,
+    head: [u8; 32],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -355,6 +364,9 @@ struct ClosedBatch {
 
 impl OutboxOwnerState {
     /// Parses the owner value with bounded evidence and required fields.
+    ///
+    /// Version 1 carries at most 15 recent digests. Version 2 carries the
+    /// evidence commitment `e` instead. Both admit only their canonical bytes.
     ///
     /// # Errors
     /// Returns a store error when the owner value is unusable.
@@ -368,6 +380,12 @@ impl OutboxOwnerState {
         }
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
+        struct StoredEvidence {
+            g: u64,
+            head: String,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct Stored {
             v: u64,
             g: u64,
@@ -375,14 +393,19 @@ impl OutboxOwnerState {
             closed: Option<StoredClosed>,
             #[serde(deserialize_with = "serde::Deserialize::deserialize")]
             legacy: Option<String>,
-            recent: Vec<String>,
+            #[serde(default)]
+            recent: Option<Vec<String>>,
+            #[serde(default)]
+            e: Option<StoredEvidence>,
         }
         let invalid = || TipAnchorStoreError::new("outbox owner state is unusable");
         let hash = |text: &str| bare_hash(text.as_bytes()).ok_or_else(invalid);
         let stored: Stored = serde_json::from_str(raw).map_err(|_| invalid())?;
-        if stored.v != 1 || stored.recent.len() > 15 {
-            return Err(invalid());
-        }
+        let recent = match (stored.v, stored.recent, &stored.e) {
+            (1, Some(recent), None) if recent.len() <= 15 => recent,
+            (2, None, Some(_)) => Vec::new(),
+            _ => return Err(invalid()),
+        };
         let owner = Self {
             g: stored.g,
             closed: stored
@@ -396,11 +419,19 @@ impl OutboxOwnerState {
                 })
                 .transpose()?,
             legacy: stored.legacy.as_deref().map(hash).transpose()?,
-            recent: stored
-                .recent
+            recent: recent
                 .iter()
                 .map(|text| hash(text))
                 .collect::<Result<_, _>>()?,
+            e: stored
+                .e
+                .map(|e| {
+                    Ok::<_, TipAnchorStoreError>(EvidenceCommitment {
+                        g: e.g,
+                        head: hash(&e.head)?,
+                    })
+                })
+                .transpose()?,
         };
         if owner.to_keyring_value() != raw {
             return Err(invalid());
@@ -426,6 +457,14 @@ impl OutboxOwnerState {
             || "null".to_owned(),
             |hash| format!(r#""{}""#, crate::hex::encode(hash)),
         );
+        if let Some(e) = &self.e {
+            return format!(
+                r#"{{"v":2,"g":{},"closed":{closed},"legacy":{legacy},"e":{{"g":{},"head":"{}"}}}}"#,
+                self.g,
+                e.g,
+                crate::hex::encode(&e.head)
+            );
+        }
         let recent = self
             .recent
             .iter()
@@ -444,6 +483,27 @@ impl OutboxOwnerState {
             closed: None,
             legacy: legacy.map(|state| Sha256::digest(state.to_keyring_value()).into()),
             recent: Vec::new(),
+            e: None,
+        }
+    }
+
+    /// One migration pin for each recent digest of a v1 owner.
+    fn migration_pins(&self) -> Vec<EvidenceRecord> {
+        self.recent
+            .iter()
+            .map(|digest| EvidenceRecord::legacy_pin(*digest))
+            .collect()
+    }
+
+    /// The v2 owner that commits evidence generation `g` and `head`, keeping
+    /// the queue generation, the closed batch, and the legacy digest.
+    fn with_evidence(&self, g: u64, head: [u8; 32]) -> Self {
+        Self {
+            g: self.g,
+            closed: self.closed.clone(),
+            legacy: self.legacy,
+            recent: Vec::new(),
+            e: Some(EvidenceCommitment { g, head }),
         }
     }
 
@@ -452,10 +512,11 @@ impl OutboxOwnerState {
     }
 
     /// Closes generation `g` over `rows`, of which the first `delivered`
-    /// already count in the recent evidence.
+    /// already count in the recent evidence. A v2 owner keeps its evidence
+    /// commitment unchanged and records no recent digest.
     fn close(&mut self, g: u64, rows: &[(u8, [u8; 32])], delivered: usize) {
         for (r, digest) in rows.get(delivered..).unwrap_or_default() {
-            if *r == 1 {
+            if *r == 1 && self.e.is_none() {
                 self.recent.push(*digest);
             }
         }
@@ -2333,6 +2394,7 @@ impl OutboxBatch {
             entries,
             owner: Some(owner),
             zero_legacy: true,
+            consent: rows.iter().any(|(r, _)| *r == 1),
         })
     }
 
@@ -2450,6 +2512,11 @@ impl OutboxBatch {
             found_rows: digests.len() as u64,
         });
         let changes = !entries.is_empty() || loss.is_some();
+        let consent = digests
+            .get(delivered..)
+            .unwrap_or_default()
+            .iter()
+            .any(|(r, _)| *r == 1);
         if changes {
             if !recovery {
                 owner.g = advance_generation(owner.g)?;
@@ -2462,6 +2529,7 @@ impl OutboxBatch {
                 publish: (changes || recovery).then_some(owner.g),
                 owner: changes.then_some(owner),
                 zero_legacy: !clean,
+                consent,
             },
             loss,
             refusal,
@@ -2621,22 +2689,7 @@ impl OutboxBatch {
         test_seam::check_stop(&self.path, test_seam::Stop::ReplacementSynced)?;
         #[cfg(test)]
         test_seam::run_replacement_synced(&self.path);
-        match &self._guard {
-            BatchGuard::Bound(lock) => lock.check_generation(store)?,
-            BatchGuard::Retained(lock) => lock.check_generation(store)?,
-            BatchGuard::Recovery { .. } => {
-                let current = store
-                    .load_carrier_record()?
-                    .ok_or(WriterError::CarriersUnbound)?
-                    .generation;
-                if current != self.generation {
-                    return Err(WriterError::CarrierGenerationChanged {
-                        held: self.generation,
-                        current,
-                    });
-                }
-            }
-        }
+        self.check_generation(store)?;
         drop(self.file.take());
         rename_replacement(&replacement, &self.path)?;
         #[cfg(any(test, feature = "test-helpers"))]
@@ -2695,6 +2748,7 @@ impl OwnerSelection {
                 publish: Some(owner.g),
                 owner: Some(owner),
                 zero_legacy: legacy_present,
+                consent: false,
             },
             loss: Some(OutboxLoss {
                 expected_rows: expected as u64,
@@ -2796,6 +2850,8 @@ pub(crate) struct OwnerDelivery {
     pub(crate) zero_legacy: bool,
     /// The generation line to publish, or `None` when the queue stays.
     pub(crate) publish: Option<u64>,
+    /// Whether a newly selected row carries delivery evidence.
+    consent: bool,
 }
 
 impl OwnerDelivery {
@@ -2805,7 +2861,14 @@ impl OwnerDelivery {
             owner: None,
             zero_legacy: false,
             publish: Some(g),
+            consent: false,
         }
+    }
+
+    /// Whether newly selected consent rows would close under an owner that
+    /// commits no evidence.
+    pub(crate) fn consent_without_evidence_root(&self) -> bool {
+        self.consent && self.owner.as_ref().is_some_and(|owner| owner.e.is_none())
     }
 
     /// The owner value to store, in its keyring form.
@@ -2827,6 +2890,335 @@ impl KeyChangeTarget {
     pub(crate) fn owner_value(&self) -> Option<String> {
         self.owner.as_ref().map(OutboxOwnerState::to_keyring_value)
     }
+}
+
+/// What an evidence initialization of one batch did.
+pub(crate) enum EvidenceInit {
+    /// The owner commits evidence.
+    Done,
+    /// A v1 owner was migrated; its queue still drains.
+    Migrated,
+    /// The queue holds rows and has no owner state; a drain runs first.
+    NeedsDrain,
+    /// Both slots hold the initial image; the caller delivers the rows of
+    /// this batch, and the delivery stores the evidence owner.
+    Deliver(Box<(OutboxBatch, OwnerDelivery)>),
+}
+
+impl OutboxBatch {
+    /// Initializes consent evidence under this batch's carrier.
+    ///
+    /// A v2 owner runs the authenticated read. A v1 owner migrates its recent
+    /// digests into pins. An empty queue without owner state gets the owner
+    /// of generation one and its published generation line. Both slots hold
+    /// the initial image, written and synced, before the owner is stored.
+    ///
+    /// `retry` marks the attempt after a preliminary drain: a queue without
+    /// owner state then takes the validated cutover instead of another drain.
+    pub(crate) fn initialize_evidence(
+        self,
+        log_path: &Path,
+        store: &dyn TipAnchorStore,
+        key: &[u8; 32],
+        retry: bool,
+    ) -> Result<EvidenceInit, WriterError> {
+        check_no_successor_owner(store, self.generation)?;
+        let (owner, publish) = match self.owner(store)? {
+            Some(owner) if owner.e.is_some() => {
+                read_owner_evidence(log_path, store, self.generation, Some(key))?;
+                return Ok(EvidenceInit::Done);
+            }
+            Some(owner) => (owner, None),
+            None => {
+                // Slots beside no owner are either the initial image an
+                // interrupted initialization left, or a refusal before any
+                // drain can write.
+                let initial = EvidenceImage::initial(store.outbox_evidence_scope()?, Vec::new());
+                let slot = initial.seal(key);
+                let interrupted = consent_evidence::any_slot_exists(log_path)?;
+                if interrupted {
+                    initial_slots_pending(log_path, &slot)?;
+                }
+                match self.key_change_target(store)? {
+                    Some(KeyChangeTarget {
+                        owner: Some(owner),
+                        generation,
+                    }) => (owner, Some(generation)),
+                    // Rows queued after an interrupted initialization, or
+                    // after the preliminary drain of a retry, take the
+                    // cutover: it validates the committed legacy prefix and
+                    // every tagged row, and the delivery appends them in
+                    // file order before it stores the evidence owner.
+                    _ if interrupted || retry => {
+                        let mut plan = self
+                            .cutover(&parse_lines(&self.bytes).lines, Some(key))
+                            .map_err(|error| match error {
+                                WriterError::OutboxRowsMissing { .. }
+                                | WriterError::OutboxUnusable { .. }
+                                | WriterError::OutboxRowKindRefused { .. } => {
+                                    evidence_unusable("queue not drained")
+                                }
+                                other => other,
+                            })?;
+                        write_initial_slots(log_path, &slot)?;
+                        let head = consent_evidence::head(&slot);
+                        plan.owner = plan
+                            .owner
+                            .map(|owner| owner.with_evidence(initial.generation, head));
+                        return Ok(EvidenceInit::Deliver(Box::new((self, plan))));
+                    }
+                    _ => return Ok(EvidenceInit::NeedsDrain),
+                }
+            }
+        };
+        let image = EvidenceImage::initial(store.outbox_evidence_scope()?, owner.migration_pins());
+        let slot = image.seal(key);
+        write_initial_slots(log_path, &slot)?;
+        let next = owner.with_evidence(image.generation, consent_evidence::head(&slot));
+        store_owner_confirmed(store, self.generation, &next.to_keyring_value())?;
+        #[cfg(any(test, feature = "test-helpers"))]
+        test_seam::check_stop(&self.path, test_seam::Stop::OwnerStored)?;
+        match publish {
+            Some(generation) => {
+                self.publish(key, generation, store)?;
+                Ok(EvidenceInit::Done)
+            }
+            None => Ok(EvidenceInit::Migrated),
+        }
+    }
+
+    /// Whether this batch's owner state commits consent evidence.
+    pub(crate) fn owner_commits_evidence(
+        &self,
+        store: &dyn TipAnchorStore,
+    ) -> Result<bool, WriterError> {
+        Ok(self.owner(store)?.is_some_and(|owner| owner.e.is_some()))
+    }
+
+    /// Checks that the carrier record still names this batch's generation.
+    pub(crate) fn check_generation(&self, store: &dyn TipAnchorStore) -> Result<(), WriterError> {
+        match &self._guard {
+            BatchGuard::Bound(lock) => lock.check_generation(store),
+            BatchGuard::Retained(lock) => lock.check_generation(store),
+            BatchGuard::Recovery { .. } => {
+                let current = store
+                    .load_carrier_record()?
+                    .ok_or(WriterError::CarriersUnbound)?
+                    .generation;
+                if current != self.generation {
+                    return Err(WriterError::CarrierGenerationChanged {
+                        held: self.generation,
+                        current,
+                    });
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+fn evidence_unusable(reason: &'static str) -> WriterError {
+    WriterError::OutboxEvidenceUnusable { reason }
+}
+
+/// Refuses while a binding left owner state at the next carrier generation.
+fn check_no_successor_owner(
+    store: &dyn TipAnchorStore,
+    carrier_generation: u64,
+) -> Result<(), WriterError> {
+    if let Some(next) = carrier_generation.checked_add(1)
+        && store.load_outbox_owner_state(next)?.is_some()
+    {
+        return Err(WriterError::CarrierRecoveryRequired {
+            detail: WriterError::CarrierBindingIncomplete.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Stores `value` as the owner state of `carrier_generation`. A failed store
+/// is resolved by a reread: the value read back decides the outcome.
+fn store_owner_confirmed(
+    store: &dyn TipAnchorStore,
+    carrier_generation: u64,
+    value: &str,
+) -> Result<(), WriterError> {
+    match store.store_outbox_owner_state(carrier_generation, value) {
+        Ok(()) => Ok(()),
+        Err(error) => match store.load_outbox_owner_state(carrier_generation)? {
+            Some(actual) if actual == value => Ok(()),
+            _ => Err(error.into()),
+        },
+    }
+}
+
+/// Writes the initial image into each slot that lacks it.
+///
+/// Every slot is checked before any write. A missing slot is created new, and
+/// a prefix of the image, left by an interrupted write, is completed. Each is
+/// written in full, synced, and its directory synced. Any other content
+/// refuses with nothing written.
+fn write_initial_slots(log_path: &Path, slot: &[u8]) -> Result<(), WriterError> {
+    for (path, create) in initial_slots_pending(log_path, slot)? {
+        let mut options = OpenOptions::new();
+        options.write(true);
+        if create {
+            options.create_new(true);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path)?;
+        file.write_all(slot)?;
+        sync_outbox_file(&file, &path)?;
+        sync_parent_dir(&path)?;
+    }
+    Ok(())
+}
+
+/// Classifies both slots against the initial image without writing: each
+/// missing slot, with `true`, and each prefix of the image, with `false`.
+///
+/// # Errors
+///
+/// [`WriterError::OutboxEvidenceUnusable`] with `evidence image without
+/// owner` for any other content.
+fn initial_slots_pending(
+    log_path: &Path,
+    slot: &[u8],
+) -> Result<Vec<(PathBuf, bool)>, WriterError> {
+    let mut pending = Vec::with_capacity(2);
+    for path in consent_evidence::slot_paths(log_path) {
+        match consent_evidence::read_slot(&path)? {
+            None => pending.push((path, true)),
+            Some(existing) if slot.starts_with(&existing) => pending.push((path, false)),
+            Some(_) => return Err(evidence_unusable("evidence image without owner")),
+        }
+    }
+    Ok(pending)
+}
+
+/// Evidence loaded under the held carrier, before any write.
+enum LoadedEvidence {
+    /// No owner commits evidence and no slot exists.
+    Absent,
+    /// The committed image.
+    Current(EvidenceImage),
+    /// A newer authenticated image the owner must commit first.
+    Newer {
+        owner: Box<OutboxOwnerState>,
+        image: EvidenceImage,
+        head: [u8; 32],
+    },
+}
+
+/// Loads the owner of `carrier_generation` and both slots, and selects.
+fn load_owner_evidence(
+    log_path: &Path,
+    store: &dyn TipAnchorStore,
+    carrier_generation: u64,
+    key: Option<&[u8; 32]>,
+) -> Result<LoadedEvidence, WriterError> {
+    check_no_successor_owner(store, carrier_generation)?;
+    let owner = store
+        .load_outbox_owner_state(carrier_generation)?
+        .map(|raw| OutboxOwnerState::parse(&raw))
+        .transpose()?;
+    let Some((owner, committed)) = owner.and_then(|owner| owner.e.map(|e| (owner, e))) else {
+        if consent_evidence::any_slot_exists(log_path)? {
+            return Err(evidence_unusable("evidence image without owner"));
+        }
+        return Ok(LoadedEvidence::Absent);
+    };
+    let key = key.ok_or(WriterError::KeyedLogNeedsKey {
+        evidence: "the owner state commits consent evidence",
+    })?;
+    let scope = store.outbox_evidence_scope()?;
+    let paths = consent_evidence::slot_paths(log_path);
+    let slots = [
+        consent_evidence::read_slot(&paths[0])?,
+        consent_evidence::read_slot(&paths[1])?,
+    ];
+    #[cfg(test)]
+    test_seam::run_evidence_loaded(log_path);
+    Ok(
+        match consent_evidence::select(&slots, committed.g, &committed.head, &scope, key)
+            .map_err(evidence_unusable)?
+        {
+            Selected::Current(image) => LoadedEvidence::Current(image),
+            Selected::Newer { image, head } => LoadedEvidence::Newer {
+                owner: Box::new(owner),
+                image,
+                head,
+            },
+        },
+    )
+}
+
+/// Recommits a newer image before returning it.
+fn commit_owner_evidence(
+    loaded: LoadedEvidence,
+    log_path: &Path,
+    store: &dyn TipAnchorStore,
+    carrier_generation: u64,
+) -> Result<Option<OutboxEvidence>, WriterError> {
+    match loaded {
+        LoadedEvidence::Absent => Ok(None),
+        LoadedEvidence::Current(image) => Ok(Some(image.into())),
+        LoadedEvidence::Newer { owner, image, head } => {
+            let next = owner.with_evidence(image.generation, head);
+            store_owner_confirmed(store, carrier_generation, &next.to_keyring_value())?;
+            #[cfg(any(test, feature = "test-helpers"))]
+            test_seam::check_stop(&outbox_path(log_path), test_seam::Stop::EvidenceRecommitted)?;
+            #[cfg(not(any(test, feature = "test-helpers")))]
+            let _ = log_path;
+            Ok(Some(image.into()))
+        }
+    }
+}
+
+/// The consent evidence the owner of `carrier_generation` commits, read
+/// under the active outbox carrier the caller holds.
+///
+/// `Ok(None)` means no owner commits evidence and neither slot exists. A
+/// newer authenticated image is recommitted before it is returned.
+///
+/// # Errors
+///
+/// - [`WriterError::CarrierRecoveryRequired`] while a binding is incomplete.
+/// - [`WriterError::OutboxEvidenceUnusable`] with its static reason.
+/// - [`WriterError::KeyedLogNeedsKey`] for a v2 owner without the key.
+/// - [`WriterError::TipAnchorStore`] and [`WriterError::Io`] for the store
+///   and the files.
+pub(crate) fn read_owner_evidence(
+    log_path: &Path,
+    store: &dyn TipAnchorStore,
+    carrier_generation: u64,
+    key: Option<&[u8; 32]>,
+) -> Result<Option<OutboxEvidence>, WriterError> {
+    let loaded = load_owner_evidence(log_path, store, carrier_generation, key)?;
+    commit_owner_evidence(loaded, log_path, store, carrier_generation)
+}
+
+/// [`read_owner_evidence`] under the outbox carrier this call acquires.
+/// Every load follows the acquisition.
+///
+/// # Errors
+///
+/// The errors of [`lock_outbox`] and [`read_owner_evidence`].
+pub(crate) fn locked_owner_evidence(
+    log_path: &Path,
+    store: &dyn TipAnchorStore,
+    key: Option<&[u8; 32]>,
+) -> Result<Option<OutboxEvidence>, WriterError> {
+    let lock = lock_outbox(&outbox_lock_path(log_path), store)?;
+    let generation = lock.generation();
+    let loaded = load_owner_evidence(log_path, store, generation, key)?;
+    let evidence = commit_owner_evidence(loaded, log_path, store, generation)?;
+    lock.check_generation(store)?;
+    Ok(evidence)
 }
 
 /// Returns `<outbox>.next`, the replacement a publication writes.
@@ -3078,6 +3470,8 @@ pub mod test_seam {
         Renamed,
         /// After the directory sync that ends a publication.
         DirectorySynced,
+        /// After an evidence read stores the owner of a newer image.
+        EvidenceRecommitted,
     }
 
     static STOPS: Mutex<Vec<(PathBuf, Stop)>> = Mutex::new(Vec::new());
@@ -3319,6 +3713,43 @@ pub mod test_seam {
     #[cfg(test)]
     pub(super) fn run_contended(lock_path: &Path) {
         run(&CONTENDED, lock_path);
+    }
+
+    /// Hooks run by the next evidence read of a log after its loads.
+    #[cfg(test)]
+    static EVIDENCE_LOADED: Mutex<Vec<(PathBuf, Hook)>> = Mutex::new(Vec::new());
+
+    /// Runs `hook` once, under the outbox carrier, after the next evidence
+    /// read of the log at `log_path` loads the owner and both slots.
+    #[cfg(test)]
+    pub(crate) fn on_evidence_loaded(log_path: &Path, hook: impl FnOnce() + Send + 'static) {
+        if let Ok(mut armed) = EVIDENCE_LOADED.lock() {
+            armed.push((log_path.to_path_buf(), Box::new(hook)));
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn run_evidence_loaded(log_path: &Path) {
+        run(&EVIDENCE_LOADED, log_path);
+    }
+
+    /// Hooks run between the preliminary drain of an evidence initialization
+    /// and its retry, with no carrier held.
+    #[cfg(test)]
+    static INITIALIZATION_RETRY: Mutex<Vec<(PathBuf, Hook)>> = Mutex::new(Vec::new());
+
+    /// Runs `hook` once before the next initialization retry of the log at
+    /// `log_path`.
+    #[cfg(test)]
+    pub(crate) fn on_initialization_retry(log_path: &Path, hook: impl FnOnce() + Send + 'static) {
+        if let Ok(mut armed) = INITIALIZATION_RETRY.lock() {
+            armed.push((log_path.to_path_buf(), Box::new(hook)));
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_initialization_retry(log_path: &Path) {
+        run(&INITIALIZATION_RETRY, log_path);
     }
 }
 
@@ -8396,6 +8827,978 @@ mod tests {
             assert_eq!(format!("{error:?}"), format!("{unsupported:?}"));
             assert_eq!(delivered(&path, "default"), attempt);
             assert_eq!(outbox_bytes(&path), queued, "nothing is cleared");
+        }
+    }
+
+    // Consent evidence storage.
+
+    use crate::audit_log::consent_evidence::tests::delivered as evidence_record;
+
+    fn slots(path: &Path) -> [Option<Vec<u8>>; 2] {
+        consent_evidence::slot_paths(path).map(|slot| consent_evidence::read_slot(&slot).unwrap())
+    }
+
+    fn sealed(store: &InMemoryTipAnchorStore, generation: u64, records: &[u32]) -> Vec<u8> {
+        EvidenceImage {
+            scope: store.outbox_evidence_scope().unwrap(),
+            generation,
+            floor_ms: generation * 10,
+            predecessor: [0; 32],
+            records: records.iter().copied().map(evidence_record).collect(),
+        }
+        .seal(&ROW_KEY)
+    }
+
+    fn plant(path: &Path, index: usize, bytes: &[u8]) {
+        fs::write(&consent_evidence::slot_paths(path)[index], bytes).unwrap();
+    }
+
+    fn owner_writes(store: &InMemoryTipAnchorStore) -> usize {
+        store
+            .outbox_item_writes()
+            .iter()
+            .filter(|(kind, _)| *kind == "owner")
+            .count()
+    }
+
+    fn committed(store: &InMemoryTipAnchorStore) -> Option<EvidenceCommitment> {
+        owner_state(store).unwrap().e
+    }
+
+    fn initialized() -> (TempDir, PathBuf, Arc<InMemoryTipAnchorStore>, AuditWriter) {
+        let (dir, path, store, mut writer) = keyed_fixture();
+        writer.initialize_consent_evidence().unwrap();
+        (dir, path, store, writer)
+    }
+
+    fn evidence_refusal(result: Result<Option<OutboxEvidence>, WriterError>) -> &'static str {
+        match result {
+            Err(WriterError::OutboxEvidenceUnusable { reason }) => reason,
+            other => panic!("expected an evidence refusal, got {other:?}"),
+        }
+    }
+
+    fn rotation_writer(path: &Path, store: &Arc<InMemoryTipAnchorStore>) -> AuditWriter {
+        store.set_reload(Ok(Some(ROW_KEY)));
+        AuditWriter::open_for_key_rotation(
+            path.to_path_buf(),
+            Some(Zeroizing::new(ROW_KEY)),
+            store.clone(),
+            crate::audit_log::BindingHistory::NotRecorded,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn owner_v2_vector_and_budget() {
+        let owner = OutboxOwnerState {
+            g: 7,
+            closed: Some(ClosedBatch {
+                g: 6,
+                n: 2,
+                batch: [0xbb; 32],
+            }),
+            legacy: Some([0xcc; 32]),
+            recent: Vec::new(),
+            e: Some(EvidenceCommitment {
+                g: 3,
+                head: [0xdd; 32],
+            }),
+        };
+        let raw = owner.to_keyring_value();
+        assert_eq!(
+            raw,
+            format!(
+                r#"{{"v":2,"g":7,"closed":{{"g":6,"n":2,"batch":"{}"}},"legacy":"{}","e":{{"g":3,"head":"{}"}}}}"#,
+                "bb".repeat(32),
+                "cc".repeat(32),
+                "dd".repeat(32)
+            )
+        );
+        assert_eq!(OutboxOwnerState::parse(&raw).unwrap(), owner);
+        let largest = OutboxOwnerState {
+            g: u64::MAX,
+            closed: Some(ClosedBatch {
+                g: u64::MAX,
+                n: u64::MAX,
+                batch: [0xff; 32],
+            }),
+            legacy: Some([0xff; 32]),
+            recent: Vec::new(),
+            e: Some(EvidenceCommitment {
+                g: u64::MAX,
+                head: [0xff; 32],
+            }),
+        }
+        .to_keyring_value();
+        assert_eq!(largest.len(), 349);
+        assert_eq!(largest.encode_utf16().count() * 2, 698);
+        assert!(OutboxOwnerState::parse(&largest).is_ok());
+    }
+
+    #[test]
+    fn owner_v2_has_one_spelling() {
+        let head = "dd".repeat(32);
+        let raw =
+            format!(r#"{{"v":2,"g":1,"closed":null,"legacy":null,"e":{{"g":3,"head":"{head}"}}}}"#);
+        assert!(OutboxOwnerState::parse(&raw).is_ok());
+        for other in [
+            format!(r#"{{"v":2,"g":1,"closed":null,"e":{{"g":3,"head":"{head}"}},"legacy":null}}"#),
+            format!(
+                r#"{{"v":2, "g":1,"closed":null,"legacy":null,"e":{{"g":3,"head":"{head}"}}}}"#
+            ),
+            format!(r#"{{"v":2,"g":1,"closed":null,"legacy":null,"e":{{"head":"{head}","g":3}}}}"#),
+            raw.replace(&head, &"DD".repeat(32)),
+            raw.replace(r#""g":3"#, r#""g":3,"x":1"#),
+            raw.replace(r#","e":{"g":3,"#, r#","recent":[],"e":{"g":3,"#),
+            r#"{"v":2,"g":1,"closed":null,"legacy":null}"#.to_owned(),
+            raw.replace(r#""v":2"#, r#""v":1"#),
+            raw.replace(r#""v":2,"g":1"#, r#""v":2,"g":1,"g":1"#),
+        ] {
+            assert!(OutboxOwnerState::parse(&other).is_err(), "{other}");
+        }
+    }
+
+    #[test]
+    fn migration_preserves_unresolved_pins() {
+        let (_dir, path, store, mut writer) = keyed_fixture();
+        let outbox = keyed_outbox(&path, &store);
+        let first = outbox.append_queued(&row("first")).unwrap();
+        let second = outbox.append_queued(&row("second")).unwrap();
+        assert_eq!(writer.drain_outbox().unwrap(), 2);
+        let mut v1 = owner_state(&store).unwrap();
+        assert_eq!(v1.recent, vec![*first.digest(), *second.digest()]);
+        v1.recent.push(*first.digest());
+        store
+            .store_outbox_owner_state(1, &v1.to_keyring_value())
+            .unwrap();
+        writer.initialize_consent_evidence().unwrap();
+        let owner = owner_state(&store).unwrap();
+        assert_eq!((owner.g, owner.closed.clone()), (v1.g, v1.closed.clone()));
+        assert!(owner.recent.is_empty());
+        let evidence = writer.outbox_evidence().unwrap().unwrap();
+        let mut expected: Vec<EvidenceRecord> = [first.digest(), second.digest()]
+            .into_iter()
+            .map(|digest| EvidenceRecord::legacy_pin(*digest))
+            .collect();
+        expected.sort_by_key(|record| record.identity);
+        assert_eq!(evidence.records(), expected.as_slice());
+        for (record, reference) in expected.iter().zip([&first, &second]) {
+            assert!(!evidence.contains_delivered(&record.identity, reference));
+        }
+    }
+
+    #[test]
+    fn initialization_publishes_a_recoverable_generation() {
+        let (_dir, path, store, writer) = initialized();
+        assert_eq!(outbox_bytes(&path), header(1));
+        let owner = owner_state(&store).unwrap();
+        assert_eq!(
+            (owner.g, owner.closed.map(|c| (c.g, c.n))),
+            (1, Some((0, 0)))
+        );
+        let [first, second] = slots(&path);
+        assert_eq!(first, second);
+        assert_eq!(
+            committed(&store).unwrap(),
+            EvidenceCommitment {
+                g: 1,
+                head: consent_evidence::head(first.as_ref().unwrap()),
+            }
+        );
+        let evidence = writer.outbox_evidence().unwrap().unwrap();
+        assert!(evidence.records().is_empty());
+        assert_eq!(evidence.time_floor_ms(), 0);
+        drop(writer);
+
+        // A stop after the owner store leaves the generation line to the
+        // closed-prefix recovery of the next drain.
+        let (_dir, path, store, mut writer) = keyed_fixture();
+        test_seam::arm_stop(&outbox_path(&path), test_seam::Stop::OwnerStored);
+        assert!(writer.initialize_consent_evidence().is_err());
+        assert!(committed(&store).is_some());
+        assert_eq!(outbox_bytes(&path), b"");
+        drop(writer);
+        let mut writer = reopen(&path, &store);
+        assert_eq!(outbox_bytes(&path), header(1));
+        let writes = store.outbox_item_writes();
+        let images = slots(&path);
+        writer.initialize_consent_evidence().unwrap();
+        assert_eq!(
+            store.outbox_item_writes(),
+            writes,
+            "a repeat writes nothing"
+        );
+        assert_eq!(slots(&path), images);
+
+        // A file fault on the first slot is completed by the retry.
+        let (_dir, path, store, mut writer) = keyed_fixture();
+        test_seam::arm_sync_failure(
+            &consent_evidence::slot_paths(&path)[0],
+            test_seam::SyncStep::File,
+        );
+        assert!(matches!(
+            writer.initialize_consent_evidence(),
+            Err(WriterError::Io(_))
+        ));
+        assert!(owner_state(&store).is_none());
+        writer.initialize_consent_evidence().unwrap();
+        assert_eq!(outbox_bytes(&path), header(1));
+    }
+
+    #[test]
+    fn initialization_reserves_both_image_budgets() {
+        for step in [test_seam::SyncStep::File, test_seam::SyncStep::Directory] {
+            let (_dir, path, store, mut writer) = keyed_fixture();
+            let second = consent_evidence::slot_paths(&path)[1].clone();
+            test_seam::arm_sync_failure(&second, step);
+            let error = writer.initialize_consent_evidence().unwrap_err();
+            assert!(matches!(error, WriterError::Io(_)), "{step:?}: {error:?}");
+            assert!(owner_state(&store).is_none(), "{step:?}");
+            writer.initialize_consent_evidence().unwrap();
+            let [first, second] = slots(&path);
+            assert_eq!(
+                first.as_ref().map(Vec::len),
+                Some(consent_evidence::SLOT_BYTES)
+            );
+            assert_eq!(first, second, "{step:?}");
+        }
+    }
+
+    #[test]
+    fn initialization_refuses_an_image_without_owner() {
+        let (_dir, path, store, mut writer) = keyed_fixture();
+        let initial = sealed(&store, 1, &[]);
+        let mut initial_image = consent_evidence::decode(&initial, &ROW_KEY).unwrap();
+        initial_image.floor_ms = 0;
+        let initial = initial_image.seal(&ROW_KEY);
+        plant(&path, 0, b"other evidence");
+        assert_eq!(
+            evidence_refusal(writer.initialize_consent_evidence().map(|()| None)),
+            "evidence image without owner"
+        );
+        assert_eq!(slots(&path), [Some(b"other evidence".to_vec()), None]);
+        assert!(owner_state(&store).is_none());
+        assert_eq!(
+            evidence_refusal(writer.outbox_evidence()),
+            "evidence image without owner"
+        );
+        plant(&path, 0, &initial[..1000]);
+        plant(&path, 1, &initial);
+        writer.initialize_consent_evidence().unwrap();
+        assert_eq!(slots(&path), [Some(initial.clone()), Some(initial)]);
+    }
+
+    #[test]
+    fn a_v1_owner_beside_evidence_files_defers_consent() {
+        let (_dir, path, store, mut writer) = keyed_fixture();
+        let outbox = keyed_outbox(&path, &store);
+        outbox.append_queued(&row("first")).unwrap();
+        assert_eq!(writer.drain_outbox().unwrap(), 1, "no evidence file exists");
+        assert!(owner_state(&store).unwrap().e.is_none());
+        assert_eq!(writer.outbox_evidence().unwrap(), None);
+        plant(&path, 1, &sealed(&store, 3, &[1]));
+        outbox.append_queued(&row("second")).unwrap();
+        let queued = outbox_bytes(&path);
+        let owner = store.load_outbox_owner_state(1).unwrap();
+        assert_eq!(writer.drain_outbox().unwrap(), 0);
+        assert_eq!(outbox_bytes(&path), queued);
+        assert_eq!(store.load_outbox_owner_state(1).unwrap(), owner);
+        assert_eq!(delivered(&path, "second"), 0);
+        assert_eq!(
+            evidence_refusal(writer.outbox_evidence()),
+            "evidence image without owner"
+        );
+        drop(writer);
+        let (_dir, path, store, mut writer) = keyed_fixture();
+        plant(&path, 0, b"x");
+        keyed_outbox(&path, &store).append(&row("plain")).unwrap();
+        assert_eq!(
+            writer.drain_outbox().unwrap(),
+            1,
+            "rows without evidence deliver"
+        );
+    }
+
+    #[test]
+    fn evidence_refuses_an_incomplete_binding() {
+        let (_dir, path, store, writer) = initialized();
+        plant(&path, 1, &sealed(&store, 2, &[1]));
+        let raw = store.load_outbox_owner_state(1).unwrap().unwrap();
+        store.store_outbox_owner_state(2, &raw).unwrap();
+        let writes = owner_writes(&store);
+        let images = slots(&path);
+        assert!(matches!(
+            writer.outbox_evidence(),
+            Err(WriterError::CarrierRecoveryRequired { .. })
+        ));
+        assert_eq!(owner_writes(&store), writes);
+        assert_eq!(store.load_outbox_owner_state(1).unwrap().unwrap(), raw);
+        assert_eq!(slots(&path), images);
+    }
+
+    #[test]
+    fn a_keyless_v2_evidence_read_refuses() {
+        let (_dir, path, store, _writer) = initialized();
+        assert!(matches!(
+            locked_owner_evidence(&path, store.as_ref(), None),
+            Err(WriterError::KeyedLogNeedsKey { .. })
+        ));
+        assert!(
+            locked_owner_evidence(&path, store.as_ref(), Some(&ROW_KEY))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn an_owner_restored_many_generations_recommits_the_newest_image() {
+        let (_dir, path, store, writer) = initialized();
+        plant(&path, 0, &sealed(&store, 2, &[2]));
+        let newest = sealed(&store, 4, &[4]);
+        plant(&path, 1, &newest);
+        let writes = owner_writes(&store);
+        let evidence = writer.outbox_evidence().unwrap().unwrap();
+        assert_eq!(evidence.records(), &[evidence_record(4)]);
+        assert_eq!(evidence.time_floor_ms(), 40);
+        assert_eq!(owner_writes(&store), writes + 1);
+        assert_eq!(
+            committed(&store).unwrap(),
+            EvidenceCommitment {
+                g: 4,
+                head: consent_evidence::head(&newest),
+            }
+        );
+        assert_eq!(writer.outbox_evidence().unwrap().unwrap(), evidence);
+        assert_eq!(
+            owner_writes(&store),
+            writes + 1,
+            "the current root writes nothing"
+        );
+    }
+
+    #[test]
+    fn concurrent_owner_roll_forward_has_one_winner() {
+        use std::sync::mpsc;
+        let (_dir, path, store, writer) = initialized();
+        drop(writer);
+        plant(&path, 1, &sealed(&store, 2, &[2]));
+        let before = owner_writes(&store);
+        let (loaded_tx, loaded_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        test_seam::on_evidence_loaded(&path, move || {
+            loaded_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        let worker = |path: PathBuf, store: Arc<InMemoryTipAnchorStore>, done: mpsc::Sender<()>| {
+            std::thread::spawn(move || {
+                let evidence = locked_owner_evidence(&path, store.as_ref(), Some(&ROW_KEY));
+                let _ = done.send(());
+                evidence.unwrap().unwrap()
+            })
+        };
+        let a = worker(path.clone(), store.clone(), done_tx.clone());
+        loaded_rx.recv().unwrap();
+        let on_contention = release_tx.clone();
+        test_seam::on_contended(&outbox_lock_path(&path), move || {
+            let _ = on_contention.send(());
+        });
+        let watched = store.clone();
+        test_seam::on_evidence_loaded(&path, move || {
+            if owner_writes(&watched) == before {
+                let _ = release_tx.send(());
+                done_rx.recv().unwrap();
+            }
+        });
+        let b = worker(path.clone(), store.clone(), done_tx);
+        let (a, b) = (a.join().unwrap(), b.join().unwrap());
+        assert_eq!(a, b);
+        assert_eq!(a.records(), &[evidence_record(2)]);
+        assert_eq!(
+            owner_writes(&store),
+            before + 1,
+            "one holder stores the successor"
+        );
+    }
+
+    #[test]
+    fn roll_forward_before_recommit_exposes_nothing() {
+        let (_dir, path, store, writer) = initialized();
+        plant(&path, 1, &sealed(&store, 2, &[2]));
+        let raw = store.load_outbox_owner_state(1).unwrap();
+        store.set_owner_failing(false, true);
+        let error = writer.outbox_evidence().unwrap_err();
+        assert!(matches!(error, WriterError::TipAnchorStore(_)), "{error:?}");
+        assert_eq!(store.load_outbox_owner_state(1).unwrap(), raw);
+        store.set_owner_failing(false, false);
+        assert_eq!(
+            writer.outbox_evidence().unwrap().unwrap().records(),
+            &[evidence_record(2)]
+        );
+    }
+
+    /// A store whose owner stores persist and then report failure, and whose
+    /// reread after such a store can fail too.
+    #[derive(Debug)]
+    struct UncertainStore {
+        inner: Arc<InMemoryTipAnchorStore>,
+        reread_fails: bool,
+        stored: std::sync::atomic::AtomicBool,
+    }
+
+    impl TipAnchorStore for UncertainStore {
+        fn reads_audit_key(&self) -> bool {
+            false
+        }
+        fn load_carrier_record(
+            &self,
+        ) -> Result<Option<crate::audit_log::tip_anchor::CarrierRecord>, TipAnchorStoreError>
+        {
+            self.inner.load_carrier_record()
+        }
+        fn store_carrier_record(
+            &self,
+            record: &crate::audit_log::tip_anchor::CarrierRecord,
+        ) -> Result<(), TipAnchorStoreError> {
+            self.inner.store_carrier_record(record)
+        }
+        fn load_outbox_state(
+            &self,
+            generation: u64,
+        ) -> Result<Option<OutboxState>, TipAnchorStoreError> {
+            self.inner.load_outbox_state(generation)
+        }
+        fn store_outbox_state(
+            &self,
+            generation: u64,
+            value: &OutboxState,
+        ) -> Result<(), TipAnchorStoreError> {
+            self.inner.store_outbox_state(generation, value)
+        }
+        fn load_outbox_owner_state(
+            &self,
+            generation: u64,
+        ) -> Result<Option<String>, TipAnchorStoreError> {
+            if self.reread_fails && self.stored.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(TipAnchorStoreError::new("owner reread fault"));
+            }
+            self.inner.load_outbox_owner_state(generation)
+        }
+        fn store_outbox_owner_state(
+            &self,
+            generation: u64,
+            value: &str,
+        ) -> Result<(), TipAnchorStoreError> {
+            self.inner.store_outbox_owner_state(generation, value)?;
+            self.stored.store(true, std::sync::atomic::Ordering::SeqCst);
+            Err(TipAnchorStoreError::new("owner write uncertain"))
+        }
+        fn outbox_evidence_scope(&self) -> Result<[u8; 32], TipAnchorStoreError> {
+            self.inner.outbox_evidence_scope()
+        }
+        fn load_anchor(
+            &self,
+        ) -> Result<Option<crate::audit_log::tip_anchor::TipAnchor>, TipAnchorStoreError> {
+            self.inner.load_anchor()
+        }
+        fn load_raw(&self) -> Result<Option<String>, TipAnchorStoreError> {
+            self.inner.load_raw()
+        }
+        fn store_anchor(
+            &self,
+            anchor: &crate::audit_log::tip_anchor::TipAnchor,
+        ) -> Result<(), TipAnchorStoreError> {
+            self.inner.store_anchor(anchor)
+        }
+        fn bump_reanchor_count(&self) -> Result<u64, TipAnchorStoreError> {
+            self.inner.bump_reanchor_count()
+        }
+        fn reanchor_count(&self) -> Result<Option<u64>, TipAnchorStoreError> {
+            self.inner.reanchor_count()
+        }
+    }
+
+    #[test]
+    fn roll_forward_uncertain_recommit_rereads_owner() {
+        for reread_fails in [false, true] {
+            let (_dir, path, store, writer) = initialized();
+            drop(writer);
+            let newest = sealed(&store, 2, &[2]);
+            plant(&path, 1, &newest);
+            let images = slots(&path);
+            let uncertain = UncertainStore {
+                inner: store.clone(),
+                reread_fails,
+                stored: std::sync::atomic::AtomicBool::new(false),
+            };
+            let result = locked_owner_evidence(&path, &uncertain, Some(&ROW_KEY));
+            if reread_fails {
+                let error = result.unwrap_err();
+                assert_eq!(
+                    format!("{error:?}"),
+                    format!(
+                        "{:?}",
+                        WriterError::TipAnchorStore(TipAnchorStoreError::new("owner reread fault"))
+                    )
+                );
+                assert_eq!(slots(&path), images, "both slots stay");
+            } else {
+                assert_eq!(result.unwrap().unwrap().records(), &[evidence_record(2)]);
+            }
+            assert_eq!(
+                committed(&store).unwrap().head,
+                consent_evidence::head(&newest)
+            );
+        }
+    }
+
+    #[test]
+    fn roll_forward_crash_after_recommit_is_idempotent() {
+        let (_dir, path, store, writer) = initialized();
+        let newest = sealed(&store, 2, &[2]);
+        plant(&path, 1, &newest);
+        test_seam::arm_stop(&outbox_path(&path), test_seam::Stop::EvidenceRecommitted);
+        assert!(matches!(writer.outbox_evidence(), Err(WriterError::Io(_))));
+        assert_eq!(committed(&store).unwrap().g, 2, "the successor is current");
+        drop(writer);
+        let writes = owner_writes(&store);
+        let writer = reopen(&path, &store);
+        assert_eq!(
+            writer.outbox_evidence().unwrap().unwrap().records(),
+            &[evidence_record(2)]
+        );
+        assert_eq!(owner_writes(&store), writes, "the retry stores nothing");
+        assert_eq!(slots(&path)[1].as_deref(), Some(newest.as_slice()));
+    }
+
+    #[test]
+    fn current_evidence_query_is_write_free_and_lock_aware() {
+        let (_dir, path, store, writer) = initialized();
+        drop(writer);
+        let rotation = rotation_writer(&path, &store);
+        let writes = store.outbox_item_writes();
+        let images = slots(&path);
+        let evidence = rotation.outbox_evidence().unwrap().unwrap();
+        assert!(evidence.records().is_empty());
+        assert_eq!(store.outbox_item_writes(), writes);
+        assert_eq!(slots(&path), images);
+    }
+
+    #[test]
+    fn ordinary_delivery_ignores_evidence_refusal() {
+        let (_dir, path, store, mut writer) = initialized();
+        plant(&path, 0, &sealed(&store, 3, &[3]));
+        plant(&path, 1, &sealed(&store, 3, &[4]));
+        assert_eq!(evidence_refusal(writer.outbox_evidence()), "owner rollback");
+        let root = committed(&store);
+        writer.write_entry(own_row("allow")).unwrap();
+        assert_eq!(writer.drain_outbox().unwrap(), 0);
+        let outbox = keyed_outbox(&path, &store);
+        outbox.append(&row("plain")).unwrap();
+        assert_eq!(writer.drain_outbox().unwrap(), 1);
+        outbox.append_queued(&row("consent")).unwrap();
+        assert_eq!(writer.drain_outbox().unwrap(), 1);
+        writer.write_entry(own_row("after")).unwrap();
+        for id in ["allow", "plain", "consent", "after"] {
+            assert_eq!(delivered(&path, id), 1, "{id}");
+        }
+        assert_eq!(committed(&store), root);
+        assert_eq!(evidence_refusal(writer.outbox_evidence()), "owner rollback");
+    }
+
+    #[test]
+    fn rotation_refuses_a_v2_owner_before_any_write() {
+        let (_dir, path, store, writer) = initialized();
+        drop(writer);
+        let mut rotation = rotation_writer(&path, &store);
+        let queue = outbox_bytes(&path);
+        let writes = store.outbox_item_writes();
+        let images = slots(&path);
+        assert!(matches!(
+            rotation.fence_outbox_for_key_change(),
+            Err(WriterError::OutboxEvidenceUnusable {
+                reason: "evidence re-tag unavailable"
+            })
+        ));
+        assert_eq!(outbox_bytes(&path), queue);
+        assert_eq!(store.outbox_item_writes(), writes);
+        assert_eq!(slots(&path), images);
+    }
+
+    #[test]
+    fn storage_protocol_documents_owner_recovery() {
+        const DOC: &str = include_str!("../../../../docs/maintainers/audit-log-recovery.md");
+        for sentence in [
+            "Any authenticated image above the committed generation proves an older owner entry, and the next keyed read recommits the newest one.",
+            "Two distinct authenticated images of that generation refuse with `owner rollback`.",
+            "Restore the most recent trusted owner value at its `-owner` account with the platform keyring tool, then retry a keyed acquisition.",
+            "Never fabricate an owner value or erase an evidence file.",
+        ] {
+            assert!(DOC.contains(sentence), "{sentence}");
+        }
+    }
+
+    #[test]
+    fn rotation_refuses_beside_the_slots_of_a_restored_v1_owner() {
+        let (_dir, path, store, mut writer) = keyed_fixture();
+        keyed_outbox(&path, &store)
+            .append_queued(&row("first"))
+            .unwrap();
+        assert_eq!(writer.drain_outbox().unwrap(), 1);
+        let v1 = store.load_outbox_owner_state(1).unwrap().unwrap();
+        writer.initialize_consent_evidence().unwrap();
+        drop(writer);
+        store.store_outbox_owner_state(1, &v1).unwrap();
+        let mut rotation = rotation_writer(&path, &store);
+        assert_eq!(
+            outbox_bytes(&path),
+            header(1),
+            "the queue is empty and valid"
+        );
+        let writes = store.outbox_item_writes();
+        let images = slots(&path);
+        assert!(matches!(
+            rotation.fence_outbox_for_key_change(),
+            Err(WriterError::OutboxEvidenceUnusable {
+                reason: "evidence image without owner"
+            })
+        ));
+        assert_eq!(outbox_bytes(&path), header(1));
+        assert_eq!(store.outbox_item_writes(), writes);
+        assert_eq!(store.load_outbox_owner_state(1).unwrap().unwrap(), v1);
+        assert_eq!(slots(&path), images);
+        for image in slots(&path) {
+            assert!(consent_evidence::decode(&image.unwrap(), &ROW_KEY).is_ok());
+        }
+    }
+
+    /// Fails the owner store of a first initialization after both slots hold
+    /// the initial image, and returns those slots.
+    fn interrupt_first_initialization(
+        path: &Path,
+        store: &InMemoryTipAnchorStore,
+        writer: &mut AuditWriter,
+    ) -> [Option<Vec<u8>>; 2] {
+        store.set_owner_failing(false, true);
+        assert!(writer.initialize_consent_evidence().is_err());
+        store.set_owner_failing(false, false);
+        assert!(owner_state(store).is_none());
+        let images = slots(path);
+        assert!(
+            images.iter().all(Option::is_some),
+            "the initial image is written"
+        );
+        images
+    }
+
+    /// Queues the consent row `id` through `append_queued` from a child
+    /// process and returns its reference.
+    #[cfg(unix)]
+    fn queue_from_child(
+        dir: &TempDir,
+        path: &Path,
+        store: &InMemoryTipAnchorStore,
+        id: &str,
+    ) -> OutboxRowRef {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        use std::os::unix::net::UnixListener;
+        let socket = dir.path().join(format!("{id}.sock"));
+        let listener = UnixListener::bind(&socket).unwrap();
+        let record = store
+            .load_carrier_record()
+            .unwrap()
+            .unwrap()
+            .to_keyring_value()
+            .unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "audit_log::outbox::tests::queued_append_process",
+                "--nocapture",
+            ])
+            .env("QUEUED_TEST_LOG", path)
+            .env("QUEUED_TEST_RECORD", &record)
+            .env("QUEUED_TEST_SOCKET", &socket)
+            .env("QUEUED_TEST_ID", id)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stream = BufReader::new(listener.accept().unwrap().0);
+        let mut wire = String::new();
+        stream.read_line(&mut wire).unwrap();
+        stream.get_mut().write_all(b"received\n").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_str(&wire).unwrap()
+    }
+
+    /// A second process that appends one queue shape and prints the
+    /// commitment it stored, as the shared keyring would hold it.
+    #[test]
+    fn gap_append_process() {
+        let Ok(log) = std::env::var("GAP_TEST_LOG") else {
+            return;
+        };
+        let path = PathBuf::from(log);
+        let state = Arc::new(InMemoryTipAnchorStore::new());
+        let record = crate::audit_log::tip_anchor::CarrierRecord::parse(
+            &std::env::var("GAP_TEST_RECORD").unwrap(),
+        )
+        .unwrap();
+        state.store_carrier_record(&record).unwrap();
+        let committed = std::env::var("GAP_TEST_STATE").unwrap();
+        if !committed.is_empty() {
+            state
+                .store_outbox_state(record.generation, &OutboxState::parse(&committed).unwrap())
+                .unwrap();
+        }
+        let shape = std::env::var("GAP_TEST_SHAPE").unwrap();
+        if shape == "raw" || shape == "mixed" {
+            AuditOutbox::for_log(&path, state.clone())
+                .append(&row("gap-raw"))
+                .unwrap();
+        }
+        if shape == "tagged" || shape == "mixed" {
+            keyed_outbox(&path, &state)
+                .append_queued(&row("gap-tagged"))
+                .unwrap();
+        }
+        if shape == "foreign" {
+            let mut file = OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(outbox_path(&path))
+                .unwrap();
+            file.write_all(b"{\"k\":\"row\"}\n").unwrap();
+        }
+        let stored = state.load_outbox_state(record.generation).unwrap();
+        writeln!(
+            std::io::stdout(),
+            "STATE:{}",
+            stored.map(|s| s.to_keyring_value()).unwrap_or_default()
+        )
+        .unwrap();
+    }
+
+    /// Runs [`gap_append_process`] for `shape` and stores its commitment.
+    fn gap_append(path: &Path, store: &InMemoryTipAnchorStore, shape: &str) {
+        let record = store.load_carrier_record().unwrap().unwrap();
+        let committed = store
+            .load_outbox_state(record.generation)
+            .unwrap()
+            .map(|s| s.to_keyring_value())
+            .unwrap_or_default();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "audit_log::outbox::tests::gap_append_process",
+                "--nocapture",
+            ])
+            .env("GAP_TEST_LOG", path)
+            .env("GAP_TEST_RECORD", record.to_keyring_value().unwrap())
+            .env("GAP_TEST_STATE", committed)
+            .env("GAP_TEST_SHAPE", shape)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stored = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("STATE:"))
+            .unwrap();
+        if !stored.is_empty() {
+            store
+                .store_outbox_state(record.generation, &OutboxState::parse(stored).unwrap())
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn initialization_retry_takes_rows_queued_after_the_preliminary_drain() {
+        let (_clean_dir, clean_path, clean_store, mut clean) = keyed_fixture();
+        clean.initialize_consent_evidence().unwrap();
+        for (shape, gap) in [
+            ("raw", &["gap-raw"][..]),
+            ("tagged", &["gap-tagged"][..]),
+            ("mixed", &["gap-raw", "gap-tagged"][..]),
+        ] {
+            let (_dir, path, store, mut writer) = keyed_fixture();
+            AuditOutbox::for_log(&path, store.clone())
+                .append(&row("first"))
+                .unwrap();
+            let (hook_path, hook_store) = (path.clone(), store.clone());
+            test_seam::on_initialization_retry(&path, move || {
+                gap_append(&hook_path, &hook_store, shape);
+            });
+            writer.initialize_consent_evidence().unwrap();
+            let ids = request_ids(&path);
+            let queued: Vec<&str> = ids
+                .iter()
+                .map(String::as_str)
+                .filter(|id| *id == "first" || gap.contains(id))
+                .collect();
+            let mut expected = vec!["first"];
+            expected.extend_from_slice(gap);
+            assert_eq!(queued, expected, "{shape}: once each, in file order");
+            assert_eq!(outbox_bytes(&path), header(1), "{shape}");
+            assert_eq!(slots(&path), slots(&clean_path), "{shape}");
+            assert_eq!(committed(&store), committed(&clean_store), "{shape}");
+            assert_eq!(
+                writer.outbox_evidence().unwrap(),
+                clean.outbox_evidence().unwrap(),
+                "{shape}"
+            );
+        }
+        let (_dir, path, store, mut writer) = keyed_fixture();
+        AuditOutbox::for_log(&path, store.clone())
+            .append(&row("first"))
+            .unwrap();
+        let (hook_path, hook_store) = (path.clone(), store.clone());
+        test_seam::on_initialization_retry(&path, move || {
+            gap_append(&hook_path, &hook_store, "foreign");
+        });
+        let error = writer.initialize_consent_evidence().unwrap_err();
+        assert!(
+            matches!(
+                error,
+                WriterError::OutboxEvidenceUnusable {
+                    reason: "queue not drained"
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(audit_writer_code(&error), "audit.outbox_evidence_unusable");
+        assert_eq!(slots(&path), [None, None], "nothing is written");
+        assert!(owner_state(&store).is_none());
+    }
+
+    fn audit_writer_code(error: &WriterError) -> &'static str {
+        crate::audit_log::writer::audit_writer_refusal("fixture", error).code()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_interrupted_initialization_keeps_a_legacy_prefix_and_its_tagged_suffix() {
+        let (dir, path, store, mut writer) = keyed_fixture();
+        let images = interrupt_first_initialization(&path, &store, &mut writer);
+        AuditOutbox::for_log(&path, store.clone())
+            .append(&row("raw"))
+            .unwrap();
+        let reference = queue_from_child(&dir, &path, &store, "consent");
+        assert_eq!((reference.generation(), reference.sequence()), (0, 2));
+
+        writer.initialize_consent_evidence().unwrap();
+        let ids = request_ids(&path);
+        let delivered_ids: Vec<&str> = ids
+            .iter()
+            .map(String::as_str)
+            .filter(|id| ["raw", "consent"].contains(id))
+            .collect();
+        assert_eq!(
+            delivered_ids,
+            ["raw", "consent"],
+            "once each, in file order"
+        );
+        assert_eq!(outbox_bytes(&path), header(1));
+        assert_eq!(slots(&path), images);
+
+        let (_clean_dir, clean_path, clean_store, mut clean) = keyed_fixture();
+        clean.initialize_consent_evidence().unwrap();
+        assert_eq!(slots(&path), slots(&clean_path), "the same evidence images");
+        assert_eq!(committed(&store), committed(&clean_store));
+        assert_eq!(
+            writer.outbox_evidence().unwrap(),
+            clean.outbox_evidence().unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_interrupted_initialization_completes_beside_a_queued_row() {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        use std::os::unix::net::UnixListener;
+        let (dir, path, store, mut writer) = keyed_fixture();
+        let images = interrupt_first_initialization(&path, &store, &mut writer);
+
+        let socket = dir.path().join("evidence.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let record = store
+            .load_carrier_record()
+            .unwrap()
+            .unwrap()
+            .to_keyring_value()
+            .unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "audit_log::outbox::tests::queued_append_process",
+                "--nocapture",
+            ])
+            .env("QUEUED_TEST_LOG", &path)
+            .env("QUEUED_TEST_RECORD", &record)
+            .env("QUEUED_TEST_SOCKET", &socket)
+            .env("QUEUED_TEST_ID", "queued-in-between")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stream = BufReader::new(listener.accept().unwrap().0);
+        let mut wire = String::new();
+        stream.read_line(&mut wire).unwrap();
+        let reference: OutboxRowRef = serde_json::from_str(&wire).unwrap();
+        stream.get_mut().write_all(b"received\n").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!((reference.generation(), reference.sequence()), (0, 1));
+
+        writer.initialize_consent_evidence().unwrap();
+        assert_eq!(delivered(&path, "queued-in-between"), 1, "the row survives");
+        assert_eq!(outbox_bytes(&path), header(1));
+        assert_eq!(slots(&path), images);
+        assert_eq!(
+            committed(&store).unwrap().head,
+            consent_evidence::head(images[0].as_ref().unwrap())
+        );
+        assert!(writer.outbox_evidence().unwrap().is_some());
+    }
+
+    #[test]
+    fn initialization_refuses_foreign_slots_before_draining() {
+        for keyed in [false, true] {
+            let (_dir, path, store, mut writer) = keyed_fixture();
+            plant(&path, 0, b"foreign evidence");
+            if keyed {
+                keyed_outbox(&path, &store).append(&row("queued")).unwrap();
+            } else {
+                AuditOutbox::for_log(&path, store.clone())
+                    .append(&row("queued"))
+                    .unwrap();
+            }
+            let queue = outbox_bytes(&path);
+            let writes = store.outbox_item_writes();
+            assert_eq!(
+                evidence_refusal(writer.initialize_consent_evidence().map(|()| None)),
+                "evidence image without owner",
+                "keyed: {keyed}"
+            );
+            assert_eq!(outbox_bytes(&path), queue, "the row stays queued");
+            assert_eq!(delivered(&path, "queued"), 0);
+            assert_eq!(store.outbox_item_writes(), writes);
+            assert_eq!(slots(&path), [Some(b"foreign evidence".to_vec()), None]);
         }
     }
 }

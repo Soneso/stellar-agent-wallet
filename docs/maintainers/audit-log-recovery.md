@@ -529,6 +529,31 @@ Every keyed writer open compares its key with the key the keyring holds before i
 An open that holds the replaced key refuses with `audit.key_replaced`.
 Run the verb again, or let the MCP server acquire the writer again: each acquisition loads the stored key.
 
+**Consent evidence.** Evidence initialization adds two files beside the queue: `<log>.outbox.evidence.0` and `<log>.outbox.evidence.1`.
+Each file is exactly 364,668 bytes: a 124-byte header, up to 4,096 records of 89 bytes, and zero padding.
+The header holds `SAEV0001`, the scope, the evidence generation, the time floor, the record count, the predecessor head, and the tag.
+The tag is HMAC-SHA256 under the audit key over the whole file with its tag bytes zeroed.
+The head is SHA-256 over the whole tagged file.
+The owner value then takes version 2: `{"v":2,"g":G,"closed":C,"legacy":L,"e":{"g":E,"head":H}}`.
+Its `e` commits the evidence generation and the head of one file, and the value carries no recent digests.
+Initialization turns each recent digest of a version 1 owner into a migration pin, and a pin never counts as delivery.
+Both files receive the initial image, written and synced, before the owner value is stored.
+A read of the committed image writes nothing.
+Any authenticated image above the committed generation proves an older owner entry, and the next keyed read recommits the newest one.
+Two distinct authenticated images of that generation refuse with `owner rollback`.
+An image that matches no committed head refuses with `head`, and an older image never stands in for it.
+A missing or version 1 owner beside either evidence file refuses with `evidence image without owner`.
+A drain under such an owner leaves queued consent rows in place, and rows without consent evidence still deliver.
+Every refusal uses `audit.outbox_evidence_unusable` with a fixed reason.
+Ordinary appends, drains, and payments that need no approval never read the evidence files.
+Key rotation refuses an owner that commits evidence with `evidence re-tag unavailable`, before it writes anything.
+
+**Restore current owner entry.** Stop every process that holds the profile, and preserve both evidence files, the queue, and the keyring entries.
+Restore the most recent trusted owner value at its `-owner` account with the platform keyring tool, then retry a keyed acquisition.
+No command restores an owner value. Never fabricate an owner value or erase an evidence file.
+`audit acknowledge-outbox-loss` handles a classified queue loss and cannot clear an evidence refusal.
+`audit reanchor` repairs the log anchor, not the owner value.
+
 ## 9. Tip anchor unavailable
 
 **Detail sub-code:** `audit.tip_anchor_unavailable`
