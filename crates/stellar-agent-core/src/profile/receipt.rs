@@ -377,7 +377,7 @@ impl ReleaseEvidence {
 /// onto its receipt, read by the caller from authenticated window state.
 ///
 /// See [`ReceiptStore::project_accounting_expiry`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountingExpiryProjection<'a> {
     /// The envelope hash naming the receipt.
     pub envelope_hash: &'a str,
@@ -393,6 +393,8 @@ pub struct AccountingExpiryProjection<'a> {
     pub recorded_at_ledger: u32,
     /// The identifier of the committed accounting decision.
     pub decision_id: &'a str,
+    /// Payment provenance from the authenticated reservation.
+    pub destinations: PaymentDestinations,
 }
 
 /// The receipt of one checked recovery decision, built by the caller from
@@ -410,6 +412,13 @@ pub struct CheckedReceiptProjection {
 }
 
 impl CheckedReceiptProjection {
+    /// Attaches payment provenance from authenticated state.
+    #[must_use]
+    pub fn with_destinations(mut self, destinations: PaymentDestinations) -> Self {
+        self.receipt.destinations = destinations;
+        self
+    }
+
     /// Builds the receipt of one checked decision.
     ///
     /// The receipt is submitted, not recovered from a reservation, and carries
@@ -452,7 +461,7 @@ impl CheckedReceiptProjection {
             recovered_from_reservation: false,
             release_code,
             settlement_decision_id: Some(decision_id.clone()),
-            destination: None,
+            destinations: PaymentDestinations::None,
         };
         Self {
             receipt,
@@ -464,6 +473,141 @@ impl CheckedReceiptProjection {
 // ─────────────────────────────────────────────────────────────────────────────
 // SubmissionReceipt
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// One payment operation's complete destination.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationDestination {
+    /// Zero-based index in the transaction's operation list.
+    pub operation: u32,
+    /// Canonical G or M destination, including the complete muxed identifier.
+    pub destination: String,
+}
+
+/// Display provenance of a transaction's payment destinations.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum PaymentDestinations {
+    /// No destination provenance.
+    #[default]
+    None,
+    /// Every payment operation names this canonical M destination.
+    Single(String),
+    /// Payment destinations differ, and at least one is muxed.
+    PerOperation(Vec<OperationDestination>),
+}
+
+impl PaymentDestinations {
+    /// Checks canonical addresses, operation order, and protocol bounds.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        use crate::payment_accounts::PaymentAccount;
+        match self {
+            Self::None => true,
+            Self::Single(value) => PaymentAccount::parse(value)
+                .is_ok_and(|account| account.muxed_id().is_some() && account.canonical() == value),
+            Self::PerOperation(entries) => {
+                (2..=100).contains(&entries.len())
+                    && entries.iter().all(|entry| {
+                        entry.operation < 100
+                            && PaymentAccount::parse(&entry.destination)
+                                .is_ok_and(|account| account.canonical() == entry.destination)
+                    })
+                    && entries
+                        .windows(2)
+                        .all(|pair| pair[0].operation < pair[1].operation)
+                    && entries
+                        .iter()
+                        .any(|entry| entry.destination.starts_with('M'))
+                    && entries
+                        .iter()
+                        .any(|entry| entry.destination != entries[0].destination)
+            }
+        }
+    }
+
+    fn from_shape(value: &serde_json::Value) -> Self {
+        match value {
+            serde_json::Value::String(value) => Self::Single(value.clone()),
+            serde_json::Value::Array(_) => serde_json::from_value(value.clone())
+                .map(Self::PerOperation)
+                .unwrap_or_default(),
+            _ => Self::None,
+        }
+    }
+
+    /// Reads stored provenance without refusing malformed or unusable display data.
+    #[must_use]
+    pub fn from_stored(value: &serde_json::Value) -> Self {
+        let value = Self::from_shape(value);
+        if value.is_valid() { value } else { Self::None }
+    }
+
+    /// Returns the stored string or operation list, or absence for no provenance.
+    #[must_use]
+    pub fn to_stored(&self) -> Option<serde_json::Value> {
+        match self {
+            Self::None => None,
+            Self::Single(value) => Some(serde_json::json!(value)),
+            Self::PerOperation(entries) => Some(serde_json::json!(entries)),
+        }
+    }
+}
+
+/// The mutually exclusive `destination` and `destinations` JSON members.
+///
+/// Reads check shape only. Receipt reads also validate canonical payment provenance.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DestinationFields(pub PaymentDestinations);
+
+impl Serialize for DestinationFields {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut fields = serde_json::Map::new();
+        if let Some(value) = self.0.to_stored() {
+            let key = if matches!(self.0, PaymentDestinations::Single(_)) {
+                "destination"
+            } else {
+                "destinations"
+            };
+            fields.insert(key.to_owned(), value);
+        }
+        fields.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for DestinationFields {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let fields = serde_json::Value::deserialize(deserializer)?;
+        let value = match (fields.get("destination"), fields.get("destinations")) {
+            (Some(value @ serde_json::Value::String(_)), None)
+            | (None, Some(value @ serde_json::Value::Array(_))) => {
+                PaymentDestinations::from_shape(value)
+            }
+            _ => PaymentDestinations::None,
+        };
+        Ok(Self(value))
+    }
+}
+
+struct ReceiptDestinations;
+
+impl ReceiptDestinations {
+    fn serialize<S: serde::Serializer>(
+        value: &PaymentDestinations,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        DestinationFields(value.clone()).serialize(serializer)
+    }
+
+    fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<PaymentDestinations, D::Error> {
+        let DestinationFields(value) = DestinationFields::deserialize(deserializer)?;
+        Ok(if value.is_valid() {
+            value
+        } else {
+            PaymentDestinations::None
+        })
+    }
+}
 
 /// A persisted record of a transaction submission attempt.
 ///
@@ -671,19 +815,15 @@ pub struct SubmissionReceipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settlement_decision_id: Option<String>,
 
-    /// The full original payment destination when it is a muxed `M...`
-    /// account, decoded from the signed envelope of a one-operation payment.
+    /// Complete payment provenance from the envelope or authenticated state.
     ///
-    /// `None` for every other receipt, and absent from the serialized form
-    /// then, so G and C receipts and older receipts keep their bytes. Three
-    /// cases record none for an M payment: a transaction with several
-    /// operations, a receipt rebuilt from a reservation (reservation
-    /// repair, accounting-expiry projection, finalization of an absent
-    /// receipt), and an absent receipt that [`ReceiptStore::replace_checked`]
-    /// writes from the checked projection of a committed decision. A checked
-    /// replacement of a stored receipt keeps its destination.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub destination: Option<String>,
+    /// Payments sharing one M destination record it in `destination`.
+    /// Differing destinations with at least one M record every payment in `destinations`.
+    /// All-G payments and legacy records carry neither field.
+    /// Reservation, expiry, and checked recovery projections preserve this display data.
+    /// Unusable provenance projects none and never refuses a receipt read.
+    #[serde(flatten, with = "ReceiptDestinations")]
+    pub destinations: PaymentDestinations,
 }
 
 /// Serde default for [`SubmissionReceipt::submitted`].
@@ -1237,14 +1377,14 @@ impl ReceiptStore {
             sequence,
             max_time,
             recorded_at_ledger,
-            None,
+            &PaymentDestinations::None,
         )
     }
 
     /// The claim of [`Self::try_begin`] that also records the full muxed
     /// destination decoded from the supplied envelope on the new receipt.
     ///
-    /// `destination` is `None` for every envelope without a muxed payment
+    /// `destinations` is `None` for every envelope without a muxed payment
     /// destination. An existing receipt is returned unchanged.
     ///
     /// # Errors
@@ -1262,7 +1402,7 @@ impl ReceiptStore {
         sequence: i64,
         max_time: u64,
         recorded_at_ledger: u32,
-        destination: Option<&str>,
+        destinations: &PaymentDestinations,
     ) -> Result<BeginOutcome, ReceiptStoreError> {
         let mut session = self.write_session()?;
 
@@ -1280,7 +1420,7 @@ impl ReceiptStore {
             max_time,
             recorded_at_ledger,
             None,
-            destination,
+            destinations,
         )?;
 
         Ok(BeginOutcome::Winner)
@@ -1292,6 +1432,10 @@ impl ReceiptStore {
     ///
     /// # Errors
     /// Returns a store error on read/write failure or a conflicting identity.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the identity and provenance are restored together"
+    )]
     pub fn recover_from_reservation(
         &self,
         envelope_hash: &str,
@@ -1300,6 +1444,7 @@ impl ReceiptStore {
         sequence: i64,
         max_time: u64,
         recorded_at_ledger: u32,
+        destinations: &PaymentDestinations,
     ) -> Result<SubmissionReceipt, ReceiptStoreError> {
         let mut session = self.write_session()?;
         if let Some(existing) = session.guard.map.get(envelope_hash) {
@@ -1333,7 +1478,7 @@ impl ReceiptStore {
             recovered_from_reservation: true,
             release_code: None,
             settlement_decision_id: None,
-            destination: None,
+            destinations: destinations.clone(),
         };
         session
             .guard
@@ -1462,15 +1607,15 @@ impl ReceiptStore {
             recorded_at_ledger,
             approval_nonce,
             Some(releases),
-            None,
+            &PaymentDestinations::None,
         )
     }
 
     /// Claims a receipt as [`Self::begin_submission_releasing`] does and
     /// records the original muxed destination on the new receipt.
     ///
-    /// `releases` of `None` admits no released claimant. `destination` is the
-    /// full `M...` payment destination, or `None` for every other payment.
+    /// `releases` of `None` admits no released claimant.
+    /// `destinations` records the envelope's complete payment provenance.
     ///
     /// # Errors
     /// Returns a receipt-store error when the claim cannot be read or persisted.
@@ -1488,7 +1633,7 @@ impl ReceiptStore {
         recorded_at_ledger: u32,
         approval_nonce: Option<&str>,
         releases: Option<&dyn SequenceReleases>,
-        destination: Option<&str>,
+        destinations: &PaymentDestinations,
     ) -> Result<BeginSubmissionOutcome, ReceiptStoreError> {
         let releases = releases.unwrap_or(&NoSequenceReleases);
         let mut session = self.write_session()?;
@@ -1527,7 +1672,7 @@ impl ReceiptStore {
             max_time,
             recorded_at_ledger,
             approval_nonce,
-            destination,
+            destinations,
         )?;
 
         Ok(BeginSubmissionOutcome::Recorded)
@@ -1621,7 +1766,21 @@ impl ReceiptStore {
         status: ReceiptStatus,
         ledger: Option<u32>,
     ) -> Result<(), ReceiptStoreError> {
-        self.finalize_with_release(envelope_hash, status, ledger, None)
+        self.finalize_to(envelope_hash, status, ledger, &PaymentDestinations::None)
+    }
+
+    /// Finalizes a receipt, preserving provenance when an absent receipt is rebuilt.
+    ///
+    /// # Errors
+    /// Returns the errors of [`Self::finalize`].
+    pub fn finalize_to(
+        &self,
+        envelope_hash: &str,
+        status: ReceiptStatus,
+        ledger: Option<u32>,
+        destinations: &PaymentDestinations,
+    ) -> Result<(), ReceiptStoreError> {
+        self.finalize_with_release(envelope_hash, status, ledger, None, destinations)
     }
 
     /// Records an observation on the receipt: the status becomes `Ambiguous`
@@ -1652,6 +1811,7 @@ impl ReceiptStore {
             ReceiptStatus::Ambiguous,
             None,
             Some(evidence),
+            &PaymentDestinations::None,
         )
     }
 
@@ -1723,7 +1883,7 @@ impl ReceiptStore {
                     recovered_from_reservation: true,
                     release_code: Some(ReleaseEvidence::AccountingExpired),
                     settlement_decision_id: decision_id,
-                    destination: None,
+                    destinations: projection.destinations.clone(),
                 };
                 session
                     .guard
@@ -1740,8 +1900,8 @@ impl ReceiptStore {
     ///
     /// Under the receipt write lock, a stored `ClearedByOperator` status and a
     /// stored `approval_consumed = true` survive. A projection without a
-    /// destination keeps the stored destination, and a receipt stored without
-    /// one keeps none. Every other field comes from the projection. A merged
+    /// destination keeps the stored destination. A receipt without provenance
+    /// takes the projection's authenticated value. Every other field comes from the projection. A merged
     /// receipt equal to the stored one is not rewritten: the store confirms
     /// the file and its directory durable
     /// instead. Otherwise the receipt is replaced and the indexes rebuilt.
@@ -1773,9 +1933,11 @@ impl ReceiptStore {
         let key = projection.receipt.envelope_hash.as_str();
         let mut merged = projection.receipt.clone();
         if let Some(existing) = session.guard.map.get(key) {
-            if merged.destination.is_none() {
-                merged.destination.clone_from(&existing.destination);
-            } else if merged.destination != existing.destination {
+            if merged.destinations == PaymentDestinations::None {
+                merged.destinations.clone_from(&existing.destinations);
+            } else if existing.destinations != PaymentDestinations::None
+                && merged.destinations != existing.destinations
+            {
                 return Err(ReceiptStoreError::InvalidTransition {
                     from: "conflicting identity",
                     to: "checked",
@@ -1806,6 +1968,7 @@ impl ReceiptStore {
         status: ReceiptStatus,
         ledger: Option<u32>,
         evidence: Option<ReleaseEvidence>,
+        destinations: &PaymentDestinations,
     ) -> Result<(), ReceiptStoreError> {
         let mut session = self.write_session()?;
 
@@ -1852,7 +2015,7 @@ impl ReceiptStore {
                 recovered_from_reservation: false,
                 release_code: evidence,
                 settlement_decision_id: None,
-                destination: None,
+                destinations: destinations.clone(),
             });
 
         session.guard.rebuild_indexes();
@@ -2374,7 +2537,7 @@ fn insert_pending(
     max_time: u64,
     recorded_at_ledger: u32,
     approval_nonce: Option<&str>,
-    destination: Option<&str>,
+    destinations: &PaymentDestinations,
 ) -> Result<(), ReceiptStoreError> {
     let receipt = SubmissionReceipt {
         envelope_hash: envelope_hash.to_owned(),
@@ -2393,7 +2556,7 @@ fn insert_pending(
         recovered_from_reservation: false,
         release_code: None,
         settlement_decision_id: None,
-        destination: destination.map(str::to_owned),
+        destinations: destinations.clone(),
     };
 
     guard.map.insert(envelope_hash.to_owned(), receipt);
@@ -2592,6 +2755,8 @@ mod tests {
 
     use super::*;
 
+    include!("receipt_destination_tests.rs");
+
     const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const TX_HASH_A: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const HASH_B: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
@@ -2767,18 +2932,18 @@ mod tests {
                 90,
                 None,
                 None,
-                Some(MUXED),
+                &PaymentDestinations::Single(MUXED.to_owned()),
             )
             .unwrap();
         let projection = checked(ReceiptStatus::Success, Some(120));
         store.replace_checked(&projection).unwrap();
         assert_eq!(
-            store.get(HASH_A).unwrap().unwrap().destination.as_deref(),
-            Some(MUXED)
+            store.get(HASH_A).unwrap().unwrap().destinations,
+            PaymentDestinations::Single(MUXED.to_owned())
         );
         let bytes = std::fs::read(store.file_path().unwrap()).unwrap();
         let mut other = projection;
-        other.receipt.destination = Some(SOURCE_B.to_owned());
+        other.receipt.destinations = PaymentDestinations::Single(SOURCE_B.to_owned());
         assert!(matches!(
             store.replace_checked(&other),
             Err(ReceiptStoreError::InvalidTransition {
@@ -2822,7 +2987,10 @@ mod tests {
                         90,
                         None,
                         None,
-                        destination.as_deref(),
+                        &destination
+                            .clone()
+                            .map(PaymentDestinations::Single)
+                            .unwrap_or_default(),
                     )
                     .unwrap();
                 let before = std::fs::read(store.file_path().unwrap()).unwrap();
@@ -2839,7 +3007,13 @@ mod tests {
 
                 let store = ReceiptStore::open_at(dir.path(), "test").unwrap();
                 let receipt = store.get(HASH_A).unwrap().unwrap();
-                assert_eq!(receipt.destination, destination);
+                assert_eq!(
+                    receipt.destinations,
+                    destination
+                        .clone()
+                        .map(PaymentDestinations::Single)
+                        .unwrap_or_default()
+                );
                 if after_rename {
                     assert_eq!(receipt.status, ReceiptStatus::Success);
                 } else {
@@ -3860,7 +4034,7 @@ mod tests {
             recovered_from_reservation: false,
             release_code: None,
             settlement_decision_id: None,
-            destination: None,
+            destinations: PaymentDestinations::None,
         };
 
         let json = serde_json::to_string(&original).unwrap();
@@ -3901,7 +4075,7 @@ mod tests {
             recovered_from_reservation: false,
             release_code: None,
             settlement_decision_id: None,
-            destination: None,
+            destinations: PaymentDestinations::None,
         };
 
         let json = serde_json::to_string(&r).unwrap();
@@ -5065,6 +5239,7 @@ mod tests {
         let (_dir, store) = open_temp_store();
         let projection =
             |hash: &'static str, decision_id: &'static str| AccountingExpiryProjection {
+                destinations: Default::default(),
                 envelope_hash: hash,
                 tx_hash: TX_HASH_A,
                 source: SOURCE_A,

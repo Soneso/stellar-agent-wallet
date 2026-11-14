@@ -854,7 +854,7 @@ minted without a digest can reject but not approve. The decision seam refuses
 an absent or different digest with `approval.presence_changed` before the
 keyring read, the row and any store write, and the attester's still-pending
 check refuses an entry replaced after that comparison with
-`approval.wrong_kind`. A same-user process that can write the pending store can
+`approval.presence_changed`. A same-user process that can write the pending store can
 therefore replace an entry while a page is open, but the approve from that page
 attests nothing, and a reload renders the replacement for review. The CLI
 prompts for and attests one copy of the entry, and the mainnet ceremonies bind
@@ -1494,8 +1494,10 @@ Stateful spending criteria read amounts and counts from `PolicyStateStore`. Conf
   `policy.window_chain_unverifiable`, because they carry no scope. Version 11
   carries optional latest reset consent, operation and approval records, admissible floors, chain
   observations, and authorization links, dispositions and release rows. Every
-  successor uses version 12. It carries total-budget epochs and an optional
-  retired digest. Older builds refuse it.
+  successor uses at least version 12, which carries total-budget epochs and an optional retired digest.
+  An authenticated recovery run record requires version 13 (`WIRE_VERSION_RECOVERY_RUN`). Builds capped at 12 refuse it.
+  Destination fields on records, consumption bindings, or accounting expiries require version 14 (`WIRE_VERSION_DESTINATION`). Builds capped at 13 refuse it.
+  Each committed version floor stays after its fields are removed.
 - **Authorization ledger**: open and claimed records hold window capacity outside the bucket records. Durable admission counts every total hold until a committed sweep removes it. Hydration counts total holds as an ordinary writer's sweep would leave them at its clock reading. Reconciliation, confirmation, and release never see a hold. Expiry is measured on the store's own clock, and a transaction sweeps expired authorizations under the lock before it counts. Invalidation or expiry releases only unclaimed holds. A signing claim records its time before the signer runs. Expiry converts claimed holds to confirmed spend dated at the claim and bound to its chain. A consumed transaction authorization's holds become submission pending records; a consumed Soroban intent's become confirmed authorized spend. Settled history is pruned after the retention window once its approval ends; open and claimed records stay. A window state reset keeps every record whose approval can still be presented and settles a record that holds capacity as expired.
 - **Key**: the profile's `policy_window_state_key_id` keyring coordinate (`stellar-agent-policy-window-<profile>` by convention), lazily minted on first write.
 - **Lock**: `WindowStoreLock`, an OFD-advisory exclusive lock on a file in the policy-state directory named by the window-state keyring entry, serializes every read-modify-write (record, reset, resign, authorization transitions) across processes; every store handle and every pin operation over one entry takes the same lock, whatever store path it names. It lives in `stellar-agent-core::policy::state_lock`, and the policy pin at `(<window service>, <window account>-policy-pin)` is read and compared under it. The verified policy advance writes the pin under the same lock. Without `test-helpers`, no public function writes a pin the caller composes.
@@ -1508,7 +1510,9 @@ Stateful spending criteria read amounts and counts from `PolicyStateStore`. Conf
 
 A total debit leaves its sum in four ways. An unclaimed hold is invalidated, or a committed sweep expires it. A checked failure or non-inclusion of its own attempt releases it once. The writer that reserved it cancels it before the signed bytes leave the process. Every other transition keeps it counted, including operator clears, accounting expiry, and other cancellations. A fee that a failed transaction paid stays charged.
 
-Every snapshot this build writes uses version 12, including one carrying a signed intent record or an intent link. Older builds refuse it.
+`select_wire_version` writes version 12 unless stored fields or a committed floor require a higher version.
+A recovery run record requires at least version 13; destination fields require version 14. Each committed floor stays after pruning.
+Builds capped at 12 refuse version 13, and builds capped at 13 refuse version 14 with `UnsupportedVersion`.
 
 Smart-account signing admits its intent before the first signature. Admission rereads the protected generation under the window lock and counts every live intent against the caps.
 
@@ -1540,7 +1544,7 @@ Intents without an authenticated purpose remain open. Calls whose authorization 
 
 Timelock envelopes carry an exact maximum ledger before signing. The maximum ledger is exclusive.
 
-Snapshots containing signed intents or intent links use version 12. Records missing required intent fields refuse as unreadable. Readers that cannot account for the format refuse current and prepared snapshots.
+Snapshots containing signed intents or intent links use at least version 12 under the same selection rule. Records missing required intent fields refuse as unreadable. Readers that cannot account for the format refuse current and prepared snapshots.
 
 An unavailable observation leaves retained charges unchanged while the policy check continues. Read only tools and preparation requests acquire no charge closure witnesses.
 

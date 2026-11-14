@@ -1,0 +1,1 @@
+- Submission receipts keep the muxed destination of a transaction with several payment operations and list each payment operation's destination when they differ. Receipts rebuilt from a reservation, an accounting expiry, or a committed decision keep it. Window state with destination fields uses version 14 and keeps that committed floor.

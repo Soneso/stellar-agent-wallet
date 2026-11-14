@@ -4702,6 +4702,7 @@ mod tests {
         let client = StellarRpcClient::new(&primary.uri()).unwrap();
         let oracle_client = StellarRpcClient::new(&oracle.uri()).unwrap();
         let hold = super::super::SubmissionHold {
+            destinations: Default::default(),
             chain_scope: super::super::ChainScope::for_chain(fx.profile.chain_id),
             id: "b5".repeat(32),
             tx_hash: "b5".repeat(32),
@@ -4863,6 +4864,7 @@ mod tests {
         // A reservation past its accounting horizon and older than the legacy
         // age threshold, whose receipt cannot be written while its lock is held.
         let hold = super::super::SubmissionHold {
+            destinations: Default::default(),
             chain_scope: super::super::ChainScope::for_chain(fx.profile.chain_id),
             id: "c6".repeat(32),
             tx_hash: "c7".repeat(32),
@@ -7116,6 +7118,7 @@ mod tests {
         assert_eq!(fx.record(id).attempts[0].recovery, None);
         // An owed accounting expiry, so the drain has a row to deliver.
         let expired = super::super::SubmissionHold {
+            destinations: Default::default(),
             chain_scope: super::super::ChainScope::for_chain(fx.profile.chain_id),
             id: "e1".repeat(32),
             tx_hash: "e2".repeat(32),

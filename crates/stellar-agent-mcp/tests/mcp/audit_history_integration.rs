@@ -95,6 +95,7 @@ async fn settle_then_rotate(seed: [u8; 32]) -> RotatedSettlement {
                 },
             )],
             &SubmissionHold {
+                destinations: Default::default(),
                 chain_scope: ChainScope::for_chain(profile.chain_id),
                 id: envelope_hash.clone(),
                 tx_hash: tx_hash.clone(),

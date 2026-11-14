@@ -25,7 +25,8 @@ use stellar_agent_core::policy::v1::signature::{WindowResetStatement, window_res
 use stellar_agent_core::profile::caip2::Caip2;
 use stellar_agent_core::profile::owner_key::{self, OwnerKeyContext};
 use stellar_agent_core::profile::receipt::{
-    AccountingExpiryProjection, ReceiptStatus, ReceiptStore, ReceiptStoreError, ReleaseEvidence,
+    AccountingExpiryProjection, PaymentDestinations, ReceiptStatus, ReceiptStore,
+    ReceiptStoreError, ReleaseEvidence,
 };
 use stellar_agent_core::profile::schema::{
     KeyringEntryRef, Profile, default_policy_window_state_path_for, generation_account,
@@ -46,6 +47,62 @@ use crate::signing::LedgerWitnessCapability;
 use crate::transaction_record::TransactionRecord;
 
 type HmacSha256 = Hmac<Sha256>;
+
+/// Stored display provenance, preserving absent members and explicit nulls.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum StoredDestinations {
+    /// The member is absent.
+    #[default]
+    Missing,
+    /// The member carries an explicit JSON null.
+    Null,
+    /// The member carries its original JSON value.
+    Value(serde_json::Value),
+}
+
+impl StoredDestinations {
+    /// Whether serialization omits this member.
+    pub fn is_missing(&self) -> bool {
+        matches!(self, Self::Missing)
+    }
+
+    pub(super) fn project(&self) -> PaymentDestinations {
+        match self {
+            Self::Value(value) => PaymentDestinations::from_stored(value),
+            _ => PaymentDestinations::None,
+        }
+    }
+}
+
+impl From<&PaymentDestinations> for StoredDestinations {
+    fn from(value: &PaymentDestinations) -> Self {
+        if value.is_valid() {
+            value.to_stored().map_or(Self::Missing, Self::Value)
+        } else {
+            Self::Missing
+        }
+    }
+}
+
+impl serde::Serialize for StoredDestinations {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Value(value) => serde::Serialize::serialize(value, serializer),
+            _ => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for StoredDestinations {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+        Ok(if value.is_null() {
+            Self::Null
+        } else {
+            Self::Value(value)
+        })
+    }
+}
 
 /// HMAC tag length in bytes.
 const HMAC_TAG_LEN: usize = 32;
@@ -210,7 +267,7 @@ pub(super) const WIRE_VERSION_LEDGER: u32 = 4;
 /// A file written by a newer build carries records this one cannot account
 /// for, so it is refused rather than read with the fields it happens to
 /// recognise.
-pub(super) const WIRE_VERSION_MAX: u32 = WIRE_VERSION_RECOVERY_RUN;
+pub(super) const WIRE_VERSION_MAX: u32 = WIRE_VERSION_DESTINATION;
 
 /// Wire version binding the accounting network on every snapshot.
 #[cfg_attr(
@@ -255,9 +312,30 @@ pub(super) const WIRE_VERSION_TOTAL_EPOCH: u32 = 12;
 /// Wire version carrying authenticated recovery run objects.
 pub(super) const WIRE_VERSION_RECOVERY_RUN: u32 = 13;
 
-/// Selects the run format when present and retains its committed floor.
+/// Wire version carrying payment destination provenance on reservations, consumptions, and accounting expiries.
+pub(crate) const WIRE_VERSION_DESTINATION: u32 = WIRE_VERSION_RECOVERY_RUN + 1;
+
+/// Selects the format required by stored fields and retains each committed floor.
 fn select_wire_version(wire: &WireFile, committed: Option<u32>) -> u32 {
-    if committed.is_some_and(|version| version >= WIRE_VERSION_RECOVERY_RUN)
+    if committed.is_some_and(|version| version >= WIRE_VERSION_DESTINATION)
+        || wire.entries.iter().any(|bucket| {
+            bucket
+                .records
+                .iter()
+                .any(|record| !record.destinations.is_missing())
+        })
+        || wire
+            .accounting_expiries
+            .iter()
+            .any(|record| !record.destinations.is_missing())
+        || wire.authorizations.iter().any(|authorization| {
+            matches!(&authorization.consumption,
+                Some(ledger::ConsumptionBinding::Transaction(binding))
+                    if !binding.destinations.is_missing())
+        })
+    {
+        WIRE_VERSION_DESTINATION
+    } else if committed.is_some_and(|version| version >= WIRE_VERSION_RECOVERY_RUN)
         || wire.operations.as_ref().is_some_and(|section| {
             section.records.iter().any(|record| {
                 record
@@ -611,6 +689,8 @@ const ACCOUNTING_EXPIRY_TOOL: &str = "accounting_expiry_delivery";
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct AccountingExpiryRecord {
+    #[serde(default, skip_serializing_if = "StoredDestinations::is_missing")]
+    destinations: StoredDestinations,
     /// Deterministic digest of the committed scope, reservation, generation
     /// and disposition; see [`accounting_expiry_decision_id`].
     decision_id: String,
@@ -711,6 +791,7 @@ impl AccountingExpiryRecord {
             max_time: self.max_time,
             recorded_at_ledger: self.submission_ledger,
             decision_id: &self.decision_id,
+            destinations: self.destinations.project(),
         }
     }
 
@@ -735,6 +816,8 @@ impl AccountingExpiryRecord {
 /// confirmed record with no reservation to reconcile.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct WireRecord {
+    #[serde(default, skip_serializing_if = "StoredDestinations::is_missing")]
+    pub(super) destinations: StoredDestinations,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) signed_intent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -810,6 +893,7 @@ impl WireRecord {
     pub(super) fn confirmed_defaults() -> Self {
         Self {
             signed_intent: None,
+            destinations: StoredDestinations::Missing,
             chain_scope: None,
             submission_anchor: None,
             execution_bound: None,
@@ -841,6 +925,8 @@ impl WireRecord {
 /// reconciliation pass settles them together from one round trip.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubmissionHold {
+    /// Payment provenance for receipt reconstruction; it grants no authority.
+    pub destinations: PaymentDestinations,
     /// The authenticated network on which the debit is admitted.
     pub chain_scope: ChainScope,
     /// Independently checked provenance; absence never inherits a receipt's ledger.
@@ -1041,7 +1127,8 @@ pub(super) struct WireBucket {
 /// carries operation records, authorization links, dispositions and release
 /// rows, the admissible floors and the stored observation. Version 12 carries
 /// total-budget epochs and the retired digest. [`WIRE_VERSION_RECOVERY_RUN`]
-/// carries recovery runs.
+/// carries recovery runs at version 13. [`WIRE_VERSION_DESTINATION`] carries
+/// payment destination provenance at version 14.
 /// Optional fields
 /// preserve the serialized shape of legacy snapshots for integrity checks;
 /// missing network provenance refuses at the authenticated read boundary.
@@ -2586,6 +2673,10 @@ impl PersistedWindowStore {
             });
         }
         self.ensure_parent_dir()?;
+        #[cfg(test)]
+        if let Some(hook) = DESTINATION_BEFORE_LOCK.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
         let lock = WindowStoreLock::acquire_for_with_retry(
             &self.path,
             &profile.policy_window_state_key_id,
@@ -2645,6 +2736,7 @@ impl PersistedWindowStore {
                     None
                 },
                 signed_intent: signed_intent.map(str::to_owned),
+                destinations: (&reservation.destinations).into(),
                 ts_ms: entry.timestamp_ms(),
                 amount: entry.amount(),
                 chain_scope: Some(reservation.chain_scope),
@@ -4435,7 +4527,10 @@ impl PersistedWindowStore {
                     describe_json_error(&error)
                 ),
             })?;
-        if version.version > WIRE_VERSION_MAX {
+        let max_version = WIRE_VERSION_MAX;
+        #[cfg(test)]
+        let max_version = DESTINATION_READER_CAP.get().unwrap_or(max_version);
+        if version.version > max_version {
             return Err(WindowStoreError::UnsupportedVersion);
         }
         let value: serde_json::Value =
@@ -4765,9 +4860,14 @@ fn authenticated_scope(wire: &WireFile) -> Result<ChainScope, WindowStoreError> 
 /// dispositions, release rows, floors and the stored observation need
 /// version 11. Total-budget epochs, links, and the retired digest need
 /// version 12; see [`check_total_fields`].
-/// Recovery run objects need [`WIRE_VERSION_RECOVERY_RUN`].
+/// Recovery run objects need [`WIRE_VERSION_RECOVERY_RUN`] (13).
+/// Writes with destination fields select [`WIRE_VERSION_DESTINATION`] (14).
+/// Builds capped at 12 refuse version 13; builds capped at 13 refuse version 14.
 fn check_snapshot(wire: &WireFile) -> Result<(), WindowStoreError> {
-    if wire.version > WIRE_VERSION_MAX {
+    let max_version = WIRE_VERSION_MAX;
+    #[cfg(test)]
+    let max_version = DESTINATION_READER_CAP.get().unwrap_or(max_version);
+    if wire.version > max_version {
         return Err(WindowStoreError::UnsupportedVersion);
     }
     if wire.version < WIRE_VERSION_RECOVERY_RUN
@@ -5811,6 +5911,7 @@ fn reservation_from_receipt(
     Some(SubmissionHold {
         chain_scope: scope,
         id: receipt.envelope_hash,
+        destinations: receipt.destinations,
         tx_hash: receipt.tx_hash,
         source: receipt.source,
         sequence: receipt.sequence,
@@ -5860,13 +5961,14 @@ fn persist_receipt(
             if !restore {
                 return Ok(());
             }
-            store.try_begin(
+            store.try_begin_to(
                 &reservation.id,
                 &reservation.tx_hash,
                 &reservation.source,
                 reservation.sequence,
                 reservation.max_time,
                 reservation.submission_ledger,
+                &reservation.destinations,
             )?;
             store.mark_submitted(&reservation.id)?;
         }
@@ -5977,6 +6079,23 @@ pub(super) fn file_holds_id(wire: &WireFile, id: &str) -> bool {
             .any(|bucket| bucket.records.iter().any(|record| record.id == id))
 }
 
+/// Projects provenance only when every record of the reservation agrees.
+pub(super) fn reservation_destinations(wire: &WireFile, id: &str) -> PaymentDestinations {
+    let mut values = wire
+        .entries
+        .iter()
+        .flat_map(|bucket| &bucket.records)
+        .filter(|record| record.id == id)
+        .map(|record| &record.destinations);
+    let Some(first) = values.next() else {
+        return PaymentDestinations::None;
+    };
+    if values.any(|value| value != first) {
+        return PaymentDestinations::None;
+    }
+    first.project()
+}
+
 /// Collects one [`SubmissionHold`] per distinct pending reservation id,
 /// oldest first by the time the reservation was taken.
 fn collect_pending(wire: &WireFile) -> Result<Vec<SubmissionHold>, WindowStoreError> {
@@ -5994,6 +6113,7 @@ fn collect_pending(wire: &WireFile) -> Result<Vec<SubmissionHold>, WindowStoreEr
                     .chain_scope
                     .ok_or(WindowStoreError::ChainUnverifiable)?,
                 id: record.id.clone(),
+                destinations: reservation_destinations(wire, &record.id),
                 tx_hash: record.tx_hash.clone(),
                 source: record.source.clone(),
                 sequence: record.sequence,
@@ -6231,6 +6351,7 @@ fn expiry_record(
         return Err(refused("the accounting decision is already recorded"));
     }
     Ok(AccountingExpiryRecord {
+        destinations: (&reservation_destinations(wire, id)).into(),
         decision_id,
         chain_scope,
         reservation_id: id.to_owned(),
@@ -6715,12 +6836,12 @@ fn earlier_build(wire: &WireFile) -> bool {
 }
 
 /// Retires the total budget of an earlier build's snapshot `successor`
-/// under the pinned digest `pinned`, and moves it to version 12.
+/// under the pinned digest `pinned`, and moves it to the current write version.
 ///
 /// Rows and holds keep their fields; no epoch, link, or sum is inferred.
 /// The pinned digest admits no further total-budget debit, even when no
 /// total row remains. Returns `false` and changes nothing for a first run
-/// or a version 12 snapshot.
+/// or a snapshot at version 12 or higher.
 ///
 /// # Errors
 ///
@@ -6745,7 +6866,7 @@ pub(super) fn retire_earlier_build(
             }
         }
     }
-    successor.version = WIRE_VERSION_TOTAL_EPOCH;
+    successor.version = select_wire_version(successor, None);
     Ok(true)
 }
 
@@ -6874,6 +6995,12 @@ pub(crate) use tests::{
     COMMIT_FAULT_AFTER_COUNTER, COMMIT_FAULT_AFTER_PREPARED, COMMIT_FAULT_COMPACTION,
     arm_accounting_fault,
 };
+
+#[cfg(test)]
+thread_local! {
+    static DESTINATION_READER_CAP: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    static DESTINATION_BEFORE_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
 
 #[cfg(test)]
 mod tests {
@@ -7719,6 +7846,7 @@ mod tests {
                     )
                     .unwrap();
                 let hold = SubmissionHold {
+                    destinations: Default::default(),
                     chain_scope: plan.chain_scope(),
                     id: facts.envelope_hash,
                     tx_hash: facts.tx_hash,
@@ -8405,6 +8533,7 @@ mod tests {
                 .bind_signed_intent(&profile, exposure.intent_id().unwrap(), &facts, plan.legs())
                 .unwrap();
             let hold = SubmissionHold {
+                destinations: Default::default(),
                 chain_scope: plan.chain_scope(),
                 id: facts.envelope_hash.clone(),
                 tx_hash: facts.tx_hash,
@@ -8490,6 +8619,8 @@ mod tests {
         assert_eq!(views[0].expiry_observed_at_ms, None);
         assert_intent_totals(&reopened, &profile, 60, 1);
     }
+
+    include!("store_destination_tests.rs");
 
     fn progress_fixture() -> (
         TempDir,
@@ -9113,6 +9244,7 @@ mod tests {
                 .unwrap();
         }
         let hold = SubmissionHold {
+            destinations: Default::default(),
             chain_scope: plan.chain_scope(),
             id: facts.envelope_hash.clone(),
             tx_hash: facts.tx_hash.clone(),
@@ -9315,6 +9447,7 @@ mod tests {
             .bind_signed_intent(&profile, id, &facts, plan.legs())
             .unwrap();
         let hold = SubmissionHold {
+            destinations: Default::default(),
             chain_scope: plan.chain_scope(),
             id: facts.envelope_hash,
             tx_hash: facts.tx_hash,
@@ -9954,6 +10087,7 @@ mod tests {
             )
             .unwrap();
         let hold = SubmissionHold {
+            destinations: Default::default(),
             id: facts.envelope_hash.clone(),
             tx_hash: facts.tx_hash,
             source: plan.facts.envelope_source.clone(),
@@ -10812,6 +10946,7 @@ mod tests {
 
     fn reservation(id: &str, source: &str, sequence: i64, pending_since_ms: u64) -> SubmissionHold {
         SubmissionHold {
+            destinations: Default::default(),
             chain_scope: crate::policy_state::ChainScope::for_chain(
                 stellar_agent_core::profile::caip2::Caip2::Testnet,
             ),
@@ -16559,9 +16694,8 @@ mod tests {
         }
     }
 
-    /// A snapshot with an exposure-era status, accounting field or submission
-    /// anchor, and one with only confirmed and pending records, with or
-    /// without a claim, is written as version 12 and keeps its records.
+    /// Exposure fields, submission anchors, and claims keep their records
+    /// when a snapshot moves to the current write version.
     #[test]
     #[serial]
     fn wire_version_tracks_exposure_content_and_preserves_legacy_records() {
@@ -16654,6 +16788,7 @@ mod tests {
         anchored.content_digest = anchored.binding.content_digest();
         anchored.consumption = Some(ledger::ConsumptionBinding::Transaction(
             ledger::SubmissionBinding {
+                destinations: Default::default(),
                 chain_scope: Some(scope),
                 fee_bump: None,
                 envelope_hash: [2; 32],
@@ -16684,8 +16819,8 @@ mod tests {
                 let mut auth = authorization.clone();
                 auth.claimed_ms = claimed_ms;
                 wire.authorizations.push(auth);
-                // Every successor is version 12, whatever the content that
-                // selected `version` in the build before it.
+                // These fields select the current write version without
+                // a recovery run or destination provenance.
                 let _ = version;
                 let expected = WIRE_VERSION_TOTAL_EPOCH;
                 let (key, _) = f.store.load_or_mint_key(&f.profile).unwrap();
@@ -16711,7 +16846,7 @@ mod tests {
     /// read on both sides of the commit point: before the counter commits the
     /// successor, the current snapshot wins; after, the successor does, also
     /// when its compaction never happened. A commitment naming another body
-    /// refuses, and the next write uses version 12.
+    /// refuses, and the next write uses the current write version.
     #[test]
     #[serial]
     fn every_prepared_version_pair_survives_both_sides_of_the_commit_point() {
@@ -16835,7 +16970,7 @@ mod tests {
             let written = store.read_for_inspection(&profile).unwrap().unwrap();
             assert_eq!(
                 written.version, WIRE_VERSION_TOTAL_EPOCH,
-                "{pair}: the next write uses version 12"
+                "{pair}: the next write uses the current write version"
             );
         }
 
@@ -16997,8 +17132,8 @@ mod tests {
         store
             .commit_generation(&hmac_key, &gen_entry, original, wire)
             .unwrap();
-        // This build writes version 12; the fixture seals the earlier version
-        // its content held, as the earlier build wrote it.
+        // The writer selects the current write version. The fixture seals
+        // the legacy version required by its content.
         let mut sealed = store.read_for_inspection(&profile).unwrap().unwrap();
         sealed.version = if policy_authority {
             WIRE_VERSION_POLICY_AUTHORITY
@@ -17673,7 +17808,7 @@ mod tests {
     }
 
     /// A version 10 file loads, its first hydration retires it, and its next
-    /// commit moves it to version 12. Every earlier section keeps its bytes,
+    /// commit moves it to the current write version. Every earlier section keeps its bytes,
     /// and the new file reserializes to itself.
     #[test]
     #[serial]
@@ -17754,7 +17889,7 @@ mod tests {
     const V10_BODY: &str = r#"{"chain_scope":{"chain":"stellar:testnet","network_passphrase_sha256":[206,224,48,45,89,132,77,50,189,202,145,92,130,3,221,68,179,63,187,126,220,25,5,30,163,122,190,223,40,236,212,114]},"version":10,"generation":6,"entries":[{"scope_specificity":1,"bucket":"native","window_secs":60,"records":[{"chain_scope":{"chain":"stellar:testnet","network_passphrase_sha256":[206,224,48,45,89,132,77,50,189,202,145,92,130,3,221,68,179,63,187,126,220,25,5,30,163,122,190,223,40,236,212,114]},"execution_bound":61000,"accounting_until_ms":121000,"admitted_window_ms":60000,"ts_ms":1000,"amount":"300","id":"e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1","status":"accounting_expired","tx_hash":"abababababababababababababababababababababababababababababababab","source":"GSOURCE","sequence":9,"max_time":61,"pending_since_ms":1000,"submission_ledger":1000,"operator_required":false}]},{"scope_specificity":1,"bucket":"native","window_secs":86400,"records":[{"chain_scope":{"chain":"stellar:testnet","network_passphrase_sha256":[206,224,48,45,89,132,77,50,189,202,145,92,130,3,221,68,179,63,187,126,220,25,5,30,163,122,190,223,40,236,212,114]},"admitted_window_ms":86400000,"ts_ms":1000,"amount":"40","id":"e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2","status":"pending","tx_hash":"abababababababababababababababababababababababababababababababab","source":"GSOURCE","sequence":10,"max_time":0,"pending_since_ms":1000,"submission_ledger":1000,"operator_required":false},{"ts_ms":1000,"amount":"7","id":"","status":"confirmed","tx_hash":"","source":"","sequence":0,"max_time":0,"pending_since_ms":0,"submission_ledger":0,"operator_required":false}]}],"authorizations":[{"id":"3333333333333333333333333333333333333333333333333333333333333333","profile":"intent","chain":"stellar:testnet","domain":"transaction","consumer":"cli_pay","content_digest":"56c7962e9f26b46fb66d793017822eee1603519e00a855341729cf18af15e3c4","binding":{"transaction":{"unsigned_envelope_sha256":"3131313131313131313131313131313131313131313131313131313131313131","tx_hash":"3232323232323232323232323232323232323232323232323232323232323232","source":"GSOURCE","sequence":11}},"state":"open","minted_ms":1000,"expires_ms":604801000,"policy_sequence":1,"policy_digest":"0101010101010101010101010101010101010101010101010101010101010101","approval_nonce":"intent-open","approval_expires_ms":604801000,"bindings_digest":"0202020202020202020202020202020202020202020202020202020202020202","entries_digest":"0303030303030303030303030303030303030303030303030303030303030303","reservation":"3333333333333333333333333333333333333333333333333333333333333333"},{"id":"3434343434343434343434343434343434343434343434343434343434343434","profile":"intent","chain":"stellar:testnet","domain":"soroban","consumer":"x402_create","content_digest":"f1b00da714f0136828d068f4e590ae41d9fb5c8a48c6a17d57e26ba3472470a9","binding":{"soroban":{"intent_digest":"3434343434343434343434343434343434343434343434343434343434343434"}},"state":"expired","minted_ms":1,"expires_ms":2,"settled_ms":1000,"policy_sequence":1,"policy_digest":"0101010101010101010101010101010101010101010101010101010101010101","policy_authority":{"policy_digest":"0101010101010101010101010101010101010101010101010101010101010101","policy_sequence":1,"rule_index":2,"evaluated_at_ms":1000,"governing_until_ms":604801000,"scope":{"kind":"classic"}},"bindings_digest":"0202020202020202020202020202020202020202020202020202020202020202","entries_digest":"0303030303030303030303030303030303030303030303030303030303030303"}],"holds":[{"kind":"value","authorization_id":"3333333333333333333333333333333333333333333333333333333333333333","ordinal":0,"scope_specificity":1,"bucket":"native","window_secs":60,"ts_ms":1000,"amount":"5"}],"accounting_expiries":[{"decision_id":"ea04d2a485346305476b280cb76a286baed3c8c9f17e009787d64f3f459ecb46","chain_scope":{"chain":"stellar:testnet","network_passphrase_sha256":[206,224,48,45,89,132,77,50,189,202,145,92,130,3,221,68,179,63,187,126,220,25,5,30,163,122,190,223,40,236,212,114]},"reservation_id":"e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1","tx_hash":"abababababababababababababababababababababababababababababababab","source":"GSOURCE","sequence":9,"max_time":61,"submission_ledger":1000,"generation":3,"disposition":"accounting_expired","observed_at_ms":121001,"accounting_until_ms":121000,"audit_acknowledged":false,"receipt_projected":false}],"signed_intents":[{"intent_id":"intent-79667c951988be5ebd0459cab17b3740b1760c626a00b90f7130e54f660af593","chain_scope":{"chain":"stellar:testnet","network_passphrase_sha256":[206,224,48,45,89,132,77,50,189,202,145,92,130,3,221,68,179,63,187,126,220,25,5,30,163,122,190,223,40,236,212,114]},"auth_address":"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF","envelope_source":"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF","envelope_sequence":1,"host_invocation_sha256":"0fa70075b4842d7358994728d5dba7bf6d1a96097a8d47c8f9e8619aa81253d7","subjects":[],"greatest_expiration_ledger":100,"purpose":"Invoke","envelope_max_ledger":100,"admitted_window_ms":60000,"legs":[{"scope_specificity":1,"bucket":"native","window_secs":60,"ts_ms":1000,"amount":"60"},{"scope_specificity":1,"bucket":"rate_limit","window_secs":60,"ts_ms":1000,"amount":"1"}],"admitted_at_ms":1000,"generation":1,"status":"Exposed","cancel_token_sha256":"6671ee70c5900cde7c80bcc619eda2cdf986367950c09541ffaa7cb47d2721ca"}]}"#;
 
     /// The version 10 body loads, reserializes byte for byte, and moves to
-    /// version 12 with its next commit, keeping every earlier section byte
+    /// the current write version with its next commit, keeping every earlier section byte
     /// for byte.
     #[test]
     #[serial]
@@ -17831,7 +17966,7 @@ mod tests {
         assert_reserializes_byte_identically(&store, &profile);
     }
 
-    /// Every writer selects version 12, with or without native amounts, a
+    /// Every writer selects the current write version, with or without native amounts, a
     /// policy authority, or operation content. Native amounts below version
     /// 10 refuse, and the amounts survive an operation write.
     #[test]
@@ -17888,8 +18023,8 @@ mod tests {
         assert_reserializes_byte_identically(&store, &profile);
     }
 
-    /// A mainnet file holding authenticated history stays at version 12 with
-    /// its first operation and keeps that history byte for byte. A file
+    /// A mainnet file's first operation keeps its authenticated history
+    /// byte for byte at the current write version. A file
     /// without authenticated scope refuses the operation write and stays
     /// unchanged.
     #[test]
@@ -18074,7 +18209,7 @@ mod tests {
         }
     }
 
-    /// A commit with or without version-11 content selects version 12 on
+    /// A commit with or without version-11 content selects the current write version on
     /// both version selections.
     #[test]
     #[serial]
@@ -19090,6 +19225,7 @@ mod tests {
         auth.content_digest = auth.binding.content_digest();
         auth.consumption = Some(ledger::ConsumptionBinding::Transaction(
             ledger::SubmissionBinding {
+                destinations: Default::default(),
                 chain_scope: Some(scope),
                 fee_bump: None,
                 envelope_hash: [2; 32],
@@ -20201,7 +20337,7 @@ mod tests {
         // ── reset ────────────────────────────────────────────────────────
 
         /// A reset fixture holding a tagged total row of 6 under D1, with D2
-        /// retired, at version 12.
+        /// retired, at the current write version.
         fn total_reset_fixture() -> (ResetFixture, WireBucket) {
             let f = ResetFixture::new();
             let mut wire = reset_wire();

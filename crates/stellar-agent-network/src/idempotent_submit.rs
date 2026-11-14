@@ -94,7 +94,7 @@ use sha2::{Digest as _, Sha256};
 use stellar_agent_core::envelope_decode::TRANSACTION_ENVELOPE_XDR_FORM;
 use stellar_agent_core::error::{NetworkError, ProtocolError, SubmissionError, WalletError};
 use stellar_agent_core::profile::receipt::{
-    BeginOutcome, ReceiptStatus, ReceiptStore, SubmissionReceipt,
+    BeginOutcome, PaymentDestinations, ReceiptStatus, ReceiptStore, SubmissionReceipt,
 };
 use stellar_rpc_client::GetHealthResponse;
 use stellar_xdr::{Limits, Preconditions, ReadXdr, TransactionEnvelope};
@@ -225,6 +225,7 @@ pub async fn submit_transaction_idempotent(
     let tx_hash_hex = compute_tx_hash_hex(&envelope, network_passphrase)?;
     let (source, sequence) = crate::submit::replay_identity(&envelope)?;
     let max_time = extract_max_time(&envelope);
+    let destinations = crate::submit::payment_destinations(&envelope);
 
     let redacted = redact_envelope_hash(&envelope_hash);
     tracing::debug!(
@@ -295,6 +296,7 @@ pub async fn submit_transaction_idempotent(
             network_passphrase,
             max_time,
             recorded_at_ledger,
+            &destinations,
         )
         .await;
     }
@@ -308,7 +310,7 @@ pub async fn submit_transaction_idempotent(
             sequence,
             max_time,
             recorded_at_ledger,
-            crate::submit::muxed_payment_destination(&envelope).as_deref(),
+            &destinations,
         )
         .map_err(|e| {
             WalletError::Internal(stellar_agent_core::error::InternalError::UnexpectedState {
@@ -316,6 +318,14 @@ pub async fn submit_transaction_idempotent(
             })
         })?;
 
+    #[cfg(test)]
+    if DESTINATION_CLAIM_STOP.replace(false) {
+        return Err(WalletError::Internal(
+            stellar_agent_core::error::InternalError::UnexpectedState {
+                detail: "interrupted receipt claim".to_owned(),
+            },
+        ));
+    }
     match outcome {
         BeginOutcome::Winner => {
             tracing::info!(
@@ -331,6 +341,7 @@ pub async fn submit_transaction_idempotent(
                 &envelope_hash,
                 recorded_at_ledger,
                 max_time,
+                &destinations,
             )
             .await
         }
@@ -534,6 +545,7 @@ async fn handle_stale_pending(
     network_passphrase: &str,
     max_time: u64,
     recorded_at_ledger: u32,
+    destinations: &PaymentDestinations,
 ) -> Result<SubmissionResult, WalletError> {
     // Belt-and-braces: if the stored tx_hash is the all-zeros sentinel, the
     // true hash is unknown.  Never resubmit — return Ambiguous immediately.
@@ -545,7 +557,9 @@ async fn handle_stale_pending(
             "submit_transaction_idempotent: stale Pending with unknown tx_hash; \
              cannot poll getTransaction; finalising Ambiguous"
         );
-        if let Err(e) = store.finalize(envelope_hash, ReceiptStatus::Ambiguous, None) {
+        if let Err(e) =
+            store.finalize_to(envelope_hash, ReceiptStatus::Ambiguous, None, destinations)
+        {
             tracing::warn!(
                 envelope_hash = %redact_envelope_hash(envelope_hash),
                 error = %e,
@@ -575,7 +589,12 @@ async fn handle_stale_pending(
         "SUCCESS" => {
             let ledger = record.ledger().unwrap_or(0);
             store
-                .finalize(envelope_hash, ReceiptStatus::Success, Some(ledger))
+                .finalize_to(
+                    envelope_hash,
+                    ReceiptStatus::Success,
+                    Some(ledger),
+                    destinations,
+                )
                 .map_err(|e| {
                     WalletError::Internal(
                         stellar_agent_core::error::InternalError::UnexpectedState {
@@ -607,10 +626,11 @@ async fn handle_stale_pending(
                 "handle_stale_pending: getTransaction=FAILED; finalising Failed"
             );
             store
-                .finalize(
+                .finalize_to(
                     envelope_hash,
                     ReceiptStatus::Failed { code },
                     record.ledger(),
+                    destinations,
                 )
                 .map_err(|e| {
                     WalletError::Internal(
@@ -630,7 +650,7 @@ async fn handle_stale_pending(
                     "submit_transaction_idempotent: stale Pending + NOT_FOUND + max_time elapsed; finalising Ambiguous"
                 );
                 store
-                    .finalize(envelope_hash, ReceiptStatus::Ambiguous, None)
+                    .finalize_to(envelope_hash, ReceiptStatus::Ambiguous, None, destinations)
                     .map_err(|e| {
                         WalletError::Internal(
                             stellar_agent_core::error::InternalError::UnexpectedState {
@@ -669,6 +689,7 @@ async fn handle_stale_pending(
                 envelope_hash,
                 recorded_at_ledger,
                 max_time,
+                destinations,
             )
             .await
         }
@@ -702,6 +723,7 @@ async fn submit_as_winner(
     envelope_hash: &str,
     recorded_at_ledger: u32,
     max_time: u64,
+    destinations: &PaymentDestinations,
 ) -> Result<SubmissionResult, WalletError> {
     // Use the retention-aware poll loop so we detect retention-window closure.
     // submit_with_retention_poll finalises the receipt internally (Success,
@@ -716,6 +738,7 @@ async fn submit_as_winner(
         envelope_hash,
         recorded_at_ledger,
         max_time,
+        destinations,
     )
     .await
 }
@@ -965,6 +988,7 @@ pub(crate) async fn submit_with_retention_poll(
     envelope_hash: &str,
     recorded_at_ledger: u32,
     max_time: u64,
+    destinations: &PaymentDestinations,
 ) -> Result<SubmissionResult, WalletError> {
     use stellar_xdr::Hash;
 
@@ -1047,6 +1071,7 @@ pub(crate) async fn submit_with_retention_poll(
                 || client.get_transaction_record(&tx_hash_obj),
                 || client.get_health(),
                 RetentionPoll {
+                    destinations,
                     store,
                     url: &client.url,
                     envelope_hash,
@@ -1150,6 +1175,7 @@ const FINAL_RETENTION_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// What [`poll_with_retention`] needs besides its two reads.
 struct RetentionPoll<'a> {
+    destinations: &'a PaymentDestinations,
     /// The store holding the submission's receipt.
     store: &'a ReceiptStore,
     /// The endpoint, for error construction; redacted before use.
@@ -1207,6 +1233,7 @@ where
     HF: std::future::Future<Output = Result<GetHealthResponse, NetworkError>>,
 {
     let RetentionPoll {
+        destinations,
         store,
         url,
         envelope_hash,
@@ -1219,6 +1246,7 @@ where
     let redacted = redact_envelope_hash(envelope_hash);
     let redacted_tx = redact_tx_hash(&tx_hash_hex);
     let at_deadline = DeadlineExit {
+        destinations,
         store,
         url,
         envelope_hash,
@@ -1282,8 +1310,12 @@ where
                     ledger,
                     "submit_with_retention_poll: confirmed SUCCESS"
                 );
-                if let Err(e) = store.finalize(envelope_hash, ReceiptStatus::Success, Some(ledger))
-                {
+                if let Err(e) = store.finalize_to(
+                    envelope_hash,
+                    ReceiptStatus::Success,
+                    Some(ledger),
+                    destinations,
+                ) {
                     tracing::warn!(
                         envelope_hash = %redacted,
                         error = %e,
@@ -1314,8 +1346,12 @@ where
                     error = %err,
                     "submit_with_retention_poll: transaction failed on-chain"
                 );
-                if let Err(e) = store.finalize(envelope_hash, ReceiptStatus::Failed { code }, None)
-                {
+                if let Err(e) = store.finalize_to(
+                    envelope_hash,
+                    ReceiptStatus::Failed { code },
+                    None,
+                    destinations,
+                ) {
                     tracing::warn!(
                         envelope_hash = %redacted,
                         error = %e,
@@ -1337,9 +1373,12 @@ where
                             "submit_with_retention_poll: NOT_FOUND + outside retention \
                              window; finalising Ambiguous"
                         );
-                        if let Err(e) =
-                            store.finalize(envelope_hash, ReceiptStatus::Ambiguous, None)
-                        {
+                        if let Err(e) = store.finalize_to(
+                            envelope_hash,
+                            ReceiptStatus::Ambiguous,
+                            None,
+                            destinations,
+                        ) {
                             tracing::warn!(
                                 envelope_hash = %redacted,
                                 error = %e,
@@ -1373,6 +1412,7 @@ where
 
 /// What a retention poll needs to settle at its deadline.
 struct DeadlineExit<'a> {
+    destinations: &'a PaymentDestinations,
     store: &'a ReceiptStore,
     url: &'a RpcEndpoint,
     envelope_hash: &'a str,
@@ -1400,6 +1440,7 @@ impl DeadlineExit<'_> {
         HF: std::future::Future<Output = Result<GetHealthResponse, NetworkError>>,
     {
         let Self {
+            destinations,
             store,
             url,
             envelope_hash,
@@ -1418,7 +1459,9 @@ impl DeadlineExit<'_> {
                 "submit_with_retention_poll: timeout during poll error; \
                  finalising Ambiguous"
             );
-            if let Err(fe) = store.finalize(envelope_hash, ReceiptStatus::Ambiguous, None) {
+            if let Err(fe) =
+                store.finalize_to(envelope_hash, ReceiptStatus::Ambiguous, None, destinations)
+            {
                 tracing::warn!(
                     envelope_hash = %redacted,
                     error = %fe,
@@ -1444,7 +1487,9 @@ impl DeadlineExit<'_> {
                     "submit_with_retention_poll: timeout + outside retention window; \
                      finalising Ambiguous"
                 );
-                if let Err(e) = store.finalize(envelope_hash, ReceiptStatus::Ambiguous, None) {
+                if let Err(e) =
+                    store.finalize_to(envelope_hash, ReceiptStatus::Ambiguous, None, destinations)
+                {
                     tracing::warn!(
                         envelope_hash = %redacted,
                         error = %e,
@@ -1474,7 +1519,9 @@ impl DeadlineExit<'_> {
                     "submit_with_retention_poll: timeout while within retention \
                      window; finalising Ambiguous (not Failed)"
                 );
-                if let Err(e) = store.finalize(envelope_hash, ReceiptStatus::Ambiguous, None) {
+                if let Err(e) =
+                    store.finalize_to(envelope_hash, ReceiptStatus::Ambiguous, None, destinations)
+                {
                     tracing::warn!(
                         envelope_hash = %redacted,
                         error = %e,
@@ -2015,6 +2062,11 @@ fn hex_to_hash32(hex: &str) -> Result<[u8; 32], WalletError> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+thread_local! {
+    static DESTINATION_CLAIM_STOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
 mod tests {
     #![allow(
         clippy::unwrap_used,
@@ -2330,6 +2382,7 @@ mod tests {
             &envelope_hash,
             0,
             100,
+            &PaymentDestinations::None,
         )
         .await;
 
@@ -2361,6 +2414,7 @@ mod tests {
             &envelope_hash,
             0,
             100,
+            &PaymentDestinations::None,
         )
         .await;
 
@@ -2535,6 +2589,7 @@ mod tests {
             "Test SDF Network ; September 2015",
             0,
             100,
+            &PaymentDestinations::None,
         )
         .await;
 
@@ -2597,6 +2652,7 @@ mod tests {
             "Test SDF Network ; September 2015",
             0,
             100,
+            &PaymentDestinations::None,
         )
         .await;
 
@@ -2618,6 +2674,88 @@ mod tests {
     }
 
     // ── Retention poll deadline ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn idempotent_and_fee_bump_receipts_keep_their_destination() {
+        use stellar_xdr::WriteXdr as _;
+        let envelope = crate::submit::destination_tests::differing_envelope();
+        let destinations = crate::submit::destination_tests::destination_provenance();
+        let xdr = envelope.to_xdr_base64(Limits::none()).unwrap();
+        let (_dir, store) = open_temp_store();
+        let client = StellarRpcClient::new(ENDPOINT).unwrap();
+        DESTINATION_CLAIM_STOP.set(true);
+        assert!(
+            submit_transaction_idempotent(
+                &client,
+                &xdr,
+                Duration::from_secs(1),
+                stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+                &store,
+                100
+            )
+            .await
+            .is_err()
+        );
+        assert!(!DESTINATION_CLAIM_STOP.get());
+        let hash = crate::submit::envelope_hash_hex(&xdr);
+        assert_eq!(
+            store.get(&hash).unwrap().unwrap().destinations,
+            destinations
+        );
+        store
+            .finalize_to(&hash, ReceiptStatus::Success, Some(101), &destinations)
+            .unwrap();
+        for _ in 0..2 {
+            let result = submit_transaction_idempotent(
+                &client,
+                &xdr,
+                Duration::from_secs(1),
+                stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+                &store,
+                100,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.ledger, 101);
+            assert_eq!(
+                store.get(&hash).unwrap().unwrap().destinations,
+                destinations
+            );
+        }
+        for status in ["SUCCESS", "FAILED", "NOT_FOUND"] {
+            let fixture = PendingReceipt::new();
+            let file = fixture.store.file_path().unwrap();
+            let poll = RetentionPoll {
+                destinations: &destinations,
+                ..fixture.poll(tokio::time::Instant::now() + Duration::from_secs(1))
+            };
+            let result = poll_with_retention(
+                || {
+                    std::fs::write(&file, b"{}").unwrap();
+                    std::future::ready(Ok(crate::poll_test_support::answer(status)))
+                },
+                || {
+                    std::future::ready(Ok(GetHealthResponse {
+                        oldest_ledger: 150,
+                        ..within_window_health()
+                    }))
+                },
+                poll,
+            )
+            .await;
+            assert_eq!(result.is_ok(), status == "SUCCESS");
+            let receipt = fixture.store.get(&fixture.envelope_hash).unwrap().unwrap();
+            assert_eq!(receipt.destinations, destinations, "{status}");
+            assert_eq!(
+                receipt.status.label(),
+                match status {
+                    "SUCCESS" => "success",
+                    "FAILED" => "failed",
+                    _ => "ambiguous",
+                }
+            );
+        }
+    }
 
     /// A `getHealth` answer whose window still covers ledger 100.
     fn within_window_health() -> GetHealthResponse {
@@ -2660,6 +2798,7 @@ mod tests {
         /// timeout that ends at `deadline`.
         fn poll(&self, deadline: tokio::time::Instant) -> RetentionPoll<'_> {
             RetentionPoll {
+                destinations: &PaymentDestinations::None,
                 store: &self.store,
                 url: &self.endpoint,
                 envelope_hash: &self.envelope_hash,

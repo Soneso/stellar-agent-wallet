@@ -572,6 +572,7 @@ async fn recovery_mainnet_legacy_stage_settles_nothing_and_testnet_is_unchanged(
         let fx = Fixture::new(0);
         let source = account_id_for_seed([1; 32]);
         let hold = SubmissionHold {
+            destinations: Default::default(),
             chain_scope: ChainScope::for_chain(fx.profile.chain_id),
             id: "b5".repeat(32),
             tx_hash: "b5".repeat(32),
@@ -637,6 +638,7 @@ async fn recovery_mainnet_legacy_stage_settles_nothing_and_testnet_is_unchanged(
             .build();
     let window = PersistedWindowStore::at_path(dir.path().join("testnet.window"));
     let hold = SubmissionHold {
+        destinations: Default::default(),
         chain_scope: ChainScope::for_chain(profile.chain_id),
         id: "e5".repeat(32),
         tx_hash: "e5".repeat(32),

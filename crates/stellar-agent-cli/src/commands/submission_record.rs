@@ -1735,6 +1735,7 @@ mod tests {
             let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
             let since = now - stellar_agent_network::policy_state::RECONCILE_MIN_AGE_MS;
             let hold = stellar_agent_network::policy_state::SubmissionHold {
+                destinations: Default::default(),
                 chain_scope: stellar_agent_network::policy_state::ChainScope::for_chain(
                     self.profile.chain_id,
                 ),

@@ -264,10 +264,9 @@ struct ClearData {
     cleared_from: String,
     /// Whether a spending-window reservation was released.
     reservation_released: bool,
-    /// The full muxed `M...` payment destination the receipt records.
-    /// Absent for every other receipt.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    destination: Option<String>,
+    /// Complete payment provenance carried by the receipt.
+    #[serde(flatten)]
+    destinations: stellar_agent_core::profile::receipt::DestinationFields,
 }
 
 /// Runs the `tx receipt` subcommand group.
@@ -629,6 +628,7 @@ async fn run_clear(args: &ClearArgs) -> i32 {
             held.sequence,
             held.max_time,
             held.submission_ledger,
+            &held.destinations,
         ) {
             Ok(record) if clearable(&record.status, Some(held)) => {}
             Ok(_) => {
@@ -894,7 +894,9 @@ fn record_and_mark_clear_with(
         tx_hash_redacted,
         cleared_from,
         reservation_released,
-        destination: receipt.destination.clone(),
+        destinations: stellar_agent_core::profile::receipt::DestinationFields(
+            receipt.destinations.clone(),
+        ),
     })
 }
 
@@ -1481,6 +1483,47 @@ mod tests {
 
     use super::*;
     use crate::common::profile_access::ProfileOrigin;
+
+    #[test]
+    fn receipt_views_show_every_destination() {
+        use stellar_agent_core::profile::receipt::PaymentDestinations;
+        for destinations in super::super::status::destination_shapes() {
+            let dir = tempfile::tempdir().expect("directory");
+            let store = ReceiptStore::open_at(dir.path(), "view").expect("store");
+            store
+                .try_begin_to("a", "b", "", 1, 0, 1, &destinations)
+                .expect("claim");
+            let receipt = store.get("a").expect("read").expect("receipt");
+            let data = record_and_mark_clear_with(
+                "view",
+                None,
+                &store,
+                &receipt,
+                None,
+                false,
+                false,
+                ClearMark::Unheld,
+                "stellar:testnet",
+                || Ok(()),
+            )
+            .expect("clear");
+            let value = serde_json::to_value(data).expect("view");
+            match destinations {
+                PaymentDestinations::None => {
+                    assert!(value.get("destination").is_none());
+                    assert!(value.get("destinations").is_none());
+                }
+                PaymentDestinations::Single(destination) => {
+                    assert_eq!(value["destination"], destination);
+                    assert!(value.get("destinations").is_none());
+                }
+                PaymentDestinations::PerOperation(entries) => {
+                    assert_eq!(value["destinations"], serde_json::json!(entries));
+                    assert!(value.get("destination").is_none());
+                }
+            }
+        }
+    }
 
     /// Records the clear with no accounting transition, for the tests of the
     /// clear row and the mark; see [`record_and_mark_clear_with`].
@@ -2314,6 +2357,7 @@ mod tests {
     /// The reservation the window holds for `receipt`.
     fn held_for(receipt: &SubmissionReceipt) -> SubmissionHold {
         SubmissionHold {
+            destinations: Default::default(),
             chain_scope: stellar_agent_network::policy_state::ChainScope::for_chain(
                 stellar_agent_core::profile::caip2::Caip2::Testnet,
             ),
@@ -2832,6 +2876,14 @@ mod tests {
         /// Records a sent submission with time bound `max_time`: its receipt
         /// and its reservation in the spending window.
         fn seed_submission(fixture: &MainnetFixture, max_time: u64) {
+            seed_submission_to(fixture, max_time, Default::default());
+        }
+
+        fn seed_submission_to(
+            fixture: &MainnetFixture,
+            max_time: u64,
+            destinations: stellar_agent_core::profile::receipt::PaymentDestinations,
+        ) {
             let profile = fixture.profile();
             let source =
                 stellar_agent_test_support::signed_envelope::account_id_for_seed(AGENT_SEED);
@@ -2855,6 +2907,7 @@ mod tests {
                         },
                     )],
                     &SubmissionHold {
+                        destinations,
                         chain_scope: stellar_agent_network::policy_state::ChainScope::for_chain(
                             profile.chain_id,
                         ),
@@ -3806,6 +3859,36 @@ mod tests {
                 &window,
                 &receipt_file,
                 &readable,
+            );
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_cleared_orphan_restores_its_destination() {
+            let fixture = Spec::new("destination-orphan")
+                .testnet()
+                .primary(testnet_past_retention())
+                .build()
+                .await;
+            let destinations = super::super::super::status::destination_shapes()
+                .pop()
+                .expect("list");
+            seed_submission_to(&fixture, now_secs() - 10, destinations.clone());
+            let receipts = ReceiptStore::open(fixture.name).expect("store");
+            std::fs::write(receipts.file_path().expect("file"), b"{}").expect("lost receipt");
+            let (code, value) = clear(&fixture, false).await;
+            assert_eq!(code, 0, "{value}");
+            assert_eq!(
+                receipts
+                    .get(ENVELOPE_HASH)
+                    .expect("read")
+                    .expect("receipt")
+                    .destinations,
+                destinations
+            );
+            assert_eq!(
+                value["data"]["destinations"],
+                destinations.to_stored().expect("list")
             );
         }
 

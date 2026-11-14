@@ -130,6 +130,7 @@ fn gate(engine: &PolicyEngineV1, profile: &Profile, amount: i128, now: u64) -> D
 
 fn hold(n: u8) -> SubmissionHold {
     SubmissionHold {
+        destinations: Default::default(),
         chain_scope: ChainScope::for_chain(Caip2::Testnet),
         submission_anchor: None,
         id: format!("{n:02x}").repeat(32),

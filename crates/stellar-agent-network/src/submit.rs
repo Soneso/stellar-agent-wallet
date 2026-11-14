@@ -56,6 +56,7 @@
 //! The retry layer applies bounded exponential backoff for transient failures.
 
 use std::time::Duration;
+use stellar_agent_core::profile::receipt::{OperationDestination, PaymentDestinations};
 
 use serde::{Deserialize, Serialize};
 use stellar_agent_core::envelope_decode::TRANSACTION_ENVELOPE_XDR_FORM;
@@ -788,7 +789,7 @@ async fn submit_unauthorized(
                 submission_ledger,
                 submission_anchor: None,
                 send_by_ms: send_by.map(|send_by| send_by.unix_ms),
-                destination: muxed_payment_destination(envelope),
+                destinations: payment_destinations(envelope),
             };
 
             // The record is written before the send, so a submission whose
@@ -1080,7 +1081,7 @@ pub(crate) async fn authorized_submission(
                 submission_ledger,
                 submission_anchor,
                 send_by_ms: Some(send_by.unix_ms),
-                destination: muxed_payment_destination(envelope),
+                destinations: payment_destinations(envelope),
             };
             let authorization_id = authorization.id();
 
@@ -2206,32 +2207,59 @@ pub(crate) fn replay_identity(
     ))
 }
 
-/// The full `M...` destination of a one-operation payment envelope, or `None`
-/// for a plain destination and every other envelope.
+#[cfg(test)]
+#[path = "submit_destination_tests.rs"]
+pub(crate) mod destination_tests;
+
+/// Every payment operation's complete destination and transaction index.
 ///
-/// A fee-bump's destination is its inner transaction's.
-pub(crate) fn muxed_payment_destination(envelope: &TransactionEnvelope) -> Option<String> {
+/// Fee bumps read their inner transaction. Legacy envelopes return an empty list.
+#[must_use]
+pub fn payment_operation_destinations(envelope: &TransactionEnvelope) -> Vec<OperationDestination> {
     let tx = match envelope {
         TransactionEnvelope::Tx(v1) => &v1.tx,
         TransactionEnvelope::TxFeeBump(fb) => {
             let stellar_xdr::FeeBumpTransactionInnerTx::Tx(inner) = &fb.tx.inner_tx;
             &inner.tx
         }
-        TransactionEnvelope::TxV0(_) => return None,
+        TransactionEnvelope::TxV0(_) => return Vec::new(),
     };
-    let [operation] = tx.operations.as_slice() else {
-        return None;
-    };
-    let destination = match &operation.body {
-        stellar_xdr::OperationBody::Payment(op) => &op.destination,
-        stellar_xdr::OperationBody::PathPaymentStrictReceive(op) => &op.destination,
-        stellar_xdr::OperationBody::PathPaymentStrictSend(op) => &op.destination,
-        _ => return None,
-    };
-    match destination {
-        stellar_xdr::MuxedAccount::MuxedEd25519(_) => Some(destination.to_string()),
-        stellar_xdr::MuxedAccount::Ed25519(_) => None,
+    tx.operations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, operation)| {
+            let destination = match &operation.body {
+                stellar_xdr::OperationBody::Payment(op) => &op.destination,
+                stellar_xdr::OperationBody::PathPaymentStrictReceive(op) => &op.destination,
+                stellar_xdr::OperationBody::PathPaymentStrictSend(op) => &op.destination,
+                _ => return None,
+            };
+            Some(OperationDestination {
+                operation: u32::try_from(index).ok()?,
+                destination: destination.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Payment provenance for shared muxed destinations or differing payment destinations.
+#[must_use]
+pub fn payment_destinations(envelope: &TransactionEnvelope) -> PaymentDestinations {
+    let entries = payment_operation_destinations(envelope);
+    if !entries
+        .iter()
+        .any(|entry| entry.destination.starts_with('M'))
+    {
+        return PaymentDestinations::None;
     }
+    if let Some(first) = entries.first()
+        && entries
+            .iter()
+            .all(|entry| entry.destination == first.destination)
+    {
+        return PaymentDestinations::Single(first.destination.clone());
+    }
+    PaymentDestinations::PerOperation(entries)
 }
 
 /// `SHA-256` over the signed envelope XDR, the identity of these exact bytes.
@@ -3117,7 +3145,7 @@ mod tests {
             submission_ledger: 1,
             submission_anchor: None,
             send_by_ms: None,
-            destination: None,
+            destinations: Default::default(),
         }
     }
 

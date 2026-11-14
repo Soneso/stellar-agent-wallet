@@ -5038,6 +5038,7 @@ impl CompetingReservationResponder {
                 &self.profile,
                 &[entry],
                 &SubmissionHold {
+                    destinations: Default::default(),
                     chain_scope: stellar_agent_network::policy_state::ChainScope::for_chain(
                         self.profile.chain_id,
                     ),

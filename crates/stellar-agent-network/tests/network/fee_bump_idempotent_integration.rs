@@ -1029,5 +1029,8 @@ async fn fee_bump_idempotent_receipt_keeps_the_inner_muxed_destination() {
     assert_eq!(sends, 1, "the repeated request sends nothing");
     let receipt = store.get(&inner_key).unwrap().unwrap();
     assert_eq!(receipt.status, ReceiptStatus::Success);
-    assert_eq!(receipt.destination.as_deref(), Some(destination.as_str()));
+    assert_eq!(
+        receipt.destinations,
+        stellar_agent_core::profile::receipt::PaymentDestinations::Single(destination.clone())
+    );
 }

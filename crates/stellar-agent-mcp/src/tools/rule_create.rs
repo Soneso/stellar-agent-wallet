@@ -1631,24 +1631,27 @@ impl WalletServer {
         drop(spent_lock);
 
         let proposal_digest_hex = stellar_agent_core::hex::encode(&recomputed_digest);
-        match store.consume(
-            &args.approval_nonce,
-            &proposal_digest_hex,
-            stellar_agent_core::approval::ConsumedOutcome::Unknown,
-        ) {
+        let mut consume = || {
+            store.consume(
+                &args.approval_nonce,
+                &proposal_digest_hex,
+                stellar_agent_core::approval::ConsumedOutcome::Unknown,
+            )
+        };
+        #[cfg(any(test, feature = "test-helpers"))]
+        let consumed = CONSUME_REFUSAL
+            .with(|fault| fault.borrow_mut().take())
+            .map_or_else(&mut consume, Err);
+        #[cfg(not(any(test, feature = "test-helpers")))]
+        let consumed = consume();
+        match consumed {
             Ok(true) => {}
             Ok(false) => {
                 return Ok(approval_required_indistinguishable(
                     &self.profile_name_for_approval(),
                 ));
             }
-            Err(e) => {
-                let err = stellar_agent_core::approval::attest::record_error(&e);
-                return Ok(crate::tools::common::business_error_result(
-                    err.code(),
-                    err.to_string(),
-                ));
-            }
+            Err(e) => return Ok(consume_refusal(&e)),
         }
         // Release the store lock before the install's network round trips.
         drop(store);
@@ -1799,6 +1802,16 @@ impl WalletServer {
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests: arg schema round-trips + grammar parsing
 // ─────────────────────────────────────────────────────────────────────────────
+
+fn consume_refusal(error: &stellar_agent_core::approval::ApprovalError) -> CallToolResult {
+    let error = stellar_agent_core::approval::attest::record_error(error);
+    crate::tools::common::business_error_result(error.code(), error.to_string())
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+thread_local! {
+    static CONSUME_REFUSAL: std::cell::RefCell<Option<stellar_agent_core::approval::ApprovalError>> = const { std::cell::RefCell::new(None) };
+}
 
 #[cfg(test)]
 mod tests {
@@ -3398,6 +3411,32 @@ mod tests {
         let record = Arc::new(InMemoryRuleApprovalSpentStore::default());
         server.rule_approval_spent_store_override = Some(record.clone());
         (server, args, store_path, record)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn approve_reports_the_store_refusal_code() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = FirstContactRpc::start();
+        let (server, args, _, _) = attested_commit_with_memory_record(dir.path(), rpc.uri()).await;
+        CONSUME_REFUSAL.with(|fault| {
+            *fault.borrow_mut() = Some(stellar_agent_core::approval::ApprovalError::WrongKind {
+                expected: "RuleProposalSimulated",
+                actual: "PaymentSimulated",
+            })
+        });
+        let result = server.call_stellar_rule_create_commit(args).await.unwrap();
+        assert!(
+            CONSUME_REFUSAL.with(|fault| fault.borrow().is_none()),
+            "the adapter reaches consume"
+        );
+        let (code, _, _) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "approval.wrong_kind");
+        assert_eq!(rpc.accepted(), 0);
     }
 
     /// An encoded spent record holding `count` live records of other approvals.

@@ -3364,7 +3364,14 @@ mod tests {
                 RequestIdentity::Local,
             );
             assert!(fired.get(), "{kind}: the swap ran after the comparison");
-            assert_eq!(outcome, Outcome::WrongKind, "{kind}");
+            assert_eq!(
+                outcome,
+                Outcome::PresenceRefused {
+                    code: "approval.presence_changed",
+                    message: "The consent details have changed; reload the approval page and review them again.",
+                },
+                "{kind}"
+            );
             let store = PendingApprovalStore::open(fx.ctx.store_path.clone()).unwrap();
             let stored = store.get(&nonce).unwrap();
             assert_eq!(stored.kind, swapped_in.kind, "{kind}");

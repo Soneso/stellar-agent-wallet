@@ -2306,6 +2306,7 @@ mod tests {
             let consumption = match binding.clone() {
                 DomainBinding::Transaction { tx_hash, .. } => {
                     ConsumptionBinding::Transaction(SubmissionBinding {
+                        destinations: Default::default(),
                         chain_scope: Some(crate::policy_state::ChainScope::for_chain(
                             stellar_agent_core::profile::caip2::Caip2::Mainnet,
                         )),
@@ -2322,6 +2323,7 @@ mod tests {
                 }
                 DomainBinding::FeeBumpInner { .. } | DomainBinding::FeeBumpOuter { .. } => {
                     ConsumptionBinding::Transaction(SubmissionBinding {
+                        destinations: Default::default(),
                         chain_scope: Some(crate::policy_state::ChainScope::for_chain(
                             stellar_agent_core::profile::caip2::Caip2::Mainnet,
                         )),

@@ -299,6 +299,9 @@ fn write_profile(home: &Path, rpc_url: &str) {
     )
     .unwrap();
 
+    let (code, listed) = run_cli(home, &["profile", "list"]);
+    assert_eq!(code, 0, "{listed}");
+    assert_eq!(listed["data"], serde_json::json!([PROFILE]));
     let (code, envelope) = run_cli(home, &["profile", "rotate-audit-key", PROFILE]);
     assert_eq!(code, 0, "rotate-audit-key must succeed: {envelope}");
 }
@@ -895,6 +898,20 @@ fn seed_window_for(
     stellar_agent_network::policy_state::PersistedWindowStore,
     stellar_agent_core::profile::schema::Profile,
 ) {
+    seed_window_for_to(home, id, tx_hash, sequence, max_time, Default::default())
+}
+
+fn seed_window_for_to(
+    home: &Path,
+    id: &str,
+    tx_hash: &str,
+    sequence: i64,
+    max_time: u64,
+    destinations: stellar_agent_core::profile::receipt::PaymentDestinations,
+) -> (
+    stellar_agent_network::policy_state::PersistedWindowStore,
+    stellar_agent_core::profile::schema::Profile,
+) {
     use stellar_agent_core::policy::v1::criteria::state_store::{
         StateKey, WindowEntry, WindowLimit,
     };
@@ -915,6 +932,7 @@ fn seed_window_for(
     let window = PersistedWindowStore::at_path(home.join(format!("policy/{PROFILE}.window")));
     let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
     let res = SubmissionHold {
+        destinations,
         chain_scope: stellar_agent_network::policy_state::ChainScope::for_chain(profile.chain_id),
         id: id.to_owned(),
         tx_hash: tx_hash.to_owned(),
@@ -971,6 +989,7 @@ fn admits(
             },
         )],
         &SubmissionHold {
+            destinations: Default::default(),
             chain_scope: ChainScope::for_chain(profile.chain_id),
             id: "5555555555555555555555555555555555555555555555555555555555555555".to_owned(),
             tx_hash: "6666666666666666666666666666666666666666666666666666666666666666".to_owned(),
@@ -1031,6 +1050,62 @@ async fn orphan_clear_recovers_identity_and_releases_headroom() {
     orphan_clear(home.path());
     assert_eq!(cleared_rows(home.path()), 1);
     assert_eq!(rpc.log.sends(), 0, "the verb never sends");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn a_cleared_orphan_restores_its_destination() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    use stellar_agent_core::profile::receipt::{OperationDestination, PaymentDestinations};
+    let home = tempfile::TempDir::new().unwrap();
+    let rpc = OrphanRpc::new("NOT_FOUND", 1200);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(rpc.clone())
+        .mount(&server)
+        .await;
+    fixture(home.path(), &server.uri());
+    let m = format!(
+        "{}",
+        stellar_strkey::ed25519::MuxedAccount {
+            ed25519: [7; 32],
+            id: u64::MAX
+        }
+    );
+    let destinations = PaymentDestinations::PerOperation(vec![
+        OperationDestination {
+            operation: 0,
+            destination: SOURCE.to_owned(),
+        },
+        OperationDestination {
+            operation: 2,
+            destination: m,
+        },
+    ]);
+    let (window, profile) = seed_window_for_to(
+        home.path(),
+        ENVELOPE_HASH,
+        TX_HASH,
+        7,
+        0,
+        destinations.clone(),
+    );
+    let receipts = ReceiptStore::open_at(&home.path().join("receipts"), PROFILE).unwrap();
+    std::fs::write(receipts.file_path().unwrap(), b"{}").unwrap();
+    let (code, data) = orphan_clear(home.path());
+    assert_eq!(code, 0, "{data}");
+    assert_eq!(
+        receipts.get(ENVELOPE_HASH).unwrap().unwrap().destinations,
+        destinations
+    );
+    assert_eq!(
+        data["data"]["destinations"],
+        destinations.to_stored().unwrap()
+    );
+    assert!(window.pending_reservations(&profile).unwrap().is_empty());
+    assert_eq!(rpc.log.sends(), 0);
 }
 
 /// Only an absent transaction beyond retention permits reconstruction of an
