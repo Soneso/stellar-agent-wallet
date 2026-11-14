@@ -475,7 +475,7 @@ pub(crate) mod tests {
             let mut entry = PendingApproval::new_payment_pending(
                 "AAAA".to_owned(),
                 b"AAAA",
-                SOURCE.to_owned(),
+                crate::operation_entry::tests::DESTINATION.to_owned(),
                 25,
                 "XLM".to_owned(),
                 None,

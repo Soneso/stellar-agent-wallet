@@ -2714,6 +2714,7 @@ mod tests {
                 amount: Some(10_000_000),
                 asset: Some("native".to_owned()),
                 destination_redacted: Some("GDNYY...B2PKP".to_owned()),
+                destination_sha256: None,
             }],
             "6ba7aaac...69060003",
             "GAOTC...PZ6X4",
@@ -7075,6 +7076,7 @@ mod tests {
                     amount: Some(i128::from(tag) * 1_000),
                     asset: Some(format!("asset-{tag}")),
                     destination_redacted: Some(format!("GDEST...{tag:05}")),
+                    destination_sha256: None,
                 }],
                 "6ba7aaac...69060003",
                 "GAOTC...PZ6X4",
@@ -7119,6 +7121,7 @@ mod tests {
                     amount: Some(i128::from(tag) * 1_000),
                     asset: Some(format!("asset-{tag}")),
                     destination_redacted: Some(format!("GDEST...{tag:05}")),
+                    destination_sha256: None,
                 }],
                 nonce_id: Some(format!("nonce-{tag}")),
                 policy_decision: if tag.is_multiple_of(2) {
@@ -7862,6 +7865,7 @@ mod tests {
                         amount: Some(i128::try_from(at).unwrap()),
                         asset: Some("x".repeat(200)),
                         destination_redacted: Some("y".repeat(200)),
+                        destination_sha256: None,
                     })
                     .collect();
             }

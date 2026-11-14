@@ -3045,6 +3045,7 @@ mod tests {
                     amount: Some(1_000_000),
                     asset: Some("native".to_owned()),
                     destination_redacted: Some("GAAAA...ZZZZZ".to_owned()),
+                    destination_sha256: None,
                 }],
                 opaque_reason: None,
                 transaction_hash_redacted: "abcd1234...5678efgh".to_owned(),
@@ -3058,6 +3059,7 @@ mod tests {
                     amount: Some(1_000_000),
                     asset: Some("native".to_owned()),
                     destination_redacted: Some("GAAAA...ZZZZZ".to_owned()),
+                    destination_sha256: None,
                 }],
                 transaction_hash_redacted: "abcd1234...5678efgh".to_owned(),
                 source_redacted: "GAAAA...ZZZZZ".to_owned(),
@@ -3072,6 +3074,7 @@ mod tests {
                     amount: Some(1_000_000),
                     asset: Some("native".to_owned()),
                     destination_redacted: Some("GAAAA...ZZZZZ".to_owned()),
+                    destination_sha256: None,
                 }],
                 transaction_hash_redacted: "abcd1234...5678efgh".to_owned(),
                 code: "ledger.insufficient_balance".to_owned(),
@@ -3132,6 +3135,7 @@ mod tests {
                         "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA".to_owned(),
                     ),
                     destination_redacted: Some("GBPXX...WIVL".to_owned()),
+                    destination_sha256: None,
                 }],
                 network: "stellar:testnet".to_owned(),
                 scheme: "exact".to_owned(),
@@ -3161,6 +3165,7 @@ mod tests {
                         "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA".to_owned(),
                     ),
                     destination_redacted: Some("GAAAA...AAAWHF".to_owned()),
+                    destination_sha256: None,
                 }],
                 network: "stellar:testnet".to_owned(),
                 payer_redacted: RedactedStrkey::from_already_redacted("GABCD...VWXYZ"),
@@ -3329,6 +3334,65 @@ mod tests {
             entry.ts = (*ts).to_owned();
             writer.write_entry(entry).unwrap();
         }
+    }
+
+    /// Payment rows without, with, and again without a destination hash chain
+    /// through the writer and verify together. Only the middle row carries
+    /// the field, and no row holds the complete M address.
+    #[test]
+    fn a_chain_mixing_rows_with_and_without_a_destination_hash_verifies() {
+        use crate::policy::v1::value::{ActionKind, ValueLeg};
+        let muxed = stellar_strkey::ed25519::MuxedAccount {
+            ed25519: [1; 32],
+            id: u64::MAX,
+        }
+        .to_string()
+        .to_string();
+        let leg = ValueLeg {
+            kind: ActionKind::Payment,
+            amount: Some(1_000_000),
+            asset: Some("native".to_owned()),
+            destination: Some(muxed.clone()),
+        };
+        let historical = ValueLegRecord::from(&leg);
+        assert!(historical.destination_sha256.is_none());
+        let hashed = ValueLegRecord::from_payment_leg(&leg).unwrap();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let mut writer = AuditWriter::open(path.clone(), None).unwrap();
+        for record in [&historical, &hashed, &historical] {
+            writer
+                .write_entry(AuditEntry::new_value_action_submitted(
+                    "stellar_pay",
+                    "stellar:testnet",
+                    vec![record.clone()],
+                    "abcd1234...5678efgh",
+                    42,
+                    PolicyDecision::Allow,
+                    None,
+                    None,
+                    None,
+                    uuid::Uuid::new_v4().to_string(),
+                    None,
+                ))
+                .unwrap();
+        }
+        drop(writer);
+
+        assert_eq!(verify_log(&path, None).unwrap().entries_verified, 3);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains(&muxed), "{text}");
+        let presence: Vec<bool> = text
+            .lines()
+            .map(|line| {
+                let row: serde_json::Value = serde_json::from_str(line).unwrap();
+                row["legs"][0]
+                    .as_object()
+                    .unwrap()
+                    .contains_key("destination_sha256")
+            })
+            .collect();
+        assert_eq!(presence, [false, true, false]);
     }
 
     /// A payment row that records the signature expiration ledger and one

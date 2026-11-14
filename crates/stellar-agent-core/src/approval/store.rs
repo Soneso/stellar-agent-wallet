@@ -369,8 +369,9 @@ pub enum ApprovalKind {
 
         /// Destination address of the simulated payment.
         ///
-        /// Validated on deserialisation: must be a Stellar G-strkey
-        /// (`^G[A-Z2-7]{55}$`) to prevent tty-rendering attacks.
+        /// Validated at construction, deserialization, and store insertion: a
+        /// canonical, checksum-valid G account or M address. The check also
+        /// keeps control text out of terminal renderings.
         summary_to: String,
 
         /// Amount of the simulated payment in stroops.
@@ -467,7 +468,7 @@ pub enum ApprovalKind {
     ///   || u32_be(len(package_version)) || package_version
     ///   || u32_be(len(package_shasum)) || package_shasum
     ///   || u32_be(len(capability))  || capability
-    ///   || u32_be(len(destination)) || destination   (canonical G-strkey)
+    ///   || u32_be(len(destination)) || destination   (stored text, G, M or C)
     ///   || u32_be(len(asset))       || asset          (code:issuer or "XLM")
     ///   || i64_be(amount_min_stroops) || i64_be(amount_max_stroops)
     /// )
@@ -497,11 +498,13 @@ pub enum ApprovalKind {
         /// Validated at construction: `[a-z0-9-]` charset, 1–64 bytes.
         capability: String,
 
-        /// Canonical G-strkey destination address from the authoritative envelope,
-        /// decoded from the resolved envelope rather than toolset-supplied args.
+        /// Destination decoded from the resolved envelope rather than
+        /// toolset-supplied args.
         ///
-        /// Validated at construction: must be a valid Stellar G-strkey (56 chars,
-        /// `^G[A-Z2-7]{55}$`).  First-5-last-5 redacted in the CLI render.
+        /// Validated at construction, deserialization, and store insertion. A
+        /// `sign-payment` destination is a canonical G account or M address.
+        /// `sign-rule-create` carries the smart-account C-strkey it proposes
+        /// against.
         destination: String,
 
         /// Full asset identifier (`"XLM"` or `"<code>:<G-strkey>"`) from the
@@ -1747,8 +1750,13 @@ impl AttestedApproverWire {
     }
 }
 
-/// Optional `summary_to` deserialiser — applies the G-strkey validator when
-/// the field is present, passes `None` through unchanged.
+/// Optional `summary_to` deserializer: a present value has the G shape
+/// `^G[A-Z2-7]{55}$` or the M shape `^M[A-Z2-7]{68}$`, and `None` passes
+/// through unchanged.
+///
+/// The shape check keeps control text out of terminal renderings. The entry
+/// check decides the canonical form: [`DestinationCheck::Strict`] refuses
+/// any other text, and a stored entry loads and refuses each use instead.
 fn deserialize_opt_summary_to<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: Deserializer<'de>,
@@ -1756,18 +1764,39 @@ where
     let opt: Option<String> = Option::deserialize(deserializer)?;
     match opt {
         None => Ok(None),
-        Some(s) => {
-            let valid = s.len() == 56
-                && s.starts_with('G')
-                && s[1..].chars().all(|c| matches!(c, 'A'..='Z' | '2'..='7'));
-            if valid {
-                Ok(Some(s))
-            } else {
-                Err(serde::de::Error::custom(
-                    "summary_to must match ^G[A-Z2-7]{55}$; repair the pending approval record.",
-                ))
-            }
-        }
+        Some(s) if strkey_shaped(&s, b"G", 56) || strkey_shaped(&s, b"M", 69) => Ok(Some(s)),
+        Some(_) => Err(serde::de::Error::custom(SUMMARY_TO_REASON)),
+    }
+}
+
+/// Why a payment summary's destination refuses.
+const SUMMARY_TO_REASON: &str =
+    "summary_to must be a canonical G account or M address; repair the pending approval record.";
+
+fn is_payment_account(text: &str) -> bool {
+    crate::payment_accounts::PaymentAccount::parse(text).is_ok()
+}
+
+/// Whether `text` is `len` characters: one of `prefixes`, then `[A-Z2-7]`.
+fn strkey_shaped(text: &str, prefixes: &[u8], len: usize) -> bool {
+    text.len() == len
+        && prefixes.contains(&text.as_bytes()[0])
+        && text[1..]
+            .chars()
+            .all(|c| matches!(c, 'A'..='Z' | '2'..='7'))
+}
+
+/// Whether a payment summary or a `sign-payment` request names a destination
+/// other than a canonical G account or M address.
+pub(crate) fn holds_refused_destination(kind: &ApprovalKind) -> bool {
+    match kind {
+        ApprovalKind::PaymentSimulated { summary_to, .. } => !is_payment_account(summary_to),
+        ApprovalKind::ToolsetFirstInvokeGate {
+            capability,
+            destination,
+            ..
+        } => super::toolset_grant::check_grant_destination(capability, destination).is_err(),
+        _ => false,
     }
 }
 
@@ -2564,7 +2593,47 @@ impl<'de> Deserialize<'de> for PendingApproval {
     where
         D: Deserializer<'de>,
     {
-        let mut raw = PendingApprovalOnDisk::deserialize(deserializer)?;
+        let raw = PendingApprovalOnDisk::deserialize(deserializer)?;
+        Self::from_on_disk(raw, DestinationCheck::Strict)
+    }
+}
+
+/// How decoding treats a payment destination.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DestinationCheck {
+    /// A request from outside the store: the destination must be a
+    /// canonical G account or M address.
+    Strict,
+    /// A stored entry: the destination needs only its stored shape, and each
+    /// use of the entry checks the canonical form.
+    Shape,
+}
+
+/// A stored entry decoded with [`DestinationCheck::Shape`].
+struct StoredEntry(PendingApproval);
+
+impl<'de> Deserialize<'de> for StoredEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = PendingApprovalOnDisk::deserialize(deserializer)?;
+        PendingApproval::from_on_disk(raw, DestinationCheck::Shape).map(Self)
+    }
+}
+
+/// The store file decoded with [`DestinationCheck::Shape`].
+#[derive(Deserialize)]
+struct StoredFile {
+    #[serde(default)]
+    pending: Vec<StoredEntry>,
+}
+
+impl PendingApproval {
+    fn from_on_disk<E: serde::de::Error>(
+        mut raw: PendingApprovalOnDisk,
+        destinations: DestinationCheck,
+    ) -> Result<Self, E> {
         let subject_kind = raw.subject_kind;
 
         // An approver is recorded together with the blob it authenticates;
@@ -2856,6 +2925,7 @@ impl<'de> Deserialize<'de> for PendingApproval {
                 &sfig.asset,
                 sfig.amount_min_stroops,
                 sfig.amount_max_stroops,
+                destinations,
             )
             .map_err(serde::de::Error::custom)?;
 
@@ -3361,6 +3431,9 @@ impl<'de> Deserialize<'de> for PendingApproval {
             let summary_to = raw
                 .summary_to
                 .ok_or_else(|| serde::de::Error::missing_field("summary_to"))?;
+            if destinations == DestinationCheck::Strict && !is_payment_account(&summary_to) {
+                return Err(serde::de::Error::custom(SUMMARY_TO_REASON));
+            }
             let summary_amount_stroops = raw
                 .summary_amount_stroops
                 .ok_or_else(|| serde::de::Error::missing_field("summary_amount_stroops"))?;
@@ -3484,7 +3557,7 @@ impl PendingApproval {
     ///
     /// - `envelope_xdr_b64`: base64-encoded envelope XDR (simulated).
     /// - `envelope_xdr_bytes`: the envelope's base64 text bytes for SHA-256 computation.
-    /// - `summary_to`: destination address string.
+    /// - `summary_to`: destination, a canonical G account or M address.
     /// - `summary_amount_stroops`: payment amount in stroops.
     /// - `summary_asset`: asset identifier (e.g. `"XLM"`).
     /// - `summary_memo`: optional memo.
@@ -3496,7 +3569,9 @@ impl PendingApproval {
     ///
     /// # Errors
     ///
-    /// Returns [`ApprovalError::Io`] if the system clock is unavailable.
+    /// Returns [`ApprovalError::InvalidEntry`] if `summary_to` is not a
+    /// canonical G account or M address, and [`ApprovalError::Io`] if the
+    /// system clock is unavailable.
     ///
     /// # Examples
     ///
@@ -3512,7 +3587,7 @@ impl PendingApproval {
     /// let entry = PendingApproval::new_payment_pending(
     ///     xdr_b64,
     ///     xdr_bytes,
-    ///     "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+    ///     "GAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQDZ7H".to_owned(),
     ///     1_000_000,
     ///     "XLM".to_owned(),
     ///     None,
@@ -3538,6 +3613,11 @@ impl PendingApproval {
         process_uid: String,
         ttl_ms: u64,
     ) -> Result<Self, ApprovalError> {
+        if crate::payment_accounts::PaymentAccount::parse(&summary_to).is_err() {
+            return Err(ApprovalError::InvalidEntry {
+                detail: SUMMARY_TO_REASON.to_owned(),
+            });
+        }
         // Generate 16-byte random nonce and encode as URL-safe base64 no-pad.
         let mut raw = [0u8; 16];
         OsRng.fill_bytes(&mut raw);
@@ -3892,7 +3972,7 @@ impl PendingApproval {
     ///     "1.0.0".to_owned(),
     ///     "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
     ///     "sign-payment".to_owned(),
-    ///     "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+    ///     "GAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQDZ7H".to_owned(),
     ///     "XLM".to_owned(),
     ///     0_i64,
     ///     10_000_000_i64,
@@ -3929,6 +4009,7 @@ impl PendingApproval {
             &asset,
             amount_min_stroops,
             amount_max_stroops,
+            DestinationCheck::Strict,
         )
         .map_err(|reason| ApprovalError::Invalid { reason })?;
 
@@ -4695,10 +4776,14 @@ const TOOLSET_GATE_FIELD_MAX_BYTES: usize = 64;
 /// Validates:
 /// - `toolset_name`: `[a-z0-9-]` charset, 1–64 bytes.
 /// - `capability`: `[a-z0-9-]` charset, 1–64 bytes.
-/// - `destination`: valid Stellar G-strkey (56 chars, `^G[A-Z2-7]{55}$`).
+/// - `destination`: a canonical G account or M address for `sign-payment`;
+///   otherwise `^[GC][A-Z2-7]{55}$`. [`DestinationCheck::Shape`] admits a
+///   stored `sign-payment` destination of that shape or `^M[A-Z2-7]{68}$`,
+///   and each use of the entry checks the canonical form.
 /// - `asset`: `"XLM"` or `"<code>:<G-strkey>"` (same rules as `summary_asset`).
 /// - `amount_min_stroops` ≤ `amount_max_stroops`.
 /// - `amount_max_stroops` > 0.
+#[allow(clippy::too_many_arguments)]
 fn validate_toolset_first_invoke_gate_invariants(
     toolset_name: &str,
     capability: &str,
@@ -4706,6 +4791,7 @@ fn validate_toolset_first_invoke_gate_invariants(
     asset: &str,
     amount_min_stroops: i64,
     amount_max_stroops: i64,
+    destinations: DestinationCheck,
 ) -> Result<(), String> {
     // toolset_name: 1–64 bytes, [a-z0-9-] charset.
     if toolset_name.is_empty() || toolset_name.len() > TOOLSET_GATE_FIELD_MAX_BYTES {
@@ -4743,18 +4829,18 @@ fn validate_toolset_first_invoke_gate_invariants(
         );
     }
 
-    // destination: a valid Stellar G-strkey (the `sign-payment` gated
-    // capability's bucket dimension) OR C-strkey (Package D's
-    // `sign-rule-create` gated capability reuses this field to carry the
-    // smart-account contract being proposed against — the correct re-prompt
-    // dimension for that capability is "different smart account", exactly as
-    // "different destination" is for `sign-payment`).
-    let dest_shape_valid = destination.len() == 56
-        && matches!(destination.as_bytes()[0], b'G' | b'C')
-        && destination[1..]
-            .chars()
-            .all(|c| matches!(c, 'A'..='Z' | '2'..='7'));
-    if !dest_shape_valid {
+    // destination: a `sign-payment` destination is a canonical G account or
+    // M address. Other capabilities keep a G- or C-shaped strkey:
+    // `sign-rule-create` carries the smart-account contract it proposes
+    // against, so a different smart account re-prompts.
+    let shaped = strkey_shaped(destination, b"GC", 56);
+    let payment = capability == super::toolset_grant::SIGN_PAYMENT_CAPABILITY;
+    let stored_shape = shaped || strkey_shaped(destination, b"M", 69);
+    if destinations == DestinationCheck::Strict || !stored_shape {
+        super::toolset_grant::check_grant_destination(capability, destination)
+            .map_err(|reason| format!("{reason}; repair the pending approval record."))?;
+    }
+    if !payment && !shaped {
         return Err(
             "destination must match ^[GC][A-Z2-7]{55}$; repair the pending approval record."
                 .to_owned(),
@@ -5214,6 +5300,12 @@ impl PendingApprovalStore {
     /// or `process_uid` fails format validation with
     /// [`ApprovalError::InvalidEntry`].
     ///
+    /// A stored payment summary destination needs only the G shape
+    /// `^G[A-Z2-7]{55}$` or the M shape `^M[A-Z2-7]{68}$` to load, and a
+    /// `sign-payment` request also admits the C shape. An entry whose
+    /// destination fails the canonical check is an ordinary entry. Each use
+    /// that reads its destination checks the canonical form and refuses alone.
+    ///
     /// # Errors
     ///
     /// - [`ApprovalError::WriterLocked`] if the lock file is held by another process.
@@ -5266,12 +5358,17 @@ impl PendingApprovalStore {
         let entries = if path.exists() {
             let content = fs::read_to_string(&path).map_err(ApprovalError::from_io)?;
             check_receipt_lengths(&content)?;
-            let sf: StoreFile = toml::from_str(&content).map_err(|e| ApprovalError::Toml {
-                detail: super::error::toml_error_position(&content, e.span().map(|s| s.start)),
-            })?;
+            let pending: Vec<PendingApproval> = toml::from_str::<StoredFile>(&content)
+                .map_err(|e| ApprovalError::Toml {
+                    detail: super::error::toml_error_position(&content, e.span().map(|s| s.start)),
+                })?
+                .pending
+                .into_iter()
+                .map(|stored| stored.0)
+                .collect();
             // Serde validators on approval_nonce and process_uid run during
             // TOML deserialisation.  Double-check nonce length for defence-in-depth.
-            for entry in &sf.pending {
+            for entry in &pending {
                 if entry.approval_nonce.len() != EXPECTED_NONCE_LEN {
                     return Err(ApprovalError::InvalidEntry {
                         detail: format!(
@@ -5281,7 +5378,7 @@ impl PendingApprovalStore {
                     });
                 }
             }
-            sf.pending
+            pending
         } else {
             Vec::new()
         };
@@ -5306,6 +5403,9 @@ impl PendingApprovalStore {
     ///
     /// # Errors
     ///
+    /// - [`ApprovalError::InvalidEntry`] if a payment summary or a
+    ///   `sign-payment` request names a destination other than a canonical G
+    ///   account or M address.
     /// - [`ApprovalError::PendingStoreFull`] if, after pruning expired entries,
     ///   the store already contains the maximum number of entries (4 096).
     /// - [`ApprovalError::DuplicateNonce`] if `entry.approval_nonce` already exists.
@@ -5325,7 +5425,7 @@ impl PendingApprovalStore {
     /// let now_ms = 1_700_000_000_000_u64; // caller-supplied current time
     /// let entry = PendingApproval::new_payment_pending(
     ///     "b64xdr".to_owned(), b"xdr",
-    ///     "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+    ///     "GAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQDZ7H".to_owned(),
     ///     1000, "XLM".to_owned(), None, 100, 1, uid, DEFAULT_TTL_MS)?;
     /// store.insert(entry, now_ms)?;
     /// # Ok(()) }
@@ -5335,6 +5435,12 @@ impl PendingApprovalStore {
         entry: PendingApproval,
         now_unix_ms: u64,
     ) -> Result<(), ApprovalError> {
+        if holds_refused_destination(&entry.kind) {
+            return Err(ApprovalError::InvalidEntry {
+                detail: "a payment destination must be a canonical G account or M address"
+                    .to_owned(),
+            });
+        }
         // Step 1: prune expired entries in memory.
         self.entries.retain(|e| !e.is_expired(now_unix_ms));
 
@@ -5363,6 +5469,9 @@ impl PendingApprovalStore {
     /// Returns a reference to the entry with the given `approval_nonce`, or
     /// `None` if absent.
     ///
+    /// A use that reads the entry's payment destination checks it with
+    /// [`super::verify_stored_destination`].
+    ///
     /// # Examples
     ///
     /// This example is `no_run` because it opens an on-disk approval-store
@@ -5381,6 +5490,17 @@ impl PendingApprovalStore {
         self.entries
             .iter()
             .find(|e| e.approval_nonce == approval_nonce)
+    }
+
+    /// Refuses a use of the entry [`Self::get`] selects for `approval_nonce`
+    /// when its payment destination is not a canonical G account or M address.
+    fn refuse_destination(&self, approval_nonce: &str) -> Result<(), ApprovalError> {
+        match self.get(approval_nonce) {
+            Some(entry) if holds_refused_destination(&entry.kind) => {
+                Err(ApprovalError::destination_refused(approval_nonce))
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Verifies an attested MPP approval against the exact stored digests.
@@ -5506,6 +5626,8 @@ impl PendingApprovalStore {
     /// - [`ApprovalError::NotFound`] if no entry with `approval_nonce` exists.
     /// - [`ApprovalError::Expired`] if the entry's TTL has elapsed.
     /// - [`ApprovalError::AlreadyAttested`] if the blob is already set.
+    /// - [`ApprovalError::DestinationRefused`] if the entry's payment
+    ///   destination is not a canonical G account or M address.
     /// - [`ApprovalError::WrongKind`] if the entry is not a supported
     ///   digest-attested approval kind.
     /// - [`ApprovalError::Io`] / [`ApprovalError::Toml`] on persistence failure.
@@ -5529,6 +5651,7 @@ impl PendingApprovalStore {
         now_ms: u64,
     ) -> Result<(), ApprovalError> {
         refuse_version_4_approver(&approver)?;
+        self.refuse_destination(approval_nonce)?;
         let entry = self
             .entries
             .iter_mut()
@@ -5788,9 +5911,33 @@ impl PendingApprovalStore {
     /// # Errors
     ///
     /// - [`ApprovalError::Io`] / [`ApprovalError::Toml`] on persistence failure.
+    /// - [`ApprovalError::DestinationRefused`] if the entry's payment
+    ///   destination is not a canonical G account or M address; the entry
+    ///   stays unchanged.
     /// - [`ApprovalError::InvalidEntry`] if `tx_hash` is not 64 lowercase hex
     ///   characters.
     pub fn consume(
+        &mut self,
+        approval_nonce: &str,
+        tx_hash: &str,
+        outcome: ConsumedOutcome,
+    ) -> Result<bool, ApprovalError> {
+        self.refuse_destination(approval_nonce)?;
+        self.record_sent_consumption(approval_nonce, tx_hash, outcome)
+    }
+
+    /// Records that a transaction already sent spent the approval.
+    ///
+    /// [`Self::consume`] without the destination check: the send has
+    /// happened, so the tombstone records that fact whatever the stored
+    /// destination holds. The receipt consumption repair calls it.
+    ///
+    /// # Errors
+    ///
+    /// - [`ApprovalError::Io`] / [`ApprovalError::Toml`] on persistence failure.
+    /// - [`ApprovalError::InvalidEntry`] if `tx_hash` is not 64 lowercase hex
+    ///   characters.
+    pub fn record_sent_consumption(
         &mut self,
         approval_nonce: &str,
         tx_hash: &str,
@@ -6180,6 +6327,7 @@ impl PendingApprovalStore {
         receipt: MainnetPresenceReceipt,
         now_ms: u64,
     ) -> Result<(), ApprovalError> {
+        self.refuse_destination(approval_nonce)?;
         let AttestedApprover::MainnetPasskey {
             credential_id_b64url,
         } = &approver
@@ -6679,6 +6827,7 @@ mod tests {
     )]
 
     use super::*;
+    use crate::approval::ApprovalSummaryView;
     use tempfile::TempDir;
 
     #[test]
@@ -6730,8 +6879,12 @@ mod tests {
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 
-    /// Valid 56-char Stellar G-strkey (G + 55 base32 chars).
-    const VALID_SUMMARY_TO: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    /// Checksum-valid G-strkey of the all-zero key.
+    const VALID_SUMMARY_TO: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+
+    /// A G-shaped strkey with an invalid checksum. MPP terms and rule signers
+    /// check only the shape, and the inbox vector records this text.
+    const SHAPED_G: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
     fn make_payment_entry(ttl_ms: u64) -> PendingApproval {
         #[allow(deprecated)]
@@ -6844,6 +6997,546 @@ mod tests {
 
         let store2 = PendingApprovalStore::open(path).unwrap();
         assert!(store2.get(&nonce).is_some());
+    }
+
+    /// The G account of the key `[9; 32]` and its M addresses with IDs zero
+    /// and `u64::MAX`.
+    fn payment_destinations() -> [String; 3] {
+        use stellar_strkey::ed25519::{MuxedAccount, PublicKey};
+        let key = [9; 32];
+        [
+            PublicKey(key).to_string().to_string(),
+            MuxedAccount {
+                ed25519: key,
+                id: 0,
+            }
+            .to_string()
+            .to_string(),
+            MuxedAccount {
+                ed25519: key,
+                id: u64::MAX,
+            }
+            .to_string()
+            .to_string(),
+        ]
+    }
+
+    /// Destinations a classic payment cannot pay, and spellings that are not
+    /// canonical.
+    fn malformed_payment_destinations() -> Vec<String> {
+        let [g, _, m_max] = payment_destinations();
+        vec![
+            stellar_strkey::Contract([9; 32]).to_string().to_string(),
+            stellar_strkey::MuxedContract {
+                contract_id: [9; 32],
+                id: 7,
+            }
+            .to_string()
+            .to_string(),
+            format!("{}A", &g[..55]),
+            format!("{}A", &m_max[..68]),
+            m_max.to_lowercase(),
+            format!("{g} "),
+        ]
+    }
+
+    fn payment_entry_to(destination: &str) -> Result<PendingApproval, ApprovalError> {
+        PendingApproval::new_payment_pending(
+            "b64xdr".to_owned(),
+            b"xdr",
+            destination.to_owned(),
+            1_000_000,
+            "XLM".to_owned(),
+            None,
+            100,
+            1,
+            "1000".to_owned(),
+            DEFAULT_TTL_MS,
+        )
+    }
+
+    fn toolset_gate_to(
+        capability: &str,
+        destination: &str,
+    ) -> Result<PendingApproval, ApprovalError> {
+        PendingApproval::new_toolset_first_invoke_gate_pending(
+            "my-toolset".to_owned(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "1.0.0".to_owned(),
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
+            capability.to_owned(),
+            destination.to_owned(),
+            "XLM".to_owned(),
+            0,
+            10_000_000,
+            "1000".to_owned(),
+            DEFAULT_TTL_MS,
+        )
+    }
+
+    /// The stored destination of a payment summary or a first-invoke request.
+    fn stored_destination(entry: &PendingApproval) -> &str {
+        match &entry.kind {
+            ApprovalKind::PaymentSimulated { summary_to, .. } => summary_to,
+            ApprovalKind::ToolsetFirstInvokeGate { destination, .. } => destination,
+            other => panic!("unexpected kind {}", other.kind_name()),
+        }
+    }
+
+    #[test]
+    fn g_and_m_payment_summaries_and_gates_reopen_unchanged() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("default.toml");
+        let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+        let mut expected = Vec::new();
+        for destination in payment_destinations() {
+            store
+                .insert(payment_entry_to(&destination).unwrap(), TEST_NOW_MS)
+                .unwrap();
+            store
+                .insert(
+                    toolset_gate_to("sign-payment", &destination).unwrap(),
+                    TEST_NOW_MS,
+                )
+                .unwrap();
+            expected.extend([destination.clone(), destination]);
+        }
+        let written = std::fs::read_to_string(&path).unwrap();
+        drop(store);
+        let reopened = PendingApprovalStore::open(path.clone()).unwrap();
+        let stored: Vec<&str> = reopened.entries.iter().map(stored_destination).collect();
+        assert_eq!(stored, expected);
+        reopened.persist().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), written);
+    }
+
+    #[test]
+    fn malformed_payment_destinations_refuse_construction() {
+        for destination in malformed_payment_destinations() {
+            for err in [
+                payment_entry_to(&destination).unwrap_err(),
+                toolset_gate_to("sign-payment", &destination).unwrap_err(),
+            ] {
+                assert!(
+                    !err.to_string().contains(destination.trim()),
+                    "{destination}: {err}"
+                );
+            }
+            assert!(matches!(
+                payment_entry_to(&destination).unwrap_err(),
+                ApprovalError::InvalidEntry { .. }
+            ));
+        }
+    }
+
+    /// Whether `text` has a destination shape a stored entry loads with: G or
+    /// M for a payment summary, and also C for a `sign-payment` request.
+    fn stored_shape(text: &str, request: bool) -> bool {
+        let prefixes: &[u8] = if request { b"GC" } else { b"G" };
+        strkey_shaped(text, prefixes, 56) || strkey_shaped(text, b"M", 69)
+    }
+
+    /// A stored destination with a stored shape loads as an ordinary entry,
+    /// and its use refuses with the typed error. Any other malformed text
+    /// fails the open.
+    #[test]
+    fn malformed_stored_payment_destinations_refuse_reopening() {
+        let [_, _, m_max] = payment_destinations();
+        for malformed in malformed_payment_destinations() {
+            for (entry, request) in [
+                (payment_entry_to(&m_max).unwrap(), false),
+                (toolset_gate_to("sign-payment", &m_max).unwrap(), true),
+            ] {
+                let nonce = entry.approval_nonce.clone();
+                let dir = TempDir::new().unwrap();
+                let path = dir.path().join("default.toml");
+                let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+                store.insert(entry, TEST_NOW_MS).unwrap();
+                drop(store);
+                assert!(PendingApprovalStore::open(path.clone()).is_ok());
+                let text = std::fs::read_to_string(&path).unwrap();
+                assert_eq!(text.matches(m_max.as_str()).count(), 1);
+                let edited = text.replace(m_max.as_str(), &malformed);
+                std::fs::write(&path, &edited).unwrap();
+                if stored_shape(&malformed, request) {
+                    let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+                    let entry = store.get(&nonce).unwrap();
+                    assert_eq!(stored_destination(entry), malformed);
+                    assert!(super::super::verify_stored_destination(&entry.kind).is_err());
+                    let err = store
+                        .consume(&nonce, &"a".repeat(64), ConsumedOutcome::Confirmed)
+                        .unwrap_err();
+                    assert!(
+                        matches!(err, ApprovalError::DestinationRefused { .. }),
+                        "{err}"
+                    );
+                    drop(store);
+                    assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+                } else {
+                    let err = PendingApprovalStore::open(path).unwrap_err();
+                    assert!(!err.to_string().contains(malformed.trim()), "{err}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn contract_rule_create_gates_keep_their_terms() {
+        let contract = stellar_strkey::Contract([9; 32]).to_string().to_string();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("default.toml");
+        let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+        store
+            .insert(
+                toolset_gate_to("sign-rule-create", &contract).unwrap(),
+                TEST_NOW_MS,
+            )
+            .unwrap();
+        drop(store);
+        let reopened = PendingApprovalStore::open(path).unwrap();
+        assert_eq!(stored_destination(&reopened.entries[0]), contract);
+        assert!(toolset_gate_to("sign-payment", &contract).is_err());
+    }
+
+    /// Replaces the stored destination of a payment summary or a request.
+    fn set_destination(entry: &mut PendingApproval, to: &str) {
+        match &mut entry.kind {
+            ApprovalKind::PaymentSimulated { summary_to, .. } => *summary_to = to.to_owned(),
+            ApprovalKind::ToolsetFirstInvokeGate { destination, .. } => {
+                *destination = to.to_owned();
+            }
+            other => panic!("unexpected kind {}", other.kind_name()),
+        }
+    }
+
+    #[test]
+    fn payment_insert_refuses_bad_destination() {
+        let [g, ..] = payment_destinations();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("default.toml");
+        let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+        for mut entry in [
+            payment_entry_to(&g).unwrap(),
+            toolset_gate_to("sign-payment", &g).unwrap(),
+        ] {
+            set_destination(&mut entry, SHAPED_G);
+            let text = toml::to_string(&entry).unwrap();
+            let err = toml::from_str::<PendingApproval>(&text).unwrap_err();
+            assert!(!err.message().contains(SHAPED_G), "{err}");
+            let err = store.insert(entry, TEST_NOW_MS).unwrap_err();
+            assert!(matches!(err, ApprovalError::InvalidEntry { .. }), "{err}");
+            assert!(!err.to_string().contains(SHAPED_G), "{err}");
+        }
+        assert!(store.is_empty());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn gate_view_refuses_bad_destination() {
+        let [g, ..] = payment_destinations();
+        let dir = TempDir::new().unwrap();
+        let mut store = open_store(&dir);
+        store
+            .insert(toolset_gate_to("sign-payment", &g).unwrap(), TEST_NOW_MS)
+            .unwrap();
+        store
+            .insert(payment_entry_to(&g).unwrap(), TEST_NOW_MS)
+            .unwrap();
+        for entry in &mut store.entries {
+            set_destination(entry, SHAPED_G);
+            let request = matches!(entry.kind, ApprovalKind::ToolsetFirstInvokeGate { .. });
+            assert_eq!(
+                super::super::verify_entry_terms(&entry.kind).is_err(),
+                request
+            );
+            assert!(super::super::verify_stored_destination(&entry.kind).is_err());
+        }
+        for view in store.snapshot(TEST_NOW_MS) {
+            assert!(
+                matches!(view.summary, ApprovalSummaryView::Inconsistent { .. }),
+                "{:?}",
+                view.summary
+            );
+            let json = serde_json::to_string(&view).unwrap();
+            assert!(!json.contains(SHAPED_G), "{json}");
+        }
+    }
+
+    /// An entry whose stored attestation verifies under `key`.
+    fn attested_payment(key: &[u8; 32], to: &str) -> PendingApproval {
+        use sha2::Digest as _;
+        let mut entry = payment_entry_to(&payment_destinations()[0]).unwrap();
+        let subject: [u8; 32] = sha2::Sha256::digest(b"xdr").into();
+        let binding = super::super::AttestationBinding::new("default", "stellar:testnet");
+        let blob = super::super::attestation::compute_attestation_v4(
+            key,
+            &binding,
+            &entry.approval_nonce,
+            &subject,
+            &entry.process_uid,
+            &entry.attested_lifetime(),
+            &AttestedApprover::Local,
+        );
+        entry.attestation_blob_b64 = Some(URL_SAFE_NO_PAD.encode(blob));
+        entry.attested_approver = Some(AttestedApprover::Local);
+        set_destination(&mut entry, to);
+        assert!(super::super::verify_attestation(
+            key,
+            &binding,
+            &entry.approval_nonce,
+            &subject,
+            &entry.process_uid,
+            &entry.attestation_scope().unwrap(),
+            &blob,
+        ));
+        entry
+    }
+
+    /// A payment entry whose envelope pays `to`.
+    fn enveloped_payment(to: &str) -> PendingApproval {
+        let source = stellar_strkey::ed25519::PublicKey([3; 32]).to_string();
+        let envelope = super::super::fixtures::payment_envelope(
+            source.as_str(),
+            to,
+            "XLM",
+            1_000_000,
+            None,
+            100,
+            1,
+        );
+        PendingApproval::new_payment_pending(
+            envelope.clone(),
+            envelope.as_bytes(),
+            to.to_owned(),
+            1_000_000,
+            "XLM".to_owned(),
+            None,
+            100,
+            1,
+            "1000".to_owned(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap()
+    }
+
+    /// Writes `entries` to `path` as the store serializes them.
+    fn write_entries(path: &std::path::Path, entries: Vec<PendingApproval>) -> String {
+        let text = toml::to_string_pretty(&StoreFile { pending: entries }).unwrap();
+        std::fs::write(path, &text).unwrap();
+        text
+    }
+
+    /// Asserts that every use of `nonce` that reads its destination refuses
+    /// with the typed error and leaves the file at `path` unchanged.
+    fn assert_use_refused(store: &mut PendingApprovalStore, path: &std::path::Path, nonce: &str) {
+        let before = std::fs::read(path).unwrap();
+        let entry = store.get(nonce).unwrap();
+        assert!(super::super::verify_stored_destination(&entry.kind).is_err());
+        let receipt = super::super::fixtures::fixed_presence_receipt(BASE_INBOX_CREATED_MS);
+        let passkey = AttestedApprover::MainnetPasskey {
+            credential_id_b64url: receipt.credential_id_b64url(),
+        };
+        for err in [
+            store
+                .record_attestation(nonce, [7; 32], AttestedApprover::Local)
+                .unwrap_err(),
+            store
+                .record_mainnet_attestation_at(nonce, [7; 32], passkey, receipt, TEST_NOW_MS)
+                .unwrap_err(),
+            store
+                .consume(nonce, &"a".repeat(64), ConsumedOutcome::Confirmed)
+                .unwrap_err(),
+        ] {
+            assert!(
+                matches!(err, ApprovalError::DestinationRefused { .. }),
+                "{err}"
+            );
+            assert!(!err.to_string().contains(SHAPED_G), "{err}");
+            let wire = super::super::attest::record_error(&err);
+            assert_eq!(wire.code(), "approval.entry_inconsistent");
+        }
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    /// An authenticated payment and a request, both with a refused
+    /// destination, sit among usable entries. Each is an ordinary entry:
+    /// found, listed, counted, kept in place on rewrite, rejected, and
+    /// pruned. Each use that reads its destination refuses with the typed
+    /// error, and the usable entries work before and after a restart.
+    #[test]
+    fn an_entry_with_a_refused_destination_is_an_ordinary_entry() {
+        let [g, m0, m_max] = payment_destinations();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("default.toml");
+        let good_payment = enveloped_payment(&m_max);
+        let bad_payment = attested_payment(&[0x42; 32], SHAPED_G);
+        let mut bad_gate = toolset_gate_to("sign-payment", &g).unwrap();
+        set_destination(&mut bad_gate, SHAPED_G);
+        let good_gate = toolset_gate_to("sign-payment", &m0).unwrap();
+        let entries = vec![
+            good_payment.clone(),
+            bad_payment.clone(),
+            bad_gate.clone(),
+            good_gate.clone(),
+        ];
+        let text = write_entries(&path, entries.clone());
+        let bad = [&bad_payment, &bad_gate];
+        let check = |store: &mut PendingApprovalStore| {
+            for entry in bad {
+                assert_use_refused(store, &path, &entry.approval_nonce);
+            }
+            let views = store.snapshot(TEST_NOW_MS);
+            let inconsistent: Vec<bool> = views
+                .iter()
+                .map(|view| matches!(view.summary, ApprovalSummaryView::Inconsistent { .. }))
+                .collect();
+            assert_eq!(inconsistent[..4], [false, true, true, false]);
+            assert!(inconsistent[4..].iter().all(|flag| !flag));
+            let json = serde_json::to_string(&views).unwrap();
+            assert!(!json.contains(SHAPED_G), "{json}");
+        };
+        for _restart in 0..2 {
+            let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+            assert_eq!(store.len(), 4);
+            check(&mut store);
+            assert_eq!(
+                stored_destination(store.get(&good_payment.approval_nonce).unwrap()),
+                m_max
+            );
+            assert_eq!(
+                stored_destination(store.get(&good_gate.approval_nonce).unwrap()),
+                m0
+            );
+            drop(store);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        }
+        let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+        store
+            .record_attestation(
+                &good_payment.approval_nonce,
+                [7; 32],
+                AttestedApprover::Local,
+            )
+            .unwrap();
+        let added = enveloped_payment(&g);
+        store.insert(added.clone(), TEST_NOW_MS).unwrap();
+        drop(store);
+        let mut expected = entries;
+        expected[0] = PendingApprovalStore::open(path.clone())
+            .unwrap()
+            .get(&good_payment.approval_nonce)
+            .unwrap()
+            .clone();
+        expected.push(added);
+        let rewritten = toml::to_string_pretty(&StoreFile { pending: expected }).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), rewritten);
+        let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+        check(&mut store);
+        assert_eq!(store.len(), 5);
+        assert!(
+            store
+                .reject(&bad_payment.approval_nonce, 1, DEFAULT_TTL_MS)
+                .unwrap()
+        );
+        assert!(matches!(
+            store.get(&bad_payment.approval_nonce).unwrap().kind,
+            ApprovalKind::Rejected { .. }
+        ));
+        drop(store);
+        let mut store = PendingApprovalStore::open(path).unwrap();
+        store.insert(enveloped_payment(&m0), u64::MAX).unwrap();
+        assert!(store.get(&bad_gate.approval_nonce).is_none(), "pruned");
+        assert_eq!(store.len(), 1);
+    }
+
+    /// Expired entries whose destinations refuse leave the cap free for an
+    /// insert, as every expired entry does.
+    #[test]
+    fn expired_refused_entries_do_not_block_an_insert() {
+        let [g, ..] = payment_destinations();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("default.toml");
+        let entries = (0..MAX_PENDING_APPROVALS)
+            .map(|_| {
+                let mut entry = toolset_gate_to("sign-payment", &g).unwrap();
+                set_destination(&mut entry, SHAPED_G);
+                entry.created_at_unix_ms = 0;
+                entry.expires_at_unix_ms = 1;
+                entry
+            })
+            .collect();
+        write_entries(&path, entries);
+        let mut store = PendingApprovalStore::open(path).unwrap();
+        assert_eq!(store.len(), MAX_PENDING_APPROVALS);
+        store.insert(enveloped_payment(&g), 2).unwrap();
+        assert_eq!(store.len(), 1);
+    }
+
+    /// A nonce stored twice selects its first entry in the lookup and in
+    /// every transition, whichever of the two holds the refused destination.
+    #[test]
+    fn a_duplicate_nonce_selects_the_first_entry_everywhere() {
+        let [g, ..] = payment_destinations();
+        let good = enveloped_payment(&g);
+        let mut bad = good.clone();
+        set_destination(&mut bad, SHAPED_G);
+        for (first, second) in [(&good, &bad), (&bad, &good)] {
+            let nonce = &first.approval_nonce;
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("default.toml");
+            write_entries(&path, vec![first.clone(), second.clone()]);
+            let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+            assert_eq!(
+                stored_destination(store.get(nonce).unwrap()),
+                stored_destination(first)
+            );
+            let consumed = store.consume(nonce, &"a".repeat(64), ConsumedOutcome::Confirmed);
+            if std::ptr::eq(first, &good) {
+                assert!(consumed.unwrap());
+                assert!(matches!(
+                    store.entries[0].kind,
+                    ApprovalKind::Consumed { .. }
+                ));
+            } else {
+                assert_use_refused(&mut store, &path, nonce);
+                assert!(store.reject(nonce, 1, DEFAULT_TTL_MS).unwrap());
+                assert!(matches!(
+                    store.entries[0].kind,
+                    ApprovalKind::Rejected { .. }
+                ));
+            }
+            assert_eq!(store.entries[1].kind, second.kind);
+        }
+    }
+
+    /// A stored M destination with a bad checksum has the stored shape: the
+    /// file opens, the entry refuses its use, and the other entry works.
+    #[test]
+    fn a_muxed_destination_with_a_bad_checksum_loads_and_refuses_its_use() {
+        let [g, _, m_max] = payment_destinations();
+        let corrupt = format!("{}A", &m_max[..68]);
+        assert!(crate::payment_accounts::PaymentAccount::parse(&corrupt).is_err());
+        let mut payment = enveloped_payment(&m_max);
+        set_destination(&mut payment, &corrupt);
+        let mut gate = toolset_gate_to("sign-payment", &m_max).unwrap();
+        set_destination(&mut gate, &corrupt);
+        let good = enveloped_payment(&g);
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("default.toml");
+        let text = write_entries(&path, vec![payment.clone(), gate.clone(), good.clone()]);
+        let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+        assert_eq!(store.len(), 3);
+        for entry in [&payment, &gate] {
+            assert_eq!(
+                stored_destination(store.get(&entry.approval_nonce).unwrap()),
+                corrupt
+            );
+            assert_use_refused(&mut store, &path, &entry.approval_nonce);
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        store
+            .record_attestation(&good.approval_nonce, [7; 32], AttestedApprover::Local)
+            .unwrap();
     }
 
     /// Windows regression: `persist()` must succeed across repeated
@@ -7197,7 +7890,7 @@ mod tests {
              approval_nonce = \"{nonce_with_cyrillic}\"\n\
              envelope_xdr_b64 = \"b64xdr\"\n\
              envelope_sha256_hex = \"aa\"\n\
-             summary_to = \"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"\n\
+             summary_to = \"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF\"\n\
              summary_amount_stroops = 100\n\
              summary_asset = \"XLM\"\n\
              summary_simulated_fee_stroops = 100\n\
@@ -7264,7 +7957,7 @@ mod tests {
              approval_nonce = \"AAAAAAAAAAAAAAAAAAAAAA\"\n\
              envelope_xdr_b64 = \"b64xdr\"\n\
              envelope_sha256_hex = \"aa\"\n\
-             summary_to = \"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"\n\
+             summary_to = \"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF\"\n\
              summary_amount_stroops = 100\n\
              summary_asset = \"USD\u{202e}C\"\n\
              summary_simulated_fee_stroops = 100\n\
@@ -7297,7 +7990,7 @@ mod tests {
              approval_nonce = \"AAAAAAAAAAAAAAAAAAAAAA\"\n\
              envelope_xdr_b64 = \"b64xdr\"\n\
              envelope_sha256_hex = \"aa\"\n\
-             summary_to = \"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"\n\
+             summary_to = \"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF\"\n\
              summary_amount_stroops = 100\n\
              summary_asset = \"XLM\"\n\
              summary_memo = \"pay\u{200f}me\"\n\
@@ -7345,7 +8038,7 @@ mod tests {
              approval_nonce = \"AAAAAAAAAAAAAAAAAAAAAA\"\n\
              envelope_xdr_b64 = \"b64xdr\"\n\
              envelope_sha256_hex = \"aa\"\n\
-             summary_to = \"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"\n\
+             summary_to = \"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF\"\n\
              summary_amount_stroops = 100\n\
              summary_asset = \"XLM\"\n\
              summary_simulated_fee_stroops = 100\n\
@@ -7386,7 +8079,7 @@ mod tests {
 approval_nonce = \"AAAAAAAAAAAAAAAAAAAAAA\"
 envelope_xdr_b64 = \"dGVzdC1lbnZlbG9wZQ\"
 envelope_sha256_hex = \"aabbcc\"
-summary_to = \"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"
+summary_to = \"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF\"
 summary_amount_stroops = 1000000
 summary_asset = \"XLM\"
 summary_simulated_fee_stroops = 100
@@ -8017,7 +8710,7 @@ approval_nonce = \"AAAAAAAAAAAAAAAAAAAAAA\"
 process_uid = \"1000\"
 created_at_unix_ms = 1746000000000
 expires_at_unix_ms = 9999999999999
-summary_to = \"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"
+summary_to = \"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF\"
 
 [pending.sign_with_passkey]
 auth_digest = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
@@ -8049,7 +8742,7 @@ created_at_unix_ms = 1746000000000
 expires_at_unix_ms = 9999999999999
 envelope_xdr_b64 = \"dGVzdC1lbnZlbG9wZQ\"
 envelope_sha256_hex = \"aabbcc\"
-summary_to = \"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"
+summary_to = \"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF\"
 summary_amount_stroops = 1000000
 summary_asset = \"XLM\"
 summary_simulated_fee_stroops = 100
@@ -8546,7 +9239,7 @@ created_at_unix_ms = 1746000000000
 expires_at_unix_ms = 9999999999999
 envelope_xdr_b64 = \"dGVzdA\"
 envelope_sha256_hex = \"aabbcc\"
-summary_to = \"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"
+summary_to = \"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF\"
 summary_amount_stroops = 1000000
 summary_asset = \"XLM\"
 summary_simulated_fee_stroops = 100
@@ -8711,7 +9404,7 @@ user_handle = {zero32}
 approval_nonce = \"BBBBBBBBBBBBBBBBBBBBBB\"
 envelope_xdr_b64 = \"dGVzdC1lbnZlbG9wZQ\"
 envelope_sha256_hex = \"aabbcc\"
-summary_to = \"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"
+summary_to = \"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF\"
 summary_amount_stroops = 500000
 summary_asset = \"XLM\"
 summary_simulated_fee_stroops = 200
@@ -10216,6 +10909,7 @@ amount_max_stroops = 1000000
             asset,
             min,
             max,
+            DestinationCheck::Strict,
         )
         .unwrap_err()
     }
@@ -10266,7 +10960,8 @@ amount_max_stroops = 1000000
         let value = || serde_json::Value::String(format!("{MARKER}!"));
         assert_reason_exact(
             &deserialize_opt_summary_to(value()).unwrap_err().to_string(),
-            "summary_to must match ^G[A-Z2-7]{55}$; repair the pending approval record.",
+            "summary_to must be a canonical G account or M address; repair the pending approval \
+             record.",
             &[MARKER],
         );
         assert_reason_exact(
@@ -10297,6 +10992,19 @@ amount_max_stroops = 1000000
         );
         assert_reason_exact(
             &toolset_gate_reason(name, capability, "creda_bad_value_mark7", "XLM", 0, 1),
+            "a sign-payment destination must be a canonical G account or M address; repair \
+             the pending approval record.",
+            &["creda_bad_value_mark7", "creda", "mark7"],
+        );
+        assert_reason_exact(
+            &toolset_gate_reason(
+                name,
+                "sign-rule-create",
+                "creda_bad_value_mark7",
+                "XLM",
+                0,
+                1,
+            ),
             "destination must match ^[GC][A-Z2-7]{55}$; repair the pending approval record.",
             &["creda_bad_value_mark7", "creda", "mark7"],
         );
@@ -11025,10 +11733,7 @@ issuer = "{TESTNET_USDC_ISSUER}"
             RuleProposalContextType::Default,
             "spend-daily".to_owned(),
             None,
-            vec![RuleProposalSigner::delegated(
-                VALID_SUMMARY_TO.to_owned(),
-                true,
-            )],
+            vec![RuleProposalSigner::delegated(SHAPED_G.to_owned(), true)],
             vec![],
             vec![0],
             false,
@@ -12785,7 +13490,7 @@ summary_balance_id_hex72 = "00000000abababababababababababababababababababababab
 summary_balance_id_strkey = "BAAKXK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK6UVM"
 summary_asset = "XLM"
 summary_amount_stroops = 50000000
-summary_source = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+summary_source = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
 summary_simulated_fee_stroops = 200
 summary_simulated_seq_num = 777
 "#
@@ -13260,13 +13965,13 @@ asset = "CADQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQP5KR"
                     [0x22; 32],
                     "a".to_owned(),
                     "stellar:testnet".to_owned(),
-                    VALID_SUMMARY_TO.to_owned(),
+                    SHAPED_G.to_owned(),
                     "mcp".to_owned(),
                     "merchant".to_owned(),
                     "tools/charge".to_owned(),
                     "1000000".to_owned(),
                     "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
-                    VALID_SUMMARY_TO.to_owned(),
+                    SHAPED_G.to_owned(),
                     BASE_INBOX_CREATED_MS / 1_000 + 3_600,
                     1_100,
                     uid.clone(),
@@ -13289,11 +13994,11 @@ asset = "CADQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQP5KR"
             panic!("register passkey kind required")
         };
         *registration_challenge = Some([0x33; 32]);
-        entries.extend([
-            make_passkey_entry(DEFAULT_TTL_MS),
-            register,
-            make_toolset_gate_entry(DEFAULT_TTL_MS),
-        ]);
+        // The released vector records a request whose destination fails its
+        // checksum; the constructor refuses that text, so the fixture sets it.
+        let mut released_gate = make_toolset_gate_entry(DEFAULT_TTL_MS);
+        set_destination(&mut released_gate, SHAPED_G);
+        entries.extend([make_passkey_entry(DEFAULT_TTL_MS), register, released_gate]);
         let tombstones = [
             attest(&mainnet_kinds[0], &layouts[4]),
             attest(&mainnet_kinds[1], &layouts[2]),
@@ -13331,6 +14036,122 @@ asset = "CADQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQP5KR"
                 .unwrap()
         );
         store.entries.clone()
+    }
+
+    /// A payment to an M address and requests for a G account and two of its
+    /// M addresses, with the fixed nonces and times of the canonical vector.
+    fn canonical_inbox_entries() -> Vec<PendingApproval> {
+        let [g, m0, m_max] = payment_destinations();
+        let source = stellar_strkey::ed25519::PublicKey([1; 32]).to_string();
+        let mut entries = vec![super::super::fixtures::payment_pending(
+            source.as_str(),
+            &m_max,
+            "XLM",
+            10,
+            None,
+            100,
+            7,
+            "1000".to_owned(),
+            DEFAULT_TTL_MS,
+        )];
+        for destination in [&g, &m0, &m_max] {
+            entries.push(toolset_gate_to("sign-payment", destination).unwrap());
+        }
+        for (index, entry) in entries.iter_mut().enumerate() {
+            entry.approval_nonce = format!("canonicalinbox{index:08}");
+            entry.created_at_unix_ms = BASE_INBOX_CREATED_MS;
+            entry.expires_at_unix_ms = BASE_INBOX_CREATED_MS + DEFAULT_TTL_MS;
+        }
+        entries
+    }
+
+    /// Canonical G and M destinations load from a vector without a refused
+    /// record, reopen with their stored text, and rewrite byte for byte.
+    #[test]
+    fn canonical_inbox_destinations_keep_their_bytes() {
+        const CANONICAL_INBOX: &str = include_str!("inbox_vectors/canonical_inbox.toml");
+        let [g, m0, m_max] = payment_destinations();
+        assert!(toml::from_str::<StoreFile>(CANONICAL_INBOX).is_ok());
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("default.toml");
+        std::fs::write(&path, CANONICAL_INBOX).unwrap();
+        let store = PendingApprovalStore::open(path.clone()).unwrap();
+        assert!(
+            store
+                .entries
+                .iter()
+                .all(|entry| super::super::verify_stored_destination(&entry.kind).is_ok())
+        );
+        let stored: Vec<&str> = (0..4)
+            .map(|index| {
+                stored_destination(store.get(&format!("canonicalinbox{index:08}")).unwrap())
+            })
+            .collect();
+        assert_eq!(stored, [&m_max, &g, &m0, &m_max]);
+        for view in store.snapshot(BASE_INBOX_CREATED_MS) {
+            assert!(
+                !matches!(view.summary, ApprovalSummaryView::Inconsistent { .. }),
+                "{:?}",
+                view.summary
+            );
+        }
+        store.persist().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), CANONICAL_INBOX);
+        assert_eq!(
+            toml::to_string_pretty(&StoreFile {
+                pending: canonical_inbox_entries(),
+            })
+            .unwrap(),
+            CANONICAL_INBOX
+        );
+    }
+
+    /// The released vector records request 36 with a destination whose
+    /// checksum fails. The strict decoder refuses it. The store opens the
+    /// file, holds all 40 records as ordinary entries, shows request 36 as
+    /// inconsistent, refuses each use of it, and rejects it on request.
+    #[test]
+    fn released_inbox_request_36_loads_and_refuses_its_use() {
+        const BASE_INBOX: &str = include_str!("inbox_vectors/base_inbox.toml");
+        let nonce = "baseinboxnonce00000036";
+        assert!(toml::from_str::<StoreFile>(BASE_INBOX).is_err());
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("default.toml");
+        std::fs::write(&path, BASE_INBOX).unwrap();
+        let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+        assert_eq!(store.len(), 40);
+        for index in 0..40 {
+            assert!(store.get(&format!("baseinboxnonce{index:08}")).is_some());
+        }
+        let refusing: Vec<&str> = store
+            .entries
+            .iter()
+            .filter(|entry| super::super::verify_stored_destination(&entry.kind).is_err())
+            .map(|entry| entry.approval_nonce.as_str())
+            .collect();
+        assert_eq!(refusing, [nonce]);
+        let view = store
+            .snapshot(BASE_INBOX_CREATED_MS)
+            .into_iter()
+            .find(|view| view.approval_nonce == nonce)
+            .unwrap();
+        assert!(matches!(
+            view.summary,
+            ApprovalSummaryView::Inconsistent { .. }
+        ));
+        let err = store
+            .consume(nonce, &"a".repeat(64), ConsumedOutcome::Confirmed)
+            .unwrap_err();
+        assert!(
+            matches!(err, ApprovalError::DestinationRefused { .. }),
+            "{err}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), BASE_INBOX);
+        assert!(store.reject(nonce, 1, DEFAULT_TTL_MS).unwrap());
+        assert!(matches!(
+            store.get(nonce).unwrap().kind,
+            ApprovalKind::Rejected { .. }
+        ));
     }
 
     /// The TOML text of one entry, for byte comparisons of single rows.
@@ -13512,7 +14333,16 @@ asset = "CADQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQP5KR"
     fn subject_kind_defaults_omits_and_round_trips() {
         const BASE_INBOX: &str = include_str!("inbox_vectors/base_inbox.toml");
         assert!(!BASE_INBOX.contains("subject_kind"));
-        let legacy: StoreFile = toml::from_str(BASE_INBOX).unwrap();
+        // The store's load decoding admits the released request 36.
+        let load = |text: &str| StoreFile {
+            pending: toml::from_str::<StoredFile>(text)
+                .unwrap()
+                .pending
+                .into_iter()
+                .map(|stored| stored.0)
+                .collect(),
+        };
+        let legacy = load(BASE_INBOX);
         assert!(
             legacy
                 .pending
@@ -13526,7 +14356,7 @@ asset = "CADQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQP5KR"
             1,
         );
         assert_ne!(explicit, BASE_INBOX);
-        let explicit: StoreFile = toml::from_str(&explicit).unwrap();
+        let explicit = load(&explicit);
         assert_eq!(
             toml::to_string_pretty(&explicit).unwrap(),
             BASE_INBOX,

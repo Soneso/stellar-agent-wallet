@@ -551,7 +551,7 @@ mod tests {
             let entry = PendingApproval::new_payment_pending(
                 "b64xdr".to_owned(),
                 b"xdr",
-                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_owned(),
                 1_000_000,
                 "XLM".to_owned(),
                 None,

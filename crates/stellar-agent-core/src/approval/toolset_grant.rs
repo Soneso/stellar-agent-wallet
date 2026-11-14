@@ -19,7 +19,9 @@
 //! - `toolset_name` == toolset name from the invoke call.
 //! - Its install identity, package version and package shasum equal the current pin.
 //! - `capability` == capability token (e.g. `"sign-payment"`).
-//! - `destination` == canonical G-strkey of the envelope destination.
+//! - A `sign-payment` grant for a G account covers that account and every M
+//!   address of it. A grant for an M address covers only that complete M
+//!   address. Other capabilities compare the destination text exactly.
 //! - `asset` == canonical `code:issuer` or `"XLM"` of the envelope asset.
 //! - `amount_min_stroops` ≤ envelope_amount ≤ `amount_max_stroops`.
 //! - The grant is not expired (TTL check).
@@ -47,6 +49,9 @@
 //!
 //! The per-action `PaymentSimulated` approval fires on every toolset-routed
 //! payment and binds the actual executed envelope.
+//!
+//! Coverage never rewrites a grant. The attestation binds the stored
+//! destination text, so a G grant and an M grant attest different bytes.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -61,9 +66,42 @@ use crate::approval::attestation::{
     ATTESTATION_VERSION, ATTESTATION_VERSION_V2, AttestationScope, AttestedLifetime,
     compute_attestation, compute_toolset_gate_digest, verify_toolset_gate_attestation,
 };
+use crate::payment_accounts::PaymentAccount;
 
 /// The kind name a grant's version 3 attestation binds.
 pub const TOOLSET_GRANT_KIND: &str = "ToolsetGrant";
+
+/// The capability whose destination is a classic payment destination.
+pub(crate) const SIGN_PAYMENT_CAPABILITY: &str = "sign-payment";
+
+/// Checks that a `sign-payment` destination is a canonical G account or M
+/// address. Other capabilities keep their own destination forms, such as the
+/// smart-account contract of `sign-rule-create`.
+pub(crate) fn check_grant_destination(capability: &str, destination: &str) -> Result<(), String> {
+    if capability == SIGN_PAYMENT_CAPABILITY && PaymentAccount::parse(destination).is_err() {
+        return Err(
+            "a sign-payment destination must be a canonical G account or M address".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+/// Whether a payment grant for `granted` covers a payment to `destination`.
+///
+/// A G grant covers its account and every M address of that account, which
+/// all credit the same balance. An M grant covers only its complete M address.
+fn payment_grant_covers(granted: &str, destination: &str) -> bool {
+    let (Ok(granted), Ok(destination)) = (
+        PaymentAccount::parse(granted),
+        PaymentAccount::parse(destination),
+    ) else {
+        return false;
+    };
+    match granted.muxed_id() {
+        None => destination.base_account() == granted.canonical(),
+        Some(_) => destination.canonical() == granted.canonical(),
+    }
+}
 
 /// The layout of a grant attestation stored before grants named theirs.
 fn legacy_attestation_version() -> u32 {
@@ -88,7 +126,12 @@ pub const TOOLSET_GRANT_DEFAULT_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 ///
 /// Created by the gated resolver after the operator approves a
 /// `ToolsetFirstInvokeGate` pending approval.
+///
+/// The capability and destination are private, so a grant built or
+/// deserialized outside the store names a destination its capability admits.
+/// A stored grant loads as written, and matching checks its destination.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "GrantRecord", into = "GrantRecord")]
 #[non_exhaustive]
 pub struct ToolsetGrant {
     /// Wallet-issued grant identifier (16 bytes, URL-safe base64 no-pad).
@@ -107,11 +150,9 @@ pub struct ToolsetGrant {
     #[serde(default)]
     pub package_shasum: String,
 
-    /// Capability token (e.g. `"sign-payment"`).
-    pub capability: String,
+    capability: String,
 
-    /// Canonical G-strkey destination address (from authoritative envelope).
-    pub destination: String,
+    destination: String,
 
     /// Asset identifier (`"XLM"` or `"<code>:<G-strkey>"`).
     pub asset: String,
@@ -147,7 +188,102 @@ pub struct ToolsetGrant {
     pub attestation_version: u32,
 }
 
+/// The stored form of a grant, before its destination is checked.
+///
+/// A [`ToolsetGrant`] serializes through this record, which keeps the
+/// layout of the derived form.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GrantRecord {
+    grant_id: String,
+    toolset_name: String,
+    #[serde(default)]
+    install_id: String,
+    #[serde(default)]
+    package_version: String,
+    #[serde(default)]
+    package_shasum: String,
+    capability: String,
+    destination: String,
+    asset: String,
+    amount_min_stroops: i64,
+    amount_max_stroops: i64,
+    granted_at_unix_ms: u64,
+    expires_at_unix_ms: u64,
+    attestation_blob_b64: Option<String>,
+    process_uid_at_grant: String,
+    #[serde(default = "legacy_attestation_version")]
+    attestation_version: u32,
+}
+
+impl TryFrom<GrantRecord> for ToolsetGrant {
+    type Error = String;
+
+    fn try_from(record: GrantRecord) -> Result<Self, String> {
+        check_grant_destination(&record.capability, &record.destination)?;
+        Ok(Self::stored(record))
+    }
+}
+
 impl ToolsetGrant {
+    /// A grant as the store holds it, without the destination check.
+    fn stored(record: GrantRecord) -> Self {
+        Self {
+            grant_id: record.grant_id,
+            toolset_name: record.toolset_name,
+            install_id: record.install_id,
+            package_version: record.package_version,
+            package_shasum: record.package_shasum,
+            capability: record.capability,
+            destination: record.destination,
+            asset: record.asset,
+            amount_min_stroops: record.amount_min_stroops,
+            amount_max_stroops: record.amount_max_stroops,
+            granted_at_unix_ms: record.granted_at_unix_ms,
+            expires_at_unix_ms: record.expires_at_unix_ms,
+            attestation_blob_b64: record.attestation_blob_b64,
+            process_uid_at_grant: record.process_uid_at_grant,
+            attestation_version: record.attestation_version,
+        }
+    }
+}
+
+impl From<ToolsetGrant> for GrantRecord {
+    fn from(grant: ToolsetGrant) -> Self {
+        Self {
+            grant_id: grant.grant_id,
+            toolset_name: grant.toolset_name,
+            install_id: grant.install_id,
+            package_version: grant.package_version,
+            package_shasum: grant.package_shasum,
+            capability: grant.capability,
+            destination: grant.destination,
+            asset: grant.asset,
+            amount_min_stroops: grant.amount_min_stroops,
+            amount_max_stroops: grant.amount_max_stroops,
+            granted_at_unix_ms: grant.granted_at_unix_ms,
+            expires_at_unix_ms: grant.expires_at_unix_ms,
+            attestation_blob_b64: grant.attestation_blob_b64,
+            process_uid_at_grant: grant.process_uid_at_grant,
+            attestation_version: grant.attestation_version,
+        }
+    }
+}
+
+impl ToolsetGrant {
+    /// Returns the capability token, such as `"sign-payment"`.
+    #[must_use]
+    pub fn capability(&self) -> &str {
+        &self.capability
+    }
+
+    /// Returns the destination from the authoritative envelope, as approved.
+    ///
+    /// A `sign-payment` grant holds a canonical G account or M address.
+    #[must_use]
+    pub fn destination(&self) -> &str {
+        &self.destination
+    }
+
     /// Returns `true` if this grant has expired relative to `now_unix_ms`.
     #[must_use]
     pub fn is_expired(&self, now_unix_ms: u64) -> bool {
@@ -155,6 +291,10 @@ impl ToolsetGrant {
     }
 
     /// Compares the installation, payment fields and clock against this grant's bucket and expiry.
+    ///
+    /// A `sign-payment` grant for a G account covers that account and its M
+    /// addresses; a grant for an M address covers only that address. Other
+    /// capabilities compare the destination text exactly.
     ///
     /// This is a field and clock comparison only. Use
     /// [`ToolsetGrantStore::find_matching`] for a verified lookup.
@@ -180,10 +320,18 @@ impl ToolsetGrant {
             && self.package_version == package_version
             && self.package_shasum == package_shasum
             && self.capability == capability
-            && self.destination == destination
+            && self.covers_destination(destination)
             && self.asset == asset
             && amount_stroops >= self.amount_min_stroops
             && amount_stroops <= self.amount_max_stroops
+    }
+
+    fn covers_destination(&self, destination: &str) -> bool {
+        if self.capability == SIGN_PAYMENT_CAPABILITY {
+            payment_grant_covers(&self.destination, destination)
+        } else {
+            self.destination == destination
+        }
     }
 
     /// Verifies the HMAC attestation blob against the stored grant fields.
@@ -252,7 +400,7 @@ impl ToolsetGrant {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct GrantStoreFile {
     #[serde(default)]
-    grants: Vec<ToolsetGrant>,
+    grants: Vec<GrantRecord>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -292,6 +440,10 @@ pub struct GrantQuery<'a> {
 /// and writes are sequentialised through the async call path).
 ///
 /// Expired grants are pruned on each `open()` call.
+///
+/// A stored grant loads as written, whatever its destination. A
+/// `sign-payment` grant whose destination is not a canonical G account or M
+/// address is an ordinary grant that never matches an invocation.
 pub struct ToolsetGrantStore {
     path: PathBuf,
     grants: Vec<ToolsetGrant>,
@@ -346,6 +498,7 @@ impl ToolsetGrantStore {
             // Prune expired grants on load.
             sf.grants
                 .into_iter()
+                .map(ToolsetGrant::stored)
                 .filter(|g| !g.is_expired(now_unix_ms))
                 .collect()
         } else {
@@ -361,7 +514,9 @@ impl ToolsetGrantStore {
     /// supplied key and binding, and expire within the default TTL of issuance.
     /// Its issue time must meet the query's installation cutoff and must not lie
     /// after the query's current time, so a grant dated in the future never
-    /// carries over to a later installation.
+    /// carries over to a later installation. A `sign-payment` grant whose
+    /// stored destination is not a canonical G account or M address covers
+    /// no destination.
     #[must_use]
     pub fn find_matching(
         &self,
@@ -398,8 +553,12 @@ impl ToolsetGrantStore {
     ///
     /// # Errors
     ///
+    /// - [`ApprovalError::InvalidEntry`] if a `sign-payment` grant names a
+    ///   destination other than a canonical G account or M address.
     /// - [`ApprovalError::Io`] / [`ApprovalError::Toml`] on persistence failure.
     pub fn insert(&mut self, grant: ToolsetGrant) -> Result<(), ApprovalError> {
+        check_grant_destination(&grant.capability, &grant.destination)
+            .map_err(|detail| ApprovalError::InvalidEntry { detail })?;
         self.grants.push(grant);
         self.persist()
     }
@@ -449,7 +608,7 @@ impl ToolsetGrantStore {
     /// Persists the grant store atomically via tempfile + rename.
     fn persist(&self) -> Result<(), ApprovalError> {
         let file_content = toml::to_string_pretty(&GrantStoreFile {
-            grants: self.grants.clone(),
+            grants: self.grants.iter().cloned().map(GrantRecord::from).collect(),
         })
         .map_err(|e| ApprovalError::Toml {
             detail: format!("toolset_grant_store: serialize error: {e}"),
@@ -498,12 +657,14 @@ impl ToolsetGrantStore {
 // Grant construction helper
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Checks that a first-invoke request names a complete installation.
+/// Checks that a first-invoke request names a complete installation and a
+/// destination its capability admits.
 ///
 /// # Errors
 ///
 /// Returns `approval.entry_inconsistent` when the installation fields are absent
-/// or malformed. Other approval kinds pass unchanged.
+/// or malformed, or when a `sign-payment` destination is not a canonical G
+/// account or M address. Other approval kinds pass unchanged.
 pub fn verify_toolset_gate_entry_terms(
     kind: &super::ApprovalKind,
 ) -> Result<(), crate::error::WalletError> {
@@ -511,11 +672,15 @@ pub fn verify_toolset_gate_entry_terms(
         install_id,
         package_version,
         package_shasum,
+        capability,
+        destination,
         ..
     } = kind
     else {
         return Ok(());
     };
+    check_grant_destination(capability, destination)
+        .map_err(|reason| super::inconsistent(&reason))?;
     let lower_hex = |value: &str, len: usize| {
         value.len() == len
             && value
@@ -547,7 +712,8 @@ pub fn verify_toolset_gate_entry_terms(
 /// - `package_version`: approved package version.
 /// - `package_shasum`: approved package SHA-256.
 /// - `capability`: capability token (e.g. `"sign-payment"`).
-/// - `destination`: canonical G-strkey destination.
+/// - `destination`: the destination as approved; a canonical G account or M
+///   address for `sign-payment`.
 /// - `asset`: canonical asset identifier.
 /// - `amount_min_stroops`: bucket lower bound.
 /// - `amount_max_stroops`: bucket upper bound.
@@ -558,7 +724,8 @@ pub fn verify_toolset_gate_entry_terms(
 ///
 /// # Errors
 ///
-/// Returns [`ApprovalError::Io`] if the system clock returns an error.
+/// Returns [`ApprovalError::InvalidEntry`] when a `sign-payment` destination
+/// is not a canonical G account or M address.
 #[allow(clippy::too_many_arguments)]
 pub fn build_attested_grant(
     toolset_name: String,
@@ -576,6 +743,8 @@ pub fn build_attested_grant(
     attestation_key: &[u8; 32],
     binding: &super::AttestationBinding<'_>,
 ) -> Result<ToolsetGrant, ApprovalError> {
+    check_grant_destination(&capability, &destination)
+        .map_err(|detail| ApprovalError::InvalidEntry { detail })?;
     // Generate a random grant_id.
     let mut raw = [0u8; 16];
     OsRng.fill_bytes(&mut raw);
@@ -659,7 +828,16 @@ mod tests {
     use super::*;
     use crate::approval::attestation::compute_toolset_gate_digest;
 
-    const DEST_G: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    /// The G account of the key `[1; 32]`.
+    const DEST_G: &str = "GAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQDZ7H";
+    /// M addresses of [`DEST_G`] with IDs zero, seven, and `u64::MAX`.
+    const DEST_M0: &str = "MAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAAAAAAAAAAAABAXI";
+    const DEST_M7: &str = "MAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAAAAAAAAAAAA6TAI";
+    const DEST_MMAX: &str = "MAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQD7777777777776QNE";
+    /// The G account of the key `[2; 32]` and its M address with ID `u64::MAX`.
+    const OTHER_G: &str = "GABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEJXA";
+    const OTHER_MMAX: &str =
+        "MABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAF7777777777777GNW";
     const NOW_MS: u64 = 1_750_000_000_000;
 
     fn make_grant(
@@ -1034,20 +1212,27 @@ mod tests {
             86_400_000,
             &key,
         );
-        let other_dest = "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
-        // other_dest is 58 chars, not a valid G-strkey, but the matches() fn
-        // does exact string compare so any mismatch returns false.
-        assert!(!grant.matches(
-            "my-toolset",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "1.0.0",
-            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-            "sign-payment",
-            other_dest,
-            "XLM",
-            1_000,
-            NOW_MS
-        ));
+        // Another account, one of its M addresses, and malformed text.
+        for other_dest in [
+            OTHER_G,
+            OTHER_MMAX,
+            "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+        ] {
+            assert!(
+                !grant.matches(
+                    "my-toolset",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "1.0.0",
+                    "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                    "sign-payment",
+                    other_dest,
+                    "XLM",
+                    1_000,
+                    NOW_MS
+                ),
+                "{other_dest}"
+            );
+        }
     }
 
     #[test]
@@ -1521,5 +1706,446 @@ mod tests {
                 )
                 .is_none()
         );
+    }
+
+    const KEY: [u8; 32] = [0x42; 32];
+
+    fn binding() -> crate::approval::AttestationBinding<'static> {
+        crate::approval::AttestationBinding::new("default", "stellar:testnet")
+    }
+
+    /// A grant of the bucket `[2, 10]` to `destination` under [`KEY`].
+    fn grant_to(capability: &str, destination: &str) -> Result<ToolsetGrant, ApprovalError> {
+        build_attested_grant(
+            "my-toolset".to_owned(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "1.0.0".to_owned(),
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
+            capability.to_owned(),
+            destination.to_owned(),
+            "XLM".to_owned(),
+            2,
+            10,
+            "1000".to_owned(),
+            NOW_MS,
+            86_400_000,
+            &KEY,
+            &binding(),
+        )
+    }
+
+    fn found(store: &ToolsetGrantStore, destination: &str) -> bool {
+        let query = GrantQuery {
+            destination,
+            ..test_query()
+        };
+        store.find_matching(&query, &KEY, &binding()).is_some()
+    }
+
+    #[test]
+    fn a_g_grant_covers_its_m_addresses() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = store_with_grant(&dir, grant_to("sign-payment", DEST_G).unwrap());
+        for destination in [DEST_G, DEST_M0, DEST_M7, DEST_MMAX] {
+            assert!(found(&store, destination), "{destination}");
+        }
+        for destination in [OTHER_G, OTHER_MMAX] {
+            assert!(!found(&store, destination), "{destination}");
+        }
+    }
+
+    #[test]
+    fn an_m_grant_covers_only_its_complete_address() {
+        for (granted, others) in [
+            (DEST_M7, [DEST_G, DEST_M0, DEST_MMAX, OTHER_MMAX]),
+            (DEST_M0, [DEST_G, DEST_M7, DEST_MMAX, OTHER_G]),
+            (DEST_MMAX, [DEST_G, DEST_M0, DEST_M7, OTHER_MMAX]),
+        ] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let store = store_with_grant(&dir, grant_to("sign-payment", granted).unwrap());
+            assert!(found(&store, granted), "{granted}");
+            for other in others {
+                assert!(!found(&store, other), "{granted} covers {other}");
+            }
+        }
+    }
+
+    /// Each query differs from a covered M payment in one non-destination
+    /// term, and each misses.
+    #[test]
+    fn every_non_destination_constraint_refuses_a_covered_m_payment() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let grant = grant_to("sign-payment", DEST_G).unwrap();
+        let mut unattested = grant.clone();
+        unattested.attestation_blob_b64 = None;
+        let store = store_with_grant(&dir, grant);
+        let covered = GrantQuery {
+            destination: DEST_MMAX,
+            ..test_query()
+        };
+        assert!(store.find_matching(&covered, &KEY, &binding()).is_some());
+        let misses = [
+            (
+                "toolset",
+                GrantQuery {
+                    toolset_name: "other",
+                    ..covered
+                },
+            ),
+            (
+                "install",
+                GrantQuery {
+                    install_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    ..covered
+                },
+            ),
+            (
+                "version",
+                GrantQuery {
+                    package_version: "1.0.1",
+                    ..covered
+                },
+            ),
+            (
+                "shasum",
+                GrantQuery {
+                    package_shasum: "eddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                    ..covered
+                },
+            ),
+            (
+                "capability",
+                GrantQuery {
+                    capability: "sign-rule-create",
+                    ..covered
+                },
+            ),
+            (
+                "asset",
+                GrantQuery {
+                    asset: "USDC:GAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQDZ7H",
+                    ..covered
+                },
+            ),
+            (
+                "minimum",
+                GrantQuery {
+                    amount_stroops: 1,
+                    ..covered
+                },
+            ),
+            (
+                "maximum",
+                GrantQuery {
+                    amount_stroops: 11,
+                    ..covered
+                },
+            ),
+            (
+                "expiry",
+                GrantQuery {
+                    now_unix_ms: NOW_MS + 86_400_000,
+                    ..covered
+                },
+            ),
+            (
+                "install cutoff",
+                GrantQuery {
+                    not_before_unix_ms: NOW_MS + 1,
+                    ..covered
+                },
+            ),
+            (
+                "issued in the future",
+                GrantQuery {
+                    now_unix_ms: NOW_MS - 1,
+                    ..covered
+                },
+            ),
+        ];
+        for (term, query) in misses {
+            assert!(
+                store.find_matching(&query, &KEY, &binding()).is_none(),
+                "{term}"
+            );
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = store_with_grant(&dir, unattested);
+        assert!(
+            store.find_matching(&covered, &KEY, &binding()).is_none(),
+            "attestation"
+        );
+    }
+
+    #[test]
+    fn g_and_m_grants_reopen_with_their_stored_bytes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("default.toolset_grants.toml");
+        let grants = [
+            grant_to("sign-payment", DEST_G).unwrap(),
+            grant_to("sign-payment", DEST_MMAX).unwrap(),
+        ];
+        let mut store = ToolsetGrantStore::open(path.clone(), NOW_MS).unwrap();
+        for grant in &grants {
+            store.insert(grant.clone()).unwrap();
+        }
+        let written = fs::read_to_string(&path).unwrap();
+        let reopened = ToolsetGrantStore::open(path.clone(), NOW_MS).unwrap();
+        for (stored, original) in reopened.grants.iter().zip(&grants) {
+            assert_eq!(stored.destination, original.destination);
+            assert_eq!(stored.attestation_blob_b64, original.attestation_blob_b64);
+            assert!(stored.verify_attestation(&KEY, &binding()));
+        }
+        assert_eq!(reopened.len(), 2);
+        assert!(found(&reopened, DEST_MMAX));
+        reopened.persist().unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), written);
+    }
+
+    #[test]
+    fn an_m_grant_attests_its_exact_destination_bytes() {
+        let grant = grant_to("sign-payment", DEST_MMAX).unwrap();
+        assert_eq!(grant.destination, DEST_MMAX);
+        let blob: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(grant.attestation_blob_b64.as_ref().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let verifies = |destination: &str| {
+            let digest = compute_toolset_gate_digest(
+                &grant.toolset_name,
+                &grant.install_id,
+                &grant.package_version,
+                &grant.package_shasum,
+                &grant.capability,
+                destination,
+                &grant.asset,
+                grant.amount_min_stroops,
+                grant.amount_max_stroops,
+            );
+            crate::approval::attestation::verify_attestation(
+                &KEY,
+                &binding(),
+                &grant.grant_id,
+                &digest,
+                "1000",
+                &AttestationScope::V3(grant.attested_lifetime()),
+                &blob,
+            )
+        };
+        assert!(verifies(DEST_MMAX));
+        assert!(!verifies(DEST_G));
+    }
+
+    #[test]
+    fn construction_refuses_a_malformed_payment_destination() {
+        let contract = stellar_strkey::Contract([1; 32]).to_string();
+        let muxed_contract = stellar_strkey::MuxedContract {
+            contract_id: [1; 32],
+            id: 7,
+        }
+        .to_string();
+        let corrupted = format!("{}A", &DEST_G[..55]);
+        for destination in [
+            contract.as_str(),
+            muxed_contract.as_str(),
+            corrupted.as_str(),
+            &DEST_M7.to_lowercase(),
+            " GAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQDZ7H",
+        ] {
+            let err = grant_to("sign-payment", destination).unwrap_err();
+            assert!(matches!(err, ApprovalError::InvalidEntry { .. }), "{err}");
+            assert!(!err.to_string().contains(destination.trim()), "{err}");
+        }
+    }
+
+    /// Replaces the stored destination text of the only grant in `path`.
+    fn edit_stored_destination(path: &Path, from: &str, to: &str) {
+        let text = fs::read_to_string(path).unwrap();
+        assert!(text.contains(from));
+        fs::write(path, text.replace(from, to)).unwrap();
+    }
+
+    #[test]
+    fn loading_refuses_a_malformed_payment_destination() {
+        let corrupted = format!("{}A", &DEST_M7[..68]);
+        let contract = stellar_strkey::Contract([1; 32]).to_string().to_string();
+        for malformed in [corrupted.as_str(), contract.as_str(), "GBBBBBBBBB"] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("default.toolset_grants.toml");
+            let grant = grant_to("sign-payment", DEST_M7).unwrap();
+            drop(store_with_grant(&dir, grant.clone()));
+            assert!(found(
+                &ToolsetGrantStore::open(path.clone(), NOW_MS).unwrap(),
+                DEST_M7
+            ));
+            edit_stored_destination(&path, DEST_M7, malformed);
+            let edited = fs::read_to_string(&path).unwrap();
+            let store = ToolsetGrantStore::open(path.clone(), NOW_MS).unwrap();
+            assert_eq!(store.len(), 1);
+            assert_eq!(store.grants[0].destination(), malformed);
+            for destination in [DEST_M7, DEST_G, malformed] {
+                assert!(!found(&store, destination), "{destination}");
+            }
+            assert_eq!(fs::read_to_string(&path).unwrap(), edited);
+        }
+    }
+
+    #[test]
+    fn rule_create_grants_keep_their_contract_destination() {
+        let contract = stellar_strkey::Contract([1; 32]).to_string().to_string();
+        let other = stellar_strkey::Contract([2; 32]).to_string().to_string();
+        let grant = grant_to("sign-rule-create", &contract).unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("default.toolset_grants.toml");
+        drop(store_with_grant(&dir, grant.clone()));
+        let reopened = ToolsetGrantStore::open(path, NOW_MS).unwrap();
+        let stored = &reopened.grants[0];
+        assert_eq!(stored.destination, contract);
+        assert_eq!(stored.attestation_blob_b64, grant.attestation_blob_b64);
+        let query = |destination| GrantQuery {
+            capability: "sign-rule-create",
+            destination,
+            ..test_query()
+        };
+        assert!(
+            reopened
+                .find_matching(&query(&contract), &KEY, &binding())
+                .is_some()
+        );
+        assert!(
+            reopened
+                .find_matching(&query(&other), &KEY, &binding())
+                .is_none()
+        );
+    }
+
+    /// [`DEST_G`] with its last character changed, so its checksum fails.
+    fn bad_checksum_g() -> String {
+        format!("{}A", &DEST_G[..55])
+    }
+
+    /// A grant to `destination` whose attestation verifies under [`KEY`],
+    /// built around the construction check.
+    fn attested_to(toolset_name: &str, destination: &str) -> ToolsetGrant {
+        let mut grant = grant_to("sign-payment", DEST_G).unwrap();
+        grant.toolset_name = toolset_name.to_owned();
+        grant.destination = destination.to_owned();
+        let digest = compute_toolset_gate_digest(
+            &grant.toolset_name,
+            &grant.install_id,
+            &grant.package_version,
+            &grant.package_shasum,
+            &grant.capability,
+            &grant.destination,
+            &grant.asset,
+            grant.amount_min_stroops,
+            grant.amount_max_stroops,
+        );
+        let blob = compute_attestation(
+            &KEY,
+            &binding(),
+            &grant.grant_id,
+            &digest,
+            &grant.process_uid_at_grant,
+            &grant.attested_lifetime(),
+        );
+        grant.attestation_blob_b64 = Some(URL_SAFE_NO_PAD.encode(blob));
+        assert!(grant.verify_attestation(&KEY, &binding()));
+        grant
+    }
+
+    #[test]
+    fn grant_deserialize_refuses_bad_destination() {
+        let grant = grant_to("sign-payment", DEST_G).unwrap();
+        let text = toml::to_string(&grant).unwrap();
+        assert!(toml::from_str::<ToolsetGrant>(&text).is_ok());
+        let bad = bad_checksum_g();
+        let err = toml::from_str::<ToolsetGrant>(&text.replace(DEST_G, &bad)).unwrap_err();
+        assert!(!err.to_string().contains(&bad), "{err}");
+        let json = serde_json::to_string(&grant).unwrap();
+        assert!(serde_json::from_str::<ToolsetGrant>(&json.replace(DEST_G, &bad)).is_err());
+    }
+
+    #[test]
+    fn grant_insert_refuses_bad_destination() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("default.toolset_grants.toml");
+        let mut store = ToolsetGrantStore::open(path.clone(), NOW_MS).unwrap();
+        let err = store.insert(attested_to("my-toolset", &bad_checksum_g()));
+        assert!(
+            matches!(err, Err(ApprovalError::InvalidEntry { .. })),
+            "{err:?}"
+        );
+        let mut contract = grant_to("sign-rule-create", DEST_G).unwrap();
+        contract.capability = SIGN_PAYMENT_CAPABILITY.to_owned();
+        contract.destination = stellar_strkey::Contract([1; 32]).to_string().to_string();
+        assert!(store.insert(contract).is_err());
+        assert!(store.is_empty());
+        assert!(!path.exists());
+    }
+
+    /// One authenticated grant with a refused destination sits between two
+    /// usable grants. It is an ordinary grant: counted, kept in place on
+    /// rewrite, revoked, and pruned. It matches no destination, not even its
+    /// own text, and the usable grants match before and after a restart.
+    #[test]
+    fn a_grant_with_a_refused_destination_is_an_ordinary_grant() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("default.toolset_grants.toml");
+        let bad = attested_to("old-toolset", &bad_checksum_g());
+        let mut grants = vec![
+            grant_to("sign-payment", DEST_G).unwrap(),
+            bad.clone(),
+            grant_to("sign-payment", OTHER_MMAX).unwrap(),
+        ];
+        let file = |grants: &[ToolsetGrant]| {
+            toml::to_string_pretty(&GrantStoreFile {
+                grants: grants.iter().cloned().map(GrantRecord::from).collect(),
+            })
+            .unwrap()
+        };
+        let text = file(&grants);
+        fs::write(&path, &text).unwrap();
+        let bad_query = GrantQuery {
+            toolset_name: "old-toolset",
+            destination: &bad.destination,
+            ..test_query()
+        };
+        for _restart in 0..2 {
+            let store = ToolsetGrantStore::open(path.clone(), NOW_MS).unwrap();
+            assert!(found(&store, DEST_M7));
+            assert!(found(&store, OTHER_MMAX));
+            assert_eq!(store.len(), 3);
+            assert_eq!(store.grants[1].destination(), bad.destination);
+            assert!(store.grants[1].verify_attestation(&KEY, &binding()));
+            assert!(store.find_matching(&bad_query, &KEY, &binding()).is_none());
+            assert!(!store.grants[1].matches(
+                "old-toolset",
+                &bad.install_id,
+                &bad.package_version,
+                &bad.package_shasum,
+                SIGN_PAYMENT_CAPABILITY,
+                &bad.destination,
+                "XLM",
+                5,
+                NOW_MS,
+            ));
+            assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        }
+        let mut store = ToolsetGrantStore::open(path.clone(), NOW_MS).unwrap();
+        let added = grant_to("sign-payment", OTHER_G).unwrap();
+        store.insert(added.clone()).unwrap();
+        grants.push(added);
+        assert_eq!(fs::read_to_string(&path).unwrap(), file(&grants));
+        let mut store = ToolsetGrantStore::open(path.clone(), NOW_MS).unwrap();
+        assert!(found(&store, OTHER_G) && found(&store, DEST_MMAX));
+        assert_eq!(store.revoke_toolset("old-toolset").unwrap(), 1);
+        let store = ToolsetGrantStore::open(path.clone(), NOW_MS).unwrap();
+        assert_eq!(store.len(), 3);
+        assert!(store.grants.iter().all(|g| g.grant_id != bad.grant_id));
+        fs::write(&path, &text).unwrap();
+        let store = ToolsetGrantStore::open(path, bad.expires_at_unix_ms).unwrap();
+        assert!(store.is_empty(), "expired grants prune on load");
     }
 }

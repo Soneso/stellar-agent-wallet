@@ -2117,6 +2117,67 @@ fn signed_origin_reject_nonce_mismatch_is_binding_mismatch() {
     assert!(so.rows("approval_attested").is_empty());
 }
 
+/// A payment whose stored summary destination fails its checksum stays
+/// rejectable and revocable on the signed-origin inbox: the challenge mints,
+/// the action applies, and a neighbouring entry stays unchanged.
+#[tokio::test]
+#[serial_test::serial]
+async fn signed_origin_bad_destination_remains_rejectable() {
+    use std::sync::atomic::Ordering;
+    for action in ["reject", "revoke"] {
+        let access = Arc::new(crate::tests::CountingRevocations::new());
+        let so = SignedOrigin::with_revocation(
+            &format!("signed-bad-destination-{action}"),
+            Some(access.clone()),
+        );
+        let neighbour = so.fixture.payment(600_000);
+        let mut store = PendingApprovalStore::open(so.fixture.store_path()).unwrap();
+        store.insert(neighbour.clone(), now_ms().unwrap()).unwrap();
+        drop(store);
+        let destination = stellar_agent_core::approval::mainnet_fixtures::ALLOWED_DESTINATION;
+        let bad = format!("{}A", &destination[..55]);
+        assert_ne!(bad, destination);
+        let text = std::fs::read_to_string(so.fixture.store_path()).unwrap();
+        let entry_at = text.find(so.nonce()).unwrap();
+        let summary_at = entry_at + text[entry_at..].find(destination).unwrap();
+        let edited = format!(
+            "{}{bad}{}",
+            &text[..summary_at],
+            &text[summary_at + destination.len()..]
+        );
+        std::fs::write(so.fixture.store_path(), &edited).unwrap();
+        assert!(
+            stellar_agent_core::approval::verify_stored_destination(&so.stored().kind).is_err()
+        );
+
+        let options = so.challenge().await;
+        assert!(options["challenge"].is_string(), "{action}: {options}");
+        let initial = access.calls.load(Ordering::SeqCst);
+        let (status, body) = so.post(action, &SignedOrigin::signed(&options, 4)).await;
+        assert_eq!(status, StatusCode::OK, "{action}: {body}");
+        if action == "reject" {
+            assert_eq!(body["status"], "rejected");
+            assert!(matches!(
+                so.stored().kind,
+                stellar_agent_core::approval::ApprovalKind::Rejected { .. }
+            ));
+            assert_eq!(so.rows("approval_rejected").len(), 1);
+        } else {
+            assert_eq!(body["view"]["state"], "revoked");
+            assert!(access.calls.load(Ordering::SeqCst) > initial);
+            assert_eq!(
+                std::fs::read_to_string(so.fixture.store_path()).unwrap(),
+                edited
+            );
+        }
+        let store = PendingApprovalStore::open(so.fixture.store_path()).unwrap();
+        let stored = store.get(&neighbour.approval_nonce).unwrap();
+        assert_eq!(stored.kind, neighbour.kind);
+        assert!(stored.attestation_blob_b64.is_none());
+        assert!(so.rows("approval_attested").is_empty());
+    }
+}
+
 /// Revoking the challenge credential refuses both decisions without a row or tombstone.
 #[tokio::test]
 #[serial_test::serial]

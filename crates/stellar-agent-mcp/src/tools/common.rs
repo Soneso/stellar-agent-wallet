@@ -1174,6 +1174,18 @@ pub(crate) fn approval_consumed_error() -> rmcp::model::CallToolResult {
     )
 }
 
+/// Returns the wire error for a pending approval whose stored payment
+/// destination is not a canonical G account or M address.
+///
+/// The entry stays stored; no attestation over it admits a send.
+pub(crate) fn approval_inconsistent_error() -> rmcp::model::CallToolResult {
+    business_error_result(
+        "approval.entry_inconsistent",
+        "this pending approval names a payment destination that is not a canonical G account \
+         or M address; simulate the action again to request a fresh approval",
+    )
+}
+
 /// Returns the wire error for a live `ApprovalKind::Consumed` tombstone of a
 /// rule proposal.
 ///
@@ -2857,6 +2869,17 @@ pub(crate) async fn verify_attestation_subject_gate(
             "approval entry was already spent on a submission"
         );
         return Err(approval_consumed_error());
+    }
+
+    // 5d. A stored payment destination must be a canonical G account or M
+    //     address before the entry admits anything.
+    if stellar_agent_core::approval::verify_stored_destination(&entry.kind).is_err() {
+        tracing::debug!(
+            nonce = %approval_nonce_str,
+            tool = tool_name,
+            "approval entry names a refused payment destination"
+        );
+        return Err(approval_inconsistent_error());
     }
 
     // An unreadable receipt still refuses before any approval can admit a send.
@@ -5660,7 +5683,7 @@ pub(crate) mod tests {
         use stellar_agent_core::approval::{
             DEFAULT_TTL_MS, PendingApproval, process_uid_for_attestation,
         };
-        let holder = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned();
+        let holder = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_owned();
         let uid = process_uid_for_attestation().unwrap();
         match kind {
             GatedApprovalKind::X402 => panic!("classic fixture requires a classic kind"),
@@ -6026,6 +6049,54 @@ pub(crate) mod tests {
             assert_business_envelope(&result).0,
             "policy.approval_required"
         );
+    }
+
+    /// An attested payment whose stored summary destination fails its
+    /// checksum passes no commit: the gate answers `approval.entry_inconsistent`
+    /// and leaves the store unchanged.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(keyring)]
+    async fn a_refused_stored_destination_refuses_the_commit_with_its_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        let server = envelope_gate_server(dir.path());
+        let entry = envelope_gate_entry(GatedApprovalKind::Payment);
+        let blob = park_gate_entry(&server, dir.path(), &entry);
+        let nonce = &entry.approval_nonce;
+        let dispatch =
+            DispatchOutcome::RequireApproval(ApprovalRequest::new(nonce.clone(), 120).into());
+        let commit = || {
+            verify_attestation_gate(
+                &server,
+                &dispatch,
+                GatedApprovalKind::Payment,
+                "AAAA",
+                Some(nonce),
+                Some(&blob),
+                "stellar_pay_commit",
+            )
+        };
+        assert!(
+            commit().await.is_ok(),
+            "the intact approval admits the commit"
+        );
+        let path = dir
+            .path()
+            .join(format!("{}.toml", server.profile_name_for_approval()));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let line = "summary_to = \"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF\"";
+        assert_eq!(text.matches(line).count(), 1);
+        let edited = text.replace(
+            line,
+            "summary_to = \"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"",
+        );
+        std::fs::write(&path, &edited).unwrap();
+        let result = commit().await.unwrap_err();
+        assert_eq!(
+            assert_business_envelope(&result).0,
+            "approval.entry_inconsistent"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
     }
 
     #[tokio::test(flavor = "current_thread")]

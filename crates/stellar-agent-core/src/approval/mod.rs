@@ -161,11 +161,32 @@ pub use view::{ApprovalSummaryView, IntentPayloadView, IntentView, PendingApprov
 ///
 /// # Errors
 ///
-/// Returns `approval.entry_inconsistent` when a stored binding disagrees.
+/// Returns `approval.entry_inconsistent` when a stored binding disagrees, or
+/// when a `sign-payment` request destination is not a canonical G account or
+/// M address. A payment summary destination is not read here: a payment's
+/// consent terms come from its envelope, and approval and use check the
+/// stored summary through [`verify_stored_destination`].
 pub fn verify_entry_terms(kind: &ApprovalKind) -> Result<(), crate::error::WalletError> {
     mpp::verify_mpp_entry_terms(kind)?;
     verify_rule_proposal_entry_terms(kind)?;
     toolset_grant::verify_toolset_gate_entry_terms(kind)
+}
+
+/// Checks the stored payment destination before a use reads it.
+///
+/// A stored payment summary or `sign-payment` request must name a canonical
+/// G account or M address. Every other kind passes.
+///
+/// # Errors
+///
+/// Returns `approval.entry_inconsistent` for any other stored destination.
+pub fn verify_stored_destination(kind: &ApprovalKind) -> Result<(), crate::error::WalletError> {
+    if store::holds_refused_destination(kind) {
+        return Err(inconsistent(
+            "its payment destination is not a canonical G account or M address",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn inconsistent(reason: &str) -> crate::error::WalletError {

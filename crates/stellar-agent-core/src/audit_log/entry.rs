@@ -8835,6 +8835,7 @@ mod tests {
                 amount: Some(10_000_000),
                 asset: Some("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned()),
                 destination_redacted: Some("GAAAA...AAAWHF".to_owned()),
+                destination_sha256: None,
             }],
             RedactedStrkey::from_already_redacted("GABCD...VWXYZ"),
             true,
@@ -8885,6 +8886,7 @@ mod tests {
             amount: Some(1_250_000),
             asset: Some(asset.to_owned()),
             destination_redacted: Some("GABCD...WXYZ2".to_owned()),
+            destination_sha256: None,
         };
         let mut pending = AuditEntry::new_value_action_pending(
             "stellar_pay",
@@ -8949,6 +8951,7 @@ mod tests {
             amount: Some(5),
             asset: Some("native".to_owned()),
             destination_redacted: None,
+            destination_sha256: None,
         };
         let pending = AuditEntry::new_value_action_pending(
             "stellar_pay",

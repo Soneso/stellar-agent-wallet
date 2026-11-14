@@ -202,6 +202,21 @@ pub enum ApprovalError {
         /// The counter value previously stored for this credential.
         stored: u32,
     },
+
+    /// A stored record names a payment destination that is not a canonical
+    /// G account or M address, so this use of it refuses.
+    ///
+    /// The record stays stored unchanged. [`super::attest::record_error`]
+    /// maps this to `approval.entry_inconsistent`.
+    #[error(
+        "approval record {nonce_redacted} names a payment destination that is not a canonical \
+         G account or M address"
+    )]
+    DestinationRefused {
+        /// Redacted approval nonce (first-5-last-5 characters, or the full
+        /// value if it has at most 10 characters).
+        nonce_redacted: String,
+    },
 }
 
 /// Names a TOML error's line and character column without including input text.
@@ -266,6 +281,14 @@ impl ApprovalError {
         }
     }
 
+    /// Constructs an [`ApprovalError::DestinationRefused`] with the nonce
+    /// redacted.
+    pub(crate) fn destination_refused(nonce: &str) -> Self {
+        Self::DestinationRefused {
+            nonce_redacted: redact_nonce(nonce),
+        }
+    }
+
     /// Constructs a [`ApprovalError::SignCounterRegression`] with the
     /// credential ID redacted.
     pub(crate) fn sign_counter_regression(
@@ -285,6 +308,8 @@ impl ApprovalError {
 ///
 /// Returns first-5-last-5 characters separated by `"..."` if the nonce is
 /// longer than 10 characters; otherwise returns the full nonce unchanged.
+/// Characters are Unicode scalar values, so any UTF-8 text redacts without
+/// splitting a character.
 ///
 /// # Examples
 ///
@@ -295,8 +320,10 @@ impl ApprovalError {
 /// assert_eq!(redact_nonce("abcdefghijk"), "abcde...ghijk");
 /// ```
 pub fn redact_nonce(nonce: &str) -> String {
-    if nonce.len() > 10 {
-        let (head, tail) = (&nonce[..5], &nonce[nonce.len() - 5..]);
+    let count = nonce.chars().count();
+    if count > 10 {
+        let head: String = nonce.chars().take(5).collect();
+        let tail: String = nonce.chars().skip(count - 5).collect();
         format!("{head}...{tail}")
     } else {
         nonce.to_owned()
@@ -312,6 +339,17 @@ mod tests {
         reason = "test-only; panics acceptable in unit tests"
     )]
     use super::*;
+
+    /// Eleven two-byte characters redact by character, without a panic.
+    #[test]
+    fn redaction_keeps_utf8_characters_whole() {
+        let id = "ééééééééééé";
+        assert_eq!(id.len(), 22);
+        assert_eq!(redact_nonce(id), "ééééé...ééééé");
+        assert_eq!(redact_nonce("éééééééééé"), "éééééééééé");
+        let err = ApprovalError::destination_refused(id);
+        assert!(err.to_string().contains("ééééé...ééééé"), "{err}");
+    }
 
     #[test]
     fn toml_error_position_names_line_and_character_column() {
