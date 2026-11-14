@@ -164,7 +164,7 @@ mod tests {
             .canonicalize()
             .unwrap();
         let fixture = tempfile::tempdir_in(workspace).unwrap();
-        let home = tempfile::tempdir().unwrap();
+        let home = StateSandbox::new().unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", test])
             .env("TMPDIR", temporary)

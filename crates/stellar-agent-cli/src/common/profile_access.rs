@@ -740,7 +740,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn the_refusal_message_does_not_leak_the_home_directory() {
-        let home = tempfile::tempdir().expect("temporary home");
+        let home =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect("temporary home");
         let _h = stellar_agent_test_support::env_guard::ScopedEnvVar::new(
             "HOME",
             Some(home.path().as_os_str()),
