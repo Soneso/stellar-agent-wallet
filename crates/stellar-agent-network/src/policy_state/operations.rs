@@ -1696,6 +1696,22 @@ pub(super) fn exposed_authorizations(wire: &WireFile) -> Vec<AuthorizationId> {
         .collect()
 }
 
+/// Every authorization whose retained attempt holds a recovery decision
+/// whose receipt projection is still owed.
+pub(super) fn projection_owed(wire: &WireFile) -> Vec<AuthorizationId> {
+    records(wire)
+        .iter()
+        .flat_map(|record| &record.attempts)
+        .filter(|attempt| {
+            attempt
+                .decision
+                .as_ref()
+                .is_some_and(|decision| !decision.projected)
+        })
+        .map(|attempt| attempt.authorization_id)
+        .collect()
+}
+
 /// Every retained operation that has not ended. A writer without an
 /// operation audit leaves the authorizations they link untouched.
 pub(super) fn live_operations(wire: &WireFile) -> Vec<OperationId> {
@@ -2396,8 +2412,16 @@ fn prune_section(wire: &mut WireFile, now_ms: u64) {
             > now_ms
     });
 
+    // A record whose committed decision still owes its receipt projection
+    // stays until that acknowledgement, whatever its age.
     let eligible = |wire: &WireFile, record: &WireOperation| {
         record.state.is_terminal()
+            && !record.attempts.iter().any(|attempt| {
+                attempt
+                    .decision
+                    .as_ref()
+                    .is_some_and(|decision| !decision.projected)
+            })
             && !wire.authorizations.iter().any(|auth| {
                 auth.operation
                     .is_some_and(|link| link.operation_id == record.id)
@@ -3103,7 +3127,9 @@ impl Session<'_> {
         if waiting >= MAX_WAITING_OPERATIONS {
             return Err(capacity(CapacityDetail::WaitingOperations));
         }
-        if serialized_len(self.original) >= FILE_THRESHOLD {
+        // Measured after `settle` prunes the successor, so rows that aged out
+        // in this step free their space.
+        if serialized_len(&self.wire) >= FILE_THRESHOLD {
             return Err(capacity(CapacityDetail::FileSize));
         }
         let id = loop {
@@ -3920,6 +3946,16 @@ impl Session<'_> {
             chain,
             decision.evidence_digest(),
         )?;
+        // A checked failure moved no payment value and a checked
+        // non-inclusion moved none, so this attempt's total-budget debits
+        // leave the allocation. The charged fee stays in the native window
+        // rows above.
+        if matches!(
+            decision.transition(),
+            DecidedTransition::Failed { .. } | DecidedTransition::NotIncluded(_)
+        ) {
+            super::ledger::release_total_debits(&mut self.wire, auth_id, now);
+        }
         let row = match outcome {
             Some(outcome) => ReleaseRow {
                 class: ReleaseClass::Settled,
@@ -4250,6 +4286,11 @@ impl<'a> OperationRecorder<'a> {
     ) -> Result<T, WindowStoreError> {
         let store = self.store;
         let profile = self.profile;
+        // A malformed mint entry refuses before the lock, the key, and any
+        // read.
+        if let Some(request) = mint {
+            super::store::check_total_shape(&request.holds)?;
+        }
         if !profile.chain_id.is_mainnet() {
             return Err(WindowStoreError::AuthorizationRefused {
                 precondition: MainnetPrecondition::ChainNotMainnet,
@@ -4296,12 +4337,13 @@ impl<'a> OperationRecorder<'a> {
         let (key, _minted) = store.load_or_mint_key(profile)?;
         let gen_entry = generation_entry_ref(profile);
         let original = store.read_verified(profile, &key, &gen_entry)?;
+        let successor = store.retired_successor(lock, profile, &original)?;
         let (value, next, entries) = {
             let mut session = Session {
                 profile,
                 now,
                 original: &original,
-                wire: original.clone(),
+                wire: successor,
                 mint_expires,
                 audit: AuditBatch {
                     request_id: &self.request_id,
@@ -4499,11 +4541,13 @@ impl<'a> OperationRecorder<'a> {
     ///
     /// Success keeps its debit; a failure keeps its counts and debits the
     /// charged fee; a non-inclusion releases every hold under an `Always`
-    /// row of class `proved_unspent`. A still-claimed authorization keeps
-    /// its holds and its state. The ledger admits no invalidation of a
-    /// claimed record, and the authorization's own lifetime bounds those
-    /// holds. A decision the attempt already holds returns its first commit
-    /// and writes nothing.
+    /// row of class `proved_unspent`. A failure or a non-inclusion also
+    /// releases the attempt's total-budget debits once: its rows become
+    /// `proved_unspent`, and an authorization that still holds is settled as
+    /// expired with its total holds released and its other holds retained as
+    /// spend. Without total holds, a still-claimed authorization keeps its
+    /// holds and its state, bounded by its own lifetime. A decision the
+    /// attempt already holds returns its first commit and writes nothing.
     ///
     /// # Errors
     ///
@@ -7360,7 +7404,7 @@ pub(crate) mod tests {
         fx.clock.set(T0 + TTL_MS);
         fx.prune_now();
         let wire = fx.wire();
-        assert_eq!(wire.version, super::super::store::WIRE_VERSION_OPERATIONS);
+        assert_eq!(wire.version, super::super::store::WIRE_VERSION_TOTAL_EPOCH);
         assert!(wire.holds.is_empty());
         let unused = fx.auth(unused.id);
         assert_eq!(unused.state, AuthorizationState::Expired);
@@ -7668,7 +7712,7 @@ pub(crate) mod tests {
     fn an_exposed_sending_attempt_never_recovers_as_not_sent() {
         let mut fx = Fx::new();
         let handle = fx.open_new(&request("order-1", canonical(1)));
-        let auth_id = exposed_attempt(&mut fx, &handle, 1, &classic_exposure(1));
+        let auth_id = exposed_attempt(&mut fx, &handle, 1, &classic_exposure(1), vec![]);
         let now = fx.now();
         rewrite_auth(&fx, auth_id, |auth| {
             auth.state = AuthorizationState::Invalidated;
@@ -8577,8 +8621,9 @@ pub(crate) mod tests {
         handle: &OperationHandle,
         n: u8,
         identity: &ExposureIdentity,
+        holds: Vec<WindowEntry>,
     ) -> AuthorizationId {
-        let mint = fx.mint_request(tx(n), fx.policy(), vec![]);
+        let mint = fx.mint_request(tx(n), fx.policy(), holds);
         let started = fx.begin_mint(handle, &mint).unwrap();
         fx.claim(&mint, started.minted.as_ref().unwrap());
         fx.recorder()
@@ -8633,7 +8678,7 @@ pub(crate) mod tests {
         for unknown in [false, true] {
             let mut fx = Fx::new();
             let handle = fx.open_new(&request("order-1", canonical(1)));
-            let auth_id = exposed_attempt(&mut fx, &handle, 1, &classic_exposure(1));
+            let auth_id = exposed_attempt(&mut fx, &handle, 1, &classic_exposure(1), vec![]);
             if unknown {
                 step(
                     &mut fx,
@@ -8689,7 +8734,7 @@ pub(crate) mod tests {
     fn a_reset_writes_no_row_for_an_exposed_authorization() {
         let mut fx = Fx::new();
         let handle = fx.open_new(&request("order-1", canonical(1)));
-        let auth_id = exposed_attempt(&mut fx, &handle, 1, &classic_exposure(1));
+        let auth_id = exposed_attempt(&mut fx, &handle, 1, &classic_exposure(1), vec![]);
         step(
             &mut fx,
             &handle,
@@ -8951,7 +8996,7 @@ pub(crate) mod tests {
         ] {
             let mut fx = Fx::new();
             let handle = fx.open_new(&request("order-1", canonical(1)));
-            let auth_id = exposed_attempt(&mut fx, &handle, 1, &identity);
+            let auth_id = exposed_attempt(&mut fx, &handle, 1, &identity, vec![]);
             step(
                 &mut fx,
                 &handle,
@@ -9130,7 +9175,7 @@ pub(crate) mod tests {
     fn a_reset_keeps_a_link_whose_authority_ended() {
         let mut fx = Fx::new();
         let handle = fx.open_new(&request("order-1", canonical(1)));
-        let auth_id = exposed_attempt(&mut fx, &handle, 1, &classic_exposure(1));
+        let auth_id = exposed_attempt(&mut fx, &handle, 1, &classic_exposure(1), vec![]);
         step(
             &mut fx,
             &handle,
@@ -9201,7 +9246,7 @@ pub(crate) mod tests {
     fn an_exposed_sending_attempt_stays_sending_after_its_authorization_ended() {
         let mut fx = Fx::new();
         let handle = fx.open_new(&request("order-1", canonical(1)));
-        let auth_id = exposed_attempt(&mut fx, &handle, 1, &classic_exposure(1));
+        let auth_id = exposed_attempt(&mut fx, &handle, 1, &classic_exposure(1), vec![]);
         let now = fx.now();
         rewrite_auth(&fx, auth_id, |auth| {
             auth.state = AuthorizationState::Expired;
@@ -11435,5 +11480,1189 @@ pub(crate) mod tests {
                 .is_err()
         );
         assert_eq!(fs::read(fx.store.path()).unwrap(), bytes);
+    }
+
+    /// Total-budget debits across operation steps: only an unclaimed hold
+    /// that expires or is invalidated leaves the sum.
+    mod total_budget {
+        use super::*;
+        use crate::mainnet::digest::entries_digest;
+        use crate::mainnet::types::{AuditFacts, RecomputedFacts};
+        use crate::policy_state::ledger::{
+            ConsumeExpect, ConsumptionBinding, SubmissionBinding, WindowReservation,
+        };
+        use crate::policy_state::store::{RecordStatus, SubmissionHold, total_in_file};
+        use stellar_agent_core::policy::v1::criteria::state_store::PolicyStateStore;
+
+        /// The fixture's pinned digest.
+        const P7: [u8; 32] = [7; 32];
+
+        fn total_key() -> StateKey {
+            StateKey::new("ops", 1, "total:native", 0)
+        }
+
+        fn total(amount: i128) -> WindowEntry {
+            WindowEntry::new(
+                total_key(),
+                T0,
+                amount,
+                WindowLimit::Total {
+                    asset: "native".to_owned(),
+                    max_stroops: 10,
+                },
+            )
+            .with_epoch(Some(P7))
+        }
+
+        fn sum(fx: &Fx) -> i128 {
+            total_in_file(&fx.wire(), &total_key(), P7).unwrap().0
+        }
+
+        fn hydrated(fx: &Fx) -> i128 {
+            let memory = PolicyStateStore::new();
+            fx.store.load_into("ops", &fx.profile, &memory).unwrap();
+            memory.query_epoch(&total_key(), P7).unwrap().0
+        }
+
+        /// A classic exposure of `tx(n)` with a positive `max_time`.
+        fn timed_exposure(n: u8) -> ExposureIdentity {
+            ExposureIdentity::Classic {
+                envelope_sha256: [n ^ 0x5a; 32],
+                tx_hash: [n ^ 0x80; 32],
+                sequence: 100 + i64::from(n),
+                max_time: T0 / 1_000 + 60,
+                receipt: stellar_agent_core::hex::encode(&[n ^ 0x5a; 32]),
+            }
+        }
+
+        /// Consumes `minted` with the transaction binding of `tx(n)`.
+        fn consume(fx: &Fx, request: &MintRequest, minted: &MintedRecord, n: u8) {
+            consume_as(fx, request, minted, n, [n ^ 0x5a; 32]);
+        }
+
+        /// [`consume`] with the signed envelope's hash `envelope_hash`.
+        fn consume_as(
+            fx: &Fx,
+            request: &MintRequest,
+            minted: &MintedRecord,
+            n: u8,
+            envelope_hash: [u8; 32],
+        ) {
+            const AUDIT: AuditFacts = AuditFacts {
+                segment: [0; 32],
+                log_path_digest: [5; 32],
+                anchored_count: 10,
+            };
+            let expect = ConsumeExpect::new(
+                stellar_agent_core::profile::name::profile_name_for_approval(&fx.profile),
+                request.chain,
+                request.consumer,
+                request.binding.clone(),
+                request.policy_sequence,
+                request.policy_digest,
+                request.authority.clone(),
+                minted.reservation.as_ref().map(WindowReservation::id),
+                minted.bindings_digest,
+                AUDIT,
+                &RecomputedFacts {
+                    content_digest: request.binding.content_digest(),
+                    entries_digest: entries_digest(&request.holds),
+                    audit: AUDIT,
+                },
+            );
+            let binding = ConsumptionBinding::Transaction(SubmissionBinding {
+                chain_scope: Some(ChainScope::for_chain(Caip2::Mainnet)),
+                fee_bump: None,
+                envelope_hash,
+                tx_hash: [n ^ 0x80; 32],
+                source: SOURCE.to_owned(),
+                sequence: 100 + i64::from(n),
+                max_time: T0 / 1_000 + 60,
+                pending_since_ms: T0,
+                submission_ledger: 1,
+                submission_anchor: None,
+            });
+            fx.store
+                .consume_authorization(&fx.profile, minted.id, &expect, &binding)
+                .unwrap();
+        }
+
+        /// Begins `order-{n}` under a policy mint of a total of `amount`,
+        /// claims it, and, with `consumed`, consumes it.
+        fn started(fx: &mut Fx, n: u8, amount: i128, consumed: bool) -> OperationHandle {
+            let handle = fx.open_new(&request(&format!("order-{n}"), canonical(n)));
+            let mint = fx.mint_request(tx(n), fx.policy(), vec![total(amount)]);
+            let started = fx.begin_mint(&handle, &mint).unwrap();
+            let minted = started.minted.as_ref().unwrap();
+            fx.claim(&mint, minted);
+            if consumed {
+                consume(fx, &mint, minted, n);
+            }
+            handle
+        }
+
+        fn transition(
+            fx: &mut Fx,
+            handle: &OperationHandle,
+            to: OperationState,
+            evidence: &TransitionEvidence,
+        ) -> Result<CommitId, WindowStoreError> {
+            fx.recorder().transition(handle.id(), Some(1), to, evidence)
+        }
+
+        #[test]
+        #[serial]
+        fn a_cancelled_clear_keeps_the_total_debit() {
+            let mut fx = Fx::new();
+            let handle = started(&mut fx, 1, 6, true);
+            fx.recorder()
+                .expose(handle.id(), 1, &timed_exposure(1), None)
+                .unwrap();
+            let none = TransitionEvidence::default();
+            transition(&mut fx, &handle, OperationState::SentOutcomeUnknown, &none).unwrap();
+            transition(
+                &mut fx,
+                &handle,
+                OperationState::Cancelled,
+                &TransitionEvidence {
+                    clear: Some(ClearForm::Timed),
+                    ..TransitionEvidence::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(fx.record(handle.id()).state, OperationState::Cancelled);
+            assert_eq!(sum(&fx), 6);
+            assert_eq!(hydrated(&fx), 6);
+        }
+
+        #[test]
+        #[serial]
+        fn public_non_inclusion_keeps_the_total_debit() {
+            let mut fx = Fx::new();
+            let handle = started(&mut fx, 1, 6, true);
+            fx.recorder()
+                .expose(handle.id(), 1, &timed_exposure(1), None)
+                .unwrap();
+            let none = TransitionEvidence::default();
+            transition(&mut fx, &handle, OperationState::SentOutcomeUnknown, &none).unwrap();
+            let result = transition(
+                &mut fx,
+                &handle,
+                OperationState::NotIncluded,
+                &TransitionEvidence {
+                    not_included: Some(proof()),
+                    ..TransitionEvidence::default()
+                },
+            );
+            assert!(
+                matches!(&result, Err(WindowStoreError::UnexpectedState { detail })
+                    if detail == "a non-inclusion commits only through a checked recovery decision"),
+                "{result:?}"
+            );
+            assert_eq!(sum(&fx), 6);
+            assert_eq!(hydrated(&fx), 6);
+        }
+
+        #[test]
+        #[serial]
+        fn release_unused_releases_a_total_hold() {
+            let mut fx = Fx::new();
+            let handle = fx.open_new(&request("order-1", canonical(1)));
+            let authority = fx.approval();
+            let mut linked = fx.mint_request(tx(1), authority.clone(), vec![total(6)]);
+            linked.operation = Some(OperationLink {
+                operation_id: handle.id(),
+                attempt_index: 1,
+            });
+            fx.store.mint_authorization(&fx.profile, &linked).unwrap();
+            let handle = match fx.open(&request("order-1", canonical(1))).unwrap() {
+                OpenOutcome::Resumable(handle) => handle,
+                other => panic!("expected the adopted record, got {other:?}"),
+            };
+            let remint = fx.mint_request(tx(2), authority, vec![total(10)]);
+            fx.begin_mint(&handle, &remint).unwrap();
+            assert_eq!(sum(&fx), 10);
+        }
+
+        #[test]
+        #[serial]
+        fn release_linked_unused_releases_a_total_hold() {
+            let mut fx = Fx::new();
+            let handle = fx.open_new(&request("order-1", canonical(1)));
+            let mut linked = fx.mint_request(tx(1), fx.approval(), vec![total(6)]);
+            linked.operation = Some(OperationLink {
+                operation_id: handle.id(),
+                attempt_index: 1,
+            });
+            let first = fx.store.mint_authorization(&fx.profile, &linked).unwrap();
+            let handle = match fx.open(&request("order-1", canonical(1))).unwrap() {
+                OpenOutcome::Resumable(handle) => handle,
+                other => panic!("expected the adopted record, got {other:?}"),
+            };
+            fx.recorder()
+                .transition(
+                    handle.id(),
+                    None,
+                    OperationState::Expired,
+                    &TransitionEvidence::default(),
+                )
+                .unwrap();
+            assert!(
+                fx.wire()
+                    .holds
+                    .iter()
+                    .all(|hold| hold.authorization_id != first.id)
+            );
+            let unlinked = fx.mint_request(tx(2), fx.approval(), vec![total(10)]);
+            fx.store.mint_authorization(&fx.profile, &unlinked).unwrap();
+        }
+
+        #[test]
+        #[serial]
+        fn public_unsent_evidence_keeps_the_total() {
+            for consumed in [false, true] {
+                let mut fx = Fx::new();
+                let handle = started(&mut fx, 1, 6, consumed);
+                transition(
+                    &mut fx,
+                    &handle,
+                    OperationState::NotSent,
+                    &TransitionEvidence {
+                        send_never_started: true,
+                        ..TransitionEvidence::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(fx.record(handle.id()).state, OperationState::NotSent);
+                assert_eq!(sum(&fx), 6, "consumed: {consumed}");
+                assert_eq!(hydrated(&fx), 6, "consumed: {consumed}");
+            }
+        }
+
+        /// The total rows of the decided fixture, as `(authorization, status,
+        /// amount)`.
+        fn total_rows(fx: &Fx) -> Vec<(Option<AuthorizationId>, RecordStatus, i128)> {
+            fx.wire()
+                .entries
+                .iter()
+                .filter(|bucket| bucket.bucket == "total:native")
+                .flat_map(|bucket| bucket.records.clone())
+                .map(|record| (record.authorization_id, record.status, record.amount))
+                .collect()
+        }
+
+        /// Adds a pending total row of `amount` under `auth_id` with window
+        /// id `id`.
+        fn push_total_row(fx: &Fx, id: &str, auth_id: AuthorizationId, amount: i128) {
+            let id = id.to_owned();
+            fx.rewrite(|wire| {
+                let scope = wire.chain_scope;
+                super::super::super::store::find_or_insert_bucket(&mut wire.entries, &total_key())
+                    .records
+                    .push(super::super::super::store::WireRecord {
+                        chain_scope: scope,
+                        ts_ms: T0,
+                        amount,
+                        id,
+                        status: RecordStatus::Pending,
+                        tx_hash: stellar_agent_core::hex::encode(&[1 ^ 0x80; 32]),
+                        source: SOURCE.to_owned(),
+                        sequence: 101,
+                        pending_since_ms: T0,
+                        epoch: Some(P7),
+                        authorization_id: Some(auth_id),
+                        ..super::super::super::store::WireRecord::confirmed_defaults()
+                    });
+            });
+        }
+
+        /// An unknown classic attempt of `order-{n}` under a policy mint of a
+        /// total of 6, with a committed sequence release. `shape` is `held`
+        /// (a claimed, exposed, unconsumed hold), `consumed` (a pending row),
+        /// or `expired` (that row with its accounting expired).
+        fn decided_total_attempt(
+            fx: &mut Fx,
+            n: u8,
+            shape: &str,
+        ) -> (OperationHandle, RecoveryAttempt, AuthorizationId) {
+            let handle = fx.open_new(&request(&format!("order-{n}"), canonical(n)));
+            let mint = fx.mint_request(tx(n), fx.policy(), vec![total(6)]);
+            let started = fx.begin_mint(&handle, &mint).unwrap();
+            let minted = started.minted.as_ref().unwrap();
+            fx.claim(&mint, minted);
+            let envelope: [u8; 32] = Sha256::digest(envelope_text(n)).into();
+            if shape != "held" {
+                consume_as(fx, &mint, minted, n, envelope);
+            }
+            let exposure = ExposureIdentity::Classic {
+                envelope_sha256: envelope,
+                tx_hash: [n ^ 0x80; 32],
+                sequence: 100 + i64::from(n),
+                max_time: T0 / 1_000 + 60,
+                receipt: envelope_id(n),
+            };
+            fx.recorder()
+                .expose(handle.id(), started.attempt_index, &exposure, Some(10))
+                .unwrap();
+            fx.recorder()
+                .transition(
+                    handle.id(),
+                    Some(started.attempt_index),
+                    OperationState::SentOutcomeUnknown,
+                    &TransitionEvidence::default(),
+                )
+                .unwrap();
+            let auth_id = started.authorization_id;
+            if shape == "expired" {
+                fx.rewrite(|wire| {
+                    for record in wire.entries.iter_mut().flat_map(|b| &mut b.records) {
+                        if record.authorization_id == Some(auth_id) {
+                            record.status = RecordStatus::AccountingExpired;
+                        }
+                    }
+                });
+            }
+            fx.recorder()
+                .record_evidence(
+                    handle.id(),
+                    started.attempt_index,
+                    &EvidenceInput {
+                        sequence_released: Some(SequenceReleaseInput {
+                            primary_ledger: 90,
+                            witness_ledger: 90,
+                            min_close_time_ms: T0,
+                        }),
+                        ..EvidenceInput::default()
+                    },
+                )
+                .unwrap();
+            (handle, snapshot(fx, n), auth_id)
+        }
+
+        fn snapshot(fx: &Fx, n: u8) -> RecoveryAttempt {
+            OperationStatus::new(&fx.store, &fx.profile)
+                .outcome_snapshot(Some(&[n ^ 0x80; 32]))
+                .unwrap()
+                .pop()
+                .unwrap()
+        }
+
+        fn failed() -> DecidedTransition {
+            DecidedTransition::Failed {
+                outcome: agreed(1, "FAILED"),
+                fee_charged: 100,
+            }
+        }
+
+        /// A checked failure and a checked non-inclusion release exactly the
+        /// attempt's total debit: zero use, then the full allocation admits.
+        /// The failure keeps its charged fee and its settled native release.
+        #[test]
+        #[serial]
+        fn a_checked_decision_releases_the_total_debit() {
+            for transition in [
+                failed(),
+                DecidedTransition::NotIncluded(not_included_proof()),
+            ] {
+                let mut fx = Fx::new();
+                let (handle, _) = decided_attempt(&mut fx, 1);
+                let auth_id = fx.record(handle.id()).attempts[0].authorization_id;
+                push_total_row(&fx, &envelope_id(1), auth_id, 6);
+                let attempt = snapshot(&fx, 1);
+                fx.recorder()
+                    .commit_decision(&decide(&attempt, transition.clone()))
+                    .unwrap();
+                assert_eq!(
+                    total_rows(&fx),
+                    vec![(Some(auth_id), RecordStatus::ProvedUnspent, 6)],
+                    "{transition:?}"
+                );
+                assert_eq!(sum(&fx), 0, "{transition:?}");
+                assert_eq!(hydrated(&fx), 0, "{transition:?}");
+                let native = fx.auth(auth_id).native_release.unwrap().class;
+                if matches!(transition, DecidedTransition::Failed { .. }) {
+                    assert_eq!(native, ReleaseClass::Settled);
+                    let fee: Vec<_> = bucket_rows(&fx, 1)
+                        .into_iter()
+                        .filter(|row| row.0 == "native")
+                        .collect();
+                    assert_eq!(fee.len(), 1, "the charged fee stays charged");
+                    assert_eq!((fee[0].1, fee[0].2), (RecordStatus::Confirmed, 100));
+                } else {
+                    assert_eq!(native, ReleaseClass::ProvedUnspent);
+                }
+                fx.store
+                    .record_authorized(&fx.profile, &[total(10)])
+                    .unwrap();
+                assert_eq!(sum(&fx), 10, "{transition:?}");
+            }
+        }
+
+        /// Attempts that hold their total in each shape: a claimed exposed
+        /// hold, a consumed pending row, and a row whose accounting expired.
+        /// A checked failure or non-inclusion releases each, and a total row
+        /// of another authorization stays counted.
+        #[test]
+        #[serial]
+        fn a_checked_decision_releases_every_shape_of_the_attempt() {
+            for shape in ["held", "consumed", "expired"] {
+                for transition in [
+                    failed(),
+                    DecidedTransition::NotIncluded(not_included_proof()),
+                ] {
+                    let mut fx = Fx::new();
+                    let (handle, _, auth_id) = decided_total_attempt(&mut fx, 1, shape);
+                    let other = AuthorizationId::from_bytes([0x77; 32]);
+                    push_total_row(&fx, &"ee".repeat(32), other, 3);
+                    let attempt = snapshot(&fx, 1);
+                    let label = format!("{shape} {transition:?}");
+                    assert_eq!(sum(&fx), 9, "{label}");
+                    fx.recorder()
+                        .commit_decision(&decide(&attempt, transition))
+                        .unwrap();
+                    assert_eq!(sum(&fx), 3, "{label}");
+                    assert_eq!(hydrated(&fx), 3, "{label}");
+                    assert!(fx.wire().holds.is_empty(), "{label}");
+                    assert!(
+                        total_rows(&fx).contains(&(Some(other), RecordStatus::Pending, 3)),
+                        "{label}"
+                    );
+                    let state = fx.auth(auth_id).state;
+                    assert!(!state.holds(), "{label}: {state:?}");
+                    fx.store
+                        .record_authorized(&fx.profile, &[total(7)])
+                        .unwrap();
+                    assert_eq!(sum(&fx), 10, "{label}");
+                    let _ = handle;
+                }
+            }
+        }
+
+        /// A success, a repeated decision, a stale decision, and a decision
+        /// for another envelope release nothing.
+        #[test]
+        #[serial]
+        fn only_a_fresh_checked_failure_or_non_inclusion_releases() {
+            let mut fx = Fx::new();
+            decided_total_attempt(&mut fx, 1, "consumed");
+            let attempt = snapshot(&fx, 1);
+            fx.recorder()
+                .commit_decision(&decide(
+                    &attempt,
+                    DecidedTransition::Succeeded(agreed(1, "SUCCESS")),
+                ))
+                .unwrap();
+            assert_eq!(sum(&fx), 6, "a success keeps its debit");
+
+            let mut fx = Fx::new();
+            let (_, _, _) = decided_total_attempt(&mut fx, 1, "consumed");
+            let stale = snapshot(&fx, 1);
+            fx.prune_now();
+            let result = fx.recorder().commit_decision(&decide(&stale, failed()));
+            assert!(result.is_err(), "a stale decision commits: {result:?}");
+            assert_eq!(sum(&fx), 6);
+            let mut foreign = snapshot(&fx, 1);
+            if let ExposureIdentity::Classic {
+                envelope_sha256, ..
+            } = &mut foreign.exposure
+            {
+                *envelope_sha256 = [0x42; 32];
+            }
+            let result = fx.recorder().commit_decision(&decide(&foreign, failed()));
+            assert!(result.is_err(), "another envelope commits: {result:?}");
+            assert_eq!(sum(&fx), 6);
+
+            let fresh = snapshot(&fx, 1);
+            let decision = decide(&fresh, failed());
+            let first = fx.recorder().commit_decision(&decision).unwrap();
+            assert_eq!(sum(&fx), 0);
+            fx.store
+                .record_authorized(&fx.profile, &[total(10)])
+                .unwrap();
+            let again = fx.recorder().commit_decision(&decision).unwrap();
+            assert_eq!(again, first, "a repeated decision returns its first commit");
+            assert_eq!(sum(&fx), 10, "a repeated decision releases nothing more");
+        }
+
+        /// The release commits with the decision: a stop before the counter
+        /// keeps the debit, a stop after it keeps the release.
+        #[test]
+        #[serial]
+        fn the_release_follows_the_commit_counter() {
+            for seam in [
+                super::super::super::store::COMMIT_FAULT_AFTER_PREPARED,
+                super::super::super::store::COMMIT_FAULT_AFTER_COUNTER,
+                super::super::super::store::COMMIT_FAULT_COMPACTION,
+            ] {
+                let mut fx = Fx::new();
+                let (_, _, _) = decided_total_attempt(&mut fx, 1, "consumed");
+                let attempt = snapshot(&fx, 1);
+                let fault = super::super::super::store::arm_accounting_fault(seam);
+                let result = fx.recorder().commit_decision(&decide(&attempt, failed()));
+                drop(fault);
+                let committed = seam != super::super::super::store::COMMIT_FAULT_AFTER_PREPARED;
+                assert_eq!(
+                    result.is_ok(),
+                    seam == super::super::super::store::COMMIT_FAULT_COMPACTION,
+                    "{seam}"
+                );
+                let reopened = PersistedWindowStore::at_path(fx.store.path().to_owned());
+                let wire = reopened.read_for_inspection(&fx.profile).unwrap().unwrap();
+                assert_eq!(
+                    total_in_file(&wire, &total_key(), P7).unwrap().0,
+                    if committed { 0 } else { 6 },
+                    "{seam}"
+                );
+            }
+        }
+
+        /// Recovery steps of version 12 state read no pin.
+        #[test]
+        #[serial]
+        fn recovery_needs_no_pin() {
+            let mut fx = Fx::new();
+            let handle = started(&mut fx, 1, 6, false);
+            let unused = fx.mint_request(tx(2), fx.approval(), vec![total(2)]);
+            let minted = fx.store.mint_authorization(&fx.profile, &unused).unwrap();
+            let scope = PinScope::for_profile(fx.store.path(), &fx.profile);
+            let entry = scope.pin_entry_ref();
+            keyring_core::Entry::new(&entry.service, &entry.account)
+                .unwrap()
+                .set_password("unreadable")
+                .unwrap();
+            assert!(
+                fx.store
+                    .invalidate_authorization(&fx.profile, minted.id, "cancel")
+                    .unwrap()
+            );
+            transition(
+                &mut fx,
+                &handle,
+                OperationState::NotSent,
+                &TransitionEvidence::default(),
+            )
+            .unwrap();
+            assert_eq!(sum(&fx), 6);
+        }
+
+        #[test]
+        #[serial]
+        fn retirement_refuses_a_total_operation_mint() {
+            let mut fx = Fx::new();
+            let handle = fx.open_new(&request("order-1", canonical(1)));
+            let mut wire = fx.wire();
+            wire.version = super::super::super::store::WIRE_VERSION_OPERATIONS;
+            fx.store.seal_unchecked_for_test(&fx.profile, &wire);
+            hydrated(&fx);
+            assert_eq!(fx.wire().retired_total_epoch, Some(P7));
+            let mint = fx.mint_request(tx(1), fx.policy(), vec![total(1)]);
+            let error = fx.begin_mint(&handle, &mint).unwrap_err();
+            assert!(matches!(error, WindowStoreError::TotalEpochRetired));
+            assert_eq!(
+                error.operation_error().unwrap().code(),
+                "policy.total_epoch_retired"
+            );
+        }
+
+        // ── expiry is committed before capacity is reused ────────────────
+
+        /// The total an ordinary writer admits against at `now`: the file
+        /// after the sweep that writer commits before it counts.
+        fn sum_at(fx: &Fx, now: u64) -> i128 {
+            let mut wire = fx.wire();
+            super::super::super::ledger::sweep_expired(&mut wire, now);
+            total_in_file(&wire, &total_key(), P7).unwrap().0
+        }
+
+        /// A live operation `order-1` with an unused linked hold of 6,
+        /// minted at `T0`. Returns the mint request and record.
+        fn live_linked_hold(fx: &mut Fx) -> (MintRequest, MintedRecord) {
+            let handle = fx.open_new(&request("order-1", canonical(1)));
+            let mut linked = fx.mint_request(tx(1), fx.approval(), vec![total(6)]);
+            linked.operation = Some(OperationLink {
+                operation_id: handle.id(),
+                attempt_index: 1,
+            });
+            let minted = fx.store.mint_authorization(&fx.profile, &linked).unwrap();
+            assert!(!fx.record(handle.id()).state.is_terminal());
+            (linked, minted)
+        }
+
+        fn claim_result(
+            fx: &Fx,
+            request: &MintRequest,
+            minted: &MintedRecord,
+        ) -> Result<u64, WindowStoreError> {
+            fx.store.claim_authorization(
+                &fx.profile,
+                minted.id,
+                &ClaimExpect {
+                    domain: request.binding.domain(),
+                    consumer: request.consumer,
+                    bindings_digest: minted.bindings_digest,
+                    policy_sequence: request.policy_sequence,
+                    policy_digest: request.policy_digest,
+                    authority: request.authority.clone(),
+                },
+            )
+        }
+
+        /// A second process reuses the capacity of an expired live-operation
+        /// hold, then the clock moves back inside that hold's lifetime and
+        /// the hold is claimed after a restart.
+        #[test]
+        #[serial]
+        fn a_rolled_back_clock_cannot_revive_a_reused_hold() {
+            let mut fx = Fx::new();
+            let (request, minted) = live_linked_hold(&mut fx);
+            fx.clock.set(minted.expires_at_ms);
+            let gate = hydrated(&fx);
+            let other = PersistedWindowStore::at_path(fx.store.path().to_owned());
+            let reused = other.record_authorized(&fx.profile, &[total(6)]);
+            let reopened = PersistedWindowStore::at_path(fx.store.path().to_owned());
+            fx.clock.set(T0 + 1);
+            let claimed = claim_result(&fx, &request, &minted);
+            let allocated = total_in_file(
+                &reopened.read_for_inspection(&fx.profile).unwrap().unwrap(),
+                &total_key(),
+                P7,
+            )
+            .unwrap()
+            .0;
+            assert!(allocated <= 10, "reactivated allocation is {allocated}");
+            assert!(
+                matches!(&reused, Err(WindowStoreError::PolicyDenied { .. })),
+                "{reused:?}"
+            );
+            claimed.unwrap();
+            assert_eq!(allocated, 6);
+            assert_eq!(gate, 6, "the gate counts the unswept hold");
+        }
+
+        /// The reuse is a reservation written through the prepared commit:
+        /// every commit seam leaves the allocation at the one hold.
+        #[test]
+        #[serial]
+        fn a_reservation_never_reuses_an_unswept_live_hold() {
+            for seam in [
+                super::super::super::store::COMMIT_FAULT_AFTER_PREPARED,
+                super::super::super::store::COMMIT_FAULT_AFTER_COUNTER,
+                super::super::super::store::COMMIT_FAULT_COMPACTION,
+            ] {
+                let mut fx = Fx::new();
+                let (_, minted) = live_linked_hold(&mut fx);
+                fx.clock.set(minted.expires_at_ms);
+                let reservation = SubmissionHold {
+                    chain_scope: ChainScope::for_chain(Caip2::Mainnet),
+                    submission_anchor: None,
+                    id: "ab".repeat(32),
+                    tx_hash: "cd".repeat(32),
+                    source: SOURCE.to_owned(),
+                    sequence: 200,
+                    max_time: 0,
+                    pending_since_ms: minted.expires_at_ms,
+                    submission_ledger: 1,
+                    operator_required: false,
+                };
+                let fault = super::super::super::store::arm_accounting_fault(seam);
+                let result = fx
+                    .store
+                    .record_pending(&fx.profile, &[total(6)], &reservation);
+                drop(fault);
+                assert!(
+                    matches!(&result, Err(WindowStoreError::PolicyDenied { .. })),
+                    "{seam}: {result:?}"
+                );
+                let reopened = PersistedWindowStore::at_path(fx.store.path().to_owned());
+                let wire = reopened.read_for_inspection(&fx.profile).unwrap().unwrap();
+                assert_eq!(
+                    total_in_file(&wire, &total_key(), P7).unwrap().0,
+                    6,
+                    "{seam}"
+                );
+            }
+        }
+
+        /// Past every expiry, the hydrated gate and durable admission count
+        /// the same holds: a claimed one, a claimed one an exposure names,
+        /// and an unclaimed one linked to a live operation. An unlinked
+        /// unclaimed hold counts in neither once its writer sweeps.
+        #[test]
+        #[serial]
+        fn hydration_and_admission_agree_beside_live_and_exposed_holds() {
+            let mut fx = Fx::new();
+            started(&mut fx, 1, 2, false);
+            let exposed = started(&mut fx, 2, 3, false);
+            fx.recorder()
+                .expose(exposed.id(), 1, &timed_exposure(2), None)
+                .unwrap();
+            let live = fx.open_new(&request("order-3", canonical(3)));
+            let mut linked = fx.mint_request(tx(3), fx.approval(), vec![total(1)]);
+            linked.operation = Some(OperationLink {
+                operation_id: live.id(),
+                attempt_index: 1,
+            });
+            let linked = fx.store.mint_authorization(&fx.profile, &linked).unwrap();
+            let unlinked = fx.mint_request(tx(4), fx.approval(), vec![total(4)]);
+            fx.store.mint_authorization(&fx.profile, &unlinked).unwrap();
+            assert_eq!(sum(&fx), 10);
+            let after = linked.expires_at_ms + 1;
+            fx.clock.set(after);
+            assert_eq!(hydrated(&fx), 6, "the gate drops only the unlinked hold");
+            assert_eq!(sum_at(&fx, after), 6);
+            fx.store
+                .record_authorized(&fx.profile, &[total(4)])
+                .unwrap();
+            assert!(matches!(
+                fx.store.record_authorized(&fx.profile, &[total(1)]),
+                Err(WindowStoreError::PolicyDenied { .. })
+            ));
+            assert_eq!(sum(&fx), 10);
+            assert_eq!(hydrated(&fx), 10);
+        }
+
+        /// Commits a checked failure of `order-1`'s consumed total of 6 and
+        /// writes its projection marker.
+        fn projected_failure(fx: &mut Fx) {
+            let (handle, attempt, _) = decided_total_attempt(fx, 1, "consumed");
+            let commit = fx
+                .recorder()
+                .commit_decision(&decide(&attempt, failed()))
+                .unwrap();
+            fx.recorder()
+                .acknowledge_projection(handle.id(), 1, commit)
+                .unwrap();
+        }
+
+        /// A total of `amount` under the digest `epoch`.
+        fn total_in(amount: i128, epoch: [u8; 32]) -> WindowEntry {
+            total(amount).with_epoch(Some(epoch))
+        }
+
+        fn total_of(fx: &Fx, epoch: [u8; 32]) -> i128 {
+            total_in_file(&fx.wire(), &total_key(), epoch).unwrap().0
+        }
+
+        /// Pins the digest `digest` at sequence 8.
+        fn repin(fx: &Fx, digest: [u8; 32]) {
+            let lock = WindowStoreLock::acquire_for(
+                fx.store.path(),
+                &fx.profile.policy_window_state_key_id,
+            )
+            .unwrap();
+            pin::write_for_test(
+                &lock,
+                &PinScope::for_profile(fx.store.path(), &fx.profile),
+                &Pin::new(8, digest, owner_of(11)).unwrap(),
+            )
+            .unwrap();
+        }
+
+        /// D7 holds 6; the pin moves to D8, which admits 10. The checked
+        /// failure of D7's attempt then releases D7's 6 and cannot reduce
+        /// D8's 10, also when the decision is replayed.
+        #[test]
+        #[serial]
+        fn a_release_after_a_repin_cannot_credit_the_new_digest() {
+            const D8: [u8; 32] = [8; 32];
+            let mut fx = Fx::new();
+            decided_total_attempt(&mut fx, 1, "consumed");
+            repin(&fx, D8);
+            fx.store
+                .record_authorized(&fx.profile, &[total_in(10, D8)])
+                .unwrap();
+            let decision = decide(&snapshot(&fx, 1), failed());
+            let first = fx.recorder().commit_decision(&decision).unwrap();
+            assert_eq!(total_of(&fx, P7), 0);
+            assert_eq!(total_of(&fx, D8), 10, "replay of D7's release reduces D8");
+            let replayed = fx.recorder().commit_decision(&decision);
+            assert!(
+                replayed.as_ref().map_or(true, |commit| *commit == first),
+                "{replayed:?}"
+            );
+            assert_eq!(total_of(&fx, D8), 10, "replay of D7's release reduces D8");
+            assert!(matches!(
+                fx.store.record_authorized(&fx.profile, &[total_in(1, D8)]),
+                Err(WindowStoreError::PolicyDenied { .. })
+            ));
+        }
+
+        /// A reset refuses while the attempt is unresolved. After its checked
+        /// failure and projection, the reset succeeds, a fresh 10 admits,
+        /// and a replay of the decision credits nothing more.
+        #[test]
+        #[serial]
+        fn a_replay_after_a_reset_cannot_credit_the_new_allocation() {
+            let mut fx = Fx::new();
+            let (handle, attempt, _) = decided_total_attempt(&mut fx, 1, "consumed");
+            let reset = |fx: &Fx, id: &str| {
+                fx.store.reset(
+                    &fx.profile,
+                    &stellar_agent_core::profile::name::profile_name_for_approval(&fx.profile),
+                    fx.now(),
+                    "repair",
+                    id,
+                    |row| Ok::<_, ()>(signed_by(11, row)),
+                    |_, _| Ok(()),
+                )
+            };
+            assert!(
+                reset(&fx, "reset-1").is_err(),
+                "the reset refuses while the attempt is unresolved"
+            );
+            let decision = decide(&attempt, failed());
+            let commit = fx.recorder().commit_decision(&decision).unwrap();
+            fx.recorder()
+                .acknowledge_projection(handle.id(), 1, commit)
+                .unwrap();
+            reset(&fx, "reset-2").unwrap();
+            fx.store
+                .record_authorized(&fx.profile, &[total(10)])
+                .unwrap();
+            let replayed = fx.recorder().commit_decision(&decision);
+            assert!(
+                replayed.as_ref().map_or(true, |again| *again == commit),
+                "{replayed:?}"
+            );
+            assert_eq!(sum(&fx), 10, "replay after reset reduces the new 10");
+            assert!(matches!(
+                fx.store.record_authorized(&fx.profile, &[total(1)]),
+                Err(WindowStoreError::PolicyDenied { .. })
+            ));
+        }
+
+        /// The clock past twice the retention, as a later process reads it.
+        fn past_retention() -> u64 {
+            T0 + 2 * super::super::super::store::RETENTION_MS + 1_000
+        }
+
+        /// A checked release whose projection stays open survives two
+        /// collections past every retention, beside a counted 4. Its
+        /// acknowledgement then succeeds, and only afterwards does the
+        /// released row age out.
+        #[test]
+        #[serial]
+        fn an_open_projection_survives_two_collections() {
+            let mut fx = Fx::new();
+            let (handle, attempt, _) = decided_total_attempt(&mut fx, 1, "consumed");
+            let commit = fx
+                .recorder()
+                .commit_decision(&decide(&attempt, failed()))
+                .unwrap();
+            let other = AuthorizationId::from_bytes([0x77; 32]);
+            push_total_row(&fx, &"cd".repeat(32), other, 4);
+            fx.clock.set(past_retention() + TERMINAL_RETENTION_MS);
+            fx.prune_now();
+            fx.prune_now();
+            fx.recorder()
+                .acknowledge_projection(handle.id(), 1, commit)
+                .expect("the open projection is still acknowledged");
+            fx.prune_now();
+            assert_eq!(
+                total_rows(&fx),
+                vec![(Some(other), RecordStatus::Pending, 4)]
+            );
+            assert_eq!(sum(&fx), 4);
+        }
+
+        /// Final released total rows fill the store past its size threshold.
+        /// Past the retention they age out before capacity is checked: a new
+        /// operation opens, and the full allocation admits.
+        #[test]
+        #[serial]
+        fn final_released_totals_age_out_before_capacity_is_checked() {
+            let mut fx = Fx::new();
+            projected_failure(&mut fx);
+            fx.rewrite(|wire| {
+                let bucket = super::super::super::store::find_or_insert_bucket(
+                    &mut wire.entries,
+                    &total_key(),
+                );
+                let released = bucket.records[0].clone();
+                assert_eq!(released.status, RecordStatus::ProvedUnspent);
+                let mut n = 0_u32;
+                while serialized_len(&*wire) <= FILE_THRESHOLD {
+                    let bucket = super::super::super::store::find_or_insert_bucket(
+                        &mut wire.entries,
+                        &total_key(),
+                    );
+                    for _ in 0..500 {
+                        n += 1;
+                        let mut copy = released.clone();
+                        copy.id = format!("{n:064x}");
+                        bucket.records.push(copy);
+                    }
+                }
+            });
+            assert_eq!(sum(&fx), 0);
+            fx.clock.set(past_retention());
+            let opened = fx.recorder().open(&request("order-2", canonical(2)));
+            assert!(
+                matches!(opened, Ok(OpenOutcome::New(_))),
+                "released capacity strands the payer: {opened:?}"
+            );
+            assert!(total_rows(&fx).is_empty(), "the released rows age out");
+            fx.store
+                .record_authorized(&fx.profile, &[total(10)])
+                .unwrap();
+            assert_eq!(sum(&fx), 10);
+        }
+
+        /// A counted total row as old as a pruned released one stays counted.
+        #[test]
+        #[serial]
+        fn a_counted_total_of_the_same_age_survives_the_pruning() {
+            let mut fx = Fx::new();
+            projected_failure(&mut fx);
+            push_total_row(
+                &fx,
+                &"cd".repeat(32),
+                AuthorizationId::from_bytes([0x77; 32]),
+                4,
+            );
+            fx.clock.set(past_retention());
+            fx.open_new(&request("order-2", canonical(2)));
+            assert_eq!(
+                total_rows(&fx),
+                vec![(
+                    Some(AuthorizationId::from_bytes([0x77; 32])),
+                    RecordStatus::Pending,
+                    4
+                )]
+            );
+            assert_eq!(sum(&fx), 4);
+            assert!(matches!(
+                fx.store.record_authorized(&fx.profile, &[total(7)]),
+                Err(WindowStoreError::PolicyDenied { .. })
+            ));
+            fx.store
+                .record_authorized(&fx.profile, &[total(6)])
+                .unwrap();
+        }
+
+        /// The clock moves back before any reuse: the hold still counts.
+        #[test]
+        #[serial]
+        fn a_rollback_before_the_reuse_keeps_the_hold() {
+            let mut fx = Fx::new();
+            let (request, minted) = live_linked_hold(&mut fx);
+            fx.clock.set(minted.expires_at_ms + 5);
+            fx.clock.set(T0 + 1);
+            assert!(matches!(
+                fx.store.record_authorized(&fx.profile, &[total(6)]),
+                Err(WindowStoreError::PolicyDenied { .. })
+            ));
+            claim_result(&fx, &request, &minted).unwrap();
+            assert_eq!(sum_at(&fx, T0 + 1), 6);
+        }
+
+        /// An unlinked hold expires and its capacity is reused: the expiry is
+        /// committed with the reuse, so a rolled-back claim refuses and the
+        /// next reuses stop at the total.
+        #[test]
+        #[serial]
+        fn a_rollback_between_two_reuses_keeps_the_expiry() {
+            let fx = Fx::new();
+            let request = fx.mint_request(tx(1), fx.approval(), vec![total(6)]);
+            let minted = fx.store.mint_authorization(&fx.profile, &request).unwrap();
+            fx.clock.set(minted.expires_at_ms);
+            fx.store
+                .record_authorized(&fx.profile, &[total(6)])
+                .unwrap();
+            fx.clock.set(T0 + 1);
+            assert!(claim_result(&fx, &request, &minted).is_err());
+            fx.store
+                .record_authorized(&fx.profile, &[total(4)])
+                .unwrap();
+            assert!(matches!(
+                fx.store.record_authorized(&fx.profile, &[total(1)]),
+                Err(WindowStoreError::PolicyDenied { .. })
+            ));
+            assert_eq!(sum_at(&fx, T0 + 1), 10);
+        }
+
+        /// The clock moves back while the expired live hold is claimed: the
+        /// claim keeps the hold counted through every later step.
+        #[test]
+        #[serial]
+        fn a_claim_under_a_rolled_back_clock_stays_counted() {
+            let mut fx = Fx::new();
+            let (request, minted) = live_linked_hold(&mut fx);
+            fx.clock.set(minted.expires_at_ms);
+            fx.clock.set(T0 + 1);
+            claim_result(&fx, &request, &minted).unwrap();
+            fx.clock.set(minted.expires_at_ms + 1);
+            assert!(matches!(
+                fx.store.record_authorized(&fx.profile, &[total(6)]),
+                Err(WindowStoreError::PolicyDenied { .. })
+            ));
+            fx.prune_now();
+            assert_eq!(sum_at(&fx, minted.expires_at_ms + 1), 6);
+            assert_eq!(hydrated(&fx), 6);
+        }
+
+        /// The operation's own step commits the expiry of its hold. Only then
+        /// is the capacity reused, and a rolled-back claim refuses.
+        #[test]
+        #[serial]
+        fn an_operation_step_commits_the_expiry_before_reuse() {
+            let mut fx = Fx::new();
+            let (request, minted) = live_linked_hold(&mut fx);
+            fx.clock.set(minted.expires_at_ms);
+            fx.recorder()
+                .lookup(&BusinessId::parse("order-1").unwrap())
+                .unwrap();
+            assert_eq!(sum_at(&fx, minted.expires_at_ms), 0);
+            fx.store
+                .record_authorized(&fx.profile, &[total(10)])
+                .unwrap();
+            fx.clock.set(T0 + 1);
+            assert!(claim_result(&fx, &request, &minted).is_err());
+            assert_eq!(sum_at(&fx, T0 + 1), 10);
+        }
+
+        /// A reset between the expiry and a rolled-back claim: the reset
+        /// refuses while the operation is open, and an unlinked expired hold
+        /// is released by the reset, after which the claim refuses.
+        #[test]
+        #[serial]
+        fn a_reset_between_expiry_and_rollback_keeps_the_total() {
+            let mut fx = Fx::new();
+            let (_, minted) = live_linked_hold(&mut fx);
+            fx.clock.set(minted.expires_at_ms);
+            let reset = fx.store.reset(
+                &fx.profile,
+                &stellar_agent_core::profile::name::profile_name_for_approval(&fx.profile),
+                minted.expires_at_ms,
+                "repair",
+                "reset-1",
+                |row| Ok::<_, ()>(signed_by(11, row)),
+                |_, _| Ok(()),
+            );
+            assert!(
+                matches!(
+                    reset,
+                    Err(ResetError::Store {
+                        error: WindowStoreError::OperationsOpen { .. },
+                        ..
+                    })
+                ),
+                "the reset refuses while the operation is open"
+            );
+
+            let fx = Fx::new();
+            let request = fx.mint_request(tx(2), fx.approval(), vec![total(6)]);
+            let minted = fx.store.mint_authorization(&fx.profile, &request).unwrap();
+            fx.clock.set(minted.expires_at_ms);
+            fx.store
+                .reset(
+                    &fx.profile,
+                    &stellar_agent_core::profile::name::profile_name_for_approval(&fx.profile),
+                    minted.expires_at_ms,
+                    "repair",
+                    "reset-2",
+                    |row| Ok::<_, ()>(signed_by(11, row)),
+                    |_, _| Ok(()),
+                )
+                .unwrap();
+            fx.clock.set(T0 + 1);
+            assert!(claim_result(&fx, &request, &minted).is_err());
+            fx.store
+                .record_authorized(&fx.profile, &[total(10)])
+                .unwrap();
+            assert_eq!(sum_at(&fx, T0 + 1), 10);
+        }
+
+        /// The operation mint refuses a malformed entry before its prechecks
+        /// read the pin or the hold timestamps.
+        #[test]
+        #[serial]
+        fn an_operation_mint_checks_the_shape_before_its_prechecks() {
+            for defect in ["malformed pin", "future timestamp"] {
+                let mut fx = Fx::new();
+                let handle = fx.open_new(&request("order-1", canonical(1)));
+                let mut ts = T0;
+                if defect == "malformed pin" {
+                    let entry_ref =
+                        PinScope::for_profile(fx.store.path(), &fx.profile).pin_entry_ref();
+                    keyring_core::Entry::new(&entry_ref.service, &entry_ref.account)
+                        .unwrap()
+                        .set_password("unreadable")
+                        .unwrap();
+                } else {
+                    ts = T0 + 3_600_000;
+                }
+                let entry = WindowEntry::new(
+                    StateKey::new("ops", 1, "native", 86_400),
+                    ts,
+                    6,
+                    WindowLimit::Total {
+                        asset: "native".to_owned(),
+                        max_stroops: 10,
+                    },
+                )
+                .with_epoch(Some(P7));
+                let before = fx.generation();
+                let bytes = file_bytes(&fx);
+                let mint = fx.mint_request(tx(1), fx.policy(), vec![entry]);
+                let result = fx.begin_mint(&handle, &mint);
+                assert!(
+                    matches!(&result, Err(WindowStoreError::Invalid { detail })
+                        if detail == "a total-budget entry's limit and key disagree"),
+                    "{defect}: {result:?}"
+                );
+                assert_eq!(fx.generation(), before, "{defect}");
+                assert_eq!(file_bytes(&fx), bytes, "{defect}");
+            }
+        }
+
+        fn shape_refusal(entry: WindowEntry) {
+            let mut fx = Fx::new();
+            let handle = fx.open_new(&request("order-1", canonical(1)));
+            let before = fx.generation();
+            let mint = fx.mint_request(tx(1), fx.policy(), vec![entry]);
+            let result = fx.begin_mint(&handle, &mint);
+            assert!(
+                matches!(&result, Err(WindowStoreError::Invalid { detail })
+                    if detail == "a total-budget entry's limit and key disagree"),
+                "{result:?}"
+            );
+            assert_eq!(fx.generation(), before);
+        }
+
+        #[test]
+        #[serial]
+        fn an_operation_mint_refuses_a_total_limit_on_a_windowed_key() {
+            shape_refusal(
+                WindowEntry::new(
+                    StateKey::new("ops", 1, "native", 86_400),
+                    T0,
+                    6,
+                    WindowLimit::Total {
+                        asset: "native".to_owned(),
+                        max_stroops: 10,
+                    },
+                )
+                .with_epoch(Some(P7)),
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn an_operation_mint_refuses_an_amount_limit_on_a_total_key() {
+            shape_refusal(
+                WindowEntry::new(
+                    total_key(),
+                    T0,
+                    6,
+                    WindowLimit::Amount {
+                        asset: "native".to_owned(),
+                        window: "1d".to_owned(),
+                        max_stroops: 10,
+                    },
+                )
+                .with_epoch(Some(P7)),
+            );
+        }
     }
 }

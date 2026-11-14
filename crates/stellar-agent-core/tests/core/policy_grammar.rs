@@ -2263,6 +2263,173 @@ fn total_key() -> StateKey {
     StateKey::new("operator", 1, "total:native", 0)
 }
 
+/// Evaluates a native `total_budget` of `max` over `store` for a payment of
+/// `amount`, under epoch `[5; 32]`, with `overlay` as the bundle's state.
+fn total_evaluation(
+    max: i128,
+    store: &PolicyStateStore,
+    amount: i128,
+    overlay: Option<&BundleStateOverlay>,
+) -> Result<Option<DenyReason>, PolicyError> {
+    use stellar_agent_core::policy::v1::criteria::total_budget::TotalBudgetCriterion;
+    let criterion = TotalBudgetCriterion::new("native".to_owned(), max);
+    let tool = pay();
+    let profile = profile();
+    let args = Value::Null;
+    let none = BundleStateOverlay::default();
+    let inners = [transfer(UNLISTED, 0)];
+    let bundle = BundleView {
+        inners: &inners,
+        overlay: overlay.unwrap_or(&none),
+    };
+    let ctx = EvalContext::new(&tool, &args, "operator", &profile, store, NOW_MS)
+        .with_policy_digest([5; 32])
+        .with_value(payment(amount, UNLISTED));
+    let ctx = if overlay.is_some() {
+        ctx.with_bundle(&bundle)
+    } else {
+        ctx
+    };
+    criterion.evaluate(&ctx)
+}
+
+#[test]
+fn total_budget_attempt_overflow_denies() {
+    let store = PolicyStateStore::new();
+    store
+        .append_epoch(&total_key(), NOW_MS, i128::MAX, [5; 32])
+        .unwrap();
+    let result = total_evaluation(i128::MAX, &store, 1, None);
+    assert!(
+        !matches!(result, Ok(None)),
+        "an overflowing attempt is allowed: {result:?}"
+    );
+}
+
+/// Two native debit legs of `i128::MAX` and 1 in one call.
+fn overflowing_legs() -> ValueClass {
+    ValueClass::Value(ValueEffects::new(vec![
+        leg(ActionKind::Payment, i128::MAX, "native", Some(UNLISTED)),
+        leg(ActionKind::Payment, 1, "native", Some(UNLISTED)),
+    ]))
+}
+
+/// The key a native `total_budget` configured as `asset` sizes `value` under.
+fn total_key_for(asset: &str, value: ValueClass) -> StateKey {
+    use stellar_agent_core::policy::v1::criteria::total_budget::TotalBudgetCriterion;
+    let store = PolicyStateStore::new();
+    let tool = pay();
+    let profile = profile();
+    let ctx = EvalContext::new(&tool, &Value::Null, "operator", &profile, &store, NOW_MS)
+        .with_policy_digest([5; 32])
+        .with_value(value);
+    TotalBudgetCriterion::new(asset.to_owned(), 10)
+        .size(&ctx, NOW_MS)
+        .unwrap()
+        .expect("the leg matches the criterion")
+        .key()
+        .clone()
+}
+
+#[test]
+fn total_budget_spellings_of_one_asset_share_one_key() {
+    let native_sac = CanonicalAsset::Native
+        .sac_contract_id(TESTNET_PASSPHRASE)
+        .unwrap();
+    let issued = format!("USDC:{LISTED}");
+    let issued_sac = CanonicalAsset::parse_threshold_key(&issued)
+        .unwrap()
+        .sac_contract_id(TESTNET_PASSPHRASE)
+        .unwrap();
+    let native_leg = || payment(1, UNLISTED);
+    let issued_leg = || ValueClass::single(leg(ActionKind::Payment, 1, &issued, Some(UNLISTED)));
+    assert_eq!(
+        total_key_for("native", native_leg()),
+        total_key_for(&native_sac, native_leg()),
+        "native and its asset contract fill two buckets"
+    );
+    assert_eq!(
+        total_key_for(&issued, issued_leg()),
+        total_key_for(&issued_sac, issued_leg()),
+        "an issued asset and its asset contract fill two buckets"
+    );
+    assert_ne!(
+        total_key_for("native", native_leg()),
+        total_key_for(&issued, issued_leg())
+    );
+}
+
+#[test]
+fn total_budget_multileg_overflow_denies() {
+    use stellar_agent_core::policy::v1::criteria::total_budget::TotalBudgetCriterion;
+    let store = PolicyStateStore::new();
+    let tool = pay();
+    let profile = profile();
+    let ctx = EvalContext::new(&tool, &Value::Null, "operator", &profile, &store, NOW_MS)
+        .with_policy_digest([5; 32])
+        .with_value(overflowing_legs());
+    let result = TotalBudgetCriterion::new("native".to_owned(), i128::MAX).evaluate(&ctx);
+    assert!(
+        matches!(&result, Err(PolicyError::CriterionEvaluationFailed { detail }) if detail == "total_budget: sum overflows"),
+        "an overflowing multileg debit is allowed: {result:?}"
+    );
+}
+
+#[test]
+fn total_budget_multileg_sizing_refuses_overflow() {
+    use stellar_agent_core::policy::v1::criteria::total_budget::TotalBudgetCriterion;
+    let store = PolicyStateStore::new();
+    let tool = pay();
+    let profile = profile();
+    let ctx = EvalContext::new(&tool, &Value::Null, "operator", &profile, &store, NOW_MS)
+        .with_policy_digest([5; 32])
+        .with_value(overflowing_legs());
+    let result = TotalBudgetCriterion::new("native".to_owned(), i128::MAX).size(&ctx, NOW_MS);
+    assert!(
+        matches!(&result, Err(PolicyError::CriterionEvaluationFailed { detail }) if detail == "total_budget: sum overflows"),
+        "an overflowing multileg debit is sized: {result:?}"
+    );
+}
+
+#[test]
+fn query_epoch_overflow_errors() {
+    use stellar_agent_core::policy::v1::criteria::state_store::StateStoreError;
+    let store = PolicyStateStore::new();
+    store
+        .append_epoch(&total_key(), NOW_MS, i128::MAX, [5; 32])
+        .unwrap();
+    store
+        .append_epoch(&total_key(), NOW_MS, 1, [5; 32])
+        .unwrap();
+    assert_eq!(
+        store.query_epoch(&total_key(), [5; 32]),
+        Err(StateStoreError::SumOverflow)
+    );
+}
+
+#[test]
+fn total_budget_overlay_overflow_denies() {
+    use stellar_agent_core::policy::v1::criteria::total_budget::TotalBudgetCriterion;
+    let store = PolicyStateStore::new();
+    store
+        .append_epoch(&total_key(), NOW_MS, i128::MAX, [5; 32])
+        .unwrap();
+    let mut overlay = BundleStateOverlay::default();
+    let tool = pay();
+    let profile = profile();
+    let ctx = EvalContext::new(&tool, &Value::Null, "operator", &profile, &store, NOW_MS);
+    TotalBudgetCriterion::new("native".to_owned(), i128::MAX).accumulate_overlay(
+        &ctx,
+        &transfer(UNLISTED, 1),
+        &mut overlay,
+    );
+    let result = total_evaluation(i128::MAX, &store, 0, Some(&overlay));
+    assert!(
+        matches!(&result, Err(PolicyError::CriterionEvaluationFailed { detail }) if detail == "total_budget: sum overflows"),
+        "{result:?}"
+    );
+}
+
 #[test]
 fn total_budget_requires_v2_allow_without_window() {
     let total = "{ kind = \"total_budget\", asset = \"native\", max_stroops = 100 }";

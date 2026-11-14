@@ -9,8 +9,10 @@
 //!
 //! The allocation never renews with time. Its epoch is the digest of the
 //! signed policy ([`EvalContext::policy_digest`]): entries count against the
-//! policy that sized them, regardless of their age, and a re-signed policy
-//! starts another allocation at zero. The criterion is accepted in version 2
+//! policy that sized them, regardless of their age, and a policy with a
+//! different signed digest starts another allocation at zero. Every spelling
+//! of one asset on the profile's network keys one allocation
+//! ([`total_budget_identity`]). The criterion is accepted in version 2
 //! documents and on `allow` rules only.
 //!
 //! An engine built outside the verified loader carries an all-zero digest.
@@ -19,10 +21,10 @@
 //! allocation accrues under an unidentified epoch.
 
 use crate::policy::v1::EvalContext;
-use crate::policy::v1::asset_equivalence::assets_equivalent;
+use crate::policy::v1::asset_equivalence::{assets_equivalent, total_budget_identity};
 use crate::policy::v1::bundle::{BundleStateOverlay, InnerOpDescriptor};
 use crate::policy::v1::criteria::Criterion;
-use crate::policy::v1::criteria::per_tx_cap::{AssetDebitSum, asset_debit_sum};
+use crate::policy::v1::criteria::per_tx_cap::{AssetDebitSum, checked_asset_debit_sum};
 use crate::policy::v1::criteria::state_store::{StateKey, WindowEntry, WindowLimit};
 use crate::policy::v1::value::{ValueClass, asset_normalise};
 use crate::policy::{DenyReason, PolicyError};
@@ -64,13 +66,17 @@ impl TotalBudgetCriterion {
         self.max_stroops
     }
 
-    /// The bucket of this asset's allocation. Its window is zero: the bucket
-    /// never ages out.
-    fn state_key(&self, profile_name: &str) -> StateKey {
+    /// The bucket of this asset's allocation on the network of `ctx`. Every
+    /// spelling of one asset names the same bucket. Its window is zero: the
+    /// bucket never ages out.
+    fn state_key(&self, ctx: &EvalContext<'_>) -> StateKey {
         StateKey::new(
-            profile_name,
+            ctx.profile_name,
             1,
-            &format!("total:{}", asset_normalise(&self.asset)),
+            &format!(
+                "total:{}",
+                total_budget_identity(&self.asset, &ctx.profile.network_passphrase)
+            ),
             0,
         )
     }
@@ -114,28 +120,33 @@ impl Criterion for TotalBudgetCriterion {
     /// # Errors
     ///
     /// Returns [`PolicyError::CriterionEvaluationFailed`] for an all-zero
-    /// policy digest, whatever the call, an unresolvable debit, or a
-    /// state-store failure.
+    /// policy digest, whatever the call, an unresolvable debit, a
+    /// state-store failure, or a sum that overflows.
     fn evaluate(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
         let epoch = epoch(ctx)?;
-        let attempted = match asset_debit_sum(ctx, &self.asset, self.kind())? {
+        let attempted = match checked_asset_debit_sum(ctx, &self.asset, self.kind())? {
             AssetDebitSum::NotApplicable => return Ok(None),
             AssetDebitSum::Deny(reason) => return Ok(Some(reason)),
             AssetDebitSum::Amount(sum) => sum,
         };
-        let state_key = self.state_key(ctx.profile_name);
+        let state_key = self.state_key(ctx);
         let (recorded, _) = ctx
             .state_store
             .query_epoch(&state_key, epoch)
             .map_err(|e| PolicyError::CriterionEvaluationFailed {
                 detail: format!("total_budget: state store error: {e}"),
             })?;
-        let used = recorded.saturating_add(
-            ctx.bundle
-                .map(|view| view.overlay.get(&state_key))
-                .unwrap_or(0),
-        );
-        if used.saturating_add(attempted) > self.max_stroops {
+        let overflow = || PolicyError::CriterionEvaluationFailed {
+            detail: "total_budget: sum overflows".to_owned(),
+        };
+        let used = recorded
+            .checked_add(
+                ctx.bundle
+                    .map(|view| view.overlay.get(&state_key))
+                    .unwrap_or(0),
+            )
+            .ok_or_else(overflow)?;
+        if used.checked_add(attempted).ok_or_else(overflow)? > self.max_stroops {
             return Ok(Some(DenyReason::TotalBudgetExhausted {
                 asset: self.asset.clone(),
                 max_stroops: self.max_stroops,
@@ -163,7 +174,7 @@ impl Criterion for TotalBudgetCriterion {
         ) {
             return;
         }
-        overlay.accumulate(self.state_key(ctx.profile_name), *amount);
+        overlay.accumulate(self.state_key(ctx), *amount);
     }
 
     /// Records the confirmed debit against this policy's epoch.
@@ -193,7 +204,8 @@ impl Criterion for TotalBudgetCriterion {
     /// # Errors
     ///
     /// Returns [`PolicyError::CriterionEvaluationFailed`] under an all-zero
-    /// policy digest, whatever the call.
+    /// policy digest, whatever the call, and when the matching legs overflow
+    /// their sum.
     fn size(&self, ctx: &EvalContext<'_>, now_ms: u64) -> Result<Option<WindowEntry>, PolicyError> {
         let epoch = epoch(ctx)?;
         let ValueClass::Value(effects) = &ctx.value else {
@@ -216,19 +228,18 @@ impl Criterion for TotalBudgetCriterion {
                 continue;
             };
             matched = true;
-            sum = sum.saturating_add(amount);
+            sum =
+                sum.checked_add(amount)
+                    .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
+                        detail: "total_budget: sum overflows".to_owned(),
+                    })?;
         }
         if !matched {
             return Ok(None);
         }
         Ok(Some(
-            WindowEntry::new(
-                self.state_key(ctx.profile_name),
-                now_ms,
-                sum,
-                self.window_limit(),
-            )
-            .with_epoch(Some(epoch)),
+            WindowEntry::new(self.state_key(ctx), now_ms, sum, self.window_limit())
+                .with_epoch(Some(epoch)),
         ))
     }
 }

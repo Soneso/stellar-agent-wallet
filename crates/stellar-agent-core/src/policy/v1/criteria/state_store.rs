@@ -364,8 +364,10 @@ impl WindowEntry {
                     attempted_stroops: self.amount,
                 }
             }),
-            WindowLimit::Total { asset, max_stroops } => (used_stroops.saturating_add(self.amount)
-                > *max_stroops)
+            // An overflowing sum exceeds every allocation, so it refuses.
+            WindowLimit::Total { asset, max_stroops } => used_stroops
+                .checked_add(self.amount)
+                .is_none_or(|would_use| would_use > *max_stroops)
                 .then(|| DenyReason::TotalBudgetExhausted {
                     asset: asset.clone(),
                     max_stroops: *max_stroops,
@@ -474,6 +476,10 @@ pub enum StateStoreError {
         /// The wall-clock time at the moment of detection in unix-milliseconds.
         now_ms: u64,
     },
+
+    /// The amounts of one total-budget epoch overflow their sum.
+    #[error("the total-budget sum overflows")]
+    SumOverflow,
 }
 
 /// Checks inclusive exposure accounting for the queried window.
@@ -777,7 +783,8 @@ impl PolicyStateStore {
     /// any other key never count, so a re-signed policy starts at zero.
     ///
     /// # Errors
-    /// Returns [`StateStoreError::LockPoisoned`] if the mutex is poisoned.
+    /// Returns [`StateStoreError::LockPoisoned`] if the mutex is poisoned, and
+    /// [`StateStoreError::SumOverflow`] when the epoch's amounts overflow.
     pub fn query_epoch(
         &self,
         key: &StateKey,
@@ -793,7 +800,9 @@ impl PolicyStateStore {
         let mut count: u32 = 0;
         for entry in guard.get(key).into_iter().flatten() {
             if entry.epoch == Some(epoch) {
-                sum = sum.saturating_add(entry.amount);
+                sum = sum
+                    .checked_add(entry.amount)
+                    .ok_or(StateStoreError::SumOverflow)?;
                 count = count.saturating_add(1);
             }
         }
@@ -1213,6 +1222,29 @@ mod tests {
         let (sum, count) = store.query_window(&k, 1_300_000).unwrap();
         assert_eq!(sum, expected);
         assert_eq!(count, 3);
+    }
+
+    /// A total entry whose addition to the used amount overflows refuses.
+    #[test]
+    fn a_total_entry_refuses_overflow() {
+        let entry = WindowEntry::new(
+            StateKey::new("alice", 1, "total:native", 0),
+            1_000,
+            1,
+            WindowLimit::Total {
+                asset: "native".to_owned(),
+                max_stroops: i128::MAX,
+            },
+        )
+        .with_epoch(Some([1; 32]));
+        assert!(
+            matches!(
+                entry.refusal(i128::MAX, 0),
+                Some(DenyReason::TotalBudgetExhausted { .. })
+            ),
+            "an overflowing total admits"
+        );
+        assert!(entry.refusal(i128::MAX - 1, 0).is_none());
     }
 }
 

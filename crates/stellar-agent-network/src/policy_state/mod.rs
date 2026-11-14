@@ -239,6 +239,7 @@ pub use recovery::{
     OutcomeAnswer, RecoveryError, RecoveryReport, RecoveryRequests, SubmissionObservation,
     recover_outcomes, recover_sequences, submission_observation,
 };
+pub(crate) use store::UnsentReservation;
 pub use store::{
     AccountingDecision, ChainScope, DeliveryReport, MintOutcome, OwedAccountingExpiries,
     OwnerResetSignature, POLICY_STATE_KEY_FIELD, PersistedWindowStore, RECONCILE_BUDGET,
@@ -283,6 +284,18 @@ pub fn record_confirmed_window_state(
             return;
         }
     };
+    // A total-budget debit is admitted before its exposure and never
+    // recorded after a confirmation, so every entry that touches a total
+    // limit or a total key stays out of this write.
+    let recorded: Vec<_> = recorded
+        .into_iter()
+        .filter(|entry| {
+            !matches!(
+                entry.limit(),
+                stellar_agent_core::policy::v1::criteria::state_store::WindowLimit::Total { .. }
+            ) && !(entry.key().window_secs() == 0 && entry.key().bucket().starts_with("total:"))
+        })
+        .collect();
     if recorded.is_empty() {
         return;
     }
@@ -602,6 +615,29 @@ pub enum WindowStoreError {
         open: usize,
     },
 
+    /// Total-budget accounting cannot read the policy pin; the window may be
+    /// empty. The window file and its committed counter stay unchanged. A
+    /// first write may already have created the window key.
+    #[error("total-budget accounting requires a readable policy pin ({detail})")]
+    TotalEpochUnavailable {
+        /// Why the pin cannot be read.
+        detail: String,
+    },
+
+    /// A total-budget debit names a policy other than the pinned one. The
+    /// window file and its committed counter stay unchanged.
+    #[error("the total-budget debit was sized under a policy other than the pinned one")]
+    TotalEpochStale,
+
+    /// A total-budget debit names the digest an earlier build's state
+    /// retired. The writer's successor is not committed, so the window file
+    /// and its committed counter stay unchanged.
+    #[error(
+        "the spending window cannot account for total-budget debits recorded by an earlier \
+         build; sign and install a new policy"
+    )]
+    TotalEpochRetired,
+
     /// The reset refuses while approvals remain inside their waiting windows.
     #[error("reset.approvals_pending: the spending window holds {pending} pending approval(s)")]
     ApprovalsPending {
@@ -672,9 +708,27 @@ impl WindowStoreError {
         }
     }
 
+    /// The validation refusal of a total-budget epoch failure, which every
+    /// adapter reports under its own `policy.total_epoch_*` code.
+    #[must_use]
+    pub fn total_epoch_error(&self) -> Option<stellar_agent_core::error::ValidationError> {
+        use stellar_agent_core::error::ValidationError;
+        match self {
+            Self::TotalEpochUnavailable { detail } => {
+                Some(ValidationError::TotalEpochUnavailable {
+                    detail: detail.clone(),
+                })
+            }
+            Self::TotalEpochStale => Some(ValidationError::TotalEpochStale),
+            Self::TotalEpochRetired => Some(ValidationError::TotalEpochRetired),
+            _ => None,
+        }
+    }
+
     /// The wallet refusal an operation store failure names, when it names
     /// one: the business id, capacity, attempt, retry, reset, audit and
-    /// state-rule refusals of the operation section.
+    /// state-rule refusals of the operation section, and the total-budget
+    /// epoch refusals.
     #[must_use]
     pub fn operation_error(&self) -> Option<stellar_agent_core::error::WalletError> {
         use stellar_agent_core::error::{InternalError, SubmissionError, ValidationError};
@@ -694,6 +748,9 @@ impl WindowStoreError {
             Self::ApprovalsPending { pending } => {
                 ValidationError::ResetApprovalsPending { pending: *pending }.into()
             }
+            Self::TotalEpochUnavailable { .. }
+            | Self::TotalEpochStale
+            | Self::TotalEpochRetired => self.total_epoch_error()?.into(),
             Self::AuditAppendFailed { detail } => ValidationError::AuditAppendFailed {
                 detail: detail.clone(),
             }

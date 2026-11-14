@@ -76,7 +76,9 @@
 //! `--asset` picks USDC or XLM, and XLM takes `--tolerated-loss` and
 //! `--typical-payment`. `--unlisted-budget` chooses one budget for
 //! unlisted recipients, shared by every payment tool, and `--total-budget`
-//! a total until the next policy signature. These flags and `--output`
+//! a total for the signed policy's digest: signing the same policy body
+//! again keeps that allocation, and a different digest starts another.
+//! These flags and `--output`
 //! apply to mainnet V1 only.
 //!
 //! At a terminal (stdin and stderr), `init` asks for a missing XLM amount,
@@ -662,8 +664,8 @@ where
             .tolerated_loss_stroops
             .unwrap_or(preset.tolerated_loss_stroops);
         let question = format!(
-            "Limit total spending to {} {code} until the next policy signature? A new \
-             signature starts a new allocation. [Y/n]: ",
+            "Limit total spending to {} {code} for this policy? Signing the same policy body \
+             again keeps the allocation; a different digest starts another. [Y/n]: ",
             presets::format_amount(loss)
         );
         let answer = prompter.ask(&question, "total_budget").await?;
@@ -1888,8 +1890,9 @@ mod tests {
     /// terminal the total budget is chosen without a question.
     #[tokio::test]
     async fn total_budget_prompt_defaults_to_yes() {
-        let question = "Limit total spending to 2 USDC until the next policy signature? A new \
-                        signature starts a new allocation. [Y/n]: ";
+        let question = "Limit total spending to 2 USDC for this policy? Signing the same policy \
+                        body again keeps the allocation; a different digest starts another. \
+                        [Y/n]: ";
         let dir = tempfile::tempdir().unwrap();
         for (n, (answer, total)) in [
             ("", true),

@@ -151,6 +151,32 @@ pub(super) fn asset_debit_sum(
     asset: &str,
     criterion: &str,
 ) -> Result<AssetDebitSum, PolicyError> {
+    debit_sum(ctx, asset, criterion, |sum, amount| {
+        Some(sum.saturating_add(amount))
+    })
+}
+
+/// Sums matching debit legs with checked addition and preserves sizing
+/// failures.
+///
+/// # Errors
+///
+/// [`PolicyError::CriterionEvaluationFailed`] with `"{criterion}: sum
+/// overflows"` when the matching legs overflow their sum.
+pub(super) fn checked_asset_debit_sum(
+    ctx: &EvalContext<'_>,
+    asset: &str,
+    criterion: &str,
+) -> Result<AssetDebitSum, PolicyError> {
+    debit_sum(ctx, asset, criterion, i128::checked_add)
+}
+
+fn debit_sum(
+    ctx: &EvalContext<'_>,
+    asset: &str,
+    criterion: &str,
+    add: fn(i128, i128) -> Option<i128>,
+) -> Result<AssetDebitSum, PolicyError> {
     let tool_name = ctx.tool.name.as_str();
 
     let criterion_asset = asset_normalise(asset);
@@ -189,7 +215,9 @@ pub(super) fn asset_debit_sum(
                 ),
             })?;
         matched = true;
-        sum = sum.saturating_add(amount);
+        sum = add(sum, amount).ok_or_else(|| PolicyError::CriterionEvaluationFailed {
+            detail: format!("{criterion}: sum overflows"),
+        })?;
     }
 
     // A call with no matching debit leaves this asset unconstrained.

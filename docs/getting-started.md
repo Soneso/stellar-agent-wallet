@@ -640,7 +640,9 @@ Review it before you sign it with `profile sign-policy`:
   CLI `pay` and the MCP payment tools. A payment beyond it is denied.
 - Caps: every payment rule allows the preset's asset alone, with a
   per-payment cap, 1d and 1w caps, and rate limits. A chosen
-  `total_budget` bounds all spending until the next policy signature.
+  `total_budget` bounds all spending under the signed policy's digest.
+  Signing the same policy body again keeps the allocation; a different
+  digest starts another.
 - Floor: `stellar_pay` and `stellar_pay_commit` keep a native balance floor.
 - Approval: shop and business presets request approval for a payment above
   their threshold.

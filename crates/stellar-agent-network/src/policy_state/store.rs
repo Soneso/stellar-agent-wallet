@@ -18,7 +18,7 @@ use stellar_agent_core::error::WalletError;
 use stellar_agent_core::policy::DenyReason;
 use stellar_agent_core::policy::pin::{self, PinError, PinScope, PinState};
 use stellar_agent_core::policy::v1::criteria::state_store::{
-    CLOCK_SKEW_TOLERANCE_MS, PolicyStateStore, StateKey, StateStoreError, WindowEntry,
+    CLOCK_SKEW_TOLERANCE_MS, PolicyStateStore, StateKey, StateStoreError, WindowEntry, WindowLimit,
     exposure_is_live,
 };
 use stellar_agent_core::policy::v1::signature::{WindowResetStatement, window_reset_digest};
@@ -34,6 +34,7 @@ use stellar_agent_core::redact::describe_json_error;
 use subtle::ConstantTimeEq as _;
 
 use crate::endpoint_identity::MainnetOracle;
+use crate::mainnet::AuthorizationId;
 use crate::policy_state::ledger::{self, WireAuthorization, WireAuthorizationHold};
 use crate::policy_state::lock::WindowStoreLock;
 use crate::policy_state::operations::{
@@ -55,9 +56,11 @@ const HMAC_TAG_LEN: usize = 32;
 const HMAC_CONTEXT_LABEL: &[u8] = b"stellar-agent-policy-window/v1/body\x00";
 
 /// Retention ceiling: the largest window a criterion supports (`"1w"`), in
-/// milliseconds. Entries older than `now_ms - RETENTION_MS` are pruned on
-/// every write, so the store never grows unbounded even if a criterion's
-/// window shrinks or a rule is removed.
+/// milliseconds. Windowed entries older than `now_ms - RETENTION_MS` are
+/// pruned on every write, even if a criterion's window shrinks or a rule is
+/// removed. A counted total-budget row is never pruned: it counts for the
+/// life of its signed policy. A final released one ages out like a windowed
+/// row ([`prune_stale`]).
 pub(super) const RETENTION_MS: u64 =
     stellar_agent_core::policy::v1::criteria::per_period_cap::MAX_SUPPORTED_WINDOW_SECS * 1_000;
 
@@ -207,15 +210,29 @@ pub(super) const WIRE_VERSION_LEDGER: u32 = 4;
 /// A file written by a newer build carries records this one cannot account
 /// for, so it is refused rather than read with the fields it happens to
 /// recognise.
-pub(super) const WIRE_VERSION_MAX: u32 = 11;
+pub(super) const WIRE_VERSION_MAX: u32 = WIRE_VERSION_TOTAL_EPOCH;
 
 /// Wire version binding the accounting network on every snapshot.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "names a version earlier builds wrote; tests seal it"
+    )
+)]
 pub(super) const WIRE_VERSION_CHAIN: u32 = 5;
 
 /// Wire version carrying durable signing claims.
 pub(super) const WIRE_VERSION_CLAIM: u32 = 6;
 
 /// Wire version carrying conservative exposure accounting.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "names a version earlier builds wrote; tests seal it"
+    )
+)]
 pub(super) const WIRE_VERSION_EXPOSURE: u32 = 7;
 
 /// Wire version carrying durable accounting-expiry audit obligations.
@@ -232,65 +249,14 @@ pub(super) const WIRE_VERSION_POLICY_AUTHORITY: u32 = 10;
 /// observation.
 pub(super) const WIRE_VERSION_OPERATIONS: u32 = 11;
 
-/// The version a successor is written under. `committed` is the version of
-/// the snapshot it replaces, absent on a first run. Version 11 content
-/// selects 11, and so does a committed version of 11 or more, so a version
-/// 11 file never moves back; below that the version follows the content.
-/// A policy authority or native amounts select at least version 10.
-fn select_wire_version(wire: &WireFile, committed: Option<u32>) -> u32 {
-    if committed.is_some_and(|version| version >= WIRE_VERSION_OPERATIONS)
-        || operations::has_content(wire)
-        || super::approvals::has_content(wire)
-        || wire.reset_consent.is_some()
-    {
-        WIRE_VERSION_OPERATIONS
-    } else if wire
-        .authorizations
-        .iter()
-        .any(|auth| auth.policy_authority.is_some() || auth.native_reservation.is_some())
-    {
-        WIRE_VERSION_POLICY_AUTHORITY
-    } else if !wire.signed_intents.is_empty()
-        || wire
-            .entries
-            .iter()
-            .flat_map(|b| &b.records)
-            .any(|r| r.signed_intent.is_some())
-    {
-        WIRE_VERSION_INTENT
-    } else if !wire.accounting_expiries.is_empty() {
-        WIRE_VERSION_EXPIRY
-    } else if wire
-        .entries
-        .iter()
-        .flat_map(|bucket| &bucket.records)
-        .any(|record| {
-            !matches!(
-                record.status,
-                RecordStatus::Confirmed | RecordStatus::Pending
-            ) || record.submission_anchor.is_some()
-                || record.execution_bound.is_some()
-                || record.observed_at_ms.is_some()
-                || record.reported_chain_time.is_some()
-                || record.accounting_until_ms.is_some()
-                || record.admitted_window_ms.is_some()
-                || record.acknowledged_unbounded.is_some()
-        })
-        || wire.authorizations.iter().any(|auth| {
-            matches!(&auth.consumption, Some(ledger::ConsumptionBinding::Transaction(binding))
-                if binding.submission_anchor.is_some())
-        })
-    {
-        WIRE_VERSION_EXPOSURE
-    } else if wire
-        .authorizations
-        .iter()
-        .any(|auth| auth.claimed_ms.is_some())
-    {
-        WIRE_VERSION_CLAIM
-    } else {
-        WIRE_VERSION_CHAIN
-    }
+/// Wire version carrying total-budget epochs and the retired digest. This
+/// build writes every successor under it.
+pub(super) const WIRE_VERSION_TOTAL_EPOCH: u32 = 12;
+
+/// The version a successor is written under: version 12 for every
+/// successor, so a file this build wrote never reads as an earlier build's.
+fn select_wire_version(_wire: &WireFile, _committed: Option<u32>) -> u32 {
+    WIRE_VERSION_TOTAL_EPOCH
 }
 
 /// How many reservations one reconciliation pass settles.
@@ -336,6 +302,9 @@ pub(super) enum RecordStatus {
     AccountingExpired,
     /// An operator records and accepts indefinite execution and uncounted spend.
     OperatorCleared,
+    /// A checked proof shows the payment debit unused; a fee the transaction
+    /// paid stays in its own row.
+    ProvedUnspent,
 }
 
 /// The canonical network and the hash of its signing passphrase.
@@ -491,6 +460,31 @@ impl SubmissionAnchor {
             witness_binding: witness.fact_digest(),
             subject: expected_subject,
         })
+    }
+}
+
+/// The capability of the writer that recorded a pending reservation and has
+/// not sent its bytes.
+///
+/// Only [`PersistedWindowStore::record_pending_unsent`] and the authorized
+/// consumption for a send create one, each for the reservation it commits.
+/// It is never cloned. Its writer drops it once the bytes may have left the
+/// process.
+#[derive(Debug)]
+pub(crate) struct UnsentReservation {
+    id: String,
+}
+
+impl UnsentReservation {
+    /// The capability of reservation `id`, for a writer of this module tree
+    /// that has just committed that reservation.
+    pub(super) fn of_reservation(id: String) -> Self {
+        Self { id }
+    }
+
+    /// The reservation id, the envelope hash of the unsent bytes.
+    pub(crate) fn id(&self) -> &str {
+        &self.id
     }
 }
 
@@ -781,6 +775,17 @@ pub(super) struct WireRecord {
     /// An orphan beyond retention requires an operator decision.
     #[serde(default)]
     pub(super) operator_required: bool,
+    /// The policy digest a total-budget row counts against. Only a row of a
+    /// total bucket carries one.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "super::ledger::opt_hex32"
+    )]
+    pub(super) epoch: Option<[u8; 32]>,
+    /// The authorization whose hold became this total-budget row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) authorization_id: Option<AuthorizationId>,
 }
 
 impl WireRecord {
@@ -810,6 +815,8 @@ impl WireRecord {
             pending_since_ms: 0,
             submission_ledger: 0,
             operator_required: false,
+            epoch: None,
+            authorization_id: None,
         }
     }
 }
@@ -1018,7 +1025,9 @@ pub(super) struct WireBucket {
 /// and version 8 carries accounting-expiry audit obligations. Version 9
 /// carries signed intents, and version 10 policy authorities. Version 11
 /// carries operation records, authorization links, dispositions and release
-/// rows, the admissible floors and the stored observation. Optional fields
+/// rows, the admissible floors and the stored observation. Version 12 carries
+/// total-budget epochs and the retired digest, and this build writes every
+/// successor under it. Optional fields
 /// preserve the serialized shape of legacy snapshots for integrity checks;
 /// missing network provenance refuses at the authenticated read boundary.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -1061,6 +1070,14 @@ pub(super) struct WireFile {
     /// The last chain observation an operation step stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) last_observation: Option<WindowObservation>,
+    /// The policy digest whose total budget an earlier build's state retired.
+    /// It admits no further total-budget debit.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "super::ledger::opt_hex32"
+    )]
+    pub(super) retired_total_epoch: Option<[u8; 32]>,
     /// Prepared next generation, authenticated with the current snapshot.
     /// The keyring counter selects exactly one side of the atomic commit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1523,6 +1540,12 @@ struct ResetSnapshot {
     /// Authorization records whose approval can still be presented on the
     /// store clock; the successor keeps them.
     retained_authorizations: Vec<WireAuthorization>,
+    /// The total-budget buckets the successor keeps: every total row of the
+    /// retired working copy, plus each claimed or exposed total hold as a
+    /// counted row.
+    retained_totals: Vec<WireBucket>,
+    /// The retired total-budget digest the successor keeps.
+    retired_total_epoch: Option<[u8; 32]>,
 }
 
 /// Whether the mainnet rules apply to `profile`: a mainnet profile in a build
@@ -1743,6 +1766,10 @@ impl PersistedWindowStore {
     /// first run for this profile. A missing file WITH a minted generation
     /// counter is deletion — see [`WindowStoreError::GenerationMismatch`].
     ///
+    /// Hydration may lock and write a one-time retirement for a committed
+    /// earlier-version snapshot. Lock, policy-pin, and write errors can refuse
+    /// hydration.
+    ///
     /// # Errors
     ///
     /// - [`WindowStoreError::HmacMismatch`] — tampering, corruption, or a
@@ -1763,9 +1790,41 @@ impl PersistedWindowStore {
         profile: &Profile,
         dest: &PolicyStateStore,
     ) -> Result<(), WindowStoreError> {
-        let Some(wire) = self.read_verified_unlocked(profile_name, profile)? else {
+        let Some(mut wire) = self.read_verified_unlocked(profile_name, profile)? else {
             return Ok(());
         };
+        #[cfg(test)]
+        if let Some(hook) = tests::HYDRATION_AFTER_READ.with_borrow_mut(Option::take) {
+            hook();
+        }
+        if earlier_build(&wire) {
+            wire = self.retire_on_load(profile)?;
+        }
+        let now = now_ms()?;
+        let in_memory = |result: Result<(), StateStoreError>| {
+            result.map_err(|e| WindowStoreError::Invalid {
+                detail: format!("in-memory store append failed: {e}"),
+            })
+        };
+        // A total-budget hold enters the in-memory store as an ordinary
+        // writer's admission counts it after its sweep, at the one clock
+        // value this hydration reads.
+        let exposed = operations::exposed_authorizations(&wire);
+        let live = operations::live_operations(&wire);
+        for hold in &wire.holds {
+            if let Some(epoch) = hold.epoch
+                && is_total_hold(hold)
+                && total_hold_counts(&wire, hold, &exposed, &live, now)
+            {
+                let key = StateKey::new(
+                    profile_name,
+                    hold.scope_specificity,
+                    &canonical_total_bucket(&hold.bucket, &wire),
+                    0,
+                );
+                in_memory(dest.append_epoch(&key, hold.ts_ms, hold.amount, epoch))?;
+            }
+        }
         for intent in &wire.signed_intents {
             for leg in &intent.legs {
                 let key = StateKey::new(
@@ -1787,6 +1846,7 @@ impl PersistedWindowStore {
                 })?;
             }
         }
+        let scope = wire.chain_scope;
         for entry in wire.entries {
             let key = StateKey::new(
                 profile_name,
@@ -1794,6 +1854,27 @@ impl PersistedWindowStore {
                 &entry.bucket,
                 entry.window_secs,
             );
+            // A total-budget row counts in its epoch, whatever its age, until a
+            // proof releases it. A row without an epoch matches no epoch. A
+            // negative stored row never lowers the use; durable admission
+            // refuses its bucket instead.
+            if is_total_budget_bucket(&entry) {
+                let key = StateKey::new(
+                    profile_name,
+                    entry.scope_specificity,
+                    &canonical_bucket_in(&entry.bucket, scope),
+                    0,
+                );
+                for record in &entry.records {
+                    if let Some(epoch) = record.epoch
+                        && record.status != RecordStatus::ProvedUnspent
+                        && record.amount >= 0
+                    {
+                        in_memory(dest.append_epoch(&key, record.ts_ms, record.amount, epoch))?;
+                    }
+                }
+                continue;
+            }
             for record in entry.records {
                 if record.signed_intent.is_some() {
                     continue;
@@ -1871,6 +1952,29 @@ impl PersistedWindowStore {
             })?;
 
         Ok(Some(wire))
+    }
+
+    /// Retires an earlier build's snapshot for a hydration: under the lock it
+    /// reads the snapshot again and, when an earlier build still wrote it,
+    /// commits its retired successor. Returns the snapshot to hydrate from.
+    ///
+    /// # Errors
+    ///
+    /// Every lock, keyring, integrity, pin, and write error of the commit.
+    fn retire_on_load(&self, profile: &Profile) -> Result<WireFile, WindowStoreError> {
+        let lock = WindowStoreLock::acquire_for_with_retry(
+            &self.path,
+            &profile.policy_window_state_key_id,
+        )?;
+        let (key, _) = self.load_or_mint_key(profile)?;
+        let gen_entry = generation_entry_ref(profile);
+        let original = self.read_verified(profile, &key, &gen_entry)?;
+        if !earlier_build(&original) {
+            return Ok(original);
+        }
+        let successor = self.retired_successor(&lock, profile, &original)?;
+        self.commit_generation(&key, &gen_entry, original, successor.clone())?;
+        Ok(successor)
     }
 
     /// Lists authenticated signed intents without changing the window or its keyring.
@@ -1984,8 +2088,15 @@ impl PersistedWindowStore {
         new_entries: &[WindowEntry],
         require_admission: bool,
     ) -> Result<MintOutcome, WindowStoreError> {
+        check_total_shape(new_entries)?;
+        let totals = new_entries.iter().any(is_total_entry);
+        if totals && !require_admission {
+            return Err(WindowStoreError::Invalid {
+                detail: "a total-budget debit needs durable admission".to_owned(),
+            });
+        }
         self.ensure_parent_dir()?;
-        let _lock = WindowStoreLock::acquire_for_with_retry(
+        let lock = WindowStoreLock::acquire_for_with_retry(
             &self.path,
             &profile.policy_window_state_key_id,
         )?;
@@ -1995,6 +2106,12 @@ impl PersistedWindowStore {
 
         let mut wire = self.read_verified(profile, &key, &gen_entry)?;
         let committed = (wire.generation != 0).then_some(wire.version);
+        if earlier_build(&wire) {
+            retire_earlier_build(&mut wire, total_pin(&lock, &self.path, profile)?)?;
+        }
+        if totals {
+            bind_total_entries(new_entries, total_pin(&lock, &self.path, profile)?)?;
+        }
         let now_ms = now_ms()?;
         // Expiry retains claimed spend and releases unclaimed holds before
         // the window is counted; remaining holds count against it.
@@ -2008,12 +2125,22 @@ impl PersistedWindowStore {
             bucket.records.push(WireRecord {
                 ts_ms: entry.timestamp_ms(),
                 amount: entry.amount(),
+                epoch: if is_total_entry(entry) {
+                    entry.epoch()
+                } else {
+                    None
+                },
                 ..WireRecord::confirmed_defaults()
             });
         }
 
         prune_stale(&mut wire, now_ms);
         wire.version = select_wire_version(&wire, committed);
+        #[cfg(test)]
+        if let Some(hook) = tests::RECORD_SETTLED_BEFORE_VALIDATE.with_borrow_mut(Option::take) {
+            hook(&mut wire);
+        }
+        check_snapshot(&wire)?;
 
         // This debit may already be on chain, so it never goes through the
         // prepared image: the counter moves first, and a failed file write
@@ -2085,9 +2212,15 @@ impl PersistedWindowStore {
         profile: &Profile,
         plan: &crate::SignedIntentPlan,
     ) -> Result<crate::IntentProof, WindowStoreError> {
+        check_total_shape(plan.legs())?;
+        if plan.legs().iter().any(is_total_entry) {
+            return Err(intent_invalid(
+                "a signed intent cannot carry a total-budget leg",
+            ));
+        }
         plan.chain_scope().require_profile(profile)?;
         self.ensure_parent_dir()?;
-        let _lock = WindowStoreLock::acquire_for_with_retry(
+        let lock = WindowStoreLock::acquire_for_with_retry(
             &self.path,
             &profile.policy_window_state_key_id,
         )?;
@@ -2098,6 +2231,7 @@ impl PersistedWindowStore {
         let (key, _) = self.load_or_mint_key(profile)?;
         let gen_entry = generation_entry_ref(profile);
         let original = self.read_verified(profile, &key, &gen_entry)?;
+        let base = self.retired_successor(&lock, profile, &original)?;
         if original.chain_scope != Some(plan.chain_scope()) {
             return Err(WindowStoreError::ChainMismatch);
         }
@@ -2106,7 +2240,7 @@ impl PersistedWindowStore {
             .filter(|capability| self.capability_is_current(profile, capability));
         loop {
             let now = now_ms()?;
-            let mut progress = original.clone();
+            let mut progress = base.clone();
             let progress_changed = reduce_intent_progress(&mut progress, witness, now, false)?;
             let mut proposed = progress.clone();
             let result = install_intent_admission(&mut proposed, plan, now);
@@ -2167,18 +2301,19 @@ impl PersistedWindowStore {
         capability: &LedgerWitnessCapability,
     ) -> Result<(), WindowStoreError> {
         self.ensure_parent_dir()?;
-        let _lock = WindowStoreLock::acquire_for_with_retry(
+        let lock = WindowStoreLock::acquire_for_with_retry(
             &self.path,
             &profile.policy_window_state_key_id,
         )?;
         let Some(original) = self.read_for_inspection_once(profile)? else {
             return Ok(());
         };
+        let base = self.retired_successor(&lock, profile, &original)?;
         let now = now_ms()?;
         let mut witness = self
             .capability_is_current(profile, capability)
             .then_some(capability);
-        let mut progress = original.clone();
+        let mut progress = base.clone();
         let mut changed = reduce_intent_progress(&mut progress, witness, now, true)?;
         let mut key = if changed {
             Some(
@@ -2190,7 +2325,7 @@ impl PersistedWindowStore {
         };
         if witness.is_some() && !self.capability_is_current(profile, capability) {
             witness = None;
-            progress = original.clone();
+            progress = base.clone();
             changed = reduce_intent_progress(&mut progress, None, now_ms()?, true)?;
             if changed && key.is_none() {
                 key = Some(
@@ -2209,7 +2344,7 @@ impl PersistedWindowStore {
                 progress,
                 || witness.is_none() || self.capability_is_current(profile, capability),
             )? {
-                let mut retained = original.clone();
+                let mut retained = base;
                 if reduce_intent_progress(&mut retained, None, now_ms()?, true)? {
                     self.commit_generation(
                         &key,
@@ -2331,13 +2466,14 @@ impl PersistedWindowStore {
         };
         proof.plan().chain_scope().require_profile(profile)?;
         self.ensure_parent_dir()?;
-        let _lock = WindowStoreLock::acquire_for_with_retry(
+        let lock = WindowStoreLock::acquire_for_with_retry(
             &self.path,
             &profile.policy_window_state_key_id,
         )?;
         let (key, _) = self.load_or_mint_key(profile)?;
         let gen_entry = generation_entry_ref(profile);
-        let mut wire = self.read_verified(profile, &key, &gen_entry)?;
+        let original = self.read_verified(profile, &key, &gen_entry)?;
+        let mut wire = self.retired_successor(&lock, profile, &original)?;
         let Some(index) = wire
             .signed_intents
             .iter()
@@ -2355,7 +2491,6 @@ impl PersistedWindowStore {
         if record.cancel_token_sha256 != Some(token_hash) {
             return Ok(());
         }
-        let original = wire.clone();
         wire.signed_intents.remove(index);
         self.commit_generation(&key, &gen_entry, original, wire)
     }
@@ -2372,14 +2507,14 @@ impl PersistedWindowStore {
         legs: &[WindowEntry],
     ) -> Result<(), WindowStoreError> {
         self.ensure_parent_dir()?;
-        let _lock = WindowStoreLock::acquire_for_with_retry(
+        let lock = WindowStoreLock::acquire_for_with_retry(
             &self.path,
             &profile.policy_window_state_key_id,
         )?;
         let (key, _) = self.load_or_mint_key(profile)?;
         let gen_entry = generation_entry_ref(profile);
-        let mut wire = self.read_verified(profile, &key, &gen_entry)?;
-        let original = wire.clone();
+        let original = self.read_verified(profile, &key, &gen_entry)?;
+        let mut wire = self.retired_successor(&lock, profile, &original)?;
         let record = wire
             .signed_intents
             .iter_mut()
@@ -2428,15 +2563,23 @@ impl PersistedWindowStore {
         reservation: &SubmissionHold,
         signed_intent: Option<&str>,
     ) -> Result<MintOutcome, WindowStoreError> {
+        check_total_shape(new_entries)?;
+        let totals = new_entries.iter().any(is_total_entry);
+        if totals && signed_intent.is_some() {
+            return Err(WindowStoreError::Invalid {
+                detail: "a signed intent cannot carry a total-budget leg".to_owned(),
+            });
+        }
         self.ensure_parent_dir()?;
-        let _lock = WindowStoreLock::acquire_for_with_retry(
+        let lock = WindowStoreLock::acquire_for_with_retry(
             &self.path,
             &profile.policy_window_state_key_id,
         )?;
 
         let (key, mint_outcome) = self.load_or_mint_key(profile)?;
         let gen_entry = generation_entry_ref(profile);
-        let mut wire = self.read_verified(profile, &key, &gen_entry)?;
+        let original = self.read_verified(profile, &key, &gen_entry)?;
+        let mut wire = self.retired_successor(&lock, profile, &original)?;
         if let Some(anchor) = &reservation.submission_anchor
             && (anchor.chain_scope != reservation.chain_scope
                 || stellar_agent_core::hex::decode_hex32(&reservation.tx_hash).ok()
@@ -2447,11 +2590,13 @@ impl PersistedWindowStore {
         if wire.chain_scope != Some(reservation.chain_scope) {
             return Err(WindowStoreError::ChainMismatch);
         }
-        let original = wire.clone();
         let now_ms = now_ms()?;
 
         if file_holds_id(&wire, &reservation.id) {
             return Err(WindowStoreError::DuplicateReservation);
+        }
+        if totals {
+            bind_total_entries(new_entries, total_pin(&lock, &self.path, profile)?)?;
         }
         // Expiry retains claimed spend and releases unclaimed holds before
         // the window is counted; remaining holds count against it.
@@ -2479,6 +2624,11 @@ impl PersistedWindowStore {
         for entry in new_entries {
             let bucket = find_or_insert_bucket(&mut wire.entries, entry.key());
             bucket.records.push(WireRecord {
+                epoch: if is_total_entry(entry) {
+                    entry.epoch()
+                } else {
+                    None
+                },
                 signed_intent: signed_intent.map(str::to_owned),
                 ts_ms: entry.timestamp_ms(),
                 amount: entry.amount(),
@@ -2593,6 +2743,66 @@ impl PersistedWindowStore {
         self.accounting_decision(profile, id, AccountingEvidence::PreExposureCancellation)
     }
 
+    /// Records a pending reservation like [`Self::record_pending`] and returns
+    /// the capability that only its writer holds before the bytes are sent.
+    ///
+    /// # Errors
+    /// See [`Self::record_pending`].
+    pub(crate) fn record_pending_unsent(
+        &self,
+        profile: &Profile,
+        new_entries: &[WindowEntry],
+        reservation: &SubmissionHold,
+    ) -> Result<(MintOutcome, UnsentReservation), WindowStoreError> {
+        let outcome = self.record_pending_inner(profile, new_entries, reservation, None)?;
+        Ok((
+            outcome,
+            UnsentReservation {
+                id: reservation.id.clone(),
+            },
+        ))
+    }
+
+    /// Releases every record of the reservation `unsent` names, its
+    /// total-budget rows included, in one committed successor.
+    ///
+    /// The capability is the proof that the bytes never left this process,
+    /// so it is consumed. The store still refuses a reservation with an
+    /// observed success or a record that has left the pending state.
+    ///
+    /// # Errors
+    /// Refuses an observed or settled reservation, or invalid state.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "releasing an unsent reservation consumes its capability"
+    )]
+    pub(crate) fn release_unsent(
+        &self,
+        profile: &Profile,
+        unsent: UnsentReservation,
+    ) -> Result<(), WindowStoreError> {
+        self.ensure_parent_dir()?;
+        let lock = WindowStoreLock::acquire_for_with_retry(
+            &self.path,
+            &profile.policy_window_state_key_id,
+        )?;
+        let (key, _) = self.load_or_mint_key(profile)?;
+        let gen_entry = generation_entry_ref(profile);
+        let original = self.read_verified(profile, &key, &gen_entry)?;
+        let mut wire = self.retired_successor(&lock, profile, &original)?;
+        check_accounting_evidence(
+            &wire,
+            &unsent.id,
+            AccountingEvidence::PreExposureCancellation,
+        )?;
+        for bucket in &mut wire.entries {
+            bucket
+                .records
+                .retain(|r| r.id != unsent.id || !is_exposure(r));
+        }
+        self.commit_generation(&key, &gen_entry, original, wire)
+    }
+
     /// Checks an explicit operator acknowledgement against authenticated exposure.
     ///
     /// Bounded spending stays charged until its horizon. Untimed exposure, on
@@ -2646,19 +2856,19 @@ impl PersistedWindowStore {
         decision: AccountingDecision,
     ) -> Result<Option<String>, WindowStoreError> {
         self.ensure_parent_dir()?;
-        let _lock = WindowStoreLock::acquire_for_with_retry(
+        let lock = WindowStoreLock::acquire_for_with_retry(
             &self.path,
             &profile.policy_window_state_key_id,
         )?;
         let (key, _) = self.load_or_mint_key(profile)?;
         let gen_entry = generation_entry_ref(profile);
-        let mut wire = self.read_verified(profile, &key, &gen_entry)?;
+        let original = self.read_verified(profile, &key, &gen_entry)?;
         if matches!(decision.evidence, AccountingEvidence::Chain { .. }) {
             return Err(WindowStoreError::Invalid {
                 detail: "chain accounting applies only inside its operation commit".into(),
             });
         }
-        let original = wire.clone();
+        let mut wire = self.retired_successor(&lock, profile, &original)?;
         let decision_id = apply_decision_in(&mut wire, &decision)?;
         self.commit_generation(&key, &gen_entry, original, wire)?;
         Ok(decision_id)
@@ -3020,7 +3230,9 @@ impl PersistedWindowStore {
             &profile.policy_window_state_key_id,
         )
         .map_err(|e| before_mint(e.into()))?;
-        let snapshot = self.reset_snapshot(profile, now_ms).map_err(before_mint)?;
+        let snapshot = self
+            .reset_snapshot(&lock, profile, now_ms)
+            .map_err(before_mint)?;
         let retained_operations = operations::Operations::on_reset(
             snapshot.original.as_ref(),
             crate::policy_state::store::now_ms().map_err(before_mint)?,
@@ -3075,17 +3287,8 @@ impl PersistedWindowStore {
             };
             let successor = WireFile {
                 chain_scope: Some(ChainScope::for_chain(profile.chain_id)),
-                entries: snapshot
-                    .original
-                    .as_ref()
-                    .map(|wire| {
-                        wire.entries
-                            .iter()
-                            .filter(|bucket| is_total_budget_bucket(bucket))
-                            .cloned()
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                entries: snapshot.retained_totals,
+                retired_total_epoch: snapshot.retired_total_epoch,
                 reset_consent,
                 accounting_expiries: snapshot.retained_expiries,
                 authorizations: snapshot.retained_authorizations,
@@ -3107,6 +3310,7 @@ impl PersistedWindowStore {
 
     fn reset_snapshot(
         &self,
+        lock: &WindowStoreLock,
         profile: &Profile,
         now_ms: u64,
     ) -> Result<ResetSnapshot, WindowStoreError> {
@@ -3152,6 +3356,8 @@ impl PersistedWindowStore {
                 original: None,
                 retained_expiries: Vec::new(),
                 retained_authorizations: Vec::new(),
+                retained_totals: Vec::new(),
+                retired_total_epoch: None,
             });
         };
         let hmac_key = key.as_ref().ok_or(WindowStoreError::ChainUnverifiable)?;
@@ -3168,6 +3374,17 @@ impl PersistedWindowStore {
             return Err(WindowStoreError::AccountingAuditOwed);
         }
         let original = wire.clone();
+        // The successor keeps every total row of the retired working copy and
+        // converts each total hold once, before the sweep below settles any.
+        let retired = self.retired_successor(lock, profile, &original)?;
+        let mut retained_totals: Vec<WireBucket> = retired
+            .entries
+            .iter()
+            .filter(|bucket| is_total_budget_bucket(bucket))
+            .cloned()
+            .collect();
+        ledger::retain_total_holds_on_reset(&retired, &mut retained_totals);
+        let retired_total_epoch = retired.retired_total_epoch;
         prune_closed_intents(&mut wire, crate::policy_state::store::now_ms()?)?;
         if !wire.signed_intents.is_empty() {
             return Err(WindowStoreError::SignedIntentLive {
@@ -3233,6 +3450,8 @@ impl PersistedWindowStore {
             original: Some(original),
             retained_expiries,
             retained_authorizations,
+            retained_totals,
+            retired_total_epoch,
         })
     }
 
@@ -3339,15 +3558,15 @@ impl PersistedWindowStore {
         mutate: impl FnOnce(&mut WireFile) -> bool,
     ) -> Result<(), WindowStoreError> {
         self.ensure_parent_dir()?;
-        let _lock = WindowStoreLock::acquire_for_with_retry(
+        let lock = WindowStoreLock::acquire_for_with_retry(
             &self.path,
             &profile.policy_window_state_key_id,
         )?;
 
         let (key, _mint) = self.load_or_mint_key(profile)?;
         let gen_entry = generation_entry_ref(profile);
-        let mut wire = self.read_verified(profile, &key, &gen_entry)?;
-        let original = wire.clone();
+        let original = self.read_verified(profile, &key, &gen_entry)?;
+        let mut wire = self.retired_successor(&lock, profile, &original)?;
 
         if !mutate(&mut wire) {
             return Ok(());
@@ -3355,6 +3574,28 @@ impl PersistedWindowStore {
 
         prune_stale(&mut wire, now_ms()?);
         self.commit_generation(&key, &gen_entry, original, wire)
+    }
+
+    /// The successor a writer builds from the verified `original`: a copy,
+    /// retired by [`retire_earlier_build`] when `original` is an earlier
+    /// build's. The pin is read under `lock` only then. `original` itself
+    /// stays unmodified, so a prepared commit keeps its authenticated digest.
+    ///
+    /// # Errors
+    ///
+    /// [`WindowStoreError::TotalEpochUnavailable`] when an earlier build's
+    /// total-budget content meets an unreadable or absent pin.
+    pub(super) fn retired_successor(
+        &self,
+        lock: &WindowStoreLock,
+        profile: &Profile,
+        original: &WireFile,
+    ) -> Result<WireFile, WindowStoreError> {
+        let mut successor = original.clone();
+        if earlier_build(&successor) {
+            retire_earlier_build(&mut successor, total_pin(lock, &self.path, profile)?)?;
+        }
+        Ok(successor)
     }
 
     /// Persists both sides before advancing the keyring commit point. A crash
@@ -3387,10 +3628,10 @@ impl PersistedWindowStore {
                     detail: "policy window-state generation counter overflow".to_owned(),
                 })?;
         next.prepared = None;
-        // The successor's version follows from its own content and the
-        // committed version's floor, before its commitment is hashed. The
-        // current snapshot keeps the version it was committed under, so its
-        // committed digest stays the same with the successor beside it.
+        // Every successor uses version 12, set before its commitment is
+        // hashed. The current snapshot keeps the version it was committed
+        // under, so its committed digest stays the same with the successor
+        // beside it.
         next.version = select_wire_version(
             &next,
             (original.generation != 0).then_some(original.version),
@@ -4445,6 +4686,8 @@ fn compute_tag(key: &[u8], body: &[u8]) -> Result<[u8; HMAC_TAG_LEN], WindowStor
 /// The store's clock: the mainnet clock every authorization transition reads,
 /// which also dates pruning and the window's own writes.
 pub(super) fn now_ms() -> Result<u64, WindowStoreError> {
+    #[cfg(test)]
+    tests::CLOCK_READS.set(tests::CLOCK_READS.get().saturating_add(1));
     crate::mainnet::clock::now_ms().map_err(|e| WindowStoreError::Invalid {
         detail: format!("the store clock cannot be read: {e}"),
     })
@@ -4498,7 +4741,7 @@ fn authenticated_scope(wire: &WireFile) -> Result<ChainScope, WindowStoreError> 
 /// Checks one snapshot's version, its authorization history and its
 /// accounting-expiry records.
 ///
-/// Versions 1 through 11 decode. Snapshots below version 4 carry no authorization
+/// Versions 1 through 12 decode. Snapshots below version 4 carry no authorization
 /// history; usable snapshots also require complete authenticated scope.
 /// Accounting-expiry records need version 8, the file's own scope, the
 /// accounting-expired disposition, a generation no later than the file's, and
@@ -4506,7 +4749,8 @@ fn authenticated_scope(wire: &WireFile) -> Result<ChainScope, WindowStoreError> 
 /// Signed intents and their links need version 9. An authorization under
 /// policy authority needs version 10. Operation records, authorization links,
 /// dispositions, release rows, floors and the stored observation need
-/// version 11.
+/// version 11. Total-budget epochs, links, and the retired digest need
+/// version 12; see [`check_total_fields`].
 fn check_snapshot(wire: &WireFile) -> Result<(), WindowStoreError> {
     if wire.version > WIRE_VERSION_MAX {
         return Err(WindowStoreError::UnsupportedVersion);
@@ -4556,11 +4800,66 @@ fn check_snapshot(wire: &WireFile) -> Result<(), WindowStoreError> {
             detail: format!("native amounts require wire version {WIRE_VERSION_POLICY_AUTHORITY}"),
         });
     }
+    check_total_fields(wire)?;
     validate_signed_intents(wire)?;
     operations::Operations::validate(wire)?;
     super::approvals::Approvals::validate(wire)?;
     super::reset_consent::ResetConsents::validate(wire)?;
     ledger::validate(wire)
+}
+
+/// Checks the total-budget fields of one snapshot.
+///
+/// Total holds are never negative. A negative stored total row refuses
+/// only admissions in its bucket ([`total_in_file`]). Only a total row carries an
+/// epoch or an authorization link, and only a total hold carries an epoch.
+/// Below version 12 no row or hold carries these fields, no row is
+/// `proved_unspent`, and no digest is retired. At version 12 a total row or
+/// hold without an epoch needs a retired digest.
+fn check_total_fields(wire: &WireFile) -> Result<(), WindowStoreError> {
+    let refuse = |detail: &str| {
+        Err(WindowStoreError::Invalid {
+            detail: detail.to_owned(),
+        })
+    };
+    let current = wire.version >= WIRE_VERSION_TOTAL_EPOCH;
+    if !current && wire.retired_total_epoch.is_some() {
+        return refuse("a retired total-budget digest requires wire version 12");
+    }
+    for bucket in &wire.entries {
+        let total = is_total_budget_bucket(bucket);
+        for record in &bucket.records {
+            if !current
+                && (record.epoch.is_some()
+                    || record.authorization_id.is_some()
+                    || record.status == RecordStatus::ProvedUnspent)
+            {
+                return refuse("total-budget record fields require wire version 12");
+            }
+            if !total && (record.epoch.is_some() || record.authorization_id.is_some()) {
+                return refuse("a windowed record carries a total-budget field");
+            }
+            if total && current && record.epoch.is_none() && wire.retired_total_epoch.is_none() {
+                return refuse("a total-budget record needs an epoch or a retired digest");
+            }
+        }
+    }
+    for hold in &wire.holds {
+        let total = hold.window_secs == 0 && hold.bucket.starts_with("total:");
+        if !current && hold.epoch.is_some() {
+            return refuse("total-budget hold fields require wire version 12");
+        }
+        if !total && hold.epoch.is_some() {
+            return refuse("a windowed hold carries a total-budget epoch");
+        }
+        if total && hold.amount < 0 {
+            return refuse("a total-budget hold is negative");
+        }
+        if total && current && hold.epoch.is_none() && wire.retired_total_epoch.is_none() {
+            return refuse("a total-budget hold needs an epoch or a retired digest");
+        }
+    }
+    Ok(())
 }
 
 fn intent_invalid(detail: &'static str) -> WindowStoreError {
@@ -5042,12 +5341,21 @@ fn check_intent_json(value: &serde_json::Value) -> Result<(), WindowStoreError> 
 /// and projection need. Keeping it restores no counted exposure. A record
 /// with both done is dropped once its observation is older than the retention
 /// interval.
+///
+/// A counted total-budget row stays whatever its age: it counts for the life
+/// of its policy. A released one ages out like any other row once it is final,
+/// that is when no retained attempt of its authorization still owes the
+/// receipt projection of the decision that released it.
 pub(super) fn prune_stale(wire: &mut WireFile, now_ms: u64) {
     let cutoff = now_ms.saturating_sub(RETENTION_MS);
+    let owed = operations::projection_owed(wire);
     for bucket in &mut wire.entries {
-        bucket
-            .records
-            .retain(|r| r.ts_ms >= cutoff || is_exposure(r));
+        let total = is_total_budget_bucket(bucket);
+        bucket.records.retain(|r| {
+            let final_release = r.status == RecordStatus::ProvedUnspent
+                && !r.authorization_id.is_some_and(|id| owed.contains(&id));
+            (total && !final_release) || r.ts_ms >= cutoff || is_exposure(r)
+        });
     }
     wire.entries.retain(|b| !b.records.is_empty());
     wire.accounting_expiries.retain(|record| {
@@ -5942,10 +6250,13 @@ fn apply_decision_in(
         | AccountingEvidence::Chain { .. } => None,
     };
     for bucket in &mut wire.entries {
+        // A total-budget row leaves its sum only on a proof bound to its
+        // attempt, which a caller's word of an unsent payload is not.
+        let total = is_total_budget_bucket(bucket);
         match decision.evidence {
             AccountingEvidence::PreExposureCancellation => bucket
                 .records
-                .retain(|r| r.id != decision.id || !is_exposure(r)),
+                .retain(|r| total || r.id != decision.id || !is_exposure(r)),
             AccountingEvidence::Chain { transition, .. } => {
                 apply_chain(bucket, &decision.id, transition);
             }
@@ -5979,9 +6290,14 @@ fn apply_decision_in(
 
 /// Applies `transition`'s disposition to the exposure records of
 /// reservation `id` in `bucket`.
+///
+/// A total-budget row keeps its status and amount under a fee-only or a
+/// release disposition: its release belongs to the attempt's own proof.
 fn apply_chain(bucket: &mut WireBucket, id: &str, transition: ChainTransition) {
     let native = bucket.bucket == NATIVE_BUCKET;
+    let total = is_total_budget_bucket(bucket);
     match transition.disposition() {
+        ChainDisposition::FeeOnly { .. } | ChainDisposition::Release if total => {}
         ChainDisposition::Release => bucket.records.retain(|r| r.id != id || !is_exposure(r)),
         disposition => {
             for record in &mut bucket.records {
@@ -6099,7 +6415,9 @@ fn record_is_live(record: &WireRecord, now_ms: u64, window_secs: u64) -> bool {
         RecordStatus::Confirmed => {
             record.ts_ms >= now_ms.saturating_sub(window_secs.saturating_mul(1000))
         }
-        RecordStatus::AccountingExpired | RecordStatus::OperatorCleared => false,
+        RecordStatus::AccountingExpired
+        | RecordStatus::OperatorCleared
+        | RecordStatus::ProvedUnspent => false,
     }
 }
 
@@ -6120,7 +6438,7 @@ fn bounded_reset_bucket(bucket: &str) -> String {
         .collect()
 }
 
-fn is_total_budget_bucket(bucket: &WireBucket) -> bool {
+pub(super) fn is_total_budget_bucket(bucket: &WireBucket) -> bool {
     bucket.window_secs == 0 && bucket.bucket.starts_with("total:")
 }
 
@@ -6144,7 +6462,9 @@ fn snapshot_accrual(wire: &WireFile, now_ms: u64, accrual: &mut WipedAccrualReco
             }
             accrual.entry_count = accrual.entry_count.saturating_add(1);
             match record.status {
-                RecordStatus::AccountingExpired | RecordStatus::OperatorCleared => continue,
+                RecordStatus::AccountingExpired
+                | RecordStatus::OperatorCleared
+                | RecordStatus::ProvedUnspent => continue,
                 RecordStatus::Confirmed => {
                     snapshot.confirmed_count = snapshot.confirmed_count.saturating_add(1);
                     snapshot.confirmed_total =
@@ -6167,28 +6487,324 @@ fn snapshot_accrual(wire: &WireFile, now_ms: u64, accrual: &mut WipedAccrualReco
     }
 }
 
+/// Whether `key` names a total-budget bucket: a zero window under `total:`.
+fn is_total_key(key: &StateKey) -> bool {
+    key.window_secs() == 0 && key.bucket().starts_with("total:")
+}
+
+/// The bucket a total-budget row or hold stored under `bucket` counts in on
+/// `wire`'s network. Every spelling of one asset, as any build wrote it,
+/// names the same bucket; any other bucket is returned unchanged.
+pub(super) fn canonical_total_bucket(bucket: &str, wire: &WireFile) -> String {
+    canonical_bucket_in(bucket, wire.chain_scope)
+}
+
+/// [`canonical_total_bucket`] for a file of network `scope`.
+fn canonical_bucket_in(bucket: &str, scope: Option<ChainScope>) -> String {
+    match (bucket.strip_prefix("total:"), scope) {
+        (Some(asset), Some(scope)) => format!(
+            "total:{}",
+            stellar_agent_core::policy::v1::asset_equivalence::total_budget_identity(
+                asset,
+                scope.chain().network_passphrase(),
+            )
+        ),
+        _ => bucket.to_owned(),
+    }
+}
+
+/// Whether `hold` reserves a total-budget bucket.
+pub(super) fn is_total_hold(hold: &WireAuthorizationHold) -> bool {
+    hold.window_secs == 0 && hold.bucket.starts_with("total:")
+}
+
+/// Whether `entry` is a total-budget entry. After [`check_total_shape`],
+/// its limit and its key agree, so the limit alone classifies it.
+pub(super) fn is_total_entry(entry: &WindowEntry) -> bool {
+    matches!(entry.limit(), WindowLimit::Total { .. })
+}
+
+/// Refuses an entry whose total-budget limit and total-budget key disagree,
+/// a total-budget entry without an epoch, and a negative total-budget debit.
+/// Every writer calls it first, before its lock, its key, and any read, so a
+/// refusal changes no state.
+///
+/// # Errors
+///
+/// [`WindowStoreError::Invalid`] naming the rule.
+pub(super) fn check_total_shape(entries: &[WindowEntry]) -> Result<(), WindowStoreError> {
+    for entry in entries {
+        let total = is_total_entry(entry);
+        if total != is_total_key(entry.key()) {
+            return Err(WindowStoreError::Invalid {
+                detail: "a total-budget entry's limit and key disagree".to_owned(),
+            });
+        }
+        if total && entry.epoch().is_none() {
+            return Err(WindowStoreError::Invalid {
+                detail: "a total-budget entry needs its epoch".to_owned(),
+            });
+        }
+        if total && entry.amount() < 0 {
+            return Err(WindowStoreError::Invalid {
+                detail: "a total-budget debit is negative".to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Whether a hydration counts `hold` at `now_ms`, as the gate sees the file
+/// once an ordinary writer's sweep has committed.
+///
+/// That sweep removes exactly the unclaimed holds of authorizations no
+/// committed exposure names, whose lifetime ends at or before `now_ms`, and
+/// that link no retained operation which has not ended. Every other hold
+/// counts. Durable admission never applies this clock rule: it counts every
+/// hold its successor still holds, so only a committed expiry frees capacity.
+pub(super) fn total_hold_counts(
+    wire: &WireFile,
+    hold: &WireAuthorizationHold,
+    exposed: &[AuthorizationId],
+    live: &[operations::OperationId],
+    now_ms: u64,
+) -> bool {
+    !wire
+        .authorizations
+        .iter()
+        .find(|auth| auth.id == hold.authorization_id)
+        .is_some_and(|auth| {
+            auth.claimed_ms.is_none()
+                && !exposed.contains(&auth.id)
+                && auth.expires_ms <= now_ms
+                && !auth
+                    .operation
+                    .is_some_and(|link| live.contains(&link.operation_id))
+        })
+}
+
+/// The total-budget use of `epoch` under `key` in `wire`: every counted row
+/// and every hold of that asset and epoch, whatever its age.
+///
+/// A hold counts until a committed transition removes it from the file. The
+/// writers sweep expired authorizations into the successor before they admit,
+/// so an expiry frees capacity only in the generation that commits it, and a
+/// later clock reading cannot revive capacity that was reused.
+///
+/// # Errors
+///
+/// [`WindowStoreError::Invalid`] when the sum overflows, or when the bucket
+/// holds a negative stored row.
+pub(super) fn total_in_file(
+    wire: &WireFile,
+    key: &StateKey,
+    epoch: [u8; 32],
+) -> Result<(i128, u32), WindowStoreError> {
+    let overflow = || WindowStoreError::Invalid {
+        detail: "a total-budget sum overflows".to_owned(),
+    };
+    let target = canonical_total_bucket(key.bucket(), wire);
+    let same_bucket = |scope: u8, bucket: &str, window_secs: u64| {
+        scope == key.scope_specificity()
+            && window_secs == 0
+            && canonical_total_bucket(bucket, wire) == target
+    };
+    let mut sum: i128 = 0;
+    let mut count: u32 = 0;
+    for bucket in &wire.entries {
+        if !same_bucket(bucket.scope_specificity, &bucket.bucket, bucket.window_secs) {
+            continue;
+        }
+        for record in &bucket.records {
+            // Any negative row of the bucket, whatever its epoch, leaves
+            // its sum undefined: the bucket refuses admissions.
+            u128::try_from(record.amount).map_err(|_| WindowStoreError::Invalid {
+                detail: "a total-budget record is negative".to_owned(),
+            })?;
+            if record.status == RecordStatus::ProvedUnspent || record.epoch != Some(epoch) {
+                continue;
+            }
+            sum = sum.checked_add(record.amount).ok_or_else(overflow)?;
+            count = count.saturating_add(1);
+        }
+    }
+    for hold in &wire.holds {
+        if !same_bucket(hold.scope_specificity, &hold.bucket, hold.window_secs)
+            || hold.epoch != Some(epoch)
+        {
+            continue;
+        }
+        sum = sum.checked_add(hold.amount).ok_or_else(overflow)?;
+        count = count.saturating_add(1);
+    }
+    Ok((sum, count))
+}
+
+/// The digest the policy pin of `profile`'s store at `path` names, read
+/// under `lock`, or `None` when no pin is recorded.
+///
+/// # Errors
+///
+/// [`WindowStoreError::TotalEpochUnavailable`] when the pin cannot be read.
+pub(super) fn total_pin(
+    lock: &WindowStoreLock,
+    path: &Path,
+    profile: &Profile,
+) -> Result<Option<[u8; 32]>, WindowStoreError> {
+    match pin::read(lock, &PinScope::for_profile(path, profile)) {
+        Ok(PinState::Present(pin)) => Ok(Some(pin.digest())),
+        Ok(PinState::Absent) => Ok(None),
+        Err(error) => Err(WindowStoreError::TotalEpochUnavailable {
+            detail: error.to_string(),
+        }),
+    }
+}
+
+/// Refuses a batch whose total-budget entries name a digest other than the
+/// pinned one, or any total-budget entry without a pin.
+///
+/// # Errors
+///
+/// [`WindowStoreError::TotalEpochStale`].
+pub(super) fn bind_total_entries(
+    entries: &[WindowEntry],
+    pinned: Option<[u8; 32]>,
+) -> Result<(), WindowStoreError> {
+    if entries
+        .iter()
+        .filter(|entry| is_total_entry(entry))
+        .any(|entry| pinned.is_none() || entry.epoch() != pinned)
+    {
+        return Err(WindowStoreError::TotalEpochStale);
+    }
+    Ok(())
+}
+
+/// Whether `wire` is a committed snapshot an earlier build wrote.
+fn earlier_build(wire: &WireFile) -> bool {
+    wire.generation != 0 && wire.version < WIRE_VERSION_TOTAL_EPOCH
+}
+
+/// Retires the total budget of an earlier build's snapshot `successor`
+/// under the pinned digest `pinned`, and moves it to version 12.
+///
+/// Rows and holds keep their fields; no epoch, link, or sum is inferred.
+/// The pinned digest admits no further total-budget debit, even when no
+/// total row remains. Returns `false` and changes nothing for a first run
+/// or a version 12 snapshot.
+///
+/// # Errors
+///
+/// [`WindowStoreError::TotalEpochUnavailable`] for total-budget content
+/// without a pin.
+pub(super) fn retire_earlier_build(
+    successor: &mut WireFile,
+    pinned: Option<[u8; 32]>,
+) -> Result<bool, WindowStoreError> {
+    if !earlier_build(successor) {
+        return Ok(false);
+    }
+    match pinned {
+        Some(digest) => successor.retired_total_epoch = Some(digest),
+        None => {
+            let content = successor.entries.iter().any(is_total_budget_bucket)
+                || successor.holds.iter().any(is_total_hold);
+            if content {
+                return Err(WindowStoreError::TotalEpochUnavailable {
+                    detail: "no policy pin is recorded".to_owned(),
+                });
+            }
+        }
+    }
+    successor.version = WIRE_VERSION_TOTAL_EPOCH;
+    Ok(true)
+}
+
 /// Refuses `entries` when any of them would take its bucket past the limit it
 /// carries, measured against `wire` plus the entries ahead of it in the batch.
 ///
 /// The batch is one submission's reservation. Entries that share a key accumulate
 /// against each other. A batch that exceeds a bucket is refused at the first
 /// entry that tips it.
+///
+/// A total-budget entry is measured with [`total_in_file`] in its own epoch.
+/// Its batch accumulates under the identity that sum counts: scope, the
+/// canonical bucket on `wire`'s network ([`canonical_total_bucket`]), and
+/// epoch, so no spelling opens a second counter. A negative total, an
+/// overflowing sum, and a retired epoch refuse. The caller sweeps expired
+/// authorizations into `wire` first, under the same lock.
 pub(super) fn admit(wire: &WireFile, entries: &[WindowEntry]) -> Result<(), WindowStoreError> {
-    let mut batch: HashMap<&StateKey, (i128, u32)> = HashMap::new();
+    // Total entries accumulate per scope, canonical bucket, and epoch;
+    // windowed ones per key.
+    type Slot = (String, u8, String, u64, Option<[u8; 32]>);
+    let slot_of = |entry: &WindowEntry| -> Slot {
+        let key = entry.key();
+        if is_total_entry(entry) {
+            (
+                String::new(),
+                key.scope_specificity(),
+                canonical_total_bucket(key.bucket(), wire),
+                0,
+                entry.epoch(),
+            )
+        } else {
+            (
+                key.profile_name().to_owned(),
+                key.scope_specificity(),
+                key.bucket().to_owned(),
+                key.window_secs(),
+                None,
+            )
+        }
+    };
+    let mut batch: HashMap<Slot, (i128, u32)> = HashMap::new();
     for entry in entries {
-        let (file_sum, file_count) = window_in_file(wire, entry.key(), entry.timestamp_ms())
-            .map_err(|reason| WindowStoreError::PolicyDenied {
-                reason: Box::new(reason),
+        let total = is_total_entry(entry);
+        if total && entry.amount() < 0 {
+            return Err(WindowStoreError::Invalid {
+                detail: "a total-budget debit is negative".to_owned(),
+            });
+        }
+    }
+    for entry in entries {
+        let total = is_total_entry(entry);
+        let slot = slot_of(entry);
+        let (batch_sum, batch_count) = batch.get(&slot).copied().unwrap_or((0, 0));
+        let (used, calls) = if total {
+            let epoch = entry.epoch().ok_or_else(|| WindowStoreError::Invalid {
+                detail: "a total-budget entry needs its epoch".to_owned(),
             })?;
-        let (batch_sum, batch_count) = batch.get(entry.key()).copied().unwrap_or((0, 0));
-        let used = file_sum.saturating_add(batch_sum);
-        let calls = file_count.saturating_add(batch_count);
+            if wire.retired_total_epoch == Some(epoch) {
+                return Err(WindowStoreError::TotalEpochRetired);
+            }
+            let (file_sum, file_count) = total_in_file(wire, entry.key(), epoch)?;
+            let used =
+                file_sum
+                    .checked_add(batch_sum)
+                    .ok_or_else(|| WindowStoreError::Invalid {
+                        detail: "a total-budget sum overflows".to_owned(),
+                    })?;
+            used.checked_add(entry.amount())
+                .ok_or_else(|| WindowStoreError::Invalid {
+                    detail: "a total-budget sum overflows".to_owned(),
+                })?;
+            (used, file_count.saturating_add(batch_count))
+        } else {
+            let (file_sum, file_count) = window_in_file(wire, entry.key(), entry.timestamp_ms())
+                .map_err(|reason| WindowStoreError::PolicyDenied {
+                    reason: Box::new(reason),
+                })?;
+            (
+                file_sum.saturating_add(batch_sum),
+                file_count.saturating_add(batch_count),
+            )
+        };
         if let Some(reason) = entry.refusal(used, calls) {
             return Err(WindowStoreError::PolicyDenied {
                 reason: Box::new(reason),
             });
         }
-        let accrued = batch.entry(entry.key()).or_insert((0, 0));
+        let accrued = batch.entry(slot).or_insert((0, 0));
         accrued.0 = accrued.0.saturating_add(entry.amount());
         accrued.1 = accrued.1.saturating_add(1);
     }
@@ -6221,10 +6837,13 @@ pub(super) fn find_or_insert_bucket<'a>(
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+pub(in crate::policy_state) use tests::CLOCK_READS;
+#[cfg(test)]
 pub(crate) use tests::fail_store_writes;
 #[cfg(test)]
 pub(crate) use tests::{
-    COMMIT_FAULT_AFTER_COUNTER, COMMIT_FAULT_AFTER_PREPARED, arm_accounting_fault,
+    COMMIT_FAULT_AFTER_COUNTER, COMMIT_FAULT_AFTER_PREPARED, COMMIT_FAULT_COMPACTION,
+    arm_accounting_fault,
 };
 
 #[cfg(test)]
@@ -6258,6 +6877,17 @@ mod tests {
             let (key, _) = self.load_or_mint_key(profile).unwrap();
             self.write_atomic(&key, wire).unwrap();
             write_generation(&generation_entry_ref(profile), wire).unwrap();
+        }
+
+        /// The reset snapshot under a freshly acquired lock.
+        fn reset_snapshot_locked(
+            &self,
+            profile: &Profile,
+            now_ms: u64,
+        ) -> Result<ResetSnapshot, WindowStoreError> {
+            let lock =
+                WindowStoreLock::acquire_for(&self.path, &profile.policy_window_state_key_id)?;
+            self.reset_snapshot(&lock, profile, now_ms)
         }
     }
 
@@ -6381,7 +7011,7 @@ mod tests {
                 );
                 assert_eq!(wire.accounting_expiries, owed);
                 assert!(matches!(
-                    reopened.reset_snapshot(&fx.profile, 2000 + RETENTION_MS + 1),
+                    reopened.reset_snapshot_locked(&fx.profile, 2000 + RETENTION_MS + 1),
                     Err(WindowStoreError::AccountingAuditOwed)
                 ));
                 clock.set(122001);
@@ -6421,7 +7051,7 @@ mod tests {
                 assert_eq!(wire.accounting_expiries, owed);
                 assert_intent_totals(&selected, &fx.profile, 0, 0);
                 assert!(matches!(
-                    selected.reset_snapshot(&fx.profile, 2001 + RETENTION_MS),
+                    selected.reset_snapshot_locked(&fx.profile, 2001 + RETENTION_MS),
                     Err(WindowStoreError::AccountingAuditOwed)
                 ));
             }
@@ -6520,7 +7150,7 @@ mod tests {
         let _clock = crate::mainnet::clock::set_now_ms_for_test(1000);
         let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
         let successor = store.read_for_inspection(&profile).unwrap().unwrap();
-        assert_eq!(successor.version, WIRE_VERSION_INTENT);
+        assert_eq!(successor.version, WIRE_VERSION_TOTAL_EPOCH);
         let key = crate::keyring::load_hmac_key_32(&profile.policy_window_state_key_id).unwrap();
         let encode = |wire: &WireFile| {
             let body = serde_json::to_vec(wire).unwrap();
@@ -6539,7 +7169,7 @@ mod tests {
         parent.prepared = Some(Box::new(successor));
         assert_eq!(
             parent.prepared.as_ref().unwrap().version,
-            WIRE_VERSION_INTENT
+            WIRE_VERSION_TOTAL_EPOCH
         );
         assert!(matches!(
             decode_version_eight(&key, &encode(&parent)),
@@ -6982,7 +7612,7 @@ mod tests {
             assert_eq!((authorized, recorded), (0, 0));
             assert_eq!(file_sha256(store.path()), before);
             assert!(matches!(
-                store.reset_snapshot(&profile, 1000),
+                store.reset_snapshot_locked(&profile, 1000),
                 Err(WindowStoreError::SignedIntentLive { .. })
             ));
             clock.set(2000);
@@ -7020,11 +7650,15 @@ mod tests {
             ));
             assert_eq!((authorized, recorded), (0, 0));
             assert!(matches!(
-                store.reset_snapshot(&profile, 2000 + RETENTION_MS),
+                store.reset_snapshot_locked(&profile, 2000 + RETENTION_MS),
                 Err(WindowStoreError::SignedIntentLive { .. })
             ));
             clock.set(2001 + RETENTION_MS);
-            assert!(store.reset_snapshot(&profile, 2001 + RETENTION_MS).is_ok());
+            assert!(
+                store
+                    .reset_snapshot_locked(&profile, 2001 + RETENTION_MS)
+                    .is_ok()
+            );
             assert_eq!(
                 file_sha256(store.path()),
                 before,
@@ -7643,7 +8277,7 @@ mod tests {
             );
             assert_intent_totals(&store, &profile, 60, 1);
             assert!(matches!(
-                store.reset_snapshot(&profile, now),
+                store.reset_snapshot_locked(&profile, now),
                 Err(WindowStoreError::SignedIntentLive { .. })
             ));
         }
@@ -7765,7 +8399,7 @@ mod tests {
                     explanation,
                     exposed,
                     bound,
-                }) = store.reset_snapshot(&profile, 2000)
+                }) = store.reset_snapshot_locked(&profile, 2000)
                 else {
                     panic!("retained intent blocks reset");
                 };
@@ -7794,7 +8428,7 @@ mod tests {
             .unwrap();
         let before = store.read_for_inspection(&profile).unwrap().unwrap();
         let Err(WindowStoreError::SignedIntentLive { exposed, bound, .. }) =
-            store.reset_snapshot(&profile, 2000 + 2 * RETENTION_MS)
+            store.reset_snapshot_locked(&profile, 2000 + 2 * RETENTION_MS)
         else {
             panic!("the store clock retains the closed record");
         };
@@ -10216,13 +10850,20 @@ mod tests {
             .unwrap();
         rewrite_body_version(&store, &profile, 1);
 
-        let original = fs::read(&store.path).unwrap();
+        // The first hydration retires the earlier build's state once and
+        // keeps its rows; a second hydration leaves the bytes unchanged.
         let dest = PolicyStateStore::new();
         store.load_into("v1-read", &profile, &dest).unwrap();
+        let retired = store.read_for_inspection(&profile).unwrap().unwrap();
+        assert_eq!(retired.version, WIRE_VERSION_TOTAL_EPOCH);
+        let original = fs::read(&store.path).unwrap();
+        store
+            .load_into("v1-read", &profile, &PolicyStateStore::new())
+            .unwrap();
         assert_eq!(
             fs::read(&store.path).unwrap(),
             original,
-            "hydration leaves v1 bytes unchanged"
+            "a second hydration leaves the bytes unchanged"
         );
         assert_eq!(dest.query_window(&k, now + 1_000).unwrap(), (4_200, 1));
         assert_eq!(dest.query_window(&k, now + 86_400_001).unwrap(), (0, 0));
@@ -10520,12 +11161,19 @@ mod tests {
             .record_pending(&profile, &[entry(k.clone(), old, 42)], &res)
             .unwrap();
         rewrite_body_version(&store, &profile, 2);
-        let original = fs::read(&store.path).unwrap();
+        let original = store.read_for_inspection(&profile).unwrap().unwrap();
         let dest = PolicyStateStore::new();
         store.load_into("v2-hold", &profile, &dest).unwrap();
         assert_eq!(dest.query_window(&k, now).unwrap(), (42, 1));
         assert_eq!(store.pending_reservations(&profile).unwrap(), vec![res]);
-        assert_eq!(fs::read(&store.path).unwrap(), original);
+        // The hydration retires the earlier build's state once and keeps
+        // every record it held.
+        let retired = store.read_for_inspection(&profile).unwrap().unwrap();
+        assert_eq!(retired.version, WIRE_VERSION_TOTAL_EPOCH);
+        assert_eq!(
+            serde_json::to_value(&retired.entries).unwrap(),
+            serde_json::to_value(&original.entries).unwrap()
+        );
     }
 
     /// A file written by a newer build carries records this one cannot
@@ -11434,7 +12082,7 @@ mod tests {
                     stellar_agent_core::profile::owner_key::owner_key_fingerprint(&owner_of(0xa1))
                 );
                 assert_eq!(record.consumed_at_ms, time);
-                assert_eq!(wire.version, 11);
+                assert_eq!(wire.version, WIRE_VERSION_TOTAL_EPOCH);
                 prune_stale(&mut wire, u64::MAX);
                 assert_eq!(wire.reset_consent, Some(record));
                 assert!(serde_json::to_value(&wire).unwrap()["reset_consent"].is_object());
@@ -11518,7 +12166,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn owner_reset_preserves_stored_totals_and_creates_no_epoch() {
+    fn owner_reset_preserves_total_buckets_beside_windowed_ones() {
         for mainnet in [false, true] {
             let f = if mainnet {
                 ResetFixture::mainnet()
@@ -11535,6 +12183,7 @@ mod tests {
             total.window_secs = 0;
             total.records[0].ts_ms = 1;
             total.records[0].amount = 91;
+            total.records[0].epoch = Some([0x91; 32]);
             total.records.push(WireRecord {
                 ts_ms: 100_000,
                 amount: 93,
@@ -11562,12 +12211,7 @@ mod tests {
                 serde_json::to_value(&committed.entries).unwrap(),
                 serde_json::to_value(vec![total]).unwrap()
             );
-            assert!(
-                !serde_json::to_value(committed)
-                    .unwrap()
-                    .to_string()
-                    .contains("epoch")
-            );
+            assert_eq!(committed.entries[0].records[0].epoch, Some([0x91; 32]));
         }
     }
 
@@ -11820,7 +12464,7 @@ mod tests {
                 .unwrap();
             let after = store.read_for_inspection(&profile).unwrap().unwrap();
             assert_eq!(after.generation, before.generation + 1);
-            assert_eq!(after.version, WIRE_VERSION_OPERATIONS);
+            assert_eq!(after.version, WIRE_VERSION_TOTAL_EPOCH);
             assert_eq!(
                 serde_json::to_vec(&after.operations).unwrap(),
                 serde_json::to_vec(&before.operations).unwrap()
@@ -12155,7 +12799,10 @@ mod tests {
                 let raw = fs::read(&f.store.path).unwrap();
                 let mut pair = f.store.verify_with_key(&key, &raw).unwrap();
                 assert_eq!(pair.version, version);
-                assert_eq!(pair.prepared.as_ref().unwrap().version, 11);
+                assert_eq!(
+                    pair.prepared.as_ref().unwrap().version,
+                    WIRE_VERSION_TOTAL_EPOCH
+                );
                 pair.prepared = None;
                 assert_eq!(serde_json::to_vec(&pair).unwrap(), bytes[HMAC_TAG_LEN..]);
                 assert_eq!(body_digest(&pair).unwrap(), digest);
@@ -12166,10 +12813,20 @@ mod tests {
                     selected.generation,
                     original.generation + u64::from(committed)
                 );
-                assert_eq!(selected.version, if committed { 11 } else { version });
+                assert_eq!(
+                    selected.version,
+                    if committed {
+                        WIRE_VERSION_TOTAL_EPOCH
+                    } else {
+                        version
+                    }
+                );
                 let mut no_content = selected.clone();
                 no_content.reset_consent = None;
-                assert_eq!(select_wire_version(&no_content, Some(11)), 11);
+                assert_eq!(
+                    select_wire_version(&no_content, Some(11)),
+                    WIRE_VERSION_TOTAL_EPOCH
+                );
                 assert_eq!(fs::read(&f.store.path).unwrap(), raw);
             }
         }
@@ -14249,7 +14906,7 @@ mod tests {
             .expire_accounting(&fx.profile, None, &fx.hold, fx.expire_at)
             .unwrap();
         let wire = fx.store.read_for_inspection(&fx.profile).unwrap().unwrap();
-        assert_eq!(wire.version, WIRE_VERSION_EXPIRY);
+        assert_eq!(wire.version, WIRE_VERSION_TOTAL_EPOCH);
         check_snapshot(&wire).unwrap();
         let refused = |change: &dyn Fn(&mut WireFile)| {
             let mut changed = wire.clone();
@@ -14286,8 +14943,11 @@ mod tests {
         });
         let mut without = wire.clone();
         without.accounting_expiries.clear();
-        assert_eq!(select_wire_version(&without, None), WIRE_VERSION_EXPOSURE);
-        assert_eq!(select_wire_version(&wire, None), WIRE_VERSION_EXPIRY);
+        assert_eq!(
+            select_wire_version(&without, None),
+            WIRE_VERSION_TOTAL_EPOCH
+        );
+        assert_eq!(select_wire_version(&wire, None), WIRE_VERSION_TOTAL_EPOCH);
         let body = serde_json::to_string(&without).unwrap();
         assert!(!body.contains("accounting_expiries"), "{body}");
     }
@@ -14921,7 +15581,7 @@ mod tests {
         assert_eq!(record.generation, generation + 1);
         assert_eq!(record.disposition, RecordStatus::AccountingExpired);
         assert!(!record.audit_acknowledged && !record.receipt_projected);
-        assert_eq!(wire.version, WIRE_VERSION_EXPIRY);
+        assert_eq!(wire.version, WIRE_VERSION_TOTAL_EPOCH);
         let event = stellar_agent_core::audit_log::AuditEntry::new_submission_accounting_expired(
             ACCOUNTING_EXPIRY_TOOL,
             "stellar:testnet",
@@ -15370,8 +16030,8 @@ mod tests {
     }
 
     /// A snapshot with an exposure-era status, accounting field or submission
-    /// anchor is written as version 7; one with only confirmed and pending
-    /// records keeps version 5, or 6 with a claim.
+    /// anchor, and one with only confirmed and pending records, with or
+    /// without a claim, is written as version 12 and keeps its records.
     #[test]
     #[serial]
     fn wire_version_tracks_exposure_content_and_preserves_legacy_records() {
@@ -15491,11 +16151,10 @@ mod tests {
                 let mut auth = authorization.clone();
                 auth.claimed_ms = claimed_ms;
                 wire.authorizations.push(auth);
-                let expected = if version == 5 && claimed_ms.is_some() {
-                    6
-                } else {
-                    version
-                };
+                // Every successor is version 12, whatever the content that
+                // selected `version` in the build before it.
+                let _ = version;
+                let expected = WIRE_VERSION_TOTAL_EPOCH;
                 let (key, _) = f.store.load_or_mint_key(&f.profile).unwrap();
                 f.store
                     .commit_generation(
@@ -15519,7 +16178,7 @@ mod tests {
     /// read on both sides of the commit point: before the counter commits the
     /// successor, the current snapshot wins; after, the successor does, also
     /// when its compaction never happened. A commitment naming another body
-    /// refuses, and the next write selects its version from its content.
+    /// refuses, and the next write uses version 12.
     #[test]
     #[serial]
     fn every_prepared_version_pair_survives_both_sides_of_the_commit_point() {
@@ -15591,6 +16250,16 @@ mod tests {
             let memory = PolicyStateStore::new();
             store.load_into("versions", &profile, &memory).unwrap();
             assert_eq!(memory.query_window(&k, now).unwrap(), (10, 1), "{pair}");
+            // The hydration retires the selected earlier-build snapshot once.
+            // The fixture then restores the prepared pair and its counter.
+            let retired = store.read_for_inspection(&profile).unwrap().unwrap();
+            assert_eq!(
+                (retired.version, retired.generation),
+                (WIRE_VERSION_TOTAL_EPOCH, current.generation + 1),
+                "{pair}: the hydration retires the current snapshot"
+            );
+            store.write_atomic(&hmac_key, &container).unwrap();
+            write_generation(&gen_entry, &current).unwrap();
 
             let mut other = next.clone();
             other.entries[0].records[0].amount = 11;
@@ -15629,8 +16298,8 @@ mod tests {
                 .unwrap();
             let written = store.read_for_inspection(&profile).unwrap().unwrap();
             assert_eq!(
-                written.version, 5,
-                "{pair}: the next write selects its version from its content"
+                written.version, WIRE_VERSION_TOTAL_EPOCH,
+                "{pair}: the next write uses version 12"
             );
         }
 
@@ -15767,6 +16436,7 @@ mod tests {
             window_secs: 60,
             ts_ms: 1000,
             amount: 5,
+            epoch: None,
         });
         if policy_authority {
             let mut settled = settled_authorization(0x34);
@@ -15791,15 +16461,18 @@ mod tests {
         store
             .commit_generation(&hmac_key, &gen_entry, original, wire)
             .unwrap();
+        // This build writes version 12; the fixture seals the earlier version
+        // its content held, as the earlier build wrote it.
+        let mut sealed = store.read_for_inspection(&profile).unwrap().unwrap();
+        sealed.version = if policy_authority {
+            WIRE_VERSION_POLICY_AUTHORITY
+        } else {
+            WIRE_VERSION_INTENT
+        };
+        store.write_atomic(&hmac_key, &sealed).unwrap();
+        write_generation(&gen_entry, &sealed).unwrap();
         let written = store.read_for_inspection(&profile).unwrap().unwrap();
-        assert_eq!(
-            written.version,
-            if policy_authority {
-                WIRE_VERSION_POLICY_AUTHORITY
-            } else {
-                WIRE_VERSION_INTENT
-            }
-        );
+        assert_eq!(written.version, sealed.version);
         assert_eq!(written.signed_intents.len(), 1);
         assert_eq!(written.accounting_expiries.len(), 1);
         assert!(!written.accounting_expiries[0].audit_acknowledged);
@@ -15839,7 +16512,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn version_eleven_file_reserializes_byte_identically() {
+    fn an_operation_file_reserializes_byte_identically() {
         let (_dir, profile, store, _clock) = operation_store();
         let mut audit = OperationRows::default();
         let handle = open_operation(&store, &profile, &mut audit, "order-1", 1);
@@ -15861,7 +16534,7 @@ mod tests {
             .unwrap();
         let bytes = fs::read(store.path()).unwrap();
         let loaded = store.read_for_inspection(&profile).unwrap().unwrap();
-        assert_eq!(loaded.version, WIRE_VERSION_OPERATIONS);
+        assert_eq!(loaded.version, WIRE_VERSION_TOTAL_EPOCH);
         assert_eq!(body_digest(&loaded).unwrap(), committed_digest(&profile));
         assert_reserializes_byte_identically(&store, &profile);
         assert_eq!(fs::read(store.path()).unwrap(), bytes);
@@ -15958,9 +16631,14 @@ mod tests {
                 );
                 next.authorizations.push(settled);
                 let k = key("intent", "native", 86_400);
+                // The hydration retires the sealed file once; the fixture
+                // restores it and its counter before the commit.
+                let sealed = fs::read(store.path()).unwrap();
                 let memory = PolicyStateStore::new();
                 store.load_into("intent", &profile, &memory).unwrap();
                 let (total, calls) = memory.query_window(&k, 1000).unwrap();
+                fs::write(store.path(), &sealed).unwrap();
+                write_generation(&gen_entry, &current).unwrap();
 
                 let armed = arm_accounting_fault(seam);
                 let result = store.commit_generation(&hmac_key, &gen_entry, current.clone(), next);
@@ -15972,7 +16650,7 @@ mod tests {
                 assert_eq!(
                     (selected.version, selected.generation),
                     if committed {
-                        (WIRE_VERSION_POLICY_AUTHORITY, current.generation + 1)
+                        (WIRE_VERSION_TOTAL_EPOCH, current.generation + 1)
                     } else {
                         (current_version, current.generation)
                     },
@@ -15998,7 +16676,7 @@ mod tests {
                         .unwrap();
                 assert_eq!(
                     body["prepared"]["version"],
-                    serde_json::json!(WIRE_VERSION_POLICY_AUTHORITY),
+                    serde_json::json!(WIRE_VERSION_TOTAL_EPOCH),
                     "{pair}: the stop leaves the prepared image beside its parent"
                 );
                 assert_eq!(
@@ -16037,7 +16715,7 @@ mod tests {
             .unwrap();
         let after = store.read_for_inspection(&profile).unwrap().unwrap();
         assert_eq!(after.generation, before.generation + 1);
-        assert_eq!(after.version, WIRE_VERSION_POLICY_AUTHORITY);
+        assert_eq!(after.version, WIRE_VERSION_TOTAL_EPOCH);
         assert_eq!(
             serde_json::to_vec(&after.signed_intents).unwrap(),
             serde_json::to_vec(&before.signed_intents).unwrap()
@@ -16323,7 +17001,7 @@ mod tests {
             .unwrap();
         let after = store.read_for_inspection(&profile).unwrap().unwrap();
         assert_eq!(after.generation, before.generation + 1);
-        assert_eq!(after.version, WIRE_VERSION_OPERATIONS);
+        assert_eq!(after.version, WIRE_VERSION_TOTAL_EPOCH);
         assert_eq!(after.operations, before.operations);
         let section = after.operations.as_ref().unwrap();
         let mut kept: Vec<_> = section
@@ -16443,12 +17121,12 @@ mod tests {
         );
     }
 
-    /// A version 10 file loads unchanged and moves to version 11 only with a
-    /// commit that carries version-11 content. Every earlier section keeps
-    /// its bytes, and the new file reserializes to itself.
+    /// A version 10 file loads, its first hydration retires it, and its next
+    /// commit moves it to version 12. Every earlier section keeps its bytes,
+    /// and the new file reserializes to itself.
     #[test]
     #[serial]
-    fn version_ten_file_migrates_to_eleven_preserving_every_section() {
+    fn a_version_ten_file_migrates_to_twelve_preserving_every_section() {
         let (_dir, profile, store, _clock) = version_ten_store(true);
         let bytes = fs::read(&store.path).unwrap();
         let current = store.read_for_inspection(&profile).unwrap().unwrap();
@@ -16469,9 +17147,15 @@ mod tests {
                 assert!(auth.get(field).is_none(), "{field}");
             }
         }
+        // A hydration retires the version 10 file once; the fixture restores
+        // the sealed file and its counter for the commit below.
         store
             .load_into("intent", &profile, &PolicyStateStore::new())
             .unwrap();
+        let retired = store.read_for_inspection(&profile).unwrap().unwrap();
+        assert_eq!(retired.version, WIRE_VERSION_TOTAL_EPOCH);
+        fs::write(&store.path, &bytes).unwrap();
+        write_generation(&generation_entry_ref(&profile), &current).unwrap();
         assert_eq!(fs::read(&store.path).unwrap(), bytes);
 
         let hmac_key =
@@ -16491,7 +17175,7 @@ mod tests {
             )
             .unwrap();
         let after = store.read_for_inspection(&profile).unwrap().unwrap();
-        assert_eq!(after.version, WIRE_VERSION_OPERATIONS);
+        assert_eq!(after.version, WIRE_VERSION_TOTAL_EPOCH);
         assert_eq!(after.generation, current.generation + 1);
         assert_eq!(after.chain_scope, current.chain_scope);
         assert_eq!(after.last_observation.map(|o| o.ledger), Some(900));
@@ -16516,8 +17200,8 @@ mod tests {
     const V10_BODY: &str = r#"{"chain_scope":{"chain":"stellar:testnet","network_passphrase_sha256":[206,224,48,45,89,132,77,50,189,202,145,92,130,3,221,68,179,63,187,126,220,25,5,30,163,122,190,223,40,236,212,114]},"version":10,"generation":6,"entries":[{"scope_specificity":1,"bucket":"native","window_secs":60,"records":[{"chain_scope":{"chain":"stellar:testnet","network_passphrase_sha256":[206,224,48,45,89,132,77,50,189,202,145,92,130,3,221,68,179,63,187,126,220,25,5,30,163,122,190,223,40,236,212,114]},"execution_bound":61000,"accounting_until_ms":121000,"admitted_window_ms":60000,"ts_ms":1000,"amount":"300","id":"e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1","status":"accounting_expired","tx_hash":"abababababababababababababababababababababababababababababababab","source":"GSOURCE","sequence":9,"max_time":61,"pending_since_ms":1000,"submission_ledger":1000,"operator_required":false}]},{"scope_specificity":1,"bucket":"native","window_secs":86400,"records":[{"chain_scope":{"chain":"stellar:testnet","network_passphrase_sha256":[206,224,48,45,89,132,77,50,189,202,145,92,130,3,221,68,179,63,187,126,220,25,5,30,163,122,190,223,40,236,212,114]},"admitted_window_ms":86400000,"ts_ms":1000,"amount":"40","id":"e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2","status":"pending","tx_hash":"abababababababababababababababababababababababababababababababab","source":"GSOURCE","sequence":10,"max_time":0,"pending_since_ms":1000,"submission_ledger":1000,"operator_required":false},{"ts_ms":1000,"amount":"7","id":"","status":"confirmed","tx_hash":"","source":"","sequence":0,"max_time":0,"pending_since_ms":0,"submission_ledger":0,"operator_required":false}]}],"authorizations":[{"id":"3333333333333333333333333333333333333333333333333333333333333333","profile":"intent","chain":"stellar:testnet","domain":"transaction","consumer":"cli_pay","content_digest":"56c7962e9f26b46fb66d793017822eee1603519e00a855341729cf18af15e3c4","binding":{"transaction":{"unsigned_envelope_sha256":"3131313131313131313131313131313131313131313131313131313131313131","tx_hash":"3232323232323232323232323232323232323232323232323232323232323232","source":"GSOURCE","sequence":11}},"state":"open","minted_ms":1000,"expires_ms":604801000,"policy_sequence":1,"policy_digest":"0101010101010101010101010101010101010101010101010101010101010101","approval_nonce":"intent-open","approval_expires_ms":604801000,"bindings_digest":"0202020202020202020202020202020202020202020202020202020202020202","entries_digest":"0303030303030303030303030303030303030303030303030303030303030303","reservation":"3333333333333333333333333333333333333333333333333333333333333333"},{"id":"3434343434343434343434343434343434343434343434343434343434343434","profile":"intent","chain":"stellar:testnet","domain":"soroban","consumer":"x402_create","content_digest":"f1b00da714f0136828d068f4e590ae41d9fb5c8a48c6a17d57e26ba3472470a9","binding":{"soroban":{"intent_digest":"3434343434343434343434343434343434343434343434343434343434343434"}},"state":"expired","minted_ms":1,"expires_ms":2,"settled_ms":1000,"policy_sequence":1,"policy_digest":"0101010101010101010101010101010101010101010101010101010101010101","policy_authority":{"policy_digest":"0101010101010101010101010101010101010101010101010101010101010101","policy_sequence":1,"rule_index":2,"evaluated_at_ms":1000,"governing_until_ms":604801000,"scope":{"kind":"classic"}},"bindings_digest":"0202020202020202020202020202020202020202020202020202020202020202","entries_digest":"0303030303030303030303030303030303030303030303030303030303030303"}],"holds":[{"kind":"value","authorization_id":"3333333333333333333333333333333333333333333333333333333333333333","ordinal":0,"scope_specificity":1,"bucket":"native","window_secs":60,"ts_ms":1000,"amount":"5"}],"accounting_expiries":[{"decision_id":"ea04d2a485346305476b280cb76a286baed3c8c9f17e009787d64f3f459ecb46","chain_scope":{"chain":"stellar:testnet","network_passphrase_sha256":[206,224,48,45,89,132,77,50,189,202,145,92,130,3,221,68,179,63,187,126,220,25,5,30,163,122,190,223,40,236,212,114]},"reservation_id":"e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1","tx_hash":"abababababababababababababababababababababababababababababababab","source":"GSOURCE","sequence":9,"max_time":61,"submission_ledger":1000,"generation":3,"disposition":"accounting_expired","observed_at_ms":121001,"accounting_until_ms":121000,"audit_acknowledged":false,"receipt_projected":false}],"signed_intents":[{"intent_id":"intent-79667c951988be5ebd0459cab17b3740b1760c626a00b90f7130e54f660af593","chain_scope":{"chain":"stellar:testnet","network_passphrase_sha256":[206,224,48,45,89,132,77,50,189,202,145,92,130,3,221,68,179,63,187,126,220,25,5,30,163,122,190,223,40,236,212,114]},"auth_address":"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF","envelope_source":"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF","envelope_sequence":1,"host_invocation_sha256":"0fa70075b4842d7358994728d5dba7bf6d1a96097a8d47c8f9e8619aa81253d7","subjects":[],"greatest_expiration_ledger":100,"purpose":"Invoke","envelope_max_ledger":100,"admitted_window_ms":60000,"legs":[{"scope_specificity":1,"bucket":"native","window_secs":60,"ts_ms":1000,"amount":"60"},{"scope_specificity":1,"bucket":"rate_limit","window_secs":60,"ts_ms":1000,"amount":"1"}],"admitted_at_ms":1000,"generation":1,"status":"Exposed","cancel_token_sha256":"6671ee70c5900cde7c80bcc619eda2cdf986367950c09541ffaa7cb47d2721ca"}]}"#;
 
     /// The version 10 body loads, reserializes byte for byte, and moves to
-    /// version 11 with a commit that carries version 11 content, keeping every
-    /// earlier section byte for byte.
+    /// version 12 with its next commit, keeping every earlier section byte
+    /// for byte.
     #[test]
     #[serial]
     fn a_version_ten_golden_body_migrates_to_eleven() {
@@ -16543,11 +17227,17 @@ mod tests {
         assert_eq!(current.signed_intents.len(), 1);
         assert_eq!(current.accounting_expiries.len(), 1);
         assert_eq!(serde_json::to_vec(&current).unwrap(), body);
+        assert_reserializes_byte_identically(&store, &profile);
+        // A hydration retires the golden body once; the fixture restores it.
         store
             .load_into("intent", &profile, &PolicyStateStore::new())
             .unwrap();
+        let retired = store.read_for_inspection(&profile).unwrap().unwrap();
+        assert_eq!(retired.version, WIRE_VERSION_TOTAL_EPOCH);
+        assert_eq!(retired.generation, current.generation + 1);
+        fs::write(&store.path, &bytes).unwrap();
+        write_generation(&generation_entry_ref(&profile), &golden).unwrap();
         assert_eq!(fs::read(&store.path).unwrap(), bytes);
-        assert_reserializes_byte_identically(&store, &profile);
 
         let mut next = current.clone();
         next.last_observation = Some(operations::WindowObservation {
@@ -16559,7 +17249,7 @@ mod tests {
             .commit_generation(&key, &generation_entry_ref(&profile), current.clone(), next)
             .unwrap();
         let after = store.read_for_inspection(&profile).unwrap().unwrap();
-        assert_eq!(after.version, WIRE_VERSION_OPERATIONS);
+        assert_eq!(after.version, WIRE_VERSION_TOTAL_EPOCH);
         assert_eq!(after.generation, current.generation + 1);
         for (name, section) in [
             ("chain_scope", serde_json::to_string(&after.chain_scope)),
@@ -16584,12 +17274,12 @@ mod tests {
         assert_reserializes_byte_identically(&store, &profile);
     }
 
-    /// Native amounts alone select version 10, a policy authority keeps
-    /// selecting 10, operation content selects 11, and a committed version
-    /// 11 file never moves back.
+    /// Every writer selects version 12, with or without native amounts, a
+    /// policy authority, or operation content. Native amounts below version
+    /// 10 refuse, and the amounts survive an operation write.
     #[test]
     #[serial]
-    fn native_reservation_selects_version_ten_and_keeps_eleven() {
+    fn native_amounts_need_version_ten_and_writers_select_twelve() {
         let (_dir, profile, store, _clock) = operation_store();
         let mut held = policy_mint(1);
         held.native_reservation = Some(ledger::NativeReservation {
@@ -16598,15 +17288,18 @@ mod tests {
         });
         store.mint_authorization(&profile, &held).unwrap();
         let wire = store.read_for_inspection(&profile).unwrap().unwrap();
-        assert_eq!(wire.version, WIRE_VERSION_POLICY_AUTHORITY);
+        assert_eq!(wire.version, WIRE_VERSION_TOTAL_EPOCH);
         let mut native_only = wire.clone();
         native_only.authorizations[0].policy_authority = None;
         assert_eq!(
             select_wire_version(&native_only, None),
-            WIRE_VERSION_POLICY_AUTHORITY
+            WIRE_VERSION_TOTAL_EPOCH
         );
         native_only.authorizations[0].native_reservation = None;
-        assert!(select_wire_version(&native_only, None) < WIRE_VERSION_POLICY_AUTHORITY);
+        assert_eq!(
+            select_wire_version(&native_only, None),
+            WIRE_VERSION_TOTAL_EPOCH
+        );
         let mut lowered = wire.clone();
         lowered.authorizations[0].policy_authority = None;
         lowered.version = WIRE_VERSION_POLICY_AUTHORITY - 1;
@@ -16621,7 +17314,7 @@ mod tests {
         let mut audit = OperationRows::default();
         open_operation(&store, &profile, &mut audit, "order-1", 1);
         let eleven = store.read_for_inspection(&profile).unwrap().unwrap();
-        assert_eq!(eleven.version, WIRE_VERSION_OPERATIONS);
+        assert_eq!(eleven.version, WIRE_VERSION_TOTAL_EPOCH);
         assert_eq!(
             eleven.authorizations[0].native_reservation,
             held.native_reservation
@@ -16630,18 +17323,18 @@ mod tests {
         emptied.operations = None;
         assert_eq!(
             select_wire_version(&emptied, Some(WIRE_VERSION_OPERATIONS)),
-            WIRE_VERSION_OPERATIONS
+            WIRE_VERSION_TOTAL_EPOCH
         );
         assert_reserializes_byte_identically(&store, &profile);
     }
 
-    /// A mainnet file holding authenticated history moves to version 11 with
+    /// A mainnet file holding authenticated history stays at version 12 with
     /// its first operation and keeps that history byte for byte. A file
     /// without authenticated scope refuses the operation write and stays
     /// unchanged.
     #[test]
     #[serial]
-    fn migration_to_eleven_preserves_authenticated_history() {
+    fn an_operation_write_preserves_authenticated_history() {
         let (_dir, profile, store, _clock) = operation_store();
         store
             .record_and_persist(
@@ -16653,13 +17346,13 @@ mod tests {
         held.holds = vec![entry(key("ops-store", "native", 86_400), OPERATION_T0, 9)];
         store.mint_authorization(&profile, &held).unwrap();
         let before = store.read_for_inspection(&profile).unwrap().unwrap();
-        assert_eq!(before.version, WIRE_VERSION_POLICY_AUTHORITY);
+        assert_eq!(before.version, WIRE_VERSION_TOTAL_EPOCH);
         assert_eq!(before.holds.len(), 1);
 
         let mut audit = OperationRows::default();
         open_operation(&store, &profile, &mut audit, "order-1", 1);
         let after = store.read_for_inspection(&profile).unwrap().unwrap();
-        assert_eq!(after.version, WIRE_VERSION_OPERATIONS);
+        assert_eq!(after.version, WIRE_VERSION_TOTAL_EPOCH);
         assert_eq!(after.generation, before.generation + 1);
         assert_eq!(after.chain_scope, before.chain_scope);
         for (stored, kept) in [
@@ -16736,15 +17429,25 @@ mod tests {
                     store
                         .commit_generation(&hmac_key, &gen_entry, ten, eleven)
                         .unwrap();
+                    // Seal the version 11 file an earlier build wrote.
+                    let mut sealed = store.read_for_inspection(&profile).unwrap().unwrap();
+                    sealed.version = WIRE_VERSION_OPERATIONS;
+                    store.write_atomic(&hmac_key, &sealed).unwrap();
+                    write_generation(&gen_entry, &sealed).unwrap();
                 }
                 let current = store.read_for_inspection(&profile).unwrap().unwrap();
                 assert_eq!(current.version, current_version, "{pair}");
                 let mut next = current.clone();
                 next.last_observation = Some(observation(900));
                 let k = key("intent", "native", 86_400);
+                // The hydration retires the sealed file once; the fixture
+                // restores it and its counter before the commit.
+                let sealed = fs::read(store.path()).unwrap();
                 let memory = PolicyStateStore::new();
                 store.load_into("intent", &profile, &memory).unwrap();
                 let (total, calls) = memory.query_window(&k, 1000).unwrap();
+                fs::write(store.path(), &sealed).unwrap();
+                write_generation(&gen_entry, &current).unwrap();
 
                 let armed = arm_accounting_fault(seam);
                 let result = store.commit_generation(&hmac_key, &gen_entry, current.clone(), next);
@@ -16760,7 +17463,7 @@ mod tests {
                         selected.last_observation.map(|o| o.ledger)
                     ),
                     if committed {
-                        (WIRE_VERSION_OPERATIONS, current.generation + 1, Some(900))
+                        (WIRE_VERSION_TOTAL_EPOCH, current.generation + 1, Some(900))
                     } else {
                         (
                             current_version,
@@ -16786,7 +17489,7 @@ mod tests {
                         .unwrap();
                 assert_eq!(
                     body["prepared"]["version"],
-                    serde_json::json!(WIRE_VERSION_OPERATIONS),
+                    serde_json::json!(WIRE_VERSION_TOTAL_EPOCH),
                     "{pair}: the stop leaves the prepared image beside its parent"
                 );
                 assert_eq!(
@@ -16805,8 +17508,8 @@ mod tests {
         }
     }
 
-    /// Once a file is committed at version 11, a commit without version-11
-    /// content stays at 11 on both version selections.
+    /// A commit with or without version-11 content selects version 12 on
+    /// both version selections.
     #[test]
     #[serial]
     fn version_eleven_file_never_selects_ten() {
@@ -16825,7 +17528,7 @@ mod tests {
             .commit_generation(&hmac_key, &gen_entry, ten, eleven)
             .unwrap();
         let committed = store.read_for_inspection(&profile).unwrap().unwrap();
-        assert_eq!(committed.version, WIRE_VERSION_OPERATIONS);
+        assert_eq!(committed.version, WIRE_VERSION_TOTAL_EPOCH);
 
         let mut plain = committed.clone();
         plain.last_observation = None;
@@ -16836,14 +17539,14 @@ mod tests {
         let after = store.read_for_inspection(&profile).unwrap().unwrap();
         assert_eq!(after.generation, committed.generation + 1);
         assert_eq!(after.last_observation, None);
-        assert_eq!(after.version, WIRE_VERSION_OPERATIONS);
+        assert_eq!(after.version, WIRE_VERSION_TOTAL_EPOCH);
 
         store
             .record_and_persist(&profile, &[entry(key("intent", "other", 3600), 1000, 9)])
             .unwrap();
         let settled = store.read_for_inspection(&profile).unwrap().unwrap();
         assert_eq!(settled.generation, after.generation + 1);
-        assert_eq!(settled.version, WIRE_VERSION_OPERATIONS);
+        assert_eq!(settled.version, WIRE_VERSION_TOTAL_EPOCH);
         assert_reserializes_byte_identically(&store, &profile);
     }
 
@@ -17054,7 +17757,7 @@ mod tests {
                 next,
             )
             .unwrap();
-        assert_eq!(fx.wire().version, 11);
+        assert_eq!(fx.wire().version, WIRE_VERSION_TOTAL_EPOCH);
         assert!(fx.view().record.consent.is_none());
     }
 
@@ -17099,7 +17802,14 @@ mod tests {
                 assert_eq!(result.is_ok(), seam == COMMIT_FAULT_COMPACTION);
                 let after = fx.wire();
                 let committed = seam != COMMIT_FAULT_AFTER_PREPARED;
-                assert_eq!(after.version, if committed { 11 } else { version });
+                assert_eq!(
+                    after.version,
+                    if committed {
+                        WIRE_VERSION_TOTAL_EPOCH
+                    } else {
+                        version
+                    }
+                );
                 assert_eq!(
                     after.approvals,
                     if committed {
@@ -17871,6 +18581,1587 @@ mod tests {
         static INSPECTION_READ_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> = std::cell::RefCell::new(None);
     }
 
+    /// Total-budget accounting in the window file: admission, projection,
+    /// hydration, retirement, and the writers' shape checks.
+    mod total_budget {
+        use super::*;
+
+        const T: u64 = 1_800_000_000_000;
+        const D1: [u8; 32] = [0xd1; 32];
+        const D2: [u8; 32] = [0xd2; 32];
+
+        struct Fx {
+            _dir: TempDir,
+            name: String,
+            profile: Profile,
+            store: PersistedWindowStore,
+            clock: crate::mainnet::clock::TestClockGuard,
+        }
+
+        fn fx(name: &str) -> Fx {
+            keyring_mock::install().unwrap();
+            let dir = TempDir::new().unwrap();
+            let profile = test_profile(dir.path(), name);
+            let store = PersistedWindowStore::at_path(dir.path().join(format!("{name}.window")));
+            Fx {
+                _dir: dir,
+                name: name.to_owned(),
+                profile,
+                store,
+                clock: crate::mainnet::clock::set_now_ms_for_test(T),
+            }
+        }
+
+        impl Fx {
+            fn pin_owned(&self, digest: [u8; 32], seed: u8) {
+                let lock = WindowStoreLock::acquire_for(
+                    &self.store.path,
+                    &self.profile.policy_window_state_key_id,
+                )
+                .unwrap();
+                pin::write_for_test(
+                    &lock,
+                    &PinScope::for_profile(&self.store.path, &self.profile),
+                    &pin::Pin::new(1, digest, owner_of(seed)).unwrap(),
+                )
+                .unwrap();
+            }
+
+            fn pin(&self, digest: [u8; 32]) {
+                self.pin_owned(digest, 11);
+            }
+
+            fn total_key(&self) -> StateKey {
+                StateKey::new(&self.name, 1, "total:native", 0)
+            }
+
+            fn total(&self, amount: i128, epoch: [u8; 32]) -> WindowEntry {
+                self.total_of(amount, 10, Some(epoch))
+            }
+
+            fn total_of(&self, amount: i128, max: i128, epoch: Option<[u8; 32]>) -> WindowEntry {
+                WindowEntry::new(
+                    self.total_key(),
+                    T,
+                    amount,
+                    WindowLimit::Total {
+                        asset: "native".to_owned(),
+                        max_stroops: max,
+                    },
+                )
+                .with_epoch(epoch)
+            }
+
+            fn windowed(&self, amount: i128) -> WindowEntry {
+                entry(key(&self.name, "native", 86_400), T, amount)
+            }
+
+            fn hold(n: u8) -> SubmissionHold {
+                reservation(&format!("{n:02x}").repeat(32), "GSOURCE", i64::from(n), T)
+            }
+
+            fn pending(&self, n: u8, entries: &[WindowEntry]) -> Result<(), WindowStoreError> {
+                self.store
+                    .record_pending(&self.profile, entries, &Self::hold(n))
+                    .map(drop)
+            }
+
+            fn authorized(&self, entries: &[WindowEntry]) -> Result<(), WindowStoreError> {
+                self.store
+                    .record_authorized(&self.profile, entries)
+                    .map(drop)
+            }
+
+            fn wire(&self) -> WireFile {
+                self.store
+                    .read_for_inspection(&self.profile)
+                    .unwrap()
+                    .unwrap()
+            }
+
+            /// The file bytes and the committed counter.
+            fn state(&self) -> (Option<Vec<u8>>, Option<String>) {
+                (
+                    fs::read(&self.store.path).ok(),
+                    get_raw(&generation_entry_ref(&self.profile)),
+                )
+            }
+
+            fn sum(&self, epoch: [u8; 32]) -> i128 {
+                total_in_file(&self.wire(), &self.total_key(), epoch)
+                    .unwrap()
+                    .0
+            }
+
+            fn hydrated(&self, epoch: [u8; 32]) -> i128 {
+                let memory = PolicyStateStore::new();
+                self.store
+                    .load_into(&self.name, &self.profile, &memory)
+                    .unwrap();
+                memory.query_epoch(&self.total_key(), epoch).unwrap().0
+            }
+
+            /// Seals `wire` as an earlier build's version 11 snapshot.
+            fn seal_v11(&self, mut wire: WireFile) {
+                wire.version = WIRE_VERSION_OPERATIONS;
+                wire.retired_total_epoch = None;
+                assert!(wire.generation >= 1);
+                self.store.seal_unchecked_for_test(&self.profile, &wire);
+            }
+
+            /// A version 11 file with one windowed row and no total content.
+            fn earlier_build_file(&self) {
+                self.store
+                    .record_and_persist(&self.profile, &[self.windowed(1)])
+                    .unwrap();
+                self.seal_v11(self.wire());
+            }
+
+            /// Appends a total row of `amount` under `epoch` to `wire`.
+            fn push_row(&self, wire: &mut WireFile, amount: i128, epoch: Option<[u8; 32]>) {
+                find_or_insert_bucket(&mut wire.entries, &self.total_key())
+                    .records
+                    .push(WireRecord {
+                        ts_ms: T,
+                        amount,
+                        epoch,
+                        ..WireRecord::confirmed_defaults()
+                    });
+            }
+        }
+
+        fn detail(result: Result<(), WindowStoreError>) -> String {
+            match result {
+                Err(WindowStoreError::Invalid { detail }) => detail,
+                other => format!("{other:?}"),
+            }
+        }
+
+        fn exhausted(result: &Result<(), WindowStoreError>) -> bool {
+            matches!(
+                result,
+                Err(WindowStoreError::PolicyDenied { reason })
+                    if matches!(**reason, DenyReason::TotalBudgetExhausted { .. })
+            )
+        }
+
+        /// An open authorization of `id` that expires at `expires_ms`,
+        /// unclaimed and linked to no operation.
+        fn open_authorization(id: u8, expires_ms: u64) -> WireAuthorization {
+            let mut auth = settled_authorization(id);
+            auth.state = ledger::AuthorizationState::Open;
+            auth.settled_ms = None;
+            auth.claimed_ms = None;
+            auth.consumption = None;
+            auth.expires_ms = expires_ms;
+            auth
+        }
+
+        fn total_hold(id: u8, amount: i128, epoch: Option<[u8; 32]>) -> WireAuthorizationHold {
+            WireAuthorizationHold {
+                kind: ledger::HoldKind::Value,
+                authorization_id: crate::mainnet::AuthorizationId::from_bytes([id; 32]),
+                ordinal: 0,
+                scope_specificity: 1,
+                bucket: "total:native".to_owned(),
+                window_secs: 0,
+                ts_ms: T,
+                amount,
+                epoch,
+            }
+        }
+
+        fn version_twelve() -> WireFile {
+            WireFile {
+                chain_scope: Some(ChainScope::for_chain(Caip2::Testnet)),
+                version: WIRE_VERSION_TOTAL_EPOCH,
+                generation: 1,
+                ..WireFile::default()
+            }
+        }
+
+        // ── operator clears and cancellations ────────────────────────────
+
+        #[test]
+        #[serial]
+        fn an_operator_clear_keeps_the_total_debit() {
+            let f = fx("total-clear");
+            f.pin(D1);
+            let mut timed = Fx::hold(1);
+            timed.max_time = T / 1000 - 10;
+            f.store
+                .record_pending(&f.profile, &[f.total(3, D1)], &timed)
+                .unwrap();
+            f.pending(2, &[f.total(3, D1)]).unwrap();
+            f.clock.set(T + 1);
+            for (n, unbounded) in [(1_u8, false), (2, true)] {
+                let decision = f
+                    .store
+                    .operator_clear_decision(
+                        &f.profile,
+                        &format!("{n:02x}").repeat(32),
+                        true,
+                        unbounded,
+                    )
+                    .unwrap();
+                f.store
+                    .apply_accounting_decision(&f.profile, decision)
+                    .unwrap();
+            }
+            assert_eq!(f.sum(D1), 6);
+            assert!(exhausted(&f.authorized(&[f.total(5, D1)])));
+        }
+
+        /// The pre-send capability of the writer that reserved releases that
+        /// reservation's total once; a reservation it does not name, or one
+        /// with an observed success, keeps its total.
+        #[test]
+        #[serial]
+        fn an_unsent_reservation_releases_only_its_own_total() {
+            let f = fx("total-unsent");
+            f.pin(D1);
+            let (_, unsent) = f
+                .store
+                .record_pending_unsent(&f.profile, &[f.total(6, D1)], &Fx::hold(1))
+                .unwrap();
+            f.pending(2, &[f.total(3, D1)]).unwrap();
+            assert_eq!(f.sum(D1), 9);
+            f.store.release_unsent(&f.profile, unsent).unwrap();
+            assert_eq!(f.sum(D1), 3, "only the named reservation is released");
+            assert_eq!(f.hydrated(D1), 3);
+            f.authorized(&[f.total(7, D1)]).unwrap();
+            assert_eq!(f.sum(D1), 10);
+
+            let g = fx("total-unsent-observed");
+            g.pin(D1);
+            let (_, unsent) = g
+                .store
+                .record_pending_unsent(&g.profile, &[g.total(6, D1)], &Fx::hold(1))
+                .unwrap();
+            g.store
+                .confirm(&g.profile, &"01".repeat(32), Some(1))
+                .unwrap();
+            let before = g.state();
+            assert!(g.store.release_unsent(&g.profile, unsent).is_err());
+            assert_eq!(g.state(), before);
+            assert_eq!(g.sum(D1), 6, "an observed success keeps its total");
+        }
+
+        const TWO_PROCESS_ROLE: &str = "STELLAR_AGENT_TOTAL_TWO_PROCESS_ROLE";
+        const TWO_PROCESS_DIR: &str = "STELLAR_AGENT_TOTAL_TWO_PROCESS_DIR";
+        const TWO_PROCESS_TEST: &str = "policy_state::store::tests::total_budget::\
+                                        a_stale_second_process_cannot_overshoot";
+
+        /// One role of the two-process test, in its own process, on the store
+        /// and file-backed keyring under `dir`.
+        fn two_process_role(role: &str, dir: &Path) {
+            use std::sync::Arc;
+            let backend: Arc<keyring_core::CredentialStore> =
+                Arc::new(stellar_agent_headless_keyring::store::HeadlessStore::new(
+                    dir.join("store.keyring"),
+                    stellar_agent_headless_keyring::crypto::ProtectionMode::EnvKey(Arc::new(
+                        zeroize::Zeroizing::new([7; 32]),
+                    )),
+                ));
+            keyring_core::set_default_store(backend);
+            let name = "two-process";
+            let profile = test_profile(dir, name);
+            let store = PersistedWindowStore::at_path(dir.join("two-process.window"));
+            let _clock = crate::mainnet::clock::set_now_ms_for_test(T);
+            let key = StateKey::new(name, 1, "total:native", 0);
+            let total = |amount: i128| {
+                WindowEntry::new(
+                    key.clone(),
+                    T,
+                    amount,
+                    WindowLimit::Total {
+                        asset: "native".to_owned(),
+                        max_stroops: 10,
+                    },
+                )
+                .with_epoch(Some(D1))
+            };
+            match role {
+                "setup" => {
+                    let lock = WindowStoreLock::acquire_for(
+                        &store.path,
+                        &profile.policy_window_state_key_id,
+                    )
+                    .unwrap();
+                    pin::write_for_test(
+                        &lock,
+                        &PinScope::for_profile(&store.path, &profile),
+                        &pin::Pin::new(1, D1, owner_of(11)).unwrap(),
+                    )
+                    .unwrap();
+                }
+                "commit" => {
+                    store.record_authorized(&profile, &[total(6)]).unwrap();
+                }
+                "stale" => {
+                    let memory = PolicyStateStore::new();
+                    store.load_into(name, &profile, &memory).unwrap();
+                    assert_eq!(memory.query_epoch(&key, D1).unwrap().0, 0);
+                    fs::write(dir.join("hydrated"), b"").unwrap();
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                    while !dir.join("committed").exists() {
+                        assert!(std::time::Instant::now() < deadline, "no commit arrived");
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    let stale = store.record_authorized(&profile, &[total(6)]);
+                    assert!(
+                        exhausted(&stale.map(drop)),
+                        "a stale view admits 6 after another process committed 6 of 10"
+                    );
+                    store.record_authorized(&profile, &[total(4)]).unwrap();
+                    let wire = store.read_for_inspection(&profile).unwrap().unwrap();
+                    assert_eq!(total_in_file(&wire, &key, D1).unwrap().0, 10);
+                }
+                other => panic!("unknown role {other}"),
+            }
+        }
+
+        /// A second OS process hydrates its view, another process commits 6
+        /// of 10, and the stale process's admission of 6 refuses because the
+        /// writer rereads the file under the lock. Its 4 then admits.
+        #[test]
+        #[serial]
+        fn a_stale_second_process_cannot_overshoot() {
+            if let Some(role) = std::env::var_os(TWO_PROCESS_ROLE) {
+                let dir = PathBuf::from(std::env::var_os(TWO_PROCESS_DIR).unwrap());
+                two_process_role(role.to_str().unwrap(), &dir);
+                return;
+            }
+            let dir = TempDir::new().unwrap();
+            let spawn = |role: &str| {
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        TWO_PROCESS_TEST,
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env(TWO_PROCESS_ROLE, role)
+                    .env(TWO_PROCESS_DIR, dir.path())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            };
+            let finish = |role: &str, child: std::process::Child| {
+                let output = child.wait_with_output().unwrap();
+                let text = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(
+                    output.status.success() && text.contains("1 passed"),
+                    "{role}: {text}"
+                );
+            };
+            finish("setup", spawn("setup"));
+            let mut stale = spawn("stale");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while !dir.path().join("hydrated").exists() {
+                if stale.try_wait().unwrap().is_some() || std::time::Instant::now() > deadline {
+                    finish("stale", stale);
+                    panic!("the stale process ended before it hydrated");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            finish("commit", spawn("commit"));
+            fs::write(dir.path().join("committed"), b"").unwrap();
+            finish("stale", stale);
+        }
+
+        /// One batch that spells one asset two ways fills one allocation: 6
+        /// under `native` and 6 under its asset contract refuse against 10.
+        #[test]
+        #[serial]
+        fn two_spellings_in_one_batch_share_one_allocation() {
+            let f = fx("total-batch-spellings");
+            f.pin(D1);
+            let sac = stellar_agent_core::asset_id::CanonicalAsset::Native
+                .sac_contract_id(&f.profile.network_passphrase)
+                .unwrap();
+            let contract = WindowEntry::new(
+                StateKey::new(&f.name, 1, &format!("total:{sac}"), 0),
+                T,
+                6,
+                WindowLimit::Total {
+                    asset: sac.clone(),
+                    max_stroops: 10,
+                },
+            )
+            .with_epoch(Some(D1));
+            let before = f.state();
+            let result = f.authorized(&[f.total(6, D1), contract.clone()]);
+            assert!(
+                exhausted(&result),
+                "one batch allocates 12 against 10: {result:?}"
+            );
+            assert_eq!(f.state(), before);
+            f.authorized(&[f.total(4, D1), contract]).unwrap();
+            assert_eq!(f.sum(D1), 10);
+        }
+
+        #[test]
+        #[serial]
+        fn pre_exposure_cancellation_keeps_the_total() {
+            let f = fx("total-cancel");
+            f.pin(D1);
+            f.pending(1, &[f.total(6, D1)]).unwrap();
+            f.store.release(&f.profile, &"01".repeat(32)).unwrap();
+            assert_eq!(f.sum(D1), 6);
+            assert!(exhausted(&f.authorized(&[f.total(10, D1)])));
+        }
+
+        // ── the projection ───────────────────────────────────────────────
+
+        /// The hydrated gate drops an unswept expired unused hold at the
+        /// ordinary sweep's boundary, while durable admission counts the hold
+        /// until a committed sweep removes it.
+        #[test]
+        fn the_hydrated_gate_drops_an_expired_unused_hold() {
+            let key = StateKey::new("p", 1, "total:native", 0);
+            let mut wire = version_twelve();
+            wire.authorizations.push(open_authorization(1, T));
+            wire.holds.push(total_hold(1, 6, Some(D1)));
+            let hold = wire.holds[0].clone();
+            assert!(!total_hold_counts(&wire, &hold, &[], &[], T));
+            assert!(total_hold_counts(&wire, &hold, &[], &[], T - 1));
+            assert_eq!(total_in_file(&wire, &key, D1).unwrap().0, 6);
+            let mut swept = wire.clone();
+            ledger::sweep_expired(&mut swept, T);
+            assert_eq!(total_in_file(&swept, &key, D1).unwrap().0, 0);
+        }
+
+        /// An expired hold of a retained operation that has not ended stays
+        /// counted by the gate and by admission: the ordinary sweep leaves it
+        /// to the operation's own step.
+        #[test]
+        fn a_live_operation_keeps_its_expired_hold_counted() {
+            let key = StateKey::new("p", 1, "total:native", 0);
+            let operation = operations::OperationId::from_bytes([9; 16]);
+            let mut wire = version_twelve();
+            let mut auth = open_authorization(1, T);
+            auth.operation = Some(operations::OperationLink {
+                operation_id: operation,
+                attempt_index: 1,
+            });
+            wire.authorizations.push(auth);
+            wire.holds.push(total_hold(1, 6, Some(D1)));
+            let hold = wire.holds[0].clone();
+            assert!(total_hold_counts(&wire, &hold, &[], &[operation], T));
+            assert!(!total_hold_counts(&wire, &hold, &[], &[], T));
+            assert_eq!(total_in_file(&wire, &key, D1).unwrap().0, 6);
+        }
+
+        #[test]
+        #[serial]
+        fn a_row_sum_overflow_refuses() {
+            let f = fx("total-row-overflow");
+            let mut wire = version_twelve();
+            f.push_row(&mut wire, i128::MAX, Some(D1));
+            f.push_row(&mut wire, 1, Some(D1));
+            assert_eq!(
+                detail(total_in_file(&wire, &f.total_key(), D1).map(drop)),
+                "a total-budget sum overflows"
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn a_hold_sum_overflow_refuses() {
+            let f = fx("total-hold-overflow");
+            let mut wire = version_twelve();
+            f.push_row(&mut wire, i128::MAX, Some(D1));
+            wire.holds.push(total_hold(1, 1, Some(D1)));
+            assert_eq!(
+                detail(total_in_file(&wire, &f.total_key(), D1).map(drop)),
+                "a total-budget sum overflows"
+            );
+        }
+
+        // ── admission ────────────────────────────────────────────────────
+
+        #[test]
+        #[serial]
+        fn record_and_persist_refuses_a_total_entry() {
+            let f = fx("total-unconditional");
+            f.pin(D1);
+            f.store
+                .record_and_persist(&f.profile, &[f.windowed(1)])
+                .unwrap();
+            let before = f.state();
+            assert_eq!(
+                detail(
+                    f.store
+                        .record_and_persist(&f.profile, &[f.total(6, D1)])
+                        .map(drop)
+                ),
+                "a total-budget debit needs durable admission"
+            );
+            assert_eq!(f.state(), before);
+        }
+
+        #[test]
+        #[serial]
+        fn record_authorized_admits_a_total_once() {
+            let f = fx("total-authorized");
+            f.pin(D1);
+            f.authorized(&[f.total(6, D1)]).unwrap();
+            f.clock.set(T + 1);
+            let later = WindowEntry::new(f.total_key(), T + 1, 6, f.total(6, D1).limit().clone())
+                .with_epoch(Some(D1));
+            assert!(exhausted(&f.authorized(&[later])));
+        }
+
+        #[test]
+        #[serial]
+        fn a_total_admission_binds_the_pin() {
+            let f = fx("total-bind");
+            f.store
+                .record_and_persist(&f.profile, &[f.windowed(1)])
+                .unwrap();
+            f.pin(D2);
+            let before = f.state();
+            assert!(matches!(
+                f.pending(1, &[f.total(6, D1)]),
+                Err(WindowStoreError::TotalEpochStale)
+            ));
+            assert!(matches!(
+                f.authorized(&[f.total(6, D1)]),
+                Err(WindowStoreError::TotalEpochStale)
+            ));
+            assert_eq!(f.state(), before);
+
+            let fresh = fx("total-bind-fresh");
+            assert!(matches!(
+                fresh.pending(1, &[fresh.total(6, D1)]),
+                Err(WindowStoreError::TotalEpochStale)
+            ));
+            assert!(matches!(
+                fresh.authorized(&[fresh.total(6, D1)]),
+                Err(WindowStoreError::TotalEpochStale)
+            ));
+            assert!(!fresh.store.path.exists());
+        }
+
+        #[test]
+        #[serial]
+        fn negative_incoming_totals_refuse() {
+            let f = fx("total-negative");
+            assert_eq!(
+                detail(admit(
+                    &version_twelve(),
+                    &[f.total(-6, D1), f.total(16, D1)]
+                )),
+                "a total-budget debit is negative"
+            );
+            f.pin(D1);
+            f.store
+                .record_and_persist(&f.profile, &[f.windowed(1)])
+                .unwrap();
+            let before = f.state();
+            assert_eq!(
+                detail(f.authorized(&[f.total(-1, D1)])),
+                "a total-budget debit is negative"
+            );
+            assert_eq!(
+                detail(f.pending(1, &[f.total(-1, D1)])),
+                "a total-budget debit is negative"
+            );
+            assert_eq!(f.state(), before);
+        }
+
+        #[test]
+        #[serial]
+        fn the_successor_is_validated_before_commit() {
+            let f = fx("total-validate");
+            f.pin(D1);
+            f.store
+                .record_and_persist(&f.profile, &[f.windowed(1)])
+                .unwrap();
+            let before = f.state();
+            RECORD_SETTLED_BEFORE_VALIDATE.set(Some(Box::new(|wire: &mut WireFile| {
+                for record in wire
+                    .entries
+                    .iter_mut()
+                    .filter(|bucket| is_total_budget_bucket(bucket))
+                    .flat_map(|bucket| &mut bucket.records)
+                {
+                    record.epoch = None;
+                }
+            })));
+            assert_eq!(
+                detail(f.authorized(&[f.total(6, D1)])),
+                "a total-budget record needs an epoch or a retired digest"
+            );
+            assert_eq!(f.state(), before);
+        }
+
+        #[test]
+        #[serial]
+        fn an_admission_overflow_refuses() {
+            let f = fx("total-admit-overflow");
+            let mut wire = version_twelve();
+            f.push_row(&mut wire, i128::MAX, Some(D1));
+            assert_eq!(
+                detail(admit(&wire, &[f.total_of(1, i128::MAX, Some(D1))])),
+                "a total-budget sum overflows"
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn a_mixed_digest_batch_accumulates_per_digest() {
+            let f = fx("total-mixed");
+            admit(&version_twelve(), &[f.total(6, D1), f.total(6, D2)]).unwrap();
+        }
+
+        #[test]
+        #[serial]
+        fn same_digest_batch_cannot_overshoot() {
+            let f = fx("total-batch");
+            assert!(exhausted(&admit(
+                &version_twelve(),
+                &[f.total(6, D1), f.total(6, D1)]
+            )));
+            admit(&version_twelve(), &[f.total(6, D1), f.total(4, D1)]).unwrap();
+        }
+
+        // ── the post-confirmation facade ─────────────────────────────────
+
+        /// An engine whose confirmed recording returns fixed entries.
+        struct Recording(Vec<WindowEntry>);
+
+        impl stellar_agent_core::policy::PolicyEngine for Recording {
+            fn evaluate(
+                &self,
+                _tool: &stellar_agent_core::policy::ToolDescriptor,
+                _args: &serde_json::Value,
+                _profile: &Profile,
+                _account_view: Option<&dyn stellar_agent_core::policy::v1::AccountReservesView>,
+                _identity_view: Option<&dyn stellar_agent_core::policy::v1::AccountIdentityView>,
+                _counterparty_cache: Option<
+                    &dyn stellar_agent_core::policy::v1::CounterpartyCacheView,
+                >,
+                _sep10_sessions: Option<&dyn stellar_agent_core::policy::v1::Sep10SessionView>,
+                _sep45_sessions: Option<&dyn stellar_agent_core::policy::v1::Sep45SessionView>,
+                _now_ms: u64,
+            ) -> Result<stellar_agent_core::policy::Decision, stellar_agent_core::policy::PolicyError>
+            {
+                Ok(stellar_agent_core::policy::Decision::Allow)
+            }
+
+            fn record_confirmed(
+                &self,
+                _tool: &stellar_agent_core::policy::ToolDescriptor,
+                _profile: &Profile,
+                _value: &stellar_agent_core::policy::v1::ValueClass,
+            ) -> Result<Vec<WindowEntry>, stellar_agent_core::policy::PolicyError> {
+                Ok(self.0.clone())
+            }
+        }
+
+        /// The child runs with `STELLAR_AGENT_HOME` set to a temporary
+        /// directory before it starts, so the facade's conventional store
+        /// path lies under that directory.
+        #[test]
+        #[serial]
+        fn post_confirm_recording_skips_total_entries() {
+            const CHILD: &str = "STELLAR_AGENT_TOTAL_BUDGET_CHILD";
+            if std::env::var_os(CHILD).is_none() {
+                let home = TempDir::new().unwrap();
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "policy_state::store::tests::total_budget::post_confirm_recording_skips_total_entries",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env(CHILD, "1")
+                    .env("STELLAR_AGENT_HOME", home.path())
+                    .output()
+                    .unwrap();
+                let text = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(
+                    output.status.success() && text.contains("1 passed"),
+                    "{text}"
+                );
+                return;
+            }
+            keyring_mock::install().unwrap();
+            let home = PathBuf::from(std::env::var_os("STELLAR_AGENT_HOME").unwrap());
+            let name = "post-confirm";
+            let profile = test_profile(&home, name);
+            let store = PersistedWindowStore::for_profile(name);
+            assert!(
+                store.path().starts_with(&home),
+                "{}",
+                store.path().display()
+            );
+            let _clock = crate::mainnet::clock::set_now_ms_for_test(T);
+            let windowed = entry(key(name, "native", 86_400), T, 4);
+            let total = WindowEntry::new(
+                StateKey::new(name, 1, "total:native", 0),
+                T,
+                6,
+                WindowLimit::Total {
+                    asset: "native".to_owned(),
+                    max_stroops: 10,
+                },
+            )
+            .with_epoch(Some(D1));
+            let tool = stellar_agent_core::policy::ToolDescriptor::from_registration(
+                &stellar_agent_core::policy::McpToolRegistration {
+                    name: "stellar_pay",
+                    destructive_hint: true,
+                    read_only_hint: false,
+                    chain_id_required: true,
+                    value_kind: stellar_agent_core::policy::ToolValueKind::MovesValue,
+                },
+            );
+            crate::policy_state::record_confirmed_window_state(
+                &Recording(vec![windowed, total]),
+                &tool,
+                &profile,
+                name,
+                &stellar_agent_core::policy::v1::ValueClass::ReadOnly,
+            );
+            let wire = store.read_for_inspection(&profile).unwrap().unwrap();
+            let buckets: Vec<_> = wire
+                .entries
+                .iter()
+                .map(|bucket| (bucket.bucket.as_str(), bucket.records.len()))
+                .collect();
+            assert_eq!(buckets, vec![("native", 1)]);
+        }
+
+        // ── stored shape ─────────────────────────────────────────────────
+
+        /// A stored -1 beside a valid 6 in one epoch never lowers the use the
+        /// hydrated gate reports, and durable admission in that bucket still
+        /// refuses as an invalid record.
+        #[test]
+        #[serial]
+        fn a_negative_stored_total_never_lowers_the_reported_use() {
+            let f = fx("total-stored-negative-use");
+            f.pin(D1);
+            let mut wire = version_twelve();
+            f.push_row(&mut wire, 6, Some(D1));
+            f.push_row(&mut wire, -1, Some(D1));
+            f.store.seal_unchecked_for_test(&f.profile, &wire);
+            assert_eq!(
+                f.hydrated(D1),
+                6,
+                "a negative stored row lowers the reported use"
+            );
+            assert_eq!(
+                detail(f.authorized(&[f.total(1, D1)])),
+                "a total-budget record is negative"
+            );
+        }
+
+        /// An authenticated earlier-build file holds a total row of -1. The
+        /// file reads, lists, hydrates, and takes ordinary writes. Only a
+        /// total admission in that bucket refuses, as an invalid record; a
+        /// total admission in another bucket of the same file succeeds.
+        #[test]
+        #[serial]
+        fn a_negative_stored_total_refuses_only_its_bucket() {
+            let f = fx("total-stored-negative");
+            f.pin(D1);
+            f.store
+                .record_and_persist(&f.profile, &[f.windowed(1)])
+                .unwrap();
+            let mut wire = f.wire();
+            f.push_row(&mut wire, -1, None);
+            f.seal_v11(wire);
+            assert!(
+                f.store.pending_reservations(&f.profile).is_ok(),
+                "legacy record blocks lifecycle listing: {:?}",
+                f.store.pending_reservations(&f.profile)
+            );
+            f.hydrated(D1);
+            f.store
+                .record_and_persist(&f.profile, &[f.windowed(1)])
+                .unwrap();
+            f.pin(D2);
+            let before = f.state();
+            assert_eq!(
+                detail(f.authorized(&[f.total(1, D2)])),
+                "a total-budget record is negative"
+            );
+            assert_eq!(f.state(), before);
+            let other = WindowEntry::new(
+                StateKey::new(
+                    &f.name,
+                    1,
+                    "total:USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+                    0,
+                ),
+                T,
+                6,
+                WindowLimit::Total {
+                    asset: "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
+                        .to_owned(),
+                    max_stroops: 10,
+                },
+            )
+            .with_epoch(Some(D2));
+            f.authorized(&[other]).unwrap();
+            assert!(f.store.pending_reservations(&f.profile).is_ok());
+        }
+
+        #[test]
+        fn ordinary_holds_keep_their_shape() {
+            let mut wire = version_twelve();
+            let mut hold = total_hold(1, 5, None);
+            hold.bucket = "native".to_owned();
+            hold.window_secs = 60;
+            wire.holds.push(hold.clone());
+            check_total_fields(&wire).unwrap();
+            wire.holds[0].epoch = Some(D1);
+            assert_eq!(
+                detail(check_total_fields(&wire)),
+                "a windowed hold carries a total-budget epoch"
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn new_fields_need_version_twelve() {
+            let f = fx("total-below-twelve");
+            let mut row = version_twelve();
+            row.version = WIRE_VERSION_OPERATIONS;
+            f.push_row(&mut row, 1, Some(D1));
+            assert_eq!(
+                detail(check_snapshot(&row)),
+                "total-budget record fields require wire version 12"
+            );
+
+            let mut container = version_twelve();
+            let mut prepared = version_twelve();
+            prepared.version = WIRE_VERSION_OPERATIONS;
+            prepared.generation = 2;
+            prepared.holds.push(total_hold(1, 1, Some(D1)));
+            container.prepared = Some(Box::new(prepared));
+            f.store.seal_unchecked_for_test(&f.profile, &container);
+            assert_eq!(
+                detail(f.store.read_for_inspection(&f.profile).map(drop)),
+                "total-budget hold fields require wire version 12"
+            );
+
+            let mut retired = version_twelve();
+            retired.version = WIRE_VERSION_OPERATIONS;
+            retired.retired_total_epoch = Some(D1);
+            assert_eq!(
+                detail(check_snapshot(&retired)),
+                "a retired total-budget digest requires wire version 12"
+            );
+        }
+
+        #[test]
+        fn version_twelve_debits_need_an_epoch_or_retirement() {
+            let key = StateKey::new("p", 1, "total:native", 0);
+            let mut row = version_twelve();
+            find_or_insert_bucket(&mut row.entries, &key)
+                .records
+                .push(WireRecord {
+                    amount: 1,
+                    ..WireRecord::confirmed_defaults()
+                });
+            assert_eq!(
+                detail(check_snapshot(&row)),
+                "a total-budget record needs an epoch or a retired digest"
+            );
+            let mut hold = version_twelve();
+            hold.holds.push(total_hold(1, 1, None));
+            assert_eq!(
+                detail(check_snapshot(&hold)),
+                "a total-budget hold needs an epoch or a retired digest"
+            );
+        }
+
+        #[test]
+        fn negative_total_holds_refuse() {
+            let mut wire = version_twelve();
+            wire.holds.push(total_hold(1, -1, Some(D1)));
+            assert_eq!(
+                detail(check_snapshot(&wire)),
+                "a total-budget hold is negative"
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn prepared_successors_validate_before_writing() {
+            let f = fx("total-prepared");
+            f.store
+                .record_and_persist(&f.profile, &[f.windowed(1)])
+                .unwrap();
+            let before = f.state();
+            let original = f.wire();
+            let mut next = original.clone();
+            f.push_row(&mut next, 1, None);
+            let (key, _) = f.store.load_or_mint_key(&f.profile).unwrap();
+            assert_eq!(
+                detail(f.store.commit_generation(
+                    &key,
+                    &generation_entry_ref(&f.profile),
+                    original,
+                    next
+                )),
+                "a total-budget record needs an epoch or a retired digest"
+            );
+            assert_eq!(f.state(), before);
+        }
+
+        // ── reset ────────────────────────────────────────────────────────
+
+        /// A reset fixture holding a tagged total row of 6 under D1, with D2
+        /// retired, at version 12.
+        fn total_reset_fixture() -> (ResetFixture, WireBucket) {
+            let f = ResetFixture::new();
+            let mut wire = reset_wire();
+            let key = StateKey::new("", 1, "total:native", 0);
+            find_or_insert_bucket(&mut wire.entries, &key)
+                .records
+                .push(WireRecord {
+                    ts_ms: 1,
+                    amount: 6,
+                    epoch: Some(D1),
+                    ..WireRecord::confirmed_defaults()
+                });
+            wire.retired_total_epoch = Some(D2);
+            f.seal(&wire);
+            let total = wire.entries[1].clone();
+            (f, total)
+        }
+
+        fn reset_total(epoch: [u8; 32], amount: i128) -> WindowEntry {
+            WindowEntry::new(
+                StateKey::new("reset-snapshot", 1, "total:native", 0),
+                100_000,
+                amount,
+                WindowLimit::Total {
+                    asset: "native".to_owned(),
+                    max_stroops: 10,
+                },
+            )
+            .with_epoch(Some(epoch))
+        }
+
+        fn pin_reset(f: &ResetFixture, digest: [u8; 32]) {
+            let lock =
+                WindowStoreLock::acquire_for(&f.store.path, &f.profile.policy_window_state_key_id)
+                    .unwrap();
+            pin::write_for_test(
+                &lock,
+                &PinScope::for_profile(&f.store.path, &f.profile),
+                &pin::Pin::new(1, digest, owner_of(0xa1)).unwrap(),
+            )
+            .unwrap();
+        }
+
+        #[test]
+        #[serial]
+        fn owner_reset_preserves_total_history() {
+            let (f, total) = total_reset_fixture();
+            let _clock = crate::mainnet::clock::set_now_ms_for_test(100_000);
+            enrolled_reset_owner(&f, 0xa1);
+            authorized_reset(&f, "preserve-total", |_, _| Ok(())).unwrap();
+            let committed = f.store.read_for_inspection(&f.profile).unwrap().unwrap();
+            assert_eq!(committed.version, WIRE_VERSION_TOTAL_EPOCH);
+            assert_eq!(
+                serde_json::to_value(&committed.entries).unwrap(),
+                serde_json::to_value(vec![total]).unwrap()
+            );
+            assert_eq!(committed.retired_total_epoch, Some(D2));
+            pin_reset(&f, D2);
+            assert!(matches!(
+                f.store.record_authorized(&f.profile, &[reset_total(D2, 1)]),
+                Err(WindowStoreError::TotalEpochRetired)
+            ));
+        }
+
+        #[test]
+        #[serial]
+        fn reset_survives_every_commit_fault() {
+            for seam in [
+                COMMIT_FAULT_AFTER_PREPARED,
+                COMMIT_FAULT_AFTER_COUNTER,
+                COMMIT_FAULT_COMPACTION,
+            ] {
+                let (f, _) = total_reset_fixture();
+                let _clock = crate::mainnet::clock::set_now_ms_for_test(100_000);
+                enrolled_reset_owner(&f, 0xa1);
+                let fault = arm_accounting_fault(seam);
+                let result = authorized_reset(&f, "fault-total", |_, _| Ok(()));
+                drop(fault);
+                assert_eq!(result.is_ok(), seam == COMMIT_FAULT_COMPACTION, "{seam}");
+                let reread = f.store.read_for_inspection(&f.profile).unwrap().unwrap();
+                let key = StateKey::new("reset-snapshot", 1, "total:native", 0);
+                assert_eq!(total_in_file(&reread, &key, D1).unwrap().0, 6, "{seam}");
+                pin_reset(&f, D1);
+                let denied = f
+                    .store
+                    .record_authorized(&f.profile, &[reset_total(D1, 5)])
+                    .map(drop);
+                assert!(exhausted(&denied), "{seam}: {denied:?}");
+            }
+        }
+
+        // ── earlier builds ───────────────────────────────────────────────
+
+        #[test]
+        #[serial]
+        fn a_pin_advanced_before_upgrade_moves_nothing() {
+            let f = fx("total-pin-advanced");
+            let mut wire = version_twelve();
+            wire.version = WIRE_VERSION_OPERATIONS;
+            f.push_row(&mut wire, 6, None);
+            assert!(retire_earlier_build(&mut wire, Some(D2)).unwrap());
+            assert_eq!(wire.entries[0].records[0].epoch, None);
+            assert_eq!(wire.retired_total_epoch, Some(D2));
+            check_total_fields(&wire).unwrap();
+            for epoch in [D1, D2] {
+                assert_eq!(total_in_file(&wire, &f.total_key(), epoch).unwrap().0, 0);
+            }
+        }
+
+        #[test]
+        #[serial]
+        fn pruned_earlier_history_retires_the_digest() {
+            let f = fx("total-pruned");
+            f.earlier_build_file();
+            f.pin(D1);
+            assert_eq!(f.hydrated(D1), 0);
+            assert_eq!(f.wire().retired_total_epoch, Some(D1));
+            let refusal = f.authorized(&[f.total(1, D1)]).unwrap_err();
+            assert!(matches!(refusal, WindowStoreError::TotalEpochRetired));
+            assert_eq!(
+                refusal.operation_error().unwrap().code(),
+                "policy.total_epoch_retired"
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn a_new_digest_admits_after_retirement() {
+            let f = fx("total-new-digest");
+            f.earlier_build_file();
+            f.pin(D1);
+            f.hydrated(D1);
+            f.pin(D2);
+            f.authorized(&[f.total(10, D2)]).unwrap();
+        }
+
+        #[test]
+        #[serial]
+        fn retirement_is_written_once() {
+            let f = fx("total-once");
+            f.earlier_build_file();
+            f.pin(D1);
+            let generation = f.wire().generation;
+            f.hydrated(D1);
+            f.hydrated(D1);
+            let wire = f.wire();
+            assert_eq!(wire.generation, generation + 1);
+            assert_eq!(wire.retired_total_epoch, Some(D1));
+            let mut again = wire.clone();
+            assert!(!retire_earlier_build(&mut again, Some(D2)).unwrap());
+            assert_eq!(
+                serde_json::to_value(&again).unwrap(),
+                serde_json::to_value(&wire).unwrap()
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn retirement_survives_a_commit_fault() {
+            for seam in [
+                COMMIT_FAULT_AFTER_PREPARED,
+                COMMIT_FAULT_AFTER_COUNTER,
+                COMMIT_FAULT_COMPACTION,
+            ] {
+                let f = fx(&format!("total-fault-{seam}"));
+                f.earlier_build_file();
+                f.pin(D1);
+                let fault = arm_accounting_fault(seam);
+                let result = f
+                    .store
+                    .load_into(&f.name, &f.profile, &PolicyStateStore::new());
+                drop(fault);
+                assert_eq!(result.is_ok(), seam == COMMIT_FAULT_COMPACTION, "{seam}");
+                let reopened = PersistedWindowStore::at_path(f.store.path.clone());
+                reopened
+                    .load_into(&f.name, &f.profile, &PolicyStateStore::new())
+                    .unwrap();
+                assert!(
+                    matches!(
+                        reopened.record_authorized(&f.profile, &[f.total(1, D1)]),
+                        Err(WindowStoreError::TotalEpochRetired)
+                    ),
+                    "{seam}"
+                );
+            }
+            let f = fx("total-fault-stop");
+            f.earlier_build_file();
+            f.pin(D1);
+            f.hydrated(D1);
+            let reopened = PersistedWindowStore::at_path(f.store.path.clone());
+            assert!(matches!(
+                reopened.record_authorized(&f.profile, &[f.total(1, D1)]),
+                Err(WindowStoreError::TotalEpochRetired)
+            ));
+        }
+
+        #[test]
+        #[serial]
+        fn earlier_history_without_a_pin_refuses() {
+            let f = fx("total-no-pin");
+            f.store
+                .record_and_persist(&f.profile, &[f.windowed(1)])
+                .unwrap();
+            let mut wire = f.wire();
+            f.push_row(&mut wire, 6, None);
+            f.seal_v11(wire);
+            let before = f.state();
+            let result = f
+                .store
+                .load_into(&f.name, &f.profile, &PolicyStateStore::new());
+            assert!(
+                matches!(&result, Err(WindowStoreError::TotalEpochUnavailable { .. })),
+                "{result:?}"
+            );
+            assert_eq!(f.state(), before);
+
+            let empty = fx("total-no-pin-empty");
+            empty.earlier_build_file();
+            empty.hydrated(D1);
+            let wire = empty.wire();
+            assert_eq!(wire.version, WIRE_VERSION_TOTAL_EPOCH);
+            assert_eq!(wire.retired_total_epoch, None);
+        }
+
+        #[test]
+        #[serial]
+        fn retirement_leaves_the_original_untouched() {
+            let f = fx("total-original");
+            f.earlier_build_file();
+            f.pin(D1);
+            let original = f.wire();
+            let digest = body_digest(&original).unwrap();
+            let fault = arm_accounting_fault(COMMIT_FAULT_AFTER_PREPARED);
+            assert!(f.pending(1, &[f.windowed(2)]).is_err());
+            drop(fault);
+            let reread = f.wire();
+            assert_eq!(reread.version, WIRE_VERSION_OPERATIONS);
+            assert_eq!(body_digest(&reread).unwrap(), digest);
+
+            let (r, _) = total_reset_fixture();
+            let mut sealed = r.store.read_for_inspection(&r.profile).unwrap().unwrap();
+            sealed.version = WIRE_VERSION_OPERATIONS;
+            sealed.retired_total_epoch = None;
+            sealed
+                .entries
+                .retain(|bucket| !is_total_budget_bucket(bucket));
+            r.seal(&sealed);
+            let sealed = r.store.read_for_inspection(&r.profile).unwrap().unwrap();
+            let digest = body_digest(&sealed).unwrap();
+            let _clock = crate::mainnet::clock::set_now_ms_for_test(100_000);
+            enrolled_reset_owner(&r, 0xa1);
+            let fault = arm_accounting_fault(COMMIT_FAULT_AFTER_PREPARED);
+            assert!(authorized_reset(&r, "original-total", |_, _| Ok(())).is_err());
+            drop(fault);
+            let reread = r.store.read_for_inspection(&r.profile).unwrap().unwrap();
+            assert_eq!(reread.version, WIRE_VERSION_OPERATIONS);
+            assert_eq!(body_digest(&reread).unwrap(), digest);
+        }
+
+        #[test]
+        #[serial]
+        fn retirement_rereads_under_the_lock() {
+            let f = fx("total-reread");
+            f.earlier_build_file();
+            f.pin(D1);
+            let other = PersistedWindowStore::at_path(f.store.path.clone());
+            let profile = f.profile.clone();
+            let name = f.name.clone();
+            let entry = f.total(6, D2);
+            let path = f.store.path.clone();
+            HYDRATION_AFTER_READ.set(Some(Box::new(move || {
+                other
+                    .load_into(&name, &profile, &PolicyStateStore::new())
+                    .unwrap();
+                let lock = WindowStoreLock::acquire_for(&path, &profile.policy_window_state_key_id)
+                    .unwrap();
+                pin::write_for_test(
+                    &lock,
+                    &PinScope::for_profile(&path, &profile),
+                    &pin::Pin::new(2, D2, owner_of(11)).unwrap(),
+                )
+                .unwrap();
+                drop(lock);
+                other.record_authorized(&profile, &[entry]).unwrap();
+            })));
+            let generation = f.wire().generation;
+            assert_eq!(f.hydrated(D2), 6);
+            let after = f.wire();
+            assert_eq!(after.generation, generation + 2, "B's two commits only");
+            assert_eq!(after.retired_total_epoch, Some(D1));
+
+            let g = fx("total-reread-race");
+            g.earlier_build_file();
+            g.pin(D1);
+            let other = PersistedWindowStore::at_path(g.store.path.clone());
+            let profile = g.profile.clone();
+            let name = g.name.clone();
+            HYDRATION_AFTER_READ.set(Some(Box::new(move || {
+                other
+                    .load_into(&name, &profile, &PolicyStateStore::new())
+                    .unwrap();
+            })));
+            let generation = g.wire().generation;
+            g.hydrated(D1);
+            assert_eq!(g.wire().generation, generation + 1, "one retirement commit");
+        }
+
+        #[test]
+        #[serial]
+        fn this_build_always_writes_version_twelve() {
+            let f = fx("total-twelve");
+            let mut windowed = version_twelve();
+            windowed.entries.push(WireBucket {
+                scope_specificity: 1,
+                bucket: "native".to_owned(),
+                window_secs: 60,
+                records: Vec::new(),
+            });
+            let mut total = version_twelve();
+            f.push_row(&mut total, 1, Some(D1));
+            for wire in [WireFile::default(), windowed, total] {
+                for committed in [None, Some(WIRE_VERSION_OPERATIONS), Some(12)] {
+                    assert_eq!(
+                        select_wire_version(&wire, committed),
+                        WIRE_VERSION_TOTAL_EPOCH
+                    );
+                }
+            }
+            f.pending(1, &[f.windowed(1)]).unwrap();
+            let written = f.wire();
+            assert_eq!(written.version, WIRE_VERSION_TOTAL_EPOCH);
+            assert_eq!(written.retired_total_epoch, None);
+            f.hydrated(D1);
+            f.hydrated(D1);
+            assert_eq!(f.wire().generation, written.generation);
+        }
+
+        #[test]
+        #[serial]
+        fn an_older_reader_refuses_version_twelve() {
+            const OLDER_MAX: u32 = 11;
+            let f = fx("total-older-reader");
+            f.pending(1, &[f.windowed(1)]).unwrap();
+            let bytes = fs::read(&f.store.path).unwrap();
+            let body = &bytes[HMAC_TAG_LEN..];
+            #[derive(serde::Deserialize)]
+            struct Version {
+                version: u32,
+            }
+            let version: Version = serde_json::from_slice(body).unwrap();
+            let older = if version.version > OLDER_MAX {
+                Err(WindowStoreError::UnsupportedVersion)
+            } else {
+                Ok(())
+            };
+            assert!(matches!(older, Err(WindowStoreError::UnsupportedVersion)));
+        }
+
+        #[test]
+        #[serial]
+        fn retirement_refuses_every_total_admission() {
+            let f = fx("total-retired-writers");
+            f.earlier_build_file();
+            f.pin(D1);
+            f.hydrated(D1);
+            for result in [
+                f.authorized(&[f.total(1, D1)]),
+                f.pending(1, &[f.total(1, D1)]),
+            ] {
+                let error = result.unwrap_err();
+                assert!(matches!(error, WindowStoreError::TotalEpochRetired));
+                assert_eq!(
+                    error.operation_error().unwrap().code(),
+                    "policy.total_epoch_retired"
+                );
+            }
+            assert_eq!(
+                detail(
+                    f.store
+                        .record_and_persist(&f.profile, &[f.total(1, D1)])
+                        .map(drop)
+                ),
+                "a total-budget debit needs durable admission"
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn retirement_survives_pruning() {
+            let f = fx("total-retired-pruned");
+            f.earlier_build_file();
+            f.pin(D1);
+            f.hydrated(D1);
+            let late = T + RETENTION_MS + 86_400_000;
+            f.clock.set(late);
+            f.pending(1, &[entry(key(&f.name, "native", 86_400), late, 1)])
+                .unwrap();
+            f.store
+                .record_and_persist(
+                    &f.profile,
+                    &[entry(key(&f.name, "native", 86_400), late, 1)],
+                )
+                .unwrap();
+            let reopened = PersistedWindowStore::at_path(f.store.path.clone());
+            assert!(matches!(
+                reopened.record_authorized(&f.profile, &[f.total(1, D1)]),
+                Err(WindowStoreError::TotalEpochRetired)
+            ));
+        }
+
+        // ── signed intents ───────────────────────────────────────────────
+
+        fn intent_with(entries: &[WindowEntry]) -> crate::SignedIntentPlan {
+            crate::signed_intent::test_helpers::with_legs(&intent_fixture_plan(1, 60).0, entries)
+        }
+
+        #[test]
+        #[serial]
+        fn a_signed_intent_refuses_a_total_leg() {
+            let f = fx("total-intent");
+            f.pin(D1);
+            let result = f
+                .store
+                .admit_signed_intent(&f.profile, &intent_with(&[f.total(6, D1)]))
+                .map(drop);
+            assert_eq!(
+                detail(result),
+                "a signed intent cannot carry a total-budget leg"
+            );
+            assert!(!f.store.path.exists());
+        }
+
+        // ── writer shape checks ──────────────────────────────────────────
+
+        const DISAGREE: &str = "a total-budget entry's limit and key disagree";
+
+        impl Fx {
+            /// A `Total` limit with epoch D1 on the windowed key `native`.
+            fn total_on_windowed_key(&self) -> WindowEntry {
+                WindowEntry::new(
+                    key(&self.name, "native", 86_400),
+                    T,
+                    6,
+                    WindowLimit::Total {
+                        asset: "native".to_owned(),
+                        max_stroops: 10,
+                    },
+                )
+                .with_epoch(Some(D1))
+            }
+
+            /// An `Amount` limit with epoch D1 on the total key.
+            fn amount_on_total_key(&self) -> WindowEntry {
+                WindowEntry::new(
+                    self.total_key(),
+                    T,
+                    6,
+                    WindowLimit::Amount {
+                        asset: "native".to_owned(),
+                        window: "1d".to_owned(),
+                        max_stroops: 10,
+                    },
+                )
+                .with_epoch(Some(D1))
+            }
+
+            /// A pinned D1 file holding one windowed row and, with
+            /// `counted`, a total row of 6 under D1.
+            fn shaped(&self, counted: bool) -> (Option<Vec<u8>>, Option<String>) {
+                self.pin(D1);
+                self.store
+                    .record_and_persist(&self.profile, &[self.windowed(1)])
+                    .unwrap();
+                if counted {
+                    self.authorized(&[self.total(6, D1)]).unwrap();
+                    self.clock.set(T + 1);
+                }
+                self.state()
+            }
+
+            fn assert_disagrees(
+                &self,
+                result: Result<(), WindowStoreError>,
+                before: &(Option<Vec<u8>>, Option<String>),
+            ) {
+                assert_eq!(detail(result), DISAGREE);
+                assert_eq!(&self.state(), before);
+            }
+        }
+
+        #[test]
+        #[serial]
+        fn record_and_persist_refuses_a_total_limit_on_a_windowed_key() {
+            let f = fx("shape-persist-limit");
+            let before = f.shaped(false);
+            let result = f
+                .store
+                .record_and_persist(&f.profile, &[f.total_on_windowed_key()])
+                .map(drop);
+            f.assert_disagrees(result, &before);
+        }
+
+        #[test]
+        #[serial]
+        fn record_and_persist_refuses_an_amount_limit_on_a_total_key() {
+            let f = fx("shape-persist-key");
+            let before = f.shaped(false);
+            let result = f
+                .store
+                .record_and_persist(&f.profile, &[f.amount_on_total_key()])
+                .map(drop);
+            f.assert_disagrees(result, &before);
+        }
+
+        #[test]
+        #[serial]
+        fn record_authorized_refuses_a_total_limit_on_a_windowed_key() {
+            let f = fx("shape-authorized-limit");
+            let before = f.shaped(false);
+            f.assert_disagrees(f.authorized(&[f.total_on_windowed_key()]), &before);
+        }
+
+        #[test]
+        #[serial]
+        fn record_authorized_refuses_an_amount_limit_on_a_total_key() {
+            let f = fx("shape-authorized-key");
+            let before = f.shaped(true);
+            f.assert_disagrees(f.authorized(&[f.amount_on_total_key()]), &before);
+        }
+
+        #[test]
+        #[serial]
+        fn record_pending_refuses_a_total_limit_on_a_windowed_key() {
+            let f = fx("shape-pending-limit");
+            let before = f.shaped(false);
+            f.assert_disagrees(f.pending(1, &[f.total_on_windowed_key()]), &before);
+        }
+
+        #[test]
+        #[serial]
+        fn record_pending_refuses_an_amount_limit_on_a_total_key() {
+            let f = fx("shape-pending-key");
+            let before = f.shaped(true);
+            f.assert_disagrees(f.pending(1, &[f.amount_on_total_key()]), &before);
+        }
+
+        #[test]
+        #[serial]
+        fn record_pending_linked_refuses_a_total_limit_on_a_windowed_key() {
+            let f = fx("shape-linked-limit");
+            let before = f.shaped(false);
+            let result = f
+                .store
+                .record_pending_linked(
+                    &f.profile,
+                    &[f.total_on_windowed_key()],
+                    &Fx::hold(1),
+                    "unknown-intent",
+                )
+                .map(drop);
+            f.assert_disagrees(result, &before);
+        }
+
+        #[test]
+        #[serial]
+        fn record_pending_linked_refuses_an_amount_limit_on_a_total_key() {
+            let f = fx("shape-linked-key");
+            let before = f.shaped(false);
+            let result = f
+                .store
+                .record_pending_linked(
+                    &f.profile,
+                    &[f.amount_on_total_key()],
+                    &Fx::hold(1),
+                    "unknown-intent",
+                )
+                .map(drop);
+            f.assert_disagrees(result, &before);
+        }
+
+        #[test]
+        #[serial]
+        fn a_signed_intent_refuses_a_total_limit_on_a_windowed_key() {
+            let f = fx("shape-intent-limit");
+            let before = f.shaped(false);
+            let result = f
+                .store
+                .admit_signed_intent(&f.profile, &intent_with(&[f.total_on_windowed_key()]))
+                .map(drop);
+            f.assert_disagrees(result, &before);
+        }
+
+        #[test]
+        #[serial]
+        fn a_signed_intent_refuses_an_amount_limit_on_a_total_key() {
+            let f = fx("shape-intent-key");
+            let before = f.shaped(false);
+            let result = f
+                .store
+                .admit_signed_intent(&f.profile, &intent_with(&[f.amount_on_total_key()]))
+                .map(drop);
+            f.assert_disagrees(result, &before);
+        }
+
+        #[test]
+        #[serial]
+        fn a_total_entry_needs_its_epoch() {
+            let f = fx("shape-epoch");
+            let before = f.shaped(false);
+            assert_eq!(
+                detail(f.authorized(&[f.total_of(6, 10, None)])),
+                "a total-budget entry needs its epoch"
+            );
+            assert_eq!(f.state(), before);
+        }
+    }
+
+    /// A seam a test arms to edit successor fields before validation.
+    type SuccessorHook = Box<dyn FnOnce(&mut WireFile)>;
+
+    thread_local! {
+        /// A test's edit of the `record_settled` successor, run once right
+        /// before its validation.
+        pub(super) static RECORD_SETTLED_BEFORE_VALIDATE: std::cell::RefCell<Option<SuccessorHook>> =
+            const { std::cell::RefCell::new(None) };
+        /// A test's interleaving, run once in `load_into` right after its
+        /// unlocked read.
+        pub(super) static HYDRATION_AFTER_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+        /// How often this thread read the store clock.
+        pub(in crate::policy_state) static CLOCK_READS: std::cell::Cell<u32> =
+            const { std::cell::Cell::new(0) };
+    }
+
     pub(super) fn after_inspection_file_read() {
         INSPECTION_READ_HOOK.with_borrow_mut(|hook| {
             if let Some(hook) = hook {
@@ -17891,7 +20182,7 @@ mod tests {
     pub(super) const ACCOUNTING_FAULT_AFTER_COMMIT: u8 = 1;
     pub(crate) const COMMIT_FAULT_AFTER_PREPARED: u8 = 4;
     pub(crate) const COMMIT_FAULT_AFTER_COUNTER: u8 = 5;
-    pub(super) const COMMIT_FAULT_COMPACTION: u8 = 6;
+    pub(crate) const COMMIT_FAULT_COMPACTION: u8 = 6;
     /// The crash seam right after an expiry event is appended, before its
     /// acknowledgement commits.
     pub(super) const ACCOUNTING_FAULT_AFTER_APPEND: u8 = 2;

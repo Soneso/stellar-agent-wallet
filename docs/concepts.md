@@ -230,8 +230,14 @@ policy:
 criteria = [{ kind = "total_budget", asset = "native", max_stroops = 200_0000000 }]
 ```
 
-The allocation never renews with time. Signing the policy again starts a new
-allocation at zero. An exhausted allocation refuses with
+The allocation never renews with time. A policy with a different signed digest
+starts a new allocation at zero; signing identical bytes keeps the allocation.
+Every spelling of one asset, such as `native` and its asset contract, counts
+against one allocation. The allocation persists across restarts, state
+refreshes, clock changes, and owner resets. A signed, sent, or confirmed debit
+stays counted. An operator clear keeps it counted. A checked failure or
+non-inclusion releases that attempt's debit and keeps its fee charged. An
+x402 or MPP debit stays counted for the life of the signed policy. An exhausted allocation refuses with
 `policy.deny.total_budget_exhausted`, which names the maximum and the
 remaining amount. The criterion requires `decision = "allow"`.
 An exhausted allocation or unlisted budget denies the payment; neither

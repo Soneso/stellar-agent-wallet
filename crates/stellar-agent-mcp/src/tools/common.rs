@@ -2160,7 +2160,7 @@ impl WalletServer {
             let profile_name = self.profile_name_for_approval();
             let window_store = self.window_store.clone();
             if let Err(e) = window_store.load_into(&profile_name, self.security_profile(), store) {
-                if e.chain_validation_error().is_some() {
+                if e.chain_validation_error().is_some() || e.operation_error().is_some() {
                     return Err(ToolError::Business(business_error_result(
                         e.submission_code(),
                         e.to_string(),

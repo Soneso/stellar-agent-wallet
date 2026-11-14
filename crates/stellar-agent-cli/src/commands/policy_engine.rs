@@ -258,7 +258,8 @@ pub(crate) fn load_v1_policy_engine(
                 error @ stellar_agent_core::policy::PolicyError::EngineSelectionUnsigned { .. },
             ) => error.wire_code(),
             PolicyEngineBuildError::WindowState { source, .. }
-                if source.chain_validation_error().is_some() =>
+                if source.chain_validation_error().is_some()
+                    || source.operation_error().is_some() =>
             {
                 source.submission_code()
             }
@@ -445,7 +446,7 @@ pub(crate) fn load_mainnet_policy_engine(
             error @ stellar_agent_core::policy::PolicyError::EngineSelectionUnsigned { .. },
         ) => Envelope::<()>::err_raw(error.wire_code(), error.to_string()),
         PolicyEngineBuildError::WindowState { source, .. }
-            if source.chain_validation_error().is_some() =>
+            if source.chain_validation_error().is_some() || source.operation_error().is_some() =>
         {
             Envelope::<()>::err_raw(source.submission_code(), source.to_string())
         }

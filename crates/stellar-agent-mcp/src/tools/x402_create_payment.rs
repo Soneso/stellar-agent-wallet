@@ -1899,6 +1899,9 @@ pub(super) fn record_x402_authorization(
         stellar_agent_network::policy_state::WindowStoreError::PolicyDenied { reason } => {
             crate::tools::common::policy_denial_error_result(&reason)
         }
+        error if error.operation_error().is_some() => {
+            business_error_result(error.submission_code(), error.to_string())
+        }
         _ => unavailable(),
     })
 }
@@ -3637,6 +3640,31 @@ mod tests {
                     .starts_with("payment withheld after intent authorization: "),
                 "{wire}"
             );
+        }
+    }
+
+    /// A total-budget epoch refusal of the ledger authorization keeps its
+    /// own code on the payment tool.
+    #[cfg(feature = "mainnet-write")]
+    #[test]
+    fn a_ledger_epoch_refusal_keeps_its_code() {
+        use stellar_agent_network::mainnet::{MainnetAuthorizationError, TotalEpochRefusal};
+        for (refusal, code) in [
+            (
+                TotalEpochRefusal::Unavailable {
+                    detail: "pin unreadable".to_owned(),
+                },
+                "policy.total_epoch_unavailable",
+            ),
+            (TotalEpochRefusal::Stale, "policy.total_epoch_stale"),
+            (TotalEpochRefusal::Retired, "policy.total_epoch_retired"),
+        ] {
+            let error =
+                stellar_agent_x402::X402Error::from(MainnetAuthorizationError::TotalEpoch(refusal));
+            assert_eq!(error.wire_code(), code);
+            let result = mainnet_x402_error(&error, "after intent authorization", None);
+            let (wire_code, _, _) = crate::tools::common::assert_business_envelope(&result);
+            assert_eq!(wire_code, code);
         }
     }
 
