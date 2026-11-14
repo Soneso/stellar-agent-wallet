@@ -329,13 +329,21 @@ impl<'a> MainnetOracle<'a> {
     pub(crate) async fn verify_once(
         client: &'a crate::StellarRpcClient,
         deadline: tokio::time::Instant,
-    ) -> Result<Self, stellar_agent_core::error::WalletError> {
-        client
-            .mainnet_endpoint_identity_once(deadline)
+    ) -> Result<Self, crate::client::RecoveryReadError> {
+        use crate::client::RecoveryReadError;
+        let result = tokio::time::timeout_at(deadline, client.recovery_identity())
             .await
-            .map_err(|error| {
-                crate::cross_check::identity_error(error, &client.url.authority(), Caip2::Mainnet)
+            .map_err(|_| {
+                RecoveryReadError::from(stellar_rpc_client::Error::JsonRpc(
+                    jsonrpsee_core::ClientError::RequestTimeout,
+                ))
             })?;
+        result.map_err(|error| match error {
+            RecoveryReadError::Validation(error) => RecoveryReadError::Validation(
+                crate::cross_check::identity_error(error, &client.url.authority(), Caip2::Mainnet),
+            ),
+            other => other,
+        })?;
         Ok(Self { client })
     }
 

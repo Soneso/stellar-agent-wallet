@@ -8142,7 +8142,9 @@ pub(crate) mod tests {
                         )
                     }
                     "getHealth" => answer(
-                        serde_json::json!({"status":"healthy", "latestLedger":100, "oldestLedger":1, "ledgerRetentionWindow":100}),
+                        serde_json::json!({"status":"healthy", "latestLedger":100, "oldestLedger":1,
+                            "ledgerRetentionWindow":100, "oldestLedgerCloseTime":1,
+                            "latestLedgerCloseTime":stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1000}),
                     ),
                     "getLedgers" => answer(serde_json::json!({
                         "latestLedger":100, "oldestLedger":1,

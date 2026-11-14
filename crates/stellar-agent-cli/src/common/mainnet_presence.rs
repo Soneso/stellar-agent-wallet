@@ -169,7 +169,7 @@ async fn acquire_signed_presence(
     let handle = stellar_agent_approval_remote::start_remote_presence(config)
         .await
         .map_err(|error| error.into_wallet_error())?;
-    #[cfg(feature = "test-helpers")]
+    #[cfg(any(test, feature = "test-helpers"))]
     remote_test_ready(&handle).await;
     signed_presence_until_done(
         handle,
@@ -181,7 +181,7 @@ async fn acquire_signed_presence(
 }
 
 /// Reports the bound test endpoint.
-#[cfg(feature = "test-helpers")]
+#[cfg(any(test, feature = "test-helpers"))]
 #[allow(clippy::print_stderr, reason = "binary test readiness")]
 pub(crate) async fn remote_test_ready(handle: &stellar_agent_approval_remote::RemoteServeHandle) {
     #[cfg(test)]
@@ -281,9 +281,9 @@ async fn signed_presence_until_done(
 #[cfg(feature = "test-helpers")]
 pub(crate) const TEST_NO_BROWSER_ENV: &str = "STELLAR_AGENT_TEST_PRESENCE_NO_BROWSER";
 
-/// The variable that makes a `test-helpers` build report its bound remote endpoint.
+/// The variable that makes a `test-helpers` or unit-test build report its bound remote endpoint.
 /// The release build never reads it.
-#[cfg(feature = "test-helpers")]
+#[cfg(any(test, feature = "test-helpers"))]
 pub(crate) const TEST_REMOTE_READY_ENV: &str = "STELLAR_AGENT_TEST_REMOTE_READY";
 
 /// Whether a local browser can take the ceremony: a graphical session, and

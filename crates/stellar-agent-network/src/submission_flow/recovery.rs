@@ -1424,6 +1424,59 @@ pub(crate) mod tests {
         .unwrap();
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn recovery_repair_refusal_precedes_missing_sequence_evidence() {
+        let mut rig = Rig::new();
+        let (_, refused) =
+            historical_without(&mut rig.fx, 1, Checked::NotIncluded, "submission_ledger");
+        unknown_named(&mut rig.fx, 2);
+        let (_server, client) = endpoint().await;
+        let repair = rig.repair(None).unwrap_err().to_string();
+        let pass = rig.dispatch(&client, Some(&rig.receipts), false).await;
+        let (warnings, guard) = stellar_agent_test_support::WarningCapture::capture(None);
+        finish_reconciliation(
+            &rig.fx.profile,
+            "ops",
+            &rig.fx.store,
+            Some(&rig.receipts),
+            &pass,
+            || Ok(Arc::clone(&rig.writer)),
+        )
+        .unwrap();
+        drop(guard);
+        let seen = warnings.seen();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(
+            seen[0].get("message").map(String::as_str),
+            Some(
+                "recovery: checked receipt repair refused after sequence recovery; completed work remains committed"
+            )
+        );
+        let ReconcilePass::RecoveryFailed {
+            error: RecoveryError::Store(WindowStoreError::Invalid { detail }),
+            ..
+        } = &pass
+        else {
+            panic!("the repair refusal precedes missing evidence: {pass:?}");
+        };
+        assert_eq!(
+            detail,
+            &format!("sequence recovery evidence missing; {repair}")
+        );
+        assert!(detail.contains(&refused.to_hex()));
+        assert!(detail.contains("missing_projection_fact:submission_ledger"));
+        assert_eq!(seen[0].get("detail"), Some(detail));
+        assert!(!rig.projected(1));
+        assert_eq!(
+            OperationStatus::new(&rig.fx.store, &rig.fx.profile)
+                .recovery_snapshot(None)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
     /// A sent decision and an incomplete historical decision survive a
     /// crash. After sequence recovery, dispatch repairs the first and
     /// refuses the second. Its detail, its completion log and the status log
@@ -1697,7 +1750,7 @@ pub(crate) mod tests {
                     &EvidenceInput {
                         sequence_released: Some(SequenceReleaseInput {
                             primary_ledger: 10,
-                            witness_ledger: 11,
+                            witness_ledger: 10,
                             min_close_time_ms: T0,
                         }),
                         ..EvidenceInput::default()

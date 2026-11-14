@@ -312,14 +312,16 @@ pub enum ReconcilePass {
     /// The legacy stage completes and the recovery stage then refuses.
     ///
     /// The refusal can follow committed sequence work and other completed
-    /// receipt projections. A sequence-stage refusal takes precedence. A
-    /// checked receipt repair refusal alone is a store refusal. Its detail
-    /// states that sequence recovery completed and names the repaired and
-    /// refused decisions, each refusal with its code and detail.
+    /// receipt projections. Sequence store and identity refusals take
+    /// precedence; a repair refusal precedes missing sequence evidence.
+    /// A checked receipt repair refusal is a store refusal. Its detail
+    /// states the sequence stage's result and names the repaired and refused
+    /// decisions, each refusal with its code and detail.
     RecoveryFailed {
         /// The completed legacy report.
         legacy: ReconcileReport,
-        /// The first recovery refusal; completed commits stand.
+        /// The first recovery refusal; only validated evidence can commit,
+        /// and completed commits stand.
         error: crate::policy_state::RecoveryError,
     },
 }
@@ -369,17 +371,25 @@ pub fn finish_reconciliation(
         ReconcilePass::RecoveryFailed {
             error: crate::policy_state::RecoveryError::Store(WindowStoreError::Invalid { detail }),
             ..
-        } if detail.starts_with(SEQUENCES_RECOVERED) => tracing::warn!(
-            profile = %profile_name,
-            detail = %detail,
-            "recovery: checked receipt repair refused after sequence recovery; completed work remains committed"
-        ),
-        ReconcilePass::RecoveryFailed { error, .. } => tracing::warn!(
-            profile = %profile_name,
-            code = error.code(),
-            error = %error,
-            "recovery: the stage refused; every sequence stays held"
-        ),
+        } if detail.starts_with(SEQUENCES_RECOVERED)
+            || detail.starts_with(SEQUENCES_MISSING_EVIDENCE) =>
+        {
+            tracing::warn!(
+                profile = %profile_name,
+                detail = %detail,
+                "recovery: checked receipt repair refused after sequence recovery; completed work remains committed"
+            )
+        }
+        ReconcilePass::RecoveryFailed { error, .. }
+            if !matches!(error, crate::policy_state::RecoveryError::NeedsEvidence(_)) =>
+        {
+            tracing::warn!(
+                profile = %profile_name,
+                code = error.code(),
+                error = %error,
+                "recovery: the stage refused; unresolved sequences stay held"
+            );
+        }
         _ => {}
     }
     drain_accounting_obligations(window, profile, profile_name, receipts, writer)
@@ -388,6 +398,9 @@ pub fn finish_reconciliation(
 /// The prefix of a recovery refusal detail whose sequence stage completed
 /// before checked receipt repair refused.
 const SEQUENCES_RECOVERED: &str = "sequence recovery completed; ";
+
+/// The prefix when checked receipt repair refuses after an incomplete sequence pass.
+const SEQUENCES_MISSING_EVIDENCE: &str = "sequence recovery evidence missing; ";
 
 /// Runs the bounded dispatch-time reconciliation pass.
 ///
@@ -510,7 +523,7 @@ async fn reconcile_stages(
     let (Some(writer), ReconcilePass::Completed(report)) = (writer, &legacy) else {
         return legacy;
     };
-    // The sequence stage completes first; a projection refusal never starves it.
+    // The sequence stage runs first; a projection refusal never starves it.
     let sequences = crate::policy_state::recover_sequences(
         window,
         profile,
@@ -518,22 +531,42 @@ async fn reconcile_stages(
         &writer,
         None,
     )
-    .await;
+    .await
+    .and_then(crate::policy_state::RecoveryReport::require_evidence);
     #[cfg(test)]
     recovery::tests::trace("sequences");
     let repaired = receipts.map_or(Ok(()), |receipts| {
         recovery::repair_committed_receipts(window, profile, receipts, &writer, None)
     });
     match (sequences, repaired) {
-        (Err(error), _) => ReconcilePass::RecoveryFailed {
+        (Err(error), _)
+            if matches!(
+                error,
+                crate::policy_state::RecoveryError::Store(_)
+                    | crate::policy_state::RecoveryError::EndpointIdentity(_)
+            ) =>
+        {
+            ReconcilePass::RecoveryFailed {
+                legacy: report.clone(),
+                error,
+            }
+        }
+        (sequences, Err(refused)) => {
+            let prefix = if sequences.is_ok() {
+                SEQUENCES_RECOVERED
+            } else {
+                SEQUENCES_MISSING_EVIDENCE
+            };
+            ReconcilePass::RecoveryFailed {
+                legacy: report.clone(),
+                error: crate::policy_state::RecoveryError::Store(WindowStoreError::Invalid {
+                    detail: format!("{prefix}{refused}"),
+                }),
+            }
+        }
+        (Err(error), Ok(())) => ReconcilePass::RecoveryFailed {
             legacy: report.clone(),
             error,
-        },
-        (Ok(_), Err(refused)) => ReconcilePass::RecoveryFailed {
-            legacy: report.clone(),
-            error: crate::policy_state::RecoveryError::Store(WindowStoreError::Invalid {
-                detail: format!("{SEQUENCES_RECOVERED}{refused}"),
-            }),
         },
         (Ok(_), Ok(())) => legacy,
     }
@@ -743,16 +776,21 @@ pub async fn transaction_status(
             Some(&hash),
         )
         .await
+        .and_then(crate::policy_state::RecoveryReport::require_evidence)
         {
-            sequences = "refused";
-            // The status answer stands; the drain below runs as on the
-            // refused reconciliation path.
-            tracing::warn!(
-                profile = %profile_name,
-                code = error.code(),
-                error = %error,
-                "transaction status: recovery refused; every sequence stays held"
-            );
+            if matches!(error, crate::policy_state::RecoveryError::NeedsEvidence(_)) {
+                sequences = "evidence missing";
+            } else {
+                sequences = "refused";
+                // The status answer stands; the drain below runs as on the
+                // refused reconciliation path.
+                tracing::warn!(
+                    profile = %profile_name,
+                    code = error.code(),
+                    error = %error,
+                    "transaction status: recovery refused; unresolved sequences stay held"
+                );
+            }
         }
     }
     // The status answer does not depend on the drain: a refusal is logged by

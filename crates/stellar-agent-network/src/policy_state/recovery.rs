@@ -11,7 +11,7 @@ use stellar_agent_core::error::WalletError;
 use stellar_agent_core::policy::state_lock::WindowStoreLock;
 use stellar_agent_core::profile::receipt::SequenceReleases;
 use stellar_agent_core::profile::schema::Profile;
-use stellar_rpc_client::{GetHealthResponse, GetLedgersResponse, LedgerStart};
+use stellar_rpc_client::{GetLedgersResponse, LedgerStart};
 use tokio::time::Instant;
 
 use super::operations::{
@@ -27,7 +27,122 @@ const ATTEMPT_REQUESTS: usize = 24;
 const SHARED_REQUESTS: usize = 9;
 const PASS_DURATION: Duration = Duration::from_secs(20);
 const OBSERVATION_AGE: Duration = Duration::from_secs(5);
-const PAGE_SIZE: usize = 200;
+const PAGE_SIZE: usize = 1;
+
+/// The evidence a bounded recovery read cannot obtain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum RecoveryReason {
+    /// A response exceeds the 10 MiB transport limit.
+    ResponseTooLarge,
+    /// The endpoint rejects work because it is overloaded.
+    RateLimited,
+    /// The transport cannot deliver the response.
+    Transport,
+    /// The response omits a required field or has an invalid shape.
+    MissingField,
+    /// The endpoint or observation is too old for this pass.
+    Lagging,
+    /// The absolute pass deadline expires.
+    Deadline,
+    /// The request allowance is exhausted.
+    RequestBudget,
+    /// The account response cannot support recovery.
+    AccountUnavailable,
+    /// The paired interval proof is unavailable.
+    CoverageRequired,
+}
+
+/// An endpoint role from the configured recovery pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum RecoveryEndpoint {
+    /// The submission endpoint.
+    Primary,
+    /// The independent oracle.
+    Oracle,
+}
+
+/// A recovery RPC method, without endpoint URLs or server text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum RecoveryMethod {
+    /// Network and protocol identity.
+    GetNetwork,
+    /// Compact endpoint readiness.
+    GetHealth,
+    /// Transaction lookup by hash.
+    GetTransaction,
+    /// Ledger close-time evidence.
+    GetLedgers,
+    /// Source account evidence.
+    GetLedgerEntries,
+}
+
+/// Bounded context for a missing recovery observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct RecoveryFailure {
+    /// The typed cause, without raw provider error text.
+    pub reason: RecoveryReason,
+    /// The configured endpoint role.
+    pub endpoint: RecoveryEndpoint,
+    /// The method whose evidence is missing.
+    pub method: RecoveryMethod,
+    /// The requested ledger when the method names one.
+    pub ledger: Option<u32>,
+}
+
+fn stream_is_length_limit(error: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    error.is::<http_body_util::LengthLimitError>()
+}
+
+fn rpc_failure(error: &stellar_rpc_client::Error) -> RecoveryReason {
+    use jsonrpsee_core::{ClientError, http_helpers::HttpError};
+    use jsonrpsee_http_client::transport::Error as HttpTransportError;
+    match error {
+        stellar_rpc_client::Error::JsonRpc(ClientError::Transport(error)) => {
+            match error.downcast_ref::<HttpTransportError>() {
+                Some(HttpTransportError::Http(HttpError::TooLarge)) => {
+                    RecoveryReason::ResponseTooLarge
+                }
+                Some(HttpTransportError::Http(HttpError::Stream(error)))
+                    if stream_is_length_limit(error.as_ref()) =>
+                {
+                    RecoveryReason::ResponseTooLarge
+                }
+                Some(HttpTransportError::Rejected {
+                    status_code: 429 | 503,
+                }) => RecoveryReason::RateLimited,
+                _ => RecoveryReason::Transport,
+            }
+        }
+        stellar_rpc_client::Error::JsonRpc(ClientError::Call(error)) if error.code() == -32001 => {
+            RecoveryReason::RateLimited
+        }
+        stellar_rpc_client::Error::JsonRpc(ClientError::ParseError(_)) => {
+            RecoveryReason::MissingField
+        }
+        stellar_rpc_client::Error::JsonRpc(ClientError::RequestTimeout) => RecoveryReason::Deadline,
+        _ => RecoveryReason::Transport,
+    }
+}
+
+fn read_failure(error: &dyn std::any::Any) -> RecoveryReason {
+    use crate::client::RecoveryReadError;
+    use stellar_agent_core::error::{NetworkError, ProtocolError};
+    if let Some(error) = error.downcast_ref::<stellar_rpc_client::Error>() {
+        return rpc_failure(error);
+    }
+    match error.downcast_ref::<RecoveryReadError>() {
+        Some(RecoveryReadError::Rpc(error)) => rpc_failure(error),
+        Some(RecoveryReadError::Shape) => RecoveryReason::MissingField,
+        Some(RecoveryReadError::Validation(WalletError::Network(
+            NetworkError::AccountNotFound { .. },
+        ))) => RecoveryReason::CoverageRequired,
+        Some(RecoveryReadError::Validation(WalletError::Protocol(
+            ProtocolError::XdrCodecFailed { .. },
+        ))) => RecoveryReason::MissingField,
+        Some(RecoveryReadError::Validation(_)) => RecoveryReason::AccountUnavailable,
+        None => RecoveryReason::Transport,
+    }
+}
 
 /// The primary endpoint and independent recovery oracle.
 pub struct EndpointPair<'a> {
@@ -56,21 +171,22 @@ impl<'a> EndpointPair<'a> {
     }
 
     async fn verify(&self, budget: &mut Budget) -> Result<(), IdentityFailure> {
-        let oracle = self
-            .oracle
-            .ok_or(IdentityFailure::Read(ReadFailure::Pending))?;
-        let deadline = budget.deadline;
+        let oracle = self.oracle.ok_or_else(|| {
+            budget.context(RecoveryEndpoint::Oracle, RecoveryMethod::GetNetwork, None);
+            budget.failed(RecoveryReason::MissingField);
+            IdentityFailure::Read(ReadFailure::Pending)
+        })?;
+        budget.context(RecoveryEndpoint::Primary, RecoveryMethod::GetNetwork, None);
+        budget.identity(self.primary.recovery_identity()).await?;
+        budget.context(RecoveryEndpoint::Oracle, RecoveryMethod::GetNetwork, None);
         budget
-            .identity(self.primary.mainnet_endpoint_identity_once(deadline))
-            .await?;
-        budget
-            .identity(MainnetOracle::verify_once(oracle, deadline))
+            .identity(MainnetOracle::verify_once(oracle, budget.deadline))
             .await?;
         Ok(())
     }
 }
 
-/// Why a recovery pass refuses without committing.
+/// Why recovery cannot supply all requested evidence.
 #[derive(Debug, thiserror::Error)]
 pub enum RecoveryError {
     /// The window store refuses the snapshot or a commit.
@@ -79,6 +195,9 @@ pub enum RecoveryError {
     /// An endpoint reports another network or an unsupported protocol.
     #[error(transparent)]
     EndpointIdentity(WalletError),
+    /// A bounded read cannot obtain required evidence.
+    #[error("recovery needs evidence: {0:?}")]
+    NeedsEvidence(RecoveryFailure),
 }
 
 impl RecoveryError {
@@ -88,6 +207,7 @@ impl RecoveryError {
         match self {
             Self::Store(error) => error.submission_code(),
             Self::EndpointIdentity(error) => error.code(),
+            Self::NeedsEvidence(_) => "recovery.needs_evidence",
         }
     }
 }
@@ -127,12 +247,15 @@ pub struct RecoveryRequests {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReadFailure {
     Pending,
+    Failed(RecoveryReason),
     Deadline,
 }
 
 struct Budget {
     used: RecoveryRequests,
     deadline: Instant,
+    context: (RecoveryEndpoint, RecoveryMethod, Option<u32>),
+    failure: Option<RecoveryFailure>,
 }
 
 impl Budget {
@@ -140,12 +263,28 @@ impl Budget {
         Self {
             used: RecoveryRequests::default(),
             deadline: Instant::now() + PASS_DURATION,
+            context: (RecoveryEndpoint::Primary, RecoveryMethod::GetNetwork, None),
+            failure: None,
         }
+    }
+
+    fn context(&mut self, endpoint: RecoveryEndpoint, method: RecoveryMethod, ledger: Option<u32>) {
+        self.context = (endpoint, method, ledger);
+    }
+
+    fn failed(&mut self, reason: RecoveryReason) {
+        self.failure.get_or_insert(RecoveryFailure {
+            reason,
+            endpoint: self.context.0,
+            method: self.context.1,
+            ledger: self.context.2,
+        });
     }
 
     /// Charges one request before its await.
     fn charge(&mut self, shared: bool) -> Result<(), ReadFailure> {
         if Instant::now() >= self.deadline {
+            self.failed(RecoveryReason::Deadline);
             return Err(ReadFailure::Deadline);
         }
         let (used, capacity) = if shared {
@@ -154,34 +293,53 @@ impl Budget {
             (&mut self.used.attempt, ATTEMPT_REQUESTS)
         };
         if *used >= capacity {
+            self.failed(RecoveryReason::RequestBudget);
             return Err(ReadFailure::Pending);
         }
         *used += 1;
         Ok(())
     }
 
-    async fn read<T, E>(
+    async fn read<T, E: 'static>(
         &mut self,
         shared: bool,
         request: impl Future<Output = Result<T, E>>,
     ) -> Result<T, ReadFailure> {
         self.charge(shared)?;
-        tokio::time::timeout_at(self.deadline, request)
-            .await
-            .map_err(|_| ReadFailure::Deadline)?
-            .map_err(|_| ReadFailure::Pending)
+        match tokio::time::timeout_at(self.deadline, request).await {
+            Err(_) => {
+                self.failed(RecoveryReason::Deadline);
+                Err(ReadFailure::Deadline)
+            }
+            Ok(Err(error)) => {
+                let reason = read_failure(&error);
+                self.failed(reason);
+                Err(ReadFailure::Failed(reason))
+            }
+            Ok(Ok(value)) => Ok(value),
+        }
     }
 
     async fn identity<T>(
         &mut self,
-        request: impl Future<Output = Result<T, WalletError>>,
+        request: impl Future<Output = Result<T, crate::client::RecoveryReadError>>,
     ) -> Result<T, IdentityFailure> {
         self.charge(true).map_err(IdentityFailure::Read)?;
         match tokio::time::timeout_at(self.deadline, request).await {
-            Err(_) => Err(IdentityFailure::Read(ReadFailure::Deadline)),
+            Err(_) => {
+                self.failed(RecoveryReason::Deadline);
+                Err(IdentityFailure::Read(ReadFailure::Deadline))
+            }
             Ok(Ok(value)) => Ok(value),
-            Ok(Err(error)) if identity_refusal(&error) => Err(IdentityFailure::Refused(error)),
-            Ok(Err(_)) => Err(IdentityFailure::Read(ReadFailure::Pending)),
+            Ok(Err(crate::client::RecoveryReadError::Validation(error)))
+                if identity_refusal(&error) =>
+            {
+                Err(IdentityFailure::Refused(error))
+            }
+            Ok(Err(error)) => {
+                self.failed(read_failure(&error));
+                Err(IdentityFailure::Read(ReadFailure::Pending))
+            }
         }
     }
 }
@@ -406,7 +564,6 @@ fn account_digest(answers: &[AccountAnswer; 2]) -> Result<[u8; 32], WindowStoreE
 }
 
 struct SharedObservation {
-    health: GetHealthResponse,
     report: OperationalReport,
     oldest: u32,
     read_at: Instant,
@@ -430,38 +587,20 @@ async fn shared_observation(
     client: &StellarRpcClient,
     budget: &mut Budget,
     now_ms: u64,
-    health: Option<GetHealthResponse>,
 ) -> Result<SharedObservation, ReadFailure> {
     let read_at = Instant::now();
-    let deadline = budget.deadline;
-    let mut refused = None;
-    let read = crate::operational::single_readiness(
-        client,
-        deadline,
-        health,
-        || Ok(now_ms / 1_000),
-        &mut || match budget.charge(true) {
-            Ok(()) => true,
-            Err(failure) => {
-                refused = Some(failure);
-                false
-            }
-        },
-    )
-    .await;
-    match read {
-        Ok(read) => Ok(SharedObservation {
-            health: read.health,
-            report: read.report,
-            oldest: read.oldest_ledger,
-            read_at,
-        }),
-        Err(_) => Err(refused.unwrap_or(if Instant::now() >= deadline {
-            ReadFailure::Deadline
-        } else {
+    budget.context(budget.context.0, RecoveryMethod::GetHealth, None);
+    let observed = budget.read(true, client.recovery_health()).await?;
+    let report =
+        OperationalReport::from_health_observation(&observed, now_ms / 1_000).map_err(|_| {
+            budget.failed(RecoveryReason::Lagging);
             ReadFailure::Pending
-        })),
-    }
+        })?;
+    Ok(SharedObservation {
+        oldest: observed.health.oldest_ledger,
+        report,
+        read_at,
+    })
 }
 
 #[derive(Debug)]
@@ -473,13 +612,18 @@ struct Scan {
     entries: Vec<(u32, u64)>,
 }
 
-fn scan_page(page: &GetLedgersResponse, cursor: u32, max_time: u64) -> Option<Scan> {
+fn scan_page(
+    page: &GetLedgersResponse,
+    cursor: u32,
+    max_time: u64,
+    requested: usize,
+) -> Option<Scan> {
     let start = cursor.max(page.oldest_ledger);
     let mut next = start;
     let mut last_close = 0;
     let mut entries = Vec::new();
     let mut boundary = None;
-    if page.ledgers.is_empty() || page.ledgers.len() > PAGE_SIZE {
+    if page.ledgers.is_empty() || page.ledgers.len() > requested {
         return None;
     }
     for ledger in &page.ledgers {
@@ -496,7 +640,7 @@ fn scan_page(page: &GetLedgersResponse, cursor: u32, max_time: u64) -> Option<Sc
     }
     let last = *entries.last()?;
     if page.latest_ledger < last.0
-        || (page.ledgers.len() < PAGE_SIZE && last.0 != page.latest_ledger)
+        || (page.ledgers.len() < requested && last.0 != page.latest_ledger)
     {
         return None;
     }
@@ -520,38 +664,53 @@ async fn history(
     budget: &mut Budget,
     attempt: &RecoveryAttempt,
     primary: bool,
+    target: u32,
 ) -> Result<Option<Scan>, ReadFailure> {
     let saved = &attempt.recovery;
-    let (cursor, upper) = if primary {
-        (saved.primary_cursor, saved.primary_upper)
+    let upper = if primary {
+        saved.primary_upper
     } else {
-        (saved.witness_cursor, saved.witness_upper)
+        saved.witness_upper
     };
-    let cursor = upper
-        .or(cursor)
-        .or(attempt.pre_exposure_ledger)
-        .unwrap_or(shared.report.latest_ledger);
-    let start = cursor.max(shared.oldest);
     let ExposureIdentity::Classic { max_time, .. } = attempt.exposure else {
         return Ok(None);
     };
-    let result = budget
-        .read(false, async {
-            Ok::<_, ()>(
-                client
-                    .inner
-                    .get_ledgers(LedgerStart::Ledger(start), Some(PAGE_SIZE), None)
-                    .await,
-            )
-        })
-        .await?;
-    match result {
-        Ok(page) => Ok(scan_page(&page, cursor, max_time)),
-        Err(stellar_rpc_client::Error::JsonRpc(jsonrpsee_core::ClientError::ParseError(_))) => {
-            Ok(None)
-        }
-        Err(_) => Err(ReadFailure::Pending),
+    budget.context(
+        if primary {
+            RecoveryEndpoint::Primary
+        } else {
+            RecoveryEndpoint::Oracle
+        },
+        RecoveryMethod::GetLedgers,
+        Some(target),
+    );
+    if target < shared.oldest || upper.is_some_and(|ledger| ledger > target) {
+        budget.failed(RecoveryReason::CoverageRequired);
+        return Err(ReadFailure::Failed(RecoveryReason::CoverageRequired));
     }
+    let page = budget
+        .read(
+            false,
+            client
+                .inner
+                .get_ledgers(LedgerStart::Ledger(target), Some(PAGE_SIZE), None),
+        )
+        .await;
+    let page = match page {
+        Err(ReadFailure::Failed(RecoveryReason::MissingField)) => {
+            return Ok(None);
+        }
+        other => other?,
+    };
+    if target < page.oldest_ledger {
+        budget.failed(RecoveryReason::CoverageRequired);
+        return Err(ReadFailure::Failed(RecoveryReason::CoverageRequired));
+    }
+    let scan = scan_page(&page, target, max_time, PAGE_SIZE);
+    if scan.is_none() {
+        budget.failed(RecoveryReason::MissingField);
+    }
+    Ok(scan)
 }
 
 fn pending(attempt: &RecoveryAttempt, now_ms: u64, class: &str, detail: &str) -> EvidenceInput {
@@ -613,7 +772,9 @@ fn evaluate(
             oracle.upper,
             primary.answer.close_time,
             oracle.answer.close_time,
-        ) {
+        ) && primary_ledger == witness_ledger
+            && left == right
+        {
             input.sequence_released = Some(SequenceReleaseInput {
                 primary_ledger,
                 witness_ledger,
@@ -907,6 +1068,12 @@ type AccountRead = Result<[AccountAnswer; 2], &'static str>;
 /// The detail of an account answer below its endpoint's readiness ledger.
 const ACCOUNT_LEDGER_REGRESSED: &str = "account.ledger_regressed";
 
+fn matched_sequence_release(attempt: &RecoveryAttempt) -> Option<SequenceReleaseInput> {
+    attempt
+        .sequence_release
+        .filter(|release| release.primary_ledger == release.witness_ledger)
+}
+
 /// Proves `attempt` not included, from a recorded sequence release and a
 /// positive finite `max_time`, by one of two branches.
 ///
@@ -932,7 +1099,7 @@ fn classify_non_inclusion(
     else {
         return Err(MISSING_FIELD);
     };
-    let Some(release) = attempt.sequence_release else {
+    let Some(release) = matched_sequence_release(attempt) else {
         return Err("sequence_pending");
     };
     if max_time == 0 || max_time == u64::MAX {
@@ -1015,7 +1182,7 @@ enum Observed {
 /// Selects at most one transition for `attempt`: an outcome first, then the
 /// first sequence release from `sequence`, then non-inclusion. An outcome
 /// disagreement blocks the sequence release and non-inclusion. An already
-/// recorded sequence release is skipped and its proof kept.
+/// recorded matched sequence release is skipped and its proof kept.
 #[must_use]
 fn observe(
     attempt: &RecoveryAttempt,
@@ -1029,7 +1196,7 @@ fn observe(
         Some(OutcomeClass::Disagreement(detail)) => return Observed::Disagreement(detail),
         _ => {}
     }
-    if attempt.sequence_release.is_none() {
+    if matched_sequence_release(attempt).is_none() {
         return match sequence {
             Some(release) => Observed::SequenceReleased(release),
             None => Observed::Pending(match class {
@@ -1057,6 +1224,17 @@ pub struct RecoveryReport {
     pub requests: RecoveryRequests,
     /// Attempts whose evaluation commits.
     pub evaluated: usize,
+    /// The first evidence this pass could not obtain or use.
+    pub missing: Option<RecoveryFailure>,
+}
+
+impl RecoveryReport {
+    pub(crate) fn require_evidence(self) -> Result<Self, RecoveryError> {
+        match self.missing {
+            Some(failure) => Err(RecoveryError::NeedsEvidence(failure)),
+            None => Ok(self),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1064,6 +1242,7 @@ struct Batch {
     inputs: Vec<(OperationId, u32, EvidenceInput)>,
     observation: Option<WindowObservation>,
     requests: RecoveryRequests,
+    missing: Option<RecoveryFailure>,
 }
 
 async fn collect(
@@ -1078,38 +1257,44 @@ async fn collect(
         Err(IdentityFailure::Refused(error)) => return Err(RecoveryError::EndpointIdentity(error)),
         Err(IdentityFailure::Read(ReadFailure::Deadline)) => {
             batch.requests = budget.used;
+            batch.missing = budget.failure;
             return Ok(batch);
         }
-        Err(IdentityFailure::Read(ReadFailure::Pending)) => false,
+        Err(IdentityFailure::Read(ReadFailure::Pending | ReadFailure::Failed(_))) => false,
     };
     let mut primary = None;
     let mut oracle = None;
     if verified {
-        match shared_observation(pair.primary, &mut budget, now_ms, None).await {
+        budget.context(RecoveryEndpoint::Primary, RecoveryMethod::GetHealth, None);
+        match shared_observation(pair.primary, &mut budget, now_ms).await {
             Ok(observation) => {
                 batch.observation = Some(observation.window(now_ms));
                 primary = Some(observation);
             }
             Err(ReadFailure::Deadline) => {
                 batch.requests = budget.used;
+                batch.missing = budget.failure;
                 return Ok(batch);
             }
-            Err(ReadFailure::Pending) => {}
+            Err(ReadFailure::Pending | ReadFailure::Failed(_)) => {}
         }
         if let Some(client) = pair.oracle.filter(|_| primary.is_some()) {
-            match shared_observation(client, &mut budget, now_ms, None).await {
+            budget.context(RecoveryEndpoint::Oracle, RecoveryMethod::GetHealth, None);
+            match shared_observation(client, &mut budget, now_ms).await {
                 Ok(observation) => oracle = Some(observation),
                 Err(ReadFailure::Deadline) => {
                     batch.requests = budget.used;
+                    batch.missing = budget.failure;
                     return Ok(batch);
                 }
-                Err(ReadFailure::Pending) => {}
+                Err(ReadFailure::Pending | ReadFailure::Failed(_)) => {}
             }
         }
     }
     let mut refreshed = false;
     for attempt in attempts.iter().take(4) {
         if Instant::now() >= budget.deadline {
+            budget.failed(RecoveryReason::Deadline);
             break;
         }
         let mut seeded = attempt.clone();
@@ -1136,30 +1321,42 @@ async fn collect(
             && !refreshed
         {
             refreshed = true;
-            let health = right.health.clone();
-            match shared_observation(pair.primary, &mut budget, now_ms, None).await {
+            budget.context(RecoveryEndpoint::Primary, RecoveryMethod::GetHealth, None);
+            match shared_observation(pair.primary, &mut budget, now_ms).await {
                 Ok(observation) => {
                     batch.observation = Some(observation.window(now_ms));
                     primary = Some(observation);
                 }
                 Err(ReadFailure::Deadline) => break,
-                Err(ReadFailure::Pending) => primary = None,
+                Err(ReadFailure::Pending | ReadFailure::Failed(_)) => primary = None,
             }
-            match shared_observation(client, &mut budget, now_ms, Some(health)).await {
+            budget.context(RecoveryEndpoint::Oracle, RecoveryMethod::GetHealth, None);
+            match shared_observation(client, &mut budget, now_ms).await {
                 Ok(observation) => oracle = Some(observation),
                 Err(ReadFailure::Deadline) => break,
-                Err(ReadFailure::Pending) => oracle = None,
+                Err(ReadFailure::Pending | ReadFailure::Failed(_)) => oracle = None,
             }
         }
         if let (Some(left), Some(right), Some(client)) = (&primary, &oracle, pair.oracle) {
             if left.stale() || right.stale() {
+                budget.context(
+                    if left.stale() {
+                        RecoveryEndpoint::Primary
+                    } else {
+                        RecoveryEndpoint::Oracle
+                    },
+                    RecoveryMethod::GetHealth,
+                    None,
+                );
+                budget.failed(RecoveryReason::Lagging);
                 detail = "stale_observation";
             } else {
-                let left = history(pair.primary, left, &mut budget, attempt, true).await;
+                let target = left.report.latest_ledger.min(right.report.latest_ledger);
+                let left = history(pair.primary, left, &mut budget, attempt, true, target).await;
                 if matches!(left, Err(ReadFailure::Deadline)) {
                     break;
                 }
-                let right = history(client, right, &mut budget, attempt, false).await;
+                let right = history(client, right, &mut budget, attempt, false, target).await;
                 if matches!(right, Err(ReadFailure::Deadline)) {
                     break;
                 }
@@ -1190,6 +1387,7 @@ async fn collect(
             .push((attempt.operation_id, attempt.attempt_index, input));
     }
     batch.requests = budget.used;
+    batch.missing = budget.failure;
     Ok(batch)
 }
 
@@ -1246,16 +1444,20 @@ async fn account_read(
     if let Err(failure) = budget.charge(false) {
         return match failure {
             ReadFailure::Deadline => Err(failure),
-            ReadFailure::Pending => Ok(Err("request_allowance")),
+            ReadFailure::Pending | ReadFailure::Failed(_) => Ok(Err("request_allowance")),
         };
     }
+    budget.context(budget.context.0, RecoveryMethod::GetLedgerEntries, None);
     match tokio::time::timeout_at(
         budget.deadline,
-        crate::account::fetch_account_observed(client, account, &shared.report),
+        crate::account::fetch_account_recovery(client, account, &shared.report),
     )
     .await
     {
-        Err(_) => Err(ReadFailure::Deadline),
+        Err(_) => {
+            budget.failed(RecoveryReason::Deadline);
+            Err(ReadFailure::Deadline)
+        }
         Ok(Ok(observed)) => {
             use stellar_agent_core::policy::v1::AccountReservesView;
             Ok(Ok(AccountAnswer {
@@ -1263,10 +1465,16 @@ async fn account_read(
                 latest_ledger: observed.observation().map(|seen| seen.ledger_sequence),
             }))
         }
-        Ok(Err(error)) if error.code() == ACCOUNT_LEDGER_REGRESSED => {
+        Ok(Err(crate::client::RecoveryReadError::Validation(WalletError::Network(
+            stellar_agent_core::error::NetworkError::AccountLedgerRegressed { .. },
+        )))) => {
+            budget.failed(RecoveryReason::AccountUnavailable);
             Ok(Err(ACCOUNT_LEDGER_REGRESSED))
         }
-        Ok(Err(_)) => Ok(Err("endpoint_unreachable")),
+        Ok(Err(error)) => {
+            budget.failed(read_failure(&error));
+            Ok(Err("endpoint_unreachable"))
+        }
     }
 }
 
@@ -1446,48 +1654,72 @@ async fn collect_outcomes(
     pair: &EndpointPair<'_>,
     attempts: &[RecoveryAttempt],
     now_ms: u64,
-) -> Result<(Vec<Evaluated>, Option<WindowObservation>, RecoveryRequests), RecoveryError> {
+) -> Result<
+    (
+        Vec<Evaluated>,
+        Option<WindowObservation>,
+        RecoveryRequests,
+        Option<RecoveryFailure>,
+    ),
+    RecoveryError,
+> {
     let mut budget = Budget::new();
     let mut evaluated = Vec::new();
     let mut observation = None;
     match pair.verify(&mut budget).await {
         Ok(()) => {}
         Err(IdentityFailure::Refused(error)) => return Err(RecoveryError::EndpointIdentity(error)),
-        Err(IdentityFailure::Read(_)) => return Ok((evaluated, observation, budget.used)),
+        Err(IdentityFailure::Read(_)) => {
+            return Ok((evaluated, observation, budget.used, budget.failure));
+        }
     }
     let Some(oracle_client) = pair.oracle else {
-        return Ok((evaluated, observation, budget.used));
+        return Ok((evaluated, observation, budget.used, budget.failure));
     };
-    let mut primary = match shared_observation(pair.primary, &mut budget, now_ms, None).await {
+    budget.context(RecoveryEndpoint::Primary, RecoveryMethod::GetHealth, None);
+    let mut primary = match shared_observation(pair.primary, &mut budget, now_ms).await {
         Ok(shared) => shared,
-        Err(_) => return Ok((evaluated, observation, budget.used)),
+        Err(_) => return Ok((evaluated, observation, budget.used, budget.failure)),
     };
     observation = Some(primary.window(now_ms));
-    let mut oracle = match shared_observation(oracle_client, &mut budget, now_ms, None).await {
+    budget.context(RecoveryEndpoint::Oracle, RecoveryMethod::GetHealth, None);
+    let mut oracle = match shared_observation(oracle_client, &mut budget, now_ms).await {
         Ok(shared) => shared,
-        Err(_) => return Ok((evaluated, observation, budget.used)),
+        Err(_) => return Ok((evaluated, observation, budget.used, budget.failure)),
     };
     let mut refreshed = false;
     for attempt in attempts.iter().take(4) {
         if Instant::now() >= budget.deadline {
+            budget.failed(RecoveryReason::Deadline);
             break;
         }
         if (primary.stale() || oracle.stale()) && !refreshed {
             refreshed = true;
-            let health = oracle.health.clone();
-            match shared_observation(pair.primary, &mut budget, now_ms, None).await {
+            budget.context(RecoveryEndpoint::Primary, RecoveryMethod::GetHealth, None);
+            match shared_observation(pair.primary, &mut budget, now_ms).await {
                 Ok(shared) => {
                     observation = Some(shared.window(now_ms));
                     primary = shared;
                 }
                 Err(_) => break,
             }
-            match shared_observation(oracle_client, &mut budget, now_ms, Some(health)).await {
+            budget.context(RecoveryEndpoint::Oracle, RecoveryMethod::GetHealth, None);
+            match shared_observation(oracle_client, &mut budget, now_ms).await {
                 Ok(shared) => oracle = shared,
                 Err(_) => break,
             }
         }
         if primary.stale() || oracle.stale() {
+            budget.context(
+                if primary.stale() {
+                    RecoveryEndpoint::Primary
+                } else {
+                    RecoveryEndpoint::Oracle
+                },
+                RecoveryMethod::GetHealth,
+                None,
+            );
+            budget.failed(RecoveryReason::Lagging);
             break;
         }
         let ExposureIdentity::Classic { tx_hash, .. } = attempt.exposure else {
@@ -1497,15 +1729,22 @@ async fn collect_outcomes(
         let mut answers = [OutcomeAnswer::default(), OutcomeAnswer::default()];
         let mut interrupted = false;
         let mut read = [false, false];
-        for ((slot, client), done) in answers
+        for (index, ((slot, client), done)) in answers
             .iter_mut()
             .zip([pair.primary, oracle_client])
             .zip(&mut read)
+            .enumerate()
         {
-            match budget
-                .read(false, client.get_transaction_observed(&hash))
-                .await
-            {
+            budget.context(
+                if index == 0 {
+                    RecoveryEndpoint::Primary
+                } else {
+                    RecoveryEndpoint::Oracle
+                },
+                RecoveryMethod::GetTransaction,
+                None,
+            );
+            match budget.read(false, client.recovery_transaction(&hash)).await {
                 Ok(observed) => {
                     *slot = OutcomeAnswer::from_observed(&observed);
                     *done = true;
@@ -1523,7 +1762,7 @@ async fn collect_outcomes(
         }
         let mut seeded = attempt.clone();
         let mut scans = (None, None);
-        if attempt.sequence_release.is_none() {
+        if matched_sequence_release(attempt).is_none() {
             seeded.recovery.primary_cursor.get_or_insert(
                 attempt
                     .pre_exposure_ledger
@@ -1534,8 +1773,12 @@ async fn collect_outcomes(
                     .pre_exposure_ledger
                     .unwrap_or(oracle.report.latest_ledger),
             );
-            let left = history(pair.primary, &primary, &mut budget, &seeded, true).await;
-            let right = history(oracle_client, &oracle, &mut budget, &seeded, false).await;
+            let target = primary
+                .report
+                .latest_ledger
+                .min(oracle.report.latest_ledger);
+            let left = history(pair.primary, &primary, &mut budget, &seeded, true, target).await;
+            let right = history(oracle_client, &oracle, &mut budget, &seeded, false, target).await;
             if matches!(left, Err(ReadFailure::Deadline))
                 || matches!(right, Err(ReadFailure::Deadline))
             {
@@ -1550,10 +1793,20 @@ async fn collect_outcomes(
         let mut account_partial = Vec::new();
         if read_all
             && absent
-            && attempt.sequence_release.is_some()
+            && matched_sequence_release(attempt).is_some()
             && let Some(account) = &attempt.account
         {
+            budget.context(
+                RecoveryEndpoint::Primary,
+                RecoveryMethod::GetLedgerEntries,
+                None,
+            );
             let left = account_read(pair.primary, account, &primary, &mut budget).await;
+            budget.context(
+                RecoveryEndpoint::Oracle,
+                RecoveryMethod::GetLedgerEntries,
+                None,
+            );
             let right = account_read(oracle_client, account, &oracle, &mut budget).await;
             let (Ok(left), Ok(right)) = (left, right) else {
                 break;
@@ -1585,6 +1838,16 @@ async fn collect_outcomes(
                 ),
             )?
         };
+        let missing_endpoint = read_all
+            .then(|| classify_outcome(attempt, &answers))
+            .filter(|class| matches!(class, OutcomeClass::Pending(MISSING_FIELD)))
+            .and_then(|_| {
+                answers
+                    .iter()
+                    .zip([RecoveryEndpoint::Primary, RecoveryEndpoint::Oracle])
+                    .find(|(answer, _)| answer.defect() == Some(MISSING_FIELD))
+                    .map(|(_, endpoint)| endpoint)
+            });
         let mut evaluation = evaluate_outcome(
             &seeded,
             read_all.then_some(answers),
@@ -1601,6 +1864,25 @@ async fn collect_outcomes(
                 "endpoint_unreachable"
             },
         )?;
+        if let Some(endpoint) = missing_endpoint {
+            budget.context(endpoint, RecoveryMethod::GetTransaction, None);
+            budget.failed(RecoveryReason::MissingField);
+        }
+        if matches!(
+            evaluation.decision,
+            Some((
+                DecidedTransition::NotIncluded(NotIncludedProof::CompleteHistory { .. }),
+                _,
+                _
+            ))
+        ) {
+            evaluation.decision = None;
+            if let Some(recovery) = &mut evaluation.input.recovery {
+                recovery.last_outcome = Some("evidence_pending".to_owned());
+                recovery.diagnostic = Some("coverage_required".to_owned());
+            }
+            budget.failed(RecoveryReason::CoverageRequired);
+        }
         evaluation.input.rows.extend(partial);
         evaluation.input.rows.extend(account_partial);
         evaluation
@@ -1612,7 +1894,7 @@ async fn collect_outcomes(
         evaluation.attempt = attempt.clone();
         evaluated.push(evaluation);
     }
-    Ok((evaluated, observation, budget.used))
+    Ok((evaluated, observation, budget.used, budget.failure))
 }
 
 /// Runs the outcome-capable recovery pass: one bounded two-endpoint pass
@@ -1640,7 +1922,8 @@ pub async fn recover_outcomes(
         return Ok(RecoveryReport::default());
     }
     let now_ms = super::store::now_ms()?;
-    let (evaluated, observation, requests) = collect_outcomes(&pair, &attempts, now_ms).await?;
+    let (evaluated, observation, requests, missing) =
+        collect_outcomes(&pair, &attempts, now_ms).await?;
     let mut writer = writer.lock().map_err(|_| WindowStoreError::Invalid {
         detail: "audit writer mutex is poisoned".to_owned(),
     })?;
@@ -1653,6 +1936,7 @@ pub async fn recover_outcomes(
     let report = RecoveryReport {
         requests,
         evaluated: evaluated.len(),
+        missing,
     };
     if evaluated.is_empty() {
         if let Some(observation) = observation {
@@ -1706,6 +1990,7 @@ fn commit_batch(
     let report = RecoveryReport {
         requests: batch.requests,
         evaluated: batch.inputs.len(),
+        missing: batch.missing,
     };
     if batch.inputs.is_empty() {
         if let Some(observation) = batch.observation {
@@ -1913,7 +2198,7 @@ mod tests {
     }
 
     fn deciding(ledger: u32, close: u64, max_time: u64) -> Scan {
-        scan_page(&page(ledger, 1, ledger, close), ledger, max_time).unwrap()
+        scan_page(&page(ledger, 1, ledger, close), ledger, max_time, 1).unwrap()
     }
 
     /// Success confirms every record with its amount and time. Failure keeps
@@ -2102,8 +2387,8 @@ mod tests {
 
     const CAP: u32 = 100;
 
-    /// An exposed attempt of the fee-100 envelope, released at ledgers 50
-    /// and 51 when `released`, with `max_time` 10 and sequence 7.
+    /// An exposed attempt of the fee-100 envelope, released at ledger 50
+    /// on both endpoints when `released`, with `max_time` 10 and sequence 7.
     fn exposed(released: bool) -> RecoveryAttempt {
         let mut attempt = attempt(10);
         if let ExposureIdentity::Classic {
@@ -2115,7 +2400,7 @@ mod tests {
         attempt.pre_exposure_ledger = Some(20);
         attempt.sequence_release = released.then_some(SequenceReleaseInput {
             primary_ledger: 50,
-            witness_ledger: 51,
+            witness_ledger: 50,
             min_close_time_ms: 11_000,
         });
         attempt.sequence_released = released;
@@ -2281,7 +2566,7 @@ mod tests {
     fn recovery_pass_selects_one_transition_in_outcome_sequence_non_inclusion_order() {
         let release = SequenceReleaseInput {
             primary_ledger: 50,
-            witness_ledger: 51,
+            witness_ledger: 50,
             min_close_time_ms: 11_000,
         };
         let good = included("SUCCESS", result_text(true, 50));
@@ -2326,7 +2611,7 @@ mod tests {
         let evaluated = evaluate_outcome(
             &unreleased,
             Some(gone),
-            (Some(&deciding(50, 11, 10)), Some(&deciding(51, 12, 10))),
+            (Some(&deciding(50, 11, 10)), Some(&deciding(50, 11, 10))),
             None,
             (Some(60), Some(61)),
             NOW,
@@ -2355,7 +2640,7 @@ mod tests {
             (released.clone(), accounts(7, 6, (60, 61))),
             (released.clone(), accounts(6, 7, (60, 61))),
             (released.clone(), accounts(6, 6, (49, 61))),
-            (released.clone(), accounts(6, 6, (60, 50))),
+            (released.clone(), accounts(6, 6, (60, 49))),
         ];
         for (attempt, read) in &refused {
             assert!(
@@ -2418,7 +2703,7 @@ mod tests {
             [absent(21, 60), absent(5, 61)],
             [absent(5, 60), absent(21, 61)],
             [absent(5, 49), absent(5, 61)],
-            [absent(5, 60), absent(5, 50)],
+            [absent(5, 60), absent(5, 49)],
             [
                 OutcomeAnswer {
                     oldest_ledger: None,
@@ -3159,7 +3444,7 @@ mod tests {
             let input = evaluate(
                 &attempt,
                 Some(&deciding(7, 11, 10)),
-                Some(&deciding(9, 12, 10)),
+                Some(&deciding(7, 11, 10)),
                 NOW,
                 "pending",
             )
@@ -3168,7 +3453,7 @@ mod tests {
                 input.sequence_released,
                 Some(SequenceReleaseInput {
                     primary_ledger: 7,
-                    witness_ledger: 9,
+                    witness_ledger: 7,
                     min_close_time_ms: 11_000
                 })
             );
@@ -3202,13 +3487,13 @@ mod tests {
                     ledger.ledger_close_time = "11".to_owned();
                 }
             }
-            let scan = scan_page(&first, 1, 10).unwrap();
+            let scan = scan_page(&first, 1, 10, 200).unwrap();
             if boundary <= 200 {
                 assert_eq!(scan.upper, Some(boundary));
             } else {
                 assert_eq!(scan.upper, None);
                 assert_eq!(scan.cursor, 201);
-                let next = scan_page(&page(201, 1, 201, 11), scan.cursor, 10).unwrap();
+                let next = scan_page(&page(201, 1, 201, 11), scan.cursor, 10, 1).unwrap();
                 assert_eq!(next.upper, Some(201));
             }
         }
@@ -3230,7 +3515,7 @@ mod tests {
                 5 => page.latest_ledger = 4,
                 _ => page.ledgers[2].ledger_close_time = "10".to_owned(),
             }
-            assert!(scan_page(&page, 1, 10).is_none());
+            assert!(scan_page(&page, 1, 10, 200).is_none());
             let input = evaluate(&attempt, None, None, NOW, "malformed_history").unwrap();
             let recovery = input.recovery.unwrap();
             assert_eq!(recovery.primary_cursor, Some(1));
@@ -3244,7 +3529,7 @@ mod tests {
             for oldest in [2, 10, 20] {
                 let mut page = page(oldest, 1, oldest, close);
                 page.oldest_ledger = oldest;
-                let scan = scan_page(&page, 1, 10).unwrap();
+                let scan = scan_page(&page, 1, 10, 200).unwrap();
                 assert!(scan.incomplete);
                 assert!(scan.upper.is_none());
                 let input =
@@ -3299,7 +3584,7 @@ mod tests {
         evaluate(
             attempt,
             Some(&deciding(7, 11, 10)),
-            Some(&deciding(9, 12, 10)),
+            Some(&deciding(7, 11, 10)),
             NOW,
             "pending",
         )
@@ -3432,7 +3717,7 @@ mod tests {
         assert_eq!(commit_id, &commit.to_hex());
         assert_eq!(
             (*primary_ledger, *witness_ledger, *min_close_time_ms),
-            (Some(7), Some(9), Some(11_000))
+            (Some(7), Some(7), Some(11_000))
         );
         let proof = fx.record(attempt.operation_id).attempts[0]
             .sequence_released
@@ -3685,7 +3970,7 @@ mod tests {
                 &EvidenceInput {
                     sequence_released: Some(SequenceReleaseInput {
                         primary_ledger: 10,
-                        witness_ledger: 11,
+                        witness_ledger: 10,
                         min_close_time_ms: NOW + 121_000,
                     }),
                     ..EvidenceInput::default()
@@ -3791,7 +4076,7 @@ mod tests {
                     &EvidenceInput {
                         sequence_released: Some(SequenceReleaseInput {
                             primary_ledger: 10,
-                            witness_ledger: 11,
+                            witness_ledger: 10,
                             min_close_time_ms: NOW + 121_000,
                         }),
                         ..EvidenceInput::default()
@@ -3997,7 +4282,6 @@ mod tests {
     }
 
     /// The methods `server` receives, in order.
-    #[cfg(feature = "mainnet-write")]
     async fn methods(server: &MockServer) -> Vec<String> {
         server
             .received_requests()
@@ -4171,7 +4455,7 @@ mod tests {
             .collect();
         for expected in [
             "window reconcile: receipt writes stay owed",
-            "recovery: the stage refused; every sequence stays held",
+            "recovery: the stage refused; unresolved sequences stay held",
         ] {
             assert!(
                 messages.iter().any(|message| message.contains(expected)),
@@ -4276,8 +4560,84 @@ mod tests {
                 .last_pass_at_ms,
             Some(NOW)
         );
-        assert_eq!(rpc_request_count(&primary, "getLedgers").await, 2);
-        assert_eq!(rpc_request_count(&oracle, "getLedgers").await, 2);
+        assert_eq!(rpc_request_count(&primary, "getLedgers").await, 1);
+        assert_eq!(rpc_request_count(&oracle, "getLedgers").await, 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn recovery_status_labels_missing_sequence_evidence() {
+        use super::super::operations::tests::{Checked, historical_without};
+        let mut fx = Fx::new();
+        historical_without(&mut fx, 1, Checked::NotIncluded, "submission_ledger");
+        let unknown = unknown_named(&mut fx, 2).id();
+        let hash = [1 ^ 0x80; 32];
+        fx.rewrite(|wire| {
+            let record = wire
+                .operations
+                .as_mut()
+                .unwrap()
+                .records
+                .iter_mut()
+                .find(|record| record.id == unknown)
+                .unwrap();
+            let ExposureIdentity::Classic { tx_hash, .. } =
+                &mut record.attempts[0].exposure.as_mut().unwrap().identity
+            else {
+                panic!("classic attempt required");
+            };
+            *tx_hash = hash;
+        });
+        assert_eq!(
+            OperationStatus::new(&fx.store, &fx.profile)
+                .recovery_snapshot(Some(&hash))
+                .unwrap()
+                .len(),
+            1
+        );
+        let server = endpoint(7, NOW / 1000).await;
+        mount(&server, "getTransaction", json!({"status":"NOT_FOUND", "latestLedger":7,
+            "oldestLedger":1, "latestLedgerCloseTime":(NOW/1000).to_string(), "oldestLedgerCloseTime":"1"})).await;
+        let client = StellarRpcClient::new(&server.uri()).unwrap();
+        let writer = crate::submission_flow::recovery::tests::writer_at(&fx.profile.audit_log_path);
+        let home = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let (warnings, guard) = stellar_agent_test_support::WarningCapture::capture(None);
+        let answer = crate::submission_flow::transaction_status(
+            crate::submission_flow::StatusRequest {
+                profile: &fx.profile,
+                profile_name: "ops",
+                tx_hash: &stellar_agent_core::hex::encode(&hash),
+                window: &fx.store,
+                client: &client,
+                oracle: None,
+            },
+            || Ok(home.path().join("approvals")),
+            || Ok(Arc::clone(&writer)),
+        )
+        .await
+        .unwrap();
+        drop(guard);
+        assert_eq!(answer.chain_status, "NOT_FOUND");
+        let seen = warnings.seen();
+        let repair = seen
+            .iter()
+            .find(|fields| {
+                fields.get("message").is_some_and(|message| {
+                    message.starts_with("transaction status: checked receipt repair refused")
+                })
+            })
+            .unwrap();
+        assert_eq!(
+            repair.get("sequence_recovery").map(String::as_str),
+            Some("\"evidence missing\"")
+        );
+        assert!(
+            repair
+                .get("detail")
+                .unwrap()
+                .contains("missing_projection_fact:submission_ledger")
+        );
     }
 
     #[tokio::test]
@@ -4285,9 +4645,13 @@ mod tests {
         let server = MockServer::start().await;
         let client = StellarRpcClient::new(&server.uri()).unwrap();
         let shared = SharedObservation {
-            health: serde_json::from_value(json!({"status":"healthy", "latestLedger":3, "oldestLedger":1, "ledgerRetentionWindow":3})).unwrap(),
-            report: OperationalReport { latest_ledger: 3, close_time_unix: NOW / 1_000, close_lag_seconds: 0 },
-            oldest: 1, read_at: Instant::now(),
+            report: OperationalReport {
+                latest_ledger: 3,
+                close_time_unix: NOW / 1_000,
+                close_lag_seconds: 0,
+            },
+            oldest: 1,
+            read_at: Instant::now(),
         };
         let mut attempt = attempt(10);
         attempt.recovery.primary_cursor = Some(1);
@@ -4311,7 +4675,7 @@ mod tests {
             mount(&server, "getLedgers", page).await;
             let mut budget = Budget::new();
             assert!(
-                history(&client, &shared, &mut budget, &attempt, true)
+                history(&client, &shared, &mut budget, &attempt, true, 3)
                     .await
                     .unwrap()
                     .is_none()
@@ -4355,7 +4719,7 @@ mod tests {
         let oracle = endpoint(8, NOW / 1_000).await;
         Mock::given(method("POST"))
             .and(body_partial_json(
-                json!({"method":"getLedgers", "params":{"pagination":{"limit":200}}}),
+                json!({"method":"getLedgers", "params":{"pagination":{"limit":1}}}),
             ))
             .respond_with(move |request: &wiremock::Request| {
                 wiremock::Respond::respond(
@@ -4384,7 +4748,7 @@ mod tests {
             report.requests,
             RecoveryRequests {
                 attempt: 1,
-                shared: 6
+                shared: 4
             }
         );
         assert_eq!(
@@ -4411,7 +4775,7 @@ mod tests {
             ),
         )
         .await;
-        mount(&server, "getHealth", json!({"status":"healthy", "latestLedger":ledger, "oldestLedger":1, "ledgerRetentionWindow":ledger})).await;
+        mount(&server, "getHealth", json!({"status":"healthy", "latestLedger":ledger, "oldestLedger":1, "ledgerRetentionWindow":ledger,"latestLedgerCloseTime":close,"oldestLedgerCloseTime":1})).await;
         mount(
             &server,
             "getLatestLedger",
@@ -4549,11 +4913,7 @@ mod tests {
             .await;
         let client = StellarRpcClient::new(&server.uri()).unwrap();
         let mut budget = Budget::new();
-        assert!(
-            shared_observation(&client, &mut budget, NOW, None)
-                .await
-                .is_err()
-        );
+        assert!(shared_observation(&client, &mut budget, NOW).await.is_err());
         assert_eq!(budget.used.shared, 1);
         assert_eq!(rpc_request_count(&server, "getHealth").await, 1);
         assert!(
@@ -4568,13 +4928,1187 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compact_health_has_no_metadata_dependency() {
+        let server = endpoint(7, NOW / 1_000).await;
+        let client = StellarRpcClient::new(&server.uri()).unwrap();
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method":"getLatestLedger"})))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_string("x".repeat(11 * 1024 * 1024)),
+            )
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let observed = shared_observation(&client, &mut Budget::new(), NOW).await;
+        assert!(
+            observed.is_ok(),
+            "compact health must not read ledger metadata"
+        );
+        assert_eq!(methods(&server).await, ["getHealth"]);
+    }
+
+    #[tokio::test]
+    async fn singleton_history_cannot_grant_complete_history_proof() {
+        let primary = endpoint(60, NOW / 1000).await;
+        let oracle = endpoint(61, NOW / 1000).await;
+        for (server, ledger) in [(&primary, 60), (&oracle, 61)] {
+            mount(server, "getTransaction", json!({"status":"NOT_FOUND", "oldestLedger":1,
+                "latestLedger":ledger, "oldestLedgerCloseTime":"1", "latestLedgerCloseTime":NOW/1000})).await;
+        }
+        let left = StellarRpcClient::new(&primary.uri()).unwrap();
+        let right = StellarRpcClient::new(&oracle.uri()).unwrap();
+        let mut attempt = exposed(true);
+        attempt.account = None;
+        let (evaluations, _, _, failure) = collect_outcomes(
+            &EndpointPair::from_clients(&left, Some(&right)),
+            &[attempt],
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert_eq!(evaluations.len(), 1);
+        assert!(
+            evaluations[0].decision.is_none(),
+            "unpaired singles cannot release a debit through history"
+        );
+        assert_eq!(failure.unwrap().reason, RecoveryReason::CoverageRequired);
+    }
+
+    #[tokio::test]
+    async fn health_shape_and_freshness() {
+        for defect in 0..10 {
+            let server = MockServer::start().await;
+            let mut health = json!({"status":"healthy", "latestLedger":7, "oldestLedger":1,
+                "ledgerRetentionWindow":7, "latestLedgerCloseTime":NOW/1000, "oldestLedgerCloseTime":1});
+            match defect {
+                0 => {
+                    health
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("latestLedgerCloseTime");
+                }
+                1 => health["oldestLedger"] = json!(0),
+                2 => health["oldestLedger"] = json!(8),
+                3 => health["ledgerRetentionWindow"] = json!(0),
+                4 => health["status"] = json!("unhealthy"),
+                5 => health["oldestLedgerCloseTime"] = json!(0),
+                6 => health["oldestLedgerCloseTime"] = json!(NOW / 1000 + 1),
+                7 => health["latestLedgerCloseTime"] = json!(NOW / 1000 - 61),
+                8 => health["latestLedgerCloseTime"] = json!(NOW / 1000 + 61),
+                _ => {
+                    health
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("oldestLedgerCloseTime");
+                }
+            }
+            mount(&server, "getHealth", health).await;
+            let client = StellarRpcClient::new(&server.uri()).unwrap();
+            let mut budget = Budget::new();
+            assert!(
+                shared_observation(&client, &mut budget, NOW).await.is_err(),
+                "invalid health {defect}"
+            );
+            assert_eq!(
+                budget.failure.unwrap().reason,
+                if matches!(defect, 0 | 1 | 2 | 3 | 5 | 6 | 9) {
+                    RecoveryReason::MissingField
+                } else {
+                    RecoveryReason::Lagging
+                },
+                "invalid health {defect}"
+            );
+            assert_eq!(methods(&server).await, ["getHealth"]);
+        }
+        let server = endpoint(7, NOW / 1000).await;
+        let client = StellarRpcClient::new(&server.uri()).unwrap();
+        let mut observed = shared_observation(&client, &mut Budget::new(), NOW)
+            .await
+            .unwrap();
+        observed.read_at = Instant::now() - OBSERVATION_AGE - Duration::from_millis(1);
+        assert!(observed.stale());
+    }
+
+    #[tokio::test]
+    async fn recovery_unadmissible_health_reports_lagging() {
+        let server = endpoint(7, NOW / 1000 - 61).await;
+        let client = StellarRpcClient::new(&server.uri()).unwrap();
+        let batch = collect(
+            &EndpointPair::from_clients(&client, Some(&client)),
+            &[attempt(10)],
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert!(batch.inputs[0].2.sequence_released.is_none());
+        assert_eq!(
+            batch.missing,
+            Some(RecoveryFailure {
+                reason: RecoveryReason::Lagging,
+                endpoint: RecoveryEndpoint::Primary,
+                method: RecoveryMethod::GetHealth,
+                ledger: None,
+            })
+        );
+        assert_eq!(
+            methods(&server).await,
+            ["getNetwork", "getNetwork", "getHealth"]
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_tip_sequence_releases_in_one_pass() {
+        for oracle_tip in [7, 8] {
+            for outcomes in [false, true] {
+                let primary = endpoint(7, 140).await;
+                let oracle = endpoint(oracle_tip, u64::from(oracle_tip) * 20).await;
+                for (server, tip) in [(&primary, 7), (&oracle, oracle_tip)] {
+                    Mock::given(method("POST"))
+                        .and(body_partial_json(json!({"method":"getLedgers"})))
+                        .respond_with(move |request: &wiremock::Request| {
+                            let body: serde_json::Value =
+                                serde_json::from_slice(&request.body).unwrap();
+                            let start =
+                                u32::try_from(body["params"]["startLedger"].as_u64().unwrap())
+                                    .unwrap();
+                            wiremock::Respond::respond(
+                                &EchoIdResponder::new(page_json(
+                                    start,
+                                    1,
+                                    tip,
+                                    u64::from(start) * 20,
+                                )),
+                                request,
+                            )
+                        })
+                        .with_priority(1)
+                        .mount(server)
+                        .await;
+                    mount(
+                        server,
+                        "getTransaction",
+                        json!({"status":"NOT_FOUND", "oldestLedger":1, "latestLedger":tip}),
+                    )
+                    .await;
+                }
+                let left = StellarRpcClient::new(&primary.uri()).unwrap();
+                let right = StellarRpcClient::new(&oracle.uri()).unwrap();
+                let pair = EndpointPair::from_clients(&left, Some(&right));
+                let mut attempt = attempt(100);
+                let mut passes = 0;
+                let mut requests = RecoveryRequests::default();
+                let release = loop {
+                    passes += 1;
+                    let (input, used) = if outcomes {
+                        let (mut evaluations, _, used, missing) =
+                            collect_outcomes(&pair, &[attempt.clone()], 140_000)
+                                .await
+                                .unwrap();
+                        assert!(missing.is_none());
+                        (evaluations.remove(0).input, used)
+                    } else {
+                        let mut batch = collect(&pair, &[attempt.clone()], 140_000).await.unwrap();
+                        assert!(batch.missing.is_none());
+                        (batch.inputs.remove(0).2, batch.requests)
+                    };
+                    requests.attempt += used.attempt;
+                    requests.shared += used.shared;
+                    if let Some(release) = input.sequence_released {
+                        break release;
+                    }
+                    assert!(passes < 7, "the expired sequence must release");
+                    attempt.recovery = input.recovery.unwrap();
+                };
+                assert_eq!(passes, 1);
+                assert_eq!(
+                    requests,
+                    RecoveryRequests {
+                        attempt: if outcomes { 4 } else { 2 },
+                        shared: 4
+                    }
+                );
+                assert_eq!((release.primary_ledger, release.witness_ledger), (7, 7));
+                assert_eq!(release.min_close_time_ms, 140_000);
+                assert_eq!(requested_starts(&primary).await, [7]);
+                assert_eq!(requested_starts(&oracle).await, [7]);
+                assert_eq!(
+                    primary.received_requests().await.unwrap().len()
+                        + oracle.received_requests().await.unwrap().len(),
+                    if outcomes { 8 } else { 6 }
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn recovery_target_coverage_waits_for_equal_tips() {
+        for primary_ahead in [true, false] {
+            for saved_upper in [false, true] {
+                for outcomes in [false, true] {
+                    let mut fx = Fx::new();
+                    let id = super::super::operations::tests::unknown_with(
+                        &mut fx,
+                        1,
+                        NOW / 1000 - 1,
+                        vec![],
+                    )
+                    .id();
+                    let account =
+                        stellar_agent_test_support::signed_envelope::account_id_for_seed([1; 32]);
+                    fx.rewrite(|wire| {
+                        let auth = &mut wire.authorizations[0];
+                        let super::super::DomainBinding::Transaction { source, .. } =
+                            &mut auth.binding
+                        else {
+                            panic!("classic binding required");
+                        };
+                        *source = account.clone();
+                        auth.native_reservation = Some(super::super::NativeReservation {
+                            debit_stroops: 25,
+                            fee_stroops: 100,
+                        });
+                    });
+                    if saved_upper {
+                        fx.recorder()
+                            .record_evidence(
+                                id,
+                                1,
+                                &EvidenceInput {
+                                    recovery: Some(RecoveryUpdate {
+                                        primary_upper: primary_ahead.then_some(9),
+                                        witness_upper: (!primary_ahead).then_some(9),
+                                        ..RecoveryUpdate::default()
+                                    }),
+                                    ..EvidenceInput::default()
+                                },
+                            )
+                            .unwrap();
+                    }
+                    let held = OperationStatus::new(&fx.store, &fx.profile)
+                        .native_reserved_stroops(None)
+                        .unwrap();
+                    assert_eq!(held, 125);
+                    for pass in 0..3 {
+                        let tips = if pass > 0 {
+                            [9, 9]
+                        } else if primary_ahead {
+                            [9, 7]
+                        } else {
+                            [7, 9]
+                        };
+                        let primary = endpoint(tips[0], NOW / 1000).await;
+                        let oracle = endpoint(tips[1], NOW / 1000).await;
+                        for (index, server) in [&primary, &oracle].into_iter().enumerate() {
+                            let oldest = if !saved_upper && (index == 0) == primary_ahead {
+                                9
+                            } else {
+                                1
+                            };
+                            Mock::given(method("POST"))
+                                .and(body_partial_json(json!({"method":"getHealth"})))
+                                .respond_with(EchoIdResponder::new(json!({
+                                    "status":"healthy", "latestLedger":tips[index], "oldestLedger":oldest,
+                                    "ledgerRetentionWindow":tips[index] - oldest + 1,
+                                    "latestLedgerCloseTime":NOW/1000, "oldestLedgerCloseTime":1
+                                })))
+                                .with_priority(1).mount(server).await;
+                            mount(server, "getTransaction", json!({
+                                "status":"NOT_FOUND", "latestLedger":tips[index], "oldestLedger":1
+                            })).await;
+                        }
+                        let left = StellarRpcClient::new(&primary.uri()).unwrap();
+                        let right = StellarRpcClient::new(&oracle.uri()).unwrap();
+                        let pair = EndpointPair::from_clients(&left, Some(&right));
+                        let attempts = OperationStatus::new(&fx.store, &fx.profile)
+                            .outcome_snapshot(None)
+                            .unwrap();
+                        for (server, tip) in [(&primary, tips[0]), (&oracle, tips[1])] {
+                            let mut answer = stellar_agent_test_support::signed_envelope::ledger_entries_result_for(&[&account]);
+                            answer["latestLedger"] = json!(tip);
+                            mount(server, "getLedgerEntries", answer).await;
+                        }
+                        let batch = if outcomes {
+                            let (evaluations, observation, requests, missing) =
+                                collect_outcomes(&pair, &attempts, NOW).await.unwrap();
+                            assert_eq!(evaluations.len(), 1);
+                            if pass < 2 {
+                                assert!(evaluations[0].decision.is_none());
+                            } else {
+                                assert!(matches!(
+                                    evaluations[0].decision,
+                                    Some((
+                                        DecidedTransition::NotIncluded(
+                                            NotIncludedProof::AccountSequence { .. }
+                                        ),
+                                        _,
+                                        _
+                                    ))
+                                ));
+                            }
+                            Batch {
+                                inputs: evaluations
+                                    .into_iter()
+                                    .map(|e| {
+                                        (e.attempt.operation_id, e.attempt.attempt_index, e.input)
+                                    })
+                                    .collect(),
+                                observation,
+                                requests,
+                                missing,
+                            }
+                        } else {
+                            collect(&pair, &attempts, NOW).await.unwrap()
+                        };
+                        if pass == 0 {
+                            assert!(batch.inputs[0].2.sequence_released.is_none());
+                            assert_eq!(
+                                batch.missing,
+                                Some(RecoveryFailure {
+                                    reason: RecoveryReason::CoverageRequired,
+                                    endpoint: if primary_ahead {
+                                        RecoveryEndpoint::Primary
+                                    } else {
+                                        RecoveryEndpoint::Oracle
+                                    },
+                                    method: RecoveryMethod::GetLedgers,
+                                    ledger: Some(7),
+                                })
+                            );
+                            assert_eq!(
+                                requested_starts(if primary_ahead { &primary } else { &oracle })
+                                    .await,
+                                Vec::<u64>::new()
+                            );
+                            assert_eq!(
+                                requested_starts(if primary_ahead { &oracle } else { &primary })
+                                    .await,
+                                [7]
+                            );
+                        } else {
+                            assert!(batch.missing.is_none());
+                            if pass == 1 {
+                                let release = batch.inputs[0].2.sequence_released.unwrap();
+                                assert_eq!(
+                                    (release.primary_ledger, release.witness_ledger),
+                                    (9, 9)
+                                );
+                                assert_eq!(requested_starts(&primary).await, [9]);
+                                assert_eq!(requested_starts(&oracle).await, [9]);
+                            }
+                        }
+                        let report = commit_batch(&mut fx.recorder(), batch).unwrap();
+                        if pass == 0 {
+                            assert!(matches!(
+                                report.require_evidence(),
+                                Err(RecoveryError::NeedsEvidence(RecoveryFailure {
+                                    reason: RecoveryReason::CoverageRequired,
+                                    ..
+                                }))
+                            ));
+                        }
+                        let record = fx.record(id);
+                        assert_eq!(record.attempts[0].sequence_released.is_some(), pass > 0);
+                        assert_eq!(record.state, OperationState::SentOutcomeUnknown);
+                        assert_eq!(
+                            OperationStatus::new(&fx.store, &fx.profile)
+                                .native_reserved_stroops(None)
+                                .unwrap(),
+                            held
+                        );
+                        assert_eq!(
+                            fx.sink
+                                .entries
+                                .iter()
+                                .filter(|entry| matches!(
+                                    entry.event_kind,
+                                    EventKind::OperationEvidence {
+                                        sequence_released: true,
+                                        ..
+                                    }
+                                ))
+                                .count(),
+                            usize::from(pass > 0)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn unmatched_release_fixture() -> (Fx, OperationId, String) {
+        use super::super::operations::tests::unknown_with;
+
+        let mut fx = Fx::new();
+        let id = unknown_with(&mut fx, 1, NOW / 1000 - 1, vec![]).id();
+        let account = stellar_agent_test_support::signed_envelope::account_id_for_seed([1; 32]);
+        fx.rewrite(|wire| {
+            let auth = &mut wire.authorizations[0];
+            let super::super::DomainBinding::Transaction { source, .. } = &mut auth.binding else {
+                panic!("classic binding required");
+            };
+            *source = account.clone();
+            auth.native_reservation = Some(super::super::NativeReservation {
+                debit_stroops: 25,
+                fee_stroops: 100,
+            });
+        });
+        fx.recorder()
+            .record_evidence(
+                id,
+                1,
+                &EvidenceInput {
+                    sequence_released: Some(SequenceReleaseInput {
+                        primary_ledger: 50,
+                        witness_ledger: 51,
+                        min_close_time_ms: NOW,
+                    }),
+                    ..EvidenceInput::default()
+                },
+            )
+            .unwrap();
+        (fx, id, account)
+    }
+
+    async fn unmatched_release_endpoints(account: &str, tips: [u32; 2]) -> [MockServer; 2] {
+        let servers = [
+            endpoint(tips[0], NOW / 1000).await,
+            endpoint(tips[1], NOW / 1000).await,
+        ];
+        for (server, tip) in servers.iter().zip(tips) {
+            Mock::given(method("POST"))
+                .and(body_partial_json(json!({"method":"getHealth"})))
+                .respond_with(EchoIdResponder::new(json!({
+                    "status":"healthy", "latestLedger":tip, "oldestLedger":tip,
+                    "ledgerRetentionWindow":1,
+                    "latestLedgerCloseTime":NOW/1000, "oldestLedgerCloseTime":NOW/1000
+                })))
+                .with_priority(1)
+                .mount(server)
+                .await;
+            mount(
+                server,
+                "getTransaction",
+                json!({
+                    "status":"NOT_FOUND", "oldestLedger":1, "latestLedger":tip
+                }),
+            )
+            .await;
+            let mut answer =
+                stellar_agent_test_support::signed_envelope::ledger_entries_result_for(&[account]);
+            answer["latestLedger"] = json!(tip);
+            mount(server, "getLedgerEntries", answer).await;
+        }
+        servers
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn recovery_unmatched_stored_release_keeps_debit_when_target_unreadable() {
+        let (mut fx, id, account) = unmatched_release_fixture();
+        let attempts = OperationStatus::new(&fx.store, &fx.profile)
+            .outcome_snapshot(None)
+            .unwrap();
+        assert!(
+            classify_non_inclusion(
+                &attempts[0],
+                &[absent(1, 60), absent(1, 59)],
+                Some(&accounts(0, 0, (60, 59))),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            OperationStatus::new(&fx.store, &fx.profile)
+                .recovery_snapshot(None)
+                .unwrap()
+                .len(),
+            1
+        );
+        let ExposureIdentity::Classic {
+            envelope_sha256, ..
+        } = attempts[0].exposure
+        else {
+            panic!("classic exposure required");
+        };
+        assert!(
+            !OperationStatus::new(&fx.store, &fx.profile)
+                .sequence_released_unlocked(
+                    &stellar_agent_core::profile::receipt::AttemptRef::EnvelopeHash(
+                        envelope_sha256
+                    )
+                )
+                .unwrap()
+        );
+        let [primary, oracle] = unmatched_release_endpoints(&account, [60, 59]).await;
+        let left = StellarRpcClient::new(&primary.uri()).unwrap();
+        let right = StellarRpcClient::new(&oracle.uri()).unwrap();
+        let (evaluations, _, _, missing) = collect_outcomes(
+            &EndpointPair::from_clients(&left, Some(&right)),
+            &attempts,
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert_eq!(evaluations.len(), 1);
+        assert!(evaluations[0].decision.is_none());
+        assert!(evaluations[0].input.sequence_released.is_none());
+        assert_eq!(
+            missing,
+            Some(RecoveryFailure {
+                reason: RecoveryReason::CoverageRequired,
+                endpoint: RecoveryEndpoint::Primary,
+                method: RecoveryMethod::GetLedgers,
+                ledger: Some(59),
+            })
+        );
+        assert_eq!(requested_starts(&primary).await, Vec::<u64>::new());
+        assert_eq!(requested_starts(&oracle).await, [59]);
+        fx.recorder()
+            .record_evidence(id, 1, &evaluations[0].input)
+            .unwrap();
+        assert_eq!(fx.record(id).state, OperationState::SentOutcomeUnknown);
+        let release = fx.record(id).attempts[0].sequence_released.clone().unwrap();
+        assert_eq!((release.primary_ledger, release.witness_ledger), (50, 51));
+        assert_eq!(
+            OperationStatus::new(&fx.store, &fx.profile)
+                .native_reserved_stroops(None)
+                .unwrap(),
+            125
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn recovery_unmatched_stored_release_reads_target_once_then_decides() {
+        let (mut fx, id, account) = unmatched_release_fixture();
+        for pass in 0..3 {
+            let [primary, oracle] = unmatched_release_endpoints(&account, [60, 60]).await;
+            let left = StellarRpcClient::new(&primary.uri()).unwrap();
+            let right = StellarRpcClient::new(&oracle.uri()).unwrap();
+            let attempts = OperationStatus::new(&fx.store, &fx.profile)
+                .outcome_snapshot(None)
+                .unwrap();
+            let (evaluations, _, _, missing) = collect_outcomes(
+                &EndpointPair::from_clients(&left, Some(&right)),
+                &attempts,
+                NOW,
+            )
+            .await
+            .unwrap();
+            assert!(missing.is_none());
+            assert_eq!(evaluations.len(), usize::from(pass < 2));
+            let starts: Vec<u64> = if pass == 0 { vec![60] } else { vec![] };
+            assert_eq!(requested_starts(&primary).await, starts);
+            assert_eq!(requested_starts(&oracle).await, starts);
+            if let Some(evaluation) = evaluations.into_iter().next() {
+                if pass == 0 {
+                    assert!(evaluation.decision.is_none());
+                    let release = evaluation.input.sequence_released.unwrap();
+                    assert_eq!((release.primary_ledger, release.witness_ledger), (60, 60));
+                } else {
+                    assert!(evaluation.input.sequence_released.is_none());
+                    assert!(matches!(
+                        evaluation.decision,
+                        Some((
+                            DecidedTransition::NotIncluded(
+                                NotIncludedProof::AccountSequence { .. }
+                            ),
+                            _,
+                            _
+                        ))
+                    ));
+                }
+                fx.recorder()
+                    .record_evidence(id, 1, &evaluation.input)
+                    .unwrap();
+                assert_eq!(
+                    OperationStatus::new(&fx.store, &fx.profile)
+                        .native_reserved_stroops(None)
+                        .unwrap(),
+                    125
+                );
+                if let Some((transition, digest, ledgers)) = evaluation.decision {
+                    let fresh = OperationStatus::new(&fx.store, &fx.profile)
+                        .outcome_snapshot(None)
+                        .unwrap()
+                        .remove(0);
+                    let decision = CheckedRecoveryDecision::new(
+                        &fresh,
+                        digest,
+                        ledgers,
+                        transition,
+                        evaluation.input.recovery.unwrap(),
+                    )
+                    .unwrap();
+                    fx.recorder().commit_decision(&decision).unwrap();
+                }
+            }
+            let release = fx.record(id).attempts[0].sequence_released.clone().unwrap();
+            assert_eq!((release.primary_ledger, release.witness_ledger), (60, 60));
+            assert_eq!(
+                fx.sink
+                    .entries
+                    .iter()
+                    .filter(|entry| matches!(
+                        entry.event_kind,
+                        EventKind::OperationEvidence {
+                            sequence_released: true,
+                            ..
+                        }
+                    ))
+                    .count(),
+                2
+            );
+            assert_eq!(
+                fx.record(id).state,
+                if pass == 0 {
+                    OperationState::SentOutcomeUnknown
+                } else {
+                    OperationState::NotIncluded
+                }
+            );
+            assert_eq!(
+                OperationStatus::new(&fx.store, &fx.profile)
+                    .native_reserved_stroops(None)
+                    .unwrap(),
+                if pass == 0 { 125 } else { 0 }
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_sequence_release_requires_matching_ledger_and_close() {
+        for (ledger, close) in [(9, 11), (7, 12)] {
+            let input = evaluate(
+                &attempt(10),
+                Some(&deciding(7, 11, 10)),
+                Some(&deciding(ledger, close, 10)),
+                NOW,
+                "pending",
+            )
+            .unwrap();
+            assert!(input.sequence_released.is_none());
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn recovery_history_failures_keep_each_reads_reason() {
+        for parse_first in [true, false] {
+            let mut fx = Fx::new();
+            let ids = [
+                unknown_named(&mut fx, 1).id(),
+                unknown_named(&mut fx, 2).id(),
+            ];
+            for (id, ledger) in ids.iter().zip([1, 2]) {
+                fx.recorder()
+                    .record_evidence(
+                        *id,
+                        1,
+                        &EvidenceInput {
+                            recovery: Some(RecoveryUpdate {
+                                primary_cursor: Some(ledger),
+                                witness_cursor: Some(ledger),
+                                primary_upper: Some(ledger),
+                                witness_upper: Some(ledger),
+                                ..RecoveryUpdate::default()
+                            }),
+                            ..EvidenceInput::default()
+                        },
+                    )
+                    .unwrap();
+            }
+            let mut attempts = OperationStatus::new(&fx.store, &fx.profile)
+                .recovery_snapshot(None)
+                .unwrap();
+            attempts.sort_by_key(|attempt| attempt.recovery.primary_upper);
+            let primary = endpoint(7, NOW / 1000).await;
+            let oracle = endpoint(7, NOW / 1000).await;
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            Mock::given(method("POST"))
+                .and(body_partial_json(json!({"method":"getLedgers"})))
+                .respond_with(move |request: &wiremock::Request| {
+                    let first = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                    if first == parse_first {
+                        wiremock::Respond::respond(
+                            &EchoIdResponder::new(json!({"ledgers":"invalid"})),
+                            request,
+                        )
+                    } else {
+                        wiremock::ResponseTemplate::new(500)
+                    }
+                })
+                .with_priority(1)
+                .mount(&primary)
+                .await;
+            let left = StellarRpcClient::new(&primary.uri()).unwrap();
+            let right = StellarRpcClient::new(&oracle.uri()).unwrap();
+            let batch = collect(
+                &EndpointPair::from_clients(&left, Some(&right)),
+                &attempts,
+                NOW,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                batch.requests,
+                RecoveryRequests {
+                    attempt: 4,
+                    shared: 4
+                }
+            );
+            assert!(
+                batch
+                    .inputs
+                    .iter()
+                    .all(|(_, _, input)| input.sequence_released.is_none())
+            );
+            commit_batch(&mut fx.recorder(), batch).unwrap();
+            for (id, ledger) in ids.iter().zip([1, 2]) {
+                let record = fx.record(*id);
+                let recovery = record.attempts[0].recovery.as_ref().unwrap();
+                assert_eq!(
+                    recovery.diagnostic.as_ref().map(|reason| reason.text()),
+                    Some(if (ledger == 1) == parse_first {
+                        "malformed_history"
+                    } else {
+                        "endpoint_unreachable"
+                    })
+                );
+            }
+            assert_eq!(requested_starts(&primary).await, [7, 7]);
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_not_found_without_latest_records_missing_field() {
+        for missing_primary in [false, true] {
+            let primary = endpoint(60, NOW / 1000).await;
+            let oracle = endpoint(60, NOW / 1000).await;
+            for (server, missing) in [(&primary, missing_primary), (&oracle, !missing_primary)] {
+                let mut answer = json!({"status":"NOT_FOUND", "oldestLedger":1, "latestLedger":60});
+                if missing {
+                    answer.as_object_mut().unwrap().remove("latestLedger");
+                }
+                mount(server, "getTransaction", answer).await;
+            }
+            let left = StellarRpcClient::new(&primary.uri()).unwrap();
+            let right = StellarRpcClient::new(&oracle.uri()).unwrap();
+            let (evaluations, _, requests, missing) = collect_outcomes(
+                &EndpointPair::from_clients(&left, Some(&right)),
+                &[exposed(true)],
+                NOW,
+            )
+            .await
+            .unwrap();
+            assert_eq!(evaluations.len(), 1);
+            assert!(evaluations[0].decision.is_none());
+            assert!(evaluations[0].input.sequence_released.is_none());
+            assert_eq!(
+                evaluations[0]
+                    .input
+                    .recovery
+                    .as_ref()
+                    .unwrap()
+                    .diagnostic
+                    .as_deref(),
+                Some(MISSING_FIELD)
+            );
+            let expected = RecoveryFailure {
+                reason: RecoveryReason::MissingField,
+                endpoint: if missing_primary {
+                    RecoveryEndpoint::Primary
+                } else {
+                    RecoveryEndpoint::Oracle
+                },
+                method: RecoveryMethod::GetTransaction,
+                ledger: None,
+            };
+            assert_eq!(missing, Some(expected));
+            let report = RecoveryReport {
+                requests,
+                evaluated: evaluations.len(),
+                missing,
+            };
+            assert!(
+                matches!(report.require_evidence(), Err(RecoveryError::NeedsEvidence(failure)) if failure == expected)
+            );
+        }
+    }
+
+    async fn account_recovery_fixture(
+        primary_account: serde_json::Value,
+        account: String,
+    ) -> (Vec<Evaluated>, Option<RecoveryFailure>) {
+        let primary = endpoint(60, NOW / 1000).await;
+        let oracle = endpoint(60, NOW / 1000).await;
+        for server in [&primary, &oracle] {
+            mount(
+                server,
+                "getTransaction",
+                json!({"status":"NOT_FOUND", "oldestLedger":1, "latestLedger":60}),
+            )
+            .await;
+        }
+        mount(&primary, "getLedgerEntries", primary_account).await;
+        let mut valid =
+            stellar_agent_test_support::signed_envelope::ledger_entries_result_for(&[&account]);
+        valid["latestLedger"] = json!(60);
+        mount(&oracle, "getLedgerEntries", valid).await;
+        let left = StellarRpcClient::new(&primary.uri()).unwrap();
+        let right = StellarRpcClient::new(&oracle.uri()).unwrap();
+        let mut attempt = exposed(true);
+        attempt.account = Some(account);
+        let (evaluations, _, _, failure) = collect_outcomes(
+            &EndpointPair::from_clients(&left, Some(&right)),
+            &[attempt],
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert_eq!(evaluations.len(), 1);
+        (evaluations, failure)
+    }
+
+    #[tokio::test]
+    async fn recovery_account_read_below_its_health_tip_refuses() {
+        let account = stellar_agent_test_support::signed_envelope::account_id_for_seed([1; 32]);
+        for latest in [60, 55] {
+            let mut answer =
+                stellar_agent_test_support::signed_envelope::ledger_entries_result_for(&[&account]);
+            answer["latestLedger"] = json!(latest);
+            let (evaluations, failure) = account_recovery_fixture(answer, account.clone()).await;
+            if latest == 60 {
+                assert!(matches!(
+                    evaluations[0].decision,
+                    Some((
+                        DecidedTransition::NotIncluded(NotIncludedProof::AccountSequence { .. }),
+                        _,
+                        _
+                    ))
+                ));
+                assert!(failure.is_none());
+            } else {
+                assert!(evaluations[0].decision.is_none());
+                assert!(evaluations[0].input.sequence_released.is_none());
+                assert_eq!(
+                    failure,
+                    Some(RecoveryFailure {
+                        reason: RecoveryReason::AccountUnavailable,
+                        endpoint: RecoveryEndpoint::Primary,
+                        method: RecoveryMethod::GetLedgerEntries,
+                        ledger: None
+                    })
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_missing_and_undecodable_accounts_keep_their_reasons() {
+        let account = stellar_agent_test_support::signed_envelope::account_id_for_seed([1; 32]);
+        for missing in [true, false] {
+            let mut answer =
+                stellar_agent_test_support::signed_envelope::ledger_entries_result_for(&[&account]);
+            answer["latestLedger"] = json!(60);
+            let reason = if missing {
+                answer["entries"] = json!([]);
+                RecoveryReason::CoverageRequired
+            } else {
+                answer["entries"][0]["xdr"] = json!("invalid");
+                RecoveryReason::MissingField
+            };
+            let (evaluations, failure) = account_recovery_fixture(answer, account.clone()).await;
+            assert!(evaluations[0].decision.is_none());
+            assert!(evaluations[0].input.sequence_released.is_none());
+            assert_eq!(
+                failure,
+                Some(RecoveryFailure {
+                    reason,
+                    endpoint: RecoveryEndpoint::Primary,
+                    method: RecoveryMethod::GetLedgerEntries,
+                    ledger: None
+                })
+            );
+        }
+    }
+
+    async fn streamed_response(truncated: bool) -> (StellarRpcClient, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client =
+            StellarRpcClient::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut buffer = [0; 4096];
+            let request: serde_json::Value = loop {
+                let count = stream.read(&mut buffer).await.unwrap();
+                assert_ne!(count, 0);
+                bytes.extend_from_slice(&buffer[..count]);
+                if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n")
+                    && let Ok(request) = serde_json::from_slice(&bytes[end + 4..])
+                {
+                    break request;
+                }
+            };
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await.unwrap();
+            let body = serde_json::to_vec(&json!({"jsonrpc":"2.0", "id":request["id"],
+                "result":{"status":"NOT_FOUND", "padding":"x".repeat(if truncated { 100 } else { 11 * 1024 * 1024 })}})).unwrap();
+            if truncated {
+                stream.write_all(b"1000\r\n{").await.unwrap();
+                return;
+            }
+            for chunk in body.chunks(16 * 1024) {
+                let header = format!("{:x}\r\n", chunk.len());
+                if stream.write_all(header.as_bytes()).await.is_err()
+                    || stream.write_all(chunk).await.is_err()
+                    || stream.write_all(b"\r\n").await.is_err()
+                {
+                    return;
+                }
+            }
+            let _ = stream.write_all(b"0\r\n\r\n").await;
+        });
+        (client, task)
+    }
+
+    #[tokio::test]
+    async fn stream_length_limit_is_oversize() {
+        let (client, server) = streamed_response(false).await;
+        let mut budget = Budget::new();
+        budget.context(
+            RecoveryEndpoint::Oracle,
+            RecoveryMethod::GetTransaction,
+            None,
+        );
+        assert!(
+            budget
+                .read(
+                    false,
+                    client.recovery_transaction(&stellar_xdr::Hash([0; 32]))
+                )
+                .await
+                .is_err()
+        );
+        server.await.unwrap();
+        assert_eq!(
+            budget.failure.unwrap().reason,
+            RecoveryReason::ResponseTooLarge
+        );
+        assert_eq!(budget.used.attempt, 1);
+    }
+
+    #[tokio::test]
+    async fn other_stream_error_is_transport() {
+        let (client, server) = streamed_response(true).await;
+        let error = client
+            .recovery_transaction(&stellar_xdr::Hash([0; 32]))
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert_eq!(read_failure(&error), RecoveryReason::Transport);
+    }
+
+    #[tokio::test]
+    async fn non_history_oversize_is_typed() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_string("x".repeat(11 * 1024 * 1024)),
+            )
+            .mount(&server)
+            .await;
+        let client = StellarRpcClient::new(&server.uri()).unwrap();
+        let hash = stellar_xdr::Hash([0; 32]);
+        let account = stellar_agent_test_support::signed_envelope::account_id_for_seed([1; 32]);
+        let report = OperationalReport {
+            latest_ledger: 1,
+            close_time_unix: NOW / 1000,
+            close_lag_seconds: 0,
+        };
+        let errors = [
+            client.recovery_identity().await.unwrap_err(),
+            client.recovery_health().await.unwrap_err(),
+            client.recovery_transaction(&hash).await.unwrap_err(),
+            crate::account::fetch_account_recovery(&client, &account, &report)
+                .await
+                .unwrap_err(),
+        ];
+        for error in errors {
+            assert_eq!(read_failure(&error), RecoveryReason::ResponseTooLarge);
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn recovery_reads_one_measured_ledger() {
+        let server = endpoint(7, NOW / 1000).await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method":"getLedgers"})))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let start = u32::try_from(body["params"]["startLedger"].as_u64().unwrap()).unwrap();
+                if body["params"]["pagination"]["limit"] == 200 {
+                    let mut result = page_json(start, 200, start + 199, NOW / 1000);
+                    result["ledgers"][0]["metadataXdr"] = json!("x".repeat(11 * 1024 * 1024));
+                    return wiremock::ResponseTemplate::new(200)
+                        .insert_header("transfer-encoding", "chunked")
+                        .set_body_json(json!({"jsonrpc":"2.0", "id":body["id"], "result":result}));
+                }
+                let mut result = page_json(start, 1, 7, NOW / 1000);
+                result["ledgers"][0]["metadataXdr"] = json!("x".repeat(1_009_496));
+                let mut answer = json!({"jsonrpc":"2.0","id":body["id"],"result":result});
+                let padding = 1_010_468 - serde_json::to_vec(&answer).unwrap().len() - 13;
+                answer["padding"] = json!("x".repeat(padding));
+                assert_eq!(serde_json::to_vec(&answer).unwrap().len(), 1_010_468);
+                wiremock::ResponseTemplate::new(200).set_body_json(answer)
+            })
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let client = StellarRpcClient::new(&server.uri()).unwrap();
+        let batch = collect(
+            &EndpointPair::from_clients(&client, Some(&client)),
+            &[attempt(NOW / 1000 - 1)],
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert!(batch.inputs[0].2.sequence_released.is_some());
+        assert!(batch.missing.is_none());
+        assert_eq!(
+            batch.requests,
+            RecoveryRequests {
+                attempt: 2,
+                shared: 4
+            }
+        );
+        for request in server.received_requests().await.unwrap() {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            if body["method"] == "getLedgers" {
+                assert_eq!(
+                    body["params"]["pagination"]["limit"], 1,
+                    "recovery reads at most one ledger"
+                );
+            }
+        }
+        let error = client
+            .inner
+            .get_ledgers(LedgerStart::Ledger(1), Some(200), None)
+            .await
+            .unwrap_err();
+        assert_eq!(rpc_failure(&error), RecoveryReason::ResponseTooLarge);
+        let stellar_rpc_client::Error::JsonRpc(jsonrpsee_core::ClientError::Transport(error)) =
+            error
+        else {
+            panic!("stream transport error required");
+        };
+        assert!(
+            matches!(error.downcast_ref::<jsonrpsee_http_client::transport::Error>(),
+            Some(jsonrpsee_http_client::transport::Error::Http(jsonrpsee_core::http_helpers::HttpError::Stream(error)))
+                if stream_is_length_limit(error.as_ref()))
+        );
+    }
+
+    #[test]
+    fn retention_close_times_are_preserved() {
+        let observed = observed(
+            json!({"status":"NOT_FOUND", "oldestLedger":1, "latestLedger":7,
+            "oldestLedgerCloseTime":"10", "latestLedgerCloseTime":20}),
+        );
+        assert_eq!(observed.oldest_ledger_close_time, Some(json!("10")));
+        assert_eq!(observed.latest_ledger_close_time, Some(json!(20)));
+        let absent = crate::ObservedTransaction::from_json(&json!({"status":"NOT_FOUND"})).unwrap();
+        assert_eq!(absent.oldest_ledger_close_time, None);
+        assert_eq!(absent.latest_ledger_close_time, None);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_is_typed() {
+        for status in [429, 503] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(wiremock::ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+            let client = StellarRpcClient::new(&server.uri()).unwrap();
+            let error = client.recovery_health().await.unwrap_err();
+            assert_eq!(read_failure(&error), RecoveryReason::RateLimited);
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(json!({"jsonrpc":"2.0", "id":body["id"],
+                "error":{"code":-32001,"message":"provider secret"}}))
+            })
+            .mount(&server)
+            .await;
+        let client = StellarRpcClient::new(&server.uri()).unwrap();
+        let mut budget = Budget::new();
+        assert!(budget.read(true, client.recovery_health()).await.is_err());
+        assert_eq!(budget.failure.unwrap().reason, RecoveryReason::RateLimited);
+        assert!(
+            !serde_json::to_string(&budget.failure)
+                .unwrap()
+                .contains("secret")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn all_reads_share_absolute_deadline() {
+        for method in [
+            RecoveryMethod::GetNetwork,
+            RecoveryMethod::GetHealth,
+            RecoveryMethod::GetTransaction,
+            RecoveryMethod::GetLedgers,
+            RecoveryMethod::GetLedgerEntries,
+        ] {
+            let mut budget = Budget::new();
+            budget.context(RecoveryEndpoint::Oracle, method, Some(7));
+            let start = Instant::now();
+            assert_eq!(
+                budget.read::<(), ()>(false, std::future::pending()).await,
+                Err(ReadFailure::Deadline)
+            );
+            assert_eq!(Instant::now() - start, Duration::from_secs(20));
+            let failure = budget.failure.unwrap();
+            assert_eq!(
+                failure,
+                RecoveryFailure {
+                    reason: RecoveryReason::Deadline,
+                    endpoint: RecoveryEndpoint::Oracle,
+                    method,
+                    ledger: Some(7)
+                }
+            );
+            assert_eq!(
+                budget.read(false, async { Ok::<_, ()>(()) }).await,
+                Err(ReadFailure::Deadline)
+            );
+            assert_eq!(budget.used.attempt, 1);
+            let report = RecoveryReport {
+                requests: budget.used,
+                evaluated: 0,
+                missing: Some(failure),
+            };
+            assert!(
+                matches!(report.require_evidence(), Err(RecoveryError::NeedsEvidence(seen)) if seen == failure)
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn recovery_four_attempts_use_eight_history_requests() {
         let primary = endpoint(7, NOW / 1_000).await;
         let oracle = endpoint(8, NOW / 1_000).await;
         let calls = std::sync::atomic::AtomicUsize::new(0);
         Mock::given(method("POST"))
             .and(body_partial_json(
-                json!({"method":"getLedgers", "params":{"pagination":{"limit":200}}}),
+                json!({"method":"getLedgers", "params":{"pagination":{"limit":1}}}),
             ))
             .respond_with(move |request: &wiremock::Request| {
                 let delay = if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
@@ -4610,13 +6144,13 @@ mod tests {
             batch.requests,
             RecoveryRequests {
                 attempt: 8,
-                shared: 9
+                shared: 6
             }
         );
         assert_eq!(
             primary.received_requests().await.unwrap().len()
                 + oracle.received_requests().await.unwrap().len(),
-            17
+            14
         );
         assert!(start.elapsed() < PASS_DURATION);
     }
@@ -4628,7 +6162,7 @@ mod tests {
         for (server, ledger) in [(&primary, 7), (&oracle, 8)] {
             Mock::given(method("POST"))
                 .and(body_partial_json(
-                    json!({"method":"getLedgers", "params":{"pagination":{"limit":200}}}),
+                    json!({"method":"getLedgers", "params":{"pagination":{"limit":1}}}),
                 ))
                 .respond_with(move |request: &wiremock::Request| {
                     wiremock::Respond::respond(
@@ -4653,7 +6187,7 @@ mod tests {
             batch.requests,
             RecoveryRequests {
                 attempt: 4,
-                shared: 9
+                shared: 6
             }
         );
         assert_eq!(batch.inputs.len(), 4);
@@ -4693,7 +6227,7 @@ mod tests {
                     &EvidenceInput {
                         sequence_released: Some(SequenceReleaseInput {
                             primary_ledger: 7,
-                            witness_ledger: 8,
+                            witness_ledger: 7,
                             min_close_time_ms: NOW,
                         }),
                         ..EvidenceInput::default()
@@ -4718,7 +6252,7 @@ mod tests {
         assert_eq!(report.evaluated, 1);
         let proof = proof_of(&fx, ids[4]).expect("the fifth attempt releases");
         assert_eq!(proof["primary_ledger"], 7);
-        assert_eq!(proof["witness_ledger"], 8);
+        assert_eq!(proof["witness_ledger"], 7);
     }
 
     #[cfg(feature = "mainnet-write")]
@@ -4901,7 +6435,7 @@ mod tests {
         }
         Mock::given(method("POST"))
             .and(body_partial_json(
-                json!({"method":"getLedgers", "params":{"pagination":{"limit":200}}}),
+                json!({"method":"getLedgers", "params":{"pagination":{"limit":1}}}),
             ))
             .respond_with(move |request: &wiremock::Request| {
                 ledgers_responder(7, NOW / 1_000)(request).set_delay(Duration::from_millis(800))

@@ -705,6 +705,15 @@ async fn fetch_account_at(
         .await
         .map_err(|e| map_rpc_error_generic(&e, &client.url))?;
 
+    project_account_response(account_id, trustline_assets, &xdr_account_id, response)
+}
+
+fn project_account_response(
+    account_id: &str,
+    trustline_assets: &[Asset],
+    xdr_account_id: &AccountId,
+    response: stellar_rpc_client::GetLedgerEntriesResponse,
+) -> Result<(AccountView, i64), WalletError> {
     let latest_ledger = response.latest_ledger;
     let entries = response.entries.unwrap_or_default();
 
@@ -766,7 +775,7 @@ async fn fetch_account_at(
         })
     })?;
 
-    tracing::debug!(account_id = %redacted, "fetch_account: account entry received");
+    tracing::debug!(account_id = %redact_account_id(account_id), "fetch_account: account entry received");
 
     let mut view = project_account_entry(account_id, &account_entry_data)?;
 
@@ -815,6 +824,30 @@ async fn fetch_account_at(
     }
 
     Ok((view, latest_ledger))
+}
+
+pub(crate) async fn fetch_account_recovery(
+    client: &StellarRpcClient,
+    account_id: &str,
+    report: &crate::operational::OperationalReport,
+) -> Result<ObservedAccount<AccountView>, crate::client::RecoveryReadError> {
+    let key = stellar_strkey::ed25519::PublicKey::from_string(account_id)
+        .map_err(|_| crate::client::RecoveryReadError::Shape)?;
+    let account = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(key.0)));
+    let response = client
+        .inner
+        .get_ledger_entries(&[LedgerKey::Account(LedgerKeyAccount {
+            account_id: account.clone(),
+        })])
+        .await?;
+    let (view, latest) = project_account_response(account_id, &[], &account, response)?;
+    let latest = account_coverage(latest, report.latest_ledger)?;
+    Ok(ObservedAccount::new(
+        view,
+        latest,
+        crate::mainnet::clock::now_ms()?,
+        report.close_time_unix.saturating_mul(1_000),
+    ))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

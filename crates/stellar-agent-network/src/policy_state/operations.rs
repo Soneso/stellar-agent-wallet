@@ -859,6 +859,12 @@ pub(super) struct SequenceReleased {
     pub(super) released_at_ms: u64,
 }
 
+impl SequenceReleased {
+    fn is_matched(&self) -> bool {
+        self.primary_ledger == self.witness_ledger
+    }
+}
+
 /// One endpoint's ledger coverage for a non-inclusion proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3707,8 +3713,10 @@ impl Session<'_> {
             }
         }
         let mut release = None;
-        if attempt.sequence_released.is_none()
-            && let Some(proof) = input.sequence_released
+        if let Some(proof) = input.sequence_released
+            && attempt.sequence_released.as_ref().is_none_or(|release| {
+                !release.is_matched() && proof.primary_ledger == proof.witness_ledger
+            })
         {
             attempt.sequence_released = Some(SequenceReleased {
                 primary_ledger: proof.primary_ledger,
@@ -3843,7 +3851,12 @@ impl Session<'_> {
         if fee_charged.is_some_and(|fee| fee < 0) {
             return Err(invalid("a failed outcome charges a negative fee"));
         }
-        if to == S::NotIncluded && attempt.sequence_released.is_none() {
+        if to == S::NotIncluded
+            && !attempt
+                .sequence_released
+                .as_ref()
+                .is_some_and(SequenceReleased::is_matched)
+        {
             return Err(invalid(
                 "a non-inclusion needs the attempt's committed sequence release",
             ));
@@ -5039,10 +5052,14 @@ impl<'a> OperationStatus<'a> {
                 else {
                     continue;
                 };
-                // A released attempt never takes a sequence slot again; the
+                // A matched release never takes a sequence slot again; the
                 // outcome stage still selects it.
                 if attempt.outcome != Some(OperationState::SentOutcomeUnknown)
-                    || (attempt.sequence_released.is_some() && !released)
+                    || (attempt
+                        .sequence_released
+                        .as_ref()
+                        .is_some_and(SequenceReleased::is_matched)
+                        && !released)
                     || tx_hash.is_some_and(|hash| hash != stored_hash)
                 {
                     continue;
@@ -5273,7 +5290,12 @@ impl<'a> OperationStatus<'a> {
                     Some(ExposureIdentity::Classic { envelope_sha256, .. }) if envelope_sha256 == signed
                 )
             })
-            .any(|stored| stored.sequence_released.is_some()))
+            .any(|stored| {
+                stored
+                    .sequence_released
+                    .as_ref()
+                    .is_some_and(SequenceReleased::is_matched)
+            }))
     }
 
     /// Every open record, and every record or tombstone closed at or after
@@ -7538,7 +7560,7 @@ pub(crate) mod tests {
                 &EvidenceInput {
                     sequence_released: Some(SequenceReleaseInput {
                         primary_ledger: 300,
-                        witness_ledger: 301,
+                        witness_ledger: 300,
                         min_close_time_ms: T0 + 5,
                     }),
                     ..EvidenceInput::default()
@@ -9385,7 +9407,7 @@ pub(crate) mod tests {
                 &EvidenceInput {
                     sequence_released: Some(SequenceReleaseInput {
                         primary_ledger: 90,
-                        witness_ledger: 91,
+                        witness_ledger: 90,
                         min_close_time_ms: T0,
                     }),
                     ..EvidenceInput::default()
@@ -10772,7 +10794,7 @@ pub(crate) mod tests {
                 &EvidenceInput {
                     sequence_released: Some(SequenceReleaseInput {
                         primary_ledger: 90,
-                        witness_ledger: 91,
+                        witness_ledger: 90,
                         min_close_time_ms: T0,
                     }),
                     ..EvidenceInput::default()

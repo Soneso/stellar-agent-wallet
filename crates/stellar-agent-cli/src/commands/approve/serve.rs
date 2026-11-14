@@ -525,7 +525,7 @@ async fn run_remote(
         }
     };
 
-    #[cfg(feature = "test-helpers")]
+    #[cfg(any(test, feature = "test-helpers"))]
     crate::common::mainnet_presence::remote_test_ready(&handle).await;
 
     if signed {

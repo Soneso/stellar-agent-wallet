@@ -265,7 +265,7 @@ async fn endpoint(ledger: u32, transaction: Value) -> MockServer {
         ("getNetwork", get_network_result(MAINNET_PASSPHRASE)),
         (
             "getHealth",
-            json!({"status":"healthy","latestLedger":ledger,"oldestLedger":1,"ledgerRetentionWindow":ledger}),
+            json!({"status":"healthy","latestLedger":ledger,"oldestLedger":1,"ledgerRetentionWindow":ledger,"latestLedgerCloseTime":close,"oldestLedgerCloseTime":1}),
         ),
         (
             "getLedgers",
@@ -312,7 +312,7 @@ async fn including(ledger: u32, delay: std::time::Duration) -> MockServer {
         ("getNetwork", get_network_result(MAINNET_PASSPHRASE)),
         (
             "getHealth",
-            json!({"status":"healthy","latestLedger":ledger,"oldestLedger":1,"ledgerRetentionWindow":ledger}),
+            json!({"status":"healthy","latestLedger":ledger,"oldestLedger":1,"ledgerRetentionWindow":ledger,"latestLedgerCloseTime":close,"oldestLedgerCloseTime":1}),
         ),
         (
             "getLedgers",
@@ -346,7 +346,7 @@ async fn transaction_unreachable(ledger: u32) -> MockServer {
         ("getNetwork", get_network_result(MAINNET_PASSPHRASE)),
         (
             "getHealth",
-            json!({"status":"healthy","latestLedger":ledger,"oldestLedger":1,"ledgerRetentionWindow":ledger}),
+            json!({"status":"healthy","latestLedger":ledger,"oldestLedger":1,"ledgerRetentionWindow":ledger,"latestLedgerCloseTime":close,"oldestLedgerCloseTime":1}),
         ),
         (
             "getLedgers",
