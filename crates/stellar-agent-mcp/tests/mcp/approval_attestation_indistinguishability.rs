@@ -326,6 +326,9 @@ async fn build_scaffold(
 #[tokio::test]
 #[serial]
 async fn property4_all_failure_modes_produce_byte_identical_wire_error() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
 
     // Seed the nonce key used by all three invocations.
@@ -553,6 +556,9 @@ async fn property4_all_failure_modes_produce_byte_identical_wire_error() {
 #[tokio::test]
 #[serial]
 async fn property4a_absent_attestation_returns_approval_required() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
 
     let nonce_key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xABu8; 32]);
@@ -629,6 +635,9 @@ async fn property4a_absent_attestation_returns_approval_required() {
 #[tokio::test]
 #[serial]
 async fn property4b_forged_attestation_returns_approval_required() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
 
     let nonce_key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xABu8; 32]);
@@ -708,6 +717,9 @@ async fn property4b_forged_attestation_returns_approval_required() {
 #[tokio::test]
 #[serial]
 async fn property4c_expired_approval_entry_returns_approval_required() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
 
     let nonce_key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xABu8; 32]);
@@ -825,6 +837,7 @@ async fn property4c_expired_approval_entry_returns_approval_required() {
 #[tokio::test]
 #[serial]
 async fn valid_attestation_passes_gate() {
+    let _root = crate::common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
 
     // Seed the nonce key used by `NonceMint` in the scaffold.
@@ -961,6 +974,7 @@ async fn valid_attestation_passes_gate() {
 #[tokio::test]
 #[serial]
 async fn an_attestation_under_the_owner_public_key_returns_the_uniform_error() {
+    let _root = crate::common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     let nonce_key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xABu8; 32]);
     keyring_core::Entry::new("n-svc", "n-acct")

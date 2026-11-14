@@ -122,13 +122,21 @@ async fn pay_commit_case(allow_all: bool) {
 
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn pay_commit_refuses_mainnet_at_entry_on_noop_engine() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     pay_commit_case(false).await;
 }
 
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn pay_commit_refuses_mainnet_at_entry_under_allow_all_engine() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     pay_commit_case(true).await;
 }
 
@@ -155,13 +163,21 @@ async fn create_account_commit_case(allow_all: bool) {
 
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn create_account_commit_refuses_mainnet_at_entry_on_noop_engine() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     create_account_commit_case(false).await;
 }
 
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn create_account_commit_refuses_mainnet_at_entry_under_allow_all_engine() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     create_account_commit_case(true).await;
 }
 
@@ -189,13 +205,21 @@ async fn trustline_commit_case(allow_all: bool) {
 
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn trustline_commit_refuses_mainnet_at_entry_on_noop_engine() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     trustline_commit_case(false).await;
 }
 
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn trustline_commit_refuses_mainnet_at_entry_under_allow_all_engine() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     trustline_commit_case(true).await;
 }
 
@@ -221,13 +245,21 @@ async fn claim_commit_case(allow_all: bool) {
 
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn claim_commit_refuses_mainnet_at_entry_on_noop_engine() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     claim_commit_case(false).await;
 }
 
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn claim_commit_refuses_mainnet_at_entry_under_allow_all_engine() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     claim_commit_case(true).await;
 }
 
@@ -249,7 +281,11 @@ async fn rule_create_commit_case(allow_all: bool) {
 /// case pins the refusal that keys on the context.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn rule_create_commit_refuses_a_mainnet_context_over_a_testnet_argument() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let rpc = wiremock::MockServer::start().await;
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let profile = Profile::builder_testnet_named("refusal", "s", "default", "n", "a")
@@ -272,13 +308,21 @@ async fn rule_create_commit_refuses_a_mainnet_context_over_a_testnet_argument() 
 
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn rule_create_commit_refuses_mainnet_at_entry_on_noop_engine() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     rule_create_commit_case(false).await;
 }
 
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn rule_create_commit_refuses_mainnet_at_entry_under_allow_all_engine() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     rule_create_commit_case(true).await;
 }
 
@@ -298,12 +342,20 @@ async fn sep43_sign_and_submit_case(allow_all: bool) {
 
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn sep43_sign_and_submit_refuses_mainnet_at_entry_on_noop_engine() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     sep43_sign_and_submit_case(false).await;
 }
 
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn sep43_sign_and_submit_refuses_mainnet_at_entry_under_allow_all_engine() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     sep43_sign_and_submit_case(true).await;
 }

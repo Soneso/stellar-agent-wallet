@@ -1447,7 +1447,11 @@ mod secondary_rule_tests {
     /// argument.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn defindex_vault_deposit_refuses_mainnet_at_entry_divergent_context() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rpc = wiremock::MockServer::start().await;
         let server = server(false, &rpc.uri());
         let args = deposit_args("stellar:testnet", Some(rpc.uri().as_str()));
@@ -1461,7 +1465,11 @@ mod secondary_rule_tests {
     /// ahead of the secondary-endpoint refusal.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn defindex_vault_deposit_refuses_mainnet_at_entry_mainnet_profile() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rpc = wiremock::MockServer::start().await;
         let server = server(true, &rpc.uri());
         let args = deposit_args("stellar:mainnet", Some(rpc.uri().as_str()));
@@ -1475,7 +1483,11 @@ mod secondary_rule_tests {
     /// changes nothing.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn defindex_vault_deposit_refuses_mainnet_under_allow_all_engine() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rpc = wiremock::MockServer::start().await;
         let mut server = server(true, &rpc.uri());
         server.policy_engine = std::sync::Arc::new(crate::tools::common::AllowAllPolicyEngine);
@@ -1490,7 +1502,11 @@ mod secondary_rule_tests {
     /// a credentialed URL is refused before any lookup or RPC.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn defindex_vault_deposit_refuses_credentialed_secondary_on_testnet() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rpc = wiremock::MockServer::start().await;
         let server = testnet_server(&rpc.uri());
         let args = deposit_args("stellar:testnet", Some(credentialed(&rpc).as_str()));
@@ -1506,7 +1522,11 @@ mod secondary_rule_tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn defindex_vault_withdraw_refuses_mainnet_at_entry_divergent_context() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rpc = wiremock::MockServer::start().await;
         let server = server(false, &rpc.uri());
         let args = withdraw_args("stellar:testnet", Some(rpc.uri().as_str()));
@@ -1518,7 +1538,11 @@ mod secondary_rule_tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn defindex_vault_withdraw_refuses_mainnet_at_entry_mainnet_profile() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rpc = wiremock::MockServer::start().await;
         let server = server(true, &rpc.uri());
         let args = withdraw_args("stellar:mainnet", Some(rpc.uri().as_str()));
@@ -1530,7 +1554,11 @@ mod secondary_rule_tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn defindex_vault_withdraw_refuses_mainnet_under_allow_all_engine() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rpc = wiremock::MockServer::start().await;
         let mut server = server(true, &rpc.uri());
         server.policy_engine = std::sync::Arc::new(crate::tools::common::AllowAllPolicyEngine);
@@ -1543,7 +1571,11 @@ mod secondary_rule_tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn defindex_vault_withdraw_refuses_credentialed_secondary_on_testnet() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rpc = wiremock::MockServer::start().await;
         let server = testnet_server(&rpc.uri());
         let args = withdraw_args("stellar:testnet", Some(credentialed(&rpc).as_str()));
@@ -1562,7 +1594,11 @@ mod secondary_rule_tests {
     /// expected form, without the argument.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn vault_address_marker_is_not_echoed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_test_support::rejected_value::{
             CREDENTIAL_MARKER, assert_no_marker_in_text,
         };
@@ -1634,7 +1670,11 @@ mod secondary_rule_tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn withdraw_shares_marker_is_not_echoed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let capture = stellar_agent_test_support::log_capture::CaptureWriter::new();
         let subscriber = tracing_subscriber::fmt()
             .without_time()

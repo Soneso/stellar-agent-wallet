@@ -23,6 +23,9 @@ use crate::helpers::{
 #[test]
 #[serial]
 fn boot_nonce_stable_within_process() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let key = [0x44u8; 32];
     let profile = make_profile("boot-nonce-stable");
@@ -44,6 +47,9 @@ fn boot_nonce_stable_within_process() {
 #[test]
 #[serial]
 fn boot_nonce_same_process_round_trip() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let key = [0x44u8; 32];
     let profile = make_profile("boot-nonce-round-trip");
@@ -91,6 +97,9 @@ fn boot_nonce_same_process_round_trip() {
 #[test]
 #[serial]
 fn boot_nonce_must_be_identical_across_instances() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let key = [0x55u8; 32];
     let profile = make_profile("boot-nonce-identical");

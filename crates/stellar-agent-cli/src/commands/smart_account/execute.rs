@@ -1370,7 +1370,10 @@ mod tests {
 
     /// An empty `--function` is refused client-side.
     #[tokio::test]
+    #[serial_test::serial]
     async fn empty_function_refused_client_side() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut args = minimal_args();
         args.function = String::new();
         args.rpc_url = Some("http://127.0.0.1:1".to_owned());
@@ -1380,7 +1383,10 @@ mod tests {
 
     /// A malformed `--arg` is refused client-side with the failing index named.
     #[tokio::test]
+    #[serial_test::serial]
     async fn malformed_arg_refused_with_index() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut args = minimal_args();
         args.arg = vec![VOID_ARG_B64.to_owned(), "not-valid-base64!!".to_owned()];
         args.rpc_url = Some("http://127.0.0.1:1".to_owned());

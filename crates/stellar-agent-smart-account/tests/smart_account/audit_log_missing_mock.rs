@@ -138,6 +138,9 @@ fn write_rule_created(writer: &Arc<Mutex<AuditWriter>>, rule_id: u32, sa_redacte
 #[tokio::test]
 #[serial_test::serial]
 async fn t11_audit_log_missing_fires_on_rpc_drop() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let server = MockServer::start().await;
     let smart_account = addr(0x00); // zero address → CAAAA...ABSC4
@@ -215,6 +218,9 @@ async fn t11_audit_log_missing_fires_on_rpc_drop() {
 #[tokio::test]
 #[serial_test::serial]
 async fn t11b_no_audit_log_missing_when_in_sync() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let server = MockServer::start().await;
     let smart_account = addr(0x00);

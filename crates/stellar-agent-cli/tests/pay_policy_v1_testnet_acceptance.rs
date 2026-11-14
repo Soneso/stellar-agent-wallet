@@ -235,7 +235,9 @@ fn write_profile_toml(home: &std::path::Path, profile: &str) {
 /// coordinate-generic) that removes the entry when dropped.
 fn rotate_audit_key_via_cli(home: &std::path::Path, profile: &str) -> OwnerKeyringGuard {
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
+    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
     let output = Command::new(bin_path)
+        .args(cfg!(feature = "live-platform-keyring").then_some("--test-live-platform-keyring"))
         .args(["profile", "rotate-audit-key", profile])
         .env("STELLAR_AGENT_HOME", home)
         .output()
@@ -335,7 +337,9 @@ fn enroll_owner_key_via_cli(
     owner_g_strkey: &str,
 ) -> OwnerKeyringGuard {
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
+    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
     let output = Command::new(bin_path)
+        .args(cfg!(feature = "live-platform-keyring").then_some("--test-live-platform-keyring"))
         .args([
             "profile",
             "enroll-owner-key",
@@ -394,7 +398,9 @@ fn run_pay(
     amount: &str,
 ) -> (i32, serde_json::Value) {
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
+    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
     let output = Command::new(bin_path)
+        .args(cfg!(feature = "live-platform-keyring").then_some("--test-live-platform-keyring"))
         .args([
             "pay",
             destination_g,
@@ -450,6 +456,16 @@ async fn pay_v1_per_tx_cap_denies_over_cap_and_submits_under_cap() {
     // and refuses when registration fails, so this suite needs a functioning
     // platform keyring (macOS Keychain locally; a headless Secret Service,
     // provisioned by the CI workflow, on Linux CI runners).
+    #[cfg(feature = "live-platform-keyring")]
+    if std::env::var("STELLAR_AGENT_TEST_LIVE_PLATFORM_KEYRING").as_deref()
+        == Ok("real-platform-keyring")
+    {
+        use stellar_agent_network::keyring::live::{
+            LivePlatformKeyring, init_platform_keyring_store_live,
+        };
+        init_platform_keyring_store_live(LivePlatformKeyring::acknowledge_real_platform_keyring())
+            .expect("live acceptance platform store");
+    }
     stellar_agent_network::init_platform_keyring_store()
         .expect("platform keyring store must initialise on this host");
 

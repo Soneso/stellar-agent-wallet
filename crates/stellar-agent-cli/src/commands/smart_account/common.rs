@@ -1098,6 +1098,10 @@ mod tests {
         reason = "test-only process environment mutation; the variable name is unique to this test"
     )]
     async fn resolve_signer_secret_env_derives_the_expected_public_key() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let seed = [0x42u8; 32];
         let s_strkey = stellar_strkey::ed25519::PrivateKey(seed)
             .as_unredacted()
@@ -1142,7 +1146,12 @@ mod tests {
     /// An unset env var refuses with `validation.secret_env_not_set` without
     /// retaining the variable name.
     #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
     async fn resolve_signer_unset_env_var_is_refused() {
+        let storage_sandbox =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let flags = SignerSourceFlags {
             signer_secret_env: Some("COMMON_RESOLVE_SIGNER_UNSET_CREDMARKER7".to_owned()),
             sign_with_ledger: false,
@@ -1176,6 +1185,10 @@ mod tests {
         reason = "test-only process environment mutation; the variable name is unique to this test"
     )]
     async fn resolve_signer_invalid_s_strkey_is_refused() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let var = "COMMON_RESOLVE_SIGNER_MALFORMED_CREDMARKER7";
         unsafe {
             std::env::set_var(var, "invalid-CREDMARKER7");
@@ -1212,7 +1225,12 @@ mod tests {
     /// device can return a signer. The test rejects every `auth.keyring_*`
     /// code, including missing entries and platform failures.
     #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
     async fn resolve_signer_ledger_source_never_reports_keyring_error() {
+        let storage_sandbox =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let flags = SignerSourceFlags {
             signer_secret_env: None,
             sign_with_ledger: true,
@@ -1246,7 +1264,12 @@ mod tests {
     /// access or network call with `validation.signer_source_required` — a
     /// missing-input failure, not a keyring condition.
     #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
     async fn resolve_signer_missing_source_reports_signer_source_required() {
+        let storage_sandbox =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let flags = SignerSourceFlags {
             signer_secret_env: None,
             sign_with_ledger: false,
@@ -1267,17 +1290,18 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn wallet_io_error_redacts_home_prefixed_path() {
         let home = std::env::var("HOME").expect("HOME is set in test environment");
-        let message = format!(
-            "networks.toml I/O error at {home}/.local/share/stellar-agent/networks.toml: Permission denied"
-        );
+        let suffix = stellar_agent_test_support::sandbox::LINUX_WALLET_SUFFIX.trim();
+        let message =
+            format!("networks.toml I/O error at {home}/{suffix}/networks.toml: Permission denied");
 
         let err = wallet_io_error(IoSource::MulticallRegistryLoad, message);
 
         match err {
             WalletError::Io { message, .. } => {
-                assert!(message.contains("<HOME>/.local/share/stellar-agent/networks.toml"));
+                assert!(message.contains(&format!("<HOME>/{suffix}/networks.toml")));
                 assert!(!message.contains(&format!("{home}/.local/share/")));
             }
             other => panic!("expected WalletError::Io, got {other:?}"),
@@ -1289,11 +1313,13 @@ mod tests {
     /// the message before it reaches the wire envelope, the same way
     /// `wallet_io_error` redacts `WalletError::Io` paths.
     #[test]
+    #[serial_test::parallel]
     fn build_sa_error_envelope_redacts_home_prefixed_paths_from_smart_account_message() {
         use std::path::PathBuf;
 
         let home = std::env::var("HOME").expect("HOME is set in test environment");
-        let path = PathBuf::from(format!("{home}/.local/share/stellar-agent/networks.toml"));
+        let suffix = stellar_agent_test_support::sandbox::LINUX_WALLET_SUFFIX.trim();
+        let path = PathBuf::from(format!("{home}/{suffix}/networks.toml"));
         let sa_err = SaError::AuditWriterIo {
             detail: "permission denied".to_owned(),
             path,
@@ -1305,7 +1331,7 @@ mod tests {
             WalletError::SmartAccount { wire_code, message } => {
                 assert_eq!(wire_code, "sa.audit_writer_io");
                 assert!(
-                    message.contains("<HOME>/.local/share/stellar-agent/networks.toml"),
+                    message.contains(&format!("<HOME>/{suffix}/networks.toml")),
                     "expected <HOME>-redacted path in message: {message}"
                 );
                 assert!(
@@ -1349,18 +1375,30 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn enrolled_resolver_equal() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         enrolled_resolver_case(EnrolledPin::Derived).await;
     }
 
     #[tokio::test]
     #[serial_test::serial]
     async fn enrolled_resolver_placeholder() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         enrolled_resolver_case(EnrolledPin::Placeholder).await;
     }
 
     #[tokio::test]
     #[serial_test::serial]
     async fn enrolled_resolver_mismatch() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         enrolled_resolver_case(EnrolledPin::Other).await;
     }
 
@@ -1368,6 +1406,10 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn enrolled_resolver_testnet() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut profile = enrolled_mainnet_profile(EnrolledPin::Other);
         profile.chain_id = stellar_agent_core::profile::caip2::Caip2::Testnet;
         resolve_test_seed_signer(&profile)
@@ -1397,6 +1439,10 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn read_only_open_refuses_a_changed_binding_and_creates_nothing() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = repointed_profile("read-only-binding", dir.path());
@@ -1415,6 +1461,10 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn signing_open_refuses_a_changed_binding_and_creates_nothing() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = repointed_profile("signing-binding", dir.path());

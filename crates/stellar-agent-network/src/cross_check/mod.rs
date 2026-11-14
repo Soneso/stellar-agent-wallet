@@ -1069,7 +1069,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn witness_retries_a_busy_oracle() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let error = stellar_rpc_client::Error::JsonRpc(jsonrpsee_core::ClientError::Call(
             serde_json::from_value(
                 serde_json::json!({"code": -32004, "message": "preflight queue full"}),
@@ -1097,7 +1100,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn busy_never_turns_divergence_into_agreement() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let (result, requests) = busy_witness(1, true, false).await;
         assert!(
             matches!(
@@ -1110,7 +1116,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn witness_stops_on_a_simulation_refusal() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let (result, requests) = busy_witness(1, false, true).await;
         assert!(
             matches!(
@@ -1213,7 +1222,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn skipped_outcome_warns_with_the_reason() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let text = "cross-check skipped; configure the oracle and asset threshold in the profile";
         let (outcome, logs) = skip_warnings(CrossCheckValue::Unvalued).await;
         assert!(matches!(

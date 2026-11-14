@@ -783,7 +783,11 @@ mod tests {
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn recovery_mcp_build_stores_the_minimum_bound_or_none() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::tools::common::tests::mainnet::{ClassicRun, Tool, ledger, mount_rpc};
         use wiremock::MockServer;
         for oracle_ledger in [Some(90_u32), Some(110), None] {
@@ -931,6 +935,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn an_opaque_class_under_a_value_cap_builds_no_recorder() {
         use stellar_agent_core::policy::v1::criteria::{
             per_period_cap::{PerPeriodCapCriterion, Window},
@@ -1336,6 +1341,7 @@ mod tests {
     }
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn allowed_recorder_requires_a_registered_tool() {
         let dir = tempfile::tempdir().expect("isolated audit directory");
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
@@ -1369,7 +1375,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn approved_recorder_requires_its_approval_store() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let profile = Profile::builder_testnet("signer", "default", "nonce", "default").build();
         let audit = Arc::new(Mutex::new(
@@ -1400,7 +1410,11 @@ mod tests {
         assert!(error.message().contains("approval store"));
     }
     #[test]
+    #[serial_test::serial]
     fn approved_recorder_requires_its_approval_nonce() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let profile = Profile::builder_testnet("signer", "default", "nonce", "default").build();
         let audit = Arc::new(Mutex::new(
@@ -1438,6 +1452,7 @@ mod tests {
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn mainnet_recorder_preparation_refuses_before_authorization() {
         use crate::tools::common::tests::mainnet::{Fixture, payment_witness};
         use stellar_agent_network::mainnet::authority::MainnetAuthority;
@@ -1701,7 +1716,11 @@ mod tests {
     /// hold refuses before any append.
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn no_receipt_status_selects_an_audit_row() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for (label, status) in [
             ("success", Some(ReceiptStatus::Success)),
             (
@@ -1749,7 +1768,11 @@ mod tests {
     /// as the one row of the submission.
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn pending_witness_survives_mcp_reconciliation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision};
         for (label, status) in [
             ("success", ReceiptStatus::Success),
@@ -1812,7 +1835,11 @@ mod tests {
     /// expiry owed. A forged `Failed` receipt emits no outcome row.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn a_forged_tail_cannot_acknowledge_an_owed_expiry() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision};
         let f = drain_fixture("forged-tail");
         let envelope = "a1".repeat(32);
@@ -1884,7 +1911,11 @@ mod tests {
     /// unavailable clock or primary client.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn the_dispatch_drain_delivers_old_obligations_after_any_pass() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for (label, pass) in [
             (
                 "completed",

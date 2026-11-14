@@ -29,6 +29,7 @@ zeroize = { workspace = true }
 stellar-agent-core = { workspace = true }
 
 [dev-dependencies]
+stellar-agent-core = { path = "../stellar-agent-core", features = ["test-helpers"] }
 tokio = { workspace = true }
 serial_test = { workspace = true }
 wiremock = { workspace = true }

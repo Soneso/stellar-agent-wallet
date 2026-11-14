@@ -335,6 +335,9 @@ fn insufficient_fee_result_xdr() -> String {
 #[tokio::test]
 #[serial]
 async fn a_first_submission_reaches_the_send() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = fixture("record-first");
     let envelope = SignedTestEnvelope::for_source([0x21; 32]);
     let server = MockServer::start().await;
@@ -380,6 +383,9 @@ async fn a_first_submission_reaches_the_send() {
 #[tokio::test]
 #[serial]
 async fn submission_confirmation_retains_exposure_regardless_of_created_at() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     for created_at in [Some((now_ms() / 1000) as i64), None] {
         let fx = fixture("record-close-time");
         let envelope = SignedTestEnvelope::for_source([0x29; 32]);
@@ -421,6 +427,9 @@ async fn submission_confirmation_retains_exposure_regardless_of_created_at() {
 #[tokio::test]
 #[serial]
 async fn a_pre_send_refusal_writes_no_record() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = fixture("record-refused");
     let envelope = SignedTestEnvelope::for_source([0x22; 32]);
     let server = MockServer::start().await;
@@ -469,6 +478,9 @@ async fn a_pre_send_refusal_writes_no_record() {
 #[tokio::test]
 #[serial]
 async fn a_latest_ledger_that_names_no_ledger_refuses_before_the_send() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     for latest_ledger in [json!(0), json!(u64::from(u32::MAX) + 1), json!(-1)] {
         let fx = fixture("record-latest-ledger");
         let envelope = SignedTestEnvelope::for_source([0x23; 32]);
@@ -535,6 +547,9 @@ async fn a_latest_ledger_that_names_no_ledger_refuses_before_the_send() {
 #[tokio::test]
 #[serial]
 async fn a_timeout_reports_the_local_hash_and_leaves_the_record_standing() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = fixture("record-timeout");
     let envelope = SignedTestEnvelope::for_source([0x23; 32]);
     let server = MockServer::start().await;
@@ -604,6 +619,9 @@ async fn a_timeout_reports_the_local_hash_and_leaves_the_record_standing() {
 #[tokio::test]
 #[serial]
 async fn a_hash_mismatch_reports_both_hashes_and_leaves_the_record_standing() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = fixture("record-mismatch");
     let envelope = SignedTestEnvelope::for_source([0x24; 32]);
     let server = MockServer::start().await;
@@ -651,6 +669,9 @@ async fn a_hash_mismatch_reports_both_hashes_and_leaves_the_record_standing() {
 #[tokio::test]
 #[serial]
 async fn a_transport_failure_after_the_record_returns_the_timeout_shape() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = fixture("record-transport");
     let envelope = SignedTestEnvelope::for_source([0x25; 32]);
     let server = MockServer::start().await;
@@ -717,6 +738,9 @@ async fn a_transport_failure_after_the_record_returns_the_timeout_shape() {
 #[tokio::test]
 #[serial]
 async fn a_refused_send_retains_the_reservation_and_sequence() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = fixture("record-rejected");
     let envelope = SignedTestEnvelope::for_source([0x26; 32]);
     let server = MockServer::start().await;
@@ -806,6 +830,9 @@ async fn a_refused_send_retains_the_reservation_and_sequence() {
 #[tokio::test]
 #[serial]
 async fn a_second_submission_at_a_pending_sequence_is_refused() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = fixture("record-duplicate");
     let envelope = SignedTestEnvelope::for_source([0x27; 32]);
     let server = MockServer::start().await;
@@ -890,6 +917,9 @@ fn envelope_hash(envelope: &SignedTestEnvelope) -> String {
 #[tokio::test]
 #[serial]
 async fn a_reservation_failure_unwinds_and_the_retry_is_admitted() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = fixture("record-unwind-reservation");
     let envelope = SignedTestEnvelope::for_source([0x31; 32]);
     let server = MockServer::start().await;
@@ -989,6 +1019,9 @@ async fn a_reservation_failure_unwinds_and_the_retry_is_admitted() {
 #[tokio::test]
 #[serial]
 async fn a_mark_submitted_failure_unwinds_and_sends_nothing() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use std::sync::atomic::Ordering;
 
     let fx = fixture("record-unwind-mark");
@@ -1054,6 +1087,9 @@ async fn a_mark_submitted_failure_unwinds_and_sends_nothing() {
 #[tokio::test]
 #[serial]
 async fn a_muxed_source_reaches_the_send() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = fixture("record-muxed");
     let envelope = SignedTestEnvelope::builder([0x33; 32])
         .muxed_source_id(42)
@@ -1122,6 +1158,9 @@ async fn a_muxed_source_reaches_the_send() {
 #[tokio::test]
 #[serial]
 async fn an_unexpected_poll_status_reports_the_timeout_shape() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = fixture("record-poll-status");
     let envelope = SignedTestEnvelope::for_source([0x34; 32]);
     let server = MockServer::start().await;
@@ -1332,18 +1371,27 @@ async fn assert_audit_append_refusal(failure: AuditAppendFailure) {
 #[tokio::test]
 #[serial]
 async fn a_truncated_audit_log_refuses_with_the_rollback_code_before_the_receipt() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     assert_audit_append_refusal(AuditAppendFailure::Truncated).await;
 }
 
 #[tokio::test]
 #[serial]
 async fn a_rewritten_audit_log_refuses_with_the_rollback_code_before_the_receipt() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     assert_audit_append_refusal(AuditAppendFailure::Rewritten).await;
 }
 
 #[tokio::test]
 #[serial]
 async fn an_untraversable_audit_directory_refuses_as_record_unavailable_before_the_receipt() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     assert_audit_append_refusal(AuditAppendFailure::Io).await;
 }
 
@@ -1512,6 +1560,9 @@ fn failed_code(kind: &EventKind) -> Option<&str> {
 #[tokio::test]
 #[serial]
 async fn an_anchor_behind_before_the_pending_row_refuses_with_nothing_written() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mut fx = fixture("record-anchor-before");
     let store = Arc::new(InMemoryTipAnchorStore::new());
     let audit = anchored_audit(&mut fx, &store);
@@ -1572,6 +1623,9 @@ async fn an_anchor_behind_before_the_pending_row_refuses_with_nothing_written() 
 #[tokio::test]
 #[serial]
 async fn an_uncovered_pending_row_is_closed_and_its_reservation_released() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mut fx = fixture("record-anchor-after");
     let store = Arc::new(InMemoryTipAnchorStore::new());
     let audit = anchored_audit(&mut fx, &store);
@@ -1633,6 +1687,9 @@ async fn an_uncovered_pending_row_is_closed_and_its_reservation_released() {
 #[tokio::test]
 #[serial]
 async fn an_uncovered_pending_row_without_window_entries_is_closed() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mut fx = fixture("record-anchor-unwindowed");
     let store = Arc::new(InMemoryTipAnchorStore::new());
     let audit = anchored_audit(&mut fx, &store);
@@ -1678,6 +1735,9 @@ async fn an_uncovered_pending_row_without_window_entries_is_closed() {
 #[tokio::test]
 #[serial]
 async fn a_pending_row_covered_by_the_repair_after_it_is_sent() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mut fx = fixture("record-anchor-repaired");
     let store = Arc::new(InMemoryTipAnchorStore::new());
     let audit = anchored_audit(&mut fx, &store);
@@ -1715,6 +1775,9 @@ async fn a_pending_row_covered_by_the_repair_after_it_is_sent() {
 #[tokio::test]
 #[serial]
 async fn a_policy_refusal_at_the_reservation_outranks_an_uncovered_pending_row() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mut fx = fixture("record-anchor-denied");
     let store = Arc::new(InMemoryTipAnchorStore::new());
     let audit = anchored_audit(&mut fx, &store);
@@ -1800,6 +1863,9 @@ async fn submit_after_a_queued_outbox_row(
 #[tokio::test]
 #[serial]
 async fn a_drained_outbox_row_left_uncovered_refuses_the_send() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (result, kinds) =
         submit_after_a_queued_outbox_row("record-anchor-drain-refused", 0x68, 6).await;
     let error = result.expect_err("six failed anchor writes leave the rows uncovered");
@@ -1830,6 +1896,9 @@ async fn a_drained_outbox_row_left_uncovered_refuses_the_send() {
 #[tokio::test]
 #[serial]
 async fn a_drained_outbox_row_covered_by_the_repair_lets_the_send_proceed() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (result, kinds) =
         submit_after_a_queued_outbox_row("record-anchor-drain-repaired", 0x69, 5).await;
     assert!(result.is_ok(), "the repair covers both rows: {result:?}");
@@ -1858,6 +1927,9 @@ async fn a_drained_outbox_row_covered_by_the_repair_lets_the_send_proceed() {
 #[tokio::test]
 #[serial]
 async fn a_pending_row_append_failure_after_the_anchor_check_unwinds_the_receipt() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mut fx = fixture("record-anchor-append");
     let store = Arc::new(InMemoryTipAnchorStore::new());
     let audit = anchored_audit(&mut fx, &store);
@@ -1921,6 +1993,9 @@ async fn a_pending_row_append_failure_after_the_anchor_check_unwinds_the_receipt
 #[tokio::test]
 #[serial]
 async fn a_reservation_the_window_cannot_admit_is_refused_as_a_policy_denial() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use base64::Engine as _;
     use stellar_agent_core::audit_log::AuditWriter;
     use stellar_agent_core::audit_log::reader::{
@@ -2099,6 +2174,9 @@ async fn a_reservation_the_window_cannot_admit_is_refused_as_a_policy_denial() {
 #[tokio::test]
 #[serial]
 async fn a_resend_after_a_lost_receipt_is_refused_before_the_send() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use base64::Engine as _;
     use stellar_agent_core::audit_log::AuditWriter;
     use stellar_agent_core::audit_log::reader::{
@@ -2342,6 +2420,9 @@ async fn assert_timeout_at_the_deadline(
 #[tokio::test]
 #[serial]
 async fn a_poll_request_held_past_the_deadline_is_cut_at_the_deadline() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = fixture("record-poll-held");
     let envelope = SignedTestEnvelope::for_source([0x26; 32]);
     let server = MockServer::start().await;
@@ -2366,6 +2447,9 @@ async fn a_poll_request_held_past_the_deadline_is_cut_at_the_deadline() {
 #[tokio::test]
 #[serial]
 async fn the_sleep_after_a_not_found_ends_at_the_deadline() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = fixture("record-poll-sleep");
     let envelope = SignedTestEnvelope::for_source([0x27; 32]);
     let server = MockServer::start().await;
@@ -2387,6 +2471,9 @@ async fn the_sleep_after_a_not_found_ends_at_the_deadline() {
 #[tokio::test]
 #[serial]
 async fn the_sleep_after_a_transient_poll_error_ends_at_the_deadline() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = fixture("record-poll-transient");
     let envelope = SignedTestEnvelope::for_source([0x28; 32]);
     let server = MockServer::start().await;

@@ -540,72 +540,128 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn classic_disagreement_source_existence() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         account_disagrees(WitnessEntry::SourceAccount, WitnessField::Existence).await;
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn classic_disagreement_source_sequence() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         account_disagrees(WitnessEntry::SourceAccount, WitnessField::Sequence).await;
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn classic_disagreement_source_native_balance() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         account_disagrees(WitnessEntry::SourceAccount, WitnessField::NativeBalance).await;
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn classic_disagreement_source_subentry_count() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         account_disagrees(WitnessEntry::SourceAccount, WitnessField::SubentryCount).await;
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn classic_disagreement_source_flags() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         account_disagrees(WitnessEntry::SourceAccount, WitnessField::Flags).await;
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn classic_disagreement_destination_existence() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         account_disagrees(WitnessEntry::DestinationAccount, WitnessField::Existence).await;
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn classic_disagreement_destination_home_domain() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         account_disagrees(WitnessEntry::DestinationAccount, WitnessField::HomeDomain).await;
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn classic_disagreement_destination_flags() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         account_disagrees(WitnessEntry::DestinationAccount, WitnessField::Flags).await;
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn classic_disagreement_issuer_existence() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         account_disagrees(WitnessEntry::IssuerAccount, WitnessField::Existence).await;
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn classic_disagreement_issuer_flags() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         account_disagrees(WitnessEntry::IssuerAccount, WitnessField::Flags).await;
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn classic_disagreement_funder_sequence() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         account_disagrees(WitnessEntry::FunderAccount, WitnessField::Sequence).await;
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn classic_disagreement_funder_native_balance() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         account_disagrees(WitnessEntry::FunderAccount, WitnessField::NativeBalance).await;
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn classic_disagreement_funder_subentry_count() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         account_disagrees(WitnessEntry::FunderAccount, WitnessField::SubentryCount).await;
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn classic_disagreement_funder_flags() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         account_disagrees(WitnessEntry::FunderAccount, WitnessField::Flags).await;
     }
 
@@ -673,19 +729,35 @@ mod tests {
         disagrees(inputs, body, WitnessEntry::SourceTrustline, field).await;
     }
     #[tokio::test]
+    #[serial_test::serial]
     async fn classic_disagreement_trustline_existence() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         trustline_disagrees(WitnessField::Existence).await;
     }
     #[tokio::test]
+    #[serial_test::serial]
     async fn classic_disagreement_trustline_balance() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         trustline_disagrees(WitnessField::Balance).await;
     }
     #[tokio::test]
+    #[serial_test::serial]
     async fn classic_disagreement_trustline_limit() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         trustline_disagrees(WitnessField::Limit).await;
     }
     #[tokio::test]
+    #[serial_test::serial]
     async fn classic_disagreement_trustline_flags() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         trustline_disagrees(WitnessField::Flags).await;
     }
     fn pay_with_trustline() -> (ClassicInputs, TrustLineEntry) {
@@ -738,7 +810,11 @@ mod tests {
         disagrees(inputs, body, WitnessEntry::SourceTrustline, field).await;
     }
     #[tokio::test]
+    #[serial_test::serial]
     async fn classic_pay_trustline_match_covers_the_trustline() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (inputs, trustline) = pay_with_trustline();
         let server = oracle(network()).await;
         read_mock(&server, pay_trustline_answer(&inputs, Some(trustline))).await;
@@ -753,23 +829,43 @@ mod tests {
         );
     }
     #[tokio::test]
+    #[serial_test::serial]
     async fn classic_pay_trustline_disagreement_existence() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         pay_trustline_disagrees(WitnessField::Existence).await;
     }
     #[tokio::test]
+    #[serial_test::serial]
     async fn classic_pay_trustline_disagreement_balance() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         pay_trustline_disagrees(WitnessField::Balance).await;
     }
     #[tokio::test]
+    #[serial_test::serial]
     async fn classic_pay_trustline_disagreement_limit() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         pay_trustline_disagrees(WitnessField::Limit).await;
     }
     #[tokio::test]
+    #[serial_test::serial]
     async fn classic_pay_trustline_disagreement_flags() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         pay_trustline_disagrees(WitnessField::Flags).await;
     }
     #[tokio::test]
+    #[serial_test::serial]
     async fn classic_disagreement_claimable_record() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (inputs, trustline, mut balance) = claim();
         balance.amount += 1;
         let body = claim_answer(&inputs, Some(trustline), Some(balance));
@@ -782,7 +878,11 @@ mod tests {
         .await;
     }
     #[tokio::test]
+    #[serial_test::serial]
     async fn classic_disagreement_claimable_absence() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (inputs, trustline, _) = claim();
         let body = claim_answer(&inputs, Some(trustline), None);
         disagrees(
@@ -794,7 +894,11 @@ mod tests {
         .await;
     }
     #[tokio::test]
+    #[serial_test::serial]
     async fn classic_disagreement_pool_channel_existence() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let inputs = PoolInitWitnessInputs {
             funder: source(7),
             absent_channels: vec![address(8)],
@@ -808,7 +912,11 @@ mod tests {
         .await;
     }
     #[tokio::test]
+    #[serial_test::serial]
     async fn classic_memo_flag_disagreement_is_rpc_divergence() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = oracle(network()).await;
         let inputs = pay();
         let key = inputs.observations().unwrap()[2].key.clone();
@@ -839,7 +947,11 @@ mod tests {
         assert_eq!(methods(&server).await, ["getNetwork", "getLedgerEntries"]);
     }
     #[tokio::test]
+    #[serial_test::serial]
     async fn classic_answer_out_of_order_associates_by_key() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // The two accounts differ in every compared field, so an answer
         // associated by position fails a field comparison.
         let mut destination = account(8);
@@ -890,7 +1002,11 @@ mod tests {
         assert_eq!(body["params"]["keys"], json!(requested));
     }
     #[tokio::test]
+    #[serial_test::serial]
     async fn self_payment_requests_the_source_key_once() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = oracle(network()).await;
         read_mock(&server, answer(vec![account_answer(7)])).await;
         let inputs = PayWitnessInputs {
@@ -932,7 +1048,11 @@ mod tests {
         assert_eq!(methods(&server).await, ["getNetwork", "getLedgerEntries"]);
     }
     #[tokio::test]
+    #[serial_test::serial]
     async fn invalid_answer_duplicate_key_is_witness_unavailable() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         invalid_answer(answer(vec![
             account_answer(7),
             account_answer(8),
@@ -941,7 +1061,11 @@ mod tests {
         .await;
     }
     #[tokio::test]
+    #[serial_test::serial]
     async fn invalid_answer_unrequested_key_is_witness_unavailable() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         invalid_answer(answer(vec![
             account_answer(7),
             account_answer(8),
@@ -950,7 +1074,11 @@ mod tests {
         .await;
     }
     #[tokio::test]
+    #[serial_test::serial]
     async fn invalid_answer_mismatched_data_is_witness_unavailable() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (_, t, _) = claim();
         invalid_answer(answer(vec![entry(
             &account_key(&address(7)).unwrap(),
@@ -959,13 +1087,21 @@ mod tests {
         .await;
     }
     #[tokio::test]
+    #[serial_test::serial]
     async fn invalid_answer_undecodable_entry_is_witness_unavailable() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut body = pay_answer();
         body["entries"][0]["xdr"] = json!("invalid-XDR");
         invalid_answer(body).await;
     }
     #[tokio::test]
+    #[serial_test::serial]
     async fn invalid_answer_ledger_out_of_range_is_witness_unavailable() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for ledger in [-1_i64, 0, i64::from(u32::MAX) + 1] {
             let mut body = pay_answer();
             body["latestLedger"] = json!(ledger);
@@ -973,7 +1109,11 @@ mod tests {
         }
     }
     #[tokio::test]
+    #[serial_test::serial]
     async fn invalid_answer_mismatched_identity_is_witness_unavailable_without_retry() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         invalid_answer(answer(vec![
             entry(
                 &account_key(&address(7)).unwrap(),
@@ -1022,7 +1162,11 @@ mod tests {
         }
     }
     #[tokio::test]
+    #[serial_test::serial]
     async fn classic_mismatch_never_retries() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // The first read disagrees and every later read agrees, so a retry
         // after a disagreement would pass.
         let server = oracle(network()).await;
@@ -1064,7 +1208,11 @@ mod tests {
         assert_eq!(reads, 1);
     }
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn classic_transport_retries_three_times_then_witness_unavailable() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = oracle(network()).await;
         Mock::given(method("POST"))
             .and(body_partial_json(json!({"method": "getLedgerEntries"})))
@@ -1096,7 +1244,11 @@ mod tests {
         );
     }
     #[tokio::test]
+    #[serial_test::serial]
     async fn classic_read_401_keeps_credential_code_without_retry() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for status in [401, 403] {
             let server = oracle(network()).await;
             Mock::given(method("POST"))
@@ -1118,7 +1270,11 @@ mod tests {
         }
     }
     #[tokio::test]
+    #[serial_test::serial]
     async fn classic_unparseable_read_body_is_invalid_answer() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = oracle(network()).await;
         Mock::given(method("POST"))
             .and(body_partial_json(json!({"method": "getLedgerEntries"})))
@@ -1136,7 +1292,11 @@ mod tests {
         assert_eq!(methods(&server).await, ["getNetwork", "getLedgerEntries"]);
     }
     #[tokio::test]
+    #[serial_test::serial]
     async fn invalid_answer_jsonrpc_error_object_is_witness_unavailable_without_retry() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = oracle(network()).await;
         Mock::given(method("POST"))
             .and(body_partial_json(json!({"method": "getLedgerEntries"})))
@@ -1157,7 +1317,11 @@ mod tests {
         assert_eq!(methods(&server).await, ["getNetwork", "getLedgerEntries"]);
     }
     #[tokio::test]
+    #[serial_test::serial]
     async fn classic_oracle_on_mainnet_from_testnet_profile_is_identity_mismatch() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = oracle(
             stellar_agent_test_support::signed_envelope::get_network_result(
                 stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE,
@@ -1174,7 +1338,11 @@ mod tests {
         assert_eq!(methods(&server).await, ["getNetwork"]);
     }
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn read_error_traces_carry_no_server_text() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = oracle(network()).await;
         Mock::given(method("POST"))
             .and(body_partial_json(json!({"method": "getLedgerEntries"})))
@@ -1263,7 +1431,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn classic_match_returns_witness_and_reads_in_one_batched_request() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = oracle(network()).await;
         read_mock(&server, pay_answer()).await;
         let outcome = run(&server, pay()).await.unwrap();
@@ -1291,7 +1463,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn classic_skip_and_not_required_make_no_oracle_request() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = oracle(network()).await;
         let mut profile = profile(&server);
         let native = CanonicalAsset::Native;
@@ -1326,7 +1502,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn classic_transport_failure_recovers_without_repeating_identity() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use std::sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -1385,17 +1565,29 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn classic_deadline_is_witness_unavailable() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         deadline_case(Duration::ZERO, Duration::from_millis(600)).await;
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn classic_identity_and_reads_share_attempt_deadline() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         deadline_case(Duration::from_millis(200), Duration::from_millis(200)).await;
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn classic_identity_failure_never_retries() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = oracle(
             stellar_agent_test_support::signed_envelope::get_network_result("private-network"),
         )
@@ -1440,6 +1632,9 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn classic_sends_oracle_credential() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let server = oracle(network()).await;
         read_mock(&server, pay_answer()).await;
@@ -1459,6 +1654,9 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn classic_missing_oracle_credential_reports_keyring_not_found() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let server = oracle(network()).await;
         let mut profile = profile(&server);
@@ -1473,7 +1671,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn classic_credential_rejection_keeps_credential_code() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for status in [401, 403] {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
@@ -1532,17 +1734,29 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn classic_same_host_warns_on_testnet() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         warning_case(false).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn classic_shared_operator_warns_on_testnet() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         warning_case(true).await;
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn witness_errors_echo_no_secret() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(401))
@@ -1580,7 +1794,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn invalid_answer_response_id_is_witness_unavailable_without_retry() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = oracle(network()).await;
         Mock::given(method("POST"))
             .and(body_partial_json(json!({"method": "getLedgerEntries"})))

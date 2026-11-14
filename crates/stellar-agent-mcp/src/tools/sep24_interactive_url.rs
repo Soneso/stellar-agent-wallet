@@ -349,6 +349,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn operation_marker_is_not_echoed() {
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fixture = crate::tools::message_signing_tests::Fixture::new();

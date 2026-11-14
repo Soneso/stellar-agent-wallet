@@ -10,7 +10,7 @@
 //! - [`WarningCapture`] records the fields of each warning a test emits.
 //! - [`keyring_mock`] — redirect `keyring_core` calls to an in-memory store
 //!   during unit tests, so no OS keychain dialog appears in `cargo test`.
-//! - [`xdr_fixtures`], [`testnet_strkeys`], [`verifier_registry`],
+//! - [`xdr_fixtures`], [`testnet_strkeys`], `verifier_registry`,
 //!   [`echo_id_responder`] — Stellar XDR / strkey fixtures and HTTP/contract
 //!   test doubles for consumer crates' tests.
 //! - [`rpc_request_count`] counts a mock server's requests for one RPC method.
@@ -23,7 +23,7 @@
 //! - [`auth_tree_rpc`]: a mocked RPC endpoint whose simulation hands an
 //!   authorizing address an invocation tree the test chooses, for tests that
 //!   drive a whole adapter submit flow.
-//! - [`testnet_helpers`] — live-network helpers (Friendbot funding, RPC) for
+//! - `testnet_helpers`: live-network helpers (Friendbot funding, RPC) for
 //!   consumer crates' testnet-acceptance tests; behind the `testnet-helpers`
 //!   feature and exercised only by those live tests.
 //! - [`env_guard::StellarAgentHomeGuard`] — RAII guard overriding
@@ -71,6 +71,7 @@ pub mod log_capture;
 mod loopback_forwarder;
 pub mod profile_fixtures;
 pub mod rejected_value;
+pub mod sandbox;
 pub mod secret_patterns;
 #[cfg(feature = "test-helpers")]
 pub mod signed_envelope;

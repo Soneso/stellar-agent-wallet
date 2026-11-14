@@ -1484,7 +1484,11 @@ mod tests {
     ///
     /// Key state is never engaged, so no keyring setup is required.
     #[test]
+    #[serial_test::serial]
     fn mint_rejects_empty_envelope_xdr() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let profile = stellar_agent_core::profile::schema::Profile::builder_testnet(
             "stellar-agent-signer",
             "empty-env-inline",

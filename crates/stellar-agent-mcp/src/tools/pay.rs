@@ -2249,6 +2249,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(keyring)]
     #[allow(clippy::expect_used, reason = "fixed test arguments")]
+    #[serial_test::serial]
     async fn muxed_contract_pay_stages_refuse_before_state() {
         let home = tempfile::tempdir().expect("home");
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
@@ -2550,7 +2551,12 @@ mod tests {
     /// the symbol the base64 decoder stopped at.
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn pay_commit_envelope_marker_is_not_echoed() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_test_support::CaptureWriter;
         use stellar_agent_test_support::rejected_value::{
             CREDENTIAL_MARKER, assert_no_marker_in_text,

@@ -216,6 +216,7 @@ fn requirements_for(f: &Fixture, amount: &str) -> String {
 /// their result.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn retried_business_id_returns_the_stored_operation_for_every_kind() {
     for tool in Tool::ALL {
         let id = fresh_business_id();
@@ -332,6 +333,7 @@ async fn retried_business_id_returns_the_stored_operation_for_every_kind() {
 /// that bounds a rebuilt envelope's time bounds.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn retried_prepare_returns_the_stored_envelope() {
     for tool in Tool::ALL {
         let id = fresh_business_id();
@@ -361,6 +363,7 @@ async fn retried_prepare_returns_the_stored_envelope() {
 /// byte-identical.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn another_intent_under_the_same_business_id_refuses_for_every_kind() {
     for tool in Tool::ALL {
         let id = fresh_business_id();
@@ -427,6 +430,7 @@ async fn another_intent_under_the_same_business_id_refuses_for_every_kind() {
 /// is read past the probe and nothing signs, mints or sends.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn a_claim_by_another_claimant_under_the_same_business_id_conflicts() {
     let id = fresh_business_id();
     let run = classic_run(Tool::Claim, &id).await;
@@ -528,6 +532,7 @@ fn entries_with_second_balance(f: &Fixture) -> Vec<Value> {
 /// under an unknown id keeps the ledger's refusal.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn a_claim_retry_after_its_balance_left_replays_the_stored_claim() {
     use stellar_xdr::{LedgerEntryData, Limits, ReadXdr as _};
     let id = fresh_business_id();
@@ -570,6 +575,7 @@ async fn a_claim_retry_after_its_balance_left_replays_the_stored_claim() {
 /// preparation under an unknown id keeps the predicate refusal.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn a_retained_claim_replays_after_its_predicate_expires() {
     let id = fresh_business_id();
     let run = classic_run(Tool::Claim, &id).await;
@@ -749,6 +755,7 @@ fn the_recovery_check_refuses_every_change_outside_the_recovery_state() {
 /// completes.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn a_retry_while_sending_replays_without_signing() {
     for tool in Tool::ALL {
         let id = fresh_business_id();
@@ -789,6 +796,7 @@ async fn a_retry_while_sending_replays_without_signing() {
 /// attempt in `Sending` with no exposure.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn begin_attempt_commits_sending_before_the_signature() {
     for tool in Tool::ALL {
         let id = fresh_business_id();
@@ -882,6 +890,7 @@ async fn x402_pay_under(run: &X402Run, approval: &(String, String), business_id:
 /// steps carry one commit id the record retains.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn x402_before_sign_commits_authorized_and_sending_together() {
     let id = fresh_business_id();
     let (run, approval) = x402_run_under(&id).await;
@@ -952,6 +961,7 @@ async fn x402_before_sign_commits_authorized_and_sending_together() {
 /// unconsumed.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn x402_exposure_commits_after_consumption_before_signed_simulation() {
     let id = fresh_business_id();
     let (run, approval) = x402_run_under(&id).await;
@@ -1005,6 +1015,7 @@ async fn x402_exposure_commits_after_consumption_before_signed_simulation() {
 /// the exposure, records `sent_outcome_unknown`.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn x402_payload_and_error_outcomes() {
     let id = fresh_business_id();
     let (run, approval) = x402_run_under(&id).await;
@@ -1060,6 +1071,7 @@ async fn x402_payload_and_error_outcomes() {
 /// commit under the preparation's id then proceeds.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn commit_with_another_business_id_refuses_with_mismatch() {
     for tool in Tool::ALL {
         let id = fresh_business_id();
@@ -1152,6 +1164,7 @@ async fn assert_foreign_envelope_conflicts(run: &ClassicRun, context: &str) {
 /// refusal comes before the approval is verified or its nonce consumed.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn a_commit_of_an_envelope_a_retained_record_does_not_bind_conflicts() {
     for tool in Tool::ALL {
         let id = fresh_business_id();
@@ -1170,6 +1183,7 @@ async fn a_commit_of_an_envelope_a_retained_record_does_not_bind_conflicts() {
 /// record's own commit then proceeds.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn a_commit_of_an_envelope_a_waiting_record_does_not_bind_conflicts() {
     for tool in Tool::ALL {
         let id = fresh_business_id();
@@ -1238,6 +1252,7 @@ async fn compacted_run(
 /// nothing mints.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn a_commit_of_other_facts_under_a_tombstone_conflicts() {
     for tool in Tool::ALL {
         let id = fresh_business_id();
@@ -1262,6 +1277,7 @@ async fn a_commit_of_other_facts_under_a_tombstone_conflicts() {
 /// nothing mints.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn a_commit_under_a_tombstone_of_another_slot_kind_conflicts() {
     use stellar_agent_network::policy_state::{
         BusinessId, OperationAudit, OperationRecorder, SlotKind,
@@ -1304,6 +1320,7 @@ async fn a_commit_under_a_tombstone_of_another_slot_kind_conflicts() {
 /// probe, minted or sent.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn a_commit_retried_under_its_tombstone_replays() {
     for tool in Tool::ALL {
         let id = fresh_business_id();
@@ -1328,6 +1345,7 @@ async fn a_commit_retried_under_its_tombstone_replays() {
 /// fee per operation matches the tombstone. A claim names no fee.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn a_commit_retried_under_a_tombstone_of_an_explicit_fee_replays() {
     use stellar_agent_network::fees::ClassicFeeChoice;
     const FEE: &str = "137";
@@ -1369,6 +1387,7 @@ async fn a_commit_retried_under_a_tombstone_of_an_explicit_fee_replays() {
 /// binds under that kind, and no identity under any other kind.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn commit_identities_follow_the_tool_kind() {
     use stellar_agent_network::policy_state::{BusinessId, OperationKind, OperationStatus};
     let kinds = [
@@ -1429,6 +1448,7 @@ fn with_raw_id(mut args: Value, raw: Option<&str>) -> Value {
 /// reads past the endpoint probe, mints or opens a record.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn mainnet_call_without_business_id_refuses_for_every_kind() {
     for tool in Tool::ALL {
         let id = fresh_business_id();
@@ -1615,6 +1635,7 @@ fn testnet_requirements(f: &Fixture) -> String {
 /// holds no operation, and a malformed id refuses.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn testnet_echoes_the_business_id_and_creates_no_record() {
     let f = Fixture::new(|raw| raw);
     let rpc = wiremock::MockServer::start().await;

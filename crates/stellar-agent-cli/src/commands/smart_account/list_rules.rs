@@ -583,7 +583,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn resolve_max_scan_id_takes_the_flag_then_the_profile_then_the_default() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert_eq!(
             resolve_max_scan_id(&scan_args(Some(7)), &scan_profile(Some(300))),
             7

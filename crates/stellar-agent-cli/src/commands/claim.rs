@@ -2318,7 +2318,11 @@ pub(crate) mod tests {
     /// submission; without it the profile's `submit_timeout_seconds` applies,
     /// then 60 seconds.
     #[tokio::test]
+    #[serial_test::serial]
     async fn timeout_flag_falls_back_to_the_profile_then_sixty() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert_eq!(
             try_parse_claim(
                 &[
@@ -2380,7 +2384,11 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn muxed_contract_staged_claim_refuses_before_keyring() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let args = minimal_args();
         let context = NetworkContext::new(
             TargetNetwork::Testnet.caip2(),
@@ -2825,7 +2833,11 @@ pub(crate) mod tests {
     /// step, before `build_unsigned_envelope` (and its RPC calls) ever runs,
     /// proving the initialisation happens ahead of any network build.
     #[tokio::test]
+    #[serial_test::serial]
     async fn run_initialises_keyring_store_before_policy_gate() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -2886,7 +2898,11 @@ pub(crate) mod tests {
     /// default), the keyring initialiser must NOT be invoked — the `Noop`
     /// engine never reads the owner key from the keyring.
     #[tokio::test]
+    #[serial_test::serial]
     async fn run_does_not_initialise_keyring_when_engine_is_noop() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -3188,7 +3204,11 @@ pub(crate) mod tests {
     /// A decodable claim envelope under a rule whose criterion does not
     /// apply to the non-debit `Claim` leg allows.
     #[test]
+    #[serial_test::serial]
     fn dispatch_staged_claim_gate_decodable_envelope_allows() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let engine = per_tx_cap_engine(false);
         let profile = staged_test_profile();
         let xdr = claim_envelope_b64();
@@ -3208,7 +3228,11 @@ pub(crate) mod tests {
     /// An envelope the decoder cannot classify, under a matched value rule,
     /// denies `policy.deny.unsizable_value_effect`.
     #[test]
+    #[serial_test::serial]
     fn dispatch_staged_claim_gate_unclassifiable_envelope_denies_unsizable() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let engine = per_tx_cap_engine(false);
         let profile = staged_test_profile();
         let xdr = unclassifiable_envelope_b64();
@@ -3233,7 +3257,11 @@ pub(crate) mod tests {
     /// The same unclassifiable envelope, under a rule with
     /// `allow_opaque_signing = true`, proceeds (allows).
     #[test]
+    #[serial_test::serial]
     fn dispatch_staged_claim_gate_unclassifiable_envelope_with_allow_opaque_signing_allows() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let engine = per_tx_cap_engine(true);
         let profile = staged_test_profile();
         let xdr = unclassifiable_envelope_b64();
@@ -3258,7 +3286,11 @@ pub(crate) mod tests {
     /// The no-op engine allows every staged flow unconditionally, decodable
     /// or not.
     #[test]
+    #[serial_test::serial]
     fn dispatch_staged_claim_gate_noop_engine_allows_regardless_of_decodability() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let engine = stellar_agent_core::policy::NoopPolicyEngine;
         let profile = staged_test_profile();
 
@@ -3326,18 +3358,27 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn enrolled_signing_equal() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         enrolled_signing_case(EnrolledPin::Derived).await;
     }
 
     #[tokio::test]
     #[serial_test::serial]
     async fn enrolled_signing_placeholder() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         enrolled_signing_case(EnrolledPin::Placeholder).await;
     }
 
     #[tokio::test]
     #[serial_test::serial]
     async fn enrolled_signing_mismatch() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         enrolled_signing_case(EnrolledPin::Other).await;
     }
 
@@ -3347,6 +3388,9 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn signer_key_mismatch_names_source() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let g = enrolled_test_g();
         let other = stellar_strkey::ed25519::PublicKey([7; 32])
             .to_string()
@@ -3522,6 +3566,9 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn a_built_claim_prints_one_envelope_with_the_preview_in_data() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let _profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         let server = mount_claim_rpc(SOURCE_G).await;
         let mut args = one_envelope_args(&server, "100");
@@ -3558,6 +3605,8 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn a_failure_after_the_preview_prints_one_envelope_with_the_preview_in_details() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let _profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         let server = mount_claim_rpc(SOURCE_G).await;
         let args = one_envelope_args(&server, "bogus");
@@ -3595,6 +3644,8 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn a_failure_before_the_preview_prints_one_envelope_without_a_preview() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let _profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         let server = mount_claim_rpc(SOURCE_G).await;
         let mut args = one_envelope_args(&server, "100");
@@ -3648,6 +3699,8 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn table_output_prints_the_preview_line_before_the_error_line() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let _profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         let server = mount_claim_rpc(SOURCE_G).await;
         let mut args = one_envelope_args(&server, "bogus");

@@ -1965,6 +1965,7 @@ mod tests {
     #[test]
     #[cfg(feature = "mainnet-write")]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn a_mainnet_server_with_an_unbound_signer_does_not_start() {
         let f = crate::tools::common::tests::mainnet::Fixture::new(|raw| raw);
         let profile = (*f.server.profile).clone();
@@ -2017,7 +2018,11 @@ mod tests {
     /// installs a fresh mock store first.
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn server_context_copies_mainnet_profile() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let profile = Profile::builder_mainnet_named(
             "context",
@@ -2038,6 +2043,7 @@ mod tests {
     /// for a testnet profile with the same oracle configuration.
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn settlement_oracle_follows_the_profile_chain() {
         use stellar_agent_core::profile::schema::{PrimaryProviderRecord, ProviderRecord};
         stellar_agent_test_support::keyring_mock::install().unwrap();
@@ -2160,7 +2166,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn profile_metadata_json_is_exact_allowlist() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let text = profile_metadata_json(&test_profile(), &HaltState::Running)
             .expect("metadata serializes");
         let value: Value = serde_json::from_str(&text).expect("valid json");
@@ -2205,7 +2215,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn profile_metadata_reports_the_halt_state() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let marker = halt::HaltMarker::new(
             "2026-10-31T12:00:00Z".to_owned(),
             Some("incident".to_owned()),
@@ -2232,7 +2246,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn account_resource_uri_round_trips_g_strkey() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let uri = account_resource_uri(SOURCE_G);
         assert_eq!(uri, format!("mcp-resource://accounts/{SOURCE_G}"));
         assert_eq!(account_resource_id_from_uri(&uri).unwrap(), SOURCE_G);
@@ -2251,7 +2269,10 @@ mod tests {
     /// given and matches the enrollment of its G base; C, W and secret-key
     /// ids are refused.
     #[test]
+    #[serial_test::serial]
     fn muxed_destination_reads() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let key = stellar_strkey::ed25519::PublicKey::from_string(SOURCE_G)
             .unwrap()
             .0;
@@ -2308,7 +2329,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn account_directory_json_is_exact_allowlist() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let profile = test_account_profile();
         let text = account_directory_json(SOURCE_G, &profile).expect("account json serializes");
         let value: Value = serde_json::from_str(&text).expect("valid json");
@@ -2334,7 +2359,11 @@ mod tests {
     /// service text.
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn owner_service_marker_is_not_echoed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_test_support::rejected_value::{CREDENTIAL_MARKER, assert_no_marker};
 
         stellar_agent_test_support::keyring_mock::install().ok();

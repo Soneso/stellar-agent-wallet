@@ -191,6 +191,7 @@ impl Respond for Rpc {
 }
 
 fn cli(home: &Path, args: &[&str]) -> (i32, Value) {
+    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
     let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
         .args(args)
         .env("STELLAR_AGENT_HOME", home)

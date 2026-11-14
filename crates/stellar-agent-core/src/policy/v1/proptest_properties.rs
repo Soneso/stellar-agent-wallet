@@ -78,6 +78,7 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(10_000))]
 
     #[test]
+    #[serial_test::serial]
     fn address_check_lists_selected_kind_with_exact_or_base_entry(
         bytes in any::<[u8; 32]>(),
         form in 0u8..3,
@@ -85,6 +86,8 @@ proptest! {
         entries in 0u8..32,
         id in any::<u64>(),
     ) {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home = stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::criteria::counterparty_allowlist::{
             CounterpartyAllowlistCriterion, CounterpartyKind, RecipientClass,
         };
@@ -155,13 +158,15 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(10_000))]
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn prop_approval_above_bounds_and_determinism(
         (rule, threshold, cap) in arb_approval_above_rule(),
         amount in 1_i128..=300_000_000_000,
         tool in arb_tool_descriptor_for_payment_tools(),
         (profile, profile_name) in arb_profile(),
     ) {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home = stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let engine = PolicyEngineV1::new(single_rule_document(rule), profile_name);
         for amount in [amount, threshold / 2, threshold, threshold + 1,
             cap.unwrap_or(threshold), cap.unwrap_or(threshold) + 1] {
@@ -202,13 +207,15 @@ proptest! {
     /// Instead we evaluate the same engine twice, which is the stronger claim:
     /// the engine has no hidden mutation between calls.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn prop_per_tx_cap_evaluate_is_deterministic(
         rule in arb_per_tx_cap_rule(),
         tool in arb_tool_descriptor(),
         args in arb_payment_args(),
         (profile, profile_name) in arb_profile(),
     ) {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home = stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let doc = single_rule_document(rule);
         let engine = PolicyEngineV1::new(doc, profile_name);
         let r1 = engine.evaluate(&tool, &args, &profile, None, None, None, None, None, 1_700_000_000_000);
@@ -223,13 +230,15 @@ proptest! {
     ///
     /// Same-engine re-evaluation must return the same `Decision`.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn prop_counterparty_allowlist_evaluate_is_deterministic(
         rule in arb_counterparty_allowlist_rule(),
         tool in arb_tool_descriptor(),
         args in arb_payment_args(),
         (profile, profile_name) in arb_profile(),
     ) {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home = stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let doc = single_rule_document(rule);
         let engine = PolicyEngineV1::new(doc, profile_name);
         let r1 = engine.evaluate(&tool, &args, &profile, None, None, None, None, None, 1_700_000_000_000);
@@ -249,13 +258,15 @@ proptest! {
     /// is `None`.  The property test exercises this correctly by omitting the
     /// view — both evaluations return identical errors.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn prop_minimum_reserve_evaluate_is_deterministic(
         rule in arb_minimum_reserve_rule(),
         tool in arb_tool_descriptor(),
         args in arb_payment_args(),
         (profile, profile_name) in arb_profile(),
     ) {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home = stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let doc = single_rule_document(rule);
         let engine = PolicyEngineV1::new(doc, profile_name);
         // Evaluate without account_view (fail-closed path).
@@ -293,7 +304,7 @@ proptest! {
     /// stroops (at minimum 2 stroops), so the strict deny rule (cap = 1 stroop)
     /// always fires for `stellar_pay` and `stellar_create_account`.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn prop_adding_deny_rule_cannot_turn_allow_into_allow(
         base_rule in prop_oneof![arb_per_tx_cap_rule(), arb_approval_above_rule().prop_map(|(rule, _, _)| rule)],
         strict_deny_rule in arb_strict_deny_per_tx_rule(),
@@ -301,6 +312,8 @@ proptest! {
         args in arb_native_payment_args(),
         (profile, profile_name) in arb_profile(),
     ) {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home = stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // Step 1: evaluate with base rule only.
         let doc_base = single_rule_document(base_rule);
         let mut engine_base = PolicyEngineV1::new(doc_base, profile_name.clone());

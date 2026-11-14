@@ -156,6 +156,7 @@ impl Run {
 /// overlays that select another profile or endpoint are removed.
 fn run(home: &Path, verb: Verb, extra: &[&str]) -> Run {
     let rule_id = RULE_ID.to_string();
+    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
     let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
         .args(verb.subcommand())
         .args([

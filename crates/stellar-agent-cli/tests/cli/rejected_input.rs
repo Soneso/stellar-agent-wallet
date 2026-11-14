@@ -8,6 +8,7 @@ use stellar_agent_test_support::rejected_value::{CREDENTIAL_MARKER, assert_no_ma
 const HEADLESS_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
 
 fn run(home: &std::path::Path, args: &[&str]) -> Output {
+    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
     Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
         .args(args)
         .env("STELLAR_AGENT_HOME", home)

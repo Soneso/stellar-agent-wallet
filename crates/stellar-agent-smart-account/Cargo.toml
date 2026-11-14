@@ -151,6 +151,7 @@ stellar-governance = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+stellar-agent-smart-account = { path = ".", features = ["test-helpers"] }
 tokio = { workspace = true, features = ["test-util"] }
 stellar-agent-network = { workspace = true, features = ["test-helpers"] }
 static_assertions = { workspace = true }

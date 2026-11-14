@@ -1912,7 +1912,11 @@ mod tests {
 
     #[test]
     #[cfg(feature = "test-helpers")]
+    #[serial_test::serial]
     fn gated_resolver_refuses_an_edited_manifest() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let fixture = GatedGrantFixture::new();
         fixture.record_grant();
         std::fs::write(
@@ -1929,7 +1933,11 @@ mod tests {
 
     #[test]
     #[cfg(feature = "test-helpers")]
+    #[serial_test::serial]
     fn gated_resolver_refuses_an_edited_pin() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let fixture = GatedGrantFixture::new();
         fixture.record_grant();
         add_stored_capability(fixture.dir.path(), "pay-toolset", "read-balance");
@@ -1945,7 +1953,11 @@ mod tests {
     /// must not reopen it.
     #[test]
     #[cfg(feature = "test-helpers")]
+    #[serial_test::serial]
     fn gated_resolver_refuses_an_edited_install_time() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let fixture = GatedGrantFixture::new();
         fixture.record_grant();
         fixture.set_install_time("2026-04-30T13:34:56Z");
@@ -1991,7 +2003,11 @@ attestation_version = 3
 
     #[test]
     #[cfg(feature = "test-helpers")]
+    #[serial_test::serial]
     fn gated_resolver_ignores_a_grant_from_an_earlier_install() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let fixture = GatedGrantFixture::new();
         fixture.record_grant();
         fixture.set_install_time("2026-04-30T13:34:56Z");
@@ -2007,7 +2023,11 @@ attestation_version = 3
 
     #[test]
     #[cfg(feature = "test-helpers")]
+    #[serial_test::serial]
     fn gated_resolver_ignores_a_pin_without_a_parsable_install_time() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let fixture = GatedGrantFixture::new();
         fixture.record_grant();
         fixture.set_install_time("yesterday");
@@ -2016,7 +2036,11 @@ attestation_version = 3
 
     #[test]
     #[cfg(feature = "test-helpers")]
+    #[serial_test::serial]
     fn a_grant_recorded_by_the_approval_path_resolves() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let fixture = GatedGrantFixture::new();
         fixture.record_grant();
         assert!(matches!(

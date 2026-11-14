@@ -3747,6 +3747,9 @@ registered_at_unix_ms = 1700000000000
     #[tokio::test]
     #[serial_test::serial]
     async fn signing_warning_holds_no_rp_id() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let mgr = test_manager(&dir);
@@ -3858,6 +3861,9 @@ registered_at_unix_ms = 1700000000000
     #[tokio::test]
     #[serial_test::serial]
     async fn the_gate_refuses_what_the_plan_does_not_name() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         crate::signing::intent_test_helpers::assert_envelope_bounds_refuse_before_signing().await;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3908,6 +3914,9 @@ registered_at_unix_ms = 1700000000000
     #[tokio::test]
     #[serial_test::serial]
     async fn sign_with_passkey_rule_starts_the_ceremony_for_a_valid_testnet_entry() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let (result, url_calls, audit_lines) = sign_entry(&testnet_partial(&[0])).await;
 
@@ -3925,6 +3934,9 @@ registered_at_unix_ms = 1700000000000
     #[tokio::test]
     #[serial_test::serial]
     async fn sign_with_passkey_rule_refuses_a_mainnet_entry_before_the_ceremony() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let partial = partial_on(stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE, &[0]);
 
@@ -3947,6 +3959,9 @@ registered_at_unix_ms = 1700000000000
     #[tokio::test]
     #[serial_test::serial]
     async fn sign_with_passkey_rule_refuses_a_tampered_digest_before_the_ceremony() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let mut partial = testnet_partial(&[0]);
         partial.auth_digest[0] ^= 0x01;
@@ -3972,6 +3987,9 @@ registered_at_unix_ms = 1700000000000
     #[tokio::test]
     #[serial_test::serial]
     async fn sign_with_passkey_rule_emits_audit_on_approval_store_unavailable() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         let dir = TempDir::new().unwrap();
@@ -4018,6 +4036,9 @@ registered_at_unix_ms = 1700000000000
     #[tokio::test]
     #[serial_test::serial]
     async fn sign_with_passkey_rule_emits_audit_on_not_found() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         let dir = TempDir::new().unwrap();
@@ -4069,6 +4090,9 @@ registered_at_unix_ms = 1700000000000
     #[tokio::test]
     #[serial_test::serial]
     async fn sign_with_passkey_rule_emits_audit_on_missing_public_key() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         let dir = TempDir::new().unwrap();
@@ -4124,6 +4148,9 @@ registered_at_unix_ms = 1700000000000
     #[tokio::test]
     #[serial_test::serial]
     async fn sign_with_passkey_rule_rejects_empty_rule_ids() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         let dir = TempDir::new().unwrap();
@@ -4157,6 +4184,9 @@ registered_at_unix_ms = 1700000000000
     #[tokio::test]
     #[serial_test::serial]
     async fn sign_with_passkey_rule_emits_smart_account_redacted_in_audit() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         let dir = TempDir::new().unwrap();
@@ -4282,6 +4312,9 @@ registered_at_unix_ms = 1700000000000
     #[tokio::test]
     #[serial_test::serial]
     async fn diversification_override_emits_audit_row_when_accept_single_verifier_true() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         let dir = TempDir::new().unwrap();
@@ -4357,6 +4390,9 @@ registered_at_unix_ms = 1700000000000
     #[test]
     #[serial_test::serial]
     fn missing_baseline_refusal_logs_no_rule_id() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         const REFUSED_RULE_ID: u32 = 4_242_424_242;
@@ -4480,6 +4516,9 @@ registered_at_unix_ms = 1700000000000
     #[test]
     #[serial_test::serial]
     fn poisoned_writer_warning_holds_no_missing_credential_name() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         use stellar_agent_test_support::rejected_value::{
             CREDENTIAL_MARKER, assert_no_marker, assert_no_marker_in_text,
@@ -4516,6 +4555,9 @@ registered_at_unix_ms = 1700000000000
     #[test]
     #[serial_test::serial]
     fn audit_write_failure_warning_holds_no_missing_credential_name() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         use stellar_agent_core::audit_log::writer::MAX_ROW_BYTES;
         use stellar_agent_test_support::rejected_value::{
@@ -4550,6 +4592,9 @@ registered_at_unix_ms = 1700000000000
     #[test]
     #[serial_test::serial]
     fn override_write_failure_warning_holds_no_rule_id() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         use std::os::unix::fs::PermissionsExt as _;
         use stellar_agent_test_support::rejected_value::{
@@ -4606,6 +4651,9 @@ registered_at_unix_ms = 1700000000000
     #[test]
     #[serial_test::serial]
     fn missing_on_chain_rule_warning_holds_no_rule_id() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         use stellar_agent_core::audit_log::signer_set::{
             BaselineReason, SignerEntryV2, SignerIdentityV2, SignerSetSnapshotV2, account_digest,
@@ -4716,6 +4764,9 @@ registered_at_unix_ms = 1700000000000
     #[tokio::test]
     #[serial_test::serial]
     async fn diversification_override_returns_error_when_audit_writer_poisoned() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         let dir = TempDir::new().unwrap();
@@ -4766,6 +4817,9 @@ registered_at_unix_ms = 1700000000000
     #[tokio::test]
     #[serial_test::serial]
     async fn result_tag_failure_verifier_diversification_required_emitted_on_refusal() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         let dir = TempDir::new().unwrap();
@@ -5241,6 +5295,9 @@ registered_at_unix_ms = 1700000000000
     #[tokio::test]
     #[serial_test::serial]
     async fn sign_with_passkey_rule_emits_invalid_rule_ids_audit_tag() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 

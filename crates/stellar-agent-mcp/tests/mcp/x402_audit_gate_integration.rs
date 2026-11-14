@@ -3752,6 +3752,9 @@ fn x402_chain_id_schema_uses_mainnet() {
 #[tokio::test]
 #[serial]
 async fn x402_chain_arguments_preserve_refusal_order() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     for (tool, profile_name, seed) in [
         (Tool::CreatePayment, "x402-chain-cp", 0xf6),
         (Tool::AuthenticatedPayment, "x402-chain-ap", 0xf7),

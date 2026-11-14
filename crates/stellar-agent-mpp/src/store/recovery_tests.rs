@@ -249,6 +249,10 @@ impl Fixture {
 #[tokio::test]
 #[serial_test::serial]
 async fn adoption_preserves_history_once_and_enforces_rollback() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("keyring");
     let fx = Fixture::new("adopt-history", 1, 0).await;
     let expected = 1;
@@ -295,6 +299,10 @@ async fn adoption_preserves_history_once_and_enforces_rollback() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_protected_snapshot_without_its_anchor_is_not_adopted() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("keyring");
     let fx = Fixture::new("adopt-refusal-anchored-format", STORE_VERSION, 7).await;
     assert!(
@@ -311,6 +319,10 @@ async fn a_protected_snapshot_without_its_anchor_is_not_adopted() {
 #[tokio::test]
 #[serial_test::serial]
 async fn adoption_refuses_bad_hmac_invalid_records_and_anchor_access_failure() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("keyring");
     for fault in ["hmac", "records", "keyring"] {
         let fx = Fixture::new(&format!("adopt-refusal-{fault}"), 1, 0).await;
@@ -346,6 +358,10 @@ async fn adoption_refuses_bad_hmac_invalid_records_and_anchor_access_failure() {
 #[tokio::test]
 #[serial_test::serial]
 async fn adoption_and_reset_require_a_durable_audit_row() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("keyring");
     let fx = Fixture::new("mpp-audit-required", 1, 0).await;
     let coord = &fx.profile.audit_log_hash_chain_key_id;
@@ -377,6 +393,10 @@ async fn adoption_and_reset_require_a_durable_audit_row() {
 #[tokio::test]
 #[serial_test::serial]
 async fn adoption_and_reset_share_the_prepare_lock() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("keyring");
     let fx = Fixture::new("mpp-maintenance-lock", 1, 0).await;
     let handle =
@@ -411,6 +431,10 @@ async fn adoption_and_reset_share_the_prepare_lock() {
 #[tokio::test]
 #[serial_test::serial]
 async fn adoption_refuses_a_present_intent() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("keyring");
     for intent in ["0", "5"] {
         let fx = Fixture::new(&format!("adopt-refusal-intent-{intent}"), 1, 0).await;
@@ -427,6 +451,10 @@ async fn adoption_refuses_a_present_intent() {
 #[tokio::test]
 #[serial_test::serial]
 async fn an_interrupted_adoption_completes_on_the_next_open() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("keyring");
     for (index, (hook, published)) in [
         (&tests::AFTER_RESERVATION, false),
@@ -469,6 +497,10 @@ async fn an_interrupted_adoption_completes_on_the_next_open() {
 #[tokio::test]
 #[serial_test::serial]
 async fn reset_carries_authenticated_records_across_a_counter_gap() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("keyring");
     let fx = Fixture::new("mpp-reset-gap", 1, 0).await;
     let stale_handle = fx.open().expect("adopt");
@@ -543,6 +575,10 @@ async fn reset_carries_authenticated_records_across_a_counter_gap() {
 #[tokio::test]
 #[serial_test::serial]
 async fn reset_reports_a_stale_carry_and_refuses_challenges_it_may_have_lost() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("keyring");
     let fx = Fixture::new("mpp-reset-stale", STORE_VERSION, 1).await;
     write_generation(&generation_entry_ref(&fx.key_ref), 1).expect("anchor");
@@ -587,6 +623,10 @@ async fn reset_reports_a_stale_carry_and_refuses_challenges_it_may_have_lost() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_renewable_expiry_cannot_pass_the_reset_horizon() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("keyring");
     for (label, expires) in [("absent", None), ("far", Some(NOW + 3600))] {
         let fx = Fixture::new(&format!("mpp-renew-reset-{label}"), STORE_VERSION, 1).await;
@@ -607,6 +647,10 @@ async fn a_renewable_expiry_cannot_pass_the_reset_horizon() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_renewable_expiry_cannot_pass_the_prune_watermark() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("keyring");
     let prune_at = NOW + MAX_CHALLENGE_LIFETIME_SECS + TERMINAL_RETENTION_SECS + 1;
     for (label, expires) in [("absent", None), ("far", Some(prune_at + 3600))] {
@@ -628,6 +672,10 @@ async fn a_renewable_expiry_cannot_pass_the_prune_watermark() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_fixed_expiry_challenge_stays_refused_through_the_horizon() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("keyring");
     let fx = Fixture::new("mpp-fixed-expiry", STORE_VERSION, 1).await;
     let resource = "https://merchant.example/fixed";
@@ -663,6 +711,10 @@ async fn a_fixed_expiry_challenge_stays_refused_through_the_horizon() {
 #[tokio::test]
 #[serial_test::serial]
 async fn malformed_counters_refuse_a_carry_and_recover_by_discarding() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("keyring");
     check_malformed_counter_recovery("text-committed", b"bad-counter", b"3", None).await;
     check_malformed_counter_recovery("text-intent", b"3", b"bad-intent", Some(3)).await;
@@ -671,6 +723,10 @@ async fn malformed_counters_refuse_a_carry_and_recover_by_discarding() {
 #[tokio::test]
 #[serial_test::serial]
 async fn non_utf8_committed_counter_recovers_by_discarding() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("keyring");
     check_malformed_counter_recovery("bytes-committed", &[0xff, 0xfe], b"3", None).await;
 }
@@ -678,6 +734,10 @@ async fn non_utf8_committed_counter_recovers_by_discarding() {
 #[tokio::test]
 #[serial_test::serial]
 async fn non_utf8_intent_counter_recovers_by_discarding() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("keyring");
     check_malformed_counter_recovery("bytes-intent", b"3", &[0xff, 0xfe], Some(3)).await;
 }
@@ -754,6 +814,10 @@ async fn check_malformed_counter_recovery(
 #[tokio::test]
 #[serial_test::serial]
 async fn reset_publishes_above_a_burned_intent() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("keyring");
     let fx = Fixture::new("mpp-reset-floor-intent", STORE_VERSION, 3).await;
     write_generation(&generation_entry_ref(&fx.key_ref), 3).expect("counter");
@@ -770,6 +834,10 @@ async fn reset_publishes_above_a_burned_intent() {
 #[tokio::test]
 #[serial_test::serial]
 async fn reset_discards_history_under_an_owner_state_key() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use base64::Engine as _;
     keyring_mock::install().expect("keyring");
     let fx = Fixture::new("mpp-reset-owner-key", STORE_VERSION, 1).await;
@@ -798,6 +866,10 @@ async fn reset_discards_history_under_an_owner_state_key() {
 #[tokio::test]
 #[serial_test::serial]
 async fn reset_discards_a_file_that_does_not_authenticate() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("keyring");
     let fx = Fixture::new("mpp-reset-tampered", STORE_VERSION, 1).await;
     write_generation(&generation_entry_ref(&fx.key_ref), 1).expect("anchor");
@@ -830,6 +902,10 @@ async fn reset_discards_a_file_that_does_not_authenticate() {
 #[tokio::test]
 #[serial_test::serial]
 async fn reset_refuses_read_errors_without_changing_state() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("keyring");
     for fault in ["directory", "directory-without-key", "keyring"] {
         let fx = Fixture::new(&format!("mpp-reset-read-error-{fault}"), STORE_VERSION, 1).await;
@@ -875,6 +951,10 @@ async fn reset_refuses_read_errors_without_changing_state() {
 #[tokio::test]
 #[serial_test::serial]
 async fn reset_closes_a_ready_record() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("keyring");
     let fx = Fixture::new("mpp-reset-ready", 1, 0).await;
     let store = fx.open().expect("adopt");
@@ -906,6 +986,10 @@ async fn reset_closes_a_ready_record() {
 #[tokio::test]
 #[serial_test::serial]
 async fn an_absent_anchor_refuses_a_carry_and_recovers_by_discarding() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("keyring");
     let fx = Fixture::new("mpp-reset-absent", STORE_VERSION, 3).await;
     let key = load_hmac_key_32(&fx.key_ref).expect("key");
@@ -949,6 +1033,10 @@ async fn an_absent_anchor_refuses_a_carry_and_recovers_by_discarding() {
 #[tokio::test]
 #[serial_test::serial]
 async fn reset_recovers_a_state_key_without_counter_or_file() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("keyring");
     let fx = Fixture::new("mpp-reset-keyonly", STORE_VERSION, 3).await;
     fs::remove_file(&fx.path).expect("remove state file");
@@ -978,6 +1066,10 @@ async fn reset_recovers_a_state_key_without_counter_or_file() {
 #[tokio::test]
 #[serial_test::serial]
 async fn reset_discards_under_a_malformed_anchor_and_missing_state_key() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("keyring");
     let fx = Fixture::new("mpp-reset-malformed", 1, 0).await;
     let anchor = generation_entry_ref(&fx.key_ref);
@@ -1026,6 +1118,10 @@ async fn reset_discards_under_a_malformed_anchor_and_missing_state_key() {
 #[tokio::test]
 #[serial_test::serial]
 async fn discard_crash_boundaries_have_documented_recovery() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("keyring");
     for (label, committed) in [
         ("absent", None),
@@ -1111,6 +1207,10 @@ async fn discard_crash_boundaries_have_documented_recovery() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_resumed_adoption_interrupted_before_publication_requires_discard() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("keyring");
     let fx = Fixture::new("adopt-resume-interrupted", 1, 0).await;
     Fixture::put(&fx.intent_entry(), "1");

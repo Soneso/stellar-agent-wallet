@@ -44,7 +44,7 @@ stellar-agent-network = { workspace = true }
 stellar-agent-test-support = { path = "../stellar-agent-test-support" }
 tokio               = { workspace = true, features = ["rt-multi-thread", "macros"] }
 stellar-agent-sep10 = { path = "../stellar-agent-sep10" }
-stellar-agent-network = { path = "../stellar-agent-network" }
+stellar-agent-network = { path = "../stellar-agent-network", features = ["test-helpers"] }
 serde_json          = { workspace = true }
 serde               = { workspace = true }
 reqwest             = { workspace = true }

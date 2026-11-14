@@ -1229,7 +1229,14 @@ mod tests {
                 "mpp.challenge_invalid"
             )
         });
-        assert_eq!(std::fs::read_dir(home.path()).expect("state").count(), 1);
+        assert_eq!(
+            std::fs::read_dir(home.path())
+                .expect("state")
+                .filter(|entry| entry.as_ref().expect("entry").file_name()
+                    != stellar_agent_test_support::sandbox::MARKER)
+                .count(),
+            1
+        );
     }
 
     thread_local! {
@@ -1252,6 +1259,10 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn the_attestation_loader_refuses_owner_key_forms() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use base64::Engine as _;
         use stellar_agent_core::profile::schema::KeyringEntryRef;
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring");
@@ -1292,7 +1303,12 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn testnet_context_derives_the_canonical_passphrase() {
+        let storage_sandbox =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut profile = Profile::builder_testnet_named("context", "s", "a", "n", "a")
             .with_noop_engine()
             .build();
@@ -1305,7 +1321,12 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn testnet_context_refuses_mainnet_with_network_error() {
+        let storage_sandbox =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let profile = Profile::builder_mainnet_named(
             "context",
             "https://rpc.example.invalid",

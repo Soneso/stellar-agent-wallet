@@ -345,7 +345,11 @@ mod tests {
     /// regressed guard that let signing proceed via a leaked key path fails here.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn mainnet_profile_refuses_before_signing_no_signature_produced() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = make_mainnet_server();
         let args = Sep43SignMessageArgs {
             chain_id: "stellar:mainnet".to_owned(),
@@ -374,7 +378,11 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn sign_message_mainnet_refusal_reads_context() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::tools::common::{assert_business_envelope, mainnet_signing_forbidden_result};
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let profile = Profile::builder_testnet_named("context", "s", "a", "n", "a")
@@ -408,7 +416,11 @@ mod tests {
     /// `policy.approval_required_unsupported`, and MUST NOT produce a signature.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn require_approval_verdict_is_fail_closed_no_signature_produced() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().ok();
         let server = make_require_approval_server();
         let args = Sep43SignMessageArgs {
@@ -446,6 +458,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn message_scope_scenario_a_refuses_before_key_access() {
         let fixture = crate::tools::message_signing_tests::Fixture::new();
         fixture.mainnet_sibling(false);
@@ -462,6 +475,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn message_scope_scenario_b_refuses_signer_overlay() {
         let mut fixture = crate::tools::message_signing_tests::Fixture::new();
         fixture.overlay_mainnet_signer();
@@ -481,6 +495,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn message_scope_refuses_testnet_shared_signer_coordinate() {
         let fixture = crate::tools::message_signing_tests::Fixture::new();
         let mut sibling = fixture.mainnet_sibling(true);
@@ -503,6 +518,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn message_signing_records_one_redacted_row_and_verifies() {
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fixture = crate::tools::message_signing_tests::Fixture::new();
@@ -523,6 +539,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn message_signing_unacquirable_audit_writer_refuses_before_signer_load() {
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let mut fixture = crate::tools::message_signing_tests::Fixture::new();

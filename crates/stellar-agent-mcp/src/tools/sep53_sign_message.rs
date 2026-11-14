@@ -430,7 +430,11 @@ mod tests {
     /// regressed guard that let signing proceed via a leaked key path fails here.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn mainnet_profile_refuses_before_signing_no_signature_produced() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = make_mainnet_server();
         let args = Sep53SignMessageArgs {
             chain_id: "stellar:mainnet".to_owned(),
@@ -465,7 +469,11 @@ mod tests {
     /// `policy.approval_required_unsupported` and MUST NOT produce a signature.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn require_approval_verdict_is_fail_closed_no_signature_produced() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().ok();
         let server = make_require_approval_server();
         let args = Sep53SignMessageArgs {
@@ -494,6 +502,7 @@ mod tests {
     /// The passphrase guard refuses even when the declared chain is testnet.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn a_testnet_chain_with_a_mainnet_passphrase_reports_the_signing_refusal() {
         use stellar_agent_network::signing::Signer;
 
@@ -547,6 +556,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn message_scope_scenario_a_refuses_before_key_access() {
         let fixture = crate::tools::message_signing_tests::Fixture::new();
         fixture.mainnet_sibling(false);
@@ -563,6 +573,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn message_scope_scenario_b_refuses_signer_overlay() {
         let mut fixture = crate::tools::message_signing_tests::Fixture::new();
         fixture.overlay_mainnet_signer();
@@ -582,6 +593,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn message_scope_refuses_testnet_shared_signer_coordinate() {
         let fixture = crate::tools::message_signing_tests::Fixture::new();
         let mut sibling = fixture.mainnet_sibling(true);
@@ -604,6 +616,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn a_mainnet_bound_signer_refuses_testnet_message_signing() {
         let mut fixture = crate::tools::message_signing_tests::Fixture::new();
         let reads = fixture.transplant_from_mainnet_victim();
@@ -626,6 +639,7 @@ mod tests {
     /// absent record refuses before the seed is read.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn an_interrupted_enrollment_refuses_message_signing() {
         use std::sync::{
             Arc,
@@ -663,6 +677,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn message_signing_records_one_redacted_row_and_verifies() {
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fixture = crate::tools::message_signing_tests::Fixture::new();
@@ -683,6 +698,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn message_signing_unacquirable_audit_writer_refuses_before_signer_load() {
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let mut fixture = crate::tools::message_signing_tests::Fixture::new();
@@ -699,6 +715,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn malformed_message_reports_its_code_before_the_audit_preflight() {
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let mut fixture = crate::tools::message_signing_tests::Fixture::new();
@@ -732,6 +749,7 @@ mod tests {
     /// decoder stopped at.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn sep53_sign_base64_marker_is_not_echoed() {
         use stellar_agent_test_support::rejected_value::{
             CREDENTIAL_MARKER, assert_no_marker_in_text,

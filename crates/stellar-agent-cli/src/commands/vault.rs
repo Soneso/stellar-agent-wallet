@@ -1213,14 +1213,14 @@ mod tests {
     // ── keyring store initialisation ordering (deposit) ───────────────────────
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn run_deposit_initialises_keyring_store_before_signer_resolution() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         // The keyring initialiser must be invoked on the deposit path, after
         // the profile load and before the signer is resolved from the keyring.
-        // Both dependencies are injected, so no OS keychain or on-disk profile
-        // is touched and no process-global keyring store is registered — hence
-        // this test needs no `#[serial]`.  The injected initialiser returns an
-        // error so the run bails at that step, which proves the store
-        // initialisation gates the path ahead of signer resolution.
+        // Injected dependencies refuse initialization before signer resolution.
+        // The marked home isolates state lookups before that refusal.
         let profile_loaded = Arc::new(AtomicBool::new(false));
         let init_invoked = Arc::new(AtomicBool::new(false));
 
@@ -1271,7 +1271,10 @@ mod tests {
     // ── keyring store initialisation ordering (withdraw) ──────────────────────
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn run_withdraw_initialises_keyring_store_before_signer_resolution() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let profile_loaded = Arc::new(AtomicBool::new(false));
         let init_invoked = Arc::new(AtomicBool::new(false));
 
@@ -1515,6 +1518,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn run_deposit_refuses_after_ordered_trust_gate_when_audit_key_unminted() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
 
         let vault_c = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
@@ -1589,6 +1594,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn run_withdraw_refuses_after_ordered_trust_gate_when_audit_key_unminted() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
 
         let vault_c = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";

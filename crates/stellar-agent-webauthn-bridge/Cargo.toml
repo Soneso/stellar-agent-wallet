@@ -61,6 +61,7 @@ base64 = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+stellar-agent-smart-account = { path = "../stellar-agent-smart-account", features = ["test-helpers"] }
 # HTTP client for integration tests (healthz, callbacks).
 reqwest = { workspace = true, features = ["json"] }
 

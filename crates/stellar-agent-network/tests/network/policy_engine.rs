@@ -487,7 +487,11 @@ fn a_stored_nonce_without_a_pin_refuses_and_writes_no_pin() {
     }
 }
 #[test]
+#[serial_test::serial]
 fn signed_fee_cap_precedence() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::error::FeeSource;
     use stellar_agent_network::fees::check_classic_fee_cap_signed;
     let mut profile = profile(true);
@@ -511,7 +515,11 @@ fn signed_fee_cap_precedence() {
     assert!(check_classic_fee_cap_signed(100, FeeSource::ProfileDefault, &profile, None).is_err());
 }
 #[test]
+#[serial_test::serial]
 fn signed_fee_cap_warns_when_profile_is_higher() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mut profile = profile(true);
     profile.classic_max_fee_per_op_stroops = Some(200);
     let capture = stellar_agent_test_support::CaptureWriter::new();
@@ -539,6 +547,9 @@ fn signed_fee_cap_warns_when_profile_is_higher() {
 #[test]
 #[serial]
 fn persisted_store_retries_contention_and_refuses_a_held_lock() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::policy::state_lock::WindowStoreLock;
     use stellar_agent_network::policy_state::{PersistedWindowStore, WindowStoreError};
     keyring_mock::install().unwrap();

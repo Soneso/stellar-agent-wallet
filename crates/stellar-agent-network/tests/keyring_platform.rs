@@ -15,7 +15,8 @@
 
 use keyring_core::Entry;
 use stellar_agent_network::keyring::{
-    KeyringBackend, active_keyring_backend, init_platform_keyring_store,
+    KeyringBackend, active_keyring_backend,
+    live::{LivePlatformKeyring, init_platform_keyring_store_live},
 };
 
 /// Service of the test entry; no wallet profile uses it.
@@ -41,7 +42,8 @@ fn keyring_platform_roundtrip() {
         std::env::var_os("STELLAR_AGENT_KEYRING_BACKEND").is_none(),
         "STELLAR_AGENT_KEYRING_BACKEND selects a headless store; the round trip needs the platform store"
     );
-    init_platform_keyring_store().expect("the platform keyring store registers");
+    init_platform_keyring_store_live(LivePlatformKeyring::acknowledge_real_platform_keyring())
+        .expect("the platform keyring store registers");
     assert_eq!(
         active_keyring_backend(),
         KeyringBackend::Platform,

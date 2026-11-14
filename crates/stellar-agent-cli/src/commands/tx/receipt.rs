@@ -1543,6 +1543,10 @@ mod tests {
     #[test]
     #[serial]
     fn the_clear_row_applies_the_binding_check_of_the_origin() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         for (name, origin, recorded) in [
@@ -1602,6 +1606,10 @@ mod tests {
     #[test]
     #[serial]
     fn a_clear_row_that_cannot_be_appended_keeps_the_disposition_clearable() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::profile::receipt::{ReceiptStatus, ReleaseEvidence};
 
         keyring_mock::install().expect("mock keyring store");
@@ -1755,6 +1763,10 @@ mod tests {
     #[test]
     #[serial]
     fn a_clear_lookup_that_cannot_read_the_history_refuses_and_keeps_the_receipt() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::profile::receipt::ReceiptStatus;
 
         keyring_mock::install().expect("mock keyring store");
@@ -1832,7 +1844,12 @@ mod tests {
     /// A clear row appended past the writer's verified tip does not stand in
     /// for the clear's own row: the clear writes its row.
     #[test]
+    #[serial_test::serial]
     fn a_forged_cleared_row_past_the_tip_does_not_suppress_the_clear_row() {
+        let storage_sandbox =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::AuditWriter;
 
         let dir = tempfile::tempdir().expect("tmp dir");
@@ -1886,7 +1903,12 @@ mod tests {
     /// A synthesized profile without a writer clears its receipt even when
     /// retained audit history cannot be read, since it owes no audit row.
     #[test]
+    #[serial_test::serial]
     fn a_synthesized_clear_without_a_writer_skips_broken_history() {
+        let storage_sandbox =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::{AuditWriter, reader, verify::VerifyError};
         use stellar_agent_core::profile::receipt::ReceiptStatus;
 

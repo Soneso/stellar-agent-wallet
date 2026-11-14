@@ -470,8 +470,11 @@ mod tests {
     /// both evaluation paths, through escalation and denial; the default-deny
     /// names no rule.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn mainnet_decision_carries_the_document_ordinal() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let policy = policy();
         for valued in [false, true] {
             let allowed = evaluate(&policy, "stellar_pay", 50, valued).unwrap();
@@ -515,8 +518,11 @@ mod tests {
     /// profile, the caller's chain and scope, the supplied instant, and the
     /// governing lifetime of its decision kind.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn mainnet_decision_records_its_provenance() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let policy = policy();
         let allowed = evaluate(&policy, "stellar_pay", 50, false).unwrap();
         assert_eq!(allowed.policy_digest(), policy.digest());
@@ -581,8 +587,11 @@ mod tests {
 
     /// An engine failure is `Engine`, never a decision.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn an_engine_failure_is_an_engine_refusal() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let policy = policy();
         let descriptor = tool("stellar_pay");
         let profile = profile();

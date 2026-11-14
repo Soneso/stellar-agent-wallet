@@ -150,6 +150,9 @@ impl Fixture {
 #[test]
 #[serial]
 fn a_second_reservation_over_the_amount_cap_is_refused_and_writes_nothing() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = fixture("admit-amount");
     let now = now_ms();
     let first_id = "a".repeat(64);
@@ -212,6 +215,9 @@ fn a_second_reservation_over_the_amount_cap_is_refused_and_writes_nothing() {
 #[test]
 #[serial]
 fn a_second_reservation_over_the_call_limit_is_refused_and_writes_nothing() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = fixture("admit-count");
     let now = now_ms();
     let first_id = "c".repeat(64);
@@ -272,6 +278,9 @@ fn a_second_reservation_over_the_call_limit_is_refused_and_writes_nothing() {
 #[test]
 #[serial]
 fn a_batch_whose_entries_jointly_exceed_the_cap_writes_none_of_them() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = fixture("admit-batch");
     let now = now_ms();
     let id = "e".repeat(64);
@@ -322,6 +331,9 @@ fn a_batch_whose_entries_jointly_exceed_the_cap_writes_none_of_them() {
 #[test]
 #[serial]
 fn a_batch_the_bucket_admits_is_written_whole() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = fixture("admit-whole");
     let now = now_ms();
     let id = "f".repeat(64);
@@ -349,6 +361,9 @@ fn a_batch_the_bucket_admits_is_written_whole() {
 #[test]
 #[serial]
 fn a_reservation_older_than_the_window_still_holds_the_cap() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = fixture("admit-aged");
     let now = now_ms();
     let first_id = "1".repeat(64);
@@ -388,6 +403,9 @@ fn a_reservation_older_than_the_window_still_holds_the_cap() {
 #[test]
 #[serial]
 fn reported_aged_success_keeps_the_next_reservation_over_cap() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = fixture("admit-rolled");
     let now = now_ms();
     let first_id = "3".repeat(64);
@@ -429,6 +447,9 @@ fn reported_aged_success_keeps_the_next_reservation_over_cap() {
 #[test]
 #[serial]
 fn ordinary_aged_spend_admits_the_next_reservation() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = fixture("ordinary-rolled");
     let now = now_ms();
     let aged = now - 2 * 24 * 60 * 60 * 1000;
@@ -454,6 +475,9 @@ fn ordinary_aged_spend_admits_the_next_reservation() {
 #[test]
 #[serial]
 fn a_record_past_the_clock_skew_tolerance_refuses_admission() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = fixture("admit-skew");
     let now = now_ms();
     let skewed_id = "a".repeat(64);
@@ -514,6 +538,9 @@ fn a_record_past_the_clock_skew_tolerance_refuses_admission() {
 #[test]
 #[serial]
 fn a_record_at_the_clock_skew_tolerance_counts_toward_the_limit() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = fixture("admit-skew-edge");
     let now = now_ms();
     let first_id = "a".repeat(64);
@@ -567,6 +594,9 @@ fn a_record_at_the_clock_skew_tolerance_counts_toward_the_limit() {
 #[test]
 #[serial]
 fn confirmed_ledger_time_ahead_of_host_counts_at_admission_and_gate() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = fixture("admit-ledger-clock");
     let now = now_ms();
     let first_id = "5".repeat(64);
@@ -609,6 +639,9 @@ fn confirmed_ledger_time_ahead_of_host_counts_at_admission_and_gate() {
 #[test]
 #[serial]
 fn authorized_settlements_share_admission_and_refusal_records_nothing() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::policy::v1::criteria::per_period_cap::{PerPeriodCapCriterion, Window};
     use stellar_agent_core::policy::v1::loader::{PolicyDocument, PolicyRule, RuleMatch, ScopeId};
     use stellar_agent_core::policy::v1::value::{ActionKind, ValueLeg};

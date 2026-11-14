@@ -254,6 +254,8 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn rotate_attestation_key_nonexistent_profile_returns_exit_1() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let args = RotateAttestationKeyArgs {
             name: Some("__nonexistent_rotate_attestation_key__".to_owned()),
             profile: None,
@@ -267,6 +269,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn an_owner_namespace_coordinate_refuses_the_rotation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::profile::schema::KeyringEntryRef;
 
         stellar_agent_test_support::keyring_mock::install().unwrap();

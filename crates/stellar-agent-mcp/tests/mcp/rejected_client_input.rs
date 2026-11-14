@@ -107,7 +107,11 @@ fn initialize(protocol_version: &str) -> Value {
 /// A request before `initialize` is refused with the fixed text, and neither
 /// the error's forms nor its source chain hold the message.
 #[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
 async fn a_request_before_initialize_is_refused_without_its_payload() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let capture = TraceCapture::start(FormatChoice::Pretty);
     let error = serve_frames(&frame(&json!({
         "jsonrpc": "2.0",
@@ -135,7 +139,11 @@ async fn a_request_before_initialize_is_refused_without_its_payload() {
 /// A frame of malformed typed JSON ends the session with an event that holds
 /// its position alone.
 #[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
 async fn a_malformed_frame_logs_its_position_alone() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     for format in [FormatChoice::Pretty, FormatChoice::Json] {
         let capture = TraceCapture::start(format);
         let error = serve_frames(&frame(&json!({
@@ -163,7 +171,11 @@ async fn a_malformed_frame_logs_its_position_alone() {
 
 /// A frame over the line limit ends the session with the fixed event.
 #[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
 async fn an_oversized_frame_logs_the_line_limit() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let capture = TraceCapture::start(FormatChoice::Pretty);
     let mut line = MARKER.repeat(STELLAR_AGENT_MCP_MAX_LINE_BYTES / MARKER.len() + 2);
     line.push('\n');
@@ -191,7 +203,11 @@ impl AsyncRead for FailingReader {
 
 /// A read failure ends the session with the fixed event and the I/O kind.
 #[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
 async fn a_read_failure_logs_the_io_kind() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let capture = TraceCapture::start(FormatChoice::Pretty);
     let (_client, server_side) = tokio::io::duplex(1 << 10);
     let (_unused, server_write) = tokio::io::split(server_side);
@@ -212,7 +228,11 @@ async fn a_read_failure_logs_the_io_kind() {
 /// the log at the most verbose directive, while the wallet and the rest of
 /// rmcp keep logging.
 #[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
 async fn held_rmcp_events_stay_out_of_a_real_session() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let capture = TraceCapture::start(FormatChoice::Pretty);
     let mut frames = frame(&initialize(MARKER));
     frames.extend(frame(
@@ -234,7 +254,11 @@ async fn held_rmcp_events_stay_out_of_a_real_session() {
 /// A rejected tool argument stays out of the log at the most verbose
 /// directive, with the session's own events in place.
 #[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
 async fn a_rejected_argument_stays_out_of_the_log() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let capture = TraceCapture::start(FormatChoice::Pretty);
     let response = tool_response(
         "stellar_balances",
@@ -297,7 +321,10 @@ async fn serve_on_send(
 /// A field of the wrong type or an unknown variant is refused with the route
 /// name and the fixed text, in the only content item.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_rejected_argument_stays_out_of_the_tool_result() {
+    let home = tempfile::tempdir().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
     let cases = [
         (
             "stellar_balances",
@@ -330,7 +357,10 @@ async fn a_rejected_argument_stays_out_of_the_tool_result() {
 
 /// An unknown route answers rmcp's fixed text without the requested name.
 #[tokio::test]
+#[serial_test::serial]
 async fn an_unknown_route_name_is_not_interpolated() {
+    let home = tempfile::tempdir().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
     let response = tool_response(&format!("{MARKER}_tool"), json!({})).await;
     assert_eq!(response["error"]["message"], "tool not found", "{response}");
     assert!(!response.to_string().contains(MARKER), "{response}");
@@ -340,6 +370,7 @@ async fn an_unknown_route_name_is_not_interpolated() {
 #[test]
 fn the_startup_log_holds_no_rejected_message() {
     let home = tempfile::tempdir().unwrap();
+    stellar_agent_test_support::sandbox::mark_sandbox(home.path()).unwrap();
     std::fs::create_dir_all(home.path().join("profiles")).unwrap();
     std::fs::write(
         home.path().join("profiles").join("default.toml"),

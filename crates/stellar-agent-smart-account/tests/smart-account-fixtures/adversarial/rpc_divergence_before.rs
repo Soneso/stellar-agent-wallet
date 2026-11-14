@@ -36,7 +36,11 @@ use super::rpc_mock_helpers::{
 /// The two-RPC agreement check fires at Step 2b and returns `NetworkRpcDivergence`
 /// rather than `SignerSetDiverged`, even though the primary view matches the baseline.
 #[tokio::test]
+#[serial_test::serial]
 async fn primary_secondary_disagree_returns_rpc_divergence() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
 
     // Write a 1-of-1 baseline.

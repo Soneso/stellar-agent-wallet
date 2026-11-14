@@ -15,6 +15,9 @@ use crate::helpers::{
 #[test]
 #[serial]
 fn key_too_short_returns_error() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
 
     let profile = make_profile("key-too-short");

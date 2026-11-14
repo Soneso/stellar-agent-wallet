@@ -291,7 +291,10 @@ fn run_cli(
     args: &[&str],
     envs: &[(&str, &str)],
 ) -> (i32, serde_json::Value, String, String) {
+    stellar_agent_test_support::sandbox::mark_sandbox(&home.join("agent"))
+        .expect("mark fixture directory");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_stellar-agent"));
+    cmd.args(cfg!(feature = "live-platform-keyring").then_some("--test-live-platform-keyring"));
     cmd.args(args)
         .env("STELLAR_AGENT_HOME", home.join("agent"))
         .env("HOME", home.join("home"))

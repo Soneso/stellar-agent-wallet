@@ -120,12 +120,12 @@ vendored-tree-check	bash .github/scripts/rebuild-vendored-wasm.sh --check-tree -
 publish-check	.github/scripts/publish-crates.sh --check
 baseline-gate	bash .github/scripts/check-no-direct-sasignersetbaselined-emit.sh
 fmt	cargo fmt --all -- --check
-clippy	cargo clippy --workspace --all-targets --no-default-features --features deploy-cli,operator-enroll-browser-acceptance,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-helpers,testnet-integration,verifier-registry,wiremock-helpers -- -D warnings
-rustdoc	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --no-default-features --features deploy-cli,operator-enroll-browser-acceptance,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-helpers,testnet-integration,verifier-registry,wiremock-helpers
+clippy	cargo clippy --workspace --all-targets --no-default-features --features deploy-cli,live-platform-keyring,operator-enroll-browser-acceptance,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-helpers,testnet-integration,verifier-registry,wiremock-helpers -- -D warnings
+rustdoc	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --no-default-features --features deploy-cli,live-platform-keyring,operator-enroll-browser-acceptance,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-helpers,testnet-integration,verifier-registry,wiremock-helpers
 test	cargo test --workspace --no-default-features --features test-helpers,test-hooks,test-loopback,verifier-registry
 proof-matrix	python3 .github/scripts/check-proof-matrix.py --configuration feature-off --workspace
-feature-on:clippy	cargo clippy --workspace --all-targets --features mainnet-write,deploy-cli,operator-enroll-browser-acceptance,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-helpers,testnet-integration,verifier-registry,wiremock-helpers -- -D warnings
-feature-on:doc	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --features mainnet-write,deploy-cli,operator-enroll-browser-acceptance,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-helpers,testnet-integration,verifier-registry,wiremock-helpers
+feature-on:clippy	cargo clippy --workspace --all-targets --features mainnet-write,deploy-cli,live-platform-keyring,operator-enroll-browser-acceptance,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-helpers,testnet-integration,verifier-registry,wiremock-helpers -- -D warnings
+feature-on:doc	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --features mainnet-write,deploy-cli,live-platform-keyring,operator-enroll-browser-acceptance,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-helpers,testnet-integration,verifier-registry,wiremock-helpers
 feature-on:test	cargo test --workspace --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry
 feature-on:network	cargo check -p stellar-agent-network --features mainnet-write
 proof-matrix:feature-on	python3 .github/scripts/check-proof-matrix.py --configuration feature-on --workspace

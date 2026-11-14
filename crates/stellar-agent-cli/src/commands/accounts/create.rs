@@ -1947,7 +1947,11 @@ pub(crate) mod tests {
     /// submission; without it the profile's `submit_timeout_seconds` applies,
     /// then 60 seconds.
     #[tokio::test]
+    #[serial_test::serial]
     async fn timeout_flag_falls_back_to_the_profile_then_sixty() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert_eq!(
             try_parse_create(&[sponsored_args(), vec!["--timeout-seconds", "5"]].concat())
                 .unwrap()
@@ -3111,18 +3115,27 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn enrolled_signing_equal() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         enrolled_signing_case(EnrolledPin::Derived).await;
     }
 
     #[tokio::test]
     #[serial_test::serial]
     async fn enrolled_signing_placeholder() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         enrolled_signing_case(EnrolledPin::Placeholder).await;
     }
 
     #[tokio::test]
     #[serial_test::serial]
     async fn enrolled_signing_mismatch() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         enrolled_signing_case(EnrolledPin::Other).await;
     }
 
@@ -3132,6 +3145,9 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn signer_key_mismatch_names_sponsor() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let g = enrolled_test_g();
         let other = stellar_strkey::ed25519::PublicKey([7; 32])
             .to_string()

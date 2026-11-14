@@ -112,6 +112,7 @@ impl Run {
 }
 
 fn run_cli(home: &Path, args: &[&str]) -> Run {
+    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
     let mut command = Command::new(env!("CARGO_BIN_EXE_stellar-agent"));
     command
         .args(args)
@@ -381,6 +382,7 @@ fn a_mismatched_default_profile_refuses_rather_than_synthesizing() {
 #[test]
 fn the_environment_selected_profile_is_reconciled_as_well() {
     let home = mismatched_home();
+    stellar_agent_test_support::sandbox::mark_sandbox(home.path()).expect("mark fixture directory");
     let mut command = Command::new(env!("CARGO_BIN_EXE_stellar-agent"));
     command
         .args([
@@ -811,7 +813,11 @@ fn mpp_surfaces_the_reconciliation_refusal_not_state_unavailable() {
 /// covers: this one for `stellar-agent`, the MCP integration test for the
 /// server.
 #[test]
+#[serial_test::serial]
 fn the_cli_and_the_mcp_server_agree_on_the_same_mismatched_file() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::profile::name::{
         OWNER_KEY_SERVICE_PREFIX, ProfileStateLayout, profile_name_mismatch_refusal,
     };

@@ -310,7 +310,11 @@ fn tools_call_unknown_tool_returns_error() {
 /// Unit test: `NoopPolicyEngine` returns `Decision::Allow` for `stellar_balances`
 /// on both testnet and mainnet profiles.
 #[test]
+#[serial_test::serial]
 fn policy_engine_allows_stellar_balances_read_only() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::policy::{
         Decision, McpToolRegistration, NoopPolicyEngine, PolicyEngine, ToolDescriptor,
     };

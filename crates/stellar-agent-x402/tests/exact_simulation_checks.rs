@@ -2881,7 +2881,11 @@ fn assert_paid_with_witness(outcome: &Outcome, oracle_ledger: u32) {
 /// from the primary's, in the outcome and to the transmit gate, and the crate
 /// builds no client of its own.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_passing_witness_reports_the_oracle_and_its_ledger() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let outcome = run(Scenario::honest().with_oracle(answer_at(&[honest_entry()], 1001))).await;
     assert_paid_with_witness(&outcome, 1001);
     assert_eq!(outcome.methods, PAYMENT_METHODS);
@@ -2906,7 +2910,11 @@ async fn a_witness_that_is_not_required_reports_not_required() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn witness_oracle_error_diverges_on_the_result() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     oracle_diverges(
         answer_with(
             &[honest_entry()],
@@ -2919,7 +2927,11 @@ async fn witness_oracle_error_diverges_on_the_result() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn witness_oracle_restore_preamble_diverges_on_the_result() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     oracle_diverges(
         answer_with(
             &[honest_entry()],
@@ -2935,7 +2947,11 @@ async fn witness_oracle_restore_preamble_diverges_on_the_result() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn witness_second_oracle_result_diverges_on_the_authorization_count() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let auth = vec![honest_entry().to_xdr_base64(Limits::none()).unwrap()];
     let result = serde_json::json!({ "auth": auth, "xdr": void_xdr() });
     oracle_diverges(
@@ -2946,7 +2962,11 @@ async fn witness_second_oracle_result_diverges_on_the_authorization_count() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn witness_zero_oracle_results_diverge_on_the_authorization_count() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     oracle_diverges(
         answer_with_results(&serde_json::json!([])),
         WitnessField::AuthorizationCount,
@@ -2955,7 +2975,11 @@ async fn witness_zero_oracle_results_diverge_on_the_authorization_count() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn witness_other_oracle_entry_count_diverges_on_the_authorization_count() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     oracle_diverges(
         answer(&[honest_entry(), honest_entry()]),
         WitnessField::AuthorizationCount,
@@ -2965,12 +2989,20 @@ async fn witness_other_oracle_entry_count_diverges_on_the_authorization_count() 
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn witness_source_account_credentials_diverge_on_the_credentials() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     oracle_diverges(answer(&[source_account_entry()]), WitnessField::Credentials).await;
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn witness_address_v2_credentials_diverge_on_the_credentials() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     oracle_diverges(
         answer(&[with_credentials_arm(
             honest_entry(),
@@ -2984,25 +3016,41 @@ async fn witness_address_v2_credentials_diverge_on_the_credentials() {
 /// The refusal precedes the payer's signature: the witness runs before
 /// `sign_soroban_auth_entry`.
 #[tokio::test]
+#[serial_test::serial]
 async fn witness_other_address_diverges_on_the_address() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     oracle_diverges(answer(&[foreign_entry()]), WitnessField::Address).await;
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn witness_signed_oracle_entry_diverges_on_the_signature() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mut entry = honest_entry();
     address_credentials(&mut entry).signature = ScVal::U32(1);
     oracle_diverges(answer(&[entry]), WitnessField::Signature).await;
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn witness_other_invocation_diverges_on_the_invocation() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let entry = with_root_args(honest_entry(), |args| args[2] = amount_scval(FORGED_AMOUNT));
     oracle_diverges(answer(&[entry]), WitnessField::Invocation).await;
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn witness_zero_resource_fee_diverges_on_the_resource_fee() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     oracle_diverges(
         answer_with(&[honest_entry()], "minResourceFee", serde_json::json!("0")),
         WitnessField::ResourceFee,
@@ -3011,7 +3059,11 @@ async fn witness_zero_resource_fee_diverges_on_the_resource_fee() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn witness_resource_fee_above_the_ceiling_diverges_on_the_resource_fee() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     oracle_diverges(
         answer_with(
             &[honest_entry()],
@@ -3025,7 +3077,11 @@ async fn witness_resource_fee_above_the_ceiling_diverges_on_the_resource_fee() {
 
 /// The oracle's resource fee may be anything from one stroop to the ceiling.
 #[tokio::test]
+#[serial_test::serial]
 async fn witness_resource_fee_bounds_pass() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     for fee in [1, FEE_CEILING] {
         let outcome = run(Scenario::honest().with_oracle(answer_with(
             &[honest_entry()],
@@ -3040,7 +3096,11 @@ async fn witness_resource_fee_bounds_pass() {
 /// An oracle three ledgers behind the primary cannot vouch for the primary's
 /// ledger.
 #[tokio::test]
+#[serial_test::serial]
 async fn witness_oracle_three_ledgers_behind_diverges_on_the_ledger_skew() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     oracle_diverges(
         answer_at(&[honest_entry()], LATEST_LEDGER - 3),
         WitnessField::LedgerSkew,
@@ -3051,7 +3111,11 @@ async fn witness_oracle_three_ledgers_behind_diverges_on_the_ledger_skew() {
 /// An oracle two ledgers behind passes, and so does one four ledgers ahead
 /// while the signature window allows it.
 #[tokio::test]
+#[serial_test::serial]
 async fn witness_oracle_ledger_within_the_bounds_passes() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     for ledger in [LATEST_LEDGER - 2, LATEST_LEDGER + 4] {
         let outcome =
             run(Scenario::honest().with_oracle(answer_at(&[honest_entry()], ledger))).await;
@@ -3063,7 +3127,11 @@ async fn witness_oracle_ledger_within_the_bounds_passes() {
 /// ledger is 1001: an oracle at 1001 or 1002 refuses and one at 1000 passes.
 /// An oracle at `u32::MAX` refuses on the expiration without an overflow.
 #[tokio::test]
+#[serial_test::serial]
 async fn witness_oracle_at_or_past_the_expiration_diverges_on_the_expiration() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     for ledger in [LATEST_LEDGER + 1, LATEST_LEDGER + 2, u32::MAX] {
         let outcome = run(Scenario::honest()
             .with_max_timeout_seconds(1)
@@ -3080,7 +3148,11 @@ async fn witness_oracle_at_or_past_the_expiration_diverges_on_the_expiration() {
 
 /// The oracle's nonce and signature expiration ledger are not compared.
 #[tokio::test]
+#[serial_test::serial]
 async fn witness_ignores_the_oracle_nonce_and_expiration() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mut entry = honest_entry();
     let credentials = address_credentials(&mut entry);
     credentials.nonce = NONCE + 1;
@@ -3092,7 +3164,11 @@ async fn witness_ignores_the_oracle_nonce_and_expiration() {
 /// An oracle answer whose authorization entry or result value does not
 /// decode is an unusable answer, refused after one attempt.
 #[tokio::test]
+#[serial_test::serial]
 async fn witness_undecodable_oracle_answer_is_witness_unavailable() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mut bad_auth = answer(&[honest_entry()]);
     bad_auth["results"][0]["auth"][0] = serde_json::json!("AAAA");
     let mut bad_value = answer(&[honest_entry()]);
@@ -3120,7 +3196,11 @@ async fn witness_undecodable_oracle_answer_is_witness_unavailable() {
 /// The oracle receives the transaction bytes the primary simulated, with no
 /// `authMode`.
 #[tokio::test]
+#[serial_test::serial]
 async fn witness_oracle_simulates_the_primary_envelope() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let outcome = run(Scenario::honest().with_oracle(answer(&[honest_entry()]))).await;
     assert_paid_with_witness(&outcome, LATEST_LEDGER);
     let primary = &outcome.bodies[1];
@@ -3141,7 +3221,11 @@ async fn witness_oracle_simulates_the_primary_envelope() {
 /// The oracle's answer is never used: the signed entry carries the primary's
 /// nonce, and the payload the primary re-simulation's resource data.
 #[tokio::test]
+#[serial_test::serial]
 async fn witness_payload_keeps_the_primary_nonce_and_resource_data() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mut entry = honest_entry();
     address_credentials(&mut entry).nonce = NONCE + 7;
     let mut simulation = answer(&[entry]);
@@ -3175,7 +3259,11 @@ async fn witness_payload_keeps_the_primary_nonce_and_resource_data() {
 /// A primary answer with a second result refuses before the witness, so the
 /// oracle receives nothing.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_second_primary_result_refuses_before_the_witness() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let auth = vec![honest_entry().to_xdr_base64(Limits::none()).unwrap()];
     let result = serde_json::json!({ "auth": auth, "xdr": void_xdr() });
     let outcome = run(Scenario::honest()
@@ -3193,7 +3281,11 @@ async fn a_second_primary_result_refuses_before_the_witness() {
 /// A witness that outlasts the caller's deadline refuses at the health read,
 /// which keeps the absolute deadline, before anything is signed.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_witness_slower_than_the_deadline_refuses_at_the_health_read() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let outcome = run(Scenario::honest()
         .with_deadline(Duration::from_millis(1_000))
         .with_oracle(answer(&[honest_entry()]))

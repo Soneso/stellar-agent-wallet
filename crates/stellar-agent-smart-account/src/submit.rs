@@ -3168,6 +3168,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn muxed_contract_submit_intake_refuses_before_admission() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new([5; 32]);
         let endpoint = format!("http://{}:9", std::net::Ipv4Addr::LOCALHOST);
@@ -3197,6 +3200,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn check_required_passes_when_multicall_check_present() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let mc = MulticallCheck {
             registry_entry_address: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
@@ -3215,6 +3221,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn submit_guard_refuses_an_undeclared_multicall_check() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let mc = MulticallCheck {
             registry_entry_address: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
@@ -3243,6 +3252,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn submit_guard_accepts_a_declared_or_absent_multicall_check() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let mc = MulticallCheck {
             registry_entry_address: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
@@ -3260,6 +3272,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn check_required_fails_when_multicall_check_missing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let args = minimal_args(None, &["multicall"]);
         let hf_kind = host_function_kind_str(&args.host_function);
@@ -3273,6 +3288,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn check_required_passes_when_required_check_not_listed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         // required_checks = &[], multicall_check = None → no gate fires.
         let args = minimal_args(None, &[]);
@@ -3289,6 +3307,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn check_required_fails_on_unknown_check_name() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         // multicall_check is Some — should not matter for an unrecognised name.
         let mc = MulticallCheck {
@@ -3408,6 +3429,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn submit_signed_invoke_rejects_ed25519_rule_signer_with_quorum_before_network_io() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         use crate::managers::authorization::{AuthorizationInfo, Combinator};
         use stellar_agent_network::SoftwareSigningKey;
@@ -3479,6 +3503,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn submit_signed_invoke_refuses_mainnet_passphrase_before_signer_and_request() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let mock = wiremock::MockServer::start().await;
         let primary = mock.uri();
@@ -3503,6 +3530,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn submit_signed_invoke_refuses_mainnet_pattern_url_before_signer_and_request() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let mock = wiremock::MockServer::start().await;
         let primary = format!("{}/pubnet", mock.uri());
@@ -3541,6 +3571,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn ed25519_rule_signer_arm_patches_credential_and_omits_g_key() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         use crate::managers::auth_entry::{
             MixedSigner, MixedSignerKind, build_authorization_entry, collect_mixed_signer_entries,
@@ -4216,6 +4249,9 @@ mod tests {
         #[tokio::test]
         #[serial_test::serial]
         async fn initial_and_recovery_simulates_retry_busy() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             stellar_agent_test_support::keyring_mock::install().unwrap();
             for recovery in [false, true] {
                 for (busy, delayed) in [(1, false), (4, false), (1, true)] {
@@ -4294,6 +4330,9 @@ mod tests {
         #[tokio::test]
         #[serial_test::serial]
         async fn multicall_secondary_is_bounded() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             stellar_agent_test_support::keyring_mock::install().unwrap();
             for delayed in [false, true] {
                 let primary = endpoint(LEDGER).start().await;
@@ -4343,6 +4382,9 @@ mod tests {
         #[tokio::test]
         #[serial_test::serial]
         async fn deadline_after_a_busy_sleep_keeps_the_stage_error() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             stellar_agent_test_support::keyring_mock::install().unwrap();
             let primary = endpoint(LEDGER).start().await;
             let secondary = endpoint(LEDGER).start().await;
@@ -4755,6 +4797,9 @@ mod tests {
         #[tokio::test]
         #[serial_test::serial]
         async fn a_refusal_before_the_first_signature_cancels_the_admission() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             use stellar_agent_core::policy::v1::criteria::state_store::{
                 PolicyStateStore, StateKey, WindowEntry, WindowLimit,
             };
@@ -5030,6 +5075,9 @@ mod tests {
         #[tokio::test]
         #[serial_test::serial]
         async fn single_invoke_refuses_plausible_inflated_height() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             stellar_agent_test_support::keyring_mock::install().unwrap();
             let outcome = submit_at(SigningPath::Single, 1_000_000, LEDGER).await;
             outcome.assert_refused(SKEW_CODE, "an inflated primary");
@@ -5038,6 +5086,9 @@ mod tests {
         #[tokio::test]
         #[serial_test::serial]
         async fn allowed_skew_has_exact_bounded_expiry() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             stellar_agent_test_support::keyring_mock::install().unwrap();
             for path in PATHS {
                 for (primary, secondary) in [
@@ -5067,6 +5118,9 @@ mod tests {
         #[tokio::test]
         #[serial_test::serial]
         async fn a_skew_of_three_with_the_primary_behind_refuses() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             stellar_agent_test_support::keyring_mock::install().unwrap();
             for path in PATHS {
                 submit_at(path, LEDGER, LEDGER + 3)
@@ -5078,6 +5132,9 @@ mod tests {
         #[tokio::test]
         #[serial_test::serial]
         async fn a_skew_of_three_with_the_primary_ahead_refuses() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             stellar_agent_test_support::keyring_mock::install().unwrap();
             for path in PATHS {
                 submit_at(path, LEDGER + 3, LEDGER)
@@ -5091,6 +5148,9 @@ mod tests {
         #[tokio::test]
         #[serial_test::serial]
         async fn out_of_bounds_heights_refuse_before_signing() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             stellar_agent_test_support::keyring_mock::install().unwrap();
             for path in PATHS {
                 for (primary, secondary) in [(0, 1), (1, 0), (0, 0), (u32::MAX - 1, u32::MAX - 1)] {
@@ -5105,6 +5165,9 @@ mod tests {
         #[tokio::test]
         #[serial_test::serial]
         async fn simulation_recovery_uses_one_retry_and_the_same_pair() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             stellar_agent_test_support::keyring_mock::install().unwrap();
             for case in [
                 RecoveryCase::Valid,
@@ -5165,6 +5228,9 @@ mod tests {
         #[tokio::test]
         #[serial_test::serial]
         async fn simulation_recovery_keeps_the_absolute_deadline() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             stellar_agent_test_support::keyring_mock::install().unwrap();
             let primary = endpoint(LEDGER)
                 .simulation_response(|n, response| {
@@ -5233,6 +5299,9 @@ mod tests {
         #[tokio::test]
         #[serial_test::serial]
         async fn simulation_recovery_revalidates_the_whole_response() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             stellar_agent_test_support::keyring_mock::install().unwrap();
             for case in [
                 RecoveryCase::Tree,
@@ -5292,6 +5361,9 @@ mod tests {
         #[tokio::test]
         #[serial_test::serial]
         async fn a_simulated_height_outside_the_pair_refuses_before_signing() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             stellar_agent_test_support::keyring_mock::install().unwrap();
             for (simulated, case) in [(1_000_000, "above"), (LEDGER - 3, "below")] {
                 let primary = endpoint(LEDGER).simulated_ledger(simulated);
@@ -5304,6 +5376,9 @@ mod tests {
         #[tokio::test]
         #[serial_test::serial]
         async fn a_simulated_height_within_the_tolerance_of_the_pair_signs() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             stellar_agent_test_support::keyring_mock::install().unwrap();
             for simulated in [LEDGER - 2, LEDGER + 2] {
                 let path = SigningPath::Single;
@@ -5328,6 +5403,9 @@ mod tests {
         #[tokio::test]
         #[serial_test::serial]
         async fn absent_unavailable_or_wrong_chain_witness_refuses() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             stellar_agent_test_support::keyring_mock::install().unwrap();
             for path in PATHS {
                 let case = |name: &str| format!("{path:?}: {name}");
@@ -5435,6 +5513,9 @@ mod tests {
         #[tokio::test]
         #[serial_test::serial]
         async fn a_refused_witness_configuration_reaches_no_endpoint() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             stellar_agent_test_support::keyring_mock::install().unwrap();
             let primary = endpoint(LEDGER).start().await;
             let outcome = submit_with(
@@ -5455,6 +5536,9 @@ mod tests {
         #[tokio::test]
         #[serial_test::serial]
         async fn rule_horizon_uses_witnessed_ledger() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             stellar_agent_test_support::keyring_mock::install().unwrap();
             let horizon = HorizonCheck {
                 valid_until: 1101,
@@ -5492,6 +5576,9 @@ mod tests {
         #[tokio::test]
         #[serial_test::serial]
         async fn a_rule_horizon_at_the_maximum_from_the_lower_ledger_signs() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             stellar_agent_test_support::keyring_mock::install().unwrap();
             let path = SigningPath::Single;
             let horizon = HorizonCheck {
@@ -5644,6 +5731,9 @@ mod tests {
         #[tokio::test]
         #[serial_test::serial]
         async fn a_key_lookup_delayed_past_the_freshness_limit_refuses_before_signing() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             stellar_agent_test_support::keyring_mock::install().unwrap();
             let (quorum_stale, rule_signer_stale, quorum_late, rule_signer_late) = tokio::join!(
                 submit_with_slow_key(LookupPath::Quorum, LOOKUP_OUTLASTS_OBSERVATION),
@@ -5850,6 +5940,9 @@ mod tests {
         #[tokio::test]
         #[serial_test::serial]
         async fn a_quorum_signature_past_the_deadline_is_cut_and_nothing_is_sent() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             stellar_agent_test_support::keyring_mock::install().unwrap();
             assert_auth_signature_cut(SigningArm::Quorum).await;
         }
@@ -5859,6 +5952,9 @@ mod tests {
         #[tokio::test]
         #[serial_test::serial]
         async fn a_rule_signer_signature_past_the_deadline_is_cut_and_nothing_is_sent() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             stellar_agent_test_support::keyring_mock::install().unwrap();
             assert_auth_signature_cut(SigningArm::RuleSigner).await;
         }
@@ -5869,6 +5965,9 @@ mod tests {
         #[tokio::test]
         #[serial_test::serial]
         async fn a_delegated_signature_past_the_deadline_is_cut_and_nothing_is_sent() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             stellar_agent_test_support::keyring_mock::install().unwrap();
             assert_auth_signature_cut(SigningArm::Delegated).await;
         }
@@ -5880,6 +5979,9 @@ mod tests {
         #[tokio::test]
         #[serial_test::serial]
         async fn a_delegated_entry_signature_past_the_deadline_is_cut_and_nothing_is_sent() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             stellar_agent_test_support::keyring_mock::install().unwrap();
             let outcome =
                 submit_with_slow_signature(SigningArm::Delegated, SlowCall::DelegatedEntry).await;
@@ -5973,6 +6075,9 @@ mod tests {
         #[tokio::test]
         #[serial_test::serial]
         async fn an_envelope_signature_past_the_deadline_is_cut_and_nothing_is_sent() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             stellar_agent_test_support::keyring_mock::install().unwrap();
             let outcome = submit_with_late_send(Some(PAST_THE_DEADLINE), None).await;
 
@@ -5991,6 +6096,9 @@ mod tests {
         #[tokio::test]
         #[serial_test::serial]
         async fn a_pre_send_step_past_the_deadline_sends_nothing() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             stellar_agent_test_support::keyring_mock::install().unwrap();
             let outcome = submit_with_late_send(None, Some(PAST_THE_DEADLINE)).await;
 

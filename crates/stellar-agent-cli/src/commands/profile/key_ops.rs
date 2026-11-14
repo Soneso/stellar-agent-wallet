@@ -98,7 +98,11 @@ mod tests {
     /// Every label an owner refusal of a key-write verb names is a field of the
     /// profile file, so the operator finds the coordinate to correct.
     #[test]
+    #[serial_test::serial]
     fn every_owner_refusal_label_names_a_profile_field() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let profile = stellar_agent_core::profile::schema::Profile::builder_testnet_named(
             "labels", "s", "a", "n", "a",
         )

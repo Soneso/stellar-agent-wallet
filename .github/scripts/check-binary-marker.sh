@@ -24,7 +24,7 @@ if ! LC_ALL=C grep -aFq "$prefix$expected" "$binary"; then
   echo 'marker: expected literal is absent' >&2
   exit 1
 fi
-for literal in STELLAR_AGENT_HOME STELLAR_AGENT_TEST_; do
+for literal in STELLAR_AGENT_HOME STELLAR_AGENT_TEST_ .stellar-agent-test-sandbox; do
   if LC_ALL=C grep -aFq "$literal" "$binary"; then
     echo "marker: test override literal $literal is embedded" >&2
     exit 1

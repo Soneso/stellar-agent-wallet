@@ -269,7 +269,11 @@ mod tests {
     /// top-level shape).
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn missing_required_args_returns_business_envelope() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = make_testnet_server();
         let args = Sep48PreviewInvocationArgs {
             transaction_xdr: None,
@@ -289,7 +293,11 @@ mod tests {
     /// business-error envelope with wire code `sep48.invoke_decode_failed`.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn malformed_transaction_xdr_returns_invoke_decode_failed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = make_testnet_server();
         let args = Sep48PreviewInvocationArgs {
             transaction_xdr: Some("!!! not valid xdr !!!".to_owned()),

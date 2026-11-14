@@ -28,7 +28,11 @@ use super::rpc_mock_helpers::{
 /// Two policy addresses, both with the allowlisted weighted-threshold wasm
 /// hash → multi-match → `WeightedThresholdPolicyIdentificationFailed`.
 #[tokio::test]
+#[serial_test::serial]
 async fn two_allowlisted_policies_returns_identification_failed_multi_match() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
 
     let policy_a = policy_sc_address();

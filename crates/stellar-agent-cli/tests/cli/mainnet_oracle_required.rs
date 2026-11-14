@@ -132,6 +132,7 @@ fn write_profile(home: &Path, rpc_url: &str, oracle: bool) {
 /// Runs the binary in `home` with `args` and `--profile PROFILE`, and
 /// returns its exit code and the JSON envelope it printed.
 fn run(home: &Path, args: &[&str]) -> (i32, Value) {
+    stellar_agent_test_support::sandbox::mark_sandbox(home).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
         .args(args)
         .args(["--profile", PROFILE])

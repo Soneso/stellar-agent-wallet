@@ -844,7 +844,11 @@ mod tests {
 
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn manager_configs_carry_a_distinct_context_secondary() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = server_with_secondary(Some(SECONDARY));
         let (signers, rules) = manager_configs(&server);
         assert_eq!(signers.primary_rpc_url, PRIMARY);
@@ -855,7 +859,11 @@ mod tests {
 
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn manager_configs_without_a_secondary_fall_back_to_the_primary() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = server_with_secondary(None);
         let (signers, rules) = manager_configs(&server);
         assert_eq!(signers.secondary_rpc_url, PRIMARY);
@@ -1152,6 +1160,7 @@ mod tests {
     /// the rule with an empty policy list.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn stellar_rules_get_refuses_a_rule_with_an_undecodable_signer() {
         use stellar_agent_core::profile::schema::Profile;
         use stellar_agent_test_support::{StellarAgentHomeGuard, keyring_mock};

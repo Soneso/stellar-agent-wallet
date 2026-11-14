@@ -62,7 +62,11 @@ fn instant() -> u64 {
 const WEEK_MS: u64 = 7 * 86_400_000;
 
 #[test]
+#[serial_test::serial]
 fn unselected_kind_destination_consumes_unlisted_budget() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let _clock = set_query_time_for_test(NOW_MS);
     let engine = engine_from_criteria(&budget(10, 20));
     let destination = contract(3);
@@ -100,7 +104,11 @@ fn g_c_budget_criterion() -> String {
 }
 
 #[test]
+#[serial_test::serial]
 fn unverified_domain_never_reaches_unlisted_mode() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let identity = Identity(Some("example.com"));
     let cache = Cache {
         resolved: false,
@@ -178,7 +186,11 @@ fn unverified_domain_never_reaches_unlisted_mode() {
 }
 
 #[test]
+#[serial_test::serial]
 fn mixed_g_c_bundle_overlay_and_confirmation() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let _clock = set_query_time_for_test(NOW_MS);
     let text = g_c_budget_criterion();
     let document = load(&v2(&rule(&text, "allow")));
@@ -231,7 +243,11 @@ fn mixed_g_c_bundle_overlay_and_confirmation() {
 }
 
 #[test]
+#[serial_test::serial]
 fn loaded_g_c_budget_sizes_and_records() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let _clock = set_query_time_for_test(NOW_MS);
     let engine = engine_from_criteria(&g_c_budget_criterion());
     let evaluated = strict(&engine, payment(6, LISTED), None).unwrap();
@@ -253,7 +269,11 @@ fn loaded_g_c_budget_sizes_and_records() {
 }
 
 #[test]
+#[serial_test::serial]
 fn unlisted_call_charges_every_debit_leg() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let criterion =
         g_c_budget_criterion().replace("allowlist = []", &format!("allowlist = [\"{LISTED}\"]"));
     let engine = engine_from_criteria(&criterion);
@@ -276,7 +296,11 @@ fn unlisted_call_charges_every_debit_leg() {
 }
 
 #[test]
+#[serial_test::serial]
 fn opaque_signing_and_generic_inners_refuse_under_address_kinds() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     for mode in [
         "{ mode = \"deny\" }",
         "{ mode = \"approval\" }",
@@ -1147,7 +1171,11 @@ fn native_exceeded(bound: UnlistedBound, max_stroops: i128, attempted_stroops: i
 /// Integer forms, key order, an escaped asset, and the omitted `native`
 /// asset parse to one table, and every rule carrying it draws on one counter.
 #[test]
+#[serial_test::serial]
 fn unlisted_representations_load_and_share_counter() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let _clock = set_query_time_for_test(NOW_MS);
     let forms = [
         budget_table("", "10", "20", "1d"),
@@ -1210,7 +1238,11 @@ fn unlisted_representations_load_and_share_counter() {
 /// Asset aliases that parse to different strings are unequal tables; the
 /// same alias on every rule loads and shares one counter.
 #[test]
+#[serial_test::serial]
 fn unlisted_asset_aliases_compare_as_parsed() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let _clock = set_query_time_for_test(NOW_MS);
     let native = budget_table(", asset = \"native\"", "10", "20", "1d");
     let native_sac = sac("native");
@@ -1247,7 +1279,11 @@ fn unlisted_asset_aliases_compare_as_parsed() {
 /// Three and four equal rules load around a rule without a table; the rules
 /// with the table share one counter and the rule without it is unaffected.
 #[test]
+#[serial_test::serial]
 fn many_equal_unlisted_rules_share_counter_around_a_plain_rule() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let _clock = set_query_time_for_test(NOW_MS);
     let shared = budget(10, 20);
     check(&rules_with(&[&shared, &shared, "", &shared])).unwrap();
@@ -1272,7 +1308,11 @@ fn many_equal_unlisted_rules_share_counter_around_a_plain_rule() {
 /// The first table may sit at a later rule and criterion; a third table
 /// that differs is refused naming that first position.
 #[test]
+#[serial_test::serial]
 fn first_unlisted_table_at_a_later_position() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let _clock = set_query_time_for_test(NOW_MS);
     let shared = budget(10, 20);
     let capped =
@@ -1334,7 +1374,11 @@ fn confirm_bundle_on(engine: &PolicyEngineV1, name: &'static str, inners: &[Inne
 /// A bundle under one of two sharing rules counts against the shared
 /// counter, writes nothing when refused, and records on confirmation.
 #[test]
+#[serial_test::serial]
 fn bundles_across_sharing_rules_use_one_counter() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let _clock = set_query_time_for_test(NOW_MS);
     let shared = budget(10, 20);
     let engine = engine(&rules_with(&[&shared, &shared]));
@@ -1373,7 +1417,11 @@ fn bundles_across_sharing_rules_use_one_counter() {
 /// Equal tables on rules with different allow lists: each rule charges only
 /// recipients outside its own list, and all charges share one counter.
 #[test]
+#[serial_test::serial]
 fn equal_unlisted_tables_with_different_allow_lists() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let _clock = set_query_time_for_test(NOW_MS);
     let listing = |account: &str| {
         format!(
@@ -1613,7 +1661,11 @@ fn allowlist(kind: CounterpartyKind, entries: &[&str]) -> CounterpartyAllowlistC
 }
 
 #[test]
+#[serial_test::serial]
 fn recipient_classes_are_rule_local_and_debit_only() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use RecipientClass::{Listed, Unlisted, Unverifiable};
 
     // G accounts, with a muxed destination reduced to its base account.
@@ -1744,7 +1796,11 @@ fn recipient_classes_are_rule_local_and_debit_only() {
 }
 
 #[test]
+#[serial_test::serial]
 fn unverifiable_recipients_never_escalate() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let approval = UnlistedMode::Approval;
     let document = load(&v2(&rule(&budget(100, 200), "allow")));
     let budget = loaded_criterion::<CounterpartyAllowlistCriterion>(&document, 0, 0)
@@ -1919,7 +1975,11 @@ fn unverifiable_recipients_never_escalate() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
+#[serial_test::serial]
 fn unlisted_approval_preserves_first_match_and_hard_caps() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let _clock = set_query_time_for_test(NOW_MS);
     let caps = "{ kind = \"per_tx_cap\", asset = \"native\", max_stroops = 1000 }, \
                 { kind = \"per_period_cap\", asset = \"native\", window = \"1d\", max_stroops = 1500 }, \
@@ -2020,7 +2080,11 @@ fn engine_with_second_rule(first: &str) -> PolicyEngineV1 {
 }
 
 #[test]
+#[serial_test::serial]
 fn unlisted_approval_escalates_with_default_ttl() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let approval = engine_from_criteria(&cp("{ mode = \"approval\" }"));
     let Decision::RequireApproval(request) = decide(&approval, payment(10, UNLISTED)) else {
         panic!("an unlisted recipient must escalate");
@@ -2065,7 +2129,11 @@ fn unlisted_key() -> StateKey {
 }
 
 #[test]
+#[serial_test::serial]
 fn unlisted_budget_checks_both_bounds_and_bundle_overlay() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let _clock = set_query_time_for_test(NOW_MS);
     let caps = "{ kind = \"per_tx_cap\", asset = \"native\", max_stroops = 1000 }";
     let engine = engine_from_criteria(&format!("{}, {caps}", budget(100, 250)));
@@ -2227,7 +2295,11 @@ fn unlisted_budget_checks_both_bounds_and_bundle_overlay() {
 /// either order, so a recipient listed by one criterion and unlisted by the
 /// budget criterion still uses the budget.
 #[test]
+#[serial_test::serial]
 fn strictest_recipient_class_is_carried_in_any_criterion_order() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let _clock = set_query_time_for_test(NOW_MS);
     let listed_by_other = format!(
         "{{ kind = \"counterparty_allowlist\", kinds = [\"G_ACCOUNT\"], allowlist = [\"{UNLISTED}\"] }}"
@@ -2294,7 +2366,10 @@ fn total_evaluation(
 }
 
 #[test]
+#[serial_test::serial]
 fn total_budget_attempt_overflow_denies() {
+    let guard_home = tempfile::tempdir().unwrap();
+    let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
     let store = PolicyStateStore::new();
     store
         .append_epoch(&total_key(), NOW_MS, i128::MAX, [5; 32])
@@ -2332,7 +2407,10 @@ fn total_key_for(asset: &str, value: ValueClass) -> StateKey {
 }
 
 #[test]
+#[serial_test::serial]
 fn total_budget_spellings_of_one_asset_share_one_key() {
+    let guard_home = tempfile::tempdir().unwrap();
+    let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
     let native_sac = CanonicalAsset::Native
         .sac_contract_id(TESTNET_PASSPHRASE)
         .unwrap();
@@ -2360,7 +2438,10 @@ fn total_budget_spellings_of_one_asset_share_one_key() {
 }
 
 #[test]
+#[serial_test::serial]
 fn total_budget_multileg_overflow_denies() {
+    let guard_home = tempfile::tempdir().unwrap();
+    let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
     use stellar_agent_core::policy::v1::criteria::total_budget::TotalBudgetCriterion;
     let store = PolicyStateStore::new();
     let tool = pay();
@@ -2376,7 +2457,10 @@ fn total_budget_multileg_overflow_denies() {
 }
 
 #[test]
+#[serial_test::serial]
 fn total_budget_multileg_sizing_refuses_overflow() {
+    let guard_home = tempfile::tempdir().unwrap();
+    let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
     use stellar_agent_core::policy::v1::criteria::total_budget::TotalBudgetCriterion;
     let store = PolicyStateStore::new();
     let tool = pay();
@@ -2408,7 +2492,10 @@ fn query_epoch_overflow_errors() {
 }
 
 #[test]
+#[serial_test::serial]
 fn total_budget_overlay_overflow_denies() {
+    let guard_home = tempfile::tempdir().unwrap();
+    let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
     use stellar_agent_core::policy::v1::criteria::total_budget::TotalBudgetCriterion;
     let store = PolicyStateStore::new();
     store
@@ -2480,7 +2567,11 @@ fn total_budget_requires_v2_allow_without_window() {
 }
 
 #[test]
+#[serial_test::serial]
 fn total_epochs_ignore_time_and_isolate_resigning() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let clock = set_query_time_for_test(NOW_MS);
     let raw = v2(&rule(
         "{ kind = \"total_budget\", asset = \"native\", max_stroops = 100 }",
@@ -2572,7 +2663,11 @@ fn total_epochs_ignore_time_and_isolate_resigning() {
 }
 
 #[test]
+#[serial_test::serial]
 fn total_budget_refuses_without_policy_digest() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let _clock = set_query_time_for_test(NOW_MS);
     let engine = PolicyEngineV1::new_with_store(
         load(&v2(&rule(
@@ -2706,7 +2801,11 @@ fn bundle_denied(inner_index: u32, reason: DenyReason) -> Decision {
 /// A confirmed bundle uses the total allocation as the same payments made
 /// one by one would, and its inners accumulate within the bundle.
 #[test]
+#[serial_test::serial]
 fn confirmed_bundles_record_total_budget_usage() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let _clock = set_query_time_for_test(NOW_MS);
     let engine =
         engine_from_criteria("{ kind = \"total_budget\", asset = \"native\", max_stroops = 100 }");
@@ -2755,7 +2854,11 @@ fn confirmed_bundles_record_total_budget_usage() {
 
 /// A confirmed bundle uses the unlisted window for its unlisted inners only.
 #[test]
+#[serial_test::serial]
 fn confirmed_bundles_record_unlisted_budget_usage() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let _clock = set_query_time_for_test(NOW_MS);
     let engine = engine_from_criteria(&budget(100, 100));
 
@@ -2796,7 +2899,11 @@ fn confirmed_bundles_record_unlisted_budget_usage() {
 /// A bundle whose inner cannot be sized refuses under a rule that records
 /// each inner, and recording such a bundle fails.
 #[test]
+#[serial_test::serial]
 fn bundles_with_unsizable_inners_refuse_under_recorded_budgets() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let _clock = set_query_time_for_test(NOW_MS);
     for criteria in [
         "{ kind = \"total_budget\", asset = \"native\", max_stroops = 100 }".to_owned(),
@@ -2843,7 +2950,11 @@ fn bundles_with_unsizable_inners_refuse_under_recorded_budgets() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
+#[serial_test::serial]
 fn evaluate_provisional_defers_only_reserve_and_floor() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let engine = engine_from_criteria(&format!(
         "{{ kind = \"minimum_reserve\", margin_stroops = 0 }}, \
          {{ kind = \"balance_floor\", min_stroops = 0 }}, \
@@ -2900,7 +3011,11 @@ fn evaluate_provisional_defers_only_reserve_and_floor() {
 }
 
 #[test]
+#[serial_test::serial]
 fn final_evaluation_runs_deferred_checks() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let _clock = set_query_time_for_test(NOW_MS);
     let above = "{ kind = \"approval_above\", asset = \"native\", max_stroops = 50 }";
 
@@ -3004,7 +3119,11 @@ impl PolicyEngine for StrictOnly {
 }
 
 #[test]
+#[serial_test::serial]
 fn evaluate_provisional_default_is_strict() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let wrapper = StrictOnly(engine_from_criteria(
         "{ kind = \"balance_floor\", min_stroops = 0 }, \
          { kind = \"approval_above\", asset = \"native\", max_stroops = 50 }",
@@ -3043,7 +3162,11 @@ fn floor_decision(
 }
 
 #[test]
+#[serial_test::serial]
 fn observed_floor_checks_age_and_exact_balance() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let _clock = set_query_time_for_test(NOW_MS);
     let null = Value::Null;
     let observed = |balance: i64, age_ms: u64| {
@@ -3155,7 +3278,11 @@ fn observed_floor_checks_age_and_exact_balance() {
 /// recorded debits carry it, and the unlisted window counts them only from
 /// it.
 #[test]
+#[serial_test::serial]
 fn grammar_criteria_read_the_evaluation_instant() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     const SAMPLE_MS: u64 = 1_000_000_000_000;
     let _clock = set_query_time_for_test(SAMPLE_MS);
     let engine = engine_from_criteria(&format!(
@@ -3270,7 +3397,11 @@ fn mismatch(kind: &str) -> Option<DenyReason> {
 }
 
 #[test]
+#[serial_test::serial]
 fn memo_binding_grammar_and_matching() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let loc = "rule[0].criteria[0]";
     let id_binding = |destination: &str| {
         format!("{{ destination = \"{destination}\", kind = \"id\", value = \"7\" }}")
@@ -3485,7 +3616,11 @@ fn memo_binding_grammar_and_matching() {
 }
 
 #[test]
+#[serial_test::serial]
 fn memo_requirements_preserve_destination_kind_and_value() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let hash = [0xab; 32];
     let other = [0xcd; 32];
     let memos = [
@@ -3607,7 +3742,11 @@ fn failing(doc: &DocumentMut, requirement: &str) -> Vec<Option<usize>> {
 }
 
 #[test]
+#[serial_test::serial]
 fn mainnet_claim_and_trustline_require_rate_limits() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     for tool in [
         "stellar_claim",
         "stellar_claim_commit",
@@ -3651,7 +3790,11 @@ fn mainnet_claim_and_trustline_require_rate_limits() {
 }
 
 #[test]
+#[serial_test::serial]
 fn mainnet_approval_ttl_accepts_one_day_only_with_explicit_value() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let with_ttl = |ttl: Option<i64>| {
         let mut doc = FIXTURE.parse::<DocumentMut>().unwrap();
         match ttl {
@@ -3749,7 +3892,11 @@ fn window_entry_refusals_for_unlisted_and_total_limits() {
 /// Each new refusal serializes its amounts as decimal strings and names no
 /// recipient and no memo value.
 #[test]
+#[serial_test::serial]
 fn new_denials_serialize_exact_json() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let max = i128::MAX.to_string();
     let cases = [
         (
@@ -3841,7 +3988,10 @@ fn m_of(key: [u8; 32], id: u64) -> String {
 /// absent or wrong memo denies M0 and M17, the bound memo passes, and the
 /// mux ID is never taken for the memo.
 #[test]
+#[serial_test::serial]
 fn muxed_explicit_memo() {
+    let guard_home = tempfile::tempdir().unwrap();
+    let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
     let key = [0xA9; 32];
     let criterion = MemoBindingCriterion::new(vec![
         MemoBinding::new(&g_of(key), MemoRequirement::Id(17)).unwrap(),
@@ -3947,7 +4097,10 @@ fn same_on_both(engine: &PolicyEngineV1, destination: &str) -> Decision {
 /// a missing entry and an unselected kind are unlisted under each mode; the
 /// issuer and domain conjunctions apply to M as to G.
 #[test]
+#[serial_test::serial]
 fn muxed_signed_policy_matrix() {
+    let guard_home = tempfile::tempdir().unwrap();
+    let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
     let key = [0xAA; 32];
     let other = [0xEA; 32];
     let (g, m0, m17, m18) = (g_of(key), m_of(key, 0), m_of(key, 17), m_of(key, 18));
@@ -4063,7 +4216,10 @@ fn muxed_signed_policy_matrix() {
 /// unlisted budget, and confirmed records charge each payment once under
 /// the same state key; an exact-M listed recipient spends no budget.
 #[test]
+#[serial_test::serial]
 fn muxed_budget_and_counterparty_accounting() {
+    let guard_home = tempfile::tempdir().unwrap();
+    let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
     let _clock = set_query_time_for_test(NOW_MS);
     let key = [0xAB; 32];
     let (g, m0, m17) = (g_of(key), m_of(key, 0), m_of(key, 17));

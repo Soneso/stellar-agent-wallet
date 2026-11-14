@@ -235,7 +235,11 @@ async fn swap(
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn an_honest_swap_signs_the_simulated_tree() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let outcome = swap(|| transfer(token_in(), pair(), AMOUNT_IN)).await;
 
     assert!(outcome.result.is_ok(), "{:?}", outcome.result);

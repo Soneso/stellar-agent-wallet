@@ -52,6 +52,7 @@ fn write_v1_profile(home: &Path, name: &str, chain_id: &str, rpc_url: Option<&st
 /// Runs `stellar-agent profile migrate <name>` and returns the exit code and
 /// stdout.
 fn run_migrate(home: &Path, name: &str) -> (i32, String) {
+    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
     let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
         .args(["profile", "migrate", name])
         .env("STELLAR_AGENT_HOME", home)

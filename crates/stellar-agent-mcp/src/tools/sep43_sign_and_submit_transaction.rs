@@ -744,6 +744,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn muxed_contract_intake_refuses_before_state() {
         use std::sync::{
             Arc,
@@ -834,6 +835,7 @@ mod tests {
     /// MUST NOT sign or submit the transaction.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn require_approval_verdict_is_fail_closed_no_signature_produced() {
         let home = tempfile::tempdir().expect("isolated home");
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
@@ -872,7 +874,11 @@ mod tests {
     /// it must never be masked by `audit.chain_key_unavailable`.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn policy_denial_precedes_the_audit_preflight() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use std::sync::Arc;
         stellar_agent_test_support::keyring_mock::install().ok();
         let profile = Profile::builder_testnet(
@@ -941,7 +947,11 @@ mod tests {
     /// read.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn a_mainnet_profile_without_an_established_owner_refuses_before_the_seed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use std::sync::atomic::{AtomicUsize, Ordering};
         use stellar_agent_core::profile::{
             schema::signer_identity_entry_ref, signer_identity::SignerIdentityRecord,
@@ -1029,6 +1039,7 @@ mod tests {
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn enrolled_signer_mismatch_survives_sep43_sign_and_submit_mapping() {
         use crate::tools::common::tests::mainnet::{Fixture, put};
         let mut fixture = Fixture::new(|raw| raw);

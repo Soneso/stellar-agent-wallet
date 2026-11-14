@@ -1578,6 +1578,9 @@ pub(crate) mod tests {
     #[test]
     #[serial_test::serial]
     fn load_attestation_key_for_verify_is_fail_closed_on_environmental_failure() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().ok();
         let profile = Profile::builder_testnet_named(
             "trustline-attest-no-logon-test",
@@ -1606,6 +1609,9 @@ pub(crate) mod tests {
     #[test]
     #[serial_test::serial]
     fn load_attestation_key_for_verify_refuses_owner_key_forms() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::profile::schema::KeyringEntryRef;
         stellar_agent_test_support::keyring_mock::install().ok();
         let name = "trustline-attest-owner";
@@ -1868,7 +1874,10 @@ pub(crate) mod tests {
     // ── keyring store initialisation ordering ─────────────────────────────────
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn run_initialises_keyring_store_before_signer_resolution() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 

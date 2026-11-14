@@ -1082,7 +1082,7 @@ fn unix_duration_to_ms(duration: Result<Duration, std::time::SystemTimeError>) -
 /// # Resolution order
 ///
 /// 1. `STELLAR_AGENT_NETWORKS_TOML`, if set to a non-empty value, is used
-///    verbatim.
+///    verbatim in production; isolated builds honor it only inside a marked sandbox.
 /// 2. Otherwise, `<canonical_data_root>/networks.toml` — see
 ///    [`stellar_agent_core::profile::schema::canonical_data_root`] for the
 ///    per-platform root.
@@ -1092,6 +1092,11 @@ fn unix_duration_to_ms(duration: Result<Duration, std::time::SystemTimeError>) -
 /// Returns [`SaError::NetworksTomlIo`] if the env-var override is unset (or
 /// empty) and the canonical data root cannot be determined.
 pub fn default_networks_toml_path() -> Result<PathBuf, SaError> {
+    #[cfg(any(test, feature = "test-helpers"))]
+    let env_override =
+        stellar_agent_core::profile::schema::sandboxed_override(STELLAR_AGENT_NETWORKS_TOML_ENV)
+            .and_then(|path| path.into_os_string().into_string().ok());
+    #[cfg(not(any(test, feature = "test-helpers")))]
     let env_override = std::env::var(STELLAR_AGENT_NETWORKS_TOML_ENV).ok();
     default_networks_toml_path_with_override(env_override.as_deref())
 }
@@ -1661,7 +1666,10 @@ mod tests {
     /// override-emptiness check — the two are now required to agree since
     /// both resolve `STELLAR_AGENT_NETWORKS_TOML`.
     #[test]
+    #[serial_test::serial]
     fn default_networks_toml_path_treats_empty_override_as_unset() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         match default_networks_toml_path_with_override(Some("")) {
             Ok(path) => assert!(
                 path.ends_with("networks.toml"),
@@ -1674,6 +1682,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn default_networks_toml_path_override_outside_a_sandbox_is_ignored() {
+        const EXPECTED: &str = "STELLAR_AGENT_TEST_NETWORKS_EXPECTED";
+        if let Some(expected) = std::env::var_os(EXPECTED) {
+            assert_eq!(
+                default_networks_toml_path().unwrap(),
+                PathBuf::from(expected),
+                "override must remain inside a marked sandbox"
+            );
+            return;
+        }
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let override_path = temporary.path().join("override.toml");
+        std::fs::write(&override_path, "").unwrap();
+        let probe = |selected: &std::path::Path, expected: &std::path::Path| {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "verifiers::tests::default_networks_toml_path_override_outside_a_sandbox_is_ignored", "--nocapture"])
+                .env("STELLAR_AGENT_HOME", home.path())
+                .env(STELLAR_AGENT_NETWORKS_TOML_ENV, selected)
+                .env(EXPECTED, expected)
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        probe(&override_path, &home.path().join("networks.toml"));
+        stellar_agent_test_support::sandbox::mark_sandbox(temporary.path()).unwrap();
+        probe(&override_path, &override_path);
+        std::fs::create_dir(temporary.path().join("child")).unwrap();
+        probe(
+            &temporary.path().join("child/../override.toml"),
+            &home.path().join("networks.toml"),
+        );
+        #[cfg(unix)]
+        {
+            let link = temporary.path().join("linked.toml");
+            std::os::unix::fs::symlink(&override_path, &link).unwrap();
+            probe(&link, &home.path().join("networks.toml"));
+        }
+    }
+
     /// `default_networks_toml_path_with_override(None)` falls through to the
     /// canonical data root.  Best-effort: this depends on
     /// [`stellar_agent_core::profile::schema::canonical_data_root`] being
@@ -1682,7 +1735,22 @@ mod tests {
     /// outcome, so the test accepts either successful resolution (with the
     /// expected per-platform shape) or that error.
     #[test]
+    #[serial_test::serial]
     fn default_networks_toml_path_falls_through_to_canonical_root() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(
+            &guard_home.path().join(if cfg!(target_os = "macos") {
+                PathBuf::from(stellar_agent_test_support::sandbox::MACOS_WALLET_SUFFIX.trim())
+            } else if cfg!(target_os = "windows") {
+                PathBuf::from("Soneso")
+                    .join(stellar_agent_test_support::sandbox::WALLET_DIRECTORY_COMPONENT.trim())
+                    .join("data")
+            } else {
+                PathBuf::from(
+                    stellar_agent_test_support::sandbox::WALLET_DIRECTORY_COMPONENT.trim(),
+                )
+            }),
+        );
         match default_networks_toml_path_with_override(None) {
             Ok(path) => {
                 assert!(
@@ -1691,7 +1759,10 @@ mod tests {
                 );
                 #[cfg(target_os = "linux")]
                 {
-                    let expected_suffix = PathBuf::from("stellar-agent").join("networks.toml");
+                    let expected_suffix = PathBuf::from(
+                        stellar_agent_test_support::sandbox::WALLET_DIRECTORY_COMPONENT.trim(),
+                    )
+                    .join("networks.toml");
                     assert!(
                         path.ends_with(&expected_suffix),
                         "Linux canonical path must be <data-root>/stellar-agent/networks.toml, got: {path:?}"
@@ -1699,17 +1770,21 @@ mod tests {
                 }
                 #[cfg(target_os = "macos")]
                 {
-                    let expected_suffix =
-                        PathBuf::from("Soneso.stellar-agent").join("networks.toml");
+                    let expected_suffix = PathBuf::from(
+                        stellar_agent_test_support::sandbox::MACOS_WALLET_SUFFIX.trim(),
+                    )
+                    .join("networks.toml");
                     assert!(
                         path.ends_with(&expected_suffix),
-                        "macOS canonical path must be <data-root>/Soneso.stellar-agent/networks.toml, got: {path:?}"
+                        "macOS canonical path must use the documented suffix and networks.toml, got: {path:?}"
                     );
                 }
                 #[cfg(target_os = "windows")]
                 {
                     let expected_suffix = PathBuf::from("Soneso")
-                        .join("stellar-agent")
+                        .join(
+                            stellar_agent_test_support::sandbox::WALLET_DIRECTORY_COMPONENT.trim(),
+                        )
                         .join("data")
                         .join("networks.toml");
                     assert!(

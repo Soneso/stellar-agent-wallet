@@ -264,7 +264,11 @@ async fn deposit(
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn an_honest_deposit_signs_the_simulated_tree() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let outcome = deposit(|| transfer(vault(), DESIRED)).await;
 
     assert!(outcome.result.is_ok(), "{:?}", outcome.result);

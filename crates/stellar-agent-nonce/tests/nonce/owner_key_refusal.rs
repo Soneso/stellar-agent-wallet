@@ -37,6 +37,9 @@ fn mint_with(profile: &Profile, profile_name: &str) -> Result<(), NonceError> {
 #[test]
 #[serial]
 fn thirty_three_bytes_are_refused() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let profile = make_profile("nonce-33");
     put(
@@ -55,6 +58,9 @@ fn thirty_three_bytes_are_refused() {
 #[test]
 #[serial]
 fn a_g_strkey_owner_value_is_refused() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let profile = make_profile("nonce-strkey");
     let strkey = stellar_agent_core::profile::owner_key::encode_owner_public_key(&[9_u8; 32]);
@@ -71,6 +77,9 @@ fn a_g_strkey_owner_value_is_refused() {
 #[test]
 #[serial]
 fn a_key_equal_to_the_older_form_owner_key_is_refused() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let profile = make_profile("nonce-owner");
     let owner_bytes = [0x44_u8; 32];
@@ -102,6 +111,9 @@ fn a_key_equal_to_the_older_form_owner_key_is_refused() {
 #[test]
 #[serial]
 fn an_owner_namespace_coordinate_is_refused_without_a_read() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let mut profile = make_profile("nonce-coord");
     profile.mcp_nonce_key_alias = KeyringEntryRef::new("stellar-agent-owner-other", "default");

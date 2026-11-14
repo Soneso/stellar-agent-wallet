@@ -95,6 +95,7 @@ impl Run {
 
 fn run_cli(home: &Path, env_profile: Option<&str>, args: &[&str]) -> Run {
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
+    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
     let mut command = Command::new(bin_path);
     command
         .args(args)

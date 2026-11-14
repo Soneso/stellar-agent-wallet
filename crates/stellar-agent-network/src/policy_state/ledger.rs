@@ -2896,6 +2896,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_claim_moves_an_open_record_and_keeps_its_holds() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let request = l.request(tx(1), vec![hold(70)]);
         let minted = l.mint(&request).unwrap();
@@ -2924,6 +2927,9 @@ mod tests {
     #[test]
     #[serial]
     fn an_invalidation_after_the_claim_keeps_the_holds() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let request = l.request(tx(1), vec![hold(70)]);
         let minted = l.mint(&request).unwrap();
@@ -2945,6 +2951,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_claim_after_the_invalidation_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let request = l.request(tx(1), vec![hold(70)]);
         let minted = l.mint(&request).unwrap();
@@ -2962,6 +2971,9 @@ mod tests {
     #[test]
     #[serial]
     fn an_expired_claim_keeps_its_spend_counted() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let request = l.request(tx(1), vec![hold(700), hold_in("fee", 30)]);
         let minted = l.mint(&request).unwrap();
@@ -3017,6 +3029,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_reopened_store_cannot_claim_twice_or_mint_the_approval_again() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let mut request = l.request(tx(1), vec![hold(70)]);
         let minted = l.mint(&request).unwrap();
@@ -3040,6 +3055,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_claim_round_trips_under_the_claim_version() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let request = l.request(tx(1), vec![hold(70)]);
         let minted = l.mint(&request).unwrap();
@@ -3062,6 +3080,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_claim_time_on_an_open_record_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let request = l.request(tx(1), vec![]);
         l.mint(&request).unwrap();
@@ -3076,6 +3097,9 @@ mod tests {
     #[test]
     #[serial]
     fn claim_times_follow_the_record_state_and_lifetime() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let claimed_request = l.request(tx(1), vec![hold(70)]);
         let claimed = l.mint(&claimed_request).unwrap();
@@ -3132,6 +3156,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_claimed_content_refuses_a_duplicate_mint() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let first = l.request(tx(1), vec![]);
         let minted = l.mint(&first).unwrap();
@@ -3147,6 +3174,9 @@ mod tests {
     #[test]
     #[serial]
     fn claimed_records_count_toward_the_open_limit() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         for n in 0..16u8 {
             let request = l.request(message(n), vec![]);
@@ -3162,6 +3192,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_claim_holds_to_the_lifetime_on_the_store_clock() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let request = l.request(tx(1), vec![hold(70)]);
         let minted = l.mint(&request).unwrap();
@@ -3187,6 +3220,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_claim_refuses_a_mismatched_expectation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         type ExpectChange = fn(&mut ClaimExpect);
         let l = Ledger::new();
         let request = l.request(tx(1), vec![hold(70)]);
@@ -3233,6 +3269,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_claim_refuses_a_changed_policy_pin() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let request = l.request(tx(1), vec![hold(70)]);
         let minted = l.mint(&request).unwrap();
@@ -3250,6 +3289,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_claim_that_fails_to_persist_leaves_the_record_open() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let request = l.request(tx(1), vec![hold(70)]);
         let minted = l.mint(&request).unwrap();
@@ -3426,6 +3468,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_mint_records_the_authorization_its_holds_and_its_reservation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let request = l.request(tx(1), vec![hold(100), hold(50)]);
         let minted = l.mint(&request).unwrap();
@@ -3469,6 +3514,9 @@ mod tests {
     #[test]
     #[serial]
     fn mint_caps_the_authorization_at_the_chain_deadline() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let ledger = Ledger::new();
         let mut request = ledger.request(message(1), vec![]);
         request.authorization_ttl_ms = 120_000;
@@ -3481,6 +3529,9 @@ mod tests {
     #[test]
     #[serial]
     fn the_lifetime_is_the_earlier_of_the_ttl_and_the_approval_expiry() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let mut short_approval = l.request(message(1), vec![]);
         *short_approval.authority.approval_expiry_mut() = T0 + 30_000;
@@ -3511,6 +3562,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_mint_requires_the_mainnet_profile_chain() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let mut testnet = l.request(message(1), vec![]);
         testnet.chain = Caip2::Testnet;
@@ -3532,6 +3586,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_mint_requires_a_present_matching_pin() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let request = l.request(message(1), vec![]);
         let pin_ref = PinScope::for_profile(l.store.path(), &l.profile).pin_entry_ref();
@@ -3566,6 +3623,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_duplicate_open_content_refuses_until_the_record_settles() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let first = l.request(tx(1), vec![]);
         let minted = l.mint(&first).unwrap();
@@ -3598,6 +3658,9 @@ mod tests {
     #[test]
     #[serial]
     fn an_approval_nonce_is_single_use_within_retention() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let first = l.request(message(1), vec![]);
         let minted = l.mint(&first).unwrap();
@@ -3622,6 +3685,9 @@ mod tests {
     #[test]
     #[serial]
     fn approval_mint_without_a_record_keeps_its_body() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let request = l.request(tx(1), vec![]);
         let minted = l.mint(&request).unwrap();
@@ -3644,6 +3710,9 @@ mod tests {
     #[test]
     #[serial]
     fn at_most_sixteen_authorizations_are_open() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let mut minted = Vec::new();
         for n in 0..16u8 {
@@ -3663,6 +3732,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_domain_without_holds_refuses_entries_and_records_no_reservation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         for binding in [message(1), x402(1), fee_submit(1)] {
             let mut request = l.request(binding, vec![hold(1)]);
@@ -3688,6 +3760,9 @@ mod tests {
     #[test]
     #[serial]
     fn holds_count_against_spend_pending_records_and_other_holds() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         l.store
             .record_and_persist(&l.profile, &[hold(300)])
@@ -3727,6 +3802,9 @@ mod tests {
     #[test]
     #[serial]
     fn hydration_and_reconciliation_never_see_holds() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         l.store.record_and_persist(&l.profile, &[hold(10)]).unwrap();
         let minted = l.mint(&l.request(tx(1), vec![hold(400)])).unwrap();
@@ -3747,6 +3825,9 @@ mod tests {
     #[test]
     #[serial]
     fn expiry_at_equality_drops_only_the_expired_holds() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         l.store.record_and_persist(&l.profile, &[hold(5)]).unwrap();
         let mut short = l.request(tx(1), vec![hold(100)]);
@@ -3791,6 +3872,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_transaction_consume_converts_its_holds_into_the_submission() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let request = l.request(tx(1), vec![hold(100), hold(20)]);
         let minted = l.mint(&request).unwrap();
@@ -3837,6 +3921,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_second_consume_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let request = l.request(message(1), vec![]);
         let minted = l.mint(&request).unwrap();
@@ -3862,6 +3949,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_consume_compares_every_expectation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use MainnetPrecondition as P;
         let l = Ledger::new();
         let request = l.request(tx(1), vec![hold(10)]);
@@ -4028,6 +4118,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_consume_accepts_the_audit_count_at_equality() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let request = l.request(message(1), vec![]);
         let minted = l.mint(&request).unwrap();
@@ -4038,6 +4131,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_consume_checks_the_binding_against_the_domain_facts() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use MainnetPrecondition as P;
         let l = Ledger::new();
         let request = l.request(tx(1), vec![]);
@@ -4136,6 +4232,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_consume_rereads_the_pin_under_its_lock() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let request = l.request(message(1), vec![]);
         let minted = l.mint(&request).unwrap();
@@ -4152,6 +4251,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_consume_holds_to_the_lifetime_on_the_store_clock() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let request = l.request(message(1), vec![]);
         let minted = l.mint(&request).unwrap();
@@ -4180,6 +4282,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_soroban_consume_retains_its_holds_as_authorized_spend() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let request = l.request(soroban(1), vec![hold(70)]);
         let minted = l.mint(&request).unwrap();
@@ -4230,6 +4335,9 @@ mod tests {
     #[test]
     #[serial]
     fn an_x402_submission_continues_its_used_intent_once() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let (_intent, parent, child) = used_intent(&l);
         let minted = l.mint(&child).unwrap();
@@ -4258,6 +4366,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_continuation_breaking_a_requirement_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use MainnetPrecondition as P;
         // The parent is used.
         {
@@ -4341,6 +4452,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_release_checks_its_parent_and_payload() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use MainnetPrecondition as P;
         let l = Ledger::new();
         let (_intent, parent, child) = used_intent(&l);
@@ -4387,6 +4501,9 @@ mod tests {
     #[test]
     #[serial]
     fn the_fee_bump_roles_split_value_and_fee_holds() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let inner = l.request(fee_inner(1), vec![hold(100)]);
         let inner_minted = l.mint(&inner).unwrap();
@@ -4462,6 +4579,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_fee_bump_consume_checks_its_role_facts() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use MainnetPrecondition as P;
         let l = Ledger::new();
         let outer = l.request(fee_outer(1), vec![hold_in("fee", 2)]);
@@ -4520,6 +4640,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_batch_consume_is_all_or_nothing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let inner = l.request(fee_inner(1), vec![hold(100)]);
         let inner_minted = l.mint(&inner).unwrap();
@@ -4573,6 +4696,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_consume_of_an_envelope_the_window_holds_is_a_duplicate() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         l.store
             .record_pending(
@@ -4609,6 +4735,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_consumed_envelope_without_holds_is_a_duplicate() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let first = l.request(tx(1), vec![]);
         let used = l.mint(&first).unwrap();
@@ -4657,6 +4786,9 @@ mod tests {
     #[test]
     #[serial]
     fn concurrent_mints_of_one_content_yield_one_open_record() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let first = l.request(tx(1), vec![hold(1)]);
         let second = l.request(tx(1), vec![hold(1)]);
@@ -4692,6 +4824,9 @@ mod tests {
     #[test]
     #[serial]
     fn an_invalidation_releases_the_holds_and_never_reopens() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let request = l.request(tx(1), vec![hold(100)]);
         let minted = l.mint(&request).unwrap();
@@ -4736,6 +4871,9 @@ mod tests {
     #[test]
     #[serial]
     fn settled_history_is_pruned_after_retention_and_the_version_follows() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let request = l.request(message(1), vec![]);
         let minted = l.mint(&request).unwrap();
@@ -4829,6 +4967,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_reset_keeps_every_record_whose_approval_can_be_presented() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         type Setup = fn(&Ledger) -> (MintRequest, AuthorizationId);
         let used: Setup = |l| {
             let request = l.request(soroban(1), vec![hold(70)]);
@@ -4931,6 +5072,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_reset_drops_records_whose_approval_expired() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for (clock, kept) in [(T0 + APPROVAL_MS, 0), (T0 + APPROVAL_MS - 1, 1)] {
             let l = Ledger::new();
             let request = l.request(soroban(1), vec![hold(70)]);
@@ -4963,6 +5107,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_reset_settles_a_record_minted_ahead_of_the_store_clock() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let mut request = l.request(tx(1), vec![hold(70)]);
         *request.authority.approval_expiry_mut() = T0 + RETENTION_MS;
@@ -5006,6 +5153,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_reset_keeps_a_continued_intent_and_its_child() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let (_intent, parent, child) = used_intent(&l);
         let minted = l.mint(&child).unwrap();
@@ -5042,6 +5192,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_reset_keeps_both_retained_collections() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         l.owe_expiry();
         let mut writer = l.delivery_writer();
@@ -5077,6 +5230,9 @@ mod tests {
     #[test]
     #[serial]
     fn the_snapshot_refusals_precede_the_owner_consent() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let nonce = stellar_agent_core::profile::schema::mainnet_enablement_entry_ref(
             &l.profile.policy_window_state_key_id,
@@ -5319,6 +5475,9 @@ mod tests {
     #[test]
     #[serial]
     fn open_authorizations_reads_without_writing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let request = l.request(message(1), vec![]);
         let minted = l.mint(&request).unwrap();
@@ -5358,6 +5517,9 @@ mod tests {
     #[test]
     #[serial]
     fn mint_computes_the_reservation_aggregate() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         for holds in [vec![hold(1)], vec![]] {
             let request = l.request(tx(holds.len() as u8), holds);
@@ -5377,6 +5539,9 @@ mod tests {
     #[test]
     #[serial]
     fn mint_refuses_a_supplied_reservation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let mut request = l.request(tx(1), vec![hold(1)]);
         request.bindings.reservation = Some([1; 32]);
@@ -5392,6 +5557,9 @@ mod tests {
     #[test]
     #[serial]
     fn an_absent_pin_mints_no_window_key() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let pin = PinScope::for_profile(l.store.path(), &l.profile).pin_entry_ref();
         keyring_core::Entry::new(&pin.service, &pin.account)
@@ -5420,6 +5588,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_future_hold_refuses_before_key_creation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let skew = CLOCK_SKEW_TOLERANCE_MS;
         let entry = |ts| {
@@ -5452,6 +5623,9 @@ mod tests {
     #[test]
     #[serial]
     fn soroban_mint_requires_an_x402_consumer() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         for consumer in [
             MainnetConsumer::X402Create,
@@ -5542,6 +5716,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_message_record_is_minted_only_for_the_authenticated_consumer() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let mut request = l.request(message(1), vec![]);
         request.consumer = MainnetConsumer::CliPay;
@@ -5558,6 +5735,9 @@ mod tests {
     #[test]
     #[serial]
     fn an_authenticated_intent_continues_its_used_message_once() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let (message_request, parent) = used_message(&l);
         let child = authenticated_child(&l, &message_request, &parent, 1);
@@ -5569,6 +5749,9 @@ mod tests {
     #[test]
     #[serial]
     fn an_authenticated_continuation_breaking_a_requirement_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use MainnetPrecondition as P;
         let assert_unchanged_refusal = |l: &Ledger, request: &MintRequest, name: &str| {
             let before = l.bytes();
@@ -5685,6 +5868,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_message_consume_compares_the_content_before_the_binding() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let request = l.request(message(1), vec![]);
         let minted = l.mint(&request).unwrap();
@@ -5721,6 +5907,9 @@ mod tests {
     #[test]
     #[serial]
     fn an_open_soroban_consume_checks_the_intent() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let request = l.request(
             DomainBinding::Soroban {
@@ -5748,6 +5937,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_changed_audit_segment_refuses_even_after_the_count_recovers() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         for count in [0, 10] {
             let request = l.request(tx(count as u8), vec![]);
@@ -5782,6 +5974,9 @@ mod tests {
     #[test]
     #[serial]
     fn consume_refuses_another_profile_name() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let request = l.request(tx(1), vec![hold(1)]);
         let minted = l.mint(&request).unwrap();
@@ -5806,6 +6001,9 @@ mod tests {
     #[test]
     #[serial]
     fn consume_refuses_another_profile_chain() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let request = l.request(tx(1), vec![hold(1)]);
         let minted = l.mint(&request).unwrap();
@@ -5829,6 +6027,9 @@ mod tests {
     #[test]
     #[serial]
     fn invalidate_refuses_another_profile_name() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let request = l.request(tx(1), vec![hold(1)]);
         let minted = l.mint(&request).unwrap();
@@ -5848,6 +6049,9 @@ mod tests {
     #[test]
     #[serial]
     fn invalidate_refuses_another_profile_chain() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let request = l.request(tx(1), vec![hold(1)]);
         let minted = l.mint(&request).unwrap();
@@ -5866,6 +6070,9 @@ mod tests {
     #[test]
     #[serial]
     fn every_fee_bump_fact_is_compared_at_consumption() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use MainnetPrecondition as P;
         let breakages: [(&str, DomainBinding, SubmissionChange, P); 11] = [
             (
@@ -5962,6 +6169,9 @@ mod tests {
     #[test]
     #[serial]
     fn only_the_inner_hash_carried_by_the_envelope_consumes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let first = l.request(fee_inner(1), vec![hold(1)]);
         let second = l.request(fee_inner(2), vec![hold(1)]);
@@ -5980,6 +6190,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_held_lock_refuses_a_mint() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let second = l.request(tx(1), vec![hold(1)]);
         {
@@ -6013,6 +6226,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_second_path_over_one_entry_cannot_mint_while_the_first_holds_the_lock() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         l.mint(&l.request(tx(1), vec![hold(1)])).unwrap();
         let second = second_path(&l);
@@ -6032,6 +6248,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_second_path_over_one_entry_cannot_admit_cancel_or_bind_while_the_first_holds_the_lock() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let plan = crate::SignedIntentPlan::new(
             l.profile.chain_id.network_passphrase(),
@@ -6105,6 +6324,9 @@ mod tests {
     #[test]
     #[serial]
     fn two_paths_mint_one_approval_once() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         l.mint(&l.request(tx(1), vec![hold(1)])).unwrap();
         let second = second_path(&l);
@@ -6147,6 +6369,9 @@ mod tests {
     #[test]
     #[serial]
     fn every_store_transition_takes_the_entry_lock() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         type Transition<'a> = (
             &'static str,
             Box<dyn Fn() -> Result<(), WindowStoreError> + 'a>,
@@ -6455,6 +6680,9 @@ mod tests {
     #[test]
     #[serial]
     fn consumption_requires_the_submission_scope() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for scope in [
             None,
             Some(crate::policy_state::ChainScope::for_chain(Caip2::Testnet)),
@@ -6669,6 +6897,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_duplicate_open_policy_content_refuses_until_the_record_settles() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let first = under_policy(l.request(tx(1), vec![]), T0 + APPROVAL_MS);
         let minted = l.mint(&first).unwrap();
@@ -6702,6 +6933,9 @@ mod tests {
     #[test]
     #[serial]
     fn policy_child_under_approval_parent_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         {
             let l = Ledger::new();
             let (_intent, _parent, child) = used_intent(&l);
@@ -6742,6 +6976,9 @@ mod tests {
     #[test]
     #[serial]
     fn wire_authorization_refuses_both_projections() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let approval = sample(AuthorizationState::Expired, 2, Some(9));
         let mut policy = approval.clone();
         policy.approval_nonce = None;
@@ -6830,6 +7067,9 @@ mod tests {
     #[test]
     #[serial]
     fn version_ten_only_with_policy_authority() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let approval = l.request(tx(1), vec![hold(5)]);
         l.mint(&approval).unwrap();
@@ -6951,6 +7191,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_policy_record_compares_its_authority() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let request = under_policy(l.request(tx(1), vec![]), T0 + APPROVAL_MS);
         let minted = l.mint(&request).unwrap();
@@ -7006,6 +7249,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_policy_record_lives_within_its_governing_end() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let request = under_policy(l.request(tx(1), vec![]), T0 + 30_000);
         let minted = l.mint(&request).unwrap();
@@ -7109,6 +7355,9 @@ mod tests {
     #[test]
     #[serial]
     fn mint_persists_native_amounts_including_zero_buckets() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let mut bucketless = l.request(tx(1), vec![]);
         bucketless.native_reservation = Some(NativeReservation {
@@ -7166,6 +7415,9 @@ mod tests {
     #[test]
     #[serial]
     fn native_amounts_count_once_per_reservation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use super::super::operations::{
             ReleaseBound, ReleaseClass, ReleaseRow, WindowObservation, native_reserved,
         };
@@ -7234,6 +7486,9 @@ mod tests {
     #[test]
     #[serial]
     fn consumption_keeps_native_amounts() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let mut request = l.request(tx(1), vec![hold(25)]);
         request.native_reservation = Some(NATIVE);
@@ -7313,6 +7568,9 @@ mod tests {
     #[test]
     #[serial]
     fn legacy_authorization_without_amounts_keeps_its_bytes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
         let request = l.request(tx(1), vec![hold(25)]);
         assert_eq!(request.native_reservation, None);
@@ -7665,6 +7923,9 @@ mod tests {
     #[test]
     #[serial]
     fn mint_stores_the_operation_link() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy_state::operations::{
             BusinessId, IntentSlot, OpenOutcome, OpenRequest, OperationKind, OperationRecorder,
             OperationTool,
@@ -7961,6 +8222,9 @@ mod tests {
         #[test]
         #[serial]
         fn total_survives_the_mcp_refresh() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let l = Ledger::new();
             let p = policy(7);
             l.pin(p.sequence, p.digest);
@@ -7985,6 +8249,9 @@ mod tests {
         #[test]
         #[serial]
         fn total_survives_a_reopen_past_every_horizon() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let l = Ledger::new();
             let p = policy(7);
             l.pin(p.sequence, p.digest);
@@ -8003,6 +8270,9 @@ mod tests {
         #[test]
         #[serial]
         fn a_new_epoch_starts_at_zero() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let l = Ledger::new();
             let first = policy(7);
             l.pin(first.sequence, first.digest);
@@ -8017,6 +8287,9 @@ mod tests {
         #[test]
         #[serial]
         fn an_expired_signed_claim_stays_counted() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let l = Ledger::new();
             let p = policy(7);
             l.pin(p.sequence, p.digest);
@@ -8034,6 +8307,9 @@ mod tests {
         #[test]
         #[serial]
         fn an_unresolved_send_stays_counted() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let l = Ledger::new();
             let p = policy(7);
             l.pin(p.sequence, p.digest);
@@ -8057,6 +8333,9 @@ mod tests {
         #[test]
         #[serial]
         fn an_unused_hold_releases() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let l = Ledger::new();
             let p = policy(7);
             l.pin(p.sequence, p.digest);
@@ -8071,6 +8350,9 @@ mod tests {
         #[test]
         #[serial]
         fn concurrent_admissions_admit_one() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let l = Ledger::new();
             let p = policy(7);
             l.pin(p.sequence, p.digest);
@@ -8143,6 +8425,9 @@ mod tests {
         #[test]
         #[serial]
         fn total_rows_survive_successful_pruning() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let l = Ledger::new();
             let p = policy(7);
             l.pin(p.sequence, p.digest);
@@ -8157,6 +8442,9 @@ mod tests {
         #[test]
         #[serial]
         fn an_x402_consume_stays_counted() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let l = Ledger::new();
             let p = policy(7);
             l.pin(p.sequence, p.digest);
@@ -8170,6 +8458,9 @@ mod tests {
         #[test]
         #[serial]
         fn assets_are_isolated_within_one_digest() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let l = Ledger::new();
             l.mint(&l.request(tx(1), vec![total(6, P7)])).unwrap();
             let other = format!("total:{DEST}");
@@ -8180,6 +8471,9 @@ mod tests {
         #[test]
         #[serial]
         fn open_holds_stay_in_their_epoch() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let l = Ledger::new();
             l.mint(&l.request(tx(1), vec![total(6, P7)])).unwrap();
             l.pin(8, [8; 32]);
@@ -8192,6 +8486,9 @@ mod tests {
         #[test]
         #[serial]
         fn an_invalidated_hold_releases() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let l = Ledger::new();
             let minted = l.mint(&l.request(tx(1), vec![total(6, P7)])).unwrap();
             assert!(
@@ -8205,6 +8502,9 @@ mod tests {
         #[test]
         #[serial]
         fn a_mint_binds_the_hold_epoch() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let l = Ledger::new();
             let before = l.store.path().exists();
             assert!(matches!(
@@ -8221,6 +8521,9 @@ mod tests {
         #[test]
         #[serial]
         fn equality_at_the_limit_passes() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let l = Ledger::new();
             let p = policy(7);
             l.pin(p.sequence, p.digest);
@@ -8234,6 +8537,9 @@ mod tests {
         #[test]
         #[serial]
         fn reset_retains_a_claim_its_survivors_omit() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let l = Ledger::new();
             let request = l.request(tx(1), vec![total(6, P7)]);
             let minted = l.mint(&request).unwrap();
@@ -8262,6 +8568,9 @@ mod tests {
         #[test]
         #[serial]
         fn reset_converts_each_hold_once() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let l = Ledger::new();
             for (n, amount) in [(1_u8, 3), (2, 4)] {
                 let request = l.request(tx(n), vec![total(amount, P7)]);
@@ -8298,6 +8607,9 @@ mod tests {
         #[test]
         #[serial]
         fn earlier_build_content_is_not_relabelled() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let l = Ledger::new();
             l.mint(&l.request(tx(1), vec![total(6, P7)])).unwrap();
             let consumed = l.request(tx(2), vec![total(3, P7)]);
@@ -8341,6 +8653,9 @@ mod tests {
         #[test]
         #[serial]
         fn retirement_refuses_a_total_mint() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let l = Ledger::new();
             l.mint(&l.request(tx(1), vec![hold(5)])).unwrap();
             reseal(&l, |wire| {
@@ -8370,6 +8685,9 @@ mod tests {
         #[test]
         #[serial]
         fn hydration_and_admission_agree_on_the_sum() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let l = Ledger::new();
             let now = T0 + 1_000;
             // An open hold, a claimed hold, and two unclaimed holds that
@@ -8426,6 +8744,9 @@ mod tests {
         #[test]
         #[serial]
         fn hydration_samples_one_clock() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let l = Ledger::new();
             for n in [1_u8, 2] {
                 l.mint(&l.request(tx(n), vec![total(1, P7)])).unwrap();
@@ -8535,6 +8856,9 @@ mod tests {
         #[test]
         #[serial]
         fn equivalent_asset_spellings_share_one_total() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let l = Ledger::new();
             let (p, _) = two_spelling_policy(&l);
             l.pin(p.sequence, p.digest);
@@ -8566,6 +8890,9 @@ mod tests {
         #[test]
         #[serial]
         fn stored_rows_of_either_spelling_count_together() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let (_, native_sac) = two_spelling_policy(&Ledger::new());
             for stored in ["native".to_owned(), native_sac] {
                 let l = Ledger::new();
@@ -8629,6 +8956,9 @@ mod tests {
         #[test]
         #[serial]
         fn a_malformed_mint_creates_no_key() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let windowed_total = WindowEntry::new(
                 StateKey::new("ledger", 1, "native", 86_400),
                 T0,
@@ -8707,6 +9037,9 @@ mod tests {
         #[test]
         #[serial]
         fn a_mint_refuses_a_total_limit_on_a_windowed_key() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let l = Ledger::new();
             let entry = WindowEntry::new(
                 StateKey::new("ledger", 1, "native", 86_400),
@@ -8729,6 +9062,9 @@ mod tests {
         #[test]
         #[serial]
         fn a_mint_refuses_an_amount_limit_on_a_total_key() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let l = Ledger::new();
             let entry = WindowEntry::new(
                 StateKey::new("ledger", 1, "total:native", 0),

@@ -269,6 +269,9 @@ impl crate::decision::RevocationAccess for CountingRevocations {
 #[tokio::test]
 #[serial]
 async fn revocation_control_matches_record_eligibility() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mut h = Harness::new("revoke-controls");
     let ctx = Arc::try_unwrap(h.state.ctx).ok().unwrap();
     h.state.ctx = Arc::new(ctx.with_revocation_access(Arc::new(CountingRevocations::new())));
@@ -338,6 +341,9 @@ async fn revocation_control_matches_record_eligibility() {
 #[tokio::test]
 #[serial]
 async fn revocation_authentication_matrix() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use std::sync::atomic::Ordering;
     let mut h = Harness::new("revoke-auth");
     let access = Arc::new(CountingRevocations::new());
@@ -613,7 +619,11 @@ const BASE_OUTPUTS: &[(&str, &str)] = &[
 ];
 
 #[test]
+#[serial_test::serial]
 fn unaffected_approval_outputs_keep_base_bytes() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let outputs = unaffected_outputs();
     assert_eq!(outputs.len(), BASE_OUTPUTS.len());
     for ((label, digest), (base_label, base)) in outputs.iter().zip(BASE_OUTPUTS) {
@@ -647,6 +657,9 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
 #[tokio::test]
 #[serial]
 async fn bootstrap_is_single_use() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("bootstrap-single");
     let cookie = h.bootstrap().await;
     assert!(cookie.starts_with("stellar_agent_approval_session_"));
@@ -673,6 +686,9 @@ async fn bootstrap_is_single_use() {
 #[tokio::test]
 #[serial]
 async fn protected_route_without_cookie_is_404() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("no-cookie");
     let req = Request::builder()
         .uri("/pending.json")
@@ -686,6 +702,9 @@ async fn protected_route_without_cookie_is_404() {
 #[tokio::test]
 #[serial]
 async fn wrong_host_is_421() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("wrong-host");
     let req = Request::builder()
         .uri("/inbox")
@@ -703,6 +722,9 @@ async fn wrong_host_is_421() {
 #[tokio::test]
 #[serial]
 async fn post_without_origin_is_403() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("no-origin");
     let cookie = h.bootstrap().await;
     let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
@@ -724,6 +746,9 @@ async fn post_without_origin_is_403() {
 #[tokio::test]
 #[serial]
 async fn post_with_missing_or_wrong_csrf_is_403_and_does_not_mutate() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("bad-csrf");
     let cookie = h.bootstrap().await;
     let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
@@ -768,6 +793,9 @@ async fn post_with_missing_or_wrong_csrf_is_403_and_does_not_mutate() {
 #[tokio::test]
 #[serial]
 async fn approve_payment_mints_verifiable_attestation() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("approve-ok");
     let cookie = h.bootstrap().await;
     let entry = payment_entry(DEFAULT_TTL_MS);
@@ -833,6 +861,9 @@ async fn approve_payment_mints_verifiable_attestation() {
 #[tokio::test]
 #[serial]
 async fn serve_trustline_json_returns_attestation() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("approve-trustline");
     let cookie = h.bootstrap().await;
     let limit = None;
@@ -922,6 +953,9 @@ async fn serve_trustline_json_returns_attestation() {
 #[tokio::test]
 #[serial]
 async fn reject_creates_tombstone() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("reject-ok");
     let cookie = h.bootstrap().await;
     let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
@@ -949,6 +983,9 @@ async fn reject_creates_tombstone() {
 #[tokio::test]
 #[serial]
 async fn second_approve_is_idempotent_already_resolved() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("reshow");
     let cookie = h.bootstrap().await;
     let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
@@ -981,6 +1018,9 @@ async fn second_approve_is_idempotent_already_resolved() {
 #[tokio::test]
 #[serial]
 async fn approve_expired_entry_reports_expired() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("expired");
     let cookie = h.bootstrap().await;
     let nonce = h.insert(payment_entry(1));
@@ -1008,6 +1048,9 @@ async fn approve_expired_entry_reports_expired() {
 #[tokio::test]
 #[serial]
 async fn approve_foreign_process_uid_reports_user_mismatch() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("approve-mismatch");
     let cookie = h.bootstrap().await;
     let entry = fixtures::payment_pending(
@@ -1047,6 +1090,9 @@ async fn approve_foreign_process_uid_reports_user_mismatch() {
 #[tokio::test]
 #[serial]
 async fn reject_foreign_process_uid_reports_user_mismatch() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("reject-mismatch");
     let cookie = h.bootstrap().await;
     let entry = fixtures::payment_pending(
@@ -1092,6 +1138,9 @@ async fn reject_foreign_process_uid_reports_user_mismatch() {
 #[tokio::test]
 #[serial]
 async fn pending_json_reports_shape() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("pending-json");
     let cookie = h.bootstrap().await;
     h.insert(payment_entry(DEFAULT_TTL_MS));
@@ -1113,6 +1162,9 @@ async fn pending_json_reports_shape() {
 #[tokio::test]
 #[serial]
 async fn detail_page_renders_for_known_nonce() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("detail");
     let cookie = h.bootstrap().await;
     let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
@@ -1139,6 +1191,9 @@ async fn detail_page_renders_for_known_nonce() {
 #[tokio::test]
 #[serial]
 async fn approve_when_store_locked_returns_503_busy() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("busy");
     let cookie = h.bootstrap().await;
     let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
@@ -1194,7 +1249,11 @@ fn config_for(
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn start_serve_rejects_non_loopback_bind() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let dir = TempDir::new().unwrap();
     let config = config_for(
         "0.0.0.0:0".parse().unwrap(),
@@ -1206,7 +1265,11 @@ async fn start_serve_rejects_non_loopback_bind() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn start_serve_bind_conflict_is_clean_error() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let dir = TempDir::new().unwrap();
     // Occupy a loopback port, then ask the server to bind the same one.
     let occupier = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1227,6 +1290,9 @@ async fn start_serve_bind_conflict_is_clean_error() {
 #[tokio::test]
 #[serial]
 async fn start_serve_end_to_end_over_real_tcp_bind() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let dir = TempDir::new().unwrap();
     let config = config_for(
@@ -1394,6 +1460,9 @@ async fn the_mainnet_inbox_binds_both_families() {
 #[tokio::test]
 #[serial]
 async fn the_testnet_inbox_keeps_one_listener() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let dir = TempDir::new().unwrap();
     let (held_v6, port) = (0..64)
@@ -1436,6 +1505,9 @@ async fn the_testnet_inbox_keeps_one_listener() {
 #[tokio::test]
 #[serial]
 async fn oversized_post_body_is_rejected() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("body-cap");
     // Host + Origin are valid; the body-limit layer sits before the handler, so
     // no session cookie is needed to observe the 413.
@@ -1459,6 +1531,9 @@ async fn oversized_post_body_is_rejected() {
 #[tokio::test]
 #[serial]
 async fn inbox_get_renders_for_authenticated_session() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("inbox-ok");
     let cookie = h.bootstrap().await;
     h.insert(payment_entry(DEFAULT_TTL_MS));
@@ -1482,6 +1557,9 @@ async fn inbox_get_renders_for_authenticated_session() {
 #[tokio::test]
 #[serial]
 async fn inbox_sinks_carry_a_bidi_memo_escaped() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("inbox-bidi");
     let cookie = h.bootstrap().await;
     // The envelope carries the memo; the stored summary memo, which no
@@ -1541,6 +1619,9 @@ async fn inbox_sinks_carry_a_bidi_memo_escaped() {
 #[tokio::test]
 #[serial]
 async fn inbox_get_without_cookie_is_404() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("inbox-no-cookie");
     let req = Request::builder()
         .uri("/inbox")
@@ -1556,6 +1637,9 @@ async fn inbox_get_without_cookie_is_404() {
 #[tokio::test]
 #[serial]
 async fn include_expired_query_flag_controls_expired_visibility() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("include-expired");
     let cookie = h.bootstrap().await;
     let nonce = h.insert(payment_entry(1)); // TTL=1ms
@@ -1606,6 +1690,9 @@ async fn include_expired_query_flag_controls_expired_visibility() {
 #[tokio::test]
 #[serial]
 async fn detail_page_without_cookie_is_404() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("detail-no-cookie");
     let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
     let req = Request::builder()
@@ -1622,6 +1709,9 @@ async fn detail_page_without_cookie_is_404() {
 #[tokio::test]
 #[serial]
 async fn protected_route_with_wrong_cookie_value_is_404() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("wrong-cookie-value");
     let cookie = h.bootstrap().await;
     let (name, _) = cookie.split_once('=').unwrap();
@@ -1638,6 +1728,9 @@ async fn protected_route_with_wrong_cookie_value_is_404() {
 #[tokio::test]
 #[serial]
 async fn detail_page_unknown_nonce_returns_not_found_page() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("detail-unknown");
     let cookie = h.bootstrap().await;
     let req = Request::builder()
@@ -1662,6 +1755,9 @@ async fn detail_page_unknown_nonce_returns_not_found_page() {
 #[tokio::test]
 #[serial]
 async fn detail_page_reshows_attestation_after_approve() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("detail-reshow");
     let cookie = h.bootstrap().await;
     let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
@@ -1704,6 +1800,9 @@ async fn detail_page_reshows_attestation_after_approve() {
 #[tokio::test]
 #[serial]
 async fn post_approve_and_reject_without_cookie_are_404() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("post-no-cookie");
     let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
 
@@ -1731,6 +1830,9 @@ async fn post_approve_and_reject_without_cookie_are_404() {
 #[tokio::test]
 #[serial]
 async fn static_app_js_requires_session_and_serves_expected_content() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("app-js");
 
     let no_cookie_req = Request::builder()
@@ -1769,6 +1871,9 @@ async fn static_app_js_requires_session_and_serves_expected_content() {
 #[tokio::test]
 #[serial]
 async fn get_endpoints_report_busy_or_degrade_when_store_locked() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("get-busy");
     let cookie = h.bootstrap().await;
     let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
@@ -1818,6 +1923,9 @@ async fn get_endpoints_report_busy_or_degrade_when_store_locked() {
 #[tokio::test]
 #[serial]
 async fn approve_toolset_first_invoke_gate_via_router_returns_grant_active() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("toolset-router");
     let cookie = h.bootstrap().await;
     let entry = PendingApproval::new_toolset_first_invoke_gate_pending(
@@ -1855,6 +1963,9 @@ async fn approve_toolset_first_invoke_gate_via_router_returns_grant_active() {
 #[tokio::test]
 #[serial]
 async fn approve_unknown_nonce_via_router_returns_not_found_status() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("unknown-router");
     let cookie = h.bootstrap().await;
     let nonce = "AAAAAAAAAAAAAAAAAAAAAA".to_owned();
@@ -1878,6 +1989,9 @@ async fn approve_unknown_nonce_via_router_returns_not_found_status() {
 #[tokio::test]
 #[serial]
 async fn approve_sign_with_passkey_via_router_returns_wrong_kind_status() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("passkey-router");
     let cookie = h.bootstrap().await;
     let entry = PendingApproval::new_passkey_pending(
@@ -1914,6 +2028,9 @@ async fn approve_sign_with_passkey_via_router_returns_wrong_kind_status() {
 #[tokio::test]
 #[serial]
 async fn approve_with_unseeded_keyring_returns_unavailable_status() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let dir = TempDir::new().unwrap();
     let store_path = dir.path().join("default.toml");
@@ -2006,6 +2123,9 @@ async fn approve_with_unseeded_keyring_returns_unavailable_status() {
 #[tokio::test]
 #[serial]
 async fn protected_route_survives_poisoned_auth_mutex() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("poisoned-session");
     let cookie = h.bootstrap().await;
 
@@ -2034,6 +2154,9 @@ async fn protected_route_survives_poisoned_auth_mutex() {
 #[tokio::test]
 #[serial]
 async fn bootstrap_survives_poisoned_auth_mutex() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("poisoned-bootstrap");
 
     let auth = Arc::clone(&h.state.auth);
@@ -2061,6 +2184,9 @@ async fn bootstrap_survives_poisoned_auth_mutex() {
 #[tokio::test]
 #[serial]
 async fn get_endpoints_report_unavailable_on_corrupt_store_file() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("corrupt-store-get");
     let cookie = h.bootstrap().await;
     std::fs::write(&h.store_path, b"this is not valid toml {{{").unwrap();
@@ -2089,6 +2215,9 @@ async fn get_endpoints_report_unavailable_on_corrupt_store_file() {
 #[tokio::test]
 #[serial]
 async fn authenticated_detail_renders_selected_context_and_envelope_source() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mut h = Harness::new("context-source");
     let context = &mut Arc::get_mut(&mut h.state.ctx).unwrap().context;
     context.profile_name = "treasury-route".to_owned();
@@ -2182,6 +2311,9 @@ async fn body_text(resp: axum::response::Response) -> String {
 #[tokio::test]
 #[serial]
 async fn cookie_and_csrf_without_proof_cannot_mutate() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("proof-required");
     let cookie = h.bootstrap().await;
     let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
@@ -2255,6 +2387,9 @@ async fn cookie_and_csrf_without_proof_cannot_mutate() {
 #[tokio::test]
 #[serial]
 async fn bootstrap_proof_is_one_shot_and_not_recoverable() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("proof-one-shot");
     let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
     let cookie = h.bootstrap().await;
@@ -2316,6 +2451,9 @@ async fn bootstrap_proof_is_one_shot_and_not_recoverable() {
 #[tokio::test]
 #[serial]
 async fn bootstrap_sets_max_age_and_distinct_cookie_names() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let a = Harness::new("cookie-a");
     let b = Harness::new("cookie-b");
     let mut names = Vec::new();
@@ -2400,6 +2538,9 @@ fn secure_session_cookie_adds_only_secure() {
 #[tokio::test]
 #[serial]
 async fn idle_expiry_boundary() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("idle-boundary");
     let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
     let cookie = h.bootstrap().await;
@@ -2443,6 +2584,9 @@ async fn idle_expiry_boundary() {
 #[tokio::test]
 #[serial]
 async fn polling_and_cookie_only_requests_do_not_extend_idle() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("idle-polling");
     let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
     let cookie = h.bootstrap().await;
@@ -2499,6 +2643,9 @@ async fn polling_and_cookie_only_requests_do_not_extend_idle() {
 #[tokio::test]
 #[serial]
 async fn activity_and_decisions_extend_idle() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("idle-activity");
     let first = h.insert(payment_entry(DEFAULT_TTL_MS));
     let cookie = h.bootstrap().await;
@@ -2553,6 +2700,9 @@ async fn activity_and_decisions_extend_idle() {
 #[tokio::test]
 #[serial]
 async fn absolute_expiry_boundary() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("absolute-boundary");
     let cookie = h.bootstrap().await;
     let activity_csrf = h.csrf_for(crate::routes::SESSION_ACTIVITY_NONCE);
@@ -2598,6 +2748,9 @@ async fn absolute_expiry_boundary() {
 #[tokio::test]
 #[serial]
 async fn session_bootstrap_js_is_served_without_a_session() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("bootstrap-js");
     let req = Request::builder()
         .uri("/static/session-bootstrap.js")
@@ -2618,6 +2771,9 @@ async fn session_bootstrap_js_is_served_without_a_session() {
 #[tokio::test]
 #[serial]
 async fn bootstrap_page_keeps_the_security_headers() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("bootstrap-headers");
     let req = Request::builder()
         .uri(format!("/bootstrap/{}", h.bootstrap_hex))
@@ -2648,6 +2804,9 @@ async fn bootstrap_page_keeps_the_security_headers() {
 #[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn bootstrap_trace_redacts_token() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("bootstrap-trace");
     let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
     let capture = crate::trace_capture::SpanCapture::install();
@@ -2795,6 +2954,9 @@ fn rule_entry(name_suffix: &str) -> PendingApproval {
 #[tokio::test]
 #[serial]
 async fn the_detail_page_carries_the_digest_of_the_entry_it_renders() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("page-digest");
     let cookie = h.bootstrap().await;
     let entry = payment_entry(DEFAULT_TTL_MS);
@@ -2832,6 +2994,9 @@ async fn the_detail_page_carries_the_digest_of_the_entry_it_renders() {
 #[tokio::test]
 #[serial]
 async fn an_entry_swapped_after_the_page_loaded_is_not_attested() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let payment_d1 = fixtures::payment_pending(
         SOURCE_G,
         DEST_G,
@@ -2900,6 +3065,9 @@ async fn an_entry_swapped_after_the_page_loaded_is_not_attested() {
 #[tokio::test]
 #[serial]
 async fn a_missing_or_malformed_view_digest_refuses() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("malformed-digest");
     let cookie = h.bootstrap().await;
     let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));

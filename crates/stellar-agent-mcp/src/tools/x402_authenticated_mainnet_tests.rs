@@ -335,6 +335,7 @@ async fn assert_muxed_approval_id_binding(authenticated: bool, contract: bool) {
 
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn muxed_unlisted_budget_pays_unattended_and_refuses_exhaustion() {
     for authenticated in [false, true] {
         let (payee, expected) = muxed_payee(false, 7);
@@ -406,12 +407,14 @@ async fn muxed_unlisted_budget_pays_unattended_and_refuses_exhaustion() {
 
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn muxed_approval_preserves_full_destination() {
     assert_muxed_approval_path(true).await;
 }
 
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn muxed_protocol_refuses_before_mainnet_state() {
     for authenticated in [false, true] {
         for require_approval in [false, true] {
@@ -467,6 +470,7 @@ async fn muxed_protocol_refuses_before_mainnet_state() {
 
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn muxed_protocol_library_mapping_preserves_code() {
     let (payee, _) = muxed_payee(true, 7);
     let run = Run::with(|raw| muxed_policy(&raw, &payee, true)).await;
@@ -505,6 +509,7 @@ async fn muxed_protocol_library_mapping_preserves_code() {
 
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn muxed_id_substitutions_refuse_at_policy_and_simulations() {
     for authenticated in [false, true] {
         for contract in [false, true] {
@@ -559,6 +564,7 @@ async fn muxed_id_substitutions_refuse_at_policy_and_simulations() {
 
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn muxed_contract_mainnet_payment_refuses_before_state() {
     let rpc = wiremock::MockServer::start().await;
     let f = crate::tools::common::tests::mainnet::routed_fixture(|raw| raw, &rpc);
@@ -1149,6 +1155,7 @@ async fn assert_accepted(run: &Run, approval: &(String, String), result: &serde_
 /// the governing TTL of the gate outcome, and sends no request.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn call_one_writes_the_pending_approval_without_a_request() {
     use stellar_agent_core::approval::ApprovalKind;
     let run = Run::new().await;
@@ -1224,6 +1231,7 @@ async fn call_one_writes_the_pending_approval_without_a_request() {
 /// written.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn call_one_fails_closed_under_a_minimum_reserve_rule() {
     let run = Run::with(|raw| {
         authenticated_policy_with(&raw, |rule| {
@@ -1252,6 +1260,7 @@ async fn call_one_fails_closed_under_a_minimum_reserve_rule() {
 /// names it.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn call_one_refuses_an_invalid_home_domain() {
     let run = Run::new().await;
     let result = run.call_raw(run.args("Anchor.Example.com", None)).await;
@@ -1268,6 +1277,7 @@ async fn call_one_refuses_an_invalid_home_domain() {
 /// One approval argument without the other refuses before any request.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn a_partial_approval_pair_refuses_without_a_request() {
     let run = Run::new().await;
     for (nonce, attestation) in [(Some("partial"), None), (None, Some("partial"))] {
@@ -1292,6 +1302,7 @@ async fn a_partial_approval_pair_refuses_without_a_request() {
 /// signature expiration derives from, and simulates nothing.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn call_two_accepts_below_the_threshold() {
     let run = Run::new().await;
     let approval = run.prepare().await;
@@ -1314,6 +1325,7 @@ async fn call_two_accepts_below_the_threshold() {
 /// names no transmitted authorization.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn call_two_refuses_a_lagging_oracle_below_the_threshold() {
     let run = Run::new().await;
     let approval = run.prepare().await;
@@ -1349,6 +1361,7 @@ async fn call_two_refuses_a_lagging_oracle_below_the_threshold() {
 /// timeout. The `x402_payment_authorized` row records the same ledger.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn call_two_derives_the_expiration_from_the_primary_ledger() {
     let run = Run::new().await;
     let approval = run.prepare().await;
@@ -1372,6 +1385,7 @@ async fn call_two_derives_the_expiration_from_the_primary_ledger() {
 /// signature expiration ledger of the entry the primary received.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn a_resimulation_failure_names_the_transmitted_authorization() {
     let run = Run::new().await;
     let approval = run.prepare().await;
@@ -1406,6 +1420,7 @@ async fn a_resimulation_failure_names_the_transmitted_authorization() {
 #[cfg(unix)]
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn a_terminal_approval_failure_names_the_transmitted_authorization() {
     let run = Run::new().await;
     let approval = run.prepare().await;
@@ -1440,6 +1455,7 @@ async fn a_terminal_approval_failure_names_the_transmitted_authorization() {
 /// oracle host and accepts as below it.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn call_two_accepts_a_witness_required_payment() {
     let run = Run::with(|raw| witness_required_policy(&raw)).await;
     let approval = run.prepare().await;
@@ -1461,6 +1477,7 @@ async fn call_two_accepts_a_witness_required_payment() {
 /// message before any SEP-10 request.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn call_two_refuses_after_the_enablement_rotates() {
     use stellar_agent_core::profile::schema::mainnet_enablement_entry_ref;
     let run = Run::new().await;
@@ -1489,6 +1506,7 @@ async fn call_two_refuses_after_the_enablement_rotates() {
 /// SEP-10 request.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn call_two_refuses_another_home_domain() {
     let run = Run::new().await;
     let approval = run.prepare().await;
@@ -1505,6 +1523,7 @@ async fn call_two_refuses_another_home_domain() {
 /// approval stays unspent and a following call 2 accepts.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn a_challenge_for_another_account_spends_no_approval() {
     let run = Run::new().await;
     let approval = run.prepare().await;
@@ -1528,6 +1547,7 @@ async fn a_challenge_for_another_account_spends_no_approval() {
 /// no intent and releases nothing.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn post_consume_sep10_failures_keep_the_message_record_used() {
     for other_sub in [false, true] {
         let run = Run::new().await;
@@ -1554,6 +1574,7 @@ async fn post_consume_sep10_failures_keep_the_message_record_used() {
 /// mint, because the approval nonce already minted a record.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn a_replay_after_a_post_consume_failure_refuses_the_reused_nonce() {
     let run = Run::new().await;
     let approval = run.prepare().await;
@@ -1594,6 +1615,7 @@ async fn a_replay_after_a_post_consume_failure_refuses_the_reused_nonce() {
 /// before anything is decoded or requested.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn the_session_seam_refuses_on_a_server_with_a_context() {
     let mut run = Run::new().await;
     run.f.server.set_x402_identity_session_for_test(
@@ -1616,6 +1638,7 @@ async fn the_session_seam_refuses_on_a_server_with_a_context() {
 /// Message record stays used, and no payment payload is released.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn an_unavailable_anchor_at_the_transmit_gate_withholds_the_payment() {
     use stellar_agent_test_support::keyring_mock;
     let run = Run::new().await;
@@ -1909,6 +1932,7 @@ impl Boundary {
 /// under an approval and under policy authority.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn the_sibling_refuses_an_expired_authorization() {
     for policy in [false, true] {
         let (b, prepared, receipt) = if policy {
@@ -1945,6 +1969,7 @@ async fn the_sibling_refuses_an_expired_authorization() {
 /// when the receipt binds the challenge's mainnet payload hash.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn the_sibling_refuses_a_challenge_validated_under_testnet() {
     let b = Boundary::new().await;
     b.double.control.testnet.store(true, Ordering::SeqCst);
@@ -1967,6 +1992,7 @@ async fn the_sibling_refuses_a_challenge_validated_under_testnet() {
 /// The completion refuses the receipt of another preparation.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn the_sibling_refuses_the_receipt_of_another_preparation() {
     let b = Boundary::new().await;
     let client = Boundary::client(MAINNET_PASSPHRASE);
@@ -1990,6 +2016,7 @@ async fn the_sibling_refuses_the_receipt_of_another_preparation() {
 /// challenge's, while its key and domains are the prepared ones.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn the_sibling_refuses_a_receipt_with_another_digest() {
     let b = Boundary::new().await;
     let prepared = b.prepare(&Boundary::client(MAINNET_PASSPHRASE)).await;
@@ -2021,6 +2048,7 @@ async fn the_sibling_refuses_a_receipt_with_another_digest() {
 /// The completion refuses when the mainnet clock fails.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn the_sibling_refuses_a_failing_clock() {
     let b = Boundary::new().await;
     let (prepared, receipt) = b.prepared_with_receipt().await;
@@ -2036,6 +2064,7 @@ async fn the_sibling_refuses_a_failing_clock() {
 /// the POST.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn the_sibling_refuses_a_corrupted_signature() {
     let b = Boundary::new().await;
     let (prepared, receipt) = b.prepared_with_receipt().await;
@@ -2060,6 +2089,7 @@ async fn the_sibling_refuses_a_corrupted_signature() {
 /// signature: the completion fails after signing and before the POST.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn the_sibling_fails_to_attach_to_a_full_envelope() {
     let b = Boundary::new().await;
     b.double
@@ -2085,6 +2115,7 @@ async fn the_sibling_fails_to_attach_to_a_full_envelope() {
 /// before anything is minted or signed.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn the_identity_gate_refuses_a_future_created_approval() {
     let b = Boundary::new().await;
     let (entry, approval) = b.approval().await;
@@ -2132,6 +2163,7 @@ async fn the_identity_gate_refuses_a_future_created_approval() {
 /// before anything is minted or signed.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn the_identity_gate_refuses_an_ended_policy_authority() {
     let b = Boundary::allowed().await;
     let decision = b.allow_decision().await;
@@ -2183,6 +2215,7 @@ async fn the_identity_gate_refuses_an_ended_policy_authority() {
 /// policy, the enablement, the audit or the store.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn the_identity_inputs_print_the_profile_only() {
     let b = Boundary::new().await;
     let (entry, approval) = b.approval().await;
@@ -2271,6 +2304,7 @@ async fn the_identity_inputs_print_the_profile_only() {
 /// digest.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn the_mainnet_session_prints_no_jwt_and_no_envelope() {
     let b = Boundary::new().await;
     let (entry, approval) = b.approval().await;
@@ -2332,6 +2366,7 @@ async fn the_mainnet_session_prints_no_jwt_and_no_envelope() {
 /// and receipt too, and its message record binds the home-domain scope.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn the_policy_session_prints_no_jwt_and_no_envelope() {
     let b = Boundary::allowed().await;
     let decision = b.allow_decision().await;

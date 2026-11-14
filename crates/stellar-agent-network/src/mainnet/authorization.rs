@@ -1629,7 +1629,11 @@ mod tests {
         }
 
         #[test]
+        #[serial_test::serial]
         fn every_header_check_accepts_the_bound_fact_and_refuses_another() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let f = Fixture::new();
             let a = f.tx();
             a.check_profile("mainnet-profile").unwrap();
@@ -1711,7 +1715,11 @@ mod tests {
         }
 
         #[test]
+        #[serial_test::serial]
         fn absence_is_compared_never_skipped() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let f = Fixture::new();
             let m = f.message();
             m.check_endpoint(None).unwrap();
@@ -1734,7 +1742,11 @@ mod tests {
         }
 
         #[test]
+        #[serial_test::serial]
         fn an_inconsistent_header_refuses_its_own_checks() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let f = Fixture::new();
             let mut header = f.header(AuthorizationDomain::Transaction, true);
             header.chain = Caip2::Testnet;
@@ -1758,7 +1770,11 @@ mod tests {
         }
 
         #[test]
+        #[serial_test::serial]
         fn the_transaction_checks_compare_each_fact() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let f = Fixture::new();
             let a = f.tx();
             a.check_unsigned_envelope(&[0x11; 32]).unwrap();
@@ -1777,7 +1793,11 @@ mod tests {
         }
 
         #[test]
+        #[serial_test::serial]
         fn the_soroban_and_submit_checks_compare_each_fact() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let f = Fixture::new();
             let intent = MainnetSorobanIntentAuthorization(SorobanIntentInner {
                 entries: vec![],
@@ -1837,7 +1857,11 @@ mod tests {
         }
 
         #[test]
+        #[serial_test::serial]
         fn the_fee_bump_checks_follow_the_phase() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let f = Fixture::new();
             let inner: MainnetFeeBumpAuthorization<Inner> =
                 f.fee_bump(DomainBinding::FeeBumpInner {
@@ -1900,7 +1924,11 @@ mod tests {
         }
 
         #[test]
+        #[serial_test::serial]
         fn the_message_check_compares_every_component() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let f = Fixture::new();
             let m = f.message();
             m.check_message(&message_domain(), &[0x33; 32]).unwrap();
@@ -1937,7 +1965,11 @@ mod tests {
         }
 
         #[test]
+        #[serial_test::serial]
         fn debug_shows_the_domain_and_an_identity_prefix_only() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let f = Fixture::new();
             let rendered = format!("{:?}", f.tx());
             assert_eq!(
@@ -2479,35 +2511,54 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn consume_expect_matches_the_minted_record() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             proof_composition(AuthorizationDomain::Transaction, true, None).await;
         }
 
         #[tokio::test]
         #[serial]
         async fn real_proofs_compose_with_inner_holds() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             proof_composition(AuthorizationDomain::FeeBumpInner, true, None).await;
         }
 
         #[tokio::test]
         #[serial]
         async fn real_proofs_compose_with_outer_holds() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             proof_composition(AuthorizationDomain::FeeBumpOuter, true, None).await;
         }
 
         #[tokio::test]
         #[serial]
         async fn real_proofs_compose_with_intent_holds() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             proof_composition(AuthorizationDomain::Soroban, true, None).await;
         }
 
         #[tokio::test]
         #[serial]
         async fn real_proofs_compose_without_holds() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             proof_composition(AuthorizationDomain::Message, false, None).await;
         }
 
         #[test]
+        #[serial_test::serial]
         fn soroban_consumer_checks_equality_and_family() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let f = Fixture::new();
             for consumer in [
                 MainnetConsumer::X402Create,
@@ -2534,7 +2585,11 @@ mod tests {
         }
 
         #[test]
+        #[serial_test::serial]
         fn audit_checks_the_segment_at_zero_and_after_count_recovery() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let f = Fixture::new();
             let header = f.header(AuthorizationDomain::Transaction, true);
             assert_eq!(
@@ -2550,6 +2605,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn rotation_refuses_authority_recorded_at_one_or_two() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             for count in [0, 1] {
                 proof_composition(AuthorizationDomain::Transaction, true, Some(count)).await;
             }

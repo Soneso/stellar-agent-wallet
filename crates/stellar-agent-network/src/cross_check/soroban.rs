@@ -396,7 +396,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn soroban_witness_passes_with_the_oracle_ledger_and_the_simulated_envelope() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = oracle_answering(EchoIdResponder::new(answer(&[entry()], 1001))).await;
         let envelope = envelope(100);
         let primary = primary();
@@ -428,7 +432,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn soroban_witness_refuses_two_primary_results_before_any_oracle_request() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = oracle_answering(EchoIdResponder::new(answer(&[entry()], 1001))).await;
         let envelope = envelope(100);
         let mut answer = answer(&[entry()], PRIMARY_LEDGER);
@@ -448,7 +456,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn soroban_witness_identity_mismatch_is_witness_unavailable() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for passphrase in ["Test SDF Future Network ; October 2022", MAINNET_PASSPHRASE] {
             let server = oracle_with_network(passphrase).await;
             let error = witness_from(&server).await.unwrap_err();
@@ -460,7 +472,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn soroban_witness_identity_timeout_is_identity_unavailable() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(body_partial_json(json!({"method": "getNetwork"})))
@@ -488,7 +504,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn soroban_witness_credential_refusal_keeps_its_code_after_one_attempt() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for status in [401, 403] {
             let server = oracle_answering(ResponseTemplate::new(status)).await;
             let error = witness_from(&server).await.unwrap_err();
@@ -509,7 +529,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn soroban_witness_retries_two_transport_failures_then_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server =
             oracle_answering(FailingThen::new(2, 503, answer(&[entry()], PRIMARY_LEDGER))).await;
         let outcome = witness_from(&server).await.unwrap();
@@ -529,7 +553,11 @@ mod tests {
     /// oracle four ledgers ahead of the primary passes while the signature
     /// window allows it.
     #[tokio::test]
+    #[serial_test::serial]
     async fn soroban_witness_retried_answer_ahead_of_the_primary_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = oracle_answering(FailingThen::new(
             1,
             503,
@@ -548,7 +576,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn soroban_witness_three_transport_failures_are_witness_unavailable() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server =
             oracle_answering(FailingThen::new(3, 503, answer(&[entry()], PRIMARY_LEDGER))).await;
         let error = witness_from(&server).await.unwrap_err();
@@ -566,7 +598,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn soroban_witness_never_retries_a_divergence() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // The first answer disagrees on the authorization count and every
         // later answer agrees, so a retry after the divergence would pass.
         let server = oracle_with_network(TESTNET_PASSPHRASE).await;
@@ -601,7 +637,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn soroban_witness_never_retries_an_invalid_answer() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for body in [
             ResponseTemplate::new(200).set_body_string("hostile-body"),
             ResponseTemplate::new(404),
@@ -620,7 +660,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn soroban_witness_undecodable_oracle_results_are_invalid_answers() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut bad_auth = answer(&[entry()], PRIMARY_LEDGER);
         bad_auth["results"][0]["auth"][0] = json!("AAAA");
         let mut bad_value = answer(&[entry()], PRIMARY_LEDGER);
@@ -671,7 +715,11 @@ mod tests {
     /// reach neither the refusal nor the wallet's log at any filter value.
     /// The wallet's own event about the failed read stays.
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn soroban_witness_renders_no_oracle_text() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let hostile =
             "https://user:credential-marker@example.invalid/private-path?token=secret-marker";
         let mut with_error = answer(&[entry()], PRIMARY_LEDGER);
@@ -718,7 +766,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn soroban_prepare_logs_the_skip_and_the_shared_host() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use super::super::log_capture::capture_logs;
         let unconfigured =
             Profile::builder_testnet("signer", "witness", "nonce", "witness").build();
@@ -785,7 +837,11 @@ mod tests {
     /// The rule decides from the profile's thresholds and oracle, and only a
     /// required witness builds a client.
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn soroban_prepare_applies_the_rule_before_building_a_client() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = oracle_with_network(TESTNET_PASSPHRASE).await;
         let token = CanonicalAsset::contract(TOKEN).unwrap();
         let native_sac = CanonicalAsset::contract(NATIVE_SAC).unwrap();
@@ -845,7 +901,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn soroban_prepare_refuses_an_oracle_client_that_cannot_be_built() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut profile = Profile::builder_testnet("signer", "witness", "nonce", "witness")
             .oracle_provider_url(
                 url::Url::parse("ftp://user:credential-marker@example.invalid/private-path")
@@ -885,6 +945,9 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn soroban_prepare_keeps_the_oracle_credential_code() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::profile::schema::{
             KeyringEntryRef, ProviderRecord, Providers, RpcCredentialPlacement,
         };

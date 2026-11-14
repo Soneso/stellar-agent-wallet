@@ -257,6 +257,7 @@ impl Fixture {
 /// The binary in `home` with `args`, under the headless backend and with
 /// every overlay that selects another profile, endpoint or secret removed.
 fn command_in(home: &Path, args: &[&str]) -> Command {
+    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
     let mut command = Command::new(env!("CARGO_BIN_EXE_stellar-agent"));
     command
         .args(args)

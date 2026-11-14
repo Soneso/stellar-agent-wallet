@@ -119,6 +119,7 @@ async fn check(case: Case) {
             )
             .unwrap();
     }
+    stellar_agent_test_support::sandbox::mark_sandbox(home.path()).expect("mark fixture directory");
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
         .args(["tx", "status", TX_HASH, "--profile", PROFILE])
         .env("STELLAR_AGENT_HOME", home.path())
@@ -143,11 +144,17 @@ async fn check(case: Case) {
 #[tokio::test]
 #[serial_test::serial]
 async fn settled_receipt_and_open_reservation() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     check(Case::Settled).await;
 }
 #[tokio::test]
 #[serial_test::serial]
 async fn orphan_hold_without_receipt() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     check(Case::Orphan).await;
 }
 #[tokio::test]
@@ -158,5 +165,8 @@ async fn chain_query_failure() {
 #[tokio::test]
 #[serial_test::serial]
 async fn reconciliation_releases_the_hold() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     check(Case::Released).await;
 }

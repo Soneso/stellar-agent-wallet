@@ -315,6 +315,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn acknowledging_a_loss_revokes_decided_approvals_and_grants() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let (args, profile) = fixture(dir.path());
@@ -363,6 +366,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn acknowledging_a_loss_revokes_a_decided_approval_with_a_refused_destination() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         keyring_mock::install().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let (args, profile) = fixture(dir.path());
@@ -407,6 +412,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn the_verb_without_a_loss_refuses_and_revokes_nothing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let (args, profile) = fixture(dir.path());
@@ -441,6 +449,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_removed_unusable_commitment_is_recovered_by_the_acknowledgement() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::{
             BindingHistory, log_path_sha256, tip_anchor::AuditKeyringEntries,
         };
@@ -522,6 +533,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_removed_unusable_commitment_without_queued_lines_leaves_no_loss() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::{
             BindingHistory, log_path_sha256, tip_anchor::AuditKeyringEntries,
         };
@@ -574,6 +588,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_lost_key_recovery_acknowledges_the_moved_queue() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::commands::audit::reanchor::{ReanchorArgs, reanchor};
         use stellar_agent_core::audit_log::BindingHistory;
 
@@ -682,6 +699,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn the_verb_refuses_a_log_rolled_back_behind_its_anchor() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let (args, profile) = fixture(dir.path());
@@ -733,6 +753,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn an_unusable_remaining_line_refuses_before_any_revocation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use std::io::Write as _;
 
         keyring_mock::install().unwrap();
@@ -787,6 +810,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn an_owner_key_as_the_audit_key_refuses_the_verb() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use base64::Engine as _;
         keyring_mock::install().unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -907,6 +933,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn the_verb_refuses_beside_a_held_writer() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let (args, profile) = fixture(dir.path());

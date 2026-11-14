@@ -174,7 +174,11 @@ async fn assert_friendbot_account_id_invalid_params(account_id: String) {
 /// `pay_integration.rs` and `create_account_integration.rs`, which test the
 /// genuine mainnet-destructive commit path.
 #[test]
+#[serial_test::serial]
 fn noopengine_rejects_stellar_friendbot_on_mainnet() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let engine = NoopPolicyEngine;
     let descriptor = ToolDescriptor::from_registration(&McpToolRegistration {
         name: "stellar_friendbot",
@@ -208,7 +212,11 @@ fn noopengine_rejects_stellar_friendbot_on_mainnet() {
 
 /// `NoopPolicyEngine` must allow `stellar_friendbot` on a testnet profile.
 #[test]
+#[serial_test::serial]
 fn noopengine_allows_stellar_friendbot_on_testnet() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::policy::Decision;
 
     let engine = NoopPolicyEngine;
@@ -251,7 +259,11 @@ fn noopengine_allows_stellar_friendbot_on_testnet() {
 /// correct annotation values (`destructive_hint = true`, `read_only_hint =
 /// false`, `chain_id_required = true`).
 #[test]
+#[serial_test::serial]
 fn stellar_friendbot_in_registry_with_correct_annotations() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let profile = testnet_profile();
     let server = WalletServer::new(profile).expect("WalletServer::new must succeed");
 
@@ -277,7 +289,11 @@ fn stellar_friendbot_in_registry_with_correct_annotations() {
 /// `stellar_friendbot`.  This guards against the vacuous-truth case in
 /// `registry_walk.rs`.
 #[test]
+#[serial_test::serial]
 fn registry_contains_both_tools() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use std::collections::HashSet;
 
     let profile = testnet_profile();
@@ -328,7 +344,11 @@ fn registry_contains_both_tools() {
 /// Handler-level dispatch coverage of this validator is exercised by the
 /// main-agent end-to-end smoke test against testnet.
 #[tokio::test]
+#[serial_test::serial]
 async fn validate_chain_id_helper_rejects_mismatch_for_friendbot_inputs() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::profile::caip2::validate_chain_id_matches_profile;
 
     let testnet_profile = testnet_profile();
@@ -359,7 +379,11 @@ async fn validate_chain_id_helper_rejects_mismatch_for_friendbot_inputs() {
 /// Invalid `chain_id` string (not a recognised CAIP-2 value) must also
 /// produce a validation error.
 #[test]
+#[serial_test::serial]
 fn stellar_friendbot_invalid_caip2_chain_id_rejected() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::profile::caip2::validate_chain_id_matches_profile;
 
     let profile = testnet_profile();
@@ -373,21 +397,33 @@ fn stellar_friendbot_invalid_caip2_chain_id_rejected() {
 /// `stellar_friendbot` rejects a structurally valid signing-key strkey at the
 /// MCP `account_id` boundary.
 #[tokio::test]
+#[serial_test::serial]
 async fn stellar_friendbot_rejects_s_strkey_account_id_with_invalid_params() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     assert_friendbot_account_id_invalid_params(disposable_s_strkey()).await;
 }
 
 /// `stellar_friendbot` rejects a structurally valid muxed-account strkey at the
 /// MCP `account_id` boundary.
 #[tokio::test]
+#[serial_test::serial]
 async fn stellar_friendbot_rejects_m_strkey_account_id_with_invalid_params() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     assert_friendbot_account_id_invalid_params(disposable_m_strkey()).await;
 }
 
 /// `stellar_friendbot` rejects a structurally valid contract strkey at the MCP
 /// `account_id` boundary.
 #[tokio::test]
+#[serial_test::serial]
 async fn stellar_friendbot_rejects_c_strkey_account_id_with_invalid_params() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     assert_friendbot_account_id_invalid_params(disposable_c_strkey()).await;
 }
 

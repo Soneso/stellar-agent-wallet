@@ -4,7 +4,12 @@
 use stellar_agent_test_support::rejected_value::{assert_refusal_text, capture_refusal};
 
 #[test]
+#[serial_test::serial]
 fn rejected_input_network_passphrase() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -59,7 +64,12 @@ fn rejected_input_network_passphrase() {
 }
 
 #[test]
+#[serial_test::serial]
 fn rejected_input_auth_preimage_base64() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

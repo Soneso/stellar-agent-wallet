@@ -201,7 +201,11 @@ fn stellar_friendbot_annotations_correct() {
 /// Also asserts that `WalletServer::new` is `Ok` for a valid (non-duplicate)
 /// registry — the fail-closed path is tested by `duplicate_registration_fails_closed`.
 #[test]
+#[serial_test::serial]
 fn wallet_server_registry_matches_inventory() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     // Explicitly set Noop so WalletServer::new succeeds without a policy file
     // on disk (PolicyEngineKind::default() is V1).
     let profile_testnet = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
@@ -248,7 +252,11 @@ fn wallet_server_registry_matches_inventory() {
 /// advertises in its `initialize` response.  Adding a tool without adding its
 /// line to `INSTRUCTIONS_STATIC` in `server.rs` fails this test.
 #[test]
+#[serial_test::serial]
 fn instructions_string_names_every_registered_tool() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use rmcp::ServerHandler as _;
 
     let profile_testnet = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
@@ -1156,7 +1164,11 @@ fn stellar_claim_commit_annotations_correct() {
 /// contains no duplicates — belt-and-braces against a regression where the
 /// production fns accidentally share a name.
 #[test]
+#[serial_test::serial]
 fn wallet_server_new_succeeds_with_production_registry() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     // Explicitly set Noop so WalletServer::new succeeds without a policy file
     // on disk (PolicyEngineKind::default() is V1).
     let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")

@@ -58,7 +58,9 @@ impl Drop for EnvGuard {
 #[test]
 #[serial]
 fn init_platform_keyring_store_dispatches_to_headless_env_backend() {
+    let _store = stellar_agent_test_support::keyring_mock::DefaultStoreGuard::cleared();
     let dir = tempfile::tempdir().expect("tmp dir");
+    stellar_agent_test_support::sandbox::mark_sandbox(dir.path()).unwrap();
     let key = URL_SAFE_NO_PAD.encode([0x33u8; 32]);
     let _guard = EnvGuard::set(&[
         (
@@ -125,9 +127,11 @@ fn the_requested_backend_is_the_active_backend_and_only_the_platform_serves_main
 #[test]
 #[serial]
 fn a_registered_headless_store_stays_the_active_backend() {
+    let _store = stellar_agent_test_support::keyring_mock::DefaultStoreGuard::cleared();
     use stellar_agent_network::keyring::{KeyringBackend, active_keyring_backend};
 
     let dir = tempfile::tempdir().expect("tmp dir");
+    stellar_agent_test_support::sandbox::mark_sandbox(dir.path()).unwrap();
     let key = URL_SAFE_NO_PAD.encode([0x34u8; 32]);
     {
         let _guard = EnvGuard::set(&[
@@ -158,6 +162,7 @@ fn a_registered_headless_store_stays_the_active_backend() {
 #[test]
 #[serial]
 fn init_platform_keyring_store_refuses_unknown_backend_without_fallback() {
+    let _store = stellar_agent_test_support::keyring_mock::DefaultStoreGuard::cleared();
     let _guard = EnvGuard::set(&[(
         stellar_agent_headless_keyring::BACKEND_ENV_VAR,
         "not-a-real-backend",
@@ -165,7 +170,7 @@ fn init_platform_keyring_store_refuses_unknown_backend_without_fallback() {
 
     let err = init_platform_keyring_store().unwrap_err();
     assert_eq!(err.category(), ErrorCategory::Auth);
-    assert_eq!(err.code(), "auth.keyring_config_invalid");
+    assert_eq!(err.code(), "auth.keyring_platform_error");
     assert!(
         err.message()
             .contains(stellar_agent_headless_keyring::BACKEND_ENV_VAR),
@@ -178,6 +183,7 @@ fn init_platform_keyring_store_refuses_unknown_backend_without_fallback() {
 #[test]
 #[serial]
 fn init_platform_keyring_store_refuses_a_padded_key_as_a_configuration_fault() {
+    let _store = stellar_agent_test_support::keyring_mock::DefaultStoreGuard::cleared();
     let padded = base64::engine::general_purpose::STANDARD.encode([0x33u8; 32]);
     assert!(padded.ends_with('='));
     let _guard = EnvGuard::set(&[

@@ -1209,8 +1209,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn claim_leg_outside_the_asset_allowlist_is_a_criterion_denial() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::{Decision, DenyReason};
         let intent = fixture("claim_native_memo_none");
         assert_eq!(
@@ -1230,8 +1233,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn claim_leg_counts_toward_no_debit_cap() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut raw = wire(5);
         raw["payload"]["claim"]["amount_stroops"] = json!("1000000000");
         assert_eq!(

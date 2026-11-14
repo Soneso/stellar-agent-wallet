@@ -429,11 +429,16 @@ pub fn arb_native_payment_args() -> impl Strategy<Value = serde_json::Value> {
 /// The profile name is drawn from a small fixed set:
 /// `{"alice", "bob", "carol", "dave"}`.  Both testnet and mainnet profiles are
 /// generated with equal probability.
+/// # Panics
+/// Panics when the fixture sandbox cannot be created.
 pub fn arb_profile() -> impl Strategy<Value = (Profile, String)> {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let profile_names = prop_oneof![Just("alice"), Just("bob"), Just("carol"), Just("dave"),];
     let is_mainnet = prop::bool::ANY;
 
-    (profile_names, is_mainnet).prop_map(|(name, mainnet)| {
+    (profile_names, is_mainnet).prop_map(move |(name, mainnet)| {
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let profile_name = name.to_owned();
         if mainnet {
             (
@@ -612,8 +617,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn profile_strategy_outputs_expected_non_empty_names() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut runner = seeded_runner();
 
         for _ in 0..16 {

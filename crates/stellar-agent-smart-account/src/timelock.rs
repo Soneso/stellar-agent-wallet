@@ -3705,6 +3705,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn cancel_refuses_mainnet_before_signer_and_request() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let operation_id = TimelockOperationId::from_bytes([3u8; 32]);
         let mock = wiremock::MockServer::start().await;
@@ -3833,6 +3836,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn cancelling_a_never_scheduled_operation_states_the_check() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         use stellar_agent_test_support::rejected_value::{
             assert_no_marker, assert_no_marker_in_text,

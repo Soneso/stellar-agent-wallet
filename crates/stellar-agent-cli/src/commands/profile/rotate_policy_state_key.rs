@@ -373,6 +373,8 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn rotate_policy_state_key_nonexistent_profile_returns_exit_1() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let args = RotatePolicyStateKeyArgs {
             name: Some("__nonexistent_rotate_policy_state_key__".to_owned()),
             profile: None,
@@ -394,6 +396,9 @@ mod tests {
     #[test]
     #[serial]
     fn the_old_key_load_refuses_the_owner_key() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use base64::Engine as _;
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let name = "rotate-window-owner";
@@ -421,6 +426,9 @@ mod tests {
     #[test]
     #[serial]
     fn the_old_key_load_refuses_a_g_strkey_and_an_owner_coordinate() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let name = "rotate-window-strkey";
         let mut profile = stellar_agent_core::profile::schema::Profile::builder_testnet_named(
@@ -535,6 +543,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn rotation_with_a_loadable_key_checks_scope() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (dir, mut profile, store) = rotation_fixture();
         profile.chain_id = stellar_agent_core::profile::caip2::Caip2::Mainnet;
         assert_eq!(
@@ -552,6 +563,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn rotation_with_an_unloadable_key_and_file_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (dir, profile, store) = rotation_fixture();
         put_raw(&profile.policy_window_state_key_id, "invalid-key");
         assert_eq!(
@@ -569,6 +583,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn rotation_without_key_or_file_refuses_protected_history() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (dir, profile, store) = rotation_fixture();
         std::fs::remove_file(dir.path().join("policy/rotate-scope.window")).unwrap();
         keyring_core::Entry::new(
@@ -595,6 +612,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn rotation_passes_on_first_use_and_on_a_verified_file() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let empty = tempfile::tempdir().unwrap();
         let fresh = stellar_agent_core::profile::schema::Profile::builder_testnet_named(
@@ -635,6 +655,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn rotation_checks_the_tag_before_scope() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (dir, mut profile, store) = rotation_fixture();
         profile.chain_id = stellar_agent_core::profile::caip2::Caip2::Mainnet;
         let mut bytes = std::fs::read(dir.path().join("policy/rotate-scope.window")).unwrap();

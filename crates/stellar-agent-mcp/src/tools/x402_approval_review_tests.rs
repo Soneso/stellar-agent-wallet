@@ -127,18 +127,21 @@ async fn changed_consent_at_signing(subject_change: bool) {
 
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn final_guard_refuses_rotated_attestation_key() {
     changed_consent_at_signing(false).await;
 }
 
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn final_guard_refuses_changed_stored_subject() {
     changed_consent_at_signing(true).await;
 }
 
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn approval_clock_bounds_refuse_without_consumption() {
     use crate::tools::common::{
         ApprovalOutcome, DispatchOutcome, GatedApprovalKind, verify_attestation_subject_gate,

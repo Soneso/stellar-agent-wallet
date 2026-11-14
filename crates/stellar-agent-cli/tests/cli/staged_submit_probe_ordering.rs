@@ -209,6 +209,7 @@ async fn received_methods(server: &MockServer) -> Vec<String> {
 /// `(exit_code, stdout_envelope)`.
 fn run_cli(home: &Path, args: &[&str]) -> (i32, Value) {
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
+    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
     let output = Command::new(bin_path)
         .args(args)
         .env("STELLAR_AGENT_HOME", home)

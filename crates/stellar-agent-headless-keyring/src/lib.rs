@@ -239,42 +239,59 @@ pub fn init_headless_store(backend: &str) -> Result<(), HeadlessKeyringInitError
 /// profile-scoped, mirroring the platform keyring's own single-shared-store
 /// shape).
 ///
-/// Tests and the CI acceptance harness may set `STELLAR_AGENT_HOME` to
-/// redirect the directory to `$STELLAR_AGENT_HOME/headless-keyring`,
-/// mirroring the profile-loader's own override — gated behind `#[cfg(any(test,
-/// feature = "test-helpers"))]` so production release builds never honour it.
+/// Isolated builds require an absolute, marked `STELLAR_AGENT_HOME` directory.
+/// They join `headless-keyring` beneath it and never invoke the platform resolver.
+/// Production builds ignore this override.
 ///
 /// # Canonical-root replication, not reuse
 ///
-/// This crate cannot depend on `stellar-agent-core` (it is a low-level,
-/// minimal-dependency store meant for headless/service deployments; pulling
-/// in core's XDR/signing/tokio dependency closure here would be a layering
-/// violation with no functional benefit — see the "prefer separate crates"
-/// project convention). It therefore replicates
-/// `stellar_agent_core::profile::schema::canonical_data_root`'s derivation
-/// byte-for-byte instead of importing it: `directories::ProjectDirs::from("",
-/// "Soneso", "stellar-agent").data_local_dir()`. The
-/// `canonical_data_root_matches_stellar_agent_core` test below pins
-/// byte-equality between the two crates' derivations (as a dev-dependency
-/// only — this does not add `stellar-agent-core` to the crate's production
-/// dependency graph) so the two cannot silently drift.
+/// This store avoids a production dependency on core and its signing and runtime dependencies.
+/// Its production resolver duplicates core's provider call.
+/// A source test pins that call without resolving either real directory.
 fn headless_keyring_path() -> Result<PathBuf, HeadlessKeyringInitError> {
     #[cfg(any(test, feature = "test-helpers"))]
-    if let Some(home) = std::env::var_os("STELLAR_AGENT_HOME") {
-        return Ok(PathBuf::from(home)
-            .join("headless-keyring")
-            .join("store.keyring"));
-    }
+    let root = std::env::var_os("STELLAR_AGENT_HOME")
+        .map(PathBuf::from)
+        .filter(|path| marked_sandbox(path))
+        .ok_or(HeadlessKeyringInitError::StateDirUnavailable)?;
+    #[cfg(not(any(test, feature = "test-helpers")))]
+    let root = canonical_data_root()?;
+    Ok(root.join("headless-keyring").join("store.keyring"))
+}
 
-    Ok(canonical_data_root()?
-        .join("headless-keyring")
-        .join("store.keyring"))
+#[cfg(any(test, feature = "test-helpers"))]
+fn marked_sandbox(path: &std::path::Path) -> bool {
+    let regular = |path: &std::path::Path, directory: bool| {
+        let Ok(meta) = std::fs::symlink_metadata(path) else {
+            return false;
+        };
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if meta.file_attributes() & 0x400 != 0 {
+                return false;
+            }
+        }
+        !meta.file_type().is_symlink()
+            && if directory {
+                meta.is_dir()
+            } else {
+                meta.is_file()
+            }
+    };
+    path.is_absolute()
+        && !path
+            .components()
+            .any(|part| part == std::path::Component::ParentDir)
+        && regular(path, true)
+        && regular(&path.join(".stellar-agent-test-sandbox"), false)
 }
 
 /// Replicates
 /// `stellar_agent_core::profile::schema::canonical_data_root`'s derivation.
 /// See `headless_keyring_path`'s rustdoc for why this crate cannot import
 /// that function directly.
+#[cfg(not(any(test, feature = "test-helpers")))]
 fn canonical_data_root() -> Result<PathBuf, HeadlessKeyringInitError> {
     directories::ProjectDirs::from("", "Soneso", "stellar-agent")
         .map(|dirs| dirs.data_local_dir().to_path_buf())
@@ -297,6 +314,50 @@ mod tests {
     use serial_test::serial;
 
     use super::*;
+
+    #[test]
+    #[serial]
+    fn isolated_headless_path_requires_a_marked_sandbox() {
+        use stellar_agent_test_support::{env_guard::ScopedEnvVar, sandbox::mark_sandbox};
+        let temporary = tempfile::tempdir().unwrap();
+        let _unset = EnvGuard::unset(&["STELLAR_AGENT_HOME"]);
+        assert!(headless_keyring_path().is_err());
+        for value in [
+            std::ffi::OsStr::new("relative"),
+            temporary.path().as_os_str(),
+        ] {
+            let _env = ScopedEnvVar::new("STELLAR_AGENT_HOME", Some(value));
+            assert!(
+                headless_keyring_path().is_err(),
+                "unmarked headless root must refuse"
+            );
+        }
+        mark_sandbox(temporary.path()).unwrap();
+        let _env = ScopedEnvVar::new("STELLAR_AGENT_HOME", Some(temporary.path().as_os_str()));
+        assert_eq!(
+            headless_keyring_path().unwrap(),
+            temporary.path().join("headless-keyring/store.keyring")
+        );
+        std::fs::create_dir(temporary.path().join("child")).unwrap();
+        let traversal = temporary.path().join("child/..");
+        let _env = ScopedEnvVar::new("STELLAR_AGENT_HOME", Some(traversal.as_os_str()));
+        assert!(headless_keyring_path().is_err());
+        #[cfg(unix)]
+        {
+            let links = tempfile::tempdir().unwrap();
+            let link = links.path().join("root");
+            std::os::unix::fs::symlink(temporary.path(), &link).unwrap();
+            let _env = ScopedEnvVar::new("STELLAR_AGENT_HOME", Some(link.as_os_str()));
+            assert!(headless_keyring_path().is_err());
+            std::os::unix::fs::symlink(
+                temporary.path().join(".stellar-agent-test-sandbox"),
+                links.path().join(".stellar-agent-test-sandbox"),
+            )
+            .unwrap();
+            let _env = ScopedEnvVar::new("STELLAR_AGENT_HOME", Some(links.path().as_os_str()));
+            assert!(headless_keyring_path().is_err());
+        }
+    }
 
     #[test]
     fn unknown_backend_marker_is_not_echoed() {
@@ -400,6 +461,7 @@ mod tests {
     #[serial]
     fn init_headless_store_env_mode_round_trips() {
         let dir = tempfile::tempdir().expect("tmp dir");
+        stellar_agent_test_support::sandbox::mark_sandbox(dir.path()).unwrap();
         let key = URL_SAFE_NO_PAD.encode([0x55u8; 32]);
         let _guard = EnvGuard::set(&[
             (ENV_KEY_VAR, key.as_str()),
@@ -432,6 +494,7 @@ mod tests {
     #[serial]
     fn headless_keyring_path_uses_stellar_agent_home_override() {
         let dir = tempfile::tempdir().expect("tmp dir");
+        stellar_agent_test_support::sandbox::mark_sandbox(dir.path()).unwrap();
         let _guard = EnvGuard::set(&[(
             "STELLAR_AGENT_HOME",
             dir.path().to_str().expect("utf8 path"),
@@ -450,14 +513,12 @@ mod tests {
     #[test]
     #[serial]
     fn canonical_data_root_matches_stellar_agent_core() {
-        let _env = EnvGuard::unset(&["STELLAR_AGENT_HOME"]);
-        let local = canonical_data_root().expect("local derivation must resolve");
-        let core = stellar_agent_core::profile::schema::canonical_data_root()
-            .expect("stellar-agent-core derivation must resolve");
-        assert_eq!(
-            local, core,
-            "headless-keyring's replicated canonical root must byte-match \
-             stellar-agent-core::profile::schema::canonical_data_root"
-        );
+        let expression = concat!("ProjectDirs::from", "(\"\", \"Soneso\", \"stellar-agent\")");
+        for source in [
+            include_str!("lib.rs"),
+            include_str!("../../stellar-agent-core/src/profile/schema.rs"),
+        ] {
+            assert_eq!(source.matches(expression).count(), 1);
+        }
     }
 }

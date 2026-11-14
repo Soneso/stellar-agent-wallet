@@ -364,8 +364,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn bundle_level_criteria_short_circuit_on_single_tx_context() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = ToolDescriptor::from_registration(&McpToolRegistration {
             name: "stellar_pay",
             destructive_hint: true,
@@ -441,8 +444,11 @@ mod tests {
     /// criterion (which does not override `accumulate_overlay`) must leave the
     /// overlay unchanged after being called.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn default_accumulate_overlay_is_noop() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::bundle::{BundleStateOverlay, InnerOpDescriptor};
 
         #[derive(Debug)]
@@ -572,8 +578,11 @@ mod tests {
         assert_send_sync::<PerTxCapCriterion>();
     }
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn criterion_size_defaults_to_none() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = ToolDescriptor::from_registration(&McpToolRegistration {
             name: "stellar_pay",
             destructive_hint: true,

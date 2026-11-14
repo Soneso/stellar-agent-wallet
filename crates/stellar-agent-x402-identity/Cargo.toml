@@ -51,7 +51,7 @@ ed25519-dalek  = { workspace = true }
 rand_core      = { workspace = true }
 stellar-xdr    = { workspace = true }
 stellar-strkey = { workspace = true }
-stellar-agent-network = { path = "../stellar-agent-network" }
+stellar-agent-network = { path = "../stellar-agent-network", features = ["test-helpers"] }
 sha2   = { workspace = true }
 base64 = { workspace = true }
 reqwest = { workspace = true }

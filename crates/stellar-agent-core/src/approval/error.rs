@@ -424,7 +424,11 @@ mod tests {
 
     #[test]
     fn from_io_display_omits_embedded_path() {
-        let path = "/home/alice/.local/share/stellar-agent/approvals/default.toml";
+        let path = format!(
+            "/home/alice/{}/approvals/default.toml",
+            stellar_agent_test_support::sandbox::LINUX_WALLET_SUFFIX.trim()
+        );
+        let path = path.as_str();
         let source = std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!("open(\"{path}\"): permission denied"),

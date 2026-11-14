@@ -31,6 +31,7 @@ stellar-agent-network = { workspace = true }
 stellar-agent-core = { workspace = true }
 
 [dev-dependencies]
+stellar-agent-network = { path = "../stellar-agent-network", features = ["test-helpers"] }
 tokio = { workspace = true }
 serial_test = { workspace = true }
 wiremock = { workspace = true }

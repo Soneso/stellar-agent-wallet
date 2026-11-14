@@ -296,7 +296,11 @@ mod tests {
     /// under the documented `{ ok: true, data: {...}, request_id }` envelope.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn valid_pay_uri_parses_under_normalised_envelope() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = make_server();
         let args = Sep7ParseUriArgs {
             chain_id: "stellar:testnet".to_owned(),
@@ -333,7 +337,11 @@ mod tests {
     /// (`sep7.malformed_uri`), not a JSON-RPC protocol error.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn malformed_uri_is_business_error() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = make_server();
         let args = Sep7ParseUriArgs {
             chain_id: "stellar:testnet".to_owned(),
@@ -350,7 +358,11 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn appended_parameter_after_signature_is_business_error() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = make_server();
         let args = Sep7ParseUriArgs {
             chain_id: "stellar:testnet".to_owned(),
@@ -378,7 +390,11 @@ mod tests {
     /// not a JSON-RPC protocol error.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn unknown_operation_is_business_error() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = make_server();
         let args = Sep7ParseUriArgs {
             chain_id: "stellar:testnet".to_owned(),
@@ -398,7 +414,11 @@ mod tests {
     /// result repeats no text of the URI.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn sep7_parse_uri_marker_is_not_echoed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let capture = stellar_agent_test_support::log_capture::CaptureWriter::new();
         let subscriber = tracing_subscriber::fmt()
             .without_time()

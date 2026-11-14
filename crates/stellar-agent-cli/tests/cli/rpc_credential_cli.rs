@@ -157,6 +157,7 @@ struct Run {
 }
 
 fn run_cli(home: &Path, args: &[&str], stdin: Option<&[u8]>, env: &[(&str, &str)]) -> Run {
+    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
     let mut command = Command::new(env!("CARGO_BIN_EXE_stellar-agent"));
     command
         .args(args)

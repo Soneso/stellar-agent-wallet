@@ -245,6 +245,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_key_write_row_advances_the_tip_anchor() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::TipAnchorStore as _;
         use stellar_agent_network::keyring::KeyringTipAnchorStore;
 
@@ -300,6 +303,9 @@ mod tests {
     #[test]
     #[serial]
     fn emit_keyring_key_written_writes_a_key_written_row() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
 
         let dir = tempfile::tempdir().expect("tmp dir");
@@ -348,6 +354,9 @@ mod tests {
     #[test]
     #[serial]
     fn load_audit_hmac_key_refuses_owner_key_forms() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use base64::Engine as _;
         keyring_mock::install().expect("mock keyring");
         let name = "audit-emit-owner";

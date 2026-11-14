@@ -85,6 +85,7 @@ impl Run {
 }
 
 fn run_cli(home: &Path, args: &[&str]) -> Run {
+    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
     let out = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
         .args(args)
         .env("STELLAR_AGENT_HOME", home)
@@ -302,6 +303,8 @@ fn protected_overlay_has_its_own_code_on_both_surfaces() {
         vec!["profile", "show", PROFILE],
         vec!["counterparty", "list", "--profile", PROFILE],
     ] {
+        stellar_agent_test_support::sandbox::mark_sandbox(home.path())
+            .expect("mark fixture directory");
         let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
             .args(args)
             .env("STELLAR_AGENT_HOME", home.path())

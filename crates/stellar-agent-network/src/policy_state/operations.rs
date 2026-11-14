@@ -6247,6 +6247,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn recovery_emitted_kinds_survive_eviction() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let handle = unknown_outcome(&mut fx);
         fx.sink.entries.clear();
@@ -6289,6 +6292,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn evidence_key_is_kind_and_observed_ledger() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let handle = unknown_outcome(&mut fx);
         let row = ledger_row(EvidenceEndpoint::Primary, 10);
@@ -6353,6 +6359,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn recovery_evidence_eviction_tie_breaks_on_sequence() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let handle = unknown_outcome(&mut fx);
         let release = SequenceReleaseInput {
@@ -6446,6 +6455,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn recovery_snapshot_selects_oldest_eligible_and_targets_by_hash() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let mut ids = Vec::new();
         for n in 1..=5 {
@@ -6527,6 +6539,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn open_returns_new_replay_resumable_and_conflict() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let a = fx.open_new(&request("order-1", canonical(1)));
         assert_eq!(a.state(), OperationState::Prepared);
@@ -6586,6 +6601,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn envelope_record_retry_with_the_same_intent_resumes_with_the_stored_envelope() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let first = fx.open_new(&request("order-1", envelope(5, 6, 0)));
         let mut retry = request("order-1", envelope(9, 6, 0));
@@ -6603,6 +6621,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn envelope_record_expiry_is_capped_at_max_time() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let max_time = T0 / 1000 + 100;
         let mut open = request("order-1", envelope(5, 6, max_time));
@@ -6621,6 +6642,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn begin_attempt_refuses_another_envelope_for_an_envelope_record() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let handle = fx.open_new(&request("order-1", envelope(5, 6, 0)));
         let before = fx.generation();
@@ -6673,6 +6697,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn waiting_operations_cap_refuses_the_seventeenth() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let mut handles = Vec::new();
         for n in 0..16_u8 {
@@ -6704,6 +6731,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn begin_attempt_refuses_an_open_attempt_and_a_ninth() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let handle = fx.open_new(&request("order-1", canonical(1)));
         let first = fx.mint_request(tx(1), fx.policy(), vec![]);
@@ -6730,6 +6760,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn longest_transition_path_fits_commit_ids() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let handle = fx.open_new(&request("order-1", canonical(1)));
         fx.recorder()
@@ -6801,6 +6834,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn every_edge_outside_the_table_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use OperationState as S;
         let table = [
             (None, S::Prepared),
@@ -6856,6 +6892,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn expose_after_not_sent_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let handle = fx.open_new(&request("order-1", canonical(1)));
         let mint = fx.mint_request(tx(1), fx.policy(), vec![]);
@@ -6886,6 +6925,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn begin_attempt_refuses_oversized_envelope_before_mint() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let handle = fx.open_new(&request("order-1", canonical(1)));
         let before = fx.generation();
@@ -7125,6 +7167,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn largest_record_fits_m() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let canonical_base = serialized_len(&IntentSlot::Canonical {
             intent_digest: [0xff; 32],
             intent: serde_json::json!({ "memo": "" }),
@@ -7197,6 +7242,9 @@ pub(crate) mod tests {
         reason = "The fixture checks framing, both admission boundaries, and protected retention."
     )]
     fn maximum_capacity_retention_184365_1179648() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use super::super::store::{WireBucket, WireRecord};
         let mut record = maximal_record(x402_slot_of_len(INTENT_SLOT_MAX));
         let before = serialized_len(&record);
@@ -7406,6 +7454,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn free_text_bounds_measure_serialized_bytes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for max in [HISTORY_EVIDENCE_MAX, ENDPOINT_TEXT_MAX, DIAGNOSTIC_MAX] {
             let at = escaped(max);
             assert_eq!(serialized_text_len(&at), max);
@@ -7488,6 +7539,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn sweep_adopts_waiting_operation_before_restart() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         #[derive(Debug, Clone, Copy)]
         enum Case {
             ApprovalClassic,
@@ -7595,6 +7649,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn sweep_marks_open_unused_with_an_always_row_and_keeps_claimed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let fx = Fx::new();
         let open = fx.mint_request(tx(1), fx.approval(), vec![hold(70)]);
         let unused = fx.store.mint_authorization(&fx.profile, &open).unwrap();
@@ -7633,6 +7690,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn remint_retires_unused_reservation_atomically() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let handle = fx.open_new(&request("order-1", canonical(1)));
         let authority = fx.approval();
@@ -7710,6 +7770,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn retire_after_expose_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let handle = fx.open_new(&request("order-1", canonical(1)));
         let mint = fx.mint_request(tx(1), fx.policy(), vec![]);
@@ -7780,6 +7843,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn unexposed_sending_after_authorization_expiry_records_not_sent() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // An authorization that expired unused.
         let mut fx = Fx::new();
         let handle = fx.open_new(&request("order-1", canonical(1)));
@@ -7855,6 +7921,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn sequence_releases_reads_by_envelope_hash() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let signed = |exposure: ExposureIdentity| match exposure {
             ExposureIdentity::Classic {
                 envelope_sha256, ..
@@ -7915,6 +7984,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn an_exposed_sending_attempt_never_recovers_as_not_sent() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let handle = fx.open_new(&request("order-1", canonical(1)));
         let auth_id = exposed_attempt(&mut fx, &handle, 1, &classic_exposure(1), vec![]);
@@ -7936,6 +8008,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn claimed_unexposed_attempt_stays_sending() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let handle = fx.open_new(&request("order-1", canonical(1)));
         let mint = fx.mint_request(tx(1), fx.policy(), vec![hold(40)]);
@@ -7955,6 +8030,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn unreleased_reservation_blocks_compaction() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let protected = fx.open_new(&request("order-1", x402([1; 32])));
         let mint = fx.mint_request(soroban(1), fx.approval(), vec![]);
@@ -8048,6 +8126,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn late_release_ordinary_pruning_raises_floor() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let fx = Fx::new();
         let ledger_bound = fx
             .store
@@ -8111,6 +8192,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn mainnet_reset_clears_the_floors() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let ended = fx.open_new(&request("order-1", canonical(1)));
         fx.recorder()
@@ -8309,6 +8393,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn history_incomplete_survives_restart_and_eviction() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let handle = unknown_outcome(&mut fx);
         fx.recorder()
@@ -8368,6 +8455,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn evidence_cap_evicts_lowest_ledger_and_keeps_the_watermark() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let handle = unknown_outcome(&mut fx);
         fx.recorder()
@@ -8418,6 +8508,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn record_evidence_appends_one_audit_row_with_a_contiguous_range() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let handle = unknown_outcome(&mut fx);
         fx.sink.entries.clear();
@@ -8525,6 +8618,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn audit_append_failure_commits_nothing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         fx.sink.fail = true;
         let error = fx.open(&request("order-1", canonical(1))).unwrap_err();
@@ -8559,6 +8655,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn record_observation_writes_no_audit_row() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let handle = unknown_outcome(&mut fx);
         fx.sink.entries.clear();
@@ -8724,6 +8823,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn list_since_returns_open_and_recently_closed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let open = fx.open_new(&request("open", canonical(1)));
         let recent = fx.open_new(&request("recent", canonical(2)));
@@ -8846,6 +8948,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn expose_refuses_an_unclaimed_authorization() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let handle = fx.open_new(&request("order-1", canonical(1)));
         let mint = fx.mint_request(tx(1), fx.policy(), vec![]);
@@ -8880,6 +8985,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn an_exposed_authorization_expires_without_a_release_row() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for unknown in [false, true] {
             let mut fx = Fx::new();
             let handle = fx.open_new(&request("order-1", canonical(1)));
@@ -8937,6 +9045,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn a_reset_writes_no_row_for_an_exposed_authorization() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let handle = fx.open_new(&request("order-1", canonical(1)));
         let auth_id = exposed_attempt(&mut fx, &handle, 1, &classic_exposure(1), vec![]);
@@ -8967,6 +9078,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn remint_refuses_after_a_claimed_expired_carrier() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let handle = fx.open_new(&request("order-1", canonical(1)));
         let authority = fx.approval();
@@ -8995,6 +9109,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn sent_outcome_unknown_needs_a_committed_exposure() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let handle = fx.open_new(&request("order-1", canonical(1)));
         let mint = fx.mint_request(tx(1), fx.policy(), vec![]);
@@ -9034,6 +9151,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn payload_released_needs_a_committed_exposure() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let handle = fx.open_new(&request("order-1", canonical(1)));
         let mint = fx.mint_request(tx(1), fx.policy(), vec![]);
@@ -9071,6 +9191,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn an_invalidated_linked_authorization_is_released_when_its_operation_ends() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let handle = fx.open_new(&request("order-1", canonical(1)));
         let linked = linked_mint(&fx, &handle, tx(1), fx.approval(), 1);
@@ -9124,6 +9247,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn begin_attempt_refuses_after_the_waiting_expiry() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let mut open = request("order-1", canonical(1));
         open.rule_ttl_ms = Some(300_000);
@@ -9178,6 +9304,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn clear_writes_the_unknown_row_in_its_commit() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let bounded = ExposureIdentity::Classic {
             envelope_sha256: [0x5b; 32],
             tx_hash: [0x81; 32],
@@ -9258,6 +9387,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn no_unknown_row_without_the_clear() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let handle = unknown_outcome(&mut fx);
         let auth_id = fx.record(handle.id()).attempts[0].authorization_id;
@@ -9290,6 +9422,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn transition_rows_match_commit_ids() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let waiting = fx.open_new(&request("order-1", canonical(1)));
         let mut linked = linked_mint(&fx, &waiting, tx(1), fx.approval(), 1);
@@ -9349,6 +9484,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn a_claimed_expired_link_outlives_the_retention() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let handle = fx.open_new(&request("order-1", canonical(1)));
         let mint = fx.mint_request(tx(1), fx.policy(), vec![]);
@@ -9378,6 +9516,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn a_reset_keeps_a_link_whose_authority_ended() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let handle = fx.open_new(&request("order-1", canonical(1)));
         let auth_id = exposed_attempt(&mut fx, &handle, 1, &classic_exposure(1), vec![]);
@@ -9413,6 +9554,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn an_exposed_unknown_outcome_expires_without_a_row() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let handle = unknown_outcome(&mut fx);
         let auth_id = fx.record(handle.id()).attempts[0].authorization_id;
@@ -9428,6 +9572,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn expire_due_keeps_an_exposed_open_link_of_an_ended_record() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let handle = unknown_outcome(&mut fx);
         let auth_id = fx.record(handle.id()).attempts[0].authorization_id;
@@ -9449,6 +9596,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn an_exposed_sending_attempt_stays_sending_after_its_authorization_ended() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let handle = fx.open_new(&request("order-1", canonical(1)));
         let auth_id = exposed_attempt(&mut fx, &handle, 1, &classic_exposure(1), vec![]);
@@ -9467,6 +9617,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn a_mint_linking_an_ended_operation_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let handle = fx.open_new(&request("order-1", canonical(1)));
         step(&mut fx, &handle, None, OperationState::Expired);
@@ -9489,6 +9642,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn a_mint_link_names_the_next_attempt() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let fresh = fx.open_new(&request("order-1", canonical(1)));
         let before = fx.generation();
@@ -9528,6 +9684,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn reset_counts_a_record_its_expiry_edge_ends() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let mut open = request("order-1", canonical(1));
         open.rule_ttl_ms = Some(300_000);
@@ -9791,6 +9950,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn recovery_release_counting_boundaries() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let (_handle, attempt) = decided_attempt(&mut fx, 1);
         let status = OperationStatus::new(&fx.store, &fx.profile);
@@ -9871,6 +10033,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn recovery_transition_before_commit_point_keeps_old_state() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use super::super::store::{COMMIT_FAULT_AFTER_PREPARED, arm_accounting_fault};
         let mut fx = Fx::new();
         let (handle, attempt) = decided_attempt(&mut fx, 1);
@@ -9926,6 +10091,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn recovery_transition_after_commit_point_reopens_new_state() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use super::super::store::{COMMIT_FAULT_AFTER_COUNTER, arm_accounting_fault};
         let mut fx = Fx::new();
         let (handle, attempt) = decided_attempt(&mut fx, 1);
@@ -9963,6 +10131,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn recovery_non_inclusion_keeps_a_claimed_authorizations_holds() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let (handle, attempt) = decided_attempt(&mut fx, 1);
         let auth_id = fx.record(handle.id()).attempts[0].authorization_id;
@@ -10003,6 +10174,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn recovery_checked_decision_refuses_stale_substituted_or_direct_proofs() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let (handle, attempt) = decided_attempt(&mut fx, 1);
         let success = DecidedTransition::Succeeded(agreed(1, "SUCCESS"));
@@ -10137,6 +10311,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn recovery_persisted_outcome_keeps_bounded_result_and_original_envelope_digest() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for (result, kept) in [
             ("A".repeat(RESULT_XDR_MAX), true),
             ("A".repeat(RESULT_XDR_MAX + 1), false),
@@ -10246,6 +10423,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn recovery_committed_decisions_survive_restart_and_gate_retry() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let (first, _) = decided_attempt(&mut fx, 1);
         let (second, two) = decided_attempt(&mut fx, 2);
@@ -10357,6 +10537,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn recovery_committed_decisions_gate_the_successor_on_projection() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let (handle, commit) = checked_not_included(&mut fx, 4);
         let mint = fx.mint_request(tx(40), fx.policy(), vec![]);
@@ -10377,6 +10560,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn recovery_transition_replay_is_idempotent() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let (handle, attempt) = decided_attempt(&mut fx, 1);
         let first = decide(
@@ -10448,6 +10634,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn recovery_transition_and_evidence_audit_rows_name_the_committed_proofs() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use super::super::recovery::{AccountAnswer, OutcomeAnswer};
         let mut fx = Fx::new();
         let (handle, attempt) = decided_attempt(&mut fx, 1);
@@ -10563,6 +10752,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn recovery_evidence_ranges_preserve_every_class() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let (handle, attempt) = decided_attempt(&mut fx, 1);
         for ledger in 0..12 {
@@ -11211,6 +11403,8 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn recovery_retry_permission_requires_evidenced_non_inclusion_and_live_authority() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut fx = Fx::new();
         let (premature, _) = decided_attempt(&mut fx, 1);
         let mint = fx.mint_request(tx(11), fx.policy(), vec![]);
@@ -11291,6 +11485,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn recovery_linked_successor_requires_the_predecessor_policy() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let repin = |fx: &Fx, sequence: i64, digest: [u8; 32]| {
             let lock = WindowStoreLock::acquire_for(
                 fx.store.path(),
@@ -11428,6 +11625,8 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn successor_without_attempt_or_proof_refuses_retry() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         type Strip = fn(&mut WireOperation);
         let strips: [(&str, Strip); 2] = [
             ("no current attempt", |record| record.attempts.clear()),
@@ -11525,6 +11724,8 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn linked_successor_refuses_a_changed_policy_pin() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let pin_refused = |error: WindowStoreError| {
             let WindowStoreError::AuthorizationRefused { precondition } = error else {
                 panic!("expected an authorization refusal, got {error:?}");
@@ -11584,6 +11785,8 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn approval_successor_admits_under_an_unchanged_pin() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut fx = Fx::new();
         let handle = projected_not_included(&mut fx, 1);
         let mint = fx.mint_request(tx(21), fx.approval(), vec![]);
@@ -11606,6 +11809,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn recovery_retry_audit_row_from_begin_attempt() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let (handle, commit) = checked_not_included(&mut fx, 1);
         fx.recorder()
@@ -11706,6 +11912,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn recovery_obligation_release_crosses_the_commit_point_as_one_unit() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use super::super::store::{
             COMMIT_FAULT_AFTER_COUNTER, COMMIT_FAULT_AFTER_PREPARED, arm_accounting_fault,
         };
@@ -11790,6 +11999,9 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn recovery_obligation_enumeration_and_release_rows_are_verified_and_atomic() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let live = x402_exposed(&mut fx, 1, OperationState::SentOutcomeUnknown);
         let released = x402_exposed(&mut fx, 2, OperationState::PayloadReleased);
@@ -12056,6 +12268,9 @@ pub(crate) mod tests {
         #[test]
         #[serial]
         fn a_cancelled_clear_keeps_the_total_debit() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let mut fx = Fx::new();
             let handle = started(&mut fx, 1, 6, true);
             fx.recorder()
@@ -12081,6 +12296,9 @@ pub(crate) mod tests {
         #[test]
         #[serial]
         fn public_non_inclusion_keeps_the_total_debit() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let mut fx = Fx::new();
             let handle = started(&mut fx, 1, 6, true);
             fx.recorder()
@@ -12109,6 +12327,9 @@ pub(crate) mod tests {
         #[test]
         #[serial]
         fn release_unused_releases_a_total_hold() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let mut fx = Fx::new();
             let handle = fx.open_new(&request("order-1", canonical(1)));
             let authority = fx.approval();
@@ -12130,6 +12351,9 @@ pub(crate) mod tests {
         #[test]
         #[serial]
         fn release_linked_unused_releases_a_total_hold() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let mut fx = Fx::new();
             let handle = fx.open_new(&request("order-1", canonical(1)));
             let mut linked = fx.mint_request(tx(1), fx.approval(), vec![total(6)]);
@@ -12163,6 +12387,9 @@ pub(crate) mod tests {
         #[test]
         #[serial]
         fn public_unsent_evidence_keeps_the_total() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             for consumed in [false, true] {
                 let mut fx = Fx::new();
                 let handle = started(&mut fx, 1, 6, consumed);
@@ -12303,6 +12530,9 @@ pub(crate) mod tests {
         #[test]
         #[serial]
         fn a_checked_decision_releases_the_total_debit() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             for transition in [
                 failed(),
                 DecidedTransition::NotIncluded(not_included_proof()),
@@ -12348,6 +12578,9 @@ pub(crate) mod tests {
         #[test]
         #[serial]
         fn a_checked_decision_releases_every_shape_of_the_attempt() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             for shape in ["held", "consumed", "expired"] {
                 for transition in [
                     failed(),
@@ -12386,6 +12619,9 @@ pub(crate) mod tests {
         #[test]
         #[serial]
         fn only_a_fresh_checked_failure_or_non_inclusion_releases() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let mut fx = Fx::new();
             decided_total_attempt(&mut fx, 1, "consumed");
             let attempt = snapshot(&fx, 1);
@@ -12432,6 +12668,9 @@ pub(crate) mod tests {
         #[test]
         #[serial]
         fn the_release_follows_the_commit_counter() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             for seam in [
                 super::super::super::store::COMMIT_FAULT_AFTER_PREPARED,
                 super::super::super::store::COMMIT_FAULT_AFTER_COUNTER,
@@ -12463,6 +12702,9 @@ pub(crate) mod tests {
         #[test]
         #[serial]
         fn recovery_needs_no_pin() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let mut fx = Fx::new();
             let handle = started(&mut fx, 1, 6, false);
             let unused = fx.mint_request(tx(2), fx.approval(), vec![total(2)]);
@@ -12491,6 +12733,9 @@ pub(crate) mod tests {
         #[test]
         #[serial]
         fn retirement_refuses_a_total_operation_mint() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let mut fx = Fx::new();
             let handle = fx.open_new(&request("order-1", canonical(1)));
             let mut wire = fx.wire();
@@ -12556,6 +12801,9 @@ pub(crate) mod tests {
         #[test]
         #[serial]
         fn a_rolled_back_clock_cannot_revive_a_reused_hold() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let mut fx = Fx::new();
             let (request, minted) = live_linked_hold(&mut fx);
             fx.clock.set(minted.expires_at_ms);
@@ -12587,6 +12835,9 @@ pub(crate) mod tests {
         #[test]
         #[serial]
         fn a_reservation_never_reuses_an_unswept_live_hold() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             for seam in [
                 super::super::super::store::COMMIT_FAULT_AFTER_PREPARED,
                 super::super::super::store::COMMIT_FAULT_AFTER_COUNTER,
@@ -12633,6 +12884,9 @@ pub(crate) mod tests {
         #[test]
         #[serial]
         fn hydration_and_admission_agree_beside_live_and_exposed_holds() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let mut fx = Fx::new();
             started(&mut fx, 1, 2, false);
             let exposed = started(&mut fx, 2, 3, false);
@@ -12707,6 +12961,9 @@ pub(crate) mod tests {
         #[test]
         #[serial]
         fn a_release_after_a_repin_cannot_credit_the_new_digest() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             const D8: [u8; 32] = [8; 32];
             let mut fx = Fx::new();
             decided_total_attempt(&mut fx, 1, "consumed");
@@ -12736,6 +12993,9 @@ pub(crate) mod tests {
         #[test]
         #[serial]
         fn a_replay_after_a_reset_cannot_credit_the_new_allocation() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let mut fx = Fx::new();
             let (handle, attempt, _) = decided_total_attempt(&mut fx, 1, "consumed");
             let reset = |fx: &Fx, id: &str| {
@@ -12786,6 +13046,9 @@ pub(crate) mod tests {
         #[test]
         #[serial]
         fn an_open_projection_survives_two_collections() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let mut fx = Fx::new();
             let (handle, attempt, _) = decided_total_attempt(&mut fx, 1, "consumed");
             let commit = fx
@@ -12814,6 +13077,9 @@ pub(crate) mod tests {
         #[test]
         #[serial]
         fn final_released_totals_age_out_before_capacity_is_checked() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let mut fx = Fx::new();
             projected_failure(&mut fx);
             fx.rewrite(|wire| {
@@ -12855,6 +13121,9 @@ pub(crate) mod tests {
         #[test]
         #[serial]
         fn a_counted_total_of_the_same_age_survives_the_pruning() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let mut fx = Fx::new();
             projected_failure(&mut fx);
             push_total_row(
@@ -12887,6 +13156,9 @@ pub(crate) mod tests {
         #[test]
         #[serial]
         fn a_rollback_before_the_reuse_keeps_the_hold() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let mut fx = Fx::new();
             let (request, minted) = live_linked_hold(&mut fx);
             fx.clock.set(minted.expires_at_ms + 5);
@@ -12905,6 +13177,9 @@ pub(crate) mod tests {
         #[test]
         #[serial]
         fn a_rollback_between_two_reuses_keeps_the_expiry() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let fx = Fx::new();
             let request = fx.mint_request(tx(1), fx.approval(), vec![total(6)]);
             let minted = fx.store.mint_authorization(&fx.profile, &request).unwrap();
@@ -12929,6 +13204,9 @@ pub(crate) mod tests {
         #[test]
         #[serial]
         fn a_claim_under_a_rolled_back_clock_stays_counted() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let mut fx = Fx::new();
             let (request, minted) = live_linked_hold(&mut fx);
             fx.clock.set(minted.expires_at_ms);
@@ -12949,6 +13227,9 @@ pub(crate) mod tests {
         #[test]
         #[serial]
         fn an_operation_step_commits_the_expiry_before_reuse() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let mut fx = Fx::new();
             let (request, minted) = live_linked_hold(&mut fx);
             fx.clock.set(minted.expires_at_ms);
@@ -12970,6 +13251,9 @@ pub(crate) mod tests {
         #[test]
         #[serial]
         fn a_reset_between_expiry_and_rollback_keeps_the_total() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let mut fx = Fx::new();
             let (_, minted) = live_linked_hold(&mut fx);
             fx.clock.set(minted.expires_at_ms);
@@ -13021,6 +13305,9 @@ pub(crate) mod tests {
         #[test]
         #[serial]
         fn an_operation_mint_checks_the_shape_before_its_prechecks() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             for defect in ["malformed pin", "future timestamp"] {
                 let mut fx = Fx::new();
                 let handle = fx.open_new(&request("order-1", canonical(1)));
@@ -13076,6 +13363,9 @@ pub(crate) mod tests {
         #[test]
         #[serial]
         fn an_operation_mint_refuses_a_total_limit_on_a_windowed_key() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             shape_refusal(
                 WindowEntry::new(
                     StateKey::new("ops", 1, "native", 86_400),
@@ -13093,6 +13383,9 @@ pub(crate) mod tests {
         #[test]
         #[serial]
         fn an_operation_mint_refuses_an_amount_limit_on_a_total_key() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             shape_refusal(
                 WindowEntry::new(
                     total_key(),

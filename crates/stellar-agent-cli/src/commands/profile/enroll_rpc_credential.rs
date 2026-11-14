@@ -603,6 +603,9 @@ mod tests {
     #[test]
     #[serial]
     fn enroll_rpc_credential_stores_the_value_and_patches_the_record() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = tempfile::tempdir().unwrap();
         save_profile(dir.path(), "https://rpc.example/v1", |_| {});
@@ -655,6 +658,9 @@ mod tests {
     #[test]
     #[serial]
     fn enroll_rpc_credential_patches_before_writing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let entry = default_entry();
         keyring_mock::install_with_write_error(
             &entry.service,
@@ -691,6 +697,9 @@ mod tests {
     #[test]
     #[serial]
     fn stdin_input_rules_apply_before_decoding() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let exact = "k".repeat(1024);
         let exact_lf = format!("{exact}\n");
         let exact_crlf = format!("{exact}\r\n");
@@ -740,6 +749,9 @@ mod tests {
     #[test]
     #[serial]
     fn enroll_rpc_credential_requires_a_terminal_without_stdin() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = tempfile::tempdir().unwrap();
         save_profile(dir.path(), "https://rpc.example", |_| {});
@@ -780,6 +792,9 @@ mod tests {
     #[test]
     #[serial]
     fn enroll_rpc_credential_refuses_without_record() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = tempfile::tempdir().unwrap();
         save_profile(dir.path(), "https://rpc.example", |profile| {
@@ -798,6 +813,9 @@ mod tests {
     #[test]
     #[serial]
     fn enroll_rpc_credential_requires_or_matches_placement() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = tempfile::tempdir().unwrap();
         save_profile(dir.path(), "https://rpc.example", |profile| {
@@ -863,6 +881,9 @@ mod tests {
     #[test]
     #[serial]
     fn enroll_rpc_credential_runs_the_loader_checks_first() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let cases: [PrecheckCase; 4] = [
             (
                 "https://rpc.example",

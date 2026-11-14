@@ -216,6 +216,7 @@ async fn endpoint(rpc: &FixedStatusRpc) -> MockServer {
 }
 
 fn run_cli(home: &Path, args: &[&str]) -> (i32, Value) {
+    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
     let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
         .args(args)
         .env("STELLAR_AGENT_HOME", home)
@@ -661,6 +662,9 @@ async fn a_pending_receipt_the_chain_confirmed_writes_no_row() {
 #[tokio::test]
 #[serial_test::serial]
 async fn an_unsent_receipt_does_not_clear_its_open_bounded_hold() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let home = tempfile::TempDir::new().unwrap();
     let rpc = FixedStatusRpc::new("NOT_FOUND");
     let server = endpoint(&rpc).await;
@@ -998,6 +1002,9 @@ fn orphan_clear(home: &Path) -> (i32, Value) {
 #[tokio::test]
 #[serial_test::serial]
 async fn orphan_clear_recovers_identity_and_releases_headroom() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let home = tempfile::TempDir::new().unwrap();
     let rpc = OrphanRpc::new("NOT_FOUND", 1200);
     let server = MockServer::start().await;
@@ -1031,6 +1038,9 @@ async fn orphan_clear_recovers_identity_and_releases_headroom() {
 #[tokio::test]
 #[serial_test::serial]
 async fn answerable_or_in_retention_bounded_orphans_are_not_cleared() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     for (status, floor) in [
         ("SUCCESS", 1200),
         ("FAILED", 1200),
@@ -1068,6 +1078,9 @@ async fn answerable_or_in_retention_bounded_orphans_are_not_cleared() {
 #[tokio::test]
 #[serial_test::serial]
 async fn an_untimed_orphan_is_cleared_with_both_acknowledgements_whatever_the_endpoint_reports() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     for (status, floor) in [
         ("SUCCESS", 1200),
         ("FAILED", 1200),
@@ -1109,6 +1122,9 @@ async fn an_untimed_orphan_is_cleared_with_both_acknowledgements_whatever_the_en
 #[tokio::test]
 #[serial_test::serial]
 async fn clear_resumes_after_recovered_receipt_write_before_release() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     for released_before_retry in [false, true] {
         let home = tempfile::TempDir::new().unwrap();
         let rpc = OrphanRpc::new("NOT_FOUND", 1200);
@@ -1169,6 +1185,9 @@ async fn clear_resumes_after_recovered_receipt_write_before_release() {
 #[tokio::test]
 #[serial_test::serial]
 async fn tx_status_reports_an_orphan_requiring_operator_recovery() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let home = tempfile::TempDir::new().unwrap();
     let rpc = OrphanRpc::new("NOT_FOUND", 1200);
     let server = MockServer::start().await;
@@ -1195,6 +1214,9 @@ async fn tx_status_reports_an_orphan_requiring_operator_recovery() {
 #[tokio::test]
 #[serial_test::serial]
 async fn orphan_recovery_preconditions_leave_state_untouched() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     for condition in ["unreadable_receipt", "bad_hmac", "no_acknowledgement"] {
         let home = tempfile::TempDir::new().unwrap();
         let rpc = OrphanRpc::new("NOT_FOUND", 1200);
@@ -1252,6 +1274,9 @@ async fn orphan_recovery_preconditions_leave_state_untouched() {
 #[tokio::test]
 #[serial_test::serial]
 async fn tx_status_surfaces_a_restored_orphan_receipt_without_settlement() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let home = tempfile::TempDir::new().unwrap();
     let rpc = OrphanRpc::new("SUCCESS", 1200);
     let server = MockServer::start().await;
@@ -1353,6 +1378,9 @@ async fn a_receipt_beyond_retention_keeps_its_open_execution_bound() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_sent_receipt_whose_time_bound_is_open_is_still_pending() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let home = tempfile::TempDir::new().unwrap();
     let rpc = FixedStatusRpc::new("NOT_FOUND");
     let server = endpoint(&rpc).await;
@@ -1415,6 +1443,9 @@ async fn without_the_acknowledgement_the_next_step_comes_from_the_record() {
 #[tokio::test]
 #[serial_test::serial]
 async fn an_audit_refusal_reconciles_nothing_and_changes_nothing() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let home = tempfile::TempDir::new().unwrap();
     let rpc = FixedStatusRpc::new("NOT_FOUND");
     let server = endpoint(&rpc).await;
@@ -1603,6 +1634,9 @@ fn assert_refused_on_the_fee(code: i32, envelope: &Value) {
 #[tokio::test]
 #[serial_test::serial]
 async fn the_gate_pass_retains_negative_exposure_and_never_sends() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let home = tempfile::TempDir::new().unwrap();
     let rpc = FixedStatusRpc::new("NOT_FOUND");
     let server = endpoint(&rpc).await;
@@ -1626,6 +1660,9 @@ async fn the_gate_pass_retains_negative_exposure_and_never_sends() {
 #[tokio::test]
 #[serial_test::serial]
 async fn the_gate_pass_drains_accounting_obligations_before_the_refusal() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let home = tempfile::TempDir::new().unwrap();
     let rpc = FixedStatusRpc::new("NOT_FOUND");
     let server = endpoint(&rpc).await;
@@ -1658,6 +1695,9 @@ async fn the_gate_pass_drains_accounting_obligations_before_the_refusal() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_negative_gate_observation_does_not_owe_an_audit_failure() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let home = tempfile::TempDir::new().unwrap();
     let rpc = FixedStatusRpc::new("NOT_FOUND");
     let server = endpoint(&rpc).await;
@@ -1758,6 +1798,9 @@ async fn an_absent_source_account_leaves_an_untimed_outcome_unknown() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_clear_refuses_a_success_whose_receipt_write_failed_and_retries() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let home = tempfile::TempDir::new().unwrap();
     let mut rpc = FixedStatusRpc::new("NOT_FOUND");
     rpc.reconcile_success = true;
@@ -1808,6 +1851,9 @@ async fn a_clear_refuses_a_success_whose_receipt_write_failed_and_retries() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_testnet_untimed_success_is_cleared_only_with_both_acknowledgements() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let home = tempfile::TempDir::new().unwrap();
     let rpc = FixedStatusRpc::new("SUCCESS");
     let server = endpoint(&rpc).await;
@@ -1885,6 +1931,9 @@ impl stellar_agent_network::SubmissionRecorder for ReceiptWriteFailure<'_> {
 #[tokio::test]
 #[serial_test::serial]
 async fn tx_status_repairs_a_post_send_receipt_failure_without_counting_twice() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::audit_log::PolicyDecision;
     use stellar_agent_core::policy::v1::criteria::state_store::{
         PolicyStateStore, StateKey, WindowEntry, WindowLimit,
@@ -2020,6 +2069,9 @@ async fn tx_status_repairs_a_post_send_receipt_failure_without_counting_twice() 
 #[tokio::test]
 #[serial_test::serial]
 async fn chain_flip_cannot_clear_original_hold() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let primary = MockServer::start().await;
     let oracle = MockServer::start().await;
     let rpc = FixedStatusRpc::new("FAILED");
@@ -2096,6 +2148,9 @@ fn counted(
 #[tokio::test]
 #[serial_test::serial]
 async fn tx_status_forged_receipts_create_no_settlement_rows() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     for (label, endpoint_status, held) in [
         ("edited-failed", "FAILED", true),
         ("fabricated-failed", "FAILED", false),
@@ -2225,6 +2280,9 @@ fn expiry_rows(home: &Path, decision_id: &str) -> usize {
 #[tokio::test]
 #[serial_test::serial]
 async fn tx_status_completes_a_projection_without_the_audit_writer() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::audit_log::{AuditWriter, BindingCheck};
 
     let home = tempfile::TempDir::new().unwrap();
@@ -2315,6 +2373,9 @@ async fn tx_status_completes_a_projection_without_the_audit_writer() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_refused_tx_status_delivers_old_obligations() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     const OLD_ENVELOPE_HASH: &str =
         "33333333333333333333333333333333333333333333333333333333333333cc";
     const OLD_TX_HASH: &str = "44444444444444444444444444444444444444444444444444444444444444dd";

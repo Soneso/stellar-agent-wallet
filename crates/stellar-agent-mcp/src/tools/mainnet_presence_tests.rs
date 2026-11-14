@@ -373,6 +373,7 @@ fn enroll_remote_credential() {
 /// the presence-backed consent of the same run commits.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn mainnet_commit_rejects_a_genuine_local_v4_attestation() {
     let run = ClassicRun::with(
         Tool::Pay,
@@ -410,6 +411,7 @@ async fn mainnet_commit_rejects_a_genuine_local_v4_attestation() {
 /// preparation reports what the readiness check observed.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn mainnet_prepare_checks_readiness_before_the_account_read() {
     for tool in Tool::ALL {
         let run = ClassicRun::new(tool).await;
@@ -430,6 +432,7 @@ async fn mainnet_prepare_checks_readiness_before_the_account_read() {
 /// payment.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn mainnet_commit_requires_the_pinned_assertion_for_every_kind() {
     let diagnostics = Diagnostics::install();
     for tool in Tool::ALL {
@@ -532,6 +535,7 @@ async fn gate_of_running_server(run: &ClassicRun) -> serde_json::Value {
 /// on the running server. No row signs.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn mainnet_commit_rechecks_consent_after_policy_change() {
     let diagnostics = Diagnostics::install();
     for change in [
@@ -659,6 +663,7 @@ async fn refused_commit(run: &ClassicRun, args: serde_json::Value) -> serde_json
 /// keep their own codes.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn mainnet_presence_failures_are_indistinguishable() {
     let run = ClassicRun::new(Tool::Pay).await;
     let xdr = run.args["envelope_xdr"].as_str().unwrap().to_owned();
@@ -945,6 +950,7 @@ const EXPECTED: &str = include_str!("require_approval_results.txt");
 /// its partial proof with the same texts.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn require_approval_mainnet_results_stay_byte_identical() {
     let mut actual = Vec::new();
     for tool in Tool::ALL {
@@ -1040,6 +1046,7 @@ fn allow_rules(raw: &str, tools: &[&str]) -> String {
 /// approval block and leaves the approval store bytes unchanged.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn allow_prepare_records_no_pending_approval_for_every_kind() {
     for tool in Tool::ALL {
         let run = ClassicRun::allowed(tool).await;
@@ -1072,6 +1079,7 @@ async fn allow_prepare_records_no_pending_approval_for_every_kind() {
 /// consent row; the pending row records `allow` with its provenance.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn allow_commit_signs_without_an_approval_for_every_kind() {
     for tool in Tool::ALL {
         let context = format!("{tool:?}");
@@ -1111,6 +1119,7 @@ async fn allow_commit_signs_without_an_approval_for_every_kind() {
 /// `policy.approval_required` before anything is minted or signed.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn require_approval_commit_without_proof_refuses_for_every_kind() {
     for tool in Tool::ALL {
         let context = format!("{tool:?}");
@@ -1135,6 +1144,7 @@ async fn require_approval_commit_without_proof_refuses_for_every_kind() {
 /// commit signs under its approval and records `require_approval`.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn commit_requires_approval_when_either_name_requires_it() {
     for tool in Tool::ALL {
         for (order, allowed, governing) in [
@@ -1174,6 +1184,7 @@ async fn commit_requires_approval_when_either_name_requires_it() {
 /// envelope before anything signs.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn allow_with_supplied_proof_verifies_and_spends_it() {
     for tool in Tool::ALL {
         let context = format!("{tool:?}");
@@ -1209,6 +1220,7 @@ async fn allow_with_supplied_proof_verifies_and_spends_it() {
 /// and nothing is minted.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn partial_proof_refuses_under_both_decisions() {
     for tool in Tool::ALL {
         for require in [false, true] {
@@ -1238,6 +1250,7 @@ async fn partial_proof_refuses_under_both_decisions() {
 /// A real loopback ceremony records a correlated row before the commit signer.
 #[tokio::test]
 #[serial_test::serial(keyring)]
+#[serial_test::serial]
 async fn mcp_approve_browser_round_trip_records_before_signing() {
     use stellar_agent_approval_ui::{
         MainnetPresenceConfig, PageIdentity, presence::test_support::PresenceClient,

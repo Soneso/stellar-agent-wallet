@@ -1472,7 +1472,11 @@ mod tests {
     /// any routing.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn toolset_invoke_refuses_an_unverifiable_pin() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let toolsets = tempfile::TempDir::new().unwrap();
         stellar_agent_toolsets_install::write_toolset_for_test(
@@ -1529,7 +1533,11 @@ mod tests {
     /// refusal is the policy code, not `toolset.not_installed`.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn toolset_invoke_is_refused_on_mainnet_under_the_default_engine() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let toolsets = tempfile::TempDir::new().unwrap();
         let profile = Profile::builder_mainnet(
@@ -1558,7 +1566,10 @@ mod tests {
     /// none of the argument values the deserialiser quotes.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn toolset_args_marker_is_not_echoed() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let capture = stellar_agent_test_support::log_capture::CaptureWriter::new();
         let subscriber = tracing_subscriber::fmt()
@@ -1684,7 +1695,10 @@ mod tests {
     }
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn toolset_name_and_action_marker_is_not_echoed() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let capture = stellar_agent_test_support::log_capture::CaptureWriter::new();
         let subscriber = tracing_subscriber::fmt()
@@ -1753,7 +1767,10 @@ mod tests {
     #[cfg(feature = "test-helpers")]
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn gated_toolset_args_marker_is_not_echoed() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let capture = stellar_agent_test_support::log_capture::CaptureWriter::new();
         let subscriber = tracing_subscriber::fmt()
             .without_time()

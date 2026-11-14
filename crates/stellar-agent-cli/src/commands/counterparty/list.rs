@@ -258,7 +258,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn list_nonexistent_profile_returns_exit_1() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let args = ListArgs {
             json: false,
             profile: Some("__nonexistent_list_cpty__".to_owned()),

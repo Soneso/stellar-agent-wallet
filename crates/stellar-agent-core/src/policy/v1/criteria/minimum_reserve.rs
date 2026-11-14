@@ -375,8 +375,11 @@ mod tests {
     /// Verifies fail-closed behaviour: absent account_view returns an Err rather
     /// than silently passing.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn absent_account_view_fails_closed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let store = PolicyStateStore::new();
         let criterion = MinimumReserveCriterion::new(5_0000000);
         let args = json!({ "amount": "10 XLM", "asset": "native" });
@@ -392,8 +395,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn post_balance_above_reserve_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let store = PolicyStateStore::new();
         let criterion = MinimumReserveCriterion::new(5_0000000); // 0.5 XLM margin
 
@@ -416,8 +422,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn post_balance_below_reserve_breaches() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let store = PolicyStateStore::new();
         let criterion = MinimumReserveCriterion::new(5_0000000); // 0.5 XLM margin
 
@@ -440,8 +449,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn saturating_sub_on_amount_exceeding_balance_still_catches_breach() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let store = PolicyStateStore::new();
         let criterion = MinimumReserveCriterion::new(0); // no margin
 
@@ -463,8 +475,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn margin_adds_to_reserve_requirement() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let store = PolicyStateStore::new();
         // Large margin to test it's correctly added.
         let criterion = MinimumReserveCriterion::new(50_000_000); // 5 XLM margin
@@ -485,8 +500,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn exact_reserve_boundary_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let store = PolicyStateStore::new();
         let criterion = MinimumReserveCriterion::new(5_000_000);
 
@@ -514,8 +532,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn create_account_starting_balance_participates_in_reserve_check() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let store = PolicyStateStore::new();
         let criterion = MinimumReserveCriterion::new(5_000_000);
 
@@ -535,8 +556,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn total_fee_stroops_can_push_post_balance_below_reserve() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let store = PolicyStateStore::new();
         let criterion = MinimumReserveCriterion::new(5_000_000);
 
@@ -564,8 +588,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn extract_total_fee_stroops_reads_the_decoder_key() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let store = PolicyStateStore::new();
         let args = json!({
             "amount": "1 XLM",
@@ -580,8 +607,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn minimum_reserve_counts_the_envelope_fee() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_xdr::{
             Asset, Limits, Memo, MuxedAccount, Operation, OperationBody, PaymentOp, Preconditions,
             SequenceNumber, Transaction, TransactionEnvelope, TransactionExt,
@@ -648,8 +678,11 @@ mod tests {
     /// A commit-time `stellar_pay_commit` authoritative_args shape that breaches
     /// the reserve on its native debit is denied.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn pay_commit_authoritative_args_shape_breach_is_caught() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let store = PolicyStateStore::new();
         let criterion = MinimumReserveCriterion::new(5_000_000);
 
@@ -683,8 +716,11 @@ mod tests {
     /// `starting_balance_stroops`, never the legacy `starting_balance` key)
     /// breaches the reserve on the real debit.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn create_account_simulate_resolved_only_shape_breach_is_now_caught() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let store = PolicyStateStore::new();
         let criterion = MinimumReserveCriterion::new(5_000_000);
 
@@ -710,8 +746,11 @@ mod tests {
 
     /// Commit-time `stellar_create_account_commit` authoritative_args shape.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn create_account_commit_authoritative_args_shape_breach_is_now_caught() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let store = PolicyStateStore::new();
         let criterion = MinimumReserveCriterion::new(5_000_000);
 
@@ -738,8 +777,11 @@ mod tests {
     /// Regression: the legacy unit-string-only shape must still evaluate to
     /// the identical verdict as before this re-point.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn legacy_starting_balance_only_shape_still_evaluates_identically() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let store = PolicyStateStore::new();
         let criterion = MinimumReserveCriterion::new(5_000_000);
 
@@ -761,8 +803,11 @@ mod tests {
     /// Version-crossing: a resolved key carrying a legacy JSON number must
     /// still parse correctly.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn version_crossing_numeric_amount_stroops_still_parses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let store = PolicyStateStore::new();
         let criterion = MinimumReserveCriterion::new(5_000_000);
 
@@ -785,8 +830,11 @@ mod tests {
     /// posture (the reserve check fires on the fee alone, via
     /// `extract_total_fee_stroops`, not on a fabricated amount).
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn genuinely_amount_less_tool_still_defaults_amount_to_zero() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let store = PolicyStateStore::new();
         let criterion = MinimumReserveCriterion::new(5_000_000);
 
@@ -809,8 +857,11 @@ mod tests {
     /// 0 debit: a native-XLM debit leg whose amount cannot be resolved denies
     /// fail-closed rather than bypassing the reserve guard.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn malformed_resolved_key_amount_is_refused_not_silently_zeroed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let store = PolicyStateStore::new();
         let criterion = MinimumReserveCriterion::new(5_000_000);
 
@@ -859,8 +910,11 @@ mod tests {
     /// (`derive_value_class` falls through to `ReadOnly` for any name outside
     /// its match arms) must deny fail-closed rather than passing silently.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn moves_value_tool_with_unpopulated_effects_denies_unsizable() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let store = PolicyStateStore::new();
         let criterion = MinimumReserveCriterion::new(5_000_000);
         let view = MockAccountView {
@@ -882,8 +936,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn an_unsizable_value_denies_before_the_account_view() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let store = PolicyStateStore::new();
         let criterion = MinimumReserveCriterion::new(5_000_000);
         let profile = make_profile();
@@ -905,8 +962,11 @@ mod tests {
 
     /// An opaque-signing call on the single-tx path must deny fail-closed.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn opaque_sign_call_denies_unsizable_on_single_tx() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let store = PolicyStateStore::new();
         let criterion = MinimumReserveCriterion::new(5_000_000);
         let view = MockAccountView {
@@ -929,8 +989,11 @@ mod tests {
     /// would otherwise breach if the token amount were (incorrectly) counted
     /// as a native debit.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn token_only_non_native_debit_leg_does_not_reduce_native_reserve() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
 
         let store = PolicyStateStore::new();

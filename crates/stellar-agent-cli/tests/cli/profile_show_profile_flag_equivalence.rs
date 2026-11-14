@@ -32,7 +32,10 @@ const MISSING_PROFILE: &str = "__issue66_show_equivalence_missing_profile__";
 /// returns `(exit_code, parsed_stdout_json)`.
 fn run_show(extra_args: &[&str]) -> (i32, Value) {
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
+    let home = tempfile::tempdir().expect("fixture directory");
+    stellar_agent_test_support::sandbox::mark_sandbox(home.path()).expect("mark fixture directory");
     let output = Command::new(bin_path)
+        .env("STELLAR_AGENT_HOME", home.path())
         .args(["profile", "show"])
         .args(extra_args)
         // Never touch the login keychain: force the headless backend. `show`

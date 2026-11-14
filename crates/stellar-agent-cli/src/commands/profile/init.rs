@@ -1069,6 +1069,7 @@ mod tests {
     #[serial_test::serial]
     fn audit_path_resolution_honors_the_test_home_override() {
         let home = tempfile::tempdir().unwrap();
+        stellar_agent_test_support::sandbox::mark_sandbox(home.path()).unwrap();
         let _guard = EnvGuard::set("STELLAR_AGENT_HOME".to_owned(), home.path().as_os_str());
 
         let path = stellar_agent_core::profile::schema::default_audit_log_path_for("override-x");
@@ -1083,6 +1084,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn init_on_clean_dir_creates_a_loadable_v1_profile_with_derived_refs() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let code = run_init(&args("acceptance"), dir.path());
         assert_eq!(code, 0, "init must succeed on a clean directory");
@@ -1138,6 +1142,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn init_default_name_is_loadable_without_the_synthesised_fallback() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let code = run_init(&args("default"), dir.path());
         assert_eq!(code, 0);
@@ -1155,7 +1162,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn init_refuses_when_file_already_exists_and_leaves_it_untouched() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let code = run_init(&args("dup"), dir.path());
         assert_eq!(code, 0, "first init must succeed");
@@ -1206,6 +1217,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn build_mainnet_plaintext_rpc_url_yields_typed_code() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut a = args("pin-plaintext");
         a.network = TargetNetwork::Mainnet;
         a.rpc_url = Some("http://mainnet.example.com/rpc".to_owned());
@@ -1223,6 +1237,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn build_mainnet_plaintext_rpc_url_omits_the_url() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut a = args("redact-plaintext");
         a.network = TargetNetwork::Mainnet;
         a.rpc_url = Some(SENTINEL_HTTP.to_owned());
@@ -1236,6 +1253,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn build_unsupported_scheme_yields_typed_code() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for network in [TargetNetwork::Testnet, TargetNetwork::Mainnet] {
             let mut a = args("pin-ftp");
             a.network = network;
@@ -1255,6 +1275,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn build_mainnet_rpc_url_with_userinfo_yields_typed_code() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut a = args("pin-userinfo");
         a.network = TargetNetwork::Mainnet;
         a.rpc_url = Some(SENTINEL_HTTPS.to_owned());
@@ -1281,6 +1304,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn init_endpoint_rule_refusals_write_no_file() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for (network, url) in [
             (TargetNetwork::Testnet, "ftp://mainnet.example.com"),
             (TargetNetwork::Mainnet, "ftp://mainnet.example.com"),
@@ -1366,6 +1392,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn init_mainnet_with_rpc_url_writes_the_supplied_url() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let mut a = args("mainnet-ok");
         a.network = TargetNetwork::Mainnet;
@@ -1385,6 +1414,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn profile_init_mainnet_writes_fee_cap() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let mut a = args("mainnet-cap");
         a.network = TargetNetwork::Mainnet;
@@ -1412,7 +1444,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn init_engine_flag_default_writes_v1() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let code = run_init(&args("engine-default"), dir.path());
         assert_eq!(code, 0);
@@ -1424,6 +1460,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn init_engine_noop_writes_noop() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let mut a = args("engine-noop");
         a.engine = PolicyEngineKind::Noop;
@@ -1448,6 +1487,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn init_testnet_default_rpc_url_when_omitted() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let code = run_init(&args("testnet-default-rpc"), dir.path());
         assert_eq!(code, 0);
@@ -1462,6 +1504,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn init_testnet_explicit_rpc_url_overrides_default() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let mut a = args("testnet-explicit-rpc");
         a.rpc_url = Some("https://custom-testnet-rpc.example.com".to_owned());
@@ -1478,6 +1523,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn init_testnet_plaintext_rpc_url_is_accepted() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let mut a = args("testnet-plaintext-rpc");
         a.rpc_url = Some("http://127.0.0.1:8000".to_owned());
@@ -1490,7 +1538,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn init_malformed_rpc_url_is_refused_before_write() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let mut a = args("malformed-rpc");
         a.rpc_url = Some("not a url".to_owned());
@@ -1592,6 +1644,7 @@ mod tests {
             CREDENTIAL_MARKER, assert_no_marker, assert_no_marker_in_text,
         };
         let home = tempfile::tempdir().unwrap();
+        stellar_agent_test_support::sandbox::mark_sandbox(home.path()).unwrap();
         let _guard = EnvGuard::set("STELLAR_AGENT_HOME".to_owned(), home.path().as_os_str());
         let mut input = args(CREDENTIAL_MARKER);
         input.network = TargetNetwork::Mainnet;
@@ -1769,7 +1822,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn omitted_preset_flag_uses_api_day() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let mut a = mainnet("preset-default");
         a.unlisted_budget = Some(YesNo::No);
@@ -1787,7 +1844,11 @@ mod tests {
     /// writes nothing without a terminal, at end of input, after a read
     /// error, and for any answer but yes or no.
     #[tokio::test]
+    #[serial_test::serial]
     async fn api_question_requires_explicit_choice() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let required = "the unlisted_budget input is required; pass --unlisted-budget, or run \
                         at a terminal to answer its prompt";
         let dir = tempfile::tempdir().unwrap();
@@ -1834,7 +1895,11 @@ mod tests {
     /// The api question states the shared budget and its bounds, and a yes
     /// puts one budget on every payment rule.
     #[tokio::test]
+    #[serial_test::serial]
     async fn api_question_states_shared_budget() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let a = mainnet("api-shared");
         let out = init_at(&a, dir.path(), true, queue(&[" YES\r\n", "\r\n"])).await;
@@ -1889,7 +1954,11 @@ mod tests {
     /// The total budget question defaults to yes at a terminal, and without a
     /// terminal the total budget is chosen without a question.
     #[tokio::test]
+    #[serial_test::serial]
     async fn total_budget_prompt_defaults_to_yes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let question = "Limit total spending to 2 USDC for this policy? Signing the same policy \
                         body again keeps the allocation; a different digest starts another. \
                         [Y/n]: ";
@@ -1946,7 +2015,11 @@ mod tests {
     /// XLM takes its amounts from the flags or, at a terminal, from the
     /// prompts in order; without a terminal a missing amount refuses.
     #[tokio::test]
+    #[serial_test::serial]
     async fn xlm_inputs_from_flags_and_prompts() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let xlm = |name: &str, loss: Option<&str>, typical: Option<&str>| {
             let mut a = mainnet(name);
@@ -2042,7 +2115,11 @@ mod tests {
     /// Flag combinations the preset refuses fail before any prompt and
     /// write nothing.
     #[tokio::test]
+    #[serial_test::serial]
     async fn preset_flag_combinations_refuse() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let mut compute = mainnet("combo-compute");
         compute.preset = Some("compute-week".to_owned());
@@ -2089,7 +2166,11 @@ mod tests {
     /// the existing refusals, naming the flags in help order and never their
     /// values.
     #[tokio::test]
+    #[serial_test::serial]
     async fn spending_flags_outside_mainnet_v1_refuse() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let mut testnet = args("flags-testnet");
         testnet.preset = Some("MARKER-VALUE".to_owned());
@@ -2158,7 +2239,11 @@ mod tests {
     /// The envelope carries the draft summary and the plan, equal to the
     /// preview on stderr; `--output table` writes the table form there.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mainnet_init_envelope_carries_summary_and_plan() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let mut a = mainnet("envelope");
         a.unlisted_budget = Some(YesNo::Yes);
@@ -2201,7 +2286,11 @@ mod tests {
     /// the bytes `sign-policy` signs from the written file. Signing assigns
     /// the next sequence, so that field is one past the written body's.
     #[tokio::test]
+    #[serial_test::serial]
     async fn init_preview_summarizes_the_signed_body() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let mut a = mainnet("signed");
         a.unlisted_budget = Some(YesNo::Yes);
@@ -2274,7 +2363,11 @@ mod tests {
     /// Every prompt and the whole preview reach stderr before the policy
     /// file and the profile exist.
     #[tokio::test]
+    #[serial_test::serial]
     async fn preview_precedes_every_write() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let a = mainnet("observed");
         let mut observer = Observer {
@@ -2317,7 +2410,11 @@ mod tests {
     /// A preview that cannot be written refuses with its code, and nothing
     /// is written.
     #[tokio::test]
+    #[serial_test::serial]
     async fn preview_output_failure_prevents_write() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for (n, writer) in [render::FailingWriter::Write, render::FailingWriter::Flush]
             .into_iter()
             .enumerate()
@@ -2349,7 +2446,11 @@ mod tests {
     /// cannot be written, the policy file exists and the refusal carries the
     /// preview.
     #[tokio::test]
+    #[serial_test::serial]
     async fn policy_written_before_profile() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("profiles"), "a regular file").unwrap();
         let mut a = mainnet("ordered");
@@ -2379,7 +2480,11 @@ mod tests {
     /// A rerun after a failed profile write finds its own policy file and
     /// continues.
     #[tokio::test]
+    #[serial_test::serial]
     async fn rerun_with_identical_policy_continues() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let policies = dir.path().join("policies");
         let mut a = mainnet("rerun");
@@ -2405,7 +2510,11 @@ mod tests {
     /// A policy file of other content, or one that cannot be written,
     /// refuses with the preview, leaves the file, and writes no profile.
     #[tokio::test]
+    #[serial_test::serial]
     async fn rerun_with_other_policy_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let path = policy_path(dir.path(), "other");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();

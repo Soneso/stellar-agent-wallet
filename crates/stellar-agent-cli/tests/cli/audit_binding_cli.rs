@@ -57,6 +57,7 @@ fn repointed_profile(home: &Path, name: &str, rpc_url: &str) -> std::path::PathB
 }
 
 fn run(home: &Path, args: &[&str]) -> (i32, serde_json::Value, String) {
+    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
     let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
         .args(args)
         .env("STELLAR_AGENT_HOME", home)

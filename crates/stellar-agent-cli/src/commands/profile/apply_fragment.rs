@@ -128,7 +128,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn apply_fragment_credential_roles_line() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         if let Some((_, stderr)) = capture(
             "commands::profile::apply_fragment::tests::apply_fragment_credential_roles_line",
         ) {
@@ -161,7 +165,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn apply_fragment_refuses_loader_failures_unchanged() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         if let Some((_, stderr)) = capture(
             "commands::profile::apply_fragment::tests::apply_fragment_refuses_loader_failures_unchanged",
         ) {
@@ -207,7 +215,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn apply_fragment_refuses_other_keys() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         if let Some((_, stderr)) =
             capture("commands::profile::apply_fragment::tests::apply_fragment_refuses_other_keys")
         {
@@ -243,7 +255,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn apply_fragment_ignores_environment_overlays() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         if crate::common::test_support::capture_with_env(
             "apply_fragment_ignores_environment_overlays",
             &[("STELLAR_AGENT_SUBMIT_TIMEOUT_SECONDS", "41")],

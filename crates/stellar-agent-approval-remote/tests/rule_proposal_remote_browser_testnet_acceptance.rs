@@ -831,6 +831,9 @@ async fn rule_proposal_remote_browser_drives_real_rule_install() {
 
     let _env_guard = EnvOverrideGuard;
     unsafe {
+        stellar_agent_test_support::sandbox::mark_sandbox(tls_home_dir.path()).unwrap();
+        stellar_agent_test_support::sandbox::mark_sandbox(networks_toml_path.parent().unwrap())
+            .unwrap();
         std::env::set_var("STELLAR_AGENT_HOME", tls_home_dir.path());
         std::env::set_var("STELLAR_AGENT_NETWORKS_TOML", &networks_toml_path);
     }

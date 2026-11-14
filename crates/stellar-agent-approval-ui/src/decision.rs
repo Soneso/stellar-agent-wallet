@@ -1414,6 +1414,9 @@ mod tests {
     #[test]
     #[serial]
     fn revocation_adapter_default_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let f = fixture("revocation-default");
         let entry = fixtures::payment_pending(
@@ -1602,6 +1605,9 @@ mod tests {
     #[test]
     #[serial]
     fn approve_inconsistent_entry_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("inconsistent");
         let mut entry = payment_entry(DEFAULT_TTL_MS);
@@ -1626,6 +1632,9 @@ mod tests {
     #[test]
     #[serial]
     fn approve_payment_mints_verifiable_attestation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("payment");
         let entry = payment_entry(DEFAULT_TTL_MS);
@@ -1688,6 +1697,9 @@ mod tests {
     #[test]
     #[serial]
     fn approve_refuses_an_attestation_key_equal_to_the_owner_key() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("owner");
         let owner = KeyringEntryRef::default_owner_key("ui-test");
@@ -1726,6 +1738,9 @@ mod tests {
     #[test]
     #[serial]
     fn attestation_key_refusals_hold_no_coordinate() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("credmarker7");
         let coordinate = fx.ctx.attestation_key_entry_ref.clone();
@@ -1818,6 +1833,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_local_mainnet_approve_is_refused_and_records_nothing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let mut fx = fixture("payment-mainnet");
         fx.ctx.context.chain_id = "stellar:mainnet".to_owned();
@@ -1846,6 +1864,9 @@ mod tests {
     #[test]
     #[serial]
     fn approve_claim_mints_attestation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("claim");
         let entry = fixtures::claim_pending(
@@ -1875,6 +1896,9 @@ mod tests {
     #[test]
     #[serial]
     fn approve_toolset_gate_consumes_entry_and_surfaces_no_blob() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("toolset");
         let entry = PendingApproval::new_toolset_first_invoke_gate_pending(
@@ -1911,6 +1935,9 @@ mod tests {
     #[test]
     #[serial]
     fn approve_trustline_clawback_opt_in_attests_without_blob() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("trustline");
         let entry = PendingApproval::new_trustline_clawback_opt_in_pending(
@@ -1939,6 +1966,9 @@ mod tests {
     #[test]
     #[serial]
     fn approve_sign_with_passkey_is_wrong_kind() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("passkey");
         let entry = PendingApproval::new_passkey_pending(
@@ -1964,6 +1994,9 @@ mod tests {
     #[test]
     #[serial]
     fn approve_expired_entry_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("expired");
         let entry = payment_entry(1);
@@ -1980,6 +2013,9 @@ mod tests {
     #[test]
     #[serial]
     fn approve_unknown_nonce_is_not_found() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("missing");
         // Open once so the store file exists but is empty.
@@ -1995,6 +2031,9 @@ mod tests {
     #[test]
     #[serial]
     fn approve_already_attested_reshows_blob() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("reshow");
         let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
@@ -2029,6 +2068,8 @@ mod tests {
     #[test]
     #[serial]
     fn a_refused_destination_refuses_approval_and_accepts_rejection() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("refused-destination");
         let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
@@ -2065,6 +2106,9 @@ mod tests {
     #[test]
     #[serial]
     fn reject_creates_tombstone_and_is_idempotent() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("reject");
         let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
@@ -2090,6 +2134,9 @@ mod tests {
     #[test]
     #[serial]
     fn approve_rejected_tombstone_is_already_resolved_not_panic() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("reject-then-approve");
         let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
@@ -2114,6 +2161,9 @@ mod tests {
     #[test]
     #[serial]
     fn reject_unknown_nonce_is_already_resolved() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("reject-missing");
         let _ = PendingApprovalStore::open(fx.ctx.store_path.clone()).unwrap();
@@ -2130,6 +2180,9 @@ mod tests {
     #[test]
     #[serial]
     fn approve_foreign_process_uid_is_user_mismatch() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("approve-mismatch");
         let nonce = insert(&fx.ctx, foreign_payment_entry(DEFAULT_TTL_MS));
@@ -2149,6 +2202,9 @@ mod tests {
     #[test]
     #[serial]
     fn reject_foreign_process_uid_is_user_mismatch() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("reject-mismatch");
         let nonce = insert(&fx.ctx, foreign_payment_entry(DEFAULT_TTL_MS));
@@ -2178,6 +2234,9 @@ mod tests {
     #[test]
     #[serial]
     fn approve_with_corrupt_store_file_is_unavailable_not_busy() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("corrupt-store");
         std::fs::write(&fx.ctx.store_path, b"this is not valid toml {{{").unwrap();
@@ -2192,6 +2251,9 @@ mod tests {
     #[test]
     #[serial]
     fn reject_with_corrupt_store_file_is_unavailable_not_busy() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("corrupt-store-reject");
         std::fs::write(&fx.ctx.store_path, b"this is not valid toml {{{").unwrap();
@@ -2207,6 +2269,9 @@ mod tests {
     #[test]
     #[serial]
     fn approve_refuses_another_chain_with_binding_mismatch() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("binding-mismatch");
         let definition = stellar_agent_core::approval::ContextRuleProposalSnapshot::new(
@@ -2387,6 +2452,9 @@ mod tests {
     #[test]
     #[serial]
     fn reject_drains_the_outbox_before_revalidation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::test_helpers::verified_audit_entries_from_path;
         use stellar_agent_core::audit_log::{AuditOutbox, BindingHistory, inspect_outbox};
 
@@ -2456,6 +2524,9 @@ mod tests {
     #[test]
     #[serial]
     fn approving_an_entry_attested_by_another_handle_reshows_the_stored_blob_with_no_row() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let store_path = Arc::new(Mutex::new(None::<std::path::PathBuf>));
         let nonce_slot = Arc::new(Mutex::new(None::<String>));
@@ -2563,6 +2634,9 @@ mod tests {
     #[test]
     #[serial]
     fn approving_an_entry_consumed_since_validation_is_already_resolved_with_no_row() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (fx, outcome) =
             approve_an_entry_resolved_by_another_handle("raced-consumed", |store, nonce| {
                 store
@@ -2585,6 +2659,9 @@ mod tests {
     #[test]
     #[serial]
     fn approving_an_entry_rejected_since_validation_is_already_resolved_with_no_row() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (fx, outcome) =
             approve_an_entry_resolved_by_another_handle("raced-rejected", |store, nonce| {
                 store
@@ -2598,6 +2675,9 @@ mod tests {
     #[test]
     #[serial]
     fn approve_with_a_poisoned_writer_mutex_is_unavailable_and_changes_no_store() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("poison-approve");
         let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
@@ -2622,6 +2702,9 @@ mod tests {
     #[test]
     #[serial]
     fn reject_with_a_poisoned_writer_mutex_is_unavailable_and_changes_no_store() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("poison-reject");
         let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
@@ -2640,6 +2723,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_reject_whose_row_cannot_be_written_leaves_the_entry_pending() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let mut fx = fixture("reject-row-refused");
         refusing_writer(&mut fx);
@@ -2661,6 +2747,9 @@ mod tests {
     #[test]
     #[serial]
     fn an_approve_whose_row_cannot_be_written_persists_nothing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let mut fx = fixture("approve-row-refused");
         refusing_writer(&mut fx);
@@ -2680,6 +2769,9 @@ mod tests {
     #[test]
     #[serial]
     fn approve_and_reject_write_their_rows() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("rows");
         let approved = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
@@ -2786,6 +2878,9 @@ mod tests {
     #[test]
     #[serial]
     fn remote_approve_attests_the_verified_credential() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("remote-approve");
         allow(&fx, &[credential_id(1)]);
@@ -2819,6 +2914,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_remote_mainnet_approve_is_refused_as_unsupported() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let mut fx = fixture("remote-mainnet");
         fx.ctx.context.chain_id = "stellar:mainnet".to_owned();
@@ -2863,6 +2961,9 @@ mod tests {
     #[test]
     #[serial]
     fn revocation_during_keyring_wait_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for revoke in ["allowlist", "enrollment"] {
             stellar_agent_test_support::keyring_mock::install().unwrap();
             let fx = fixture(&format!("remote-wait-{revoke}"));
@@ -2937,6 +3038,9 @@ mod tests {
     #[test]
     #[serial]
     fn revocation_while_reject_waits_for_the_writer_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for revoke in ["allowlist", "enrollment"] {
             stellar_agent_test_support::keyring_mock::install().unwrap();
             let fx = fixture(&format!("remote-reject-wait-{revoke}"));
@@ -2993,6 +3097,9 @@ mod tests {
     #[test]
     #[serial]
     fn unauthorized_remote_requester_decides_nothing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("remote-unauthorized");
         allow(&fx, &[credential_id(2)]);
@@ -3167,6 +3274,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_stale_view_digest_refuses_and_attests_nothing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert_every_kind_refuses_with("stale", Some([0x11; 32]));
     }
 
@@ -3174,6 +3284,9 @@ mod tests {
     #[test]
     #[serial]
     fn an_approve_that_names_no_view_digest_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert_every_kind_refuses_with("no-digest", None);
     }
 
@@ -3183,6 +3296,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_swap_during_the_key_wait_attests_nothing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rule_d1 = {
             let (_, definition) = fixtures::rule_proposal_mutations()
                 .into_iter()

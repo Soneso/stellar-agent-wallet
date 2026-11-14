@@ -2147,6 +2147,20 @@ MUTATIONS = {
 }
 
 
+MUTATIONS.update({
+    "fold-build-dependency": ("d14_refuses_a_build_dependency_on_a_storage_crate", "if names[package] in storage:", "if False:", "D14 accepts a build dependency on storage"),
+    "fold-live-execution": ("d14_refuses_live_execution_outside_the_platform_job", "if not allowed and not compile_only:", "if False:", "D14 accepts live execution outside acceptance"),
+    "fold-live-child": ("d15_refuses_a_live_child_flag_outside_acceptance", "if '--test-live-platform-keyring' in code and relative not in acceptance_children:", "if False:", "D15 accepts a live child outside acceptance"),
+    "fold-doc-constructor": ("d15_refuses_a_native_constructor_in_a_doc_block", "if re.search(native + '|' + resolver + '|' + live, rust_code(block)[0]):", "if False:", "D15 accepts a storage constructor in documentation"),
+    "fold-marker-owner": ("d15_refuses_the_marker_literal_outside_its_owners", "if '.stellar-agent-test-sandbox' in code and relative not in (core, headless, 'crates/stellar-agent-test-support/src/sandbox.rs'):", "if False:", "D15 accepts a sandbox marker outside its owner"),
+    "fold-security-framework": ("d15_refuses_security_framework", "security_framework(?!\\s*::\\s*base\\s*::\\s*Error\\b)|", "", "D15 accepts security_framework"),
+    "fold-dbus-service": ("d15_refuses_dbus_secret_service", "|dbus_secret_service|", "|", "D15 accepts dbus_secret_service"),
+    "fold-manifest-rename": ("d15_refuses_a_manifest_storage_rename", "if value.get('package') in storage_packages and name != value['package']:", "if False:", "D15 accepts a manifest storage rename"),
+    "fold-extern-alias": ("d15_refuses_an_extern_crate_resolver_alias", "ProjectDirs|BaseDirs|UserDirs|directories\\s*::|dirs\\s*::|home_dir\\s*\\()|\\bextern\\s+crate\\s+(?:directories|dirs)\\b", "ProjectDirs|directories\\s*::|dirs\\s*::|home_dir\\s*\\()", "D15 accepts an extern crate resolver alias"),
+    "fold-platform-suffix": ("d15_refuses_a_hand_built_platform_wallet_path", "if component or any(suffix in literal for suffix in ('Soneso.stellar-agent', '.local/share/stellar-agent')):", "if False:", "D15 accepts a hand built platform wallet path"),
+    "fold-lexical-boundaries": ("d15_keeps_fixture_and_lexical_boundaries", "|dbus)\\b", "|unused_dbus)\\b", "D15 accepts storage escape: fn test() { dbus::Connection::new_session(); }"),
+})
+
 def named_mutations(checker, directory, selected=None):
     source = checker.read_text()
     for name, (case, needle, replacement, diagnostic) in MUTATIONS.items():
@@ -2167,6 +2181,208 @@ def named_mutations(checker, directory, selected=None):
                                  '--case', case, '--checker', str(path)], text=True, capture_output=True)
         assert result.returncode == 0, f'{name}: control fails: {result.stdout}\n{result.stderr}'
         print(f'ok control-{name}')
+
+
+@unit('d14_refuses_a_member_without_the_isolation_edge')
+def case_d14_isolation(m, tmp, checker):
+    root = tmp / 'workspace'
+    root.mkdir()
+    (root / 'src').mkdir()
+    (root / 'src/lib.rs').write_text('pub fn fixture() {}\n')
+    (root / 'Cargo.toml').write_text(
+        '[package]\nname="stellar-agent-network"\nversion="0.0.0"\nedition="2024"\n'
+        '[features]\ndefault=[]\ntest-hooks=[]\ntest-helpers=[]\n'
+        '[dev-dependencies]\nstellar-agent-network={path=".",features=["test-hooks"]}\n[workspace]\n')
+    m.run_cargo(root, ['metadata', '--offline', '--format-version', '1'])
+    c = m.Checker(root)
+    c.workflows, c.scripts = {}, {}
+    c.D14()
+    assert any('lacks isolation' in error for error in c.errors), 'D14 accepts test-hooks without isolation'
+
+
+@unit('d15_refuses_a_planted_native_constructor')
+def case_d15_native(m, tmp, checker):
+    path = tmp / 'crates/fixture/tests/planted.rs'
+    path.parent.mkdir(parents=True)
+    path.write_text('use dbus_secret_service_keyring_store::Store as Planted;\nfn test() { Planted::new(); }\n')
+    c = bare_checker(m)
+    c.root = tmp
+    c.D15()
+    assert any('planted.rs' in error for error in c.errors), 'D15 accepts a planted native constructor'
+
+
+@unit('d15_refuses_a_live_call_outside_the_roundtrip')
+def case_d15_live(m, tmp, checker):
+    path = tmp / 'crates/fixture/tests/keyring_platform.rs'
+    path.parent.mkdir(parents=True)
+    path.write_text('fn test() { init_platform_keyring_store_live(permit); }\n')
+    c = bare_checker(m)
+    c.root = tmp
+    c.D15()
+    assert any('keyring_platform.rs' in error for error in c.errors), 'D15 accepts a live call outside the roundtrip'
+
+
+@unit('d15_refuses_a_native_factory_call_in_an_ordinary_test')
+def case_d15_factory(m, tmp, checker):
+    path = tmp / 'crates/stellar-agent-network/src/keyring.rs'
+    path.parent.mkdir(parents=True)
+    path.write_text('fn construct_native_store() {}\n#[test] fn planted() { construct_native_store(); }\n')
+    c = bare_checker(m)
+    c.root = tmp
+    c.D15()
+    assert any('native factory call outside' in error for error in c.errors), 'D15 accepts an ordinary native factory call'
+    path.write_text('fn construct_native_store() {}\n#[test] fn planted() { use crate::construct_native_store as native; native(); }\n')
+    c.errors = []
+    c.D15()
+    assert any('native factory call outside' in error for error in c.errors), 'D15 accepts a renamed native factory'
+
+
+@unit('d15_refuses_a_resolver_alias_and_allows_fixture_temporaries')
+def case_d15_resolver_alias(m, tmp, checker):
+    path = tmp / 'crates/fixture/tests/planted.rs'
+    path.parent.mkdir(parents=True)
+    path.write_text('pub use home::home_dir as root;\nfn test() { root(); }\n')
+    c = bare_checker(m)
+    c.root = tmp
+    c.D15()
+    assert c.errors, 'D15 accepts a renamed wallet directory resolver'
+    path.write_text('use std::env::temp_dir as fixture;\nuse super::{home, mock};\nfn test() { fixture(); }\n')
+    c.errors = []
+    c.D15()
+    assert not c.errors, 'D15 rejects caller-selected fixture temporary paths'
+
+
+@unit('d14_refuses_a_build_dependency_on_a_storage_crate')
+def case_d14_build_storage(m, tmp, checker):
+    c = bare_checker(m)
+    c.root, c.packages, c.workflows, c.scripts = tmp, {}, {}, {}
+    data = {'packages': [{'id': 'build', 'name': 'build'}, {'id': 'store', 'name': 'directories'}],
+            'resolve': {'nodes': [
+                {'id': 'build', 'deps': [{'pkg': 'store', 'dep_kinds': [{'kind': 'build'}]}]},
+                {'id': 'store', 'deps': []}]}}
+    original = m.run_cargo
+    try:
+        m.run_cargo = lambda root, args: json.dumps(data)
+        c.D14()
+    finally:
+        m.run_cargo = original
+    assert any('build dependency reaches' in e for e in c.errors), 'D14 accepts a build dependency on storage'
+
+
+@unit('d14_refuses_live_execution_outside_the_platform_job')
+def case_d14_live_execution(m, tmp, checker):
+    c = bare_checker(m)
+    c.root, c.packages, c.workflows, c.scripts = tmp, {}, {}, {}
+    cargo, inventory = m.run_cargo, m.inventory
+    try:
+        m.run_cargo = lambda root, args: json.dumps({'packages': [], 'resolve': {'nodes': []}})
+        m.inventory = lambda *args: [{'command': 'cargo test -p x --features live-platform-keyring',
+                                     'job': 'test', 'source': 'ci.yml'}]
+        c.D14()
+    finally:
+        m.run_cargo, m.inventory = cargo, inventory
+    assert any('live execution outside acceptance' in e for e in c.errors), 'D14 accepts live execution outside acceptance'
+
+
+def d15_fixture(m, tmp, source, manifest=None):
+    path = tmp / 'crates/fx/tests/planted.rs'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(source)
+    if manifest is not None:
+        (path.parent.parent / 'Cargo.toml').write_text(manifest)
+    c = bare_checker(m)
+    c.root = tmp
+    c.D15()
+    return c
+
+
+@unit('d15_refuses_a_live_child_flag_outside_acceptance')
+def case_d15_child(m, tmp, checker):
+    c = d15_fixture(m, tmp, 'fn test() { child.arg("--test-live-platform-keyring"); }')
+    assert any('live child entry outside acceptance' in e for e in c.errors), 'D15 accepts a live child outside acceptance'
+
+
+@unit('d15_refuses_a_native_constructor_in_a_doc_block')
+def case_d15_doc(m, tmp, checker):
+    c = d15_fixture(m, tmp, '/// ```no_run\n/// apple_native_keyring_store::Store::new();\n/// ```\npub fn fixture() {}')
+    assert any('storage constructor in documentation' in e for e in c.errors), 'D15 accepts a storage constructor in documentation'
+
+
+@unit('d15_refuses_the_marker_literal_outside_its_owners')
+def case_d15_marker(m, tmp, checker):
+    c = d15_fixture(m, tmp, 'const MARKER: &str = ".stellar-agent-test-sandbox";')
+    assert any('sandbox marker outside its owner' in e for e in c.errors), 'D15 accepts a sandbox marker outside its owner'
+
+
+@unit('d15_refuses_security_framework')
+def case_d15_security_framework(m, tmp, checker):
+    c = d15_fixture(m, tmp, 'fn test() { security_framework::passwords::get_generic_password("svc", "acct"); }')
+    assert c.errors, 'D15 accepts security_framework'
+
+
+@unit('d15_refuses_dbus_secret_service')
+def case_d15_dbus_secret_service(m, tmp, checker):
+    c = d15_fixture(m, tmp, 'fn test() { dbus_secret_service::SecretService::connect(); }')
+    assert c.errors, 'D15 accepts dbus_secret_service'
+
+
+@unit('d15_refuses_a_manifest_storage_rename')
+def case_d15_manifest_rename(m, tmp, checker):
+    c = d15_fixture(m, tmp, 'fn test() { os_store::Store::new(); }',
+                   '[dependencies]\nos_store = { package = "dbus-secret-service-keyring-store", version = "1" }\n')
+    assert any('renamed storage dependency' in e for e in c.errors), 'D15 accepts a manifest storage rename'
+
+
+@unit('d15_refuses_a_workspace_storage_rename')
+def case_d15_workspace_rename(m, tmp, checker):
+    (tmp / 'Cargo.toml').write_text(
+        '[workspace.dependencies]\nos_store = { package = "dbus-secret-service-keyring-store", version = "1" }\n')
+    c = d15_fixture(m, tmp, 'fn test() { os_store::Store::new(); }',
+                   '[dependencies]\nos_store = { workspace = true }\n')
+    assert any('Cargo.toml: renamed storage dependency' in e for e in c.errors), 'D15 accepts a workspace storage rename'
+
+
+@unit('d15_refuses_an_extern_crate_resolver_alias')
+def case_d15_extern_alias(m, tmp, checker):
+    c = d15_fixture(m, tmp, 'extern crate directories as platform; fn test() { platform::BaseDirs::new(); }')
+    assert c.errors, 'D15 accepts an extern crate resolver alias'
+
+
+@unit('d15_refuses_a_hand_built_platform_wallet_path')
+def case_d15_platform_suffix(m, tmp, checker):
+    for suffix in ('.local/share/stellar-agent', 'Soneso.stellar-agent'):
+        c = d15_fixture(m, tmp, f'fn test() {{ PathBuf::from(var_os("HOME")).join("{suffix}"); }}')
+        assert any('platform wallet suffix' in e for e in c.errors), 'D15 accepts a hand built platform wallet path'
+
+
+@unit('d15_refuses_grouped_credentials')
+def case_d15_grouped_credentials(m, tmp, checker):
+    c = d15_fixture(m, tmp, 'use windows_sys::Win32::Security::{Credentials::CredReadW};')
+    assert any('storage escape' in e for e in c.errors), 'D15 accepts grouped credentials'
+
+
+@unit('d15_refuses_a_wallet_component')
+def case_d15_wallet_component(m, tmp, checker):
+    c = d15_fixture(m, tmp,
+                   'fn test() { PathBuf::from(var_os("HOME")).join(".local").join("share").join("stellar-agent"); }')
+    assert any('platform wallet suffix' in e for e in c.errors), 'D15 accepts a wallet component'
+
+
+@unit('d15_keeps_fixture_and_lexical_boundaries')
+def case_d15_boundaries(m, tmp, checker):
+    allowed = '''// directories::BaseDirs::new(); security_framework::passwords
+const TEXT: &str = "directories::BaseDirs::new() dbus_secret_service::SecretService";
+/// Soneso.stellar-agent and .local/share/stellar-agent are production suffixes.
+fn test() { tempfile::tempdir(); TempDir::new(); tempfile::Builder::new(); std::env::temp_dir(); sandbox::MARKER; }
+'''
+    assert not d15_fixture(m, tmp, allowed).errors, 'D15 rejects fixture paths, comments, strings or marker references'
+    for source in ('fn test() { dbus::Connection::new_session(); }',
+                   'fn test() { windows_sys::Win32::Security::Credentials::CredReadW(); }',
+                   'use directories::ProjectDirs as P;', 'fn test() { UserDirs::new(); }',
+                   'extern crate dirs as platform;',
+                   'pub use live::init_platform_keyring_store_live as grant;',
+                   'use live::*; fn test() { init_platform_keyring_store_live(permit); }'):
+        assert d15_fixture(m, tmp, source).errors, f'D15 accepts storage escape: {source}'
 
 
 def main():

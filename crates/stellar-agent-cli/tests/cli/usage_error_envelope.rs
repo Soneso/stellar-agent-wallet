@@ -22,6 +22,7 @@ const HEADLESS_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
 /// Runs the binary with `args` against an isolated home.
 fn run(args: &[&str]) -> Output {
     let home = tempfile::tempdir().expect("temp home");
+    stellar_agent_test_support::sandbox::mark_sandbox(home.path()).expect("mark fixture directory");
     Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
         .args(args)
         .env("STELLAR_AGENT_HOME", home.path())
@@ -188,6 +189,8 @@ fn credentials_registry_marker_is_not_echoed() {
         vec!["credentials", "list"],
         vec!["credentials", "show", "fixture"],
     ] {
+        stellar_agent_test_support::sandbox::mark_sandbox(home.path())
+            .expect("mark fixture directory");
         let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
             .args(args)
             .env("STELLAR_AGENT_HOME", home.path())
@@ -223,6 +226,7 @@ fn profile_migration_refusal_omits_the_requested_name() {
         "version = 987654321\n",
     )
     .expect("profile fixture");
+    stellar_agent_test_support::sandbox::mark_sandbox(home.path()).expect("mark fixture directory");
     let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
         .args(["profile", "migrate", "--profile", "CREDMARKER7"])
         .env("STELLAR_AGENT_HOME", home.path())

@@ -845,6 +845,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn muxed_contract_challenge_refuses_before_state() {
         let home = tempfile::tempdir().expect("home");
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
@@ -988,7 +989,12 @@ mod tests {
 
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn registry_and_router_expose_closed_mpp_surface() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring");
         let server = WalletServer::new(
             Profile::builder_testnet("svc", "acct", "nonce-svc", "nonce-acct")
@@ -1077,7 +1083,12 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn every_mpp_tool_refuses_mainnet_before_state_or_keyring_access() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring");
         let server = WalletServer::new(
             Profile::builder_mainnet(
@@ -1219,6 +1230,7 @@ mod tests {
     /// the two surfaces answer this case identically by construction.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn every_id_lookup_reports_not_found_on_a_profile_with_no_mpp_state() {
         let home = tempfile::tempdir().expect("temp home");
         let _home_guard = StellarAgentHomeGuard::new(home.path());
@@ -1288,6 +1300,7 @@ mod tests {
     /// see.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn an_unknown_id_on_a_minted_empty_store_reports_not_found() {
         let home = tempfile::tempdir().expect("temp home");
         let _home_guard = StellarAgentHomeGuard::new(home.path());
@@ -1353,6 +1366,7 @@ mod tests {
     /// under an existing store cannot be answered as "nothing was ever here".
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn a_state_file_without_its_key_still_refuses() {
         let home = tempfile::tempdir().expect("temp home");
         let _home_guard = StellarAgentHomeGuard::new(home.path());

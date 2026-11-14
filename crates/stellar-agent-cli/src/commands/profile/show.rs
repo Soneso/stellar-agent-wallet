@@ -162,7 +162,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn show_not_found_returns_exit_1() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         // We test the run() function with a name that does not exist.
         // Since run() calls loader::load() which uses the default OS dir,
         // we can only test for a profile that definitively does not exist.

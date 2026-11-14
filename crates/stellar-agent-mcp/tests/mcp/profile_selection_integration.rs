@@ -61,6 +61,7 @@ struct ProfileHome {
 impl ProfileHome {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
+        stellar_agent_test_support::sandbox::mark_sandbox(dir.path()).unwrap();
         std::fs::create_dir_all(dir.path().join("profiles")).unwrap();
         Self { dir }
     }

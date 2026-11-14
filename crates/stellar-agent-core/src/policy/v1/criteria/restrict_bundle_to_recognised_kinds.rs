@@ -185,8 +185,11 @@ mod tests {
 
     /// T-A: enabled + all TokenTransfer → Allow.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn enabled_all_token_transfer_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool();
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -208,8 +211,11 @@ mod tests {
 
     /// T-B: enabled + 1 Generic → Deny with correct inner_index.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn enabled_with_generic_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool();
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -235,8 +241,11 @@ mod tests {
 
     /// T-C: disabled + Generic → Allow.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn disabled_with_generic_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool();
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -258,8 +267,11 @@ mod tests {
 
     /// Single-tx path (bundle=None) passes regardless of enabled state.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn single_tx_bundle_none_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool();
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -275,8 +287,11 @@ mod tests {
 
     /// Reports the index of the FIRST Generic inner, not the last.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn reports_first_generic_index() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool();
         let profile = make_profile();
         let store = PolicyStateStore::new();

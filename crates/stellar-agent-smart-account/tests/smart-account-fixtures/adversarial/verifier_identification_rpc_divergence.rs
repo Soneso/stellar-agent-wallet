@@ -56,7 +56,11 @@ fn smart_account_sc_address() -> stellar_xdr::ScAddress {
 /// eight bytes: not the Display, Debug and source chain, the serialized
 /// form, the MCP error envelope, or the wallet's logs.
 #[test]
+#[serial_test::serial]
 fn verifier_hash_rpc_disagreement_returns_rpc_divergence() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
 
     // Write a valid baseline so rule_id=1 is not missing-baseline.

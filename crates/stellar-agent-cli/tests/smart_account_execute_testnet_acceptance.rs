@@ -249,7 +249,10 @@ fn run_cli(
     envs: &[(&str, &str)],
 ) -> (bool, serde_json::Value, String, String) {
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
+    stellar_agent_test_support::sandbox::mark_sandbox(&home.join("agent"))
+        .expect("mark fixture directory");
     let mut cmd = Command::new(bin_path);
+    cmd.args(cfg!(feature = "live-platform-keyring").then_some("--test-live-platform-keyring"));
     cmd.args(args)
         .env("STELLAR_AGENT_HOME", home.join("agent"))
         .env("HOME", home.join("home"))
@@ -412,6 +415,7 @@ async fn smart_account_execute_full_flow_testnet_acceptance() {
     // refuses before anything is signed or sent.
     let first_amount_scval = ScVal::I128(i128_parts(FIRST_TRANSFER_STROOPS));
     let empty_home = tempfile::tempdir().expect("tempdir must be created");
+    stellar_agent_test_support::sandbox::mark_sandbox(empty_home.path()).expect("marked sandbox");
     let empty_home_path = empty_home
         .path()
         .to_str()

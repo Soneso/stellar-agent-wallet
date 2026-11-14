@@ -436,6 +436,9 @@ mod tests {
     #[test]
     #[serial]
     fn binding_needs_the_pinned_owner_seed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = Fixture::new();
         let before = f.raw();
         assert_eq!(
@@ -460,6 +463,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_binding_writes_the_bind_signer_audit_row() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut f = Fixture::new();
         f.profile.audit_log_path = f.dir.path().join("audit.jsonl");
         stellar_agent_core::audit_log::AuditWriterRegistry::remove_for_test("v");
@@ -482,6 +488,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_keyring_failure_keeps_its_wallet_code() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = Fixture::new();
         let before = f.raw();
         let identity = signer_identity_entry_ref(&f.profile.mcp_signer_default);
@@ -500,6 +509,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_foreign_coordinate_cannot_be_bound() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = Fixture::new();
         let before = f.raw();
         let evil = Profile::builder_mainnet_named(
@@ -535,6 +547,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_record_of_another_profile_is_never_rebound() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = Fixture::new();
         let key =
             stellar_strkey::ed25519::PublicKey::from_string(&f.profile.mcp_signer_default.account)
@@ -561,6 +576,9 @@ mod tests {
     #[test]
     #[serial]
     fn the_agent_key_is_no_owner_proof() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = Fixture::new();
         let agent = SigningKey::from_bytes(&[21; 32]);
         f.pin(&agent, 2);
@@ -575,6 +593,9 @@ mod tests {
     #[test]
     #[serial]
     fn rebinding_follows_the_rotated_pin() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = Fixture::new();
         assert!(f.bind(&f.owner).unwrap());
         let next = SigningKey::from_bytes(&[12; 32]);

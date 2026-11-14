@@ -80,7 +80,11 @@ impl AccountReservesView for MockAccountView {
 // ── per_tx_cap ────────────────────────────────────────────────────────────────
 
 #[test]
+#[serial_test::serial]
 fn per_tx_cap_pay_under_cap_allows() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let tool = tool("stellar_pay");
     let profile = profile();
     let store = PolicyStateStore::new();
@@ -95,7 +99,11 @@ fn per_tx_cap_pay_under_cap_allows() {
 }
 
 #[test]
+#[serial_test::serial]
 fn per_tx_cap_pay_over_cap_denies() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let tool = tool("stellar_pay");
     let profile = profile();
     let store = PolicyStateStore::new();
@@ -113,7 +121,11 @@ fn per_tx_cap_pay_over_cap_denies() {
 }
 
 #[test]
+#[serial_test::serial]
 fn per_tx_cap_pay_at_cap_boundary_allows() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let tool = tool("stellar_pay");
     let profile = profile();
     let store = PolicyStateStore::new();
@@ -128,7 +140,11 @@ fn per_tx_cap_pay_at_cap_boundary_allows() {
 }
 
 #[test]
+#[serial_test::serial]
 fn per_tx_cap_create_over_cap_denies() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let tool = tool("stellar_create_account");
     let profile = profile();
     let store = PolicyStateStore::new();
@@ -147,7 +163,11 @@ fn per_tx_cap_create_over_cap_denies() {
 // ── per_period_cap ────────────────────────────────────────────────────────────
 
 #[test]
+#[serial_test::serial]
 fn per_period_cap_pay_over_cap_denies() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     // per_period_cap shares the sole_value_leg read path with per_tx_cap; on an
     // empty window the period total is the attempted amount alone, so an
     // over-cap pay must deny purely on the derived leg amount.
@@ -171,7 +191,11 @@ fn per_period_cap_pay_over_cap_denies() {
 // ── minimum_reserve ───────────────────────────────────────────────────────────
 
 #[test]
+#[serial_test::serial]
 fn minimum_reserve_pay_above_reserve_allows() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let tool = tool("stellar_pay");
     let profile = profile();
     let store = PolicyStateStore::new();
@@ -190,7 +214,11 @@ fn minimum_reserve_pay_above_reserve_allows() {
 }
 
 #[test]
+#[serial_test::serial]
 fn minimum_reserve_pay_breach_denies() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let tool = tool("stellar_pay");
     let profile = profile();
     let store = PolicyStateStore::new();
@@ -214,7 +242,11 @@ fn minimum_reserve_pay_breach_denies() {
 // ── counterparty_allowlist ────────────────────────────────────────────────────
 
 #[test]
+#[serial_test::serial]
 fn counterparty_allowlist_g_account_hit_allows() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let tool = tool("stellar_pay");
     let profile = profile();
     let store = PolicyStateStore::new();
@@ -232,7 +264,11 @@ fn counterparty_allowlist_g_account_hit_allows() {
 }
 
 #[test]
+#[serial_test::serial]
 fn counterparty_allowlist_g_account_miss_denies() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let tool = tool("stellar_pay");
     let profile = profile();
     let store = PolicyStateStore::new();
@@ -257,7 +293,11 @@ fn counterparty_allowlist_g_account_miss_denies() {
 /// pay exactly as the criterion does, exercising the engine's own derivation
 /// (the criterion never sees `args` for the amount).
 #[test]
+#[serial_test::serial]
 fn engine_derives_descriptor_and_denies_over_cap_pay() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::policy::PolicyEngine;
     use stellar_agent_core::policy::v1::PolicyEngineV1;
     use stellar_agent_core::policy::v1::loader::{PolicyDocument, PolicyRule, RuleMatch, ScopeId};

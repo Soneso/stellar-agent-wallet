@@ -231,7 +231,11 @@ async fn manager_with_server(server: &MockServer) -> (SignersManager, tempfile::
 ///
 /// Verifier diversification pre-flight gate 1: destination hash must be in the allowlist.
 #[test]
+#[serial_test::serial]
 fn preflight_unknown_destination_via_planner() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let requested: [u8; 32] = std::array::from_fn(|i| 0xb7 ^ u8::try_from(i).unwrap());
     assert!(
         VERIFIER_ALLOWLIST
@@ -317,7 +321,11 @@ fn preflight_unknown_destination_via_planner() {
 ///
 /// Verifier diversification pre-flight gate 3: destination verifier must be immutable.
 #[tokio::test]
+#[serial_test::serial]
 async fn preflight_mutable_destination_error_shape() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let server = MockServer::start().await;
     let dest_addr = addr(0xBE);
     let ledger_resp =
@@ -366,7 +374,11 @@ async fn preflight_mutable_destination_error_shape() {
 ///
 /// Verifier diversification pre-flight gate 2: destination verifier must not be revoked.
 #[tokio::test]
+#[serial_test::serial]
 async fn revoked_destination_error_shape() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let server = MockServer::start().await;
     let dest_addr = addr(0xEF);
     let ledger_resp =
@@ -441,7 +453,11 @@ async fn revoked_destination_error_shape() {
 ///
 /// Verifier diversification plan-build phase: zero-rule account produces an empty plan.
 #[tokio::test]
+#[serial_test::serial]
 async fn empty_plan_via_planner() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let server = MockServer::start().await;
 
     let dest_addr = addr(0xCD);
@@ -537,7 +553,11 @@ async fn empty_plan_via_planner() {
 ///
 /// Verifier diversification transaction-count invariant: 2 transactions per signer step.
 #[tokio::test]
+#[serial_test::serial]
 async fn plan_total_tx_count_two_per_signer_step() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let server = MockServer::start().await;
     let smart_account = addr(0x01);
     let dest_addr = addr(0xCD);
@@ -653,7 +673,11 @@ async fn plan_total_tx_count_two_per_signer_step() {
 ///
 /// Active-rule enumeration: sparse-ID gap handling in `collect_affected_rules`.
 #[tokio::test]
+#[serial_test::serial]
 async fn t9_sparse_id_migration_planner() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let server = MockServer::start().await;
 
     let smart_account = addr(0x01);
@@ -772,7 +796,11 @@ async fn t9_sparse_id_migration_planner() {
 /// rule 1 with the shared context-rule decoder and refuses it, so no per-rule
 /// read follows.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_rule_with_an_undecodable_signer_refuses_the_plan() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let server = MockServer::start().await;
     let smart_account = addr(0x01);
     let dest_addr = addr(0xCD);
@@ -842,7 +870,11 @@ async fn a_rule_with_an_undecodable_signer_refuses_the_plan() {
 /// one External signer (id `10`); rule 1 holds one External signer (id `20`)
 /// and a signer with id `21` that encodes `External` with four items.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_rule_with_a_surplus_item_signer_refuses_the_plan() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let server = MockServer::start().await;
     let smart_account = addr(0x01);
     let dest_addr = addr(0xCD);
@@ -926,7 +958,11 @@ async fn a_rule_with_a_surplus_item_signer_refuses_the_plan() {
 /// also holds a signer with id `21` whose tag is unknown, so the rule changed
 /// between the two reads.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_rule_that_gains_an_undecodable_signer_after_the_listing_refuses_the_plan() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let server = MockServer::start().await;
     let smart_account = addr(0x01);
     let dest_addr = addr(0xCD);
@@ -999,7 +1035,11 @@ async fn a_rule_that_gains_an_undecodable_signer_after_the_listing_refuses_the_p
 /// event log whose `fn_call` data renders the id. Rule 0 keeps the gap count
 /// apart from the id.
 #[test]
+#[serial_test::serial]
 fn a_rule_deleted_between_the_listing_and_the_read_refuses_without_its_id() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_test_support::rejected_value::{assert_no_marker, assert_no_marker_in_text};
 
     const RULE_ID: u32 = 189;
@@ -1155,7 +1195,11 @@ fn with_external_ref(
 /// allowlisted hash passes identification and fails the mutability preflight
 /// with a detail stating the check.
 #[test]
+#[serial_test::serial]
 fn external_ref_destination_fails_preflight_destination_mutable() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let dest_addr = addr(0xA1);
     let dest_strkey = scaddress_strkey(&dest_addr);
     let (err, logs) = traced(async {
@@ -1206,7 +1250,11 @@ fn external_ref_destination_fails_preflight_destination_mutable() {
 /// destination-unknown phase with the check, and the error holds the
 /// destination in no form.
 #[test]
+#[serial_test::serial]
 fn destination_without_wasm_code_reports_the_check() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let dest_addr = addr(0xA5);
     let dest_strkey = scaddress_strkey(&dest_addr);
     let (err, logs) = traced(async {
@@ -1251,7 +1299,11 @@ fn destination_without_wasm_code_reports_the_check() {
 /// with `sa.contract_instance_unsupported`, reason `ExternalRefUnresolved`,
 /// before the no-deployed-Wasm check.
 #[tokio::test]
+#[serial_test::serial]
 async fn unresolved_external_ref_destination_is_refused_as_unsupported() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let server = MockServer::start().await;
     let dest_addr = addr(0xA3);
     let ledger_resp = with_external_ref(
@@ -1302,7 +1354,11 @@ async fn unresolved_external_ref_destination_is_refused_as_unsupported() {
 /// The source scan plans a signer whose verifier is an external reference
 /// resolving to `from_hash`.
 #[tokio::test]
+#[serial_test::serial]
 async fn source_scan_plans_signer_whose_verifier_reference_resolves_to_from_hash() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let server = MockServer::start().await;
     let smart_account = addr(0x01);
     let dest_addr = addr(0xCD);
@@ -1408,7 +1464,11 @@ impl wiremock::Respond for SwitchingLedgerDispatcher {
 /// that the mutability probe then observes as immutable Wasm is refused with
 /// `ContractInstanceUnsupported { reason: ExecutableChanged }` and no plan.
 #[tokio::test]
+#[serial_test::serial]
 async fn destination_changing_executable_between_identification_and_probe_is_refused() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let server = MockServer::start().await;
     let dest_addr = addr(0xA6);
     // Identification: the destination is a reference resolving to the

@@ -32,9 +32,11 @@ run_case version-line-only off 1
 printf '#!/usr/bin/env bash\nprintf "stub 1\\n%soff\\n"\nexit 1\n' "$prefix" > "$tmp/binary"
 run_case version-exit off 1
 run_case invalid-expectation invalid 2
-for literal in STELLAR_AGENT_HOME STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE; do
+for literal in STELLAR_AGENT_HOME STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE .stellar-agent-test-sandbox; do
   printf '#!/usr/bin/env bash\nprintf "stub 1\\n%soff\\n"\n# %s\n' "$prefix" "$literal" > "$tmp/binary"
-  run_case "test-override-$literal" off 1
+  label="test-override-$literal"
+  [ "$literal" != .stellar-agent-test-sandbox ] || label='a binary holding the sandbox marker is refused'
+  run_case "$label" off 1
   expected_literal=$literal
   [ "$literal" != STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE ] || expected_literal=STELLAR_AGENT_TEST_
   if ! grep -Fq "marker: test override literal $expected_literal is embedded" "$tmp/output"; then

@@ -345,6 +345,9 @@ impl Fixture {
 #[tokio::test]
 #[serial]
 async fn success_report_keeps_the_reservation_and_finalizes_the_receipt() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = fixture("reconcile-success");
     let source = account_id_for_seed([0x11; 32]);
@@ -412,6 +415,9 @@ async fn success_report_keeps_the_reservation_and_finalizes_the_receipt() {
 #[tokio::test]
 #[serial]
 async fn success_with_undecodable_meta_keeps_the_reservation() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = fixture("reconcile-success-undecodable-meta");
     let source = account_id_for_seed([0x13; 32]);
@@ -471,6 +477,9 @@ async fn success_with_undecodable_meta_keeps_the_reservation() {
 #[tokio::test]
 #[serial]
 async fn success_report_does_not_backdate_spend() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = fixture("reconcile-success-close-time");
     let source = account_id_for_seed([0x12; 32]);
@@ -543,6 +552,9 @@ async fn success_report_does_not_backdate_spend() {
 #[tokio::test]
 #[serial]
 async fn failed_retains_the_reservation_and_writes_no_failed_row() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = fixture("reconcile-failed");
     let source = account_id_for_seed([0x12; 32]);
@@ -592,6 +604,9 @@ async fn failed_retains_the_reservation_and_writes_no_failed_row() {
 #[tokio::test]
 #[serial]
 async fn not_found_with_a_consumed_sequence_retains_the_reservation() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = fixture("reconcile-consumed");
     let source = account_id_for_seed([0x13; 32]);
@@ -660,6 +675,9 @@ async fn not_found_with_a_consumed_sequence_retains_the_reservation() {
 #[tokio::test]
 #[serial]
 async fn not_found_with_a_passed_time_bound_retains_the_reservation() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = fixture("reconcile-maxtime");
     let source = account_id_for_seed([0x14; 32]);
@@ -735,6 +753,9 @@ async fn not_found_with_a_passed_time_bound_retains_the_reservation() {
 #[tokio::test]
 #[serial]
 async fn not_found_with_an_unconsumed_sequence_keeps_the_reservation() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = fixture("reconcile-keep");
     let source = account_id_for_seed([0x15; 32]);
@@ -805,6 +826,9 @@ async fn not_found_with_an_unconsumed_sequence_keeps_the_reservation() {
 #[tokio::test]
 #[serial]
 async fn not_found_past_the_retention_floor_keeps_the_reservation() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = fixture("reconcile-retention");
     let source = account_id_for_seed([0x16; 32]);
@@ -882,6 +906,9 @@ async fn not_found_past_the_retention_floor_keeps_the_reservation() {
 #[tokio::test]
 #[serial]
 async fn a_pass_is_bounded_and_takes_the_oldest_due_reservations() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = fixture("reconcile-budget");
     let source = account_id_for_seed([0x17; 32]);
@@ -961,6 +988,9 @@ async fn a_pass_is_bounded_and_takes_the_oldest_due_reservations() {
 #[tokio::test]
 #[serial]
 async fn a_transport_failure_settles_nothing() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = fixture("reconcile-transport");
     let source = account_id_for_seed([0x18; 32]);
@@ -1021,6 +1051,9 @@ async fn a_transport_failure_settles_nothing() {
 #[tokio::test]
 #[serial]
 async fn reconcile_one_examines_a_named_reservation_whatever_its_age() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = fixture("reconcile-named");
     let source = account_id_for_seed([0x19; 32]);
@@ -1087,6 +1120,9 @@ async fn reconcile_one_examines_a_named_reservation_whatever_its_age() {
 #[tokio::test]
 #[serial]
 async fn reservations_the_endpoint_cannot_answer_for_do_not_hold_the_budget() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = fixture("reconcile-starve");
     let source = account_id_for_seed([0x21; 32]);
@@ -1158,6 +1194,9 @@ async fn reservations_the_endpoint_cannot_answer_for_do_not_hold_the_budget() {
 #[tokio::test]
 #[serial]
 async fn the_automatic_pass_finishes_a_checkpointed_accounting_expiry() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = fixture("reconcile-release-checkpoint");
     let source = account_id_for_seed([0x37; 32]);
@@ -1298,6 +1337,9 @@ async fn the_automatic_pass_finishes_a_checkpointed_accounting_expiry() {
 #[tokio::test]
 #[serial]
 async fn a_checkpointed_evidence_release_beyond_retention_keeps_the_reservation() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = fixture("reconcile-release-retention");
     let source = account_id_for_seed([0x38; 32]);
@@ -1357,6 +1399,9 @@ async fn a_checkpointed_evidence_release_beyond_retention_keeps_the_reservation(
 #[tokio::test]
 #[serial]
 async fn a_pending_reservation_is_not_pruned_by_age() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = fixture("reconcile-prune");
     let source = account_id_for_seed([0x22; 32]);
@@ -1426,6 +1471,9 @@ async fn a_pending_reservation_is_not_pruned_by_age() {
 #[tokio::test]
 #[serial]
 async fn an_orphaned_reservation_stands_after_its_sequence_is_consumed() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = fixture("reconcile-orphan");
     let source = account_id_for_seed([0x23; 32]);
@@ -1543,6 +1591,9 @@ async fn an_orphaned_reservation_stands_after_its_sequence_is_consumed() {
 #[tokio::test]
 #[serial]
 async fn a_local_receipt_read_failure_refuses_clear_and_keeps_the_reservation_counted() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = fixture("reconcile-unreadable");
     let source = account_id_for_seed([0x24; 32]);
@@ -1637,6 +1688,9 @@ async fn a_local_receipt_read_failure_refuses_clear_and_keeps_the_reservation_co
 #[tokio::test]
 #[serial]
 async fn transaction_landing_during_sequence_read_keeps_its_debit() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let now = now_ms();
@@ -1707,6 +1761,9 @@ async fn transaction_landing_during_sequence_read_keeps_its_debit() {
 #[tokio::test]
 #[serial]
 async fn lost_receipt_success_preserves_spend_and_restores_identity() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = fixture("reconcile-lost-receipt");
     let source = account_id_for_seed([0x26; 32]);
@@ -1769,6 +1826,9 @@ async fn lost_receipt_success_preserves_spend_and_restores_identity() {
 #[tokio::test]
 #[serial]
 async fn lost_receipt_outside_retention_keeps_the_reservation() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = fixture("reconcile-lost-retention");
     let source = account_id_for_seed([0x27; 32]);
@@ -1814,6 +1874,9 @@ async fn lost_receipt_outside_retention_keeps_the_reservation() {
 #[tokio::test]
 #[serial]
 async fn confirmation_without_a_valid_close_time_keeps_the_hold() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = fixture("confirm-no-time");
     let res = reservation(
@@ -1838,6 +1901,9 @@ async fn confirmation_without_a_valid_close_time_keeps_the_hold() {
 #[tokio::test]
 #[serial]
 async fn host_clock_ahead_and_invalid_chain_times_keep_headroom() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     for (close_delta, oldest_delta) in [(0, 0), (-10, -20), (10, 20)] {
         let now = now_ms();
         let fx = fixture("chain-clock-validation");
@@ -1900,6 +1966,9 @@ async fn host_clock_ahead_and_invalid_chain_times_keep_headroom() {
 #[tokio::test]
 #[serial]
 async fn time_bound_fresh_answer_records_success_and_retains_failure() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use std::sync::atomic::{AtomicUsize, Ordering};
     for status in ["SUCCESS", "FAILED"] {
         let now = now_ms();
@@ -1967,6 +2036,9 @@ async fn time_bound_fresh_answer_records_success_and_retains_failure() {
 #[tokio::test]
 #[serial]
 async fn unavailable_ledgers_leave_sequence_settlement_available() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     for sequence in [9, 1] {
         let now = now_ms();
         let fx = fixture("ledgers-unavailable");
@@ -2022,6 +2094,9 @@ async fn unavailable_ledgers_leave_sequence_settlement_available() {
 #[tokio::test]
 #[serial]
 async fn orphan_markers_survive_restart_and_free_the_next_pass_budget() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = fixture("orphan-budget");
     let source = account_id_for_seed([0x33; 32]);
@@ -2086,6 +2161,9 @@ async fn orphan_markers_survive_restart_and_free_the_next_pass_budget() {
 #[tokio::test]
 #[serial]
 async fn failed_orphan_marker_write_keeps_the_reservation_selectable() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = fixture("orphan-marker-failure");
     let res = reservation(
@@ -2144,6 +2222,9 @@ async fn failed_orphan_marker_write_keeps_the_reservation_selectable() {
 #[tokio::test]
 #[serial]
 async fn chain_observation_is_shared_and_charged_once_per_pass() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = fixture("shared-chain-observation");
     let source = account_id_for_seed([0x34; 32]);
@@ -2199,6 +2280,9 @@ async fn chain_observation_is_shared_and_charged_once_per_pass() {
 #[tokio::test]
 #[serial]
 async fn an_endpoint_failure_survives_a_later_successful_read() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = fixture("reconcile-failure-channel");
     let source = account_id_for_seed([0x35; 32]);
@@ -2309,6 +2393,9 @@ async fn mount_reconcile_answers(
 #[tokio::test]
 #[serial]
 async fn a_success_waits_for_its_receipt_and_retries() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = fixture("reconcile-checkpoint");
     let source = account_id_for_seed([0x36; 32]);
@@ -2442,6 +2529,9 @@ async fn assert_expiry_commits_before_projection(missing: bool) {
 #[tokio::test]
 #[serial]
 async fn an_accounting_expiry_commits_before_its_receipt_and_retries() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     assert_expiry_commits_before_projection(false).await;
 }
 
@@ -2450,6 +2540,9 @@ async fn an_accounting_expiry_commits_before_its_receipt_and_retries() {
 #[tokio::test]
 #[serial]
 async fn a_missing_receipt_is_rebuilt_after_accounting_expiry() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     assert_expiry_commits_before_projection(true).await;
 }
 
@@ -2461,6 +2554,9 @@ async fn a_missing_receipt_is_rebuilt_after_accounting_expiry() {
 #[tokio::test]
 #[serial]
 async fn a_backdated_success_keeps_the_spend_in_the_window() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = fixture("reconcile-success-backdated");
     let source = account_id_for_seed([0x15; 32]);
@@ -2519,6 +2615,9 @@ async fn a_backdated_success_keeps_the_spend_in_the_window() {
 #[tokio::test]
 #[serial]
 async fn a_reservation_without_a_submission_ledger_never_releases_on_not_found() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = fixture("reconcile-ledger-zero");
     let source = account_id_for_seed([0x16; 32]);
@@ -2643,6 +2742,9 @@ fn the_decision_id_encoding_has_a_known_answer() {
 #[serial]
 #[cfg(feature = "test-hooks")]
 async fn authentic_decision_overrides_forged_release_code() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use base64::Engine as _;
     use stellar_agent_core::audit_log::{AuditWriter, EventKind};
 
@@ -2778,6 +2880,9 @@ async fn authentic_decision_overrides_forged_release_code() {
 #[tokio::test]
 #[serial]
 async fn a_forged_release_code_does_not_release_the_reservation() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = fixture("reconcile-forged-not-found");
     let source = account_id_for_seed([0x17; 32]);
@@ -2842,6 +2947,9 @@ async fn a_forged_release_code_does_not_release_the_reservation() {
 #[tokio::test]
 #[serial]
 async fn a_forged_release_code_does_not_stop_a_success_confirming() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = fixture("reconcile-forged-success");
     let source = account_id_for_seed([0x18; 32]);
@@ -3022,6 +3130,9 @@ impl Respond for IdentityResponder {
 #[tokio::test]
 #[serial]
 async fn a_mainnet_failed_answer_the_oracle_reports_applied_confirms() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = mainnet_fixture("reconcile-mainnet-oracle-success");
     let source = account_id_for_seed([0x41; 32]);
@@ -3063,6 +3174,9 @@ async fn a_mainnet_failed_answer_the_oracle_reports_applied_confirms() {
 #[tokio::test]
 #[serial]
 async fn a_mainnet_failed_answer_the_oracle_confirms_retains_the_reservation() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = mainnet_fixture("reconcile-mainnet-oracle-failed");
     let source = account_id_for_seed([0x42; 32]);
@@ -3108,6 +3222,9 @@ async fn a_mainnet_failed_answer_the_oracle_confirms_retains_the_reservation() {
 #[tokio::test]
 #[serial]
 async fn a_mainnet_failed_answer_without_an_oracle_answer_stands() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     for with_oracle in [true, false] {
         let now = now_ms();
         let fx = mainnet_fixture(if with_oracle {
@@ -3154,6 +3271,9 @@ async fn a_mainnet_failed_answer_without_an_oracle_answer_stands() {
 #[tokio::test]
 #[serial]
 async fn a_mainnet_sequence_observation_reads_the_oracle() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = mainnet_fixture("reconcile-mainnet-oracle-sequence");
     let source = account_id_for_seed([0x44; 32]);
@@ -3210,6 +3330,9 @@ async fn a_mainnet_sequence_observation_reads_the_oracle() {
 #[tokio::test]
 #[serial]
 async fn a_mainnet_oracle_time_bound_retains_the_reservation() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = mainnet_fixture("reconcile-mainnet-oracle-time");
     let source = account_id_for_seed([0x45; 32]);
@@ -3261,6 +3384,9 @@ async fn a_mainnet_oracle_time_bound_retains_the_reservation() {
 #[tokio::test]
 #[serial]
 async fn a_named_mainnet_reservation_stands_on_the_oracle_sequence() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = mainnet_fixture("reconcile-mainnet-oracle-one");
     let source = account_id_for_seed([0x46; 32]);
@@ -3327,6 +3453,9 @@ async fn oracle_would_release(endpoints: &Endpoints, now: u64, source: &str) {
 #[tokio::test]
 #[serial]
 async fn a_mainnet_oracle_on_another_network_settles_nothing() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = mainnet_fixture("reconcile-mainnet-oracle-testnet");
     let source = account_id_for_seed([0x47; 32]);
@@ -3373,6 +3502,9 @@ async fn a_mainnet_oracle_on_another_network_settles_nothing() {
 #[tokio::test]
 #[serial]
 async fn a_mainnet_oracle_whose_identity_cannot_be_read_settles_nothing() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = mainnet_fixture("reconcile-mainnet-oracle-anonymous");
     let source = account_id_for_seed([0x48; 32]);
@@ -3423,6 +3555,9 @@ async fn assert_no_legacy_settlement(report: &ReconcileReport, endpoints: &Endpo
 #[tokio::test]
 #[serial]
 async fn a_mainnet_oracle_on_an_unsupported_protocol_settles_nothing() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = mainnet_fixture("reconcile-mainnet-oracle-protocol");
     let source = account_id_for_seed([0x49; 32]);
@@ -3461,6 +3596,9 @@ async fn a_mainnet_oracle_on_an_unsupported_protocol_settles_nothing() {
 #[tokio::test]
 #[serial]
 async fn an_oracle_identity_request_that_fails_is_counted_and_not_retried() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = mainnet_fixture("reconcile-mainnet-oracle-identity-500");
     let source = account_id_for_seed([0x4a; 32]);
@@ -3513,6 +3651,9 @@ async fn an_oracle_identity_request_that_fails_is_counted_and_not_retried() {
 #[tokio::test]
 #[serial]
 async fn a_mainnet_oracle_whose_identity_answers_late_settles_nothing() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     const IDENTITY_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
     let now = now_ms();
     let fx = mainnet_fixture("reconcile-mainnet-oracle-identity-late");
@@ -3556,6 +3697,9 @@ async fn a_mainnet_oracle_whose_identity_answers_late_settles_nothing() {
 #[tokio::test]
 #[serial]
 async fn chain_flip_refuses_before_reconciliation() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = mainnet_fixture("chain-flip");
     let now = now_ms();
     let hold = reservation(
@@ -3621,6 +3765,9 @@ async fn chain_flip_refuses_before_reconciliation() {
 #[tokio::test]
 #[serial]
 async fn inflated_primary_anchor_and_delayed_absence_retain_exposure() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let now = now_ms();
     let fx = mainnet_fixture("inflated-anchor");
     let source = account_id_for_seed([0x31; 32]);
@@ -3746,6 +3893,9 @@ async fn reported_success_keeps_short_window(delayed: bool) {
 #[serial]
 #[cfg(feature = "test-hooks")]
 async fn delayed_success_does_not_backdate_accounting() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     reported_success_keeps_short_window(true).await;
 }
 
@@ -3753,6 +3903,9 @@ async fn delayed_success_does_not_backdate_accounting() {
 #[serial]
 #[cfg(feature = "test-hooks")]
 async fn early_success_retains_deadline_plus_short_window() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     reported_success_keeps_short_window(false).await;
 }
 
@@ -3802,11 +3955,17 @@ async fn assert_negative_answers(answers: Vec<serde_json::Value>) {
 #[tokio::test]
 #[serial]
 async fn hostile_oracle_failure_retains_executable_spending() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     assert_negative_answers(vec![get_transaction_failed()]).await;
 }
 
 #[tokio::test]
 #[serial]
 async fn malformed_failure_and_absence_retain_exposure() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     assert_negative_answers(vec![json!({"status": "FAILED", "latestLedger": 2000, "oldestLedger": 1, "resultXdr": "malformed"}), get_transaction("NOT_FOUND")]).await;
 }

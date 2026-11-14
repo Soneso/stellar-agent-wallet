@@ -569,6 +569,9 @@ mod tests {
     #[test]
     #[serial]
     fn empty_window_allows() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -583,6 +586,9 @@ mod tests {
     #[test]
     #[serial]
     fn window_with_history_still_under_cap_allows() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -607,6 +613,9 @@ mod tests {
     #[test]
     #[serial]
     fn would_exceed_cap_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -631,6 +640,9 @@ mod tests {
     #[test]
     #[serial]
     fn confirmed_ledger_time_ahead_of_host_is_counted_by_the_gate() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -665,6 +677,9 @@ mod tests {
     #[test]
     #[serial]
     fn clock_skew_over_30s_returns_evaluation_failed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -698,6 +713,9 @@ mod tests {
     #[test]
     #[serial]
     fn asset_mismatch_criterion_does_not_apply() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -718,6 +736,9 @@ mod tests {
     #[test]
     #[serial]
     fn create_account_starting_balance_participates_in_period_cap() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_create_account");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -736,6 +757,9 @@ mod tests {
     #[test]
     #[serial]
     fn exact_period_cap_boundary_is_allowed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -754,6 +778,9 @@ mod tests {
     #[test]
     #[serial]
     fn exact_period_cap_boundary_with_existing_history_is_allowed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -776,6 +803,9 @@ mod tests {
     #[test]
     #[serial]
     fn xlm_configured_period_cap_matches_native_tool_asset() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -797,6 +827,9 @@ mod tests {
     #[test]
     #[serial]
     fn evaluate_with_bundle_overlay_single_tx_none_sees_zero_overlay() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -825,6 +858,9 @@ mod tests {
     #[test]
     #[serial]
     fn evaluate_with_bundle_overlay_accumulated_stroops_added_to_window() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::bundle::{BundleStateOverlay, BundleView};
 
         let tool = make_tool("stellar_pay");
@@ -882,6 +918,9 @@ mod tests {
     #[test]
     #[serial]
     fn pay_simulate_amount_in_stroops_shape_cap_under_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -906,6 +945,9 @@ mod tests {
     #[test]
     #[serial]
     fn pay_commit_authoritative_args_shape_cap_over_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay_commit");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -933,6 +975,9 @@ mod tests {
     #[test]
     #[serial]
     fn create_account_simulate_resolved_only_shape_cap_over_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_create_account");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -957,6 +1002,9 @@ mod tests {
     #[test]
     #[serial]
     fn create_account_commit_authoritative_args_shape_cap_over_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_create_account_commit");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -981,6 +1029,9 @@ mod tests {
     #[test]
     #[serial]
     fn legacy_amount_only_shape_still_evaluates_identically() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -1000,6 +1051,9 @@ mod tests {
     #[test]
     #[serial]
     fn version_crossing_numeric_amount_stroops_still_parses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -1038,6 +1092,9 @@ mod tests {
     #[test]
     #[serial]
     fn moves_value_tool_with_unpopulated_effects_denies_unsizable() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool_with_kind(
             "stellar_dex_trade",
             crate::policy::ToolValueKind::MovesValue,
@@ -1059,6 +1116,9 @@ mod tests {
     #[test]
     #[serial]
     fn opaque_sign_call_denies_unsizable_on_single_tx() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_sep43_sign_transaction");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -1079,6 +1139,9 @@ mod tests {
     #[test]
     #[serial]
     fn two_leg_native_value_aggregates_over_cap_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
 
         let tool = make_tool("stellar_multicall");
@@ -1120,6 +1183,9 @@ mod tests {
     #[test]
     #[serial]
     fn debit_leg_amount_beyond_i64_max_denies_without_clamp() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
 
         let tool = make_tool("stellar_multicall");
@@ -1154,6 +1220,9 @@ mod tests {
     #[test]
     #[serial]
     fn cap_aggregates_only_debit_legs_not_inflow_legs() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
 
         let tool = make_tool("stellar_dex_trade");
@@ -1197,6 +1266,9 @@ mod tests {
     #[test]
     #[serial]
     fn window_total_above_i64_max_denies_at_exact_cap_boundary() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
 
         let tool = make_tool("stellar_multicall");
@@ -1242,6 +1314,9 @@ mod tests {
     #[test]
     #[serial]
     fn window_total_above_i64_max_allows_when_still_under_cap() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
 
         let tool = make_tool("stellar_multicall");

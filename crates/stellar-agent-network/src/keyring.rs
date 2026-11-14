@@ -182,7 +182,10 @@ pub fn map_keyring_operation_error(
 ///
 /// # Errors
 ///
-/// Returns [`WalletError::Auth`] wrapping [`AuthError::KeyringConfigInvalid`]
+/// In isolated builds, an existing store remains registered.
+/// Otherwise, only recognized headless backends initialize; all other selectors return an isolation error before native construction.
+///
+/// In production, returns [`WalletError::Auth`] wrapping [`AuthError::KeyringConfigInvalid`]
 /// if `STELLAR_AGENT_KEYRING_BACKEND` selects a headless backend that cannot
 /// be set up. The causes are an unrecognized backend value, a missing or
 /// malformed `STELLAR_AGENT_HEADLESS_KEYRING_KEY`, a backend the platform does
@@ -205,6 +208,32 @@ pub fn map_keyring_operation_error(
 /// init_platform_keyring_store().expect("platform keyring unavailable");
 /// ```
 pub fn init_platform_keyring_store() -> Result<(), WalletError> {
+    #[cfg(any(test, feature = "test-helpers"))]
+    {
+        if keyring_core::get_default_store().is_some() {
+            return Ok(());
+        }
+        if let Some(backend) = stellar_agent_headless_keyring::requested_backend()
+            && matches!(backend.as_str(), "headless-env" | "headless-dpapi")
+        {
+            return stellar_agent_headless_keyring::init_headless_store(&backend).map_err(
+                |error| {
+                    WalletError::Auth(AuthError::KeyringConfigInvalid {
+                        detail: error.to_string(),
+                    })
+                },
+            );
+        }
+        Err(platform_store_init_failure(
+            "STELLAR_AGENT_TEST_STORAGE_ISOLATED: STELLAR_AGENT_KEYRING_BACKEND requires an isolated store",
+        ))
+    }
+    #[cfg(not(any(test, feature = "test-helpers")))]
+    init_production_store()
+}
+
+#[cfg(not(any(test, feature = "test-helpers")))]
+fn init_production_store() -> Result<(), WalletError> {
     #[cfg(feature = "test-hooks")]
     if KEEP_REGISTERED_STORE.load(std::sync::atomic::Ordering::SeqCst)
         && keyring_core::get_default_store().is_some()
@@ -223,6 +252,14 @@ pub fn init_platform_keyring_store() -> Result<(), WalletError> {
         });
     }
 
+    construct_native_store()
+}
+
+#[cfg(any(
+    not(any(test, feature = "test-helpers")),
+    feature = "live-platform-keyring"
+))]
+fn construct_native_store() -> Result<(), WalletError> {
     #[cfg(target_os = "macos")]
     {
         use apple_native_keyring_store::keychain::Store;
@@ -248,6 +285,54 @@ pub fn init_platform_keyring_store() -> Result<(), WalletError> {
     Err(platform_store_init_failure(
         "unsupported-platform credential store initialization failed",
     ))
+}
+
+/// Counts forbidden native factory requests in isolated builds.
+#[cfg(all(
+    any(test, feature = "test-helpers"),
+    not(feature = "live-platform-keyring")
+))]
+static NATIVE_STORE_REQUESTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(all(
+    any(test, feature = "test-helpers"),
+    not(feature = "live-platform-keyring")
+))]
+#[allow(
+    dead_code,
+    reason = "isolated builds compile the factory name without a native constructor"
+)]
+fn construct_native_store() -> Result<(), WalletError> {
+    NATIVE_STORE_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Err(platform_store_init_failure(
+        "STELLAR_AGENT_TEST_STORAGE_ISOLATED",
+    ))
+}
+
+/// Explicit access to real platform storage for live acceptance suites.
+#[cfg(feature = "live-platform-keyring")]
+pub mod live {
+    /// Acknowledges real platform keyring access.
+    pub struct LivePlatformKeyring(());
+
+    impl LivePlatformKeyring {
+        /// Grants real platform keyring access to a live acceptance suite.
+        #[must_use]
+        pub fn acknowledge_real_platform_keyring() -> Self {
+            Self(())
+        }
+    }
+
+    /// Installs the real native store.
+    ///
+    /// # Errors
+    /// Returns the platform initialization error when the store is unavailable.
+    pub fn init_platform_keyring_store_live(
+        _: LivePlatformKeyring,
+    ) -> Result<(), super::WalletError> {
+        super::construct_native_store()
+    }
 }
 
 /// The keyring backend a process stores its entries in.
@@ -435,6 +520,7 @@ fn platform_store_init_failure(label: &str) -> WalletError {
     })
 }
 
+#[cfg(any(test, not(feature = "test-helpers"), feature = "live-platform-keyring"))]
 fn install_platform_store(
     store: keyring_core::Result<Arc<keyring_core::CredentialStore>>,
 ) -> Result<(), WalletError> {
@@ -2175,6 +2261,60 @@ mod tests {
     use stellar_agent_core::error::ErrorCategory;
     use stellar_agent_test_support::{CaptureWriter, keyring_mock};
 
+    #[test]
+    #[serial_test::serial]
+    fn isolated_init_refuses_and_requests_no_native_store() {
+        use stellar_agent_test_support::env_guard::ScopedEnvVar;
+        let _store = RestoreStore::new();
+        let _live = ScopedEnvVar::new(
+            "STELLAR_AGENT_TEST_LIVE_PLATFORM_KEYRING",
+            Some(std::ffi::OsStr::new("real-platform-keyring")),
+        );
+        let mut selectors = vec![
+            None,
+            Some(std::ffi::OsString::new()),
+            Some("unknown".into()),
+        ];
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            selectors.push(Some(std::ffi::OsString::from_vec(vec![0xff])));
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+            selectors.push(Some(std::ffi::OsString::from_wide(&[0xd800])));
+        }
+        for selector in selectors {
+            let _env = ScopedEnvVar::new("STELLAR_AGENT_KEYRING_BACKEND", selector.as_deref());
+            assert!(
+                init_platform_keyring_store()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("STELLAR_AGENT_TEST_STORAGE_ISOLATED")
+            );
+            assert!(keyring_core::get_default_store().is_none());
+            #[cfg(not(feature = "live-platform-keyring"))]
+            assert_eq!(
+                NATIVE_STORE_REQUESTS.load(std::sync::atomic::Ordering::SeqCst),
+                0
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn isolated_init_keeps_the_registered_store() {
+        let _store = RestoreStore::new();
+        keyring_mock::install().unwrap();
+        let original = keyring_core::get_default_store().unwrap();
+        assert!(init_platform_keyring_store().is_ok());
+        assert!(Arc::ptr_eq(
+            &original,
+            &keyring_core::get_default_store().unwrap()
+        ));
+    }
+
     struct RestoreStore(Option<Arc<keyring_core::CredentialStore>>);
     impl RestoreStore {
         fn new() -> Self {
@@ -2277,6 +2417,8 @@ mod tests {
     #[serial_test::serial]
     fn platform_store_initialization_failure_is_platform_error() {
         let _restore = RestoreStore::new();
+        #[cfg(not(feature = "live-platform-keyring"))]
+        let requests = NATIVE_STORE_REQUESTS.load(std::sync::atomic::Ordering::SeqCst);
         let expected = if cfg!(target_os = "macos") {
             "keyring operation failed: macOS Keychain store initialization failed"
         } else if cfg!(target_os = "linux") {
@@ -2297,18 +2439,39 @@ mod tests {
                 ))),
                 "credential store access denied (OS error 13)",
             ),
+            #[cfg(target_os = "linux")]
+            (
+                keyring_core::Error::PlatformFailure(Box::new(std::io::Error::other(
+                    "service unavailable",
+                ))),
+                "credential store operation failed",
+            ),
+            #[cfg(target_os = "windows")]
+            (
+                keyring_core::Error::NoStorageAccess(Box::new(std::io::Error::from_raw_os_error(
+                    1312,
+                ))),
+                "credential store requires an interactive logon session",
+            ),
         ] {
             let error = install_platform_store(Err(error)).unwrap_err();
             assert_eq!(error.code(), "auth.keyring_platform_error");
             assert_eq!(error.message(), format!("{expected}: {cause}"));
             assert!(!format!("{error:?}").contains("secret-sentinel"));
         }
+        #[cfg(not(feature = "live-platform-keyring"))]
+        assert_eq!(
+            NATIVE_STORE_REQUESTS.load(std::sync::atomic::Ordering::SeqCst),
+            requests
+        );
     }
 
     #[test]
     #[serial_test::serial]
     #[cfg(target_os = "windows")]
     fn dpapi_protect_failure_reaches_wallet_error() {
+        #[cfg(not(feature = "live-platform-keyring"))]
+        let requests = NATIVE_STORE_REQUESTS.load(std::sync::atomic::Ordering::SeqCst);
         use stellar_agent_headless_keyring::crypto::{
             DpapiError, ProtectionMode, with_dpapi_protect_result,
         };
@@ -2360,6 +2523,11 @@ mod tests {
                 "keyring operation failed: write headless-dpapi: headless-dpapi could not protect the value"
             );
         });
+        #[cfg(not(feature = "live-platform-keyring"))]
+        assert_eq!(
+            NATIVE_STORE_REQUESTS.load(std::sync::atomic::Ordering::SeqCst),
+            requests
+        );
     }
 
     #[test]
@@ -2413,6 +2581,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn enrolled_mainnet_placeholder_refuses_before_store_read() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let profile = enrolled_profile(true, "default");
         let entry = &profile.mcp_signer_default;
@@ -2434,6 +2605,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn enrolled_mainnet_malformed_refuses_before_store_read() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let profile = enrolled_profile(true, "malformed");
         let entry = &profile.mcp_signer_default;
@@ -2455,6 +2629,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn enrolled_stored_b_expected_a() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let profile = enrolled_profile(true, &gstrkey_for_seed([1; 32]));
         bind_identity(&profile, [1; 32]);
@@ -2475,6 +2652,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn enrolled_stored_b_expected_b() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let profile = enrolled_profile(true, &gstrkey_for_seed([1; 32]));
         bind_identity(&profile, [1; 32]);
@@ -2495,6 +2675,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn enrolled_stored_a_expected_b() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let profile = enrolled_profile(true, &gstrkey_for_seed([1; 32]));
         bind_identity(&profile, [1; 32]);
@@ -2515,6 +2698,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn enrolled_stored_a_expected_a() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let profile = enrolled_profile(true, &gstrkey_for_seed([1; 32]));
         bind_identity(&profile, [1; 32]);
@@ -2535,6 +2721,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn enrolled_testnet_stored_a_expected_a() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let profile = enrolled_profile(false, &gstrkey_for_seed([1; 32]));
         bind_identity(&profile, [1; 32]);
@@ -2550,6 +2739,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn enrolled_testnet_placeholder_preserves_keyring_errors() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let profile = enrolled_profile(false, "default");
         bind_identity(&profile, [1; 32]);
@@ -3452,6 +3644,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn an_absent_binding_is_recorded_under_enforce_and_a_changed_path_then_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let mut profile = bound_profile("bind-enforce", "/data/audit/one.jsonl");
         assert!(
@@ -3482,6 +3677,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_keyless_profile_records_no_binding() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let mut profile =
             Profile::builder_testnet_named("bind-keyless", "s", "a", "n", "a").build();
@@ -3502,6 +3700,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn the_access_carries_the_binding_history_from_before_the_call() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let profile = bound_profile("bind-history", "/data/audit/one.jsonl");
 
@@ -3527,6 +3728,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn check_only_records_nothing_and_refuses_a_changed_record() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let mut profile = bound_profile("bind-check", "/data/audit/one.jsonl");
 
@@ -3560,6 +3764,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_changed_path_refuses_before_the_hmac_key_load() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let mut profile = bound_profile("bind-order", "/data/audit/one.jsonl");
         keyed_audit_access(&profile, "bind-order", BindingCheck::Enforce).expect("record");
@@ -3585,6 +3792,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_changed_audit_key_coordinate_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let mut profile = bound_profile("bind-key", "/data/audit/one.jsonl");
         keyed_audit_access(&profile, "bind-key", BindingCheck::Enforce).expect("record");
@@ -3601,6 +3811,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn an_unparseable_record_refuses_under_both_checks() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let profile = bound_profile("bind-garbage", "/data/audit/one.jsonl");
         write_keyring_string(
@@ -3623,6 +3836,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_binding_write_error_fails_the_acquisition_with_the_keyring_code() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let coordinate = KeyringEntryRef::default_audit_binding("bind-write");
         keyring_mock::install_with_write_error(
             &coordinate.service,
@@ -3646,6 +3862,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_binding_read_error_fails_closed_and_writes_nothing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let profile = bound_profile("bind-read", "/data/audit/one.jsonl");
         let coordinate = KeyringEntryRef::default_audit_binding("bind-read");
@@ -3668,6 +3887,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn keyed_audit_access_refuses_the_owner_public_key() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let profile = bound_profile("owner-audit", "/data/audit/owner.jsonl");
         let older_form = URL_SAFE_NO_PAD.encode([0x4d; 32]);
@@ -3686,6 +3908,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn keyed_audit_access_refuses_a_g_strkey_owner_value() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let profile = bound_profile("owner-audit-strkey", "/data/audit/strkey.jsonl");
         write_keyring_string(
@@ -3704,6 +3929,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn keyed_audit_access_refuses_an_owner_coordinate_without_a_read() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let mut profile = bound_profile("owner-audit-coord", "/data/audit/coord.jsonl");
         profile.audit_log_hash_chain_key_id =
@@ -4107,6 +4335,9 @@ mod tests {
         #[test]
         #[serial_test::serial]
         fn a_transplanted_signer_refuses_before_seed_access() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let key = ed25519_dalek::SigningKey::from_bytes(&[21; 32])
                 .verifying_key()
                 .to_bytes();
@@ -4180,6 +4411,9 @@ mod tests {
         #[test]
         #[serial_test::serial]
         fn an_unbound_record_refuses_on_mainnet() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let raw = format!(r#"{{"v":1,"public_key":"{}","role":"agent"}}"#, pin());
             let (dir, profile) = stored(&pin(), Some(&raw));
             assert_eq!(
@@ -4204,6 +4438,9 @@ mod tests {
         #[test]
         #[serial_test::serial]
         fn the_owner_must_match_and_sign() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let (dir, profile) = stored(&pin(), Some(&agent_record()));
             assert_eq!(
                 unusable(enrolled_signer(
@@ -4233,6 +4470,9 @@ mod tests {
         #[test]
         #[serial_test::serial]
         fn a_mainnet_check_needs_the_established_owner() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let profile = profile_with(&pin());
             let record = SignerIdentityRecord::parse(&agent_record()).unwrap();
             assert_eq!(
@@ -4253,6 +4493,9 @@ mod tests {
         #[tokio::test]
         #[serial_test::serial]
         async fn a_seed_without_its_record_signs_for_no_profile() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let profile =
                 Profile::builder_testnet_named("enrolled", SERVICE, &pin(), "n", "a").build();
             SEED_READS.store(0, Ordering::SeqCst);
@@ -4291,6 +4534,9 @@ mod tests {
         #[test]
         #[serial_test::serial]
         fn a_testnet_v1_record_warns_and_passes() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let raw = format!(r#"{{"v":1,"public_key":"{}","role":"agent"}}"#, pin());
             let record = SignerIdentityRecord::parse(&raw).unwrap();
             let profile =
@@ -4323,6 +4569,9 @@ mod tests {
         #[test]
         #[serial_test::serial]
         fn the_enrolled_signer_comes_from_the_record_never_the_seed() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let (dir, profile) = stored(&pin(), Some(&agent_record()));
             for role in [EnrolledRole::Agent, EnrolledRole::FeePayer] {
                 let signer = produce(&dir, &profile, role, PUBLIC_KEY).unwrap();
@@ -4340,6 +4589,9 @@ mod tests {
         #[test]
         #[serial_test::serial]
         fn each_broken_identity_refuses_beside_its_accepted_twin() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let other = stellar_strkey::ed25519::PublicKey([0x22; 32])
                 .to_string()
                 .to_string();
@@ -4421,6 +4673,9 @@ mod tests {
         #[test]
         #[serial_test::serial]
         fn an_unpinned_or_unstored_profile_refuses() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             for (account, reason) in [("default", "placeholder"), ("not-a-g-strkey", "malformed")] {
                 let (dir, profile) = stored(account, Some(&agent_record()));
                 match produce(&dir, &profile, EnrolledRole::Agent, PUBLIC_KEY) {
@@ -4451,6 +4706,9 @@ mod tests {
         #[test]
         #[serial_test::serial]
         fn a_keyring_failure_on_the_record_refuses() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             keyring_mock::install().unwrap();
             let dir = TempDir::new().unwrap();
             let profile = profile_with(&pin());
@@ -4470,6 +4728,9 @@ mod tests {
         #[test]
         #[serial_test::serial]
         fn the_signer_fact_digest_is_frozen() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let (dir, profile) = stored(&pin(), Some(&agent_record()));
             let signer = produce(&dir, &profile, EnrolledRole::FeePayer, PUBLIC_KEY).unwrap();
             assert_eq!(

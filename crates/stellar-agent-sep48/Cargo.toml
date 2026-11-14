@@ -33,6 +33,7 @@ tracing               = { workspace = true }
 sha2                  = { workspace = true }
 
 [dev-dependencies]
+stellar-agent-network = { path = "../stellar-agent-network", features = ["test-helpers"] }
 stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["wiremock-helpers", "test-helpers"] }
 tokio              = { workspace = true, features = ["rt-multi-thread", "macros"] }
 serial_test        = { workspace = true }

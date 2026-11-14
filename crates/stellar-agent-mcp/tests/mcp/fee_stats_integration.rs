@@ -80,6 +80,9 @@ fn call_result_text(result: &rmcp::model::CallToolResult) -> &str {
 #[tokio::test]
 #[serial]
 async fn stellar_fee_stats_with_mock_rpc_succeeds() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(EchoIdResponder::new(fee_stats_result()))
@@ -116,6 +119,9 @@ async fn stellar_fee_stats_with_mock_rpc_succeeds() {
 #[tokio::test]
 #[serial]
 async fn stellar_fee_stats_mainnet_read_only_succeeds() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(EchoIdResponder::new(fee_stats_result()))
@@ -138,6 +144,9 @@ async fn stellar_fee_stats_mainnet_read_only_succeeds() {
 #[tokio::test]
 #[serial]
 async fn stellar_fee_stats_non_allowlisted_rpc_url_is_invalid_params() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let server = WalletServer::new(testnet_profile_with_rpc(
         "https://soroban-testnet.stellar.org",
     ))

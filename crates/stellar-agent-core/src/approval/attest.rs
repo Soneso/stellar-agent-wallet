@@ -1992,6 +1992,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn load_attestation_key_compares_the_engine_coordinate_for_a_non_default_account() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use base64::Engine as _;
         keyring_mock::install().unwrap();
         let mut profile = crate::profile::schema::Profile::builder_testnet_named(
