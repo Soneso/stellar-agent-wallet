@@ -1101,6 +1101,16 @@ impl TipAnchorStore for KeyringTipAnchorStore {
             .map_err(|e| anchor_store_error("audit key reload failed", &e))
     }
 
+    /// Hashes the generation-zero outbox coordinate, which carries the log
+    /// path digest. It reads no secret and survives carrier and key changes.
+    fn outbox_evidence_scope(&self) -> Result<[u8; 32], TipAnchorStoreError> {
+        let entry = self.generation_entry(0);
+        Ok(stellar_agent_core::audit_log::evidence_scope(
+            &entry.service,
+            &entry.account,
+        ))
+    }
+
     fn load_outbox_owner_state(
         &self,
         carrier_generation: u64,
@@ -3377,6 +3387,32 @@ mod tests {
         assert!(
             error.detail.starts_with("audit key reload failed"),
             "{error:?}"
+        );
+    }
+
+    #[test]
+    fn evidence_scope_uses_stable_owner_coordinate() {
+        use stellar_agent_core::audit_log::{evidence_scope, log_path_sha256};
+        let key = audit_ref();
+        let path = Path::new("evidence-scope.jsonl");
+        let store = KeyringTipAnchorStore::new(&key, path);
+        let scope = store.outbox_evidence_scope().unwrap();
+        let outbox = store.generation_entry(0);
+        assert_eq!(scope, evidence_scope(&outbox.service, &outbox.account));
+        assert_eq!(
+            KeyringTipAnchorStore::for_path_digest(&key, &log_path_sha256(path))
+                .outbox_evidence_scope()
+                .unwrap(),
+            scope,
+            "the recorded path digest yields the same scope"
+        );
+        assert!(store.owner_entry(3).account.starts_with(&outbox.account));
+        assert_ne!(
+            KeyringTipAnchorStore::new(&key, Path::new("other-evidence.jsonl"))
+                .outbox_evidence_scope()
+                .unwrap(),
+            scope,
+            "another log under the same audit key has its own scope"
         );
     }
 

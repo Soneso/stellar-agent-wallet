@@ -2421,3 +2421,52 @@ fn a_reanchor_reports_a_changed_retired_commitment_without_draining() {
     assert_eq!(fs::read(outbox.path()).unwrap(), bytes);
     assert_eq!(store.load_carrier_record().unwrap(), record);
 }
+
+/// Drains, a loss acknowledgement, and a binding carry the evidence root of
+/// a v2 owner unchanged and leave both evidence files as they are.
+#[test]
+fn v2_owner_transports_preserve_the_evidence_root() {
+    let (_dir, path, store) = fixture();
+    let slots = || {
+        crate::audit_log::consent_evidence::slot_paths(&path).map(|slot| fs::read(slot).unwrap())
+    };
+    let mut writer = AuditWriter::open(path.clone(), Some(access(&store))).unwrap();
+    writer.initialize_consent_evidence().unwrap();
+    let root = owner_json(&store, 1)["e"].clone();
+    assert!(root.is_object());
+    let images = slots();
+    let evidence = writer.outbox_evidence().unwrap().unwrap();
+    for (id, flag) in [("plain", 0), ("consent", 1)] {
+        queue_owned(&path, &store, id, flag);
+        assert_eq!(writer.drain_outbox().unwrap(), 1, "{id}");
+        assert_eq!(owner_json(&store, 1)["e"], root, "{id}");
+        assert!(owner_json(&store, 1).get("recent").is_none(), "{id}");
+    }
+    drop(writer);
+    for id in ["selected", "discarded"] {
+        queue_owned(&path, &store, id, 0);
+    }
+    corrupt_middle(&path, 2);
+    let mut acknowledging = acknowledge_open(&path, &store).unwrap();
+    let report = acknowledging
+        .acknowledge_outbox_loss("inspection", Default::default())
+        .unwrap();
+    assert_eq!((report.drained, report.discarded), (1, 1));
+    assert_eq!(owner_json(&store, 1)["e"], root);
+    drop(acknowledging);
+    let raw = owner_value(&store, 1);
+    let mut binding = AuditWriter::open_for_carrier_binding(path.clone(), access(&store)).unwrap();
+    assert!(binding.bind_carriers_with_fault(2).is_err());
+    drop(binding);
+    let mut binding = AuditWriter::open_for_carrier_binding(path.clone(), access(&store)).unwrap();
+    binding.bind_carriers().unwrap();
+    drop(binding);
+    assert_eq!(
+        owner_value(&store, 2),
+        raw,
+        "the stage carries the v2 owner"
+    );
+    assert_eq!(slots(), images);
+    let writer = AuditWriter::open(path.clone(), Some(access(&store))).unwrap();
+    assert_eq!(writer.outbox_evidence().unwrap().unwrap(), evidence);
+}

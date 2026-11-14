@@ -86,7 +86,8 @@ pub(crate) fn audit_writer_error(
         }
         // A keyed log opened without its key is the condition every other
         // audited verb reports as an unusable log; one condition, one code.
-        WriterError::KeyedLogNeedsKey { .. } => {
+        // An evidence refusal keeps its own code the same way.
+        WriterError::KeyedLogNeedsKey { .. } | WriterError::OutboxEvidenceUnusable { .. } => {
             stellar_agent_core::audit_log::audit_writer_refusal(profile_name, e)
         }
         // Variants whose own Display already leads with an `audit.*` code carry

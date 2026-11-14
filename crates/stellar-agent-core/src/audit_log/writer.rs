@@ -1990,30 +1990,7 @@ impl AuditWriter {
             .tip_anchor
             .clone()
             .ok_or(WriterError::TipAnchorUnavailable)?;
-        // A recovery writer took the carriers at their paths. It drains only
-        // when they are the recorded ones and the retired watch holds. An
-        // ordinary writer's bound outbox acquisition checks that itself. A
-        // key-rotation writer retains its outbox lock, so it runs the watch
-        // on every drain too.
-        let retained = matches!(
-            self.carriers,
-            HeldCarriers::Anchored {
-                outbox: Some(_),
-                ..
-            }
-        );
-        if let HeldCarriers::Recovery { refusal, .. } = &self.carriers
-            && let Some(refusal) = refusal
-        {
-            return Err(WriterError::CarrierRecoveryRequired {
-                detail: refusal.clone(),
-            });
-        }
-        if (retained || matches!(self.carriers, HeldCarriers::Recovery { .. }))
-            && let Some(record) = store.load_carrier_record()?
-        {
-            super::lock::check_retired(store.as_ref(), &record)?;
-        }
+        self.check_carrier_guards(store.as_ref())?;
         let batch = self.read_outbox(store.as_ref())?;
         #[cfg(test)]
         if let Some(hook) = self.drain_after_snapshot.take() {
@@ -2023,6 +2000,18 @@ impl AuditWriter {
         // drains through the owner protocol; only an untagged legacy queue
         // reaches the recognition and the commitment check below.
         if let Some(plan) = batch.owner_plan(store.as_ref(), self.hmac_key.as_deref())? {
+            // Consent rows wait while evidence files exist beside an owner
+            // that commits none: that owner entry is older than the files.
+            if plan.consent_without_evidence_root()
+                && super::consent_evidence::any_slot_exists(&self.path)?
+            {
+                tracing::warn!(
+                    log = %basename_lossy_path(&self.path),
+                    "audit outbox: consent rows wait because evidence files exist without an \
+                     evidence owner; restore the current owner entry"
+                );
+                return Ok(0);
+            }
             return self.deliver_owner_plan(batch, plan, store.as_ref(), false);
         }
         if let Some(delivered) = batch.uncommitted_entries(self.hmac_key.as_deref())
@@ -2364,6 +2353,132 @@ impl AuditWriter {
                 retired: Some(retired.clone()),
             })?;
         }
+    }
+
+    /// The carrier checks that precede every drain and evidence read.
+    ///
+    /// A recovery writer took the carriers at their paths. It proceeds only
+    /// when they are the recorded ones and the retired watch holds. An
+    /// ordinary writer's bound outbox acquisition checks that itself. A
+    /// key-rotation writer retains its outbox lock, so it runs the watch
+    /// here too.
+    fn check_carrier_guards(&self, store: &dyn TipAnchorStore) -> Result<(), WriterError> {
+        let retained = matches!(
+            self.carriers,
+            HeldCarriers::Anchored {
+                outbox: Some(_),
+                ..
+            }
+        );
+        if let HeldCarriers::Recovery { refusal, .. } = &self.carriers
+            && let Some(refusal) = refusal
+        {
+            return Err(WriterError::CarrierRecoveryRequired {
+                detail: refusal.clone(),
+            });
+        }
+        if (retained || matches!(self.carriers, HeldCarriers::Recovery { .. }))
+            && let Some(record) = store.load_carrier_record()?
+        {
+            super::lock::check_retired(store, &record)?;
+        }
+        Ok(())
+    }
+
+    /// The consent evidence the active owner commits, read under the outbox
+    /// carrier.
+    ///
+    /// `Ok(None)` means the owner commits no evidence and neither evidence
+    /// file exists. A newer authenticated image is recommitted to the owner
+    /// before it is returned; a read of the committed image writes nothing.
+    /// The read uses the writer's audit key, scans no log, and takes no
+    /// policy-window lock.
+    ///
+    /// # Errors
+    ///
+    /// - [`WriterError::TipAnchorUnavailable`] without an attached store.
+    /// - The carrier refusals of [`Self::drain_outbox`], including
+    ///   [`WriterError::CarrierRecoveryRequired`] while a binding is
+    ///   incomplete.
+    /// - [`WriterError::OutboxEvidenceUnusable`] with its static reason, for
+    ///   example `owner rollback` or `evidence image without owner`.
+    /// - [`WriterError::KeyedLogNeedsKey`] for an evidence owner without the
+    ///   audit key.
+    /// - [`WriterError::TipAnchorStore`] and [`WriterError::Io`] for the
+    ///   store and the files.
+    pub fn outbox_evidence(&self) -> Result<Option<super::OutboxEvidence>, WriterError> {
+        let store = self
+            .tip_anchor
+            .clone()
+            .ok_or(WriterError::TipAnchorUnavailable)?;
+        self.check_carrier_guards(store.as_ref())?;
+        let key = self.hmac_key.as_deref();
+        if let HeldCarriers::Writer { .. } | HeldCarriers::Anchored { outbox: None, .. } =
+            &self.carriers
+        {
+            return super::outbox::locked_owner_evidence(&self.path, store.as_ref(), key);
+        }
+        let batch = self.read_outbox(store.as_ref())?;
+        let evidence = super::outbox::read_owner_evidence(
+            &self.path,
+            store.as_ref(),
+            batch.generation(),
+            key,
+        )?;
+        batch.check_generation(store.as_ref())?;
+        Ok(evidence)
+    }
+
+    /// Initializes consent evidence for this log.
+    ///
+    /// Under the outbox carrier, a v1 owner migrates every recent digest into
+    /// a pin, and the queue then drains. An empty queue without owner state
+    /// gets owner state of generation one and its generation line. A queue
+    /// with rows and without owner state drains first. Both evidence files
+    /// receive the initial image, fully written and synced, before the owner
+    /// is stored. An owner that already commits evidence runs
+    /// [`Self::outbox_evidence`] and writes nothing else.
+    ///
+    /// # Errors
+    ///
+    /// - [`WriterError::KeyedLogNeedsKey`] without the audit key.
+    /// - [`WriterError::OutboxEvidenceUnusable`] with `evidence image without
+    ///   owner` beside other evidence content, and `queue not drained` when
+    ///   the queue cannot be emptied. Nothing is written.
+    /// - Every error of [`Self::drain_outbox`] and [`Self::outbox_evidence`].
+    pub fn initialize_consent_evidence(&mut self) -> Result<(), WriterError> {
+        let store = self
+            .tip_anchor
+            .clone()
+            .ok_or(WriterError::TipAnchorUnavailable)?;
+        let key = self.hmac_key.clone().ok_or(WriterError::KeyedLogNeedsKey {
+            evidence: "consent evidence authenticates only under the audit key",
+        })?;
+        self.check_carrier_guards(store.as_ref())?;
+        for attempt in 0..2 {
+            let batch = self.read_outbox(store.as_ref())?;
+            match batch.initialize_evidence(&self.path, store.as_ref(), &key, attempt == 1)? {
+                super::outbox::EvidenceInit::Done => return Ok(()),
+                super::outbox::EvidenceInit::Migrated => {
+                    self.drain_outbox()?;
+                    return Ok(());
+                }
+                super::outbox::EvidenceInit::NeedsDrain if attempt == 0 => {
+                    self.drain_outbox()?;
+                    #[cfg(test)]
+                    super::outbox::test_seam::run_initialization_retry(&self.path);
+                }
+                super::outbox::EvidenceInit::NeedsDrain => {}
+                super::outbox::EvidenceInit::Deliver(delivery) => {
+                    let (batch, plan) = *delivery;
+                    self.deliver_owner_plan(batch, plan, store.as_ref(), false)?;
+                    return Ok(());
+                }
+            }
+        }
+        Err(WriterError::OutboxEvidenceUnusable {
+            reason: "queue not drained",
+        })
     }
 
     /// Reads the outbox under its lock.
@@ -3520,6 +3635,10 @@ impl AuditWriter {
     /// - [`WriterError::TipAnchorUnavailable`] without an attached store.
     /// - [`WriterError::OutboxUnusable`] with `queue not drained before a key
     ///   change` when the queue holds a row. Nothing is written.
+    /// - [`WriterError::OutboxEvidenceUnusable`] with `evidence re-tag
+    ///   unavailable` when the owner commits consent evidence, and with
+    ///   `evidence image without owner` when evidence files exist beside an
+    ///   owner without an evidence root. Nothing is written.
     /// - Every error of reading the queue, of storing owner state, and of the
     ///   publication.
     pub fn fence_outbox_for_key_change(&mut self) -> Result<(), WriterError> {
@@ -3543,6 +3662,20 @@ impl AuditWriter {
             .clone()
             .ok_or(WriterError::TipAnchorUnavailable)?;
         let batch = self.read_outbox(store.as_ref())?;
+        // Evidence images authenticate under the current key only, so an
+        // owner that commits evidence keeps its key until re-tagging exists.
+        // Evidence files beside an owner without a root, such as a restored
+        // v1 owner, keep the key too: the current owner may be restored.
+        if batch.owner_commits_evidence(store.as_ref())? {
+            return Err(WriterError::OutboxEvidenceUnusable {
+                reason: "evidence re-tag unavailable",
+            });
+        }
+        if super::consent_evidence::any_slot_exists(&self.path)? {
+            return Err(WriterError::OutboxEvidenceUnusable {
+                reason: "evidence image without owner",
+            });
+        }
         let target =
             batch
                 .key_change_target(store.as_ref())?
@@ -7028,6 +7161,22 @@ pub enum WriterError {
         reason: &'static str,
     },
 
+    /// The consent evidence files do not match the trusted owner state.
+    ///
+    /// `reason` is one of `missing image`, `length`, `tag`, `layout`,
+    /// `scope`, `head`, `owner rollback`, `evidence image without owner`,
+    /// `queue not drained`, and `evidence re-tag unavailable`. It never
+    /// carries file contents. Recovery is in
+    /// `docs/maintainers/audit-log-recovery.md`.
+    #[error(
+        "audit.outbox_evidence_unusable: the consent evidence files do not match the trusted \
+         owner state ({reason}); nothing was changed"
+    )]
+    OutboxEvidenceUnusable {
+        /// Class of the refusal, from a closed set.
+        reason: &'static str,
+    },
+
     /// The serialized row is longer than [`MAX_ROW_BYTES`].
     ///
     /// [`AuditWriter::write_entry`] and the outbox drain measure the row before
@@ -7203,6 +7352,7 @@ pub fn audit_log_unusable_detail(e: &WriterError) -> Option<String> {
         | WriterError::RetainedHistoryUnverified(_)
         | WriterError::OutboxBusy
         | WriterError::OutboxUnusable { .. }
+        | WriterError::OutboxEvidenceUnusable { .. }
         | WriterError::RowTooLarge { .. }
         | WriterError::OutboxRowsMissing { .. }
         | WriterError::OutboxFull { .. }
@@ -7297,6 +7447,11 @@ pub fn audit_writer_refusal(profile: &str, e: &WriterError) -> crate::error::Wal
     }
     if matches!(e, WriterError::OutboxRowTooLarge { .. }) {
         return WalletError::Validation(ValidationError::AuditOutboxRowTooLarge {
+            detail: e.to_string(),
+        });
+    }
+    if matches!(e, WriterError::OutboxEvidenceUnusable { .. }) {
+        return WalletError::Validation(ValidationError::AuditOutboxEvidenceUnusable {
             detail: e.to_string(),
         });
     }
@@ -16345,6 +16500,23 @@ mod tests {
         assert_ne!(store.peek(), Some(tip_of(&path)));
         drop(open_keyed_anchored(&path, &store));
         assert_eq!(store.peek(), Some(tip_of(&path)));
+    }
+
+    /// The evidence refusal keeps its own code and names only its reason.
+    #[test]
+    fn evidence_unusable_maps_to_its_code() {
+        for reason in ["owner rollback", "evidence image without owner", "head"] {
+            let error = WriterError::OutboxEvidenceUnusable { reason };
+            let refusal = audit_writer_refusal("fixture", &error);
+            assert_eq!(refusal.code(), "audit.outbox_evidence_unusable");
+            assert_eq!(
+                refusal.to_string(),
+                format!(
+                    "audit.outbox_evidence_unusable: the consent evidence files do not match the \
+                     trusted owner state ({reason}); nothing was changed"
+                )
+            );
+        }
     }
 
     /// An open without the key refuses a log with a chain-root sidecar, an
