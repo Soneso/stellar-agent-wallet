@@ -191,6 +191,9 @@ fn engine_selection_signature_binds_kind() {
 #[test]
 #[serial]
 fn engine_selection_reuses_sequence_and_pin_freshness() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::profile::schema::PolicyEngineKind;
     keyring_mock::install().unwrap();
     let dir = tempfile::tempdir().unwrap();
@@ -375,7 +378,11 @@ fn public_docs_cover_both_owner_ceremonies() {
 macro_rules! minimum {
     ($name:ident, $requirement:literal, $edit:expr) => {
         #[test]
+        #[serial_test::serial]
         fn $name() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let profile = profile(true);
             let mut doc = FULL.parse::<DocumentMut>().unwrap();
             assert!(mainnet_minimum::failures(&doc, &profile, "operator").is_empty());
@@ -398,7 +405,11 @@ macro_rules! minimum {
 /// approval credentials; an absent, empty, malformed or duplicated list is
 /// unmet with its own detail.
 #[test]
+#[serial_test::serial]
 fn mainnet_minimum_requires_approval_credentials() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let profile = profile(true);
     let entry = |id: &str| {
         format!(
@@ -603,7 +614,11 @@ minimum!(
     }
 );
 #[test]
+#[serial_test::serial]
 fn minimum_deny_rules_need_no_value_restrictions() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let profile = profile(true);
     for tool in ["stellar_pay", "stellar_trustline"] {
         let mut doc = FULL.parse::<DocumentMut>().unwrap();
@@ -623,7 +638,11 @@ fn minimum_deny_rules_need_no_value_restrictions() {
 }
 
 #[test]
+#[serial_test::serial]
 fn minimum_authorization_ttl_endpoints_pass() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let profile = profile(true);
     for ttl in [1, 120] {
         let mut doc = FULL.parse::<DocumentMut>().unwrap();
@@ -633,7 +652,11 @@ fn minimum_authorization_ttl_endpoints_pass() {
 }
 
 #[test]
+#[serial_test::serial]
 fn minimum_read_only_and_trustline_requirements() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let profile = profile(true);
     for tool in mainnet_minimum::MAINNET_READ_ONLY_TOOLS {
         let mut doc = FULL.parse::<DocumentMut>().unwrap();
@@ -655,7 +678,11 @@ fn minimum_read_only_and_trustline_requirements() {
 }
 
 #[test]
+#[serial_test::serial]
 fn minimum_cap_coverage_uses_network_identity() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let profile = profile(true);
     let classic = "USD:GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
     let sac = stellar_agent_core::asset_id::CanonicalAsset::parse_threshold_key(classic)
@@ -698,6 +725,9 @@ fn minimum_cap_coverage_uses_network_identity() {
 #[test]
 #[serial]
 fn absent_v2_advances_and_equal_does_not_write() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (dir, profile, key) = fixture();
     let first = load(dir.path(), FULL, &profile, &key, PinMode::Advance).unwrap();
     assert_eq!(first.sequence(), 7);
@@ -721,6 +751,9 @@ fn absent_v2_advances_and_equal_does_not_write() {
 #[test]
 #[serial]
 fn honest_advance_accepts_and_rollback_refuses() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (dir, profile, key) = fixture();
     load(dir.path(), FULL, &profile, &key, PinMode::Advance).unwrap();
     let newer = FULL.replace("sequence = 7", "sequence = 8");
@@ -739,6 +772,9 @@ fn honest_advance_accepts_and_rollback_refuses() {
 #[test]
 #[serial]
 fn equal_sequence_digest_fork_refuses() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (dir, profile, key) = fixture();
     load(dir.path(), FULL, &profile, &key, PinMode::Advance).unwrap();
     assert!(matches!(
@@ -755,6 +791,9 @@ fn equal_sequence_digest_fork_refuses() {
 #[test]
 #[serial]
 fn equal_sequence_owner_fork_refuses() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (dir, profile, key) = fixture();
     let canonical = canonical_bytes(FULL).unwrap();
     put_pin(
@@ -772,6 +811,9 @@ fn equal_sequence_owner_fork_refuses() {
 #[test]
 #[serial]
 fn v1_absent_accepts_but_present_refuses_on_testnet() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (dir, _, key) = fixture();
     let profile = profile(false);
     assert_eq!(
@@ -796,6 +838,9 @@ fn v1_absent_accepts_but_present_refuses_on_testnet() {
 #[test]
 #[serial]
 fn invalid_body_never_advances() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (dir, profile, key) = fixture();
     load(dir.path(), FULL, &profile, &key, PinMode::Advance).unwrap();
     let before = pinned(dir.path(), &profile);
@@ -808,6 +853,9 @@ fn invalid_body_never_advances() {
 #[test]
 #[serial]
 fn compare_only_never_writes_absent_or_advancing() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (dir, profile, key) = fixture();
     load(dir.path(), FULL, &profile, &key, PinMode::CompareOnly).unwrap();
     assert_eq!(pinned(dir.path(), &profile), PinState::Absent);
@@ -825,6 +873,9 @@ fn compare_only_never_writes_absent_or_advancing() {
 #[test]
 #[serial]
 fn failed_pin_write_returns_no_proof() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (dir, profile, key) = fixture();
     let coordinate = policy_pin_entry_ref(&profile.policy_window_state_key_id);
     keyring_mock::install_with_write_error(
@@ -849,6 +900,9 @@ fn failed_pin_write_returns_no_proof() {
 #[test]
 #[serial]
 fn held_lock_refuses_with_busy_and_no_proof() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (dir, profile, key) = fixture();
     let _lock = WindowStoreLock::acquire_for(
         &dir.path().join("state.window"),
@@ -865,6 +919,9 @@ fn held_lock_refuses_with_busy_and_no_proof() {
 #[test]
 #[serial]
 fn pin_read_is_guarded_against_interleaving() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (dir, profile, key) = fixture();
     let coordinate = policy_pin_entry_ref(&profile.policy_window_state_key_id);
     let path = dir.path().join("state.window");
@@ -916,6 +973,8 @@ fn pin_read_is_guarded_against_interleaving() {
 #[test]
 #[serial]
 fn advance_compares_the_pin_again_before_it_writes() {
+    let guard_home = tempfile::tempdir().unwrap();
+    let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
     let (dir, profile, key) = fixture();
     let coordinate = policy_pin_entry_ref(&profile.policy_window_state_key_id);
     let newer = format!(
@@ -964,6 +1023,8 @@ fn advance_compares_the_pin_again_before_it_writes() {
 #[test]
 #[serial]
 fn a_writer_in_the_advance_gap_is_compared_before_the_write() {
+    let guard_home = tempfile::tempdir().unwrap();
+    let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
     let (dir, profile, key) = fixture();
     let owner = key.verifying_key().to_bytes();
     put_pin(dir.path(), &profile, 6, [6; 32], owner);
@@ -1029,6 +1090,9 @@ fn a_writer_in_the_advance_gap_is_compared_before_the_write() {
 #[test]
 #[serial]
 fn compare_runs_under_the_lock_the_pin_was_read_with() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (dir, profile, key) = fixture();
     let path = dir.path().join("state.window");
     let window_key = &profile.policy_window_state_key_id;
@@ -1058,6 +1122,9 @@ fn compare_runs_under_the_lock_the_pin_was_read_with() {
 #[test]
 #[serial]
 fn compare_only_loads_hold_the_lock_against_a_writer() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (dir, profile, key) = fixture();
     let coordinate = policy_pin_entry_ref(&profile.policy_window_state_key_id);
     let path = dir.path().join("state.window");
@@ -1117,6 +1184,9 @@ fn compare_only_loads_hold_the_lock_against_a_writer() {
 #[test]
 #[serial]
 fn testnet_refuses_mainnet_table() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (dir, _, key) = fixture();
     assert!(matches!(
         load(
@@ -1133,6 +1203,9 @@ fn testnet_refuses_mainnet_table() {
 #[test]
 #[serial]
 fn unknown_v2_keys_precede_signature_verification() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     // A credential-like key: the refusal names the location and the accepted
     // keys, never the rejected key.
     const MARKER: &str = "CREDMARKER7";
@@ -1207,6 +1280,9 @@ fn unknown_v2_keys_precede_signature_verification() {
 #[test]
 #[serial]
 fn mainnet_configuration_condition() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (dir, profile, key) = fixture();
     assert!(load(dir.path(), V1, &profile, &key, PinMode::CompareOnly).is_ok());
     assert!(
@@ -1230,6 +1306,9 @@ fn mainnet_configuration_condition() {
 #[test]
 #[serial]
 fn policy_digest_matches_verified_policy() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::policy::v1::{
         criteria::state_store::WindowLimit,
         value::{ActionKind, ValueClass, ValueLeg},
@@ -1285,7 +1364,11 @@ fn criterion(doc: &mut DocumentMut, index: usize) -> &mut toml_edit::InlineTable
 }
 
 #[test]
+#[serial_test::serial]
 fn asset_equivalence_covers_classic_native_and_networks() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::{
         asset_id::CanonicalAsset, policy::v1::asset_equivalence::assets_equivalent,
     };
@@ -1366,7 +1449,11 @@ fn classic_and_sac(profile: &Profile) -> (String, String) {
     (classic, sac)
 }
 #[test]
+#[serial_test::serial]
 fn asset_allowlist_testnet_equivalence_and_deny_code() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::policy::{
         DenyReason,
         v1::criteria::{Criterion, asset_allowlist::AssetAllowlistCriterion},
@@ -1392,7 +1479,11 @@ fn asset_allowlist_testnet_equivalence_and_deny_code() {
     assert_eq!(denial.wire_code(), "policy.deny.asset_not_allowlisted");
 }
 #[test]
+#[serial_test::serial]
 fn per_transaction_cap_counts_equivalent_sac() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::policy::{
         DenyReason,
         v1::criteria::{Criterion, per_tx_cap::PerTxCapCriterion},
@@ -1412,7 +1503,11 @@ fn per_transaction_cap_counts_equivalent_sac() {
     ));
 }
 #[test]
+#[serial_test::serial]
 fn period_accounting_sums_classic_and_sac() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::policy::{
         DenyReason,
         v1::criteria::{
@@ -1441,7 +1536,11 @@ fn period_accounting_sums_classic_and_sac() {
     ));
 }
 #[test]
+#[serial_test::serial]
 fn bundle_period_overlay_counts_two_sac_inners() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::policy::{
         DenyReason,
         v1::{
@@ -1483,7 +1582,11 @@ fn bundle_period_overlay_counts_two_sac_inners() {
     ));
 }
 #[test]
+#[serial_test::serial]
 fn bundle_caps_and_accounting_use_classic_sac_identity() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::policy::v1::{
         bundle::{BundleStateOverlay, BundleView, InnerOpDescriptor},
         criteria::{
@@ -1547,6 +1650,9 @@ fn nonce(
 #[test]
 #[serial]
 fn enablement_verifies_all_bindings() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (dir, profile, verified) = enabled_fixture();
     let record = verify_enablement(
         &verified,
@@ -1566,6 +1672,9 @@ fn enablement_verifies_all_bindings() {
 #[test]
 #[serial]
 fn enablement_name_source_and_default_refuse() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (dir, profile, verified) = enabled_fixture();
     for (name, source, binding) in [
         ("other", ProfileNameSource::Flag, "profile"),
@@ -1619,6 +1728,9 @@ fn enablement_name_source_and_default_refuse() {
 #[test]
 #[serial]
 fn enablement_disk_and_merged_hosts_are_both_checked() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (dir, mut profile, verified) = enabled_fixture();
     profile.rpc_url = "https://another.example.invalid".into();
     assert!(
@@ -1666,6 +1778,9 @@ fn endpoint_host_normalization() {
 #[test]
 #[serial]
 fn enablement_nonce_digest_and_absence_refuse() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (dir, profile, verified) = enabled_fixture();
     let digest = verify_enablement(
         &verified,
@@ -1707,6 +1822,9 @@ fn enablement_nonce_digest_and_absence_refuse() {
 #[test]
 #[serial]
 fn malformed_nonce_digest_refuses_at_load() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (dir, profile, key) = fixture();
     for malformed in ["A".repeat(64), "0".repeat(63), "g".repeat(64)] {
         assert!(matches!(
@@ -1723,7 +1841,11 @@ fn malformed_nonce_digest_refuses_at_load() {
     }
 }
 #[test]
+#[serial_test::serial]
 fn state_lock_retries_then_succeeds() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let dir = tempfile::tempdir().unwrap();
     let profile = profile(false);
     let path = dir.path().join("state.window");
@@ -1740,7 +1862,11 @@ fn state_lock_retries_then_succeeds() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn state_lock_io_preserves_error_kind() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let dir = tempfile::tempdir().unwrap();
     let profile = profile(false);
     let err = stellar_agent_core::policy::v1::verified::acquire_state_lock(
@@ -1757,7 +1883,11 @@ fn state_lock_io_preserves_error_kind() {
     assert_eq!(err.wire_code(), "policy.state_lock_io");
 }
 #[test]
+#[serial_test::serial]
 fn signed_threshold_precedence_and_wide_values() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use std::collections::BTreeMap;
     use stellar_agent_core::{
         asset_id::CanonicalAsset,
@@ -1810,7 +1940,11 @@ fn signed_threshold_precedence_and_wide_values() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn signed_threshold_warns_when_profile_is_higher() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use std::collections::BTreeMap;
     use stellar_agent_core::{
         asset_id::CanonicalAsset,
@@ -1841,7 +1975,11 @@ fn signed_threshold_warns_when_profile_is_higher() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn threshold_aliases_and_duplicate_identities_refuse() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let profile = profile(true);
     let (classic, sac) = classic_and_sac(&profile);
     let refusal = |doc: &DocumentMut| {
@@ -1904,7 +2042,11 @@ fn verified_sequence_is_a_positive_toml_integer() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn asset_allowlist_leaves_assetless_claims_unrestricted() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::policy::v1::criteria::{
         Criterion, asset_allowlist::AssetAllowlistCriterion,
     };
@@ -1959,6 +2101,9 @@ fn listing(dir: &Path) -> Vec<std::path::PathBuf> {
 #[test]
 #[serial]
 fn home_domain_criteria_are_valid_but_fail_the_minimum() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     for criterion in [
         r#"{ kind = "home_domain_resolved" }"#,
         r#"{ kind = "counterparty_allowlist", kinds = ["HOME_DOMAIN"], allowlist = ["example.org"] }"#,
@@ -2004,6 +2149,9 @@ fn home_domain_criteria_are_valid_but_fail_the_minimum() {
 #[test]
 #[serial]
 fn test_owner_source_refuses_an_enabled_mainnet_body_and_keeps_the_pin() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (dir, profile, key) = fixture();
     std::fs::write(dir.path().join("policy.toml"), signed(FULL, &key)).unwrap();
     let refused = |dir: &Path| {
@@ -2052,6 +2200,9 @@ fn test_owner_source_refuses_an_enabled_mainnet_body_and_keeps_the_pin() {
 #[test]
 #[serial]
 fn test_owner_source_loads_outside_the_mainnet_condition() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (dir, _, key) = fixture();
     let testnet = profile(false);
     std::fs::write(dir.path().join("policy.toml"), signed(V1, &key)).unwrap();
@@ -2090,6 +2241,9 @@ fn test_owner_source_loads_outside_the_mainnet_condition() {
 #[test]
 #[serial]
 fn compare_only_creates_neither_the_window_directory_nor_the_lock_file() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (dir, profile, key) = fixture();
     std::fs::write(dir.path().join("policy.toml"), signed(FULL, &key)).unwrap();
     let owner = key.verifying_key().to_bytes();
@@ -2128,6 +2282,9 @@ fn compare_only_creates_neither_the_window_directory_nor_the_lock_file() {
 #[test]
 #[serial]
 fn inspection_reports_the_pin_it_compared_and_the_verified_document() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (dir, profile, key) = fixture();
     std::fs::write(dir.path().join("policy.toml"), signed(FULL, &key)).unwrap();
     put_pin(
@@ -2173,7 +2330,11 @@ fn inspection_reports_the_pin_it_compared_and_the_verified_document() {
 }
 
 #[test]
+#[serial_test::serial]
 fn minimum_report_lists_every_requirement_with_its_status() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let profile = profile(true);
     let evaluate = |doc: &DocumentMut| mainnet_minimum::evaluate(doc, &profile, "operator");
     let full = evaluate(&FULL.parse::<DocumentMut>().unwrap());
@@ -2311,6 +2472,9 @@ fn minimum_report_lists_every_requirement_with_its_status() {
 #[test]
 #[serial]
 fn higher_sequence_owner_rotation_is_accepted() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (dir, profile, key) = fixture();
     load(dir.path(), FULL, &profile, &key, PinMode::Advance).unwrap();
     let rotated = SigningKey::from_bytes(&[12; 32]);
@@ -2344,6 +2508,9 @@ fn higher_sequence_owner_rotation_is_accepted() {
 #[test]
 #[serial]
 fn integer_threshold_is_accepted() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (dir, profile, key) = fixture();
     let body = FULL.replace("native = \"10000000000\"", "native = 10000000000");
     assert_ne!(body, FULL, "the threshold edit must apply");
@@ -2361,7 +2528,11 @@ fn integer_threshold_is_accepted() {
 }
 
 #[test]
+#[serial_test::serial]
 fn period_cap_coverage_is_checked_independently_of_the_transaction_cap() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let profile = profile(true);
     let mut doc = FULL.parse::<DocumentMut>().unwrap();
     criterion(&mut doc, 3).insert(
@@ -2618,6 +2789,9 @@ fn approval_rp_id_is_origin_host() {
 #[test]
 #[serial]
 fn remote_approval_fields_are_signed_and_canonical() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (dir, profile, key) = fixture();
     let canonical = canonical_bytes(REMOTE).unwrap();
     assert_eq!(canonical, REMOTE_CANONICAL.as_bytes());
@@ -2700,7 +2874,11 @@ fn remote_approval_fields_are_signed_and_canonical() {
 }
 
 #[test]
+#[serial_test::serial]
 fn mainnet_minimum_pairs_origin_and_pin() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     for (origin, pin, requirement) in [
         (false, false, None),
         (true, true, None),
@@ -2728,6 +2906,9 @@ fn mainnet_minimum_pairs_origin_and_pin() {
 #[test]
 #[serial]
 fn mainnet_body_exposes_signed_origin_and_pin() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (dir, mut profile, key) = fixture();
     for remote_settings in [false, true] {
         if remote_settings {
@@ -2759,6 +2940,9 @@ fn mainnet_body_exposes_signed_origin_and_pin() {
 #[test]
 #[serial]
 fn approval_fields_validate_at_policy_boundaries() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (dir, profile, key) = fixture();
     stellar_agent_core::policy::v1::validate_unsigned_policy(
         REMOTE,
@@ -2849,6 +3033,9 @@ fn approval_fields_validate_at_policy_boundaries() {
 #[test]
 #[serial]
 fn malformed_approval_fields_preserve_policy_pin() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     for existing in [false, true] {
         for (field, bad) in [
             ("approval_origin", "http://marker.invalid"),
@@ -2894,7 +3081,11 @@ fn malformed_approval_fields_preserve_policy_pin() {
 }
 
 #[test]
+#[serial_test::serial]
 fn approval_field_refusals_are_redacted() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let marker = "SYNTHETIC_REJECTED_MARKER";
     // Lowercase hex passes the pin's character check and refuses on length.
     let hex_marker = "5eed".repeat(5);
@@ -2938,7 +3129,11 @@ fn approval_field_refusals_are_redacted() {
 }
 
 #[test]
+#[serial_test::serial]
 fn approval_origin_closed_keys_precede_signature() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let key = SigningKey::from_bytes(&[11; 32]);
     for field in [
         "mode",
@@ -2980,6 +3175,9 @@ fn approval_origin_closed_keys_precede_signature() {
 #[test]
 #[serial]
 fn runtime_binding_requirements_unchanged() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::policy::v1::verified::{check_owner_enrollment, validate_profile_body};
     for source in [FULL, REMOTE] {
         for removed in [

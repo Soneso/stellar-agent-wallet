@@ -182,7 +182,11 @@ mod tests {
     /// gets the credential, read once. Only construction runs, no request.
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn fee_stats_input_url_gets_no_credential() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let entry = KeyringEntryRef::new("stellar-agent-rpc-fee-stats", "primary");
         let reads = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&reads);

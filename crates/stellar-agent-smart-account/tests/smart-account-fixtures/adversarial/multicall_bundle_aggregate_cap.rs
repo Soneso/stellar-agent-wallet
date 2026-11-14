@@ -111,7 +111,11 @@ fn build_engine_with_aggregate_cap(asset: &str, max_amount: i128) -> PolicyEngin
 /// This is the split-and-scatter pattern the bundle-aggregate-cap
 /// criterion defends against.
 #[test]
+#[serial_test::serial]
 fn t2_split_and_scatter_10x5b_denied_via_evaluate_bundle() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let engine = build_engine_with_aggregate_cap(USDC_ASSET, 40_000_000_000);
     let tool = make_tool();
     let profile = make_profile();
@@ -151,7 +155,11 @@ fn t2_split_and_scatter_10x5b_denied_via_evaluate_bundle() {
 /// regression-locks against a criterion that always denies regardless
 /// of sum.
 #[test]
+#[serial_test::serial]
 fn below_cap_4x5b_allowed_via_evaluate_bundle() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let engine = build_engine_with_aggregate_cap(USDC_ASSET, 40_000_000_000);
     let tool = make_tool();
     let profile = make_profile();
@@ -180,7 +188,11 @@ fn below_cap_4x5b_allowed_via_evaluate_bundle() {
 /// Bundle summing exactly the cap value (40_000_000_000) is allowed per
 /// strict-greater-than-cap semantics (`sum > max_amount` is the deny condition).
 #[test]
+#[serial_test::serial]
 fn boundary_exactly_at_cap_allowed_via_evaluate_bundle() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let engine = build_engine_with_aggregate_cap(USDC_ASSET, 40_000_000_000);
     let tool = make_tool();
     let profile = make_profile();

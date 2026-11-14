@@ -35,7 +35,11 @@ use super::rpc_mock_helpers::{
 /// hash disagreement and returns `NetworkRpcDivergence` before performing the
 /// allowlist match.
 #[tokio::test]
+#[serial_test::serial]
 async fn policy_hash_rpc_disagreement_returns_rpc_divergence() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
 
     let policy = policy_sc_address();

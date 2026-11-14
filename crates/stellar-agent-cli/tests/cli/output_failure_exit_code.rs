@@ -25,6 +25,7 @@ const HEADLESS_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
 /// renderer and needs no network.
 fn profile_list(stdout: Stdio) -> Output {
     let home = tempfile::tempdir().expect("temp home");
+    stellar_agent_test_support::sandbox::mark_sandbox(home.path()).expect("mark fixture directory");
     Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
         .args(["profile", "list"])
         .env("STELLAR_AGENT_HOME", home.path())
@@ -55,13 +56,17 @@ fn an_envelope_that_cannot_be_written_exits_one_and_names_the_failure() {
 /// A draft edit whose envelope cannot be written exits `1` after the replace,
 /// and the policy file holds the complete change.
 #[test]
+#[serial_test::serial]
 fn draft_output_failure_exits_1() {
+    let guard_home = tempfile::tempdir().expect("temporary home");
+    let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
     use stellar_agent_core::profile::loader::save_new_to_dir;
     use stellar_agent_core::profile::schema::Profile;
 
     const NAME: &str = "output-draft";
     const RECIPIENT: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
     let home = tempfile::tempdir().expect("temp home");
+    let _child_home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
     let profile = Profile::builder_testnet_named(NAME, "s", "a", "n", "a")
         .audit_log_path(home.path().join("audit").join(format!("{NAME}.jsonl")))
         .build();

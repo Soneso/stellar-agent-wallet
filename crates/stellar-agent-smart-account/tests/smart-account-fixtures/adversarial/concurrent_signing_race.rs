@@ -321,7 +321,11 @@ async fn build_traced_secondary_server_1_of_1(
 /// (the baseline is unchanged between callers) and the second caller's
 /// `simulation_ledger` timestamp is ≥ the first's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
 async fn a1_a2_callers_serialise_behind_per_rule_mutex() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
     let policy = policy_sc_address();
     let baseline = signer_set_n_of_n(1);
@@ -525,7 +529,11 @@ async fn a1_a2_callers_serialise_behind_per_rule_mutex() {
 /// Both calls are sequential here (not concurrent) to isolate the hash-binding
 /// assertion from the serialisation mechanics tested by the concurrent cases.
 #[tokio::test]
+#[serial_test::serial]
 async fn a3_second_caller_expected_hash_reflects_post_first_call_state() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
     let policy = policy_sc_address();
 
@@ -627,7 +635,11 @@ async fn a3_second_caller_expected_hash_reflects_post_first_call_state() {
 /// See module docstring for the relationship between `SignerSetDiverged` here
 /// and `SimulationDivergence` at the submit layer.
 #[tokio::test]
+#[serial_test::serial]
 async fn a4_second_caller_diverges_after_audit_log_update() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
     let policy = policy_sc_address();
 
@@ -706,7 +718,11 @@ async fn a4_second_caller_diverges_after_audit_log_update() {
 /// This covers mutex serialisation in the multi-threaded runtime using
 /// the traced responder to confirm non-interleaving.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
 async fn a1_multi_threaded_both_callers_serialise_and_succeed() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
     let policy = policy_sc_address();
 

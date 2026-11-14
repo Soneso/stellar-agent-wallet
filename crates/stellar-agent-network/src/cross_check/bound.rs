@@ -911,7 +911,11 @@ mod tests {
     /// The envelope check runs before the requirement rule: a value below the
     /// threshold needs no comparison, yet a mismatched envelope refuses.
     #[tokio::test]
+    #[serial_test::serial]
     async fn the_envelope_check_precedes_the_requirement_rule() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let profile = testnet_profile(None);
         let context = NetworkContext::from_profile(&profile);
         let thresholds = ThresholdSet::from_profile(&profile);
@@ -987,7 +991,11 @@ mod tests {
     /// The account creation funds exactly the effective native threshold, the
     /// profile value raised to the floor, so the comparison is required.
     #[tokio::test]
+    #[serial_test::serial]
     async fn a_passed_classic_witness_carries_its_subject() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = classic_oracle().await;
         let profile = testnet_profile(Some(&server));
         let context = NetworkContext::from_profile(&profile);
@@ -1189,7 +1197,11 @@ mod tests {
 
     /// A passed bound Soroban witness carries the intent digest.
     #[tokio::test]
+    #[serial_test::serial]
     async fn a_passed_soroban_witness_carries_its_subject() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(body_partial_json(json!({"method": "getNetwork"})))
@@ -1301,7 +1313,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn the_bound_producer_compares_payment_and_creation_values() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let profile = testnet_profile(None);
         let context = NetworkContext::from_profile(&profile);
         let thresholds = ThresholdSet::from_profile(&profile);
@@ -1402,7 +1418,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn soroban_identity_refuses_before_the_requirement_decision() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let profile = testnet_profile(None);
         let context = NetworkContext::from_profile(&profile);
         let thresholds = ThresholdSet::from_profile(&profile);

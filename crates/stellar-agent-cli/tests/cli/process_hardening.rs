@@ -141,6 +141,7 @@ fn a_same_user_process_cannot_read_the_cli_environment() {
          without CAP_SYS_PTRACE"
     );
 
+    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
     let mut child = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
         .args(["approve", "--id", &nonce, "--profile", name])
         .stdin(Stdio::piped())

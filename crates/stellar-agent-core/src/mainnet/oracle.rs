@@ -84,8 +84,11 @@ mod tests {
     /// URL, even when it holds an oracle record, and the refusal carries the
     /// profile code.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn mainnet_oracle_required_refuses_a_profile_without_the_url() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for profile in [
             builder().build(),
             builder().oracle_provider(oracle_record()).build(),
@@ -105,8 +108,11 @@ mod tests {
     /// record is refused with the missing record, with and without other
     /// provider records.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn mainnet_oracle_required_refuses_a_url_without_its_record() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let bare = Profile::builder_mainnet_named(
             "operator",
             "https://rpc.example.invalid",
@@ -138,8 +144,11 @@ mod tests {
 
     /// A profile with the URL and its record passes.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn mainnet_oracle_required_accepts_a_complete_oracle() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let profile = builder()
             .oracle_provider_url(oracle_url())
             .oracle_provider(oracle_record())

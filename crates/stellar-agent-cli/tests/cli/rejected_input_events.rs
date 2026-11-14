@@ -35,6 +35,7 @@ const SECRET_VAR: &str = "EVENT_FIXTURE_SIGNER_SECRET";
 const OPERATION_ID: &str = "c0ffee42abababababababababababababababababababababababab1ced7ea5";
 
 fn run(home: &Path, args: &[&str], log_format: &str) -> Output {
+    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
     let mut command = Command::new(env!("CARGO_BIN_EXE_stellar-agent"));
     command
         .args(args)

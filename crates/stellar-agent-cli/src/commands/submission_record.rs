@@ -1112,6 +1112,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn the_accounting_audit_writer_applies_the_binding_check_of_the_origin() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::AuditBinding;
         use stellar_agent_network::keyring::{KeyringAuditBindingStore, rotate_keyring_secret_32};
 
@@ -1775,6 +1778,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn settlement_rows_preserve_pending_approval_context() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision};
         for approved in [false, true] {
             for failed in [false, true] {
@@ -1841,6 +1847,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn no_receipt_status_selects_an_audit_row() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for (label, status) in [
             ("success", Some(ReceiptStatus::Success)),
             (
@@ -1883,6 +1892,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn an_unreadable_history_leaves_the_expiry_owed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::rotation::test_seam::set_rotation_threshold;
         use stellar_agent_core::audit_log::test_helpers::break_newest_archive_link;
         use stellar_agent_core::audit_log::{AuditEntry, NewToolInvocation, PolicyDecision};
@@ -1944,6 +1956,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn pending_witness_survives_cli_reconciliation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision};
         for (label, status) in [
             ("success", ReceiptStatus::Success),

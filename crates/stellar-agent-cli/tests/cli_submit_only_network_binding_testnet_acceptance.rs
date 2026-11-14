@@ -161,7 +161,9 @@ fn run_pay(
     ];
     args.extend_from_slice(extra);
 
+    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
     let output = Command::new(bin_path)
+        .args(cfg!(feature = "live-platform-keyring").then_some("--test-live-platform-keyring"))
         .args(&args)
         .env(SECRET_ENV_VAR, source_secret)
         .env("STELLAR_AGENT_HOME", home)

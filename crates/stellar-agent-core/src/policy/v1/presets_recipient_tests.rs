@@ -352,7 +352,11 @@ fn w_recipient_is_added_with_contract_kind() {
 }
 
 #[test]
+#[serial_test::serial]
 fn w_entry_covers_only_itself() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let added = addition(&recipient_body(), &w_address(7, 9), &[]);
     for (to, expected) in [
         (w_address(7, 9), "allow"),
@@ -373,7 +377,11 @@ fn w_entry_covers_only_itself() {
 }
 
 #[test]
+#[serial_test::serial]
 fn recipient_kind_is_appended_when_missing() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let body = recipient_body().replace("\"G_ACCOUNT\", \"C_ACCOUNT\"", "\"G_ACCOUNT\"");
     let added = addition(&body, &contract(7), &[]);
     assert_eq!(added.kinds_added, added.updated_rules);
@@ -390,7 +398,11 @@ fn recipient_kind_is_appended_when_missing() {
 }
 
 #[test]
+#[serial_test::serial]
 fn inert_recipient_entry_is_not_listed() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let recipient = contract(7);
     let body = all_recipient_lists(&recipient_body(), |list| {
         list.insert("kinds", Value::from_iter(["G_ACCOUNT"]));
@@ -400,7 +412,13 @@ fn inert_recipient_entry_is_not_listed() {
     assert_eq!(added.kinds_added, [0, 1, 2, 3]);
     assert_eq!(added.updated_rules, added.kinds_added);
     assert_eq!(
-        label(&x402(&verified_engine(&added.body), CREATE_TOOL, &recipient, 1, T0)),
+        label(&x402(
+            &verified_engine(&added.body),
+            CREATE_TOOL,
+            &recipient,
+            1,
+            T0
+        )),
         "allow"
     );
     assert!(
@@ -488,7 +506,11 @@ fn issuer_body() -> String {
 }
 
 #[test]
+#[serial_test::serial]
 fn recipient_insert_does_not_expand_issuer_authority() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let body = add_recipient(&issuer_body(), &account(7)).unwrap();
     assert_eq!(
         label(&pay(&verified_engine(&body), &account(7), 1, T0)),
@@ -503,7 +525,11 @@ fn recipient_insert_does_not_expand_issuer_authority() {
 }
 
 #[test]
+#[serial_test::serial]
 fn known_issuer_g_already_accepted_is_added() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let body = all_recipient_lists(&issuer_body(), |list| {
         list.insert("allowlist", Value::from_iter([format!("USDC:{ISSUER}")]));
     });
@@ -515,7 +541,11 @@ fn known_issuer_g_already_accepted_is_added() {
 }
 
 #[test]
+#[serial_test::serial]
 fn muxed_entry_never_acts_as_issuer() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let added = addition(&issuer_body(), &muxed(7, 9), &[]);
     assert_eq!(
         label(&pay(&verified_engine(&added.body), &muxed(7, 9), 1, T0)),
@@ -563,7 +593,11 @@ fn differing_lists_refuse_ambiguous() {
 #[test]
 fn issuer_and_domain_entries_make_lists_differ() {
     for (kind, first, second) in [
-        ("KNOWN_ISSUER", format!("USDC:{ISSUER}"), format!("USDC:{OTHER_ISSUER}")),
+        (
+            "KNOWN_ISSUER",
+            format!("USDC:{ISSUER}"),
+            format!("USDC:{OTHER_ISSUER}"),
+        ),
         ("HOME_DOMAIN", "one.example".into(), "two.example".into()),
     ] {
         let body = all_recipient_lists(&recipient_body(), |list| {
@@ -574,7 +608,10 @@ fn issuer_and_domain_entries_make_lists_differ() {
             list.insert("allowlist", Value::from_iter([second.clone()]));
         });
         let text = recipient_refusal(
-            &body, &contract(7), &[], "profile.policy_counterparty_ambiguous",
+            &body,
+            &contract(7),
+            &[],
+            "profile.policy_counterparty_ambiguous",
         );
         assert!(text.contains(&first) && text.contains(&second), "{text}");
     }
@@ -582,11 +619,15 @@ fn issuer_and_domain_entries_make_lists_differ() {
 
 #[test]
 fn explicit_scope_ambiguity_precedes_kind_conflict() {
-    let body = first_rule(&recipient_body(), "*", "*", "allow")
-        .replace("kinds = [\"G_ACCOUNT\", \"C_ACCOUNT\"], allowlist = []",
-                 &format!("kinds = [\"G_ACCOUNT\"], allowlist = [{:?}]", contract(8)));
+    let body = first_rule(&recipient_body(), "*", "*", "allow").replace(
+        "kinds = [\"G_ACCOUNT\", \"C_ACCOUNT\"], allowlist = []",
+        &format!("kinds = [\"G_ACCOUNT\"], allowlist = [{:?}]", contract(8)),
+    );
     let text = recipient_refusal(
-        &body, &contract(7), &["stellar_pay"], "profile.policy_counterparty_ambiguous",
+        &body,
+        &contract(7),
+        &["stellar_pay"],
+        "profile.policy_counterparty_ambiguous",
     );
     assert!(text.contains("rule 0 shares its list"));
 }
@@ -662,20 +703,26 @@ fn explicit_tool_refuses_non_payment_consumer() {
 #[test]
 fn wildcard_scope_refuses_even_when_known_consumers_are_selected() {
     let mut body = first_rule(&recipient_body(), "*", "*", "allow");
-    for tool in MAINNET_READ_ONLY_TOOLS.iter()
+    for tool in MAINNET_READ_ONLY_TOOLS
+        .iter()
         .chain(MAINNET_TRUSTLINE_TOOLS)
         .chain(MAINNET_CLAIM_TOOLS)
     {
         body = first_rule(&body, tool, "*", "allow");
     }
-    let rules = read_rules(&doc(&body)).into_iter()
-        .map(|rule| rule.tool.to_owned()).collect::<Vec<_>>();
+    let rules = read_rules(&doc(&body))
+        .into_iter()
+        .map(|rule| rule.tool.to_owned())
+        .collect::<Vec<_>>();
     let wildcard = rules.iter().position(|tool| tool == "*").unwrap();
     let added = addition(&body, &account(7), &[]);
     assert_eq!(added.scope[0].rule, wildcard);
     assert_eq!(added.scope[0].tools, MAINNET_VALUE_OUT_TOOLS);
     let text = recipient_refusal(
-        &body, &account(7), MAINNET_VALUE_OUT_TOOLS, "profile.policy_counterparty_ambiguous",
+        &body,
+        &account(7),
+        MAINNET_VALUE_OUT_TOOLS,
+        "profile.policy_counterparty_ambiguous",
     );
     assert!(text.contains("every tool without an earlier match"));
 }
@@ -729,7 +776,11 @@ fn domain_list_without_unlisted_is_split() {
 }
 
 #[test]
+#[serial_test::serial]
 fn domain_split_appends_the_missing_contract_kind() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     struct DomainBinding(String);
     impl super::super::AccountIdentityView for DomainBinding {
         fn home_domain(&self) -> Option<String> {
@@ -760,28 +811,42 @@ fn domain_split_appends_the_missing_contract_kind() {
         assert!(selects(lists[1], "C_ACCOUNT"));
     }
     let binding = DomainBinding(contract(7));
-    let evaluate = |body: &str| verified_engine(body).evaluate_with_value(
-        &tool_on(CREATE_TOOL, Net::Mainnet),
-        &serde_json::json!({}),
-        &mainnet_profile(),
-        x402_value(&contract(7), 1),
-        None,
-        Some(&binding),
-        Some(&binding),
-        None,
-        None,
-        T0,
-    ).unwrap();
+    let evaluate = |body: &str| {
+        verified_engine(body)
+            .evaluate_with_value(
+                &tool_on(CREATE_TOOL, Net::Mainnet),
+                &serde_json::json!({}),
+                &mainnet_profile(),
+                x402_value(&contract(7), 1),
+                None,
+                Some(&binding),
+                Some(&binding),
+                None,
+                None,
+                T0,
+            )
+            .unwrap()
+    };
     assert_eq!(label(&evaluate(&body)), "deny");
     assert_eq!(label(&evaluate(&added.body)), "allow");
     assert_eq!(
-        label(&x402(&verified_engine(&added.body), CREATE_TOOL, &contract(7), 1, T0)),
+        label(&x402(
+            &verified_engine(&added.body),
+            CREATE_TOOL,
+            &contract(7),
+            1,
+            T0
+        )),
         "deny"
     );
 }
 
 #[test]
+#[serial_test::serial]
 fn domain_split_preserves_other_recipients() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let body = domain_body(false);
     let added = addition(&body, &account(7), &[]);
     for recipient in [account(8), muxed(8, 9), contract(8), w_address(8, 9)] {
@@ -863,7 +928,11 @@ fn edit_preserves_comments_and_mainnet() {
 }
 
 #[test]
+#[serial_test::serial]
 fn edited_body_loads_and_meets_minimum() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let body = format!(
         "{}\n[mainnet]\nclassic_max_fee_per_op_stroops = 10000\n",
         recipient_body()
@@ -878,7 +947,11 @@ fn edited_body_loads_and_meets_minimum() {
 }
 
 #[test]
+#[serial_test::serial]
 fn edited_body_pays_as_summarized() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mut body = recipient_body();
     for recipient in [account(7), muxed(8, 9), contract(7), w_address(8, 9)] {
         body = addition(&body, &recipient, &[]).body;
@@ -929,7 +1002,8 @@ fn unknown_network_refuses_before_targeting() {
         first_rule(&recipient_body(), "*", "*", "allow"),
         "secret = private-input-marker".into(),
     ] {
-        let error = add_payment_recipient(&body, "unrecognized-network", &account(7), &[]).unwrap_err();
+        let error =
+            add_payment_recipient(&body, "unrecognized-network", &account(7), &[]).unwrap_err();
         assert_eq!(error, RecipientRefusal::UnknownNetwork);
         assert_eq!(error.code(), "profile.policy_network_unknown");
         assert_eq!(error.to_string(), "the passphrase is not a known network");

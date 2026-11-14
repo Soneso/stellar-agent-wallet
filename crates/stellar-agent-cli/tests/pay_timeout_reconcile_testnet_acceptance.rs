@@ -259,7 +259,9 @@ fn write_signed_policy_toml(home: &std::path::Path, profile: &str, owner: &Signi
 }
 
 fn rotate_audit_key_via_cli(home: &std::path::Path, profile: &str) -> KeyringGuard {
+    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
     let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
+        .args(cfg!(feature = "live-platform-keyring").then_some("--test-live-platform-keyring"))
         .args(["profile", "rotate-audit-key", profile])
         .env("STELLAR_AGENT_HOME", home)
         .output()
@@ -283,7 +285,9 @@ fn enroll_owner_key_via_cli(
     owner_s_strkey: &str,
     owner_g_strkey: &str,
 ) -> KeyringGuard {
+    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
     let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
+        .args(cfg!(feature = "live-platform-keyring").then_some("--test-live-platform-keyring"))
         .args([
             "profile",
             "enroll-owner-key",
@@ -331,7 +335,9 @@ fn run_cli(
     args: &[&str],
     env: &[(&str, &str)],
 ) -> (i32, serde_json::Value) {
+    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
     let mut command = Command::new(env!("CARGO_BIN_EXE_stellar-agent"));
+    command.args(cfg!(feature = "live-platform-keyring").then_some("--test-live-platform-keyring"));
     command.args(args).env("STELLAR_AGENT_HOME", home);
     for (key, value) in env {
         command.env(key, value);
@@ -376,6 +382,16 @@ fn audit_rows(home: &std::path::Path, profile: &str) -> Vec<serde_json::Value> {
 #[tokio::test]
 #[serial_test::serial]
 async fn pay_timeout_is_recorded_and_tx_status_reconciles_it() {
+    #[cfg(feature = "live-platform-keyring")]
+    if std::env::var("STELLAR_AGENT_TEST_LIVE_PLATFORM_KEYRING").as_deref()
+        == Ok("real-platform-keyring")
+    {
+        use stellar_agent_network::keyring::live::{
+            LivePlatformKeyring, init_platform_keyring_store_live,
+        };
+        init_platform_keyring_store_live(LivePlatformKeyring::acknowledge_real_platform_keyring())
+            .expect("live acceptance platform store");
+    }
     stellar_agent_network::init_platform_keyring_store()
         .expect("platform keyring store must initialise on this host");
 

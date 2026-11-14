@@ -640,6 +640,8 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn reset_window_state_nonexistent_profile_returns_exit_1() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let args = ResetWindowStateArgs {
             name: Some("__nonexistent_reset_window_state__".to_owned()),
             profile: None,
@@ -926,6 +928,9 @@ mod tests {
     #[test]
     #[serial]
     fn reset_explains_permanent_and_missing_secondary_blocks() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_network::intent_view_test_helpers::{PERMANENT, SECONDARY};
         for (permanent, missing) in [(true, false), (false, true), (true, true)] {
             stellar_agent_test_support::keyring_mock::install().unwrap();

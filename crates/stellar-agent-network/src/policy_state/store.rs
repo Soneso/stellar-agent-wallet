@@ -6887,6 +6887,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn recovery_run_versions_and_safe_refusals() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use super::super::operations::tests::{Fx, unknown_with};
         let mut fx = Fx::new();
         unknown_with(&mut fx, 1, 10, vec![]);
@@ -7038,6 +7041,9 @@ mod tests {
     #[test]
     #[serial]
     fn an_unbounded_source_subject_never_closes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for kind in 0..3 {
             let (_dir, profile, store, _) = progress_fixture();
             let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
@@ -7067,6 +7073,9 @@ mod tests {
     #[test]
     #[serial]
     fn closure_survives_each_commit_seam() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert_closure_and_pruning_survive_each_commit_seam();
     }
 
@@ -7205,6 +7214,9 @@ mod tests {
     #[test]
     #[serial]
     fn freshness_is_rechecked_at_the_protected_commit() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for admission in [false, true] {
             let (_dir, profile, store, plan) = progress_fixture();
             let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
@@ -7259,6 +7271,9 @@ mod tests {
     #[test]
     #[serial]
     fn older_readers_refuse_final_intent_snapshots() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // This decoder is a frozen copy of the version 8 reader's ceiling check at 8ebb68c5.
         fn check_version_eight(body: &[u8]) -> Result<(), WindowStoreError> {
             const WIRE_VERSION_MAX: u32 = 8;
@@ -7324,6 +7339,9 @@ mod tests {
     #[test]
     #[serial]
     fn final_intent_snapshot_predicates_are_distinct() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert_final_intent_snapshot_predicates_are_distinct();
     }
 
@@ -7658,6 +7676,9 @@ mod tests {
     #[test]
     #[serial]
     fn reset_obeys_intent_retention_and_refusal_order() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for schedule in [false, true] {
             let (dir, profile, store, mut plan) = progress_fixture();
             let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
@@ -7886,6 +7907,9 @@ mod tests {
     #[test]
     #[serial]
     fn intent_views_report_horizons_without_mutation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for terminal in [None, Some(0), Some(1)] {
             let (_dir, profile, store, mut plan) = progress_fixture();
             let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
@@ -7954,6 +7978,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn schedule_closure_requires_two_terminal_reads() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for (values, heights, lower, closes) in [
             ([0, 0], [101, 102], 101, true),
             ([1, 1], [101, 102], 101, true),
@@ -8086,6 +8113,9 @@ mod tests {
     #[test]
     #[serial]
     fn schedule_evidence_matches_guarded_record() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (_dir, profile, store, mut plan) = progress_fixture();
         let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
         let timelock = stellar_strkey::Contract([1; 32]).to_string().to_string();
@@ -8285,6 +8315,9 @@ mod tests {
     #[test]
     #[serial]
     fn insufficient_evidence_keeps_intents_open() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for purpose in [
             None,
             Some(IntentPurpose::TimelockSchedule {
@@ -8430,6 +8463,9 @@ mod tests {
     #[test]
     #[serial]
     fn readmission_cannot_reclassify_an_intent() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert_readmission_cannot_reclassify_an_intent();
     }
 
@@ -8478,6 +8514,9 @@ mod tests {
     #[test]
     #[serial]
     fn stored_testnet_default_primary_authorizes_capability() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (dir, profile, store, plan) = progress_fixture();
         let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
         fs::write(dir.path().join("intent.toml"), "chain_id = \"stellar:testnet\"\nsecondary_rpc_url = \"https://secondary.example/rpc\"\n").unwrap();
@@ -8515,6 +8554,9 @@ mod tests {
     #[test]
     #[serial]
     fn intent_reset_explanations_follow_open_records_and_stored_endpoints() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::intent_view_test_helpers::{SECONDARY, UNREADABLE};
         for closed in [false, true] {
             for unreadable in [false, true] {
@@ -8563,6 +8605,9 @@ mod tests {
     #[test]
     #[serial]
     fn reset_retains_closed_intents_on_store_clock() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (_dir, profile, store, plan) = progress_fixture();
         let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
         let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
@@ -8611,6 +8656,9 @@ mod tests {
     #[test]
     #[serial]
     fn stale_observation_commits_pruning_once() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let runtime = std::sync::Arc::new(
             tokio::runtime::Builder::new_current_thread()
                 .enable_time()
@@ -8674,6 +8722,9 @@ mod tests {
     #[test]
     #[serial]
     fn witnessed_closure_requires_stored_pair() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (_dir, profile, store, plan) = progress_fixture();
         let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
         let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
@@ -8848,6 +8899,9 @@ mod tests {
     #[test]
     #[serial]
     fn intent_horizons_survive_window_lengthening() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert_intent_horizons_survive_window_lengthening();
     }
 
@@ -8884,6 +8938,9 @@ mod tests {
     #[test]
     #[serial]
     fn refused_admission_commits_only_progress() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (_dir, profile, store, plan) = progress_fixture();
         let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
         let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
@@ -8944,6 +9001,9 @@ mod tests {
     #[test]
     #[serial]
     fn intent_horizon_overflow_changes_nothing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (_dir, profile, store, plan) = progress_fixture();
         let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
         let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
@@ -9035,6 +9095,9 @@ mod tests {
     #[test]
     #[serial]
     fn final_submission_links_and_charges_once() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "intent");
@@ -9323,6 +9386,9 @@ mod tests {
     #[test]
     #[serial]
     fn same_authority_with_changed_legs_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for kind in 0..3 {
             keyring_mock::install().unwrap();
             let dir = TempDir::new().unwrap();
@@ -9401,6 +9467,9 @@ mod tests {
     #[test]
     #[serial]
     fn cancellation_removes_only_the_unexposed_charge() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "intent");
@@ -9416,6 +9485,9 @@ mod tests {
     #[test]
     #[serial]
     fn signed_intents_read_without_writing_and_refuse_tampering() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "intent");
@@ -9474,6 +9546,9 @@ mod tests {
     #[test]
     #[serial]
     fn different_final_intent_cannot_consume_reservation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "intent");
@@ -9515,6 +9590,9 @@ mod tests {
     #[test]
     #[serial]
     fn restart_preserves_exposed_intent_without_envelope() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for seam in [
             COMMIT_FAULT_AFTER_PREPARED,
             COMMIT_FAULT_AFTER_COUNTER,
@@ -9575,6 +9653,9 @@ mod tests {
     #[test]
     #[serial]
     fn malformed_intent_snapshots_refuse() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = ResetFixture::new();
         let (plan, envelope) = intent_fixture_kind(2);
         let _exposure = f
@@ -10131,6 +10212,9 @@ mod tests {
     #[test]
     #[serial]
     fn fresh_store_load_into_appends_nothing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "fresh");
@@ -10146,6 +10230,9 @@ mod tests {
     #[test]
     #[serial]
     fn record_then_load_into_round_trips_accumulated_entries() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "acc");
@@ -10167,6 +10254,9 @@ mod tests {
     #[test]
     #[serial]
     fn second_record_does_not_re_mint_and_accumulates() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "acc2");
@@ -10193,6 +10283,9 @@ mod tests {
     #[test]
     #[serial]
     fn round_trip_amount_above_i64_max_is_exact() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "big");
@@ -10214,6 +10307,9 @@ mod tests {
     #[test]
     #[serial]
     fn post_prune_old_entries_are_dropped() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "prune");
@@ -10241,6 +10337,9 @@ mod tests {
     #[test]
     #[serial]
     fn tampered_file_fails_closed_on_load() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "tamper");
@@ -10265,6 +10364,9 @@ mod tests {
     #[test]
     #[serial]
     fn tampered_file_fails_closed_on_record() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "tamper2");
@@ -10289,6 +10391,9 @@ mod tests {
     #[test]
     #[serial]
     fn concurrent_record_calls_are_serialised_not_lost() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "lockt");
@@ -10331,6 +10436,9 @@ mod tests {
     #[test]
     #[serial]
     fn leftover_temp_file_does_not_block_next_write() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "crash");
@@ -10355,6 +10463,9 @@ mod tests {
     #[test]
     #[serial]
     fn reset_clears_accumulated_history() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "reset");
@@ -10383,6 +10494,9 @@ mod tests {
     #[test]
     #[serial]
     fn resign_then_load_with_new_key_reads_green() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let mut profile = test_profile(dir.path(), "resign");
@@ -10422,6 +10536,9 @@ mod tests {
     #[test]
     #[serial]
     fn first_run_initializes_cleanly_with_no_prior_state() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "firstrun");
@@ -10454,6 +10571,9 @@ mod tests {
     #[test]
     #[serial]
     fn deletion_after_use_fails_closed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "deleted");
@@ -10482,6 +10602,9 @@ mod tests {
     #[test]
     #[serial]
     fn rollback_to_older_valid_file_fails_closed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "rollback");
@@ -10520,6 +10643,9 @@ mod tests {
     #[test]
     #[serial]
     fn crash_ordering_keyring_ahead_of_file_and_reset_fail_closed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "crashgen");
@@ -10568,6 +10694,9 @@ mod tests {
     #[test]
     #[serial]
     fn end_to_end_persist_seam_second_process_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::policy::ToolValueKind;
         use stellar_agent_core::policy::v1::criteria::per_period_cap::{
             PerPeriodCapCriterion, Window,
@@ -10703,6 +10832,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_pending_reservation_counts_toward_the_window_total() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "resv-count");
@@ -10733,6 +10865,9 @@ mod tests {
     #[test]
     #[serial]
     fn confirm_keeps_exposure_open() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "resv-confirm");
@@ -10773,6 +10908,9 @@ mod tests {
     #[test]
     #[serial]
     fn pre_exposure_cancellation_removes_the_records() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "resv-release");
@@ -10807,6 +10945,9 @@ mod tests {
     #[test]
     #[serial]
     fn pre_exposure_cancellation_refuses_an_observed_success() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "resv-keep-confirmed");
@@ -10851,6 +10992,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_reservation_for_bytes_the_file_holds_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "resv-duplicate");
@@ -10916,6 +11060,9 @@ mod tests {
     #[test]
     #[serial]
     fn pending_reservations_are_reported_oldest_first() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "resv-order");
@@ -10983,6 +11130,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_v1_file_reads_as_confirmed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "v1-read");
@@ -11022,6 +11172,9 @@ mod tests {
     #[test]
     #[serial]
     fn prepared_settlement_recovers_both_sides_of_the_commit_point() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for release in [false, true] {
             keyring_mock::install().unwrap();
             let dir = TempDir::new().unwrap();
@@ -11087,6 +11240,9 @@ mod tests {
     #[test]
     #[serial]
     fn abandoned_candidate_cannot_replay_at_a_reused_generation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "abandoned-candidate");
@@ -11142,6 +11298,9 @@ mod tests {
     #[test]
     #[serial]
     fn failed_prepare_write_keeps_the_authenticated_hold_readable() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "prepare-write-failure");
@@ -11171,6 +11330,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_numeric_counter_never_selects_a_candidate() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "numeric-candidate");
@@ -11229,6 +11391,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_keyring_failure_at_the_commit_point_keeps_the_hold_and_the_retry_completes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "commit-point");
@@ -11293,6 +11458,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_v2_pending_file_keeps_its_hold() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "v2-hold");
@@ -11326,6 +11494,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_newer_wire_version_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "v3-read");
@@ -11369,6 +11540,9 @@ mod tests {
     #[test]
     #[serial]
     fn the_window_file_is_owner_only_on_unix() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use std::os::unix::fs::PermissionsExt as _;
 
         keyring_mock::install().unwrap();
@@ -11420,6 +11594,9 @@ mod tests {
     #[test]
     #[serial]
     fn every_window_key_loader_refuses_the_owner_key() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use base64::Engine as _;
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
@@ -11466,6 +11643,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_g_strkey_owner_value_is_refused_by_the_window_readers() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let name = "owner-window-strkey";
@@ -11495,6 +11675,9 @@ mod tests {
     #[test]
     #[serial]
     fn an_owner_namespace_window_key_coordinate_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let mut profile = owner_profile(dir.path(), "owner-window-coord");
@@ -11756,6 +11939,9 @@ mod tests {
     #[test]
     #[serial]
     fn reset_consent_refusals_change_nothing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         type Setup = fn(&ResetFixture);
         type Consent = fn(&ResetRecord<'_>) -> ResetConsent;
         let sealed: Setup = |f| f.seal(&reset_wire());
@@ -11927,6 +12113,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_consent_does_not_transfer_between_first_use_stores() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let first = ResetFixture::new();
         first.pin_owner(owner_of(0xa1));
         let mut kept = None;
@@ -11986,6 +12175,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_reset_signed_by_the_pinned_owner_proceeds() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = ResetFixture::new();
         f.enable();
         f.pin_owner(owner_of(0xa1));
@@ -12080,6 +12272,9 @@ mod tests {
     #[test]
     #[serial]
     fn owner_reset_without_nonce_requires_signature() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for present_pin in [false, true] {
             for populated in [false, true] {
                 let f = ResetFixture::new();
@@ -12104,6 +12299,9 @@ mod tests {
     #[test]
     #[serial]
     fn mainnet_pinned_reset_without_nonce_requires_signature() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for populated in [false, true] {
             let f = ResetFixture::mainnet();
             if populated {
@@ -12119,6 +12317,9 @@ mod tests {
     #[test]
     #[serial]
     fn owner_reset_selects_pin_then_enrolled_owner_and_refuses_unreadable_state() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for pinned in [false, true] {
             let f = ResetFixture::new();
             enrolled_reset_owner(&f, if pinned { 0xb2 } else { 0xa1 });
@@ -12178,6 +12379,9 @@ mod tests {
     #[test]
     #[serial]
     fn owner_reset_rejects_wrong_key_invalid_signature_and_replay() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         reset_consent_refusals_change_nothing();
         a_consent_does_not_transfer_between_first_use_stores();
         let f = ResetFixture::new();
@@ -12197,6 +12401,9 @@ mod tests {
     #[test]
     #[serial]
     fn reset_consent_replaces_latest_record_and_survives_pruning() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let clock = crate::mainnet::clock::set_now_ms_for_test(100_000);
         for mainnet in [false, true] {
             let f = if mainnet {
@@ -12237,6 +12444,9 @@ mod tests {
     #[test]
     #[serial]
     fn owner_reset_audit_failure_changes_no_state() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for mainnet in [false, true] {
             for populated in [false, true] {
                 let f = if mainnet {
@@ -12276,6 +12486,9 @@ mod tests {
     #[test]
     #[serial]
     fn owner_reset_serializes_authority_and_mutation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use std::sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -12311,6 +12524,9 @@ mod tests {
     #[test]
     #[serial]
     fn owner_reset_preserves_total_buckets_beside_windowed_ones() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for mainnet in [false, true] {
             let f = if mainnet {
                 ResetFixture::mainnet()
@@ -12362,6 +12578,9 @@ mod tests {
     #[test]
     #[serial]
     fn owner_reset_preserves_all_reset_barriers() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let refuse = |store: &PersistedWindowStore, profile: &Profile| {
             put_raw(
                 &profile.policy_owner_key_id,
@@ -12502,6 +12721,9 @@ mod tests {
     #[test]
     #[serial]
     fn owner_reset_preserves_terminal_history_and_unreleased_reservations() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         {
             use operations::OperationState as S;
             let (_dir, profile, store, clock) = operation_store();
@@ -12844,6 +13066,9 @@ mod tests {
     #[test]
     #[serial]
     fn reset_consent_validates_current_and_prepared_images() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = ResetFixture::new();
         enrolled_reset_owner(&f, 0xa1);
         authorized_reset(&f, "valid-reset", |_, _| Ok(())).unwrap();
@@ -12914,6 +13139,9 @@ mod tests {
     #[test]
     #[serial]
     fn reset_consent_preserves_bytes_versions_and_crash_recovery() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for version in [10, 11] {
             for seam in [
                 COMMIT_FAULT_AFTER_PREPARED,
@@ -12979,6 +13207,9 @@ mod tests {
     #[test]
     #[serial]
     fn reset_consent_load_is_write_free() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = ResetFixture::new();
         enrolled_reset_owner(&f, 0xa1);
         authorized_reset(&f, "read-only", |_, _| Ok(())).unwrap();
@@ -13000,6 +13231,9 @@ mod tests {
     #[test]
     #[serial]
     fn owner_reset_clears_floors_only_after_commit() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for seam in [
             COMMIT_FAULT_AFTER_PREPARED,
             COMMIT_FAULT_AFTER_COUNTER,
@@ -13033,6 +13267,9 @@ mod tests {
     #[test]
     #[serial]
     fn reset_snapshot_keeps_inclusive_boundary_and_pending_records() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = ResetFixture::new();
         let mut wire = reset_wire();
         wire.entries[0].records.extend([
@@ -13097,6 +13334,9 @@ mod tests {
     #[test]
     #[serial]
     fn reset_totals_saturate() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = ResetFixture::new();
         let mut wire = reset_wire();
         wire.entries[0].records = [RecordStatus::Confirmed, RecordStatus::Pending]
@@ -13119,6 +13359,9 @@ mod tests {
     #[test]
     #[serial]
     fn reset_omits_empty_buckets_and_caps_live_buckets_in_file_order() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = ResetFixture::new();
         let mut wire = reset_wire();
         let live = wire.entries[0].clone();
@@ -13156,6 +13399,9 @@ mod tests {
     #[test]
     #[serial]
     fn reset_largest_row_fits_without_writer_truncation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::AuditEntry;
         use stellar_agent_core::audit_log::entry::MAX_ENTRY_BYTES;
         let f = ResetFixture::new();
@@ -13209,6 +13455,9 @@ mod tests {
     #[test]
     #[serial]
     fn reset_escaped_and_multibyte_ids_fit_without_writer_truncation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::AuditEntry;
         use stellar_agent_core::audit_log::entry::MAX_ENTRY_BYTES;
         for (id, count) in [("\0", 10), ("\u{10348}", 16)] {
@@ -13264,6 +13513,9 @@ mod tests {
     #[test]
     #[serial]
     fn reset_snapshots_the_committed_prepared_successor() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = ResetFixture::new();
         let mut original = reset_wire();
         let mut next = original.clone();
@@ -13281,6 +13533,9 @@ mod tests {
     #[test]
     #[serial]
     fn reset_tampered_file_refuses_without_mutation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = ResetFixture::new();
         f.seal(&reset_wire());
         let mut bytes = fs::read(&f.store.path).unwrap();
@@ -13295,6 +13550,9 @@ mod tests {
     #[test]
     #[serial]
     fn reset_authentic_rollback_refuses_without_mutation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = ResetFixture::new();
         f.seal(&reset_wire());
         put_raw(&generation_entry_ref(&f.profile), "2");
@@ -13307,6 +13565,9 @@ mod tests {
     #[test]
     #[serial]
     fn reset_malformed_file_refuses_without_mutation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = ResetFixture::new();
         f.seal(&reset_wire());
         let key = crate::keyring::load_hmac_key_32(&f.profile.policy_window_state_key_id).unwrap();
@@ -13323,6 +13584,9 @@ mod tests {
     #[test]
     #[serial]
     fn reset_file_without_key_refuses_without_mutation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = ResetFixture::new();
         fs::write(&f.store.path, b"unverifiable").unwrap();
         assert!(matches!(
@@ -13334,6 +13598,9 @@ mod tests {
     #[test]
     #[serial]
     fn reset_short_key_refuses_without_mutation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = ResetFixture::new();
         put_raw(&f.profile.policy_window_state_key_id, "AA");
         fs::write(&f.store.path, b"unverifiable").unwrap();
@@ -13346,6 +13613,9 @@ mod tests {
     #[test]
     #[serial]
     fn reset_undecodable_key_refuses_without_mutation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = ResetFixture::new();
         f.seal(&reset_wire());
         put_raw(&f.profile.policy_window_state_key_id, "not*base64");
@@ -13358,6 +13628,9 @@ mod tests {
     #[test]
     #[serial]
     fn reset_key_read_error_refuses_before_recorder() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = ResetFixture::new();
         f.seal(&reset_wire());
         let old = get_raw(&f.profile.policy_window_state_key_id);
@@ -13383,6 +13656,9 @@ mod tests {
     #[test]
     #[serial]
     fn reset_invalid_counter_refuses_before_recorder() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = ResetFixture::new();
         put_raw(&generation_entry_ref(&f.profile), "invalid commitment");
         let (result, authorized, recorded) =
@@ -13401,6 +13677,9 @@ mod tests {
     #[test]
     #[serial]
     fn reset_read_error_refuses_before_recorder() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = ResetFixture::new();
         fs::create_dir(&f.store.path).unwrap();
         let (result, authorized, recorded) =
@@ -13419,6 +13698,9 @@ mod tests {
     #[test]
     #[serial]
     fn reset_missing_with_counter_and_first_run_are_distinct() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = ResetFixture::new();
         let first = f.reset().accrual;
         assert_eq!(first.previous, PreviousState::Missing);
@@ -13434,6 +13716,9 @@ mod tests {
     #[test]
     #[serial]
     fn reset_generation_overflow_refuses_before_recorder() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = ResetFixture::new();
         let mut wire = reset_wire();
         wire.generation = u64::MAX;
@@ -13447,6 +13732,9 @@ mod tests {
     #[test]
     #[serial]
     fn reset_owner_namespace_refuses_before_recorder() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut f = ResetFixture::new();
         f.profile.policy_window_state_key_id = KeyringEntryRef::default_owner_key("another");
         let (result, authorized, recorded) =
@@ -13465,6 +13753,9 @@ mod tests {
     #[test]
     #[serial]
     fn reset_owner_equal_key_refuses_before_recorder() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use base64::Engine as _;
         let f = ResetFixture::new();
         let value = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(OWNER_KEY);
@@ -13486,6 +13777,9 @@ mod tests {
     #[test]
     #[serial]
     fn reset_recorder_observes_unchanged_state_and_refusal_changes_nothing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = ResetFixture::new();
         for present in [false, true] {
             if present {
@@ -13559,6 +13853,9 @@ mod tests {
     #[test]
     #[serial]
     fn reset_holds_window_lock_during_recorder() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = ResetFixture::new();
         let other = f.store.clone();
         let mut during_authorize = None;
@@ -13598,6 +13895,9 @@ mod tests {
     #[test]
     #[serial]
     fn reset_write_failure_after_mint_reports_minted() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = ResetFixture::new();
         fs::create_dir(f.store.path.with_file_name("state.window.tmp")).unwrap();
         let result = reset_unsigned(&f.store, &f.profile, 100_000, |_| Ok::<_, ()>(()));
@@ -13796,6 +14096,9 @@ mod tests {
     #[test]
     #[serial]
     fn accounting_expiry_commits_before_its_receipt_projection() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert_expiry_commits_before_projection(false);
     }
 
@@ -13804,6 +14107,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_success_waits_for_receipt_persistence_and_a_failure_keeps_the_hold() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert_settlement_waits_for_receipt("SUCCESS");
         assert_settlement_waits_for_receipt("FAILED");
     }
@@ -13813,6 +14119,9 @@ mod tests {
     #[test]
     #[serial]
     fn accounting_expiry_commits_before_a_missing_receipt_is_rebuilt() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert_expiry_commits_before_projection(true);
     }
 
@@ -13823,6 +14132,9 @@ mod tests {
     #[test]
     #[serial]
     fn accounting_expiry_of_a_cleared_receipt_keeps_the_receipt() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "release-cleared");
@@ -13907,6 +14219,9 @@ mod tests {
     #[test]
     #[serial]
     fn recovery_expiry_suppression_completes_receipt_flag() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use super::super::operations::tests::{
             Checked, Fx, checked_transition, commit_on, decided_attempt, envelope_id,
             expire_reservation, unknown_at,
@@ -13981,6 +14296,8 @@ mod tests {
     #[test]
     #[serial]
     fn recovery_expiry_receipt_flag_replays_after_crash() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         use super::super::operations::tests::{
             Checked, Fx, checked_transition, commit_on, decided_attempt, envelope_id,
             expire_reservation,
@@ -14068,6 +14385,8 @@ mod tests {
     #[test]
     #[serial]
     fn recovery_projection_acknowledgement_survives_commit_point() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         use super::super::operations::tests::{
             Checked, Fx, accounting_state, commit_checked, envelope_id,
         };
@@ -14130,6 +14449,8 @@ mod tests {
     #[test]
     #[serial]
     fn recovery_projection_heals_late_expiry_write() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         use super::super::operations::tests::{
             Fx, Sink, accounting_state, decide, decided_attempt, envelope_id, expire_reservation,
             not_included_proof,
@@ -14225,6 +14546,8 @@ mod tests {
     #[test]
     #[serial]
     fn an_expiry_commits_before_its_receipt_projection() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "release-retry");
@@ -14411,6 +14734,9 @@ mod tests {
     #[test]
     #[serial]
     fn restart_replays_exact_owed_decision() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let start = now_ms().unwrap();
         let clock = crate::mainnet::clock::set_now_ms_for_test(start);
         let fx = expiring_hold("replay", "a1", start);
@@ -14581,6 +14907,9 @@ mod tests {
     #[test]
     #[serial]
     fn restart_after_append_does_not_duplicate() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let now = now_ms().unwrap();
         for case in ["active", "archive", "tampered"] {
             let fx = expiring_hold(&format!("append-{case}"), "b2", now);
@@ -14775,6 +15104,9 @@ mod tests {
     #[test]
     #[serial]
     fn an_unanchored_append_is_not_acknowledged() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use std::sync::Arc;
         use stellar_agent_core::audit_log::tip_anchor::InMemoryTipAnchorStore;
         use stellar_agent_core::audit_log::{KeyedAuditAccess, TipAnchorStore};
@@ -14841,6 +15173,9 @@ mod tests {
     #[test]
     #[serial]
     fn delivery_refuses_an_identifier_the_window_does_not_hold() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let now = now_ms().unwrap();
         let fx = expiring_hold("unverifiable", "d4", now);
         let mut writer = delivery_writer(&fx.profile);
@@ -14869,6 +15204,9 @@ mod tests {
     #[test]
     #[serial]
     fn projection_follows_the_receipt_status_rule() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let now = now_ms().unwrap();
         let cases: [(&str, Option<ReceiptStatus>); 7] = [
             ("absent", None),
@@ -15010,6 +15348,9 @@ mod tests {
     #[test]
     #[serial]
     fn prune_keeps_owed_expiry_records_whatever_their_age() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let now = now_ms().unwrap();
         let fx = expiring_hold("prune-expiry", "a7", now);
         fx.store
@@ -15044,6 +15385,9 @@ mod tests {
     #[test]
     #[serial]
     fn snapshot_check_refuses_foreign_expiry_records() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let now = now_ms().unwrap();
         let fx = expiring_hold("snapshot-expiry", "b8", now);
         fx.store
@@ -15102,6 +15446,9 @@ mod tests {
     #[test]
     #[serial]
     fn reset_refuses_an_undelivered_expiry_obligation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let now = now_ms().unwrap();
         let fx = expiring_hold("reset-expiry", "c9", now);
         let Some(Settlement::AccountingExpired { decision_id, .. }) = fx
@@ -15145,6 +15492,9 @@ mod tests {
     #[test]
     #[serial]
     fn an_untimed_hold_keeps_the_recorded_answer_and_reports_the_new_one() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "untimed-recorded");
@@ -15322,6 +15672,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn an_unreadable_receipt_store_is_reported_on_the_chain_answer_path() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let (profile, store, receipts, res) =
@@ -15383,6 +15736,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn an_unreadable_receipt_store_is_reported_on_the_retention_branch() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let (profile, store, receipts, res) =
@@ -15452,6 +15808,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn reconciliation_expires_accounting_at_the_callers_horizon() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "caller-horizon");
@@ -15593,6 +15952,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn a_legacy_hold_is_retained_by_reconciliation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "legacy-retained");
@@ -15661,6 +16023,9 @@ mod tests {
     #[test]
     #[serial]
     fn accounting_horizon_preserves_multiple_windows_and_unknown_outcome() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "accounting-horizon");
@@ -15762,6 +16127,9 @@ mod tests {
     #[test]
     #[serial]
     fn two_windows_on_one_asset_keep_each_exposure_at_its_own_duration() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "two-window-horizon");
@@ -15852,6 +16220,9 @@ mod tests {
     #[test]
     #[serial]
     fn policy_duration_edits_apply_the_longer_window_at_query_time() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "edited-horizon");
@@ -15926,18 +16297,27 @@ mod tests {
     #[test]
     #[serial]
     fn delayed_success_uses_first_observation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert_success_horizon(true);
     }
 
     #[test]
     #[serial]
     fn early_success_keeps_execution_bound() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert_success_horizon(false);
     }
 
     #[test]
     #[serial]
     fn negative_reports_never_construct_failure_or_refund() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "negative-reports");
@@ -15972,6 +16352,9 @@ mod tests {
     #[test]
     #[serial]
     fn decisions_refuse_stale_generation_and_record_unbounded_override() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let mut profile = test_profile(dir.path(), "checked-decisions");
@@ -16023,6 +16406,9 @@ mod tests {
     #[test]
     #[serial]
     fn an_untimed_testnet_override_needs_the_unbounded_acknowledgement() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "testnet-unbounded");
@@ -16179,6 +16565,9 @@ mod tests {
     #[test]
     #[serial]
     fn wire_version_tracks_exposure_content_and_preserves_legacy_records() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let scope = ChainScope::for_chain(Caip2::Mainnet);
         let base = WireRecord {
             chain_scope: Some(scope),
@@ -16326,6 +16715,9 @@ mod tests {
     #[test]
     #[serial]
     fn every_prepared_version_pair_survives_both_sides_of_the_commit_point() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for (current_version, prepared_version) in [
             (1, 3),
             (2, 3),
@@ -16657,6 +17049,9 @@ mod tests {
     #[test]
     #[serial]
     fn an_operation_file_reserializes_byte_identically() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (_dir, profile, store, _clock) = operation_store();
         let mut audit = OperationRows::default();
         let handle = open_operation(&store, &profile, &mut audit, "order-1", 1);
@@ -16694,6 +17089,9 @@ mod tests {
     #[test]
     #[serial]
     fn version_ten_file_reserializes_byte_identically() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let golden: WireFile = serde_json::from_str(V10_BODY).unwrap();
         assert_eq!(serde_json::to_vec(&golden).unwrap(), V10_BODY.as_bytes());
         let (_dir, profile, store, _clock) = version_ten_store(true);
@@ -16741,6 +17139,9 @@ mod tests {
     #[test]
     #[serial]
     fn version_ten_prepared_pairs_survive_both_sides_of_the_commit_point() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for current_version in [WIRE_VERSION_INTENT, WIRE_VERSION_POLICY_AUTHORITY] {
             for seam in [
                 COMMIT_FAULT_AFTER_PREPARED,
@@ -16844,6 +17245,9 @@ mod tests {
     #[test]
     #[serial]
     fn unrelated_write_preserves_intents_obligations_and_pending_holds() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (_dir, profile, store, _clock) = version_ten_store(true);
         let pending = |wire: &WireFile| {
             wire.entries
@@ -17022,6 +17426,9 @@ mod tests {
     #[test]
     #[serial]
     fn reset_refuses_open_operations_and_keeps_terminal_records() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use operations::OperationState as S;
         let (_dir, profile, store, clock) = operation_store();
         let mut audit = OperationRows::default();
@@ -17271,6 +17678,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_version_ten_file_migrates_to_twelve_preserving_every_section() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (_dir, profile, store, _clock) = version_ten_store(true);
         let bytes = fs::read(&store.path).unwrap();
         let current = store.read_for_inspection(&profile).unwrap().unwrap();
@@ -17349,6 +17759,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_version_ten_golden_body_migrates_to_eleven() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (_dir, profile, store, _plan) = progress_fixture();
         let _clock = crate::mainnet::clock::set_now_ms_for_test(1000);
         let (key, _) = store.load_or_mint_key(&profile).unwrap();
@@ -17424,6 +17837,9 @@ mod tests {
     #[test]
     #[serial]
     fn native_amounts_need_version_ten_and_writers_select_twelve() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (_dir, profile, store, _clock) = operation_store();
         let mut held = policy_mint(1);
         held.native_reservation = Some(ledger::NativeReservation {
@@ -17479,6 +17895,9 @@ mod tests {
     #[test]
     #[serial]
     fn an_operation_write_preserves_authenticated_history() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (_dir, profile, store, _clock) = operation_store();
         store
             .record_and_persist(
@@ -17550,6 +17969,9 @@ mod tests {
     #[test]
     #[serial]
     fn version_eleven_prepared_pairs_survive_both_sides_of_the_commit_point() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let observation = |ledger| operations::WindowObservation {
             ledger,
             close_time_floor_ms: 900,
@@ -17657,6 +18079,9 @@ mod tests {
     #[test]
     #[serial]
     fn version_eleven_file_never_selects_ten() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (_dir, profile, store, _clock) = version_ten_store(true);
         let hmac_key =
             crate::keyring::load_hmac_key_32(&profile.policy_window_state_key_id).unwrap();
@@ -18122,6 +18547,9 @@ mod tests {
     #[test]
     #[serial]
     fn each_unverifiable_mainnet_state_refuses_naming_its_defect() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for defect in DEFECTS {
             let (_dir, profile, store) = broken("rules", true, defect);
             let unverifiable = |result: Result<(), WindowStoreError>, what: &str| {
@@ -18167,6 +18595,9 @@ mod tests {
     #[test]
     #[serial]
     fn without_the_mainnet_rules_the_generic_errors_stand() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let networks: &[bool] = if cfg!(feature = "mainnet-write") {
             &[false]
         } else {
@@ -18200,6 +18631,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_genuine_mainnet_first_run_reads_empty_and_writes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = mainnet_test_profile(dir.path(), "first");
@@ -18221,6 +18655,9 @@ mod tests {
     #[test]
     #[serial]
     fn an_unverifiable_reset_preserves_every_durable_component() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for mainnet in [true, false] {
             for defect in DEFECTS {
                 let (_dir, profile, store) = broken("unverifiable", mainnet, defect);
@@ -18249,6 +18686,9 @@ mod tests {
     #[serial]
     #[cfg(feature = "mainnet-write")]
     fn a_claimed_record_blocks_the_mainnet_reset() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::mainnet::fixtures::{self, LedgerFixture};
         let f = LedgerFixture::new("claimed-reset", 1_800_000_000_000);
         let envelope = fixtures::unsigned_envelope();
@@ -18284,6 +18724,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_reset_refuses_while_a_mainnet_authorization_is_open() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for mainnet in [true, false] {
             keyring_mock::install().unwrap();
             let dir = TempDir::new().unwrap();
@@ -18351,6 +18794,9 @@ mod tests {
     #[test]
     #[serial]
     fn newer_files_with_unknown_fields_cannot_be_reset() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::profile::caip2::Caip2;
         for chain in [Caip2::Testnet, Caip2::Mainnet] {
             let mut f = ResetFixture::new();
@@ -18398,6 +18844,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_supported_version_with_broken_invariants_is_malformed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = ResetFixture::new();
         f.seal(&reset_wire());
         let key = crate::keyring::load_hmac_key_32(&f.profile.policy_window_state_key_id).unwrap();
@@ -18420,6 +18869,9 @@ mod tests {
     #[test]
     #[serial]
     fn lazy_mint_refuses_installation_coordinate() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use base64::Engine as _;
         let dir = TempDir::new().unwrap();
         let mut profile = owner_profile(dir.path(), "installation-window");
@@ -18446,6 +18898,9 @@ mod tests {
     #[test]
     #[serial]
     fn generation_write_refuses_installation_coordinate() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let mut profile = owner_profile(dir.path(), "installation-generation");
@@ -18462,6 +18917,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn missing_receipt_does_not_supply_chain_provenance() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "legacy-receipt");
@@ -18520,6 +18978,9 @@ mod tests {
     #[test]
     #[serial]
     fn nonempty_legacy_state_is_not_adopted_from_toml() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "legacy-history");
@@ -18584,6 +19045,9 @@ mod tests {
     #[test]
     #[serial]
     fn reset_refuses_a_rolled_back_file_of_another_network() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut f = ResetFixture::new();
         f.profile.chain_id = Caip2::Mainnet;
         f.seal(&reset_wire());
@@ -18599,6 +19063,9 @@ mod tests {
     #[test]
     #[serial]
     fn sealed_v5_provenance_defects_refuse_independently() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut f = ResetFixture::new();
         f.profile.chain_id = Caip2::Mainnet;
         f.seal(&reset_wire());
@@ -18705,6 +19172,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_foreign_submission_hold_refuses_before_reserving() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = ResetFixture::new();
         f.seal(&reset_wire());
         let before = fs::read(&f.store.path).unwrap();
@@ -18929,6 +19399,9 @@ mod tests {
         #[test]
         #[serial]
         fn an_operator_clear_keeps_the_total_debit() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-clear");
             f.pin(D1);
             let mut timed = Fx::hold(1);
@@ -18962,6 +19435,9 @@ mod tests {
         #[test]
         #[serial]
         fn an_unsent_reservation_releases_only_its_own_total() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-unsent");
             f.pin(D1);
             let (_, unsent) = f
@@ -19071,6 +19547,9 @@ mod tests {
         #[test]
         #[serial]
         fn a_stale_second_process_cannot_overshoot() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             if let Some(role) = std::env::var_os(TWO_PROCESS_ROLE) {
                 let dir = PathBuf::from(std::env::var_os(TWO_PROCESS_DIR).unwrap());
                 two_process_role(role.to_str().unwrap(), &dir);
@@ -19124,6 +19603,9 @@ mod tests {
         #[test]
         #[serial]
         fn two_spellings_in_one_batch_share_one_allocation() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-batch-spellings");
             f.pin(D1);
             let sac = stellar_agent_core::asset_id::CanonicalAsset::Native
@@ -19153,6 +19635,9 @@ mod tests {
         #[test]
         #[serial]
         fn pre_exposure_cancellation_keeps_the_total() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-cancel");
             f.pin(D1);
             f.pending(1, &[f.total(6, D1)]).unwrap();
@@ -19205,6 +19690,9 @@ mod tests {
         #[test]
         #[serial]
         fn a_row_sum_overflow_refuses() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-row-overflow");
             let mut wire = version_twelve();
             f.push_row(&mut wire, i128::MAX, Some(D1));
@@ -19218,6 +19706,9 @@ mod tests {
         #[test]
         #[serial]
         fn a_hold_sum_overflow_refuses() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-hold-overflow");
             let mut wire = version_twelve();
             f.push_row(&mut wire, i128::MAX, Some(D1));
@@ -19233,6 +19724,9 @@ mod tests {
         #[test]
         #[serial]
         fn record_and_persist_refuses_a_total_entry() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-unconditional");
             f.pin(D1);
             f.store
@@ -19253,6 +19747,9 @@ mod tests {
         #[test]
         #[serial]
         fn record_authorized_admits_a_total_once() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-authorized");
             f.pin(D1);
             f.authorized(&[f.total(6, D1)]).unwrap();
@@ -19265,6 +19762,9 @@ mod tests {
         #[test]
         #[serial]
         fn a_total_admission_binds_the_pin() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-bind");
             f.store
                 .record_and_persist(&f.profile, &[f.windowed(1)])
@@ -19296,6 +19796,9 @@ mod tests {
         #[test]
         #[serial]
         fn negative_incoming_totals_refuse() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-negative");
             assert_eq!(
                 detail(admit(
@@ -19323,6 +19826,9 @@ mod tests {
         #[test]
         #[serial]
         fn the_successor_is_validated_before_commit() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-validate");
             f.pin(D1);
             f.store
@@ -19349,6 +19855,9 @@ mod tests {
         #[test]
         #[serial]
         fn an_admission_overflow_refuses() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-admit-overflow");
             let mut wire = version_twelve();
             f.push_row(&mut wire, i128::MAX, Some(D1));
@@ -19361,6 +19870,9 @@ mod tests {
         #[test]
         #[serial]
         fn a_mixed_digest_batch_accumulates_per_digest() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-mixed");
             admit(&version_twelve(), &[f.total(6, D1), f.total(6, D2)]).unwrap();
         }
@@ -19368,6 +19880,9 @@ mod tests {
         #[test]
         #[serial]
         fn same_digest_batch_cannot_overshoot() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-batch");
             assert!(exhausted(&admit(
                 &version_twelve(),
@@ -19416,6 +19931,9 @@ mod tests {
         #[test]
         #[serial]
         fn post_confirm_recording_skips_total_entries() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             const CHILD: &str = "STELLAR_AGENT_TOTAL_BUDGET_CHILD";
             if std::env::var_os(CHILD).is_none() {
                 let home = TempDir::new().unwrap();
@@ -19496,6 +20014,9 @@ mod tests {
         #[test]
         #[serial]
         fn a_negative_stored_total_never_lowers_the_reported_use() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-stored-negative-use");
             f.pin(D1);
             let mut wire = version_twelve();
@@ -19520,6 +20041,9 @@ mod tests {
         #[test]
         #[serial]
         fn a_negative_stored_total_refuses_only_its_bucket() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-stored-negative");
             f.pin(D1);
             f.store
@@ -19582,6 +20106,9 @@ mod tests {
         #[test]
         #[serial]
         fn new_fields_need_version_twelve() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-below-twelve");
             let mut row = version_twelve();
             row.version = WIRE_VERSION_OPERATIONS;
@@ -19647,6 +20174,9 @@ mod tests {
         #[test]
         #[serial]
         fn prepared_successors_validate_before_writing() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-prepared");
             f.store
                 .record_and_persist(&f.profile, &[f.windowed(1)])
@@ -19718,6 +20248,9 @@ mod tests {
         #[test]
         #[serial]
         fn owner_reset_preserves_total_history() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let (f, total) = total_reset_fixture();
             let _clock = crate::mainnet::clock::set_now_ms_for_test(100_000);
             enrolled_reset_owner(&f, 0xa1);
@@ -19739,6 +20272,9 @@ mod tests {
         #[test]
         #[serial]
         fn reset_survives_every_commit_fault() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             for seam in [
                 COMMIT_FAULT_AFTER_PREPARED,
                 COMMIT_FAULT_AFTER_COUNTER,
@@ -19768,6 +20304,9 @@ mod tests {
         #[test]
         #[serial]
         fn a_pin_advanced_before_upgrade_moves_nothing() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-pin-advanced");
             let mut wire = version_twelve();
             wire.version = WIRE_VERSION_OPERATIONS;
@@ -19784,6 +20323,9 @@ mod tests {
         #[test]
         #[serial]
         fn pruned_earlier_history_retires_the_digest() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-pruned");
             f.earlier_build_file();
             f.pin(D1);
@@ -19800,6 +20342,9 @@ mod tests {
         #[test]
         #[serial]
         fn a_new_digest_admits_after_retirement() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-new-digest");
             f.earlier_build_file();
             f.pin(D1);
@@ -19811,6 +20356,9 @@ mod tests {
         #[test]
         #[serial]
         fn retirement_is_written_once() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-once");
             f.earlier_build_file();
             f.pin(D1);
@@ -19831,6 +20379,9 @@ mod tests {
         #[test]
         #[serial]
         fn retirement_survives_a_commit_fault() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             for seam in [
                 COMMIT_FAULT_AFTER_PREPARED,
                 COMMIT_FAULT_AFTER_COUNTER,
@@ -19871,6 +20422,9 @@ mod tests {
         #[test]
         #[serial]
         fn earlier_history_without_a_pin_refuses() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-no-pin");
             f.store
                 .record_and_persist(&f.profile, &[f.windowed(1)])
@@ -19899,6 +20453,9 @@ mod tests {
         #[test]
         #[serial]
         fn retirement_leaves_the_original_untouched() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-original");
             f.earlier_build_file();
             f.pin(D1);
@@ -19934,6 +20491,9 @@ mod tests {
         #[test]
         #[serial]
         fn retirement_rereads_under_the_lock() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-reread");
             f.earlier_build_file();
             f.pin(D1);
@@ -19982,6 +20542,9 @@ mod tests {
         #[test]
         #[serial]
         fn this_build_always_writes_version_twelve() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-twelve");
             let mut windowed = version_twelve();
             windowed.entries.push(WireBucket {
@@ -20012,6 +20575,9 @@ mod tests {
         #[test]
         #[serial]
         fn an_older_reader_refuses_version_twelve() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             const OLDER_MAX: u32 = 11;
             let f = fx("total-older-reader");
             f.pending(1, &[f.windowed(1)]).unwrap();
@@ -20033,6 +20599,9 @@ mod tests {
         #[test]
         #[serial]
         fn retirement_refuses_every_total_admission() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-retired-writers");
             f.earlier_build_file();
             f.pin(D1);
@@ -20061,6 +20630,9 @@ mod tests {
         #[test]
         #[serial]
         fn retirement_survives_pruning() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-retired-pruned");
             f.earlier_build_file();
             f.pin(D1);
@@ -20091,6 +20663,9 @@ mod tests {
         #[test]
         #[serial]
         fn a_signed_intent_refuses_a_total_leg() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-intent");
             f.pin(D1);
             let result = f
@@ -20165,6 +20740,9 @@ mod tests {
         #[test]
         #[serial]
         fn record_and_persist_refuses_a_total_limit_on_a_windowed_key() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("shape-persist-limit");
             let before = f.shaped(false);
             let result = f
@@ -20177,6 +20755,9 @@ mod tests {
         #[test]
         #[serial]
         fn record_and_persist_refuses_an_amount_limit_on_a_total_key() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("shape-persist-key");
             let before = f.shaped(false);
             let result = f
@@ -20189,6 +20770,9 @@ mod tests {
         #[test]
         #[serial]
         fn record_authorized_refuses_a_total_limit_on_a_windowed_key() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("shape-authorized-limit");
             let before = f.shaped(false);
             f.assert_disagrees(f.authorized(&[f.total_on_windowed_key()]), &before);
@@ -20197,6 +20781,9 @@ mod tests {
         #[test]
         #[serial]
         fn record_authorized_refuses_an_amount_limit_on_a_total_key() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("shape-authorized-key");
             let before = f.shaped(true);
             f.assert_disagrees(f.authorized(&[f.amount_on_total_key()]), &before);
@@ -20205,6 +20792,9 @@ mod tests {
         #[test]
         #[serial]
         fn record_pending_refuses_a_total_limit_on_a_windowed_key() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("shape-pending-limit");
             let before = f.shaped(false);
             f.assert_disagrees(f.pending(1, &[f.total_on_windowed_key()]), &before);
@@ -20213,6 +20803,9 @@ mod tests {
         #[test]
         #[serial]
         fn record_pending_refuses_an_amount_limit_on_a_total_key() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("shape-pending-key");
             let before = f.shaped(true);
             f.assert_disagrees(f.pending(1, &[f.amount_on_total_key()]), &before);
@@ -20221,6 +20814,9 @@ mod tests {
         #[test]
         #[serial]
         fn record_pending_linked_refuses_a_total_limit_on_a_windowed_key() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("shape-linked-limit");
             let before = f.shaped(false);
             let result = f
@@ -20238,6 +20834,9 @@ mod tests {
         #[test]
         #[serial]
         fn record_pending_linked_refuses_an_amount_limit_on_a_total_key() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("shape-linked-key");
             let before = f.shaped(false);
             let result = f
@@ -20255,6 +20854,9 @@ mod tests {
         #[test]
         #[serial]
         fn a_signed_intent_refuses_a_total_limit_on_a_windowed_key() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("shape-intent-limit");
             let before = f.shaped(false);
             let result = f
@@ -20267,6 +20869,9 @@ mod tests {
         #[test]
         #[serial]
         fn a_signed_intent_refuses_an_amount_limit_on_a_total_key() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("shape-intent-key");
             let before = f.shaped(false);
             let result = f
@@ -20279,6 +20884,9 @@ mod tests {
         #[test]
         #[serial]
         fn a_total_entry_needs_its_epoch() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("shape-epoch");
             let before = f.shaped(false);
             assert_eq!(
@@ -20580,6 +21188,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_failed_reset_commit_leaves_a_readable_store() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for step in COMMIT_STEPS {
             assert_a_failed_commit_step_reads(
                 "reset-commit",
@@ -20612,6 +21223,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_failed_debit_commit_leaves_a_readable_store() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for step in COMMIT_STEPS {
             assert_a_failed_commit_step_reads(
                 "pending-commit",
@@ -20657,6 +21271,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_failed_settled_debit_write_refuses_load_and_reset() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = test_profile(dir.path(), "settled-write");
@@ -20696,6 +21313,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_reset_retry_completes_at_the_recorded_generation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for step in [CommitStep::PreparedImage, CommitStep::Keyring] {
             let f = ResetFixture::new();
             f.seal(&reset_wire());
@@ -20723,6 +21343,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_first_reset_commits_its_generation_before_the_file() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = ResetFixture::new();
         let gen_entry = generation_entry_ref(&f.profile);
         let armed = fail_commit_at(CommitStep::PreparedImage, &gen_entry);
@@ -20748,6 +21371,9 @@ mod tests {
     #[test]
     #[serial]
     fn chain_scope_retries_a_concurrent_payment_commit() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for chain in [Caip2::Testnet, Caip2::Mainnet] {
             let mut f = ResetFixture::new();
             f.profile.chain_id = chain;
@@ -20778,6 +21404,9 @@ mod tests {
     #[test]
     #[serial]
     fn chain_scope_limits_generation_mismatch_to_three_reads() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = ResetFixture::new();
         f.seal(&reset_wire());
         put_raw(&generation_entry_ref(&f.profile), "2");
@@ -20795,6 +21424,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn reconciliation_retries_a_payment_commit_once_per_pass() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::body_partial_json(
             serde_json::json!({ "method": "getTransaction" }),

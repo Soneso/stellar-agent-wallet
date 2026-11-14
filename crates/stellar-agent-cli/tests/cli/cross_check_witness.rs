@@ -55,6 +55,7 @@ fn write_profile(home: &Path, name: &str, primary: &str, oracle: &str) {
 /// Runs the binary with `args`, the secret of `signer` in
 /// `CROSS_CHECK_SIGNER` when given, and returns `(exit_code, stdout)`.
 fn run(home: &Path, args: &[&str], signer: Option<[u8; 32]>) -> (i32, String) {
+    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
     let mut command = Command::new(env!("CARGO_BIN_EXE_stellar-agent"));
     command
         .args(args)

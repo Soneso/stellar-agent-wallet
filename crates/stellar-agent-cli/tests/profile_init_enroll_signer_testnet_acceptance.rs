@@ -224,7 +224,9 @@ impl Drop for KeyringCleanupGuard {
 /// child process only, and returns the parsed JSON envelope.
 fn run_profile_init(home: &Path, profile: &str) -> serde_json::Value {
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
+    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
     let output = Command::new(bin_path)
+        .args(cfg!(feature = "live-platform-keyring").then_some("--test-live-platform-keyring"))
         .args([
             "profile",
             "init",
@@ -258,7 +260,9 @@ fn run_profile_init(home: &Path, profile: &str) -> serde_json::Value {
 /// envelope.
 fn run_enroll_signer(home: &Path, profile: &str, s_strkey: &str) -> serde_json::Value {
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
+    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
     let output = Command::new(bin_path)
+        .args(cfg!(feature = "live-platform-keyring").then_some("--test-live-platform-keyring"))
         .args([
             "profile",
             "enroll-signer",
@@ -290,7 +294,9 @@ fn run_enroll_signer(home: &Path, profile: &str, s_strkey: &str) -> serde_json::
 /// parsed JSON envelope.
 fn run_rotate_audit_key(home: &Path, profile: &str) -> serde_json::Value {
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
+    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
     let output = Command::new(bin_path)
+        .args(cfg!(feature = "live-platform-keyring").then_some("--test-live-platform-keyring"))
         .args(["profile", "rotate-audit-key", profile])
         .env("STELLAR_AGENT_HOME", home)
         .output()
@@ -324,7 +330,9 @@ fn run_trustline(
     asset: &str,
 ) -> (i32, serde_json::Value) {
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
+    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
     let output = Command::new(bin_path)
+        .args(cfg!(feature = "live-platform-keyring").then_some("--test-live-platform-keyring"))
         .args([
             "trustline",
             "--profile",
@@ -373,6 +381,16 @@ async fn profile_init_then_enroll_signer_enables_a_real_signing_operation() {
     // keyring (macOS Keychain locally; a headless Secret Service, provisioned
     // by the CI workflow, on Linux CI runners). The test process also needs
     // it initialised directly for `KeyringCleanupGuard`'s cleanup delete.
+    #[cfg(feature = "live-platform-keyring")]
+    if std::env::var("STELLAR_AGENT_TEST_LIVE_PLATFORM_KEYRING").as_deref()
+        == Ok("real-platform-keyring")
+    {
+        use stellar_agent_network::keyring::live::{
+            LivePlatformKeyring, init_platform_keyring_store_live,
+        };
+        init_platform_keyring_store_live(LivePlatformKeyring::acknowledge_real_platform_keyring())
+            .expect("live acceptance platform store");
+    }
     stellar_agent_network::init_platform_keyring_store()
         .expect("platform keyring store must initialise on this host");
 

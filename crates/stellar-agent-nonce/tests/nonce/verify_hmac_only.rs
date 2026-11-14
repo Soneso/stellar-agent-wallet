@@ -40,6 +40,9 @@ use crate::helpers::{
 #[test]
 #[serial]
 fn verify_hmac_only_happy_path_then_record() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let key = [0xA1u8; 32];
     let profile = make_profile("vho-happy");
@@ -92,6 +95,9 @@ fn verify_hmac_only_happy_path_then_record() {
 #[test]
 #[serial]
 fn record_verified_nonce_returns_replayed_on_duplicate() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let key = [0xA2u8; 32];
     let profile = make_profile("vho-replay");
@@ -139,6 +145,9 @@ fn record_verified_nonce_returns_replayed_on_duplicate() {
 #[test]
 #[serial]
 fn verify_hmac_only_returns_expired_when_now_at_expiry() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let key = [0xA3u8; 32];
     let profile = make_profile("vho-expired");
@@ -185,6 +194,9 @@ fn verify_hmac_only_returns_expired_when_now_at_expiry() {
 #[test]
 #[serial]
 fn verify_hmac_only_returns_expired_when_now_past_expiry() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let key = [0xA4u8; 32];
     let profile = make_profile("vho-expired-past");
@@ -233,6 +245,9 @@ fn verify_hmac_only_returns_expired_when_now_past_expiry() {
 #[test]
 #[serial]
 fn verify_hmac_only_returns_chain_mismatch() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let key = [0xA5u8; 32];
     let profile = make_profile("vho-chain");
@@ -287,6 +302,9 @@ fn verify_hmac_only_returns_chain_mismatch() {
 #[test]
 #[serial]
 fn verify_hmac_only_returns_hmac_mismatch_on_tampered_envelope() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let key = [0xA6u8; 32];
     let profile = make_profile("vho-hmac-env");
@@ -332,6 +350,9 @@ fn verify_hmac_only_returns_hmac_mismatch_on_tampered_envelope() {
 #[test]
 #[serial]
 fn verify_hmac_only_returns_hmac_mismatch_on_tool_substitution() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let key = [0xA7u8; 32];
     let profile = make_profile("vho-hmac-tool");
@@ -378,6 +399,9 @@ fn verify_hmac_only_returns_hmac_mismatch_on_tool_substitution() {
 #[test]
 #[serial]
 fn verify_hmac_only_returns_hmac_mismatch_on_corrupted_tag() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let key = [0xA8u8; 32];
     let profile = make_profile("vho-hmac-corrupt");
@@ -433,6 +457,9 @@ fn verify_hmac_only_returns_hmac_mismatch_on_corrupted_tag() {
 #[test]
 #[serial]
 fn verify_hmac_only_propagates_keyring_error_on_get_password_failure() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let key = [0xA9u8; 32];
     let profile = make_profile("vho-keyring-err");
@@ -491,6 +518,9 @@ fn verify_hmac_only_propagates_keyring_error_on_get_password_failure() {
 #[test]
 #[serial]
 fn refused_nonce_debug_holds_no_byte() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let profile = make_profile("vho-refused-debug");
     seed_key(&profile, &[0xA7; 32]);

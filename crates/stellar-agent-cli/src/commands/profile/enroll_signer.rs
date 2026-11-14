@@ -1044,6 +1044,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn enroll_happy_path_writes_entry_and_produces_working_signer() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock store");
         let (s_strkey, derived_g) = seed_material([0x11u8; 32]);
         let var = unique_var("HAPPY");
@@ -1086,6 +1089,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn expected_address_mismatch_refuses_without_writing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock store");
         let (s_strkey, derived_g) = seed_material([0x22u8; 32]);
         let var = unique_var("EXPECTED");
@@ -1124,6 +1130,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn enroll_signer_marker_is_not_echoed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_test_support::rejected_value::{
             CREDENTIAL_MARKER, assert_no_marker_in_text,
         };
@@ -1184,6 +1193,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn account_identity_mismatch_refuses_without_writing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock store");
         let (s_strkey, _derived_g) = seed_material([0x44u8; 32]);
         let var = unique_var("IDENTITY");
@@ -1219,6 +1231,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn overwrite_without_force_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock store");
         let (s_strkey, derived_g) = seed_material([0x11u8; 32]);
         let var = unique_var("NOFORCE");
@@ -1256,6 +1271,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn force_replaces_existing_entry() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock store");
         let (s_strkey, derived_g) = seed_material([0x11u8; 32]);
         let var = unique_var("FORCE");
@@ -1305,6 +1323,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn enroll_on_placeholder_account_populates_profile_before_keyring_write() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock store");
         let (s_strkey, derived_g) = seed_material([0x77u8; 32]);
         let var = unique_var("PLACEHOLDER");
@@ -1379,6 +1400,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn malformed_account_pin_refuses_without_writing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock store");
         let (s_strkey, derived_g) = seed_material([0x88u8; 32]);
         let var = unique_var("MALFORMED");
@@ -1418,6 +1442,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn env_overlay_never_reaches_the_on_disk_pin() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock store");
         let (s_strkey, derived_g) = seed_material([0x99u8; 32]);
         let var = unique_var("ENVIMMUNE");
@@ -1473,6 +1500,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn second_secret_read_refusal_leaves_profile_and_keyring_unchanged() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let (seed, address) = seed_material([0x63; 32]);
         let var = unique_var("SECOND_READ");
@@ -1523,6 +1553,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn initially_unset_secret_refuses_before_pin_and_second_read() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let var = unique_var("INITIALLY_UNSET");
         assert!(std::env::var(&var).is_err());
@@ -1557,6 +1590,8 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn enroll_nonexistent_profile_returns_exit_1() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let args = EnrollSignerArgs {
             profile: Some("__nonexistent_enroll_signer__".to_owned()),
             secret_env: Some("__UNSET_ENROLL_SIGNER_VAR__".to_owned()),
@@ -1610,6 +1645,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn enrollment_writes_the_identity_record_after_the_seed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let (s_strkey, derived_g) = seed_material([0x41; 32]);
         let var = unique_var("IDENTITY");
@@ -1650,6 +1688,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn enrollment_writes_a_profile_bound_record() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let (secret, address) = seed_material([0x61; 32]);
         let var = unique_var("BOUND");
@@ -1694,6 +1735,8 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn mainnet_enrollment_names_the_bind_signer_step() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         keyring_mock::install().unwrap();
         let (secret, address) = seed_material([0x65; 32]);
         let var = unique_var("MAINNET_NEXT");
@@ -1733,6 +1776,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn force_never_removes_a_record_bound_elsewhere() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for force in [true, false] {
             keyring_mock::install().unwrap();
             let (secret, address) = seed_material([0x62; 32]);
@@ -1775,6 +1821,8 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn repair_does_not_upgrade_a_v1_record() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let (secret, address) = seed_material([0x64; 32]);
         for (profile, remedy) in [
             (
@@ -1819,6 +1867,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn a_failed_identity_write_reports_a_partial_enrollment() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let (s_strkey, derived_g) = seed_material([0x42; 32]);
         let var = unique_var("PARTIAL");
@@ -1873,6 +1924,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn a_repair_writes_only_the_identity_record_and_is_idempotent() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let (s_strkey, derived_g) = seed_material([0x43; 32]);
         KeyringEntry::new(SIGNER_SERVICE, &derived_g)
@@ -1920,6 +1974,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn a_repair_refuses_a_conflicting_record_or_seed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // Another key's record is a conflict and stays as it is.
         keyring_mock::install().unwrap();
         let (s_strkey, derived_g) = seed_material([0x44; 32]);
@@ -2041,6 +2098,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn a_force_replacement_removes_the_old_identity_before_a_failed_write() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let (s_strkey, derived_g) = seed_material([0x42; 32]);
         let var = unique_var("PARTIAL");
@@ -2103,6 +2163,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn a_failed_seed_write_after_the_removal_reports_the_removed_record() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (s_strkey, derived_g) = seed_material([0x45; 32]);
         let (old_seed, _) = seed_material([0x46; 32]);
         for previous in [Some(old_seed.as_str()), None] {
@@ -2184,6 +2247,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn a_repair_refuses_a_malformed_identity_record() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // A malformed record is a conflict and stays as it is.
         keyring_mock::install().unwrap();
         let (s_strkey, derived_g) = seed_material([0x44; 32]);
@@ -2218,6 +2284,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn repair_identity_records_the_enrollment_audit_row() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = tempfile::TempDir::new().unwrap();
         let (seed, public) = seed_material([0x49; 32]);
@@ -2257,6 +2326,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn policy_pin_coordinate_refuses_without_writing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (_, public_key) = seed_material([0x35; 32]);
         for coordinate in [
             KeyringEntryRef::new("custom", "default-PoLiCy-PiN"),
@@ -2341,6 +2413,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn secret_env_name_marker_is_not_echoed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let capture = stellar_agent_test_support::log_capture::CaptureWriter::new();
         let subscriber = tracing_subscriber::fmt()
             .without_time()

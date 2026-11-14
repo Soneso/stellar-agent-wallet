@@ -1304,6 +1304,9 @@ mod tests {
     #[test]
     #[serial]
     fn ceremony_pins_the_verified_policy_before_enablement() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let fixture = Fixture::new();
         let initial = load_verified_policy(
             &PolicyLoad {
@@ -1368,6 +1371,9 @@ mod tests {
     #[test]
     #[serial]
     fn check_preserves_every_persisted_value_for_absent_and_advancing_pins() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fixture = Fixture::new();
         fixture.run().unwrap();
         fixture.signed_body(7);
@@ -1416,6 +1422,9 @@ mod tests {
     #[test]
     #[serial]
     fn enablement_refuses_a_transplanted_signer() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut f = Fixture::new();
         let original = f.profile.clone();
         f.profile.mcp_signer_default.service = KeyringEntryRef::default_signer("v").service;
@@ -1450,6 +1459,9 @@ mod tests {
     #[test]
     #[serial]
     fn an_unbound_signer_names_the_bind_signer_remedy() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut f = Fixture::new();
         put(
             &signer_identity_entry_ref(&f.profile.mcp_signer_default),
@@ -1474,6 +1486,9 @@ mod tests {
     #[test]
     #[serial]
     fn check_before_enablement_reports_a_first_use_pin_and_creates_nothing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for window in ["absent/state.window", "state.window"] {
             let mut fixture = Fixture::new();
             fixture.window = fixture.dir.path().join(window);
@@ -1514,6 +1529,9 @@ mod tests {
     #[test]
     #[serial]
     fn check_reports_a_missing_lock_for_a_present_pin_with_or_without_a_nonce() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::policy::state_lock::window_lock_path;
         for nonce_present in [true, false] {
             let mut fixture = Fixture::new();
@@ -1571,6 +1589,9 @@ mod tests {
     #[test]
     #[serial]
     fn check_reports_an_unreadable_pin_when_its_lock_is_missing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::policy::state_lock::window_lock_path;
         for nonce_present in [true, false] {
             let mut fixture = Fixture::new();
@@ -1611,6 +1632,9 @@ mod tests {
     #[test]
     #[serial]
     fn first_enablement_refuses_a_v1_or_unsigned_policy_and_writes_nothing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for (body, code) in [
             ("v1", "profile.enable_mainnet_precondition"),
             ("unsigned", "policy.policy_file_parse_failed"),
@@ -1643,6 +1667,9 @@ mod tests {
     #[test]
     #[serial]
     fn rotate_leaves_an_existing_pin_unchanged() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fixture = Fixture::new();
         fixture.run().unwrap();
         let pinned = fixture.pin();
@@ -1665,6 +1692,9 @@ mod tests {
     #[test]
     #[serial]
     fn an_enabled_installation_without_a_pin_refuses_both_forms_and_writes_nothing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::policy::state_lock::window_lock_path;
         for missing in ["pin", "pin_and_lock"] {
             let mut fixture = Fixture::new();
@@ -1714,6 +1744,9 @@ mod tests {
     #[test]
     #[serial]
     fn an_unusable_pin_refuses_with_its_recovery_and_writes_nothing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for nonce_present in [true, false] {
             let mut fixture = Fixture::new();
             fixture.run().unwrap();
@@ -1774,6 +1807,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_missing_lock_file_refuses_both_forms_without_prescribing_nonce_removal() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::policy::state_lock::window_lock_path;
         let mut fixture = Fixture::new();
         fixture.run().unwrap();
@@ -1841,6 +1877,9 @@ mod tests {
     #[test]
     #[serial]
     fn removing_the_nonce_entry_lets_the_first_enablement_pin_the_installed_policy() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let fixture = Fixture::new();
         fixture.run().unwrap();
         fixture.sign_rewritten_and_verify(2);
@@ -1902,6 +1941,9 @@ mod tests {
     #[test]
     #[serial]
     fn check_reports_an_older_form_owner_entry_as_failed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use base64::Engine as _;
         let mut fixture = Fixture::new();
         fixture.args.check = true;
@@ -1979,6 +2021,9 @@ mod tests {
     #[test]
     #[serial]
     fn enablement_check_reports_approval_credentials() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fixture = Fixture::new();
         fixture.run().unwrap();
         assert!(get(&fixture.nonce_ref()).is_some());
@@ -2043,6 +2088,9 @@ mod tests {
     #[test]
     #[serial]
     fn check_without_a_verified_policy_evaluates_no_requirement() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fixture = Fixture::new();
         let mut doc = std::fs::read_to_string(fixture.path())
             .unwrap()
@@ -2086,6 +2134,9 @@ mod tests {
     #[test]
     #[serial]
     fn check_exits_one_exactly_when_a_check_failed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fixture = Fixture::new();
         let ceremony = fixture.run();
         assert!(ceremony.as_ref().unwrap().get("valid").is_none());
@@ -2131,6 +2182,9 @@ mod tests {
     #[test]
     #[serial]
     fn mainnet_oracle_required_check_fails_without_an_oracle() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fixture = Fixture::new();
         fixture.run().unwrap();
         fixture.signed_body(7);
@@ -2188,6 +2242,9 @@ mod tests {
     #[test]
     #[serial]
     fn mainnet_oracle_required_enablement_refuses_without_an_oracle() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let reads = Arc::new(Mutex::new(Vec::new()));
         let take = || std::mem::take(&mut *reads.lock().unwrap());
         for gap in GAPS {
@@ -2259,6 +2316,9 @@ mod tests {
     #[test]
     #[serial]
     fn check_reports_a_failed_pin_comparison_on_the_pin() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fixture = Fixture::new();
         fixture.run().unwrap();
         fixture.signed_body(7);
@@ -2285,6 +2345,9 @@ mod tests {
     #[test]
     #[serial]
     fn rotate_replaces_only_digest_and_invalidates_old_nonce() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fixture = Fixture::new();
         fixture.run().unwrap();
         fixture.signed_body(7);
@@ -2314,6 +2377,9 @@ mod tests {
     #[test]
     #[serial]
     fn rotate_binds_in_full_after_a_failed_policy_rewrite() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fixture = Fixture::new();
         let before = std::fs::read(fixture.path()).unwrap();
         let nonce_at_audit = RefCell::new(Vec::new());
@@ -2383,6 +2449,9 @@ mod tests {
     #[test]
     #[serial]
     fn audit_failure_leaves_nonce_and_policy_untouched() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let fixture = Fixture::new();
         let before = std::fs::read(fixture.path()).unwrap();
         let result = fixture.run_with(
@@ -2396,6 +2465,9 @@ mod tests {
     #[test]
     #[serial]
     fn nonce_failure_leaves_audit_row_and_unchanged_policy() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let fixture = Fixture::new();
         let coordinate = fixture.nonce_ref();
         keyring_mock::install_with_write_error(
@@ -2439,6 +2511,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_headless_keyring_backend_refuses_enable_mainnet() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for check in [false, true] {
             let mut fixture = Fixture::new();
             fixture.args.check = check;
@@ -2466,6 +2541,9 @@ mod tests {
     #[test]
     #[serial]
     fn ceremony_preconditions_refuse_before_effects() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for defect in [
             "flag",
             "chain_id",
@@ -2595,6 +2673,9 @@ mod tests {
     #[test]
     #[serial]
     fn unreadable_owner_key_is_not_reported_as_not_enrolled() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let fixture = Fixture::new();
         let coordinate = KeyringEntryRef::default_owner_key("operator");
         keyring_mock::inject_no_logon_session(&coordinate.service, &coordinate.account).unwrap();
@@ -2645,6 +2726,9 @@ mod tests {
     #[test]
     #[serial]
     fn check_output_unchanged() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fixture = Fixture::new();
         fixture.run().unwrap();
         fixture.signed_body(7);
@@ -2687,6 +2771,9 @@ mod tests {
     #[test]
     #[serial]
     fn enable_check_summarizes_without_writes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fixture = Fixture::new();
         fixture.run().unwrap();
         fixture.signed_body(7);
@@ -2717,6 +2804,9 @@ mod tests {
     #[test]
     #[serial]
     fn enable_unverified_never_labeled_verified() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fixture = Fixture::new();
         fixture.run().unwrap();
         fixture.signed_body(7);
@@ -2743,6 +2833,9 @@ mod tests {
     #[test]
     #[serial]
     fn enable_preview_shows_bound_body() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let fixture = Fixture::new();
         let result = fixture.run().unwrap();
         let text = String::from_utf8(fixture.preview.borrow().clone()).unwrap();
@@ -2773,6 +2866,9 @@ mod tests {
     #[test]
     #[serial]
     fn enable_preview_is_the_signed_body() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fixture = Fixture::new();
         fixture.run().unwrap();
         let first: serde_json::Value = serde_json::from_slice(&fixture.preview.borrow()).unwrap();
@@ -2852,6 +2948,9 @@ mod tests {
     #[test]
     #[serial]
     fn enable_preview_precedes_pin_write() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let fixture = Fixture::new();
         assert!(matches!(fixture.pin(), PinState::Absent));
         let mut watch = WriteWatch {
@@ -2871,6 +2970,9 @@ mod tests {
     #[test]
     #[serial]
     fn enable_preview_failure_prevents_writes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for writer in [render::FailingWriter::Write, render::FailingWriter::Flush] {
             let fixture = Fixture::new();
             let before = persisted(&fixture);
@@ -2889,6 +2991,9 @@ mod tests {
     #[test]
     #[serial]
     fn failure_envelope_carries_preview() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let fixture = Fixture::new();
         let (code, detail) = fixture
             .run_with(
@@ -2919,6 +3024,9 @@ mod tests {
     #[test]
     #[serial]
     fn enablement_fills_absent_fee_keeps_authored() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let fee = |rewritten: &str| {
             rewritten.parse::<toml_edit::DocumentMut>().unwrap()["mainnet"]
                 .get("classic_max_fee_per_op_stroops")
@@ -2990,6 +3098,9 @@ mod tests {
     #[test]
     #[serial]
     fn state_envelope_and_exit_codes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use clap::Parser;
         #[derive(Debug, Parser)]
         struct Command {
@@ -3152,6 +3263,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn initial_pin_accepts_binding_free_body() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let fixture = Fixture::new();
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(fixture.dir.path());
         let mut profile = fixture.profile.clone();
@@ -3209,6 +3323,9 @@ mod tests {
     #[test]
     #[serial]
     fn initial_pin_verifies_signature_sequence_and_owner() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for defect in [
             "unsigned",
             "tampered",
@@ -3288,6 +3405,9 @@ mod tests {
     #[test]
     #[serial]
     fn initial_pin_loader_refuses_v1_and_nonpositive_sequence() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::policy::v1::verified::pin_provisioning_policy;
 
         for defect in ["v1", "zero", "negative"] {
@@ -3336,6 +3456,9 @@ mod tests {
     #[test]
     #[serial]
     fn unsigned_v1_reports_signature_error_before_version_refusal() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let fixture = Fixture::new();
         let mut body = unbound_body(false)
             .parse::<toml_edit::DocumentMut>()
@@ -3357,6 +3480,9 @@ mod tests {
     #[test]
     #[serial]
     fn initial_pin_uses_the_supplied_body() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let fixture = Fixture::new();
         fixture.sign(&unbound_body(false));
         let raw = std::fs::read_to_string(fixture.path()).unwrap();
@@ -3393,6 +3519,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn partial_binding_fields_refuse() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let fields = ["profile", "endpoint_host", "installation_nonce_sha256"];
         for mask in 1_u8..7 {
             for nonce in ["absent", "present", "unreadable"] {
@@ -3463,6 +3592,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn provisioning_nonbinding_checks_remain_strict() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for defect in [
             "scope",
             "keys",
@@ -3569,6 +3701,9 @@ mod tests {
     #[test]
     #[serial]
     fn initial_pin_concurrent_pin_returns_unchanged() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use std::sync::atomic::{AtomicBool, Ordering};
         let profile = Fixture::profile();
         let owner_coordinate = KeyringEntryRef::default_owner_key("operator");
@@ -3649,6 +3784,9 @@ mod tests {
     #[test]
     #[serial]
     fn initial_pin_nonce_guard_holds_the_lock() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use std::sync::atomic::{AtomicUsize, Ordering};
         for unreadable in [false, true] {
             let profile = Fixture::profile();
@@ -3733,6 +3871,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn enablement_persists_while_check_fails() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (mut fixture, _home) = cycle_fixture();
         enable_native_body(&fixture, false).await;
         let snapshot = persisted(&fixture);
@@ -3773,6 +3914,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn post_enable_resign() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (fixture, _home) = cycle_fixture();
         let enabled = enable_native_body(&fixture, false).await;
         let pin = assert_enabled_bindings(&fixture, &enabled);
@@ -3786,6 +3930,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn final_check_after_bound_signing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (mut fixture, _home) = cycle_fixture();
         enable_native_body(&fixture, false).await;
         let (status, signed) = sign_bound_body(&fixture).await;
@@ -3807,6 +3954,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn local_cycle_completes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (mut fixture, _home) = cycle_fixture();
         enable_native_body(&fixture, false).await;
         let (status, signed) = sign_bound_body(&fixture).await;
@@ -3824,6 +3974,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn remote_bootstrap_cycle() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (mut fixture, _home) = cycle_fixture();
         let enabled = enable_native_body(&fixture, true).await;
         let pin = assert_enabled_bindings(&fixture, &enabled);

@@ -1424,6 +1424,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn muxed_contract_create_stages_refuse_before_state() {
         let home = tempfile::tempdir().expect("home");
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());

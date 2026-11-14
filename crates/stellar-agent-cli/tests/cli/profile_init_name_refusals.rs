@@ -44,6 +44,7 @@ const HEADLESS_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
 /// Extra arguments are appended after `--profile`.
 fn run_init(home: &Path, profile: &str, extra: &[&str]) -> (i32, Value, String) {
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
+    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
     let output = Command::new(bin_path)
         .args([
             "profile",
@@ -189,6 +190,7 @@ fn profile_init_redacts_rpc_url_and_preserves_saved_url() {
 #[test]
 fn profile_init_refuses_credentialed_rpc_before_creating_file() {
     let home = tempfile::tempdir().expect("temp home");
+    stellar_agent_test_support::sandbox::mark_sandbox(home.path()).expect("mark fixture directory");
     let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
         .args([
             "profile",

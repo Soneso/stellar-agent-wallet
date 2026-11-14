@@ -255,7 +255,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn get_network_returns_testnet() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let module = test_module();
         let result = module.get_network().await.unwrap();
         let passphrase = result["networkPassphrase"].as_str().unwrap();
@@ -266,7 +270,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn get_address_with_empty_account_returns_missing_address_error() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // test_module() builds a profile with an empty account, so
         // resolve_active_address returns MissingAddress before strkey parsing.
         let module = test_module();
@@ -279,7 +287,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn sign_transaction_invalid_xdr_returns_error() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let module = test_module();
         let result = module.sign_transaction("not-valid-xdr", None, None).await;
         assert!(
@@ -289,7 +301,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn sign_auth_entry_invalid_xdr_returns_error() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let module = test_module();
         let result = module.sign_auth_entry("not-valid-xdr", None, None).await;
         assert!(
@@ -299,7 +315,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn sign_message_empty_returns_error() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let module = test_module();
         let result = module.sign_message("", None, None).await;
         assert!(
@@ -309,7 +329,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn sign_message_nonempty_returns_signed_message() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use base64::Engine as _;
 
         let module = test_module();

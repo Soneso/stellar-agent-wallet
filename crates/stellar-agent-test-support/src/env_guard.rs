@@ -6,6 +6,40 @@
 use std::ffi::OsString;
 use std::path::Path;
 
+/// Restores a process environment variable after a serialized fixture.
+pub struct ScopedEnvVar(&'static str, Option<OsString>);
+
+impl ScopedEnvVar {
+    /// Sets or clears a variable until drop.
+    /// Callers serialize all access to the variable.
+    #[must_use]
+    #[allow(unsafe_code, reason = "serialized test environment fixture")]
+    pub fn new(name: &'static str, value: Option<&std::ffi::OsStr>) -> Self {
+        let guard = Self(name, std::env::var_os(name));
+        // SAFETY: callers serialize process environment access.
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        guard
+    }
+}
+
+impl Drop for ScopedEnvVar {
+    #[allow(unsafe_code, reason = "serialized test environment fixture")]
+    fn drop(&mut self) {
+        // SAFETY: callers serialize process environment access.
+        unsafe {
+            match self.1.take() {
+                Some(value) => std::env::set_var(self.0, value),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
+}
+
 /// Overrides `STELLAR_AGENT_HOME` for the lifetime of the guard, restoring
 /// the previous value (or clearing the variable if it was unset) on drop.
 ///
@@ -21,8 +55,18 @@ pub struct StellarAgentHomeGuard {
 
 impl StellarAgentHomeGuard {
     /// Sets `STELLAR_AGENT_HOME` to `value` for the duration of the guard.
+    ///
+    /// # Panics
+    /// Panics when the fixture directory cannot be marked or resolved.
     #[must_use]
+    #[allow(
+        clippy::expect_used,
+        clippy::panic,
+        reason = "fixture setup must succeed"
+    )]
     pub fn new(value: &Path) -> Self {
+        crate::sandbox::mark_sandbox(value).unwrap_or_else(|error| panic!("{error}"));
+        let value = value.canonicalize().expect("resolve fixture directory");
         let previous = std::env::var_os("STELLAR_AGENT_HOME");
         #[allow(
             unsafe_code,

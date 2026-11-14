@@ -406,6 +406,9 @@ mod tests {
     #[test]
     #[serial]
     fn the_profile_coordinate_is_compared_when_it_differs() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         install();
         let mut profile = Profile::builder_testnet_named("owner-two", "s", "a", "n", "a").build();
         profile.policy_owner_key_id = KeyringEntryRef::new("stellar-agent-owner-owner-two", "x");

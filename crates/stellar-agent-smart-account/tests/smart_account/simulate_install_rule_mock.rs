@@ -123,6 +123,9 @@ fn simulate_error_response(error_msg: &str) -> serde_json::Value {
 #[tokio::test]
 #[serial_test::serial]
 async fn success_shape_returns_pin_result_and_latest_ledger() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     use stellar_xdr::{Limits, ScVal, WriteXdr};
 
@@ -182,6 +185,9 @@ async fn success_shape_returns_pin_result_and_latest_ledger() {
 #[tokio::test]
 #[serial_test::serial]
 async fn simulate_error_propagates_as_deployment_failed() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     use stellar_xdr::{ContractId, Hash, ScAddress};
 
@@ -232,6 +238,9 @@ async fn simulate_error_propagates_as_deployment_failed() {
 #[tokio::test]
 #[serial_test::serial]
 async fn does_not_modify_install_rule_path_no_extra_simulate_calls() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     use stellar_xdr::{ContractId, Hash, Limits, ScAddress, ScVal, WriteXdr};
 
@@ -278,6 +287,9 @@ async fn does_not_modify_install_rule_path_no_extra_simulate_calls() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_simulation_without_a_signers_manager_refuses_before_any_rpc() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     use stellar_xdr::{ContractId, Hash, ScAddress};
 

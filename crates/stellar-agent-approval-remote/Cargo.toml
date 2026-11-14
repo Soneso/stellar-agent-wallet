@@ -80,6 +80,7 @@ testnet-acceptance = ["test-helpers", "stellar-agent-mcp/test-helpers", "stellar
 operator-enroll-browser-acceptance = ["test-helpers"]
 
 [dev-dependencies]
+stellar-agent-smart-account = { path = "../stellar-agent-smart-account", features = ["test-helpers"] }
 stellar-agent-core = { path = "../stellar-agent-core", features = ["test-helpers"] }
 # The operator-enroll browser acceptance suite posts real registrations from a
 # software authenticator over HTTP.

@@ -41,7 +41,11 @@ use super::rpc_mock_helpers::{
 /// and source chain, its serialized form, the MCP error envelope or the
 /// wallet's logs, which hold the observation event.
 #[test]
+#[serial_test::serial]
 fn unknown_wasm_hash_returns_identification_failed_zero_match() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
 
     // Write a valid baseline so Step 1 passes.

@@ -122,6 +122,9 @@ mod tests {
     #[test]
     #[serial]
     fn rotate_creates_new_key() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock store");
         let profile = test_profile("rotate-creates");
 
@@ -138,6 +141,9 @@ mod tests {
     #[test]
     #[serial]
     fn rotate_overwrites_existing_key() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock store");
         let profile = test_profile("rotate-overwrite");
 
@@ -162,6 +168,9 @@ mod tests {
     #[test]
     #[serial]
     fn rotate_surfaces_interactive_session_required_on_windows_write_failure() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock store");
         let profile = test_profile("rotate-no-logon");
         let entry_ref = &profile.mcp_nonce_key_alias;
@@ -180,6 +189,9 @@ mod tests {
     #[test]
     #[serial]
     fn rotated_key_is_base64_encoded() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock store");
         let profile = test_profile("rotate-b64");
 

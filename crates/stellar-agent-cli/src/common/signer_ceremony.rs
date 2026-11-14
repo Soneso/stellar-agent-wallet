@@ -793,6 +793,9 @@ mod tests {
         reason = "test-only process environment mutation; the variable name is unique to this test"
     )]
     async fn derives_the_expected_public_key_with_testnet_profile() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let seed = [0x11u8; 32];
         let s_strkey = stellar_strkey::ed25519::PrivateKey(seed)
             .as_unredacted()
@@ -827,7 +830,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
     async fn unset_env_var_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let var = unique_var("UNSET_CREDMARKER7");
         let err = match resolve_software_signer_from_env(&var, "unit-test", &test_profile()).await {
             Ok(_) => panic!("unset env var must refuse"),
@@ -845,6 +852,9 @@ mod tests {
     #[serial_test::serial]
     #[allow(unsafe_code, reason = "test-only process environment mutation")]
     async fn invalid_s_strkey_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let var = unique_var("INVALID_CREDMARKER7");
         unsafe {
             std::env::set_var(&var, "invalid-CREDMARKER7");
@@ -876,6 +886,9 @@ mod tests {
         reason = "test-only process environment mutation; the S-strkey variable name is unique to this test"
     )]
     async fn over_max_ttl_profile_surfaces_unlock_failed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::wallet::MAX_TTL_SECONDS;
 
         let mut profile = test_profile();
@@ -1103,7 +1116,11 @@ mod tests {
     /// resolver refuses with `validation.signer_source_required` before any
     /// key access.
     #[tokio::test]
+    #[serial_test::serial]
     async fn resolve_deployer_keypair_without_a_source_flag_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let error = match resolve_deployer_keypair(
             None,
             false,
@@ -1193,7 +1210,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn require_enrolled_signer_leaves_the_signer_untouched_on_testnet() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let signer = CountingKeyFetchSigner::default();
         let result = require_enrolled_signer("ceremony", &test_profile(), &signer).await;
         assert_eq!(
@@ -1205,7 +1226,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn require_enrolled_signer_fetches_the_key_once_on_mainnet() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let signer = CountingKeyFetchSigner::default();
         let error = require_enrolled_signer("enrolled", &pinned_mainnet_profile(), &signer)
             .await

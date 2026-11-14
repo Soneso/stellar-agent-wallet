@@ -479,7 +479,7 @@ Run `cargo fmt --all` to format Rust sources.
 
 ```bash
 # operator-enroll-browser-acceptance covers browser acceptance tests of the approval pages.
-FEATURES_EXCEPT_MAINNET_WRITE=deploy-cli,operator-enroll-browser-acceptance,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-helpers,testnet-integration,verifier-registry,wiremock-helpers
+FEATURES_EXCEPT_MAINNET_WRITE=deploy-cli,operator-enroll-browser-acceptance,live-platform-keyring,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-helpers,testnet-integration,verifier-registry,wiremock-helpers
 cargo clippy --workspace --all-targets --no-default-features --features "$FEATURES_EXCEPT_MAINNET_WRITE" -- -D warnings
 cargo clippy --workspace --all-targets --features "mainnet-write,$FEATURES_EXCEPT_MAINNET_WRITE" -- -D warnings
 ```
@@ -617,7 +617,7 @@ because a local run writes to the keyring of the person at the machine, so a
 local check only builds it:
 
 ```sh
-cargo test -p stellar-agent-network --test keyring_platform --no-run
+cargo test -p stellar-agent-network --features live-platform-keyring --test keyring_platform --no-run
 ```
 
 A `deploy-scripts` job runs on Ubuntu and on macOS. Its Linux leg runs

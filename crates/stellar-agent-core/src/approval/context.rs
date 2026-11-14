@@ -62,8 +62,13 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn context_uses_profile_and_redacts_endpoint() {
+        #[allow(clippy::expect_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut profile = Profile::builder_testnet("svc", "default", "nonce", "default").build();
         profile.rpc_url = "https://user:secret@rpc.example:8443/private?token=secret".to_owned();
         let context = ApprovalContext::from_profile("selected", &profile);

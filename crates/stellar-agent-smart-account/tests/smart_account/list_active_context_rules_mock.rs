@@ -135,6 +135,9 @@ fn manager_for_server(server: &MockServer) -> ContextRuleManager {
 #[tokio::test]
 #[serial_test::serial]
 async fn t1_empty_account_returns_empty_vec() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let server = MockServer::start().await;
     let smart_account = addr(0x01);
@@ -188,6 +191,9 @@ async fn t1_empty_account_returns_empty_vec() {
 #[tokio::test]
 #[serial_test::serial]
 async fn t2_dense_scan_all_returned() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let server = MockServer::start().await;
     let smart_account = addr(0x02);
@@ -291,6 +297,9 @@ async fn t2_dense_scan_all_returned() {
 #[tokio::test]
 #[serial_test::serial]
 async fn t2b_valid_until_some_decoded_correctly() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let server = MockServer::start().await;
     let smart_account = addr(0x0B);
@@ -363,6 +372,9 @@ async fn t2b_valid_until_some_decoded_correctly() {
 #[tokio::test]
 #[serial_test::serial]
 async fn t3_sparse_scan_single_gap() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let server = MockServer::start().await;
     let smart_account = addr(0x03);
@@ -448,6 +460,9 @@ async fn t3_sparse_scan_single_gap() {
 #[tokio::test]
 #[serial_test::serial]
 async fn t4_multi_gap_sparse_scan() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let server = MockServer::start().await;
     let smart_account = addr(0x04);
@@ -529,6 +544,9 @@ async fn t4_multi_gap_sparse_scan() {
 #[tokio::test]
 #[serial_test::serial]
 async fn t5_max_scan_id_exhaustion_returns_error() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let server = MockServer::start().await;
     let smart_account = addr(0x05);
@@ -592,6 +610,9 @@ async fn t5_max_scan_id_exhaustion_returns_error() {
 #[tokio::test]
 #[serial_test::serial]
 async fn t6_symbolic_not_found_treated_as_gap() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let server = MockServer::start().await;
     let smart_account = addr(0x06);
@@ -668,6 +689,9 @@ async fn t6_symbolic_not_found_treated_as_gap() {
 #[tokio::test]
 #[serial_test::serial]
 async fn t7_non_context_rule_not_found_error_is_skipped_defensively() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let server = MockServer::start().await;
     let smart_account = addr(0x07);
@@ -802,6 +826,9 @@ impl wiremock::Respond for DelayedPerRuleResponder {
 #[tokio::test]
 #[serial_test::serial]
 async fn t8_collective_scan_budget_fires_before_max_scan_id_exhaustion() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let server = MockServer::start().await;
     let smart_account = addr(0x08);
@@ -870,6 +897,9 @@ async fn t8_collective_scan_budget_fires_before_max_scan_id_exhaustion() {
 #[tokio::test]
 #[serial_test::serial]
 async fn t9_baseline_column_reports_each_rules_state_row() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let server = MockServer::start().await;
     let smart_account = addr(0x09);
@@ -985,6 +1015,9 @@ async fn t9_baseline_column_reports_each_rules_state_row() {
 #[tokio::test]
 #[serial_test::serial]
 async fn t10_a_malformed_state_row_reports_unreadable_and_the_listing_answers() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let server = MockServer::start().await;
     let smart_account = addr(0x0a);

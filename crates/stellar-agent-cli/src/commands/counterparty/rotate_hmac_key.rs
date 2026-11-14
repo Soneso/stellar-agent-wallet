@@ -163,6 +163,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn an_owner_namespace_coordinate_refuses_the_rotation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::profile::schema::KeyringEntryRef;
 
         stellar_agent_test_support::keyring_mock::install().unwrap();

@@ -1417,8 +1417,19 @@ mod tests {
                 );
             }
         }
-        assert!(tree_snapshot(home.path()).is_empty(), "nothing was created");
-        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
+        assert!(
+            tree_snapshot(home.path()).iter().all(|(path, _)| path
+                == std::path::Path::new(stellar_agent_test_support::sandbox::MARKER)),
+            "nothing was created"
+        );
+        assert_eq!(
+            std::fs::read_dir(home.path())
+                .unwrap()
+                .filter(|entry| entry.as_ref().unwrap().file_name()
+                    != stellar_agent_test_support::sandbox::MARKER)
+                .count(),
+            0
+        );
     }
 
     /// Argument import refuses a label that holds a control character
@@ -1466,7 +1477,11 @@ mod tests {
                 .exists()
         );
         assert_eq!(
-            std::fs::read_dir(home.path()).unwrap().count(),
+            std::fs::read_dir(home.path())
+                .unwrap()
+                .filter(|entry| entry.as_ref().unwrap().file_name()
+                    != stellar_agent_test_support::sandbox::MARKER)
+                .count(),
             0,
             "nothing was created"
         );

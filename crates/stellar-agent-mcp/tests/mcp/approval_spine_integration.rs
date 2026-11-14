@@ -197,6 +197,9 @@ fn minimal_create_account_envelope_b64(source: &str, dest: &str) -> String {
 #[test]
 #[serial]
 fn profile_name_for_approval_strips_prefix() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().ok();
     // Explicitly set Noop so WalletServer::new succeeds without a policy file
     // on disk (PolicyEngineKind::default() is V1).
@@ -225,6 +228,9 @@ fn profile_name_for_approval_strips_prefix() {
 #[test]
 #[serial]
 fn profile_name_for_approval_falls_back_to_default() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().ok();
     // Explicitly set Noop so WalletServer::new succeeds without a policy file
     // on disk (PolicyEngineKind::default() is V1).
@@ -255,6 +261,9 @@ fn profile_name_for_approval_falls_back_to_default() {
 #[tokio::test]
 #[serial]
 async fn stellar_pay_commit_require_approval_no_attestation_is_blocked() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().ok();
     let source = "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI";
     let endpoint = local_endpoint_for(source).await;
@@ -307,6 +316,9 @@ async fn stellar_pay_commit_require_approval_no_attestation_is_blocked() {
 #[tokio::test]
 #[serial]
 async fn stellar_create_account_commit_require_approval_no_attestation_is_blocked() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().ok();
     let source = "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI";
     let endpoint = local_endpoint_for(source).await;
@@ -359,6 +371,9 @@ async fn stellar_create_account_commit_require_approval_no_attestation_is_blocke
 #[tokio::test]
 #[serial]
 async fn stellar_pay_commit_allow_engine_no_attestation_gate() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().ok();
     let source = "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI";
     let endpoint = local_endpoint_for(source).await;
@@ -543,6 +558,9 @@ impl Respond for T7EchoIdResponder {
 #[tokio::test]
 #[serial]
 async fn commit_with_valid_nonce_but_no_attestation_returns_indistinguishable_approval_required() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::DEFAULT_CLASSIC_FEE_STROOPS;
     use stellar_agent_network::ClassicOpBuilder;
 

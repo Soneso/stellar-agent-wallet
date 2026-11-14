@@ -478,6 +478,9 @@ async fn outer_cap_uses_envelope_and_missing_envelope_keeps_raw_gate() {
 #[tokio::test]
 #[serial]
 async fn approved_unlisted_budget_commit_records_once() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let key = setup_mock_keyring();
     let approval = TempDir::new().unwrap();
     let grants = TempDir::new().unwrap();
@@ -909,6 +912,7 @@ fn gated_tool_only_via_both_gates() {
 #[tokio::test]
 #[serial]
 async fn without_sign_payment_capability_refused() {
+    let _root = crate::common::isolated_data_root();
     let _key = setup_mock_keyring();
     let toolsets_dir = TempDir::new().unwrap();
     let approval_dir = TempDir::new().unwrap();
@@ -958,6 +962,7 @@ async fn without_sign_payment_capability_refused() {
 #[tokio::test]
 #[serial]
 async fn grant_store_empty_after_synthetic_install() {
+    let _root = crate::common::isolated_data_root();
     let _key = setup_mock_keyring();
     let toolsets_dir = TempDir::new().unwrap();
     let approval_dir = TempDir::new().unwrap();
@@ -1016,6 +1021,7 @@ async fn grant_store_empty_after_synthetic_install() {
 #[tokio::test]
 #[serial]
 async fn first_invoke_returns_approval_required() {
+    let _root = crate::common::isolated_data_root();
     let _key = setup_mock_keyring();
     let toolsets_dir = TempDir::new().unwrap();
     let approval_dir = TempDir::new().unwrap();
@@ -1083,6 +1089,7 @@ async fn first_invoke_returns_approval_required() {
 #[tokio::test]
 #[serial]
 async fn grant_present_creates_per_action_queue_entry() {
+    let _root = crate::common::isolated_data_root();
     let key = setup_mock_keyring();
     let toolsets_dir = TempDir::new().unwrap();
     let approval_dir = TempDir::new().unwrap();
@@ -1150,6 +1157,7 @@ async fn grant_present_creates_per_action_queue_entry() {
 #[tokio::test]
 #[serial]
 async fn grant_present_missing_amount_unit_refuses_without_pending_entry() {
+    let _root = crate::common::isolated_data_root();
     assert_invalid_amount_does_not_queue(
         Grant::Present,
         "native",
@@ -1163,6 +1171,7 @@ async fn grant_present_missing_amount_unit_refuses_without_pending_entry() {
 #[tokio::test]
 #[serial]
 async fn grant_present_issued_amount_with_xlm_unit_refuses_without_pending_entry() {
+    let _root = crate::common::isolated_data_root();
     assert_invalid_amount_does_not_queue(
         Grant::Present,
         &format!("TST:{DEST_G}"),
@@ -1178,6 +1187,7 @@ async fn grant_present_issued_amount_with_xlm_unit_refuses_without_pending_entry
 #[tokio::test]
 #[serial]
 async fn no_grant_missing_amount_unit_refuses_without_first_invoke_entry() {
+    let _root = crate::common::isolated_data_root();
     assert_invalid_amount_does_not_queue(
         Grant::Absent,
         "native",
@@ -1274,6 +1284,7 @@ async fn assert_invalid_amount_does_not_queue(
 #[tokio::test]
 #[serial]
 async fn missing_envelope_and_asset_reports_missing_envelope_without_pending_entry() {
+    let _root = crate::common::isolated_data_root();
     setup_mock_keyring();
     let toolsets_dir = TempDir::new().unwrap();
     let approval_dir = TempDir::new().unwrap();
@@ -1321,6 +1332,7 @@ async fn missing_envelope_and_asset_reports_missing_envelope_without_pending_ent
 #[tokio::test]
 #[serial]
 async fn permissive_policy_forces_per_action_approval() {
+    let _root = crate::common::isolated_data_root();
     let key = setup_mock_keyring();
     let toolsets_dir = TempDir::new().unwrap();
     let approval_dir = TempDir::new().unwrap();
@@ -1399,6 +1411,7 @@ async fn permissive_policy_forces_per_action_approval() {
 #[tokio::test]
 #[serial]
 async fn forged_grant_does_not_suppress_the_first_invoke_gate() {
+    let _root = crate::common::isolated_data_root();
     setup_mock_keyring();
     let toolsets_dir = TempDir::new().unwrap();
     let approval_dir = TempDir::new().unwrap();
@@ -1473,6 +1486,7 @@ fn assert_first_invoke_queued(err: &rmcp::ErrorData, approval_dir: &std::path::P
 #[tokio::test]
 #[serial]
 async fn hand_written_grant_does_not_suppress_the_first_invoke_gate() {
+    let _root = crate::common::isolated_data_root();
     use std::io::Write as _;
     setup_mock_keyring();
     let toolsets_dir = TempDir::new().unwrap();
@@ -1537,6 +1551,7 @@ fn profile_without_attestation_key() -> Profile {
 #[tokio::test]
 #[serial]
 async fn payment_without_attestation_key_refuses_before_the_grant_lookup() {
+    let _root = crate::common::isolated_data_root();
     setup_mock_keyring();
     let toolsets_dir = TempDir::new().unwrap();
     let approval_dir = TempDir::new().unwrap();
@@ -1593,6 +1608,7 @@ async fn payment_without_attestation_key_refuses_before_the_grant_lookup() {
 #[tokio::test]
 #[serial]
 async fn rule_create_without_attestation_key_refuses_before_the_grant_lookup() {
+    let _root = crate::common::isolated_data_root();
     use stellar_agent_core::approval::store::ApprovalKind;
 
     setup_mock_keyring();
@@ -1644,6 +1660,7 @@ async fn rule_create_without_attestation_key_refuses_before_the_grant_lookup() {
 #[tokio::test]
 #[serial]
 async fn amount_exceeds_grant_max_reprompts() {
+    let _root = crate::common::isolated_data_root();
     let key = setup_mock_keyring();
     let toolsets_dir = TempDir::new().unwrap();
     let approval_dir = TempDir::new().unwrap();
@@ -1710,6 +1727,7 @@ async fn amount_exceeds_grant_max_reprompts() {
 #[tokio::test]
 #[serial]
 async fn adversarial_different_destination_reprompts() {
+    let _root = crate::common::isolated_data_root();
     let key = setup_mock_keyring();
     let toolsets_dir = TempDir::new().unwrap();
     let approval_dir = TempDir::new().unwrap();
@@ -1779,6 +1797,7 @@ async fn adversarial_different_destination_reprompts() {
 #[tokio::test]
 #[serial]
 async fn adversarial_muxed_destination_reprompts() {
+    let _root = crate::common::isolated_data_root();
     let key = setup_mock_keyring();
     let toolsets_dir = TempDir::new().unwrap();
     let approval_dir = TempDir::new().unwrap();
@@ -2125,6 +2144,7 @@ async fn mainnet_read_only_toolset_action_is_refused_under_the_default_engine() 
 #[tokio::test]
 #[serial]
 async fn rule_create_pending_proposal_without_grant_queues_first_invoke_approval() {
+    let _root = crate::common::isolated_data_root();
     use stellar_agent_core::approval::store::ApprovalKind;
 
     setup_mock_keyring();

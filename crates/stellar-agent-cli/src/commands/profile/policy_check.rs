@@ -383,7 +383,11 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn operator_open_flag_conflicts() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for args in [
             vec!["approve", "serve", "--open-by-operator", "--remote"],
             vec!["approve", "serve", "--open-by-operator", "--no-open"],

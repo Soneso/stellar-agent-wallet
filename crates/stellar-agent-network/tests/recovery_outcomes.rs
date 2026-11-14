@@ -377,6 +377,9 @@ async fn transaction_unreachable(ledger: u32) -> MockServer {
 #[tokio::test]
 #[serial]
 async fn recovery_partial_transaction_evidence_is_kept_without_a_decision() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = Fixture::new(1);
     let primary = including(60, std::time::Duration::ZERO).await;
     let oracle = transaction_unreachable(61).await;
@@ -409,6 +412,9 @@ async fn recovery_partial_transaction_evidence_is_kept_without_a_decision() {
 #[tokio::test]
 #[serial]
 async fn recovery_decisions_of_one_pass_bind_fresh_generations() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = Fixture::new(2);
     let primary = including(60, std::time::Duration::ZERO).await;
     let oracle = including(61, std::time::Duration::ZERO).await;
@@ -424,6 +430,9 @@ async fn recovery_decisions_of_one_pass_bind_fresh_generations() {
 #[tokio::test]
 #[serial]
 async fn recovery_pass_ends_at_its_deadline_and_leaves_the_interrupted_attempt() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = Fixture::new(1);
     let before = fx.records();
     let primary = including(60, std::time::Duration::ZERO).await;
@@ -455,6 +464,9 @@ fn included(status: &str, envelope: impl Into<Value>, result: impl Into<Value>) 
 #[tokio::test]
 #[serial]
 async fn recovery_outcome_requires_the_configured_pair_in_one_pass() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let success = included("SUCCESS", envelope_text(100), result_text(true, 70));
     let fx = Fixture::new(1);
     let primary = endpoint(60, success.clone()).await;
@@ -496,6 +508,9 @@ async fn recovery_outcome_requires_the_configured_pair_in_one_pass() {
 #[tokio::test]
 #[serial]
 async fn recovery_consumed_sequence_without_original_envelope_stays_unknown() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let other = included("SUCCESS", envelope_text(101), result_text(true, 70));
     let fx = Fixture::new(1);
     let primary = endpoint(60, other.clone()).await;
@@ -518,6 +533,9 @@ async fn recovery_consumed_sequence_without_original_envelope_stays_unknown() {
 #[tokio::test]
 #[serial]
 async fn recovery_combined_pass_limits_attempts_requests_refresh_and_deadline() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = Fixture::new(5);
     let absent = json!({"status":"NOT_FOUND","latestLedger":60,"oldestLedger":1});
     let primary = endpoint(60, absent.clone()).await;
@@ -543,6 +561,9 @@ async fn recovery_combined_pass_limits_attempts_requests_refresh_and_deadline() 
 #[tokio::test]
 #[serial]
 async fn recovery_mainnet_legacy_stage_settles_nothing_and_testnet_is_unchanged() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     for answer in [
         included("SUCCESS", envelope_text(100), result_text(true, 70)),
         included("FAILED", envelope_text(100), result_text(false, 70)),

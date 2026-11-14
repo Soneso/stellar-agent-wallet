@@ -103,6 +103,9 @@ fn write_baseline(
 #[tokio::test]
 #[serial_test::serial]
 async fn wholesale_replacement_with_wrong_account_returns_missing_baseline() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let dir = tempfile::tempdir().expect("tempdir must succeed");
     let log_path = dir.path().join("audit.jsonl");
@@ -159,6 +162,9 @@ async fn wholesale_replacement_with_wrong_account_returns_missing_baseline() {
 #[tokio::test]
 #[serial_test::serial]
 async fn wholesale_replacement_with_wrong_rule_id_returns_missing_baseline() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let dir = tempfile::tempdir().expect("tempdir must succeed");
     let log_path = dir.path().join("audit.jsonl");

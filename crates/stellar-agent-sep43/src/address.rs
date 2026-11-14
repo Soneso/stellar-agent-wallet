@@ -192,7 +192,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn resolve_active_address_returns_g_strkey_for_classic_account() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::profile::schema::Profile;
 
         // Build a G-strkey deterministically from fixed bytes so the expected
@@ -295,7 +299,11 @@ mod tests {
     // ── resolve_active_address: C-strkey and M-strkey ─────────────────────────
 
     #[test]
+    #[serial_test::serial]
     fn resolve_active_address_c_strkey_returns_smart_account_c() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::profile::schema::Profile;
 
         let c_strkey: String = stellar_strkey::Contract([0x02u8; 32])
@@ -309,7 +317,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn resolve_active_address_m_strkey_returns_muxed_m() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::profile::schema::Profile;
 
         let m_strkey: String = stellar_strkey::ed25519::MuxedAccount {
@@ -326,7 +338,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn resolve_active_address_empty_account_returns_missing_address() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::profile::schema::Profile;
 
         let profile = Profile::builder_testnet("svc", "", "nonce-svc", "nonce-acct").build();

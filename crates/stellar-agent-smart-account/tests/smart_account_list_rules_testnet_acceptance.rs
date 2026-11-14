@@ -689,6 +689,8 @@ async fn h3_cli_envelope_shape_on_testnet() {
     eprintln!("deleted rule {rule_1_id}; sparse-ID gap created");
 
     // ── Invoke the CLI binary ─────────────────────────────────────────────────
+    stellar_agent_test_support::sandbox::require_isolated_executable(&binary)
+        .expect("isolated acceptance child");
     let output = std::process::Command::new(&binary)
         .args([
             "smart-account",

@@ -103,7 +103,11 @@ fn observation_simulations() -> Vec<serde_json::Value> {
 /// `verify_signer_set_against_chain` refuses a version-1 row whose verifier
 /// contract is malformed, and the refusal holds no fragment of the address.
 #[tokio::test]
+#[serial_test::serial]
 async fn signers_path_refuses_the_malformed_verifier_without_its_fragments() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
     write_baseline(
         &audit_writer,
@@ -151,6 +155,9 @@ async fn signers_path_refuses_the_malformed_verifier_without_its_fragments() {
 #[tokio::test]
 #[serial_test::serial]
 async fn credentials_path_refuses_the_malformed_verifier_without_its_fragments() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;

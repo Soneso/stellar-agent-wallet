@@ -1840,6 +1840,8 @@ pub(super) mod tests {
     #[tokio::test]
     #[serial]
     async fn nonexistent_profile_returns_exit_1() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let args = SignPolicyArgs {
             profile: Some("__nonexistent_sign_policy__".to_owned()),
             secret_env: "__UNSET_SIGN_POLICY_VAR__".to_owned(),
@@ -1856,7 +1858,11 @@ pub(super) mod tests {
     /// position of the failure, before signing and after it; the line is not
     /// repeated.
     #[test]
+    #[serial_test::serial]
     fn a_malformed_policy_line_is_reported_by_position_only() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_test_support::rejected_value::{
             CREDENTIAL_MARKER, assert_no_marker_in_text,
         };
@@ -1929,6 +1935,9 @@ pub(super) mod tests {
     #[test]
     #[serial]
     fn sequence_assignment_uses_pin_and_body_without_writing_pin() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::policy::{
             pin::{self, Pin, PinScope, PinState},
             state_lock::WindowStoreLock,
@@ -1982,6 +1991,9 @@ pub(super) mod tests {
     #[test]
     #[serial]
     fn sequence_missing_and_exhaustion_boundaries() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let directory = TempDir::new().unwrap();
         let window = directory.path().join("state.window");
@@ -2016,6 +2028,9 @@ pub(super) mod tests {
     #[test]
     #[serial]
     fn v1_warning_and_pin_rollback_warning() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::policy::{
             pin::{self, Pin, PinScope},
             state_lock::WindowStoreLock,
@@ -2063,6 +2078,9 @@ pub(super) mod tests {
     #[tokio::test]
     #[serial]
     async fn sign_policy_refuses_invalid_credentials_without_writing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::policy::v1::verified::{
             OwnerKeySource, PinMode, PolicyLoad, load_verified_policy,
         };
@@ -2203,6 +2221,9 @@ pub(super) mod tests {
     #[test]
     #[serial]
     fn unsigned_and_minimum_validation_precede_signing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let directory = TempDir::new().unwrap();
         let window = directory.path().join("state.window");
@@ -2320,6 +2341,9 @@ pub(super) mod tests {
     #[test]
     #[serial]
     fn unreadable_pin_keeps_its_state_code() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let directory = TempDir::new().unwrap();
         let window = directory.path().join("state.window");
@@ -2784,6 +2808,9 @@ pub(super) mod tests {
     #[tokio::test]
     #[serial]
     async fn signing_without_a_mainnet_table_is_unchanged() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use std::sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},

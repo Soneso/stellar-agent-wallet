@@ -152,6 +152,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn binding_enrolls_an_unkeyed_log_before_its_first_key() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let name = "carrier-first-key";

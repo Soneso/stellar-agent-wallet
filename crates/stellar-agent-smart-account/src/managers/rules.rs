@@ -10931,6 +10931,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn a_pair_gone_stale_during_the_rule_read_is_read_again() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let primary = rule_read_rpc(1200, 1000)
             .slow_simulations(2..3, RULE_READ_OUTLASTS_OBSERVATION)
@@ -10951,6 +10954,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn a_pair_stale_again_after_the_second_rule_read_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let primary =
             rule_read_rpc(1200, 1000).slow_simulations(2..4, RULE_READ_OUTLASTS_OBSERVATION);
@@ -10973,6 +10979,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn rule_validity_uses_the_higher_witnessed_ledger() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         match submit_under_rule_valid_until(1001).await {
             Err(SaError::RuleExpired {
@@ -10995,7 +11004,11 @@ mod tests {
 
     /// The testnet write passes its guard and reaches the first RPC.
     #[tokio::test]
+    #[serial_test::serial]
     async fn install_rule_reaches_rpc_on_testnet() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = stellar_agent_test_support::KeyedLedgerEntriesResponder::new()
             .serve()
             .await;
@@ -11037,7 +11050,11 @@ mod tests {
 
     /// The testnet write passes its guard and reaches the first RPC.
     #[tokio::test]
+    #[serial_test::serial]
     async fn add_policy_reaches_rpc_on_testnet() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = stellar_agent_test_support::KeyedLedgerEntriesResponder::new()
             .serve()
             .await;
@@ -11074,7 +11091,11 @@ mod tests {
 
     /// The testnet write passes its guard and reaches the first RPC.
     #[tokio::test]
+    #[serial_test::serial]
     async fn remove_policy_reaches_rpc_on_testnet() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = stellar_agent_test_support::KeyedLedgerEntriesResponder::new()
             .serve()
             .await;

@@ -316,29 +316,72 @@ impl Commands {
 /// platform and build profile runs the body with the same stack.
 const BODY_STACK_SIZE: usize = 8 * 1024 * 1024;
 
+/// Opens native storage only for the explicit live acceptance entry point.
+#[cfg(feature = "live-platform-keyring")]
+fn live_acceptance_entry() -> Result<(), stellar_agent_core::error::WalletError> {
+    use stellar_agent_network::keyring::live::{
+        LivePlatformKeyring, init_platform_keyring_store_live,
+    };
+    if std::env::var("STELLAR_AGENT_TEST_LIVE_PLATFORM_KEYRING").as_deref()
+        != Ok("real-platform-keyring")
+    {
+        return Err(stellar_agent_core::error::WalletError::Auth(
+            stellar_agent_core::error::AuthError::KeyringPlatformError {
+                detail:
+                    "STELLAR_AGENT_TEST_STORAGE_ISOLATED: live acceptance requires its named permit"
+                        .into(),
+            },
+        ));
+    }
+    init_platform_keyring_store_live(LivePlatformKeyring::acknowledge_real_platform_keyring())
+}
+
 /// Selects the process role before either role initializes its runtime.
 ///
 /// The tool hardens while still single-threaded and exits if hardening fails.
 /// Each role's body then runs on a thread of [`BODY_STACK_SIZE`] bytes.
 fn main() {
-    match role::select(&std::env::args_os().collect::<Vec<_>>(), cfg!(windows)) {
+    #[allow(unused_mut)]
+    let mut args = std::env::args_os().collect::<Vec<_>>();
+    #[cfg(feature = "live-platform-keyring")]
+    if args
+        .get(1)
+        .is_some_and(|arg| arg == "--test-live-platform-keyring")
+    {
+        args.remove(1);
+        if let Err(error) = live_acceptance_entry() {
+            common::render::render_json(&stellar_agent_core::envelope::Envelope::<()>::err_raw(
+                "auth.keyring_platform_error",
+                error.to_string(),
+            ));
+            std::process::exit(1);
+        }
+    }
+    match role::select(&args, cfg!(windows)) {
         role::Role::Server { skip, display_name } => {
             #[allow(
                 clippy::expect_used,
                 reason = "no thread means no server, as no runtime does in run_server_process"
             )]
             let code = on_body_thread(move || -> i32 {
-                stellar_agent_mcp::entry::run_server_process(
-                    display_name,
-                    std::env::args().skip(skip),
-                )
+                #[cfg(not(feature = "live-platform-keyring"))]
+                let server_args = std::env::args().skip(skip);
+                #[cfg(feature = "live-platform-keyring")]
+                let server_args = args
+                    .into_iter()
+                    .skip(skip)
+                    .map(|arg| arg.into_string().expect("Unicode argument"));
+                stellar_agent_mcp::entry::run_server_process(display_name, server_args)
             })
             .expect("Failed starting the server thread");
             std::process::exit(code)
         }
         role::Role::Tool => std::process::exit(process_hardening::guarded_start(
             process_hardening::harden_process,
-            || on_body_thread(run).unwrap_or_else(|err| render_runtime_unavailable(&err)),
+            || {
+                on_body_thread(move || run(args))
+                    .unwrap_or_else(|err| render_runtime_unavailable(&err))
+            },
         )),
     }
 }
@@ -382,14 +425,14 @@ fn render_runtime_unavailable(err: &dyn std::fmt::Display) -> i32 {
 ///
 /// The runtime is shut down without waiting for its remaining tasks, so a
 /// task still blocked on a terminal or socket read does not hold the exit.
-fn run() -> i32 {
+fn run(args: Vec<std::ffi::OsString>) -> i32 {
     stellar_agent_core::test_trace::record("runtime");
     match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
     {
         Ok(runtime) => {
-            let exit_code = runtime.block_on(async_main());
+            let exit_code = runtime.block_on(async_main(args));
             runtime.shutdown_background();
             exit_code
         }
@@ -398,7 +441,7 @@ fn run() -> i32 {
 }
 
 /// Runs the parsed command and returns its exit code.
-async fn async_main() -> i32 {
+async fn async_main(args: Vec<std::ffi::OsString>) -> i32 {
     // Install the subscriber first so any subsequent `tracing::*` call
     // participates in the redaction pipeline.
     let init_result = observability::init_subscriber(None);
@@ -414,7 +457,7 @@ async fn async_main() -> i32 {
         }
     }
 
-    let cli = match Cli::try_parse() {
+    let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
         Err(error) => return report_parse_error(&error),
     };
@@ -626,6 +669,22 @@ mod tests {
     #![allow(clippy::expect_used, reason = "test-only")]
 
     use super::*;
+
+    #[cfg(feature = "live-platform-keyring")]
+    #[test]
+    #[serial_test::serial]
+    fn live_acceptance_entry_requires_its_named_permit() {
+        use stellar_agent_test_support::env_guard::ScopedEnvVar;
+        for permit in [None, Some(std::ffi::OsStr::new("invalid"))] {
+            let _env = ScopedEnvVar::new("STELLAR_AGENT_TEST_LIVE_PLATFORM_KEYRING", permit);
+            let error = live_acceptance_entry().expect_err("missing live permit must refuse");
+            assert!(
+                error
+                    .to_string()
+                    .contains("STELLAR_AGENT_TEST_STORAGE_ISOLATED")
+            );
+        }
+    }
 
     /// The release proof matrix, read from beside its checker.
     const PROOF_MATRIX: &str = include_str!("../../../.github/scripts/proof-matrix.toml");

@@ -142,6 +142,7 @@ fn run_cli(home: &Path, args: &[&str]) -> (i32, Value) {
 
 /// Runs the binary as [`run_cli`] does, with the variables `envs` set.
 fn run_cli_with(home: &Path, args: &[&str], envs: &[(&str, &str)]) -> (i32, Value) {
+    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
     let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
         .args(args)
         .envs(envs.iter().copied())

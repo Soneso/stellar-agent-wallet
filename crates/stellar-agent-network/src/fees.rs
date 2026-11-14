@@ -539,29 +539,49 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn mainnet_without_cap_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let error = check_classic_fee_cap(100, FeeSource::Explicit, &mainnet(None)).unwrap_err();
         assert_eq!(error.code(), "validation.mainnet_fee_cap_required");
     }
 
     #[test]
+    #[serial_test::serial]
     fn mainnet_with_cap_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert!(check_classic_fee_cap(100, FeeSource::Explicit, &mainnet(Some(10_000))).is_ok());
     }
 
     #[test]
+    #[serial_test::serial]
     fn testnet_without_cap_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert!(check_classic_fee_cap(u32::MAX, FeeSource::Explicit, &testnet(None)).is_ok());
     }
 
     #[test]
+    #[serial_test::serial]
     fn fee_equal_to_cap_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert!(check_classic_fee_cap(500, FeeSource::Envelope, &testnet(Some(500))).is_ok());
         assert!(check_classic_fee_cap(500, FeeSource::Envelope, &mainnet(Some(500))).is_ok());
     }
 
     #[test]
+    #[serial_test::serial]
     fn fee_above_cap_names_its_source() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let profile = testnet(Some(500));
         let selected = FeeSource::Selected {
             percentile: "p95".to_owned(),
@@ -616,7 +636,11 @@ mod tests {
         );
     }
     #[test]
+    #[serial_test::serial]
     fn effective_fee_cap_is_tighter_cap() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut profile = Profile::builder_mainnet_named(
             "fees",
             "https://rpc.example.invalid",

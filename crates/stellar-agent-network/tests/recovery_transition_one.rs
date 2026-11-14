@@ -277,6 +277,9 @@ impl Endpoints {
 #[tokio::test]
 #[serial]
 async fn recovery_two_post_expiry_ledgers_release_only_the_sequence() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = Fixture::new(NOW / 1_000 - 1);
     let endpoints = Endpoints::new(NOW / 1_000).await;
     let before = fx.wire();
@@ -346,6 +349,9 @@ async fn recovery_two_post_expiry_ledgers_release_only_the_sequence() {
 #[tokio::test]
 #[serial]
 async fn recovery_single_endpoint_refuses() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     for primary_fails in [false, true] {
         let fx = Fixture::new(NOW / 1_000 - 1);
         let endpoints = Endpoints::new(NOW / 1_000).await;
@@ -363,6 +369,9 @@ async fn recovery_single_endpoint_refuses() {
 #[tokio::test]
 #[serial]
 async fn recovery_two_not_found_without_coverage_keeps_hold() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = Fixture::new(NOW / 1_000 + 20);
     let endpoints = Endpoints::new(NOW / 1_000).await;
     let before = fx.wire()["holds"].clone();
@@ -382,6 +391,9 @@ async fn recovery_two_not_found_without_coverage_keeps_hold() {
 #[tokio::test]
 #[serial]
 async fn recovery_fresh_concurrence_ignores_saved_bounds() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = Fixture::new(NOW / 1_000 - 1);
     let endpoints = Endpoints::new(NOW / 1_000).await;
     endpoints.oracle_history.store(false, Ordering::SeqCst);
@@ -399,6 +411,9 @@ async fn recovery_fresh_concurrence_ignores_saved_bounds() {
 #[tokio::test]
 #[serial]
 async fn recovery_receipt_claim_honors_sequence_release() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = Fixture::new(NOW / 1_000 - 1);
     fx.run(&Endpoints::new(NOW / 1_000).await).await;
     let _lock =

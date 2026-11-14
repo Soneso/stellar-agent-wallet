@@ -109,6 +109,13 @@ pub struct DefaultStoreGuard {
 }
 
 impl DefaultStoreGuard {
+    /// Clears the default store until the guard drops.
+    pub fn cleared() -> Self {
+        Self {
+            previous: keyring_core::unset_default_store(),
+        }
+    }
+
     /// Installs `store` as the process-global default and returns the guard
     /// that restores the previous default.
     pub fn install(store: Arc<keyring_core::CredentialStore>) -> Self {

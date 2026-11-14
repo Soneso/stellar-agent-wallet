@@ -212,8 +212,11 @@ mod tests {
 
     /// Criterion passes when all groups are satisfied.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn passes_when_quorum_satisfied() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let criterion = QuorumSatisfiedCriterion::new();
         let tool = make_tool();
         let profile = make_profile();
@@ -230,8 +233,11 @@ mod tests {
     /// Criterion returns QuorumNotSatisfied with And combinator when groups
     /// are short.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn denies_when_and_groups_unsatisfied() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let criterion = QuorumSatisfiedCriterion::new();
         let tool = make_tool();
         let profile = make_profile();
@@ -259,8 +265,11 @@ mod tests {
     /// Criterion returns QuorumNotSatisfied with Or combinator when no group
     /// is satisfied.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn denies_when_or_no_group_satisfied() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let criterion = QuorumSatisfiedCriterion::new();
         let tool = make_tool();
         let profile = make_profile();
@@ -288,8 +297,11 @@ mod tests {
     /// Criterion returns CriterionEvaluationFailed (fail-closed) when quorum
     /// view is absent.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn fails_closed_when_quorum_view_absent() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let criterion = QuorumSatisfiedCriterion::new();
         let tool = make_tool();
         let profile = make_profile();

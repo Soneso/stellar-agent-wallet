@@ -831,7 +831,11 @@ mod secondary_rule_tests {
 
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn secondary_override_reads_context_and_preserves_defaults() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut server = server(false, "https://primary.example");
         let err = server
             .secondary_override(Some("https://input.example"))
@@ -894,7 +898,11 @@ mod secondary_rule_tests {
     /// argument.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn dex_trade_refuses_mainnet_at_entry_divergent_context() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rpc = wiremock::MockServer::start().await;
         let server = mock_server(false, &rpc.uri());
         let args = trade_args("stellar:testnet", Some(rpc.uri().as_str()));
@@ -908,7 +916,11 @@ mod secondary_rule_tests {
     /// ahead of the secondary-endpoint refusal and the router lookup.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn dex_trade_refuses_mainnet_at_entry_mainnet_profile() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rpc = wiremock::MockServer::start().await;
         let server = mock_server(true, &rpc.uri());
         let args = trade_args("stellar:mainnet", Some(rpc.uri().as_str()));
@@ -922,7 +934,11 @@ mod secondary_rule_tests {
     /// changes nothing.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn dex_trade_refuses_mainnet_under_allow_all_engine() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rpc = wiremock::MockServer::start().await;
         let mut server = mock_server(true, &rpc.uri());
         server.policy_engine = std::sync::Arc::new(crate::tools::common::AllowAllPolicyEngine);
@@ -937,7 +953,11 @@ mod secondary_rule_tests {
     /// a credentialed URL is refused before any lookup or RPC.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn dex_trade_refuses_credentialed_secondary_on_testnet() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rpc = wiremock::MockServer::start().await;
         let server = testnet_server(&rpc.uri());
         let credentialed = format!("http://agent:secret@{}", rpc.address());
@@ -958,7 +978,11 @@ mod secondary_rule_tests {
     /// argument.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn dex_trade_marker_is_not_echoed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_test_support::rejected_value::{
             CREDENTIAL_MARKER, assert_no_marker_in_text,
         };
@@ -1013,7 +1037,11 @@ mod secondary_rule_tests {
     /// accepted values, without the argument.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn dex_quote_chain_marker_is_not_echoed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_test_support::rejected_value::{
             CREDENTIAL_MARKER, assert_no_marker_in_text,
         };

@@ -1577,6 +1577,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn testnet_remote_transcript_keeps_base_bytes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let fixture = fixture("transcript");
         let router = crate::build_router(
             fixture.state.clone(),
@@ -1720,6 +1723,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn served_shared_app_js_is_the_approval_ui_bytes_verbatim() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = fixture("shared-js");
         let router = build_router(f.state.ctx.decision.clone().unwrap());
         let cookie = login(&router, &f.state, &f.authenticator).await;
@@ -1751,6 +1757,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn shared_app_js_without_cookie_is_not_found() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = fixture("shared-js-nocookie");
         let resp = build_router(f.state.ctx.decision.clone().unwrap())
             .with_state(f.state.clone())
@@ -1770,6 +1779,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn unknown_approval_page_holds_no_nonce() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = fixture("unknown-nonce");
         let router = build_router(f.state.ctx.decision.clone().unwrap());
         let cookie = login(&router, &f.state, &f.authenticator).await;
@@ -2020,6 +2032,9 @@ mod tests {
     #[test]
     #[serial]
     fn an_entry_swapped_before_the_challenge_mints_no_challenge() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("swap-before-challenge");
@@ -2065,6 +2080,9 @@ mod tests {
     #[test]
     #[serial]
     fn an_entry_swapped_after_the_challenge_is_not_attested() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("swap-after-challenge");
@@ -2121,6 +2139,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_challenge_without_a_digest_rejects_but_cannot_approve() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("digest-less-challenge");
@@ -2172,6 +2193,8 @@ mod tests {
     #[test]
     #[serial]
     fn a_refused_destination_is_rejected_remotely_and_never_approved() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("refused-destination");
@@ -2250,6 +2273,9 @@ mod tests {
     #[test]
     #[serial]
     fn approve_route_reports_binding_mismatch() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("binding-mismatch-route");
@@ -2318,6 +2344,9 @@ mod tests {
     #[test]
     #[serial]
     fn happy_path_approve_mints_attestation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("happy");
@@ -2395,6 +2424,9 @@ mod tests {
     #[test]
     #[serial]
     fn wysiwys_challenge_for_entry_a_does_not_authorize_entry_b() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("wysiwys");
@@ -2439,6 +2471,9 @@ mod tests {
     #[test]
     #[serial]
     fn unminted_challenge_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("unminted");
@@ -2477,6 +2512,9 @@ mod tests {
     #[test]
     #[serial]
     fn replayed_challenge_is_refused_second_time() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("replay");
@@ -2546,6 +2584,9 @@ mod tests {
     #[test]
     #[serial]
     fn wrong_origin_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("wrong-origin");
@@ -2589,6 +2630,9 @@ mod tests {
     #[test]
     #[serial]
     fn origin_port_mismatch_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("origin-port-mismatch");
@@ -2633,6 +2677,9 @@ mod tests {
     #[test]
     #[serial]
     fn expired_session_is_refused_like_no_session() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("expired-session");
@@ -2691,6 +2738,9 @@ mod tests {
     #[test]
     #[serial]
     fn inbox_sinks_carry_a_bidi_memo_escaped() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("inbox-bidi");
@@ -2758,6 +2808,9 @@ mod tests {
     #[test]
     #[serial]
     fn wrong_rp_id_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("wrong-rp-id");
@@ -2795,6 +2848,9 @@ mod tests {
     #[test]
     #[serial]
     fn uv_absent_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("uv-absent");
@@ -2836,6 +2892,9 @@ mod tests {
     #[test]
     #[serial]
     fn credential_not_allowlisted_is_refused_at_login() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("not-allowlisted");
@@ -2949,6 +3008,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn testnet_login_lock_timeout_is_busy_and_retryable() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let fx = fixture("login-lock-timeout");
         let router = build_router(fx.state.ctx.decision.clone().unwrap());
         let cookie = login(&router, &fx.state, &fx.authenticator).await;
@@ -2987,6 +3049,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn testnet_decision_lock_timeout_is_busy_and_retryable() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let fx = fixture("decision-lock-timeout");
         let nonce = insert_payment_entry(&fx.state.ctx.store_path);
         let router = build_router(fx.state.ctx.decision.clone().unwrap());
@@ -3057,6 +3122,9 @@ mod tests {
     #[test]
     #[serial]
     fn revoked_credential_cannot_login_without_restart() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("revoked-login");
@@ -3142,6 +3210,9 @@ mod tests {
     #[test]
     #[serial]
     fn revocation_during_login_verification_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             for revoke in ["allowlist", "enrollment"] {
@@ -3207,6 +3278,9 @@ mod tests {
     #[test]
     #[serial]
     fn revoked_session_serves_no_authenticated_get() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             for revoke in ["allowlist", "enrollment"] {
@@ -3251,6 +3325,9 @@ mod tests {
     #[test]
     #[serial]
     fn unaffected_credential_survives_allowlist_edit() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("unaffected-login");
@@ -3282,6 +3359,9 @@ mod tests {
     #[test]
     #[serial]
     fn revoked_session_cannot_approve_or_reject() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             for (decision, revoke) in [
@@ -3380,6 +3460,9 @@ mod tests {
     #[test]
     #[serial]
     fn sign_counter_regression_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("counter-regression");
@@ -3471,6 +3554,9 @@ mod tests {
     #[test]
     #[serial]
     fn signed_origin_listener_serves_no_enroll_helper() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("enroll-signed-absent");
@@ -3503,6 +3589,9 @@ mod tests {
     #[test]
     #[serial]
     fn enroll_page_is_reachable_pre_auth() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("enroll-reachable");
@@ -3534,6 +3623,9 @@ mod tests {
     #[test]
     #[serial]
     fn enroll_page_shares_login_rate_limiter_and_refuses_once_exhausted() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("enroll-rate-limited");
@@ -3586,6 +3678,9 @@ mod tests {
     #[test]
     #[serial]
     fn enroll_page_interaction_leaves_operator_credential_store_untouched() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("enroll-no-side-effect");
@@ -3635,6 +3730,9 @@ mod tests {
     #[test]
     #[serial]
     fn enroll_page_has_no_inline_event_handler_attributes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("enroll-no-inline-handlers");
@@ -3690,6 +3788,9 @@ mod tests {
     #[test]
     #[serial]
     fn csp_contract_holds_across_html_routes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("csp-contract");
@@ -3830,6 +3931,9 @@ mod tests {
     #[test]
     #[serial]
     fn authenticated_detail_renders_selected_context_and_envelope_source() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let mut fx = fixture("context-source");
@@ -3863,6 +3967,9 @@ mod tests {
     #[test]
     #[serial]
     fn remote_refuses_x402_challenge() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("x402-challenge");

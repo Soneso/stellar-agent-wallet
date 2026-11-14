@@ -207,7 +207,10 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn refresh_nonexistent_profile_returns_exit_1() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let args = RefreshArgs {
             home_domain: "example.com".to_owned(),
             profile: Some("__nonexistent_refresh_cpty__".to_owned()),

@@ -84,7 +84,11 @@ fn testnet_profile_with_rpc(rpc_url: &str) -> Profile {
 /// instance entry for the contract, the cheapest honest way to force
 /// `fetch_contract_spec`'s RPC-fetch failure without a live network.
 #[tokio::test]
+#[serial_test::serial]
 async fn preview_invocation_empty_instance_entries_returns_spec_fetch_failed_envelope() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let contract = contract_strkey(20);
     let mock_server = KeyedLedgerEntriesResponder::new().serve().await;
 
@@ -117,7 +121,11 @@ async fn preview_invocation_empty_instance_entries_returns_spec_fetch_failed_env
 /// with wire code `sep48.render_failed` when the spec fetch succeeds but the
 /// requested function is absent from the contract's spec.
 #[tokio::test]
+#[serial_test::serial]
 async fn preview_invocation_unknown_function_returns_render_failed_envelope() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let contract = contract_strkey(21);
     let wasm = seeded(WASM_BYTES, "unknown_function");
     let wasm_hash = sha256(&wasm);
@@ -165,7 +173,11 @@ async fn preview_invocation_unknown_function_returns_render_failed_envelope() {
 /// `fetch_contract_spec`, so the identical empty responder forces the same
 /// underlying `Sep48Error::RpcFetchFailure`.
 #[tokio::test]
+#[serial_test::serial]
 async fn discover_empty_instance_entries_returns_discovery_failed_envelope() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let contract = contract_strkey(22);
     let mock_server = KeyedLedgerEntriesResponder::new().serve().await;
 

@@ -955,7 +955,11 @@ fn assert_required_subdirs(root: &Path) {
     clippy::print_stderr,
     reason = "test-only; per-case PASS/FAIL output aids CI failure triage"
 )]
+#[serial_test::serial]
 fn run_all_adversarial_fixtures() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let root = adversarial_root();
     assert_required_subdirs(&root);
 

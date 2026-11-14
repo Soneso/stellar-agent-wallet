@@ -31,6 +31,9 @@ fn with_salt_bit_flipped(nonce: &Nonce, index: usize) -> Nonce {
 #[test]
 #[serial]
 fn a_changed_salt_byte_fails_verification() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let profile = make_profile("salt-binding-verify");
     seed_key(&profile, &[0x5Au8; 32]);
@@ -86,6 +89,9 @@ fn a_changed_salt_byte_fails_verification() {
 #[test]
 #[serial]
 fn a_changed_salt_byte_fails_the_split_path() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let profile = make_profile("salt-binding-split");
     seed_key(&profile, &[0x5Bu8; 32]);
@@ -131,6 +137,9 @@ fn a_changed_salt_byte_fails_the_split_path() {
 #[test]
 #[serial]
 fn a_tag_over_the_earlier_preimage_is_refused() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let key = [0x5Cu8; 32];
     let profile = make_profile("salt-binding-preimage");
@@ -195,6 +204,9 @@ fn a_tag_over_the_earlier_preimage_is_refused() {
 #[test]
 #[serial]
 fn two_genuine_mints_stay_distinct() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let profile = make_profile("salt-binding-distinct");
     seed_key(&profile, &[0x5Du8; 32]);

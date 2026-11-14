@@ -70,7 +70,11 @@ fn sign_policy_toml(policy_body: &str, sk: &SigningKey, owner_id: &str) -> Strin
 }
 
 #[test]
+#[serial_test::serial]
 fn signed_policy_admits_muxed_x402_without_rewriting_bytes() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::policy::{
         ToolValueKind,
         v1::value::{ActionKind, ValueClass, ValueLeg},
@@ -223,6 +227,7 @@ fn keyringless_profiles_serve_reads_and_refuse_signing() {
 
     for named in [false, true] {
         let home = TempDir::new().unwrap();
+        stellar_agent_test_support::sandbox::mark_sandbox(home.path()).unwrap();
         let mut command = crate::common::server_binary::server_command();
         if named {
             std::fs::create_dir(home.path().join("profiles")).unwrap();
@@ -296,6 +301,9 @@ fn keyringless_profiles_serve_reads_and_refuse_signing() {
 #[test]
 #[serial]
 fn engine_selection_refuses_unreadable_owner_state() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let mut profile = build_v1_profile("unreadable_selection");
     profile.policy.engine = PolicyEngineKind::Noop;
@@ -367,6 +375,9 @@ fn engine_selection_refusal_preserves_typed_code() {
 #[test]
 #[serial]
 fn engine_authorization_keeps_unrelated_behavior() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let mut profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
         .with_noop_engine()
@@ -414,6 +425,9 @@ fn balances_args() -> StellarBalancesArgs {
 #[test]
 #[serial]
 fn signed_allow_rule_evaluates_to_allow() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     const BODY: &str = r#"version = 1
 scope = "profile:default"
 
@@ -467,6 +481,9 @@ decision = "allow"
 #[test]
 #[serial]
 fn signed_deny_rule_evaluates_to_explicit_rule_deny() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     const BODY: &str = r#"version = 1
 scope = "profile:default"
 
@@ -511,6 +528,9 @@ decision = "deny"
 #[test]
 #[serial]
 fn signed_require_approval_rule_evaluates_to_require_approval() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     const BODY: &str = r#"version = 1
 scope = "profile:default"
 
@@ -562,6 +582,9 @@ decision = "require_approval"
 #[test]
 #[serial]
 fn empty_rules_default_deny_evaluates_to_no_matching_rule() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     const BODY: &str = r#"version = 1
 scope = "profile:default"
 "#;
@@ -673,6 +696,9 @@ decision = "allow"
 #[tokio::test]
 #[serial]
 async fn dispatch_gate_routes_v1_deny_to_wire_code() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     const BODY: &str = r#"version = 1
 scope = "profile:default"
 
@@ -728,6 +754,9 @@ decision = "deny"
 #[tokio::test]
 #[serial]
 async fn dispatch_gate_routes_v1_require_approval_to_wire_code() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     const BODY: &str = r#"version = 1
 scope = "profile:default"
 
@@ -911,6 +940,9 @@ decision = "allow"
 #[test]
 #[serial]
 fn build_policy_engine_v1_fails_when_owner_key_absent_from_keyring() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let suffix = "missing_keyring";
     let profile_name = test_profile_name(suffix);
 
@@ -954,6 +986,9 @@ scope = "profile:{profile_name}"
 #[test]
 #[serial]
 fn build_policy_engine_v1_fails_when_policy_file_absent() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let suffix = "missing_policy";
     let (_sk, pk) = fresh_keypair();
     install_owner_key_in_mock_keyring(suffix, &pk);

@@ -75,11 +75,14 @@ pub fn server_command() -> Command {
 fn scratch_home(bin_dir: &Path) -> Result<PathBuf, String> {
     let root = bin_dir.join("..").join("tmp");
     std::fs::create_dir_all(&root).map_err(|err| format!("{}: {err}", root.display()))?;
-    tempfile::Builder::new()
+    let home = tempfile::Builder::new()
         .prefix("server-home-")
         .tempdir_in(&root)
         .map(tempfile::TempDir::keep)
-        .map_err(|err| format!("scratch home in {}: {err}", root.display()))
+        .map_err(|err| format!("scratch home in {}: {err}", root.display()))?;
+    let home = home.canonicalize().map_err(|err| err.to_string())?;
+    stellar_agent_test_support::sandbox::mark_sandbox(&home).map_err(|err| err.to_string())?;
+    Ok(home)
 }
 
 /// One alias resolution per process.
@@ -134,16 +137,33 @@ fn bin_dir_of(exe: &Path) -> Result<PathBuf, String> {
 /// Returns the reason when any step refuses.
 fn resolve(dir: &Path) -> Result<PathBuf, String> {
     let canonical = locate_in(dir)?;
+    let bytes = std::fs::read(&canonical).map_err(|error| error.to_string())?;
+    if !isolated_executable(&bytes) {
+        return Err("child lacks storage isolation; run cargo test -p stellar-agent-cli -p stellar-agent-mcp --no-run".to_owned());
+    }
     verify_marker(&canonical, cfg!(feature = "mainnet-write"))?;
     let alias = alias_path(&canonical)?;
     publish(&canonical, &alias)?;
     Ok(alias)
 }
 
+/// Reports whether executable bytes contain the isolation marker.
+fn isolated_executable(bytes: &[u8]) -> bool {
+    const MARKER: &[u8] = b"STELLAR_AGENT_TEST_STORAGE_ISOLATED";
+    bytes.windows(MARKER.len()).any(|window| window == MARKER)
+}
+
+#[test]
+fn child_executable_requires_the_isolation_literal() {
+    assert!(isolated_executable(
+        b"prefix STELLAR_AGENT_TEST_STORAGE_ISOLATED suffix"
+    ));
+    assert!(!isolated_executable(b"production executable"));
+}
+
 /// The canonical executable in `dir`.
 ///
 /// # Errors
-///
 /// Returns the build command when no regular file is there.
 fn locate_in(dir: &Path) -> Result<PathBuf, String> {
     let path = dir.join(canonical_name());
@@ -381,7 +401,7 @@ mod tests {
         let marker = format!("{}{}{state}", "STELLAR_AGENT_BUILD_", "MAINNET_WRITE=");
         let path = canonical_in(
             fixture,
-            format!("#!/bin/sh\nprintf 'stellar-agent 0.0.0\\n{marker}\\n'\nexit {status}\n")
+            format!("#!/bin/sh\n# STELLAR_AGENT_TEST_STORAGE_ISOLATED\nprintf 'stellar-agent 0.0.0\\n{marker}\\n'\nexit {status}\n")
                 .as_bytes(),
         );
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -414,6 +434,21 @@ mod tests {
         } else {
             "off"
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_refuses_a_child_without_the_isolation_literal() {
+        let fixture = fixture();
+        let canonical = version_script(fixture.path(), build_state(), 0);
+        let source = std::fs::read_to_string(&canonical).unwrap();
+        std::fs::write(
+            &canonical,
+            source.replace("# STELLAR_AGENT_TEST_STORAGE_ISOLATED\n", ""),
+        )
+        .unwrap();
+        let reason = resolve(&fixture.path().join("bin")).unwrap_err();
+        assert!(reason.contains("child lacks storage isolation"), "{reason}");
     }
 
     #[cfg(unix)]
@@ -690,6 +725,14 @@ mod tests {
             .map(PathBuf::from)
             .unwrap();
         assert!(home.is_dir(), "{}", home.display());
-        assert_eq!(home.parent(), program.parent().and_then(Path::parent));
+        assert_eq!(
+            home.parent().unwrap().canonicalize().unwrap(),
+            program
+                .parent()
+                .and_then(Path::parent)
+                .unwrap()
+                .canonicalize()
+                .unwrap()
+        );
     }
 }

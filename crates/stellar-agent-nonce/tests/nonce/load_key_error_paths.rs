@@ -41,6 +41,9 @@ use crate::helpers::{
 #[test]
 #[serial]
 fn load_key_returns_keyring_error_when_entry_missing() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
 
     // Intentionally do NOT seed any key.
@@ -76,6 +79,9 @@ fn load_key_returns_keyring_error_when_entry_missing() {
 #[test]
 #[serial]
 fn load_key_returns_keyring_error_on_get_password_no_storage_access() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use keyring_core::Entry as KeyringEntry;
@@ -133,6 +139,9 @@ fn load_key_returns_keyring_error_on_get_password_no_storage_access() {
 #[test]
 #[serial]
 fn load_key_returns_serialise_failed_on_invalid_base64() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use keyring_core::Entry as KeyringEntry;
 
     init_mock();
@@ -181,6 +190,9 @@ fn load_key_returns_serialise_failed_on_invalid_base64() {
 #[test]
 #[serial]
 fn rotate_nonce_key_returns_wallet_error_on_set_password_failure() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use keyring_core::Entry as KeyringEntry;
 
     init_mock();
@@ -235,6 +247,9 @@ fn rotate_nonce_key_returns_wallet_error_on_set_password_failure() {
 #[test]
 #[serial]
 fn keyring_refusals_hold_no_coordinate() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     const MISSING: &str = "keyring error: the configured keyring entry must exist; provision or \
                            select the required entry.";
     const NO_STORE: &str = "keyring error: a platform keychain must be available for this \

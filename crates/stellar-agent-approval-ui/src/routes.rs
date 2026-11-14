@@ -684,6 +684,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn approve_route_reports_binding_mismatch() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let h = crate::tests::Harness::new("binding-mismatch-route");
         let definition = stellar_agent_core::approval::ContextRuleProposalSnapshot::new(
             stellar_agent_core::approval::RuleProposalContextType::Default,

@@ -657,6 +657,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn without_the_acknowledgement_nothing_is_written_and_the_exit_code_is_one() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = rolled_back_profile("reanchor-gate", dir.path());
@@ -693,6 +696,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn with_the_acknowledgement_the_log_is_repaired_and_the_counter_advances() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = rolled_back_profile("reanchor-repair", dir.path());
@@ -895,6 +901,9 @@ mod tests {
     #[test]
     #[serial]
     fn reanchor_requires_the_unauthenticated_tail_flag() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
 
@@ -958,6 +967,9 @@ mod tests {
     #[test]
     #[serial]
     fn rollback_flag_alone_on_a_changed_binding_refuses_and_writes_nothing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let old = anchored_profile("bind-refuse", dir.path(), 2);
@@ -1005,6 +1017,9 @@ mod tests {
     #[test]
     #[serial]
     fn the_binding_flag_on_an_equal_binding_is_ignored_and_the_rollback_rule_applies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = anchored_profile("bind-equal", dir.path(), 2);
@@ -1036,6 +1051,9 @@ mod tests {
     #[test]
     #[serial]
     fn the_rollback_flag_clears_a_missing_anchor_and_writes_its_row() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = anchored_profile("missing-anchor", dir.path(), 3);
@@ -1108,6 +1126,9 @@ mod tests {
     #[test]
     #[serial]
     fn an_absent_binding_is_recorded_after_a_rollback_repair() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = anchored_profile("bind-absent", dir.path(), 2);
@@ -1149,6 +1170,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_changed_binding_with_missing_anchor_requires_rollback_before_and_under_lock() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let name = "bind-missing-refuse";
@@ -1191,6 +1215,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_changed_binding_with_missing_anchor_and_both_flags_writes_both_rows() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let name = "bind-missing-both";
@@ -1211,6 +1238,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_changed_binding_without_anchor_evidence_needs_only_the_binding_flag() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let name = "bind-no-evidence";
@@ -1235,6 +1265,9 @@ mod tests {
     #[test]
     #[serial]
     fn an_anchoring_row_in_the_active_file_needs_rollback_despite_a_broken_archive() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::TipAnchorReason;
         use stellar_agent_core::audit_log::rotation::test_seam::set_rotation_threshold;
         use stellar_agent_core::audit_log::test_helpers::break_newest_archive_link;
@@ -1296,6 +1329,9 @@ mod tests {
     #[test]
     #[serial]
     fn the_binding_flag_alone_accepts_a_changed_binding_with_an_agreeing_anchor() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let old = anchored_profile("bind-accept", dir.path(), 2);
@@ -1367,6 +1403,9 @@ mod tests {
     #[test]
     #[serial]
     fn the_rollback_flag_is_ignored_on_a_changed_binding_with_an_agreeing_anchor() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let old = anchored_profile("bind-ignore-rollback", dir.path(), 2);
@@ -1395,6 +1434,9 @@ mod tests {
     #[test]
     #[serial]
     fn both_flags_on_a_disagreeing_anchor_append_rollback_then_binding_changed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let old = anchored_profile("bind-both", dir.path(), 2);
@@ -1453,6 +1495,9 @@ mod tests {
     #[test]
     #[serial]
     fn both_flags_drain_queued_rows_after_both_repair_rows() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let old = anchored_profile("bind-both-outbox", dir.path(), 2);
@@ -1518,6 +1563,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_refused_drain_on_a_binding_change_is_a_warning_and_the_binding_is_stored() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for rollback in [false, true] {
             keyring_mock::install().expect("mock keyring store");
             let dir = tempfile::tempdir().expect("tmp dir");
@@ -1589,6 +1637,9 @@ mod tests {
     #[test]
     #[serial]
     fn an_unusable_stored_anchor_counts_as_disagreeing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let old = anchored_profile("bind-unusable", dir.path(), 2);
@@ -1623,6 +1674,9 @@ mod tests {
     #[test]
     #[serial]
     fn an_unparseable_record_gives_previous_anchor_none() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = anchored_profile("bind-garbage", dir.path(), 2);
@@ -1652,6 +1706,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_failed_binding_write_leaves_the_refusal_and_a_rerun_appends_again() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().expect("tmp dir");
         let coordinate =
             stellar_agent_core::profile::schema::KeyringEntryRef::default_audit_binding(
@@ -1758,6 +1815,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn without_the_acknowledgement_the_log_the_anchor_and_the_outbox_are_unchanged() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = rolled_back_profile("reanchor-outbox-gate", dir.path());
@@ -1803,6 +1863,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn with_the_acknowledgement_queued_rows_follow_the_repair_row() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = rolled_back_profile("reanchor-outbox-drain", dir.path());
@@ -1863,6 +1926,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn a_drain_refusal_after_the_repair_is_a_warning_and_the_repair_stands() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = rolled_back_profile("reanchor-outbox-unusable", dir.path());

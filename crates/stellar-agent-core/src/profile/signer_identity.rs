@@ -388,8 +388,11 @@ mod tests {
     use super::*;
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn a_bound_record_round_trips() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let profile = profile(&key(1));
         let owner = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
         let record = SignerIdentityRecord::signed_for_test([1; 32], "identity", &profile, &owner);
@@ -538,16 +541,22 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn testnet_placeholder_has_no_pin_and_accepts_any_signer() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = Profile::builder_testnet_named("identity", "s", "default", "n", "a").build();
         assert!(matches!(enrolled_signer_pin("identity", &p), Ok(None)));
         assert!(check_enrolled_signer("identity", &p, "any key").is_ok());
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn mainnet_placeholder_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert!(matches!(
             check_enrolled_signer("identity", &profile("default"), &key(1)),
             Err(AuthError::EnrolledSignerUnpinned {
@@ -558,8 +567,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn mainnet_malformed_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert!(matches!(
             check_enrolled_signer("identity", &profile("invalid"), &key(1)),
             Err(AuthError::EnrolledSignerUnpinned {
@@ -570,8 +582,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn mainnet_differing_key_refuses_with_both_keys() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let a = key(1);
         let b = key(2);
         let result = check_enrolled_signer("identity", &profile(&a), &b);
@@ -618,8 +633,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn mainnet_equal_key_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let a = key(1);
         assert!(check_enrolled_signer("identity", &profile(&a), &a).is_ok());
     }

@@ -3476,7 +3476,10 @@ mod tests {
     /// `batch-add` with zero signer flags is refused at runtime (client-side,
     /// before any RPC call).
     #[tokio::test]
+    #[serial_test::serial]
     async fn batch_add_run_refuses_empty_batch() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let args = BatchAddArgsHarness::parse_from([
             "test",
             "--account",
@@ -4269,7 +4272,10 @@ mod tests {
     /// `--signer-ed25519` with invalid hex is refused fail-closed before any
     /// network call.
     #[tokio::test]
+    #[serial_test::serial]
     async fn signer_ed25519_rejects_invalid_hex() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let args = add_args_ed25519(&"zz".repeat(32), Some(ED25519_TEST_VERIFIER.to_owned()));
         let code = add_run(&args).await;
         assert_eq!(code, 1, "invalid hex must be refused");
@@ -4278,7 +4284,10 @@ mod tests {
     /// `--signer-ed25519` that decodes to a non-32-byte length is refused
     /// fail-closed (never silently truncated or padded) before any network call.
     #[tokio::test]
+    #[serial_test::serial]
     async fn signer_ed25519_rejects_wrong_length() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         // 62 hex chars → 31 bytes.
         let args = add_args_ed25519(&"ab".repeat(31), Some(ED25519_TEST_VERIFIER.to_owned()));
         let code = add_run(&args).await;
@@ -4290,6 +4299,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn signer_ed25519_missing_verifier_and_registry_fails_closed() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let dir = tempfile::tempdir().unwrap();
         let registry_path = dir.path().join("networks.toml");
 

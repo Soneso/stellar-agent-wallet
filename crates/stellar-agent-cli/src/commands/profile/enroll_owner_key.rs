@@ -664,6 +664,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn enroll_happy_path_stores_pubkey_the_engine_can_read() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock store");
         let profile_name = "enroll-owner-happy";
         let (s_strkey, derived_g, pk_bytes) = seed_material([0x11u8; 32]);
@@ -754,6 +757,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn expected_address_mismatch_refuses_without_writing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock store");
         let profile_name = "enroll-owner-expected";
         let (s_strkey, _derived_g, _pk) = seed_material([0x22u8; 32]);
@@ -785,6 +791,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn expected_address_marker_is_not_echoed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_test_support::rejected_value::{
             CREDENTIAL_MARKER, assert_no_marker_in_text,
         };
@@ -833,6 +842,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn owner_service_marker_is_not_echoed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let capture = stellar_agent_test_support::log_capture::CaptureWriter::new();
         let subscriber = tracing_subscriber::fmt()
             .without_time()
@@ -885,6 +897,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn overwrite_without_force_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock store");
         let profile_name = "enroll-owner-noforce";
         let (s_strkey, _g, _pk) = seed_material([0x44u8; 32]);
@@ -915,6 +930,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn force_replaces_existing_entry() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock store");
         let profile_name = "enroll-owner-force";
         let (s_strkey, derived_g, pk_bytes) = seed_material([0x11u8; 32]);
@@ -955,6 +973,8 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn enroll_nonexistent_profile_returns_exit_1() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let args = EnrollOwnerKeyArgs {
             profile: Some("__nonexistent_enroll_owner_key__".to_owned()),
             secret_env: "__UNSET_ENROLL_OWNER_KEY_VAR__".to_owned(),
@@ -1913,6 +1933,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn a_testnet_custom_window_key_without_records_enrolls() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock store");
         let profile_name = "enroll-owner-custom-window";
         let (s_strkey, derived_g, _) = seed_material([0x11u8; 32]);

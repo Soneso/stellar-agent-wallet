@@ -13,6 +13,9 @@ use crate::helpers::{init_mock, make_profile};
 #[test]
 #[serial]
 fn key_rotation_first_run_creates_key() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
 
     // Do NOT pre-seed any key — fresh keyring entry.

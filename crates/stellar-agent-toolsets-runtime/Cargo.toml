@@ -19,6 +19,7 @@ tracing   = { workspace = true }
 serde     = { workspace = true }
 
 [dev-dependencies]
+serial_test = { workspace = true }
 ed25519-dalek = { workspace = true }
 flate2 = { workspace = true }
 tar = { workspace = true }
@@ -26,7 +27,7 @@ stellar-strkey = { workspace = true }
 tempfile                   = { workspace = true }
 stellar-agent-test-support = { path = "../stellar-agent-test-support" }
 stellar-agent-toolsets = { path = "../stellar-agent-toolsets", features = ["test-helpers"] }
-stellar-agent-core = { path = "../stellar-agent-core" }
+stellar-agent-core = { path = "../stellar-agent-core", features = ["test-helpers"] }
 serde_json                 = { workspace = true }
 stellar-agent-toolsets-install = { path = "../stellar-agent-toolsets-install", features = ["test-helpers"] }
 # Builds the fixture pin key.

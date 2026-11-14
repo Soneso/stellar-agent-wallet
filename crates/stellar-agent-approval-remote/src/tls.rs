@@ -238,15 +238,6 @@ impl std::fmt::Debug for ProvisionedTls {
 /// Returns [`TlsProvisionError::StateDirUnavailable`] if the platform
 /// directories library cannot determine the state directory.
 pub fn tls_file_paths(profile_name: &str) -> Result<(PathBuf, PathBuf), TlsProvisionError> {
-    #[cfg(any(test, feature = "test-helpers"))]
-    if let Some(home) = std::env::var_os("STELLAR_AGENT_HOME") {
-        let dir = PathBuf::from(home).join("remote-approval-tls");
-        return Ok((
-            dir.join(format!("{profile_name}-cert.pem")),
-            dir.join(format!("{profile_name}-key.pem")),
-        ));
-    }
-
     let root = stellar_agent_core::profile::schema::canonical_data_root()
         .map_err(|_| TlsProvisionError::StateDirUnavailable)?;
     let dir = root.join("remote-approval-tls");
@@ -653,6 +644,7 @@ mod tests {
     fn with_isolated_home<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
         let dir = tempfile::TempDir::new().unwrap();
         unsafe {
+            stellar_agent_test_support::sandbox::mark_sandbox(dir.path()).unwrap();
             std::env::set_var("STELLAR_AGENT_HOME", dir.path());
         }
         let result = f(dir.path());

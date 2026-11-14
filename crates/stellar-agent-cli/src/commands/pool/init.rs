@@ -1335,7 +1335,11 @@ mod tests {
     /// with the fixed text, on the pool error and on the wallet error it maps
     /// to, and stays out of the events of the check.
     #[test]
+    #[serial_test::serial]
     fn overflowing_fee_stays_out_of_the_refusal() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_test_support::rejected_value::{
             assert_no_marker, assert_no_marker_in_text,
         };
@@ -1389,7 +1393,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn pool_fee_precheck_caps_before_checking_total() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut profile = Profile::builder_testnet("fee", "default", "nonce", "default")
             .with_noop_engine()
             .build();

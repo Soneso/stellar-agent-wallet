@@ -101,7 +101,11 @@ fn build_engine_with_cap(max_count: u32) -> PolicyEngineV1 {
 /// 51 inners vs cap=50 fires `InnerInvocationCountCapExceeded` via
 /// `evaluate_bundle` dispatch.
 #[test]
+#[serial_test::serial]
 fn t9_51_inner_bundle_denied_via_evaluate_bundle() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let engine = build_engine_with_cap(50);
     let tool = make_tool();
     let profile = make_profile();
@@ -133,7 +137,11 @@ fn t9_51_inner_bundle_denied_via_evaluate_bundle() {
 
 /// Boundary minus 1 (49 inners vs cap=50) passes via `evaluate_bundle`.
 #[test]
+#[serial_test::serial]
 fn boundary_49_inner_bundle_allowed_via_evaluate_bundle() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let engine = build_engine_with_cap(50);
     let tool = make_tool();
     let profile = make_profile();
@@ -158,7 +166,11 @@ fn boundary_49_inner_bundle_allowed_via_evaluate_bundle() {
 /// Boundary exactly at cap (50 inners vs cap=50) passes via `evaluate_bundle`
 /// per strict-greater-than-cap semantics (`count > max_count` is the deny condition).
 #[test]
+#[serial_test::serial]
 fn boundary_50_inner_bundle_allowed_via_evaluate_bundle() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let engine = build_engine_with_cap(50);
     let tool = make_tool();
     let profile = make_profile();

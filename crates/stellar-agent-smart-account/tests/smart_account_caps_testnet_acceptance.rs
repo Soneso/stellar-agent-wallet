@@ -370,6 +370,8 @@ async fn h1_16th_signer_refused() {
         smart_account_strkey, rule_id_str, sixteenth_signer_g, TESTNET_RPC_URL, signer_env_var
     );
 
+    stellar_agent_test_support::sandbox::require_isolated_executable(&binary)
+        .expect("isolated acceptance child");
     let output = std::process::Command::new(&binary)
         .args([
             "smart-account",
@@ -959,6 +961,8 @@ async fn h2_6th_policy_refused() {
         smart_account_strkey, rule_id_str, sixth_policy_strkey, TESTNET_RPC_URL, signer_env_var
     );
 
+    stellar_agent_test_support::sandbox::require_isolated_executable(&binary)
+        .expect("isolated acceptance child");
     let output = std::process::Command::new(&binary)
         .args([
             "smart-account",

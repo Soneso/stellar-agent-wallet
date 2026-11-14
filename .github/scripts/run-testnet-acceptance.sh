@@ -79,6 +79,13 @@ SHARE="${SHARE:-}"
 # value that is not on or off.
 MAINNET_WRITE="${MAINNET_WRITE-off}"
 
+# Every suite uses a fresh marked wallet root.
+storage_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/target/tmp/test-sandboxes
+mkdir -p "$storage_root"
+STELLAR_AGENT_HOME=$(mktemp -d "$storage_root/acceptance.XXXXXX")
+touch "$STELLAR_AGENT_HOME/.stellar-agent-test-sandbox"
+export STELLAR_AGENT_HOME
+
 # The suites spawn the real binary, which reads its audit keys, window-state
 # generation counters and tip anchors from the OS keyring. On macOS that is
 # the login Keychain, and an unsigned development build is a program the
@@ -89,6 +96,7 @@ MAINNET_WRITE="${MAINNET_WRITE-off}"
 # STELLAR_AGENT_TEST_KEYRING=platform selects the platform keyring instead.
 if [ "${STELLAR_AGENT_TEST_KEYRING-}" = platform ]; then
   unset STELLAR_AGENT_KEYRING_BACKEND STELLAR_AGENT_HEADLESS_KEYRING_KEY
+  export STELLAR_AGENT_TEST_LIVE_PLATFORM_KEYRING=real-platform-keyring
 elif [ -z "${STELLAR_AGENT_KEYRING_BACKEND:-}" ]; then
   export STELLAR_AGENT_KEYRING_BACKEND=headless-env
   # 32 random bytes, URL-safe base64, unpadded: the key format the headless
@@ -181,6 +189,9 @@ check_test_keyring() {
 # gate of its own, and naming the feature would fail its build.
 suite_features() {
   local crate="$1" feature="$2"
+  if [ "${STELLAR_AGENT_TEST_KEYRING-}" = platform ] && grep -qE '^live-platform-keyring *=' "crates/$crate/Cargo.toml"; then
+    feature="$feature,live-platform-keyring"
+  fi
   if [ "$MAINNET_WRITE" = "on" ] && grep -qE '^mainnet-write *=' "crates/$crate/Cargo.toml"; then
     printf 'mainnet-write,%s\n' "$feature"
   else

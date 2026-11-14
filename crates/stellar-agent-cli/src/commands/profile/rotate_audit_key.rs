@@ -604,6 +604,8 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn rotate_audit_key_nonexistent_profile_returns_exit_1() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let args = RotateAuditKeyArgs {
             name: Some("__nonexistent_rotate_audit_key__".to_owned()),
             profile: None,
@@ -620,6 +622,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn rotate_audit_key_run_resign_keeps_verify_green_under_new_key_and_emits_row() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use std::io::BufRead as _;
 
         use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision, verify_log};
@@ -789,6 +794,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn a_consent_row_queued_before_the_rotation_is_resigned_under_the_new_key() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::{inspect_outbox, verify_log};
 
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
@@ -845,6 +853,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn appends_during_the_rotation_refuse_busy_and_leave_the_outbox() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use std::sync::{Arc, Mutex};
 
         use stellar_agent_core::audit_log::{
@@ -937,6 +948,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn a_row_queued_after_the_rotation_drains_under_the_new_key() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::{inspect_outbox, verify_log};
 
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
@@ -987,6 +1001,9 @@ mod tests {
     #[serial]
     async fn the_outbox_fence_precedes_the_key_write_and_a_stale_appender_queues_under_the_new_key()
     {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::outbox::test_seam;
         use stellar_agent_core::audit_log::{AuditOutbox, outbox_path, verify_log};
 
@@ -1054,6 +1071,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn a_rotation_row_that_opens_a_new_file_is_resigned_under_the_new_key() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::rotation::test_seam;
         use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision, verify_log};
         use stellar_agent_test_support::keyring_mock;
@@ -1144,6 +1164,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn rotate_audit_key_refuses_a_rolled_back_log_and_rotates_nothing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision};
         use stellar_agent_test_support::keyring_mock;
 
@@ -1230,6 +1253,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn rotate_audit_key_refuses_key_read_errors_and_writes_nothing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision, TipAnchorStore};
         use stellar_agent_network::keyring::{KeyringOperation, map_keyring_operation_error};
         use stellar_agent_test_support::keyring_mock;
@@ -1340,6 +1366,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn rotate_audit_key_refuses_an_undecodable_key_with_the_remedy_and_writes_nothing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision, TipAnchorStore};
         use stellar_agent_test_support::keyring_mock;
 
@@ -1430,6 +1459,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn rotate_audit_key_refuses_a_changed_binding_and_creates_nothing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_test_support::keyring_mock;
 
         keyring_mock::install().expect("mock keyring store");
@@ -1490,6 +1522,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn rotate_audit_key_refuses_an_owner_namespace_coordinate() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::profile::schema::KeyringEntryRef;
         use stellar_agent_test_support::keyring_mock;
 
@@ -1549,6 +1584,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn rotate_audit_key_records_an_absent_binding_and_keeps_an_equal_one() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_test_support::keyring_mock;
 
         keyring_mock::install().expect("mock keyring store");
@@ -1596,6 +1634,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn the_first_key_adopts_a_quickstart_log_under_a_recorded_binding() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision};
         use stellar_agent_test_support::keyring_mock;
 
@@ -1701,6 +1742,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn rotate_audit_key_appends_a_rekey_row_under_the_new_key() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::verify_log;
 
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
@@ -1758,6 +1802,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn rotate_audit_key_refuses_a_log_whose_tags_fail_under_the_old_key() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::rotation::test_seam;
         use stellar_agent_core::audit_log::test_helpers::rotated_archives_newest_first;
         use stellar_agent_core::audit_log::{AuditEntry, NewToolInvocation, PolicyDecision};
@@ -1842,6 +1889,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn rotate_audit_key_refuses_while_the_anchor_is_behind_the_last_row() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::{AuditEntry, AuditOutbox};
 
         let dir = tempfile::tempdir().expect("tmp dir");
@@ -1923,6 +1973,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn a_rotation_stopped_after_its_key_write_is_repaired_by_the_rerun() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::verify_log;
 
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
@@ -1967,6 +2020,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn a_lost_key_takes_no_first_mint_on_a_keyed_log() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::commands::audit::reanchor::{ReanchorArgs, reanchor};
         use stellar_agent_core::audit_log::verify_log;
 
@@ -2060,6 +2116,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn a_first_mint_takes_an_anchored_log_without_entry_tags() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::{
             AuditEntry, NewToolInvocation, PolicyDecision, verify_log,
         };

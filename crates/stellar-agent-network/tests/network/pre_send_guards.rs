@@ -208,6 +208,9 @@ fn now_ms() -> u64 {
 #[tokio::test]
 #[serial]
 async fn a_bound_intent_past_send_by_keeps_its_record() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().unwrap();
     let name = "bound-record";
     let dir = TempDir::new().unwrap();

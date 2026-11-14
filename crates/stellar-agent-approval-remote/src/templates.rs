@@ -640,7 +640,11 @@ mod tests {
     /// A memo carrying U+202E and U+202C reaches the page as visible escapes,
     /// with no raw override character anywhere in the response.
     #[test]
+    #[serial_test::serial]
     fn detail_page_neutralises_a_bidi_override_in_a_memo() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = TempDir::new().unwrap();
         let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
         let entry = fixtures::payment_pending(
@@ -734,7 +738,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn detail_page_escapes_summary_and_offers_approve() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = TempDir::new().unwrap();
         let view = payment_view(&dir, false, NOW_MS);
         let html = render_detail_page(
@@ -754,7 +762,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn detail_page_expired_offers_reject_only() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = TempDir::new().unwrap();
         let view = payment_view(&dir, false, u64::MAX);
         assert!(view.expired);
@@ -772,7 +784,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn detail_page_attested_shows_blob() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = TempDir::new().unwrap();
         let view = payment_view(&dir, true, NOW_MS);
         assert!(view.attested);
@@ -965,7 +981,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn detail_page_informational_kind_offers_reject_only() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = TempDir::new().unwrap();
         let view = sign_with_passkey_view(&dir);
         assert!(!view.expired);
@@ -984,7 +1004,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn detail_page_rejected_tombstone_offers_no_actions() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = TempDir::new().unwrap();
         let view = rejected_view(&dir);
         assert!(matches!(view.summary, ApprovalSummaryView::Rejected { .. }));
@@ -1075,7 +1099,11 @@ mod tests {
     /// would render the page unstyled. The design is the same on every
     /// deployment, so it holds under each identity.
     #[test]
+    #[serial_test::serial]
     fn every_page_embeds_the_brand_style_exactly_once() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = TempDir::new().unwrap();
         for identity in [neutral(), named(), marked()] {
             for (_, html) in every_page(&dir, &identity) {
@@ -1092,7 +1120,11 @@ mod tests {
     /// surface is the one an operator reaches from a phone on someone else's
     /// deployment, so the default matters most here.
     #[test]
+    #[serial_test::serial]
     fn an_unconfigured_deployment_serves_no_mark_and_no_wordmark() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = TempDir::new().unwrap();
         for (_, html) in every_page(&dir, &neutral()) {
             assert!(
@@ -1112,7 +1144,11 @@ mod tests {
 
     /// A configured display name renders, and does not turn the mark on.
     #[test]
+    #[serial_test::serial]
     fn a_configured_display_name_renders_on_every_page() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = TempDir::new().unwrap();
         for (_, html) in every_page(&dir, &named()) {
             assert!(html.contains("Acme Ops"), "{html}");
@@ -1122,7 +1158,11 @@ mod tests {
 
     /// A name carrying markup renders as inert text on every page.
     #[test]
+    #[serial_test::serial]
     fn an_injection_payload_in_the_display_name_renders_inert() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = TempDir::new().unwrap();
         let hostile = PageIdentity::new(Some(r#"</title><script>alert(1)</script>"#), false);
         for (_, html) in every_page(&dir, &hostile) {
@@ -1139,7 +1179,11 @@ mod tests {
 
     /// The mark renders when the deployment asks for it.
     #[test]
+    #[serial_test::serial]
     fn the_project_mark_renders_when_enabled() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = TempDir::new().unwrap();
         for (_, html) in every_page(&dir, &marked()) {
             assert!(html.contains(MARK_PATH_DATA), "{html}");
@@ -1151,7 +1195,11 @@ mod tests {
     /// configuration would be a channel for making the page misstate what is
     /// being signed.
     #[test]
+    #[serial_test::serial]
     fn the_transaction_detail_block_is_identical_under_every_identity() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = TempDir::new().unwrap();
         let view = payment_view(&dir, false, NOW_MS);
         let csrf = "c".repeat(64);
@@ -1202,7 +1250,11 @@ mod tests {
     /// `img-src 'self'` blocks every remote origin, so a page referencing one
     /// would render a hole rather than fail loudly.
     #[test]
+    #[serial_test::serial]
     fn every_page_references_no_external_origin() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = TempDir::new().unwrap();
         for identity in [neutral(), named(), marked()] {
             for (label, html) in every_page(&dir, &identity) {
@@ -1252,7 +1304,11 @@ mod tests {
     /// the human form is what gets read, the stroop count is what matches the
     /// CLI and the audit record, and a truncated address cannot be verified.
     #[test]
+    #[serial_test::serial]
     fn detail_page_renders_payment_amount_in_both_denominations_and_the_full_destination() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = TempDir::new().unwrap();
         let view = payment_view(&dir, false, NOW_MS);
         let html = render_detail_page(
@@ -1275,7 +1331,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn detail_page_approve_button_names_the_kind() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = TempDir::new().unwrap();
         let html = render_detail_page(
             &payment_view(&dir, false, NOW_MS),
@@ -1298,7 +1358,11 @@ mod tests {
     /// not, because the page it sits on offers no approve button — and an
     /// expired one must not read "expires expired (...)".
     #[test]
+    #[serial_test::serial]
     fn detail_page_expiry_sentence_is_selected_by_state() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = TempDir::new().unwrap();
         let live = render_detail_page(
             &payment_view(&dir, false, NOW_MS),
@@ -1369,7 +1433,11 @@ mod tests {
     /// The nonce is what the operator matches against the CLI and the audit
     /// record, so it is rendered as a visible field, not only in the island.
     #[test]
+    #[serial_test::serial]
     fn detail_page_renders_the_nonce_as_a_visible_field() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = TempDir::new().unwrap();
         let view = payment_view(&dir, false, NOW_MS);
         let html = render_detail_page(
@@ -1392,7 +1460,11 @@ mod tests {
     /// The timestamps stay machine-readable on the element the client formats,
     /// so a page whose script never runs still shows the real values.
     #[test]
+    #[serial_test::serial]
     fn detail_page_carries_absolute_timestamps_in_data_attributes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = TempDir::new().unwrap();
         let view = payment_view(&dir, false, NOW_MS);
         let html = render_detail_page(
@@ -1419,7 +1491,11 @@ mod tests {
     /// what this copy guards is that THIS surface routes every kind through
     /// it rather than growing a local fallback.
     #[test]
+    #[serial_test::serial]
     fn detail_page_kind_pill_covers_every_kind() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // A store file holds one entry per fixture, so each fixture gets its
         // own directory rather than reading back the first entry written.
         type Fixture = fn(&TempDir) -> PendingApprovalView;
@@ -1461,7 +1537,11 @@ mod tests {
     /// The conversion is `StellarAmount`'s, so the seven-decimal quantisation
     /// holds at a magnitude a float would already have rounded.
     #[test]
+    #[serial_test::serial]
     fn detail_page_payment_amount_survives_the_f64_precision_boundary() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = TempDir::new().unwrap();
         let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
         let entry = fixtures::payment_pending(
@@ -1493,7 +1573,11 @@ mod tests {
     /// A non-XLM classic asset keeps the protocol's seven-decimal scale and
     /// carries its own code; the issuer stays on the untouched `Asset` field.
     #[test]
+    #[serial_test::serial]
     fn detail_page_renders_a_non_xlm_asset_with_its_own_code() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = TempDir::new().unwrap();
         let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
         let issuer = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
@@ -1530,7 +1614,11 @@ mod tests {
     /// stays in them: the wallet does not know that token's decimal scale
     /// here, so a seven-decimal reading would misstate the amount.
     #[test]
+    #[serial_test::serial]
     fn detail_page_mpp_charge_keeps_the_amount_in_base_units() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = TempDir::new().unwrap();
         let view = mpp_charge_view(&dir);
         let html = render_detail_page(
@@ -1562,7 +1650,11 @@ mod tests {
     /// An expired entry says so in the warning treatment and offers only the
     /// destructive action.
     #[test]
+    #[serial_test::serial]
     fn detail_page_expired_states_the_reason_as_a_warning() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = TempDir::new().unwrap();
         let view = payment_view(&dir, false, u64::MAX);
         let html = render_detail_page(
@@ -1625,7 +1717,11 @@ mod tests {
 
     /// A claim page shows the envelope's source and no stored summary field.
     #[test]
+    #[serial_test::serial]
     fn detail_page_renders_the_decoded_claim_source() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = TempDir::new().unwrap();
         let view = claim_view(&dir);
         let html = render_detail_page(&view, &test_context(), "csrf", None, None, &neutral());
@@ -1664,7 +1760,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn trustline_detail_page_is_approvable_until_resolved() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = TempDir::new().unwrap();
         let mut view = trustline_view(&dir);
         for (limit, shown) in [
@@ -1731,7 +1831,11 @@ mod tests {
     /// The remote detail page renders the envelope's amount and destination
     /// when the stored summary fields name another payment.
     #[test]
+    #[serial_test::serial]
     fn an_edited_entry_renders_the_envelope_amount() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut entry = fixtures::payment_pending(
             SOURCE_G,
             DEST_G,
@@ -1781,7 +1885,11 @@ mod tests {
     /// An entry whose stored digest is not its envelope's offers no approve
     /// action on the remote page.
     #[test]
+    #[serial_test::serial]
     fn an_inconsistent_entry_offers_only_reject() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut entry = fixtures::payment_pending(
             SOURCE_G,
             DEST_G,
@@ -1847,18 +1955,29 @@ mod tests {
         assert_eq!(json[0]["summary"]["kind"], "inconsistent");
     }
     #[test]
+    #[serial_test::serial]
     fn edited_mpp_amount_renders_inconsistent() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert_edited_mpp_inconsistent(true);
     }
     #[test]
+    #[serial_test::serial]
     fn edited_mpp_recipient_renders_inconsistent() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert_edited_mpp_inconsistent(false);
     }
 
     /// The remote detail page shows the full M and a base
     /// account row for a payment to M0 or M17, and no base row for a G.
     #[test]
+    #[serial_test::serial]
     fn muxed_approval_shows_base_account() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let key = [0xAE; 32];
         let g = format!("{}", stellar_strkey::ed25519::PublicKey(key));
         let base_row = format!("Base account</div>\n      <div class=\"addr\">{g}</div>");

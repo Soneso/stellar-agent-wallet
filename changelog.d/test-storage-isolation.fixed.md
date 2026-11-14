@@ -1,0 +1,1 @@
+- Tests, examples and repository scripts isolate wallet storage. Test builds refuse native storage outside explicit live acceptance entry points and resolve wallet overrides only inside marked sandboxes. Fixture temporary paths remain caller-selected.
