@@ -210,7 +210,7 @@ pub(super) const WIRE_VERSION_LEDGER: u32 = 4;
 /// A file written by a newer build carries records this one cannot account
 /// for, so it is refused rather than read with the fields it happens to
 /// recognise.
-pub(super) const WIRE_VERSION_MAX: u32 = WIRE_VERSION_TOTAL_EPOCH;
+pub(super) const WIRE_VERSION_MAX: u32 = WIRE_VERSION_RECOVERY_RUN;
 
 /// Wire version binding the accounting network on every snapshot.
 #[cfg_attr(
@@ -249,14 +249,28 @@ pub(super) const WIRE_VERSION_POLICY_AUTHORITY: u32 = 10;
 /// observation.
 pub(super) const WIRE_VERSION_OPERATIONS: u32 = 11;
 
-/// Wire version carrying total-budget epochs and the retired digest. This
-/// build writes every successor under it.
+/// Wire version carrying total-budget epochs and the retired digest.
 pub(super) const WIRE_VERSION_TOTAL_EPOCH: u32 = 12;
 
-/// The version a successor is written under: version 12 for every
-/// successor, so a file this build wrote never reads as an earlier build's.
-fn select_wire_version(_wire: &WireFile, _committed: Option<u32>) -> u32 {
-    WIRE_VERSION_TOTAL_EPOCH
+/// Wire version carrying authenticated recovery run objects.
+pub(super) const WIRE_VERSION_RECOVERY_RUN: u32 = 13;
+
+/// Selects the run format when present and retains its committed floor.
+fn select_wire_version(wire: &WireFile, committed: Option<u32>) -> u32 {
+    if committed.is_some_and(|version| version >= WIRE_VERSION_RECOVERY_RUN)
+        || wire.operations.as_ref().is_some_and(|section| {
+            section.records.iter().any(|record| {
+                record
+                    .attempts
+                    .iter()
+                    .any(|attempt| attempt.recovery_run.is_some())
+            })
+        })
+    {
+        WIRE_VERSION_RECOVERY_RUN
+    } else {
+        WIRE_VERSION_TOTAL_EPOCH
+    }
 }
 
 /// How many reservations one reconciliation pass settles.
@@ -1026,8 +1040,9 @@ pub(super) struct WireBucket {
 /// carries signed intents, and version 10 policy authorities. Version 11
 /// carries operation records, authorization links, dispositions and release
 /// rows, the admissible floors and the stored observation. Version 12 carries
-/// total-budget epochs and the retired digest, and this build writes every
-/// successor under it. Optional fields
+/// total-budget epochs and the retired digest. [`WIRE_VERSION_RECOVERY_RUN`]
+/// carries recovery runs.
+/// Optional fields
 /// preserve the serialized shape of legacy snapshots for integrity checks;
 /// missing network provenance refuses at the authenticated read boundary.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -3628,10 +3643,8 @@ impl PersistedWindowStore {
                     detail: "policy window-state generation counter overflow".to_owned(),
                 })?;
         next.prepared = None;
-        // Every successor uses version 12, set before its commitment is
-        // hashed. The current snapshot keeps the version it was committed
-        // under, so its committed digest stays the same with the successor
-        // beside it.
+        // The successor's version participates in its commitment.
+        // The current snapshot retains its committed version and digest.
         next.version = select_wire_version(
             &next,
             (original.generation != 0).then_some(original.version),
@@ -4386,7 +4399,7 @@ impl PersistedWindowStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => match load_generation(gen_entry)?
             {
                 None => Ok(WireFile {
-                    version: WIRE_VERSION_MAX,
+                    version: WIRE_VERSION_TOTAL_EPOCH,
                     chain_scope: Some(ChainScope::for_chain(profile.chain_id)),
                     ..WireFile::default()
                 }),
@@ -4741,7 +4754,8 @@ fn authenticated_scope(wire: &WireFile) -> Result<ChainScope, WindowStoreError> 
 /// Checks one snapshot's version, its authorization history and its
 /// accounting-expiry records.
 ///
-/// Versions 1 through 12 decode. Snapshots below version 4 carry no authorization
+/// Versions 1 through [`WIRE_VERSION_MAX`] decode.
+/// Snapshots below version 4 carry no authorization
 /// history; usable snapshots also require complete authenticated scope.
 /// Accounting-expiry records need version 8, the file's own scope, the
 /// accounting-expired disposition, a generation no later than the file's, and
@@ -4751,9 +4765,24 @@ fn authenticated_scope(wire: &WireFile) -> Result<ChainScope, WindowStoreError> 
 /// dispositions, release rows, floors and the stored observation need
 /// version 11. Total-budget epochs, links, and the retired digest need
 /// version 12; see [`check_total_fields`].
+/// Recovery run objects need [`WIRE_VERSION_RECOVERY_RUN`].
 fn check_snapshot(wire: &WireFile) -> Result<(), WindowStoreError> {
     if wire.version > WIRE_VERSION_MAX {
         return Err(WindowStoreError::UnsupportedVersion);
+    }
+    if wire.version < WIRE_VERSION_RECOVERY_RUN
+        && wire.operations.as_ref().is_some_and(|section| {
+            section.records.iter().any(|record| {
+                record
+                    .attempts
+                    .iter()
+                    .any(|attempt| attempt.recovery_run.is_some())
+            })
+        })
+    {
+        return Err(WindowStoreError::Invalid {
+            detail: format!("recovery_run requires wire version {WIRE_VERSION_RECOVERY_RUN}"),
+        });
     }
     if wire.version == 0 {
         return Err(WindowStoreError::Invalid {
@@ -6854,6 +6883,121 @@ mod tests {
         clippy::panic,
         reason = "test-only; panics acceptable in unit tests"
     )]
+
+    #[test]
+    #[serial_test::serial]
+    fn recovery_run_versions_and_safe_refusals() {
+        use super::super::operations::tests::{Fx, unknown_with};
+        let mut fx = Fx::new();
+        unknown_with(&mut fx, 1, 10, vec![]);
+        let current = fx.wire();
+        let (key, _) = fx.store.load_or_mint_key(&fx.profile).unwrap();
+        let verify = |body: &[u8]| {
+            let mut bytes = compute_tag(&key[..], body).unwrap().to_vec();
+            bytes.extend_from_slice(body);
+            fx.store.verify_with_key(&key, &bytes)
+        };
+        for prepared in [false, true] {
+            let mut row = current.clone();
+            if prepared {
+                let mut candidate = current.clone();
+                candidate.version = WIRE_VERSION_MAX + 1;
+                candidate.generation += 1;
+                row.prepared = Some(Box::new(candidate));
+            } else {
+                row.version = WIRE_VERSION_MAX + 1;
+            }
+            assert!(
+                matches!(
+                    verify(&serde_json::to_vec(&row).unwrap()),
+                    Err(WindowStoreError::UnsupportedVersion)
+                ),
+                "future prepared={prepared}"
+            );
+            if prepared {
+                let mut future = serde_json::to_value(&row).unwrap();
+                future["prepared"]["unknown_future_shape"] = serde_json::json!(true);
+                assert!(
+                    matches!(
+                        verify(&serde_json::to_vec(&future).unwrap()),
+                        Err(WindowStoreError::UnsupportedVersion)
+                    ),
+                    "prepared version precedes schema decoding"
+                );
+                future["prepared"]["generation"] = serde_json::json!("future-format");
+                assert!(
+                    matches!(
+                        verify(&serde_json::to_vec(&future).unwrap()),
+                        Err(WindowStoreError::UnsupportedVersion)
+                    ),
+                    "prepared version precedes known-field decoding"
+                );
+            }
+        }
+        #[derive(serde::Deserialize)]
+        struct FrozenVersion {
+            version: u32,
+            prepared: Option<Box<FrozenVersion>>,
+        }
+        fn frozen(bytes: &[u8]) -> Result<(), WindowStoreError> {
+            let row: FrozenVersion = serde_json::from_slice(bytes).unwrap();
+            if row.version > 12 || row.prepared.is_some_and(|next| next.version > 12) {
+                Err(WindowStoreError::UnsupportedVersion)
+            } else {
+                Ok(())
+            }
+        }
+        for prepared in [false, true] {
+            let mut row = current.clone();
+            if prepared {
+                let mut candidate = row.clone();
+                candidate.version = WIRE_VERSION_RECOVERY_RUN;
+                row.prepared = Some(Box::new(candidate));
+            } else {
+                row.version = WIRE_VERSION_RECOVERY_RUN;
+            }
+            assert!(matches!(
+                frozen(&serde_json::to_vec(&row).unwrap()),
+                Err(WindowStoreError::UnsupportedVersion)
+            ));
+        }
+        let mut row = current.clone();
+        row.operations.as_mut().unwrap().records[0].attempts[0].recovery_run =
+            Some(serde_json::from_str("{}").unwrap());
+        assert!(matches!(
+            verify(&serde_json::to_vec(&row).unwrap()),
+            Err(WindowStoreError::Invalid { detail })
+                if detail == format!("recovery_run requires wire version {WIRE_VERSION_RECOVERY_RUN}")
+        ));
+        row.version = WIRE_VERSION_RECOVERY_RUN;
+        let body = serde_json::to_string(&row).unwrap();
+        assert!(verify(body.as_bytes()).is_ok());
+        for raw in [
+            "null".to_owned(),
+            "[]".into(),
+            format!("{{\"{}\":0}}", "🔐".repeat(300)),
+        ] {
+            let bad = body.replace("\"recovery_run\":{}", &format!("\"recovery_run\":{raw}"));
+            let error = verify(bad.as_bytes()).unwrap_err();
+            assert!(matches!(&error, WindowStoreError::Invalid { .. }));
+            assert!(!error.to_string().contains('🔐'));
+            assert!(error.to_string().len() < 256);
+        }
+        let bad = body.replace(
+            "\"recovery_run\":{}",
+            "\"recovery_run\":{},\"recovery_run\":{}",
+        );
+        assert!(matches!(
+            verify(bad.as_bytes()),
+            Err(WindowStoreError::Invalid { .. })
+        ));
+        let duplicate = row.operations.as_ref().unwrap().records[0].clone();
+        row.operations.as_mut().unwrap().records.push(duplicate);
+        assert!(matches!(
+            verify(&serde_json::to_vec(&row).unwrap()),
+            Err(WindowStoreError::Invalid { .. })
+        ));
+    }
 
     use crate::signed_intent::test_helpers::{intent_fixture_kind, intent_fixture_plan};
     use std::path::Path;
@@ -11893,7 +12037,7 @@ mod tests {
     fn reset_wire() -> WireFile {
         WireFile {
             chain_scope: Some(ChainScope::for_chain(Caip2::Testnet)),
-            version: WIRE_VERSION_MAX,
+            version: WIRE_VERSION_TOTAL_EPOCH,
             generation: 1,
             prepared: None,
             entries: vec![WireBucket {

@@ -2228,6 +2228,7 @@ mod tests {
             send_by_ms: NOW - 1,
             pre_exposure_ledger: Some(1),
             recovery: RecoveryUpdate::default(),
+            recovery_run: None,
             sequence_released: false,
             reservation_present: false,
             generation: 1,
@@ -5208,6 +5209,93 @@ mod tests {
             .mount(&server)
             .await;
         server
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn run_records_preserve_driver_requests_and_evidence_bytes() {
+        use super::super::operations::tests::unknown_with;
+        for shape in ["absent", "opaque", "running", "stopped", "exhausted"] {
+            let mut fx = Fx::new();
+            let id = unknown_with(&mut fx, 1, NOW / 1000 - 10, vec![]).id();
+            let selected = OperationStatus::new(&fx.store, &fx.profile)
+                .recovery_snapshot(None)
+                .unwrap()
+                .remove(0);
+            let mut run = json!({"version":1,
+                "exposure":super::super::recovery_exposure_digest(id,1,&selected.exposure).unwrap(),
+                "phase":"running", "run_started_ms":NOW, "run_deadline_ms":NOW+20000,
+                "automatic_runs":1, "consecutive_stops":0});
+            if shape == "stopped" {
+                run["phase"] = json!("stopped");
+                run["consecutive_stops"] = json!(1);
+                run["stop"] = json!({"reason":"missing_field","stage":"hash","method":"get_transaction",
+                    "roles":["primary"],"ledger":null,"target":null,"stopped_at_ms":NOW,"class":"automatic","earliest_retry_ms":NOW+30000});
+            }
+            if shape == "exhausted" {
+                run["automatic_runs"] = json!(16);
+                run["consecutive_stops"] = json!(15);
+            }
+            let raw = if shape == "opaque" {
+                "{ \"version\":99,\"v\":1,\"v\":2 }".to_owned()
+            } else {
+                run.to_string()
+            };
+            if shape != "absent" {
+                fx.rewrite(|wire| {
+                    wire.operations.as_mut().unwrap().records[0].attempts[0].recovery_run =
+                        Some(serde_json::from_str(&raw).unwrap())
+                });
+            }
+            let primary = endpoint(7, NOW / 1000).await;
+            let oracle = endpoint(8, NOW / 1000).await;
+            let left = StellarRpcClient::new(&primary.uri()).unwrap();
+            let right = StellarRpcClient::new(&oracle.uri()).unwrap();
+            let writer =
+                crate::submission_flow::recovery::tests::writer_at(&fx.profile.audit_log_path);
+            let report = recover_sequences(
+                &fx.store,
+                &fx.profile,
+                EndpointPair::from_clients(&left, Some(&right)),
+                &writer,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                report.requests,
+                RecoveryRequests {
+                    attempt: 2,
+                    shared: 4
+                },
+                "{shape}"
+            );
+            assert_eq!(report.evaluated, 1, "{shape}");
+            assert!(
+                fx.record(id).attempts[0].sequence_released.is_some(),
+                "{shape}"
+            );
+            let after = fx.record(id).attempts[0].recovery_run.clone();
+            if shape == "absent" {
+                assert!(after.is_none());
+            } else {
+                assert_eq!(
+                    serde_json::to_string(&after.unwrap()).unwrap(),
+                    raw,
+                    "{shape}"
+                );
+            }
+            assert_eq!(
+                methods(&primary).await,
+                ["getNetwork", "getHealth", "getLedgers"],
+                "{shape}"
+            );
+            assert_eq!(
+                methods(&oracle).await,
+                ["getNetwork", "getHealth", "getLedgers"],
+                "{shape}"
+            );
+        }
     }
 
     /// Answers `getLedgers` from the requested start ledger and refuses a

@@ -67,6 +67,7 @@ use super::ledger::{
     MintedRecord, WireAuthorization,
 };
 use super::recovery::{CheckedRecoveryDecision, DecidedTransition};
+use super::recovery_run::{RawRecoveryRun, RecoveryRunSnapshot};
 use super::store::{
     ChainTransition, PersistedWindowStore, WireFile, generation_entry_ref, now_ms, prune_stale,
 };
@@ -96,15 +97,14 @@ pub const ENVELOPE_XDR_MAX: usize = 8_192;
 /// detail `intent_size`.
 pub const INTENT_SLOT_MAX: usize = 1_377;
 
-/// M: the largest serialized operation record, in bytes, with every optional
-/// field present and every text at its bound. A larger new record refuses
-/// with `operation.capacity`, detail `record_size`.
-pub const RECORD_MAX: usize = 184_365;
+/// M: the serialized operation allowance, including eight bounded run objects.
+/// A larger new record refuses with `operation.capacity`, detail `record_size`.
+pub const RECORD_MAX: usize = 192_685;
 
 /// T: the committed image size at which a new record refuses with
 /// `operation.capacity`, detail `file_size`. It is 4 MiB less the headroom
 /// of sixteen records of size M, rounded up to 64 KiB.
-pub const FILE_THRESHOLD: usize = 1_179_648;
+pub const FILE_THRESHOLD: usize = 1_048_576;
 
 /// The most attempts one operation makes. A further `begin_attempt` refuses
 /// with `operation.attempt_limit`.
@@ -842,7 +842,7 @@ pub(super) struct WireExposure {
 const ACCOUNT_ID_LEN: usize = 56;
 
 /// Whether `source` has the shape of a G-strkey account identity.
-fn account_id_shaped(source: &str) -> bool {
+pub(super) fn account_id_shaped(source: &str) -> bool {
     source.len() == ACCOUNT_ID_LEN
         && source
             .bytes()
@@ -1304,6 +1304,12 @@ pub(super) struct WireAttempt {
     pub(super) evidence: Vec<WireEvidenceRow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) recovery: Option<WireRecovery>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::recovery_run::deserialize_run"
+    )]
+    pub(super) recovery_run: Option<RawRecoveryRun>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) decision: Option<WireDecision>,
 }
@@ -3451,6 +3457,7 @@ impl Session<'_> {
             agreed_outcome: None,
             evidence: Vec::new(),
             recovery: None,
+            recovery_run: None,
             decision: None,
         });
         let before = record.state;
@@ -3710,6 +3717,11 @@ impl Session<'_> {
                 || attempt.pre_exposure_ledger != expected.pre_exposure_ledger
                 || attempt.sequence_released.is_some() != expected.sequence_released
                 || attempt.recovery.clone().unwrap_or_default().snapshot() != expected.recovery
+                || RecoveryRunSnapshot::of(
+                    id,
+                    attempt,
+                    attempt_account(&self.wire, attempt).as_deref(),
+                ) != expected.recovery_run
             {
                 return Err(invalid("recovery snapshot is stale"));
             }
@@ -5038,6 +5050,8 @@ pub struct RecoveryAttempt {
     pub pre_exposure_ledger: Option<u32>,
     /// Both cursors, upper bounds and mutable recovery facts.
     pub recovery: RecoveryUpdate,
+    /// The authenticated run identity and interpreted metadata, when present.
+    pub recovery_run: Option<RecoveryRunSnapshot>,
     /// Whether the immutable sequence release exists; a commit refuses when it changes.
     pub sequence_released: bool,
     /// Whether the attempt's authorization names a window reservation.
@@ -5052,6 +5066,49 @@ pub struct RecoveryAttempt {
 }
 
 impl<'a> OperationStatus<'a> {
+    /// Reads scheduling advice for a retained classic attempt, including committed decisions.
+    ///
+    /// # Errors
+    /// Returns the verified window's integrity, keyring and I/O errors.
+    pub fn recovery_run_view(
+        &self,
+        id: OperationId,
+        index: u32,
+        now_ms: u64,
+    ) -> Result<Option<super::RecoveryRunView>, WindowStoreError> {
+        let Some(wire) = self.store.read_for_inspection(self.profile)? else {
+            return Ok(None);
+        };
+        let Some(attempt) = records(&wire)
+            .iter()
+            .find(|record| record.id == id)
+            .and_then(|record| {
+                record
+                    .attempts
+                    .iter()
+                    .find(|attempt| attempt.index == index)
+            })
+        else {
+            return Ok(None);
+        };
+        let Some(WireExposure {
+            identity: ExposureIdentity::Classic { max_time, .. },
+            ..
+        }) = &attempt.exposure
+        else {
+            return Ok(None);
+        };
+        let snapshot =
+            RecoveryRunSnapshot::of(id, attempt, attempt_account(&wire, attempt).as_deref());
+        Ok(Some(super::normalize_recovery_run(
+            snapshot.as_ref(),
+            *max_time,
+            attempt.send_by_ms,
+            attempt.decision.is_some(),
+            now_ms,
+        )))
+    }
+
     /// A status reader for `profile`'s window in `store`.
     #[must_use]
     pub fn new(store: &'a PersistedWindowStore, profile: &'a Profile) -> Self {
@@ -5166,6 +5223,11 @@ impl<'a> OperationStatus<'a> {
                     send_by_ms: attempt.send_by_ms,
                     pre_exposure_ledger: attempt.pre_exposure_ledger,
                     recovery: recovery.snapshot(),
+                    recovery_run: RecoveryRunSnapshot::of(
+                        record.id,
+                        attempt,
+                        attempt_account(&wire, attempt).as_deref(),
+                    ),
                     sequence_released: attempt.sequence_released.is_some(),
                     reservation_present: wire.authorizations.iter().any(|auth| {
                         auth.id == attempt.authorization_id && auth.reservation.is_some()
@@ -6993,6 +7055,7 @@ pub(crate) mod tests {
                 history_incomplete: true,
                 diagnostic: Some(maximal_text(DIAGNOSTIC_MAX)),
             }),
+            recovery_run: None,
             decision: Some(WireDecision {
                 commit_id: CommitId::from_bytes([0xff; 16]),
                 evidence_digest: [0xff; 32],
@@ -7125,6 +7188,127 @@ pub(crate) mod tests {
         ));
         assert_eq!(code(&error), "operation.capacity");
         assert_eq!(fx.generation(), before);
+    }
+
+    #[test]
+    #[serial]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "The fixture checks framing, both admission boundaries, and protected retention."
+    )]
+    fn maximum_capacity_retention_184365_1179648() {
+        use super::super::store::{WireBucket, WireRecord};
+        let mut record = maximal_record(x402_slot_of_len(INTENT_SLOT_MAX));
+        let before = serialized_len(&record);
+        assert_eq!(before, 142227);
+        let raw = format!("{{\"x\":\"{}\"}}", "x".repeat(1016));
+        for attempt in &mut record.attempts {
+            attempt.recovery_run = Some(serde_json::from_str(&raw).unwrap());
+        }
+        assert_eq!(serialized_len(&record) - before, 8 * (1024 + 16));
+        assert_eq!(serialized_len(&record), 150547);
+        assert!(serialized_len(&record) <= RECORD_MAX);
+        for attempt in &mut record.attempts {
+            attempt.recovery_run = None;
+            let ExposureIdentity::Classic { max_time, .. } =
+                &mut attempt.exposure.as_mut().unwrap().identity
+            else {
+                panic!("classic size fixture")
+            };
+            *max_time = 10;
+        }
+        let before_valid = serialized_len(&record);
+        for attempt in &mut record.attempts {
+            let exposure = super::super::recovery_exposure_digest(
+                record.id,
+                attempt.index,
+                &attempt.exposure.as_ref().unwrap().identity,
+            )
+            .unwrap();
+            let raw = serde_json::json!({"version":1, "exposure":exposure, "phase":"stopped",
+                "run_started_ms":u64::MAX-3600000, "run_deadline_ms":u64::MAX-3580000,
+                "automatic_runs":16, "consecutive_stops":16,
+                "stop":{"reason":"account_unavailable","stage":"account","method":"get_ledger_entries",
+                    "roles":["primary","oracle"],"ledger":u32::MAX,"target":u32::MAX,
+                    "stopped_at_ms":u64::MAX-3600000,"class":"automatic","earliest_retry_ms":u64::MAX}}).to_string();
+            assert_eq!(raw.len(), 484);
+            attempt.recovery_run = Some(serde_json::from_str(&raw).unwrap());
+            assert!(
+                RecoveryRunSnapshot::of(record.id, attempt, None)
+                    .unwrap()
+                    .record()
+                    .is_some()
+            );
+        }
+        assert_eq!(serialized_len(&record) - before_valid, 8 * (484 + 16));
+        assert!(serialized_len(&record) <= RECORD_MAX);
+        assert_eq!(184365 + 8 * (1024 + 16), RECORD_MAX);
+        assert_eq!(RECORD_MAX, 192685);
+        assert_eq!((16 * RECORD_MAX).div_ceil(65536) * 65536, 3145728);
+        assert_eq!(FILE_THRESHOLD, 1048576);
+        assert_eq!(
+            4194304 - (16 * RECORD_MAX).div_ceil(65536) * 65536,
+            FILE_THRESHOLD
+        );
+        for size in [1179647, 1048576] {
+            let mut fx = Fx::new();
+            let id = unknown_with(&mut fx, 1, 10, vec![]).id();
+            fx.rewrite(|wire| {
+                wire.entries.push(WireBucket {
+                    scope_specificity: 0,
+                    bucket: String::new(),
+                    window_secs: 60,
+                    records: vec![WireRecord {
+                        ts_ms: T0,
+                        amount: 1,
+                        chain_scope: Some(ChainScope::for_chain(Caip2::Mainnet)),
+                        ..WireRecord::confirmed_defaults()
+                    }],
+                });
+                let padding = size - serialized_len(wire);
+                wire.entries.last_mut().unwrap().bucket = "p".repeat(padding);
+                assert_eq!(serialized_len(wire), size);
+            });
+            assert_eq!(fx.wire().version, 12);
+            let error = fx.open(&request("capacity", canonical(2))).unwrap_err();
+            assert_eq!(code(&error), "operation.capacity");
+            assert!(matches!(
+                error,
+                WindowStoreError::OperationCapacity {
+                    detail: CapacityDetail::FileSize
+                }
+            ));
+            fx.clock.set(T0 + super::super::store::RETENTION_MS + 1);
+            assert!(matches!(
+                fx.open(&request("capacity", canonical(2))),
+                Ok(OpenOutcome::New(_))
+            ));
+            assert!(fx.wire().entries.is_empty());
+            assert_eq!(fx.record(id).state, OperationState::SentOutcomeUnknown);
+        }
+        let mut wire = WireFile::default();
+        for n in 0..=u16::try_from(TERMINAL_RECORDS_MAX).unwrap() {
+            let mut record = terminal_record(n, T0);
+            record.attempts = vec![with_opaque_attempt(n)];
+            let id = record.id;
+            section_mut(&mut wire).records.push(record);
+            wire.authorizations.push(unreleased(id));
+        }
+        Operations::prune(&mut wire, T0 + TERMINAL_RETENTION_MS + 1);
+        assert_eq!(records(&wire).len(), TERMINAL_RECORDS_MAX + 1);
+        assert!(tombstones(&wire).is_empty());
+        wire.authorizations.clear();
+        Operations::prune(&mut wire, T0 + TERMINAL_RETENTION_MS + 1);
+        assert!(records(&wire).is_empty());
+        assert_eq!(tombstones(&wire).len(), TERMINAL_RECORDS_MAX + 1);
+    }
+
+    fn with_opaque_attempt(n: u16) -> WireAttempt {
+        let mut attempt = maximal_record(envelope(1, 1, 10)).attempts.remove(0);
+        attempt.index = u32::from(n) + 1;
+        attempt.decision = None;
+        attempt.recovery_run = Some(serde_json::from_str("{ \"version\":99 }").unwrap());
+        attempt
     }
 
     /// Stored outcome and account rows keep their bytes, and a nullable

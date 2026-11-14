@@ -207,6 +207,7 @@ pub mod ledger;
 pub mod lock;
 pub mod operations;
 pub mod recovery;
+mod recovery_run;
 mod reset_consent;
 pub mod store;
 
@@ -238,6 +239,13 @@ pub use recovery::{
     AccountAnswer, CheckedRecoveryDecision, DecidedTransition, EndpointPair, LedgerAnswer,
     OutcomeAnswer, RecoveryError, RecoveryReport, RecoveryRequests, SubmissionObservation,
     recover_outcomes, recover_sequences, submission_observation,
+};
+pub use recovery_run::{
+    RECOVERY_RUN_MAX, RecoveryClass, RecoveryRole, RecoveryRunMethod, RecoveryRunPhase,
+    RecoveryRunSnapshot, RecoveryRunState, RecoveryRunView, RecoveryStage, RecoveryStop,
+    RecoveryStopReason, WireRecoveryRun, classify_recovery_stop, normalize_recovery_run,
+    recovery_backoff, recovery_deadline, recovery_expiry, recovery_exposure_digest,
+    recovery_retry_time,
 };
 pub(crate) use store::UnsentReservation;
 pub use store::{
