@@ -9242,13 +9242,23 @@ async fn simulate_read_only_at_ledger(
     let sim_envelope = tx_for_simulate
         .to_envelope()
         .map_err(|e| auth_payload_err(format!("to_envelope failed: {e:?}")))?;
+    let deadline = tokio::time::Instant::now().checked_add(timeout);
     let sim = tokio::time::timeout(
         timeout,
-        server.simulate_transaction_envelope(&sim_envelope, None),
+        stellar_agent_network::retry::retry_preflight_busy(deadline, || {
+            server.simulate_transaction_envelope(&sim_envelope, None)
+        }),
     )
     .await
     .map_err(|_| auth_payload_err("simulate_transaction_envelope timed out".to_owned()))?
-    .map_err(|e| auth_payload_err(format!("simulate_transaction_envelope failed: {e}")))?;
+    .map_err(|e| match e {
+        stellar_agent_network::retry::BusyRetryError::Rpc(e) => {
+            auth_payload_err(format!("simulate_transaction_envelope failed: {e}"))
+        }
+        stellar_agent_network::retry::BusyRetryError::Expired => {
+            auth_payload_err("simulate_transaction_envelope timed out".to_owned())
+        }
+    })?;
 
     let latest_ledger = sim.latest_ledger;
     if let Some(err) = &sim.error {
@@ -9968,6 +9978,96 @@ pub(crate) mod tests {
     use stellar_agent_core::constants::SIMULATE_SENTINEL_G;
 
     use super::*;
+
+    async fn busy_ledger_read(timeout: Duration, busy: u64, delayed: bool) -> SaError {
+        use crate::managers::rules::event_reason_tests::{
+            SMART_ACCOUNT, address, busy_replies, read_only_server, successful_read_result,
+        };
+        let source = stellar_strkey::ed25519::PublicKey([7; 32]).to_string();
+        let server = read_only_server(&source, successful_read_result()).await;
+        if delayed {
+            wiremock::Mock::given(wiremock::matchers::body_partial_json(
+                serde_json::json!({"method": "simulateTransaction"}),
+            ))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = request.body_json().unwrap();
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({
+                        "jsonrpc": "2.0", "id": body["id"], "result": successful_read_result()
+                    }))
+                    .set_delay(Duration::from_secs(3))
+            })
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        }
+        busy_replies(&server, busy).await;
+        let error = simulate_read_only_at_ledger(
+            &server.uri(),
+            address(SMART_ACCOUNT),
+            "get_context_rules_count",
+            vec![],
+            None,
+            "Test SDF Network ; September 2015",
+            timeout,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            stellar_agent_test_support::rpc_request_count(&server, "simulateTransaction").await,
+            if delayed { 2 } else { 4 }
+        );
+        error
+    }
+
+    #[tokio::test]
+    async fn ledger_read_simulate_retries_busy() {
+        use crate::managers::rules::event_reason_tests::{
+            SMART_ACCOUNT, address, busy_replies, read_only_server, successful_read_result,
+        };
+        let source = stellar_strkey::ed25519::PublicKey([7; 32]).to_string();
+        let server = read_only_server(&source, successful_read_result()).await;
+        busy_replies(&server, 1).await;
+        let (result, ledger) = simulate_read_only_at_ledger(
+            &server.uri(),
+            address(SMART_ACCOUNT),
+            "get_context_rules_count",
+            vec![],
+            None,
+            "Test SDF Network ; September 2015",
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap(), ScVal::U32(7));
+        assert_eq!(ledger, 100);
+        assert_eq!(
+            stellar_agent_test_support::rpc_request_count(&server, "simulateTransaction").await,
+            2
+        );
+        let error = busy_ledger_read(Duration::from_secs(30), 4, false).await;
+        assert!(
+            matches!(error, SaError::AuthEntryConstructionFailed { stage: "auth_payload", ref redacted_reason } if redacted_reason.starts_with("simulate_transaction_envelope failed: ")),
+            "{error:?}"
+        );
+        let error = busy_ledger_read(Duration::from_secs(2), 1, true).await;
+        assert!(
+            matches!(error, SaError::AuthEntryConstructionFailed { stage: "auth_payload", ref redacted_reason } if redacted_reason == "simulate_transaction_envelope timed out"),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ledger_read_overflowing_timeout_is_bounded() {
+        let error = crate::managers::rules::event_reason_tests::drive_busy_paused(
+            busy_ledger_read(Duration::MAX, 4, false),
+        )
+        .await;
+        assert!(
+            matches!(error, SaError::AuthEntryConstructionFailed { stage: "auth_payload", ref redacted_reason } if redacted_reason.starts_with("simulate_transaction_envelope failed: ")),
+            "{error:?}"
+        );
+    }
 
     /// A migration step keeps a mainnet refusal as itself, so
     /// `MigrationPlan::submit` reports the canonical code; another failure is

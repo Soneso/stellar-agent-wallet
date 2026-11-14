@@ -23,9 +23,12 @@ use stellar_agent_core::audit_log::schema::SaInvocationResult;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::error::{SubmissionError, WalletError};
 use stellar_agent_core::profile::caip2::Caip2;
-use stellar_agent_core::rpc_budget::{SequentialRpcBudget, bound_stage};
+use stellar_agent_core::rpc_budget::{
+    SequentialRpcBudget, SequentialRpcBudgetElapsed, bound_stage,
+};
 #[cfg(any(test, feature = "test-helpers"))]
 use stellar_agent_network::SoftwareSigningKey;
+use stellar_agent_network::retry::{BusyRetryError, retry_preflight_busy};
 use stellar_agent_network::{
     Signer, StellarRpcClient, fetch_account, signing::envelope_signing::attach_signature,
     submit_transaction_and_wait,
@@ -962,16 +965,28 @@ async fn deploy_smart_account_body(
                 phase: "build",
                 redacted_reason: format!("upload to_envelope (pre-sim) failed: {e}"),
             })?;
+        let upload_stage = "upload_simulate";
         let upload_sim = bound_stage(
             deploy_budget,
-            "upload_simulate",
-            rpc_server.simulate_transaction_envelope(&upload_envelope, None),
+            upload_stage,
+            retry_preflight_busy(Some(deploy_budget.deadline), || {
+                rpc_server.simulate_transaction_envelope(&upload_envelope, None)
+            }),
         )
         .await
         .map_err(|elapsed| map_budget_elapsed(elapsed, "simulate"))?
-        .map_err(|e| SaError::DeploymentFailed {
-            phase: "simulate",
-            redacted_reason: format!("upload simulate_transaction_envelope failed: {e}"),
+        .map_err(|e| match e {
+            BusyRetryError::Rpc(e) => SaError::DeploymentFailed {
+                phase: "simulate",
+                redacted_reason: format!("upload simulate_transaction_envelope failed: {e}"),
+            },
+            BusyRetryError::Expired => map_budget_elapsed(
+                SequentialRpcBudgetElapsed {
+                    stage: upload_stage,
+                    total_secs: deploy_budget.total.as_secs(),
+                },
+                "simulate",
+            ),
         })?;
 
         // Panic-insulation pre-check.
@@ -1189,16 +1204,28 @@ async fn deploy_smart_account_body(
         phase: "build",
         redacted_reason: format!("deploy to_envelope (pre-sim) failed: {e}"),
     })?;
+    let deploy_stage = "deploy_simulate";
     let sim_response = bound_stage(
         deploy_budget,
-        "deploy_simulate",
-        rpc_server.simulate_transaction_envelope(&deploy_envelope_pre, None),
+        deploy_stage,
+        retry_preflight_busy(Some(deploy_budget.deadline), || {
+            rpc_server.simulate_transaction_envelope(&deploy_envelope_pre, None)
+        }),
     )
     .await
     .map_err(|elapsed| map_budget_elapsed(elapsed, "simulate"))?
-    .map_err(|e| SaError::DeploymentFailed {
-        phase: "simulate",
-        redacted_reason: format!("deploy simulate_transaction_envelope failed: {e}"),
+    .map_err(|e| match e {
+        BusyRetryError::Rpc(e) => SaError::DeploymentFailed {
+            phase: "simulate",
+            redacted_reason: format!("deploy simulate_transaction_envelope failed: {e}"),
+        },
+        BusyRetryError::Expired => map_budget_elapsed(
+            SequentialRpcBudgetElapsed {
+                stage: deploy_stage,
+                total_secs: deploy_budget.total.as_secs(),
+            },
+            "simulate",
+        ),
     })?;
 
     // Panic-insulation pre-check.
@@ -1403,7 +1430,7 @@ async fn deploy_smart_account_body(
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
@@ -1541,6 +1568,120 @@ mod tests {
             dry_run: true,
             genesis_signer_scval_override: None,
         }
+    }
+
+    /// Exercises both simulation stages through a deployment entry point.
+    pub(crate) async fn check_deployment_busy<F, Fut>(mut deploy: F)
+    where
+        F: FnMut(String, Duration) -> Fut,
+        Fut: std::future::Future<Output = Result<(), SaError>>,
+    {
+        use stellar_xdr::{LedgerKey, ReadXdr, ScVal, SorobanTransactionData};
+        for upload in [true, false] {
+            for (busy, delayed) in [(1, false), (4, false), (1, true)] {
+                let server = wiremock::MockServer::start().await;
+                let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let observed = calls.clone();
+                wiremock::Mock::given(wiremock::matchers::method("POST"))
+                    .respond_with(move |request: &wiremock::Request| {
+                        let body: serde_json::Value = request.body_json().unwrap();
+                        let result = match body["method"].as_str().unwrap() {
+                            "getLedgerEntries" => {
+                                let key = LedgerKey::from_xdr_base64(body["params"]["keys"][0].as_str().unwrap(), Limits::none()).unwrap();
+                                if matches!(key, LedgerKey::Account(_)) || (!upload && matches!(key, LedgerKey::ContractCode(_))) {
+                                    let source = stellar_agent_test_support::signed_envelope::account_id_for_seed([0x61; 32]);
+                                    stellar_agent_test_support::signed_envelope::ledger_entries_result_for(&[&source])
+                                } else {
+                                    serde_json::json!({"entries": [], "latestLedger": 100})
+                                }
+                            }
+                            "getNetwork" => stellar_agent_test_support::signed_envelope::get_network_result(stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE),
+                            "simulateTransaction" => {
+                                let n = observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                if n < busy {
+                                    return wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                                        "jsonrpc": "2.0", "id": body["id"], "error": {"code": -32004, "message": "preflight queue full"}
+                                    }));
+                                }
+                                serde_json::json!({
+                                    "latestLedger": 100, "minResourceFee": "1000",
+                                    "transactionData": SorobanTransactionData::default().to_xdr_base64(Limits::none()).unwrap(),
+                                    "results": [{"auth": [], "xdr": ScVal::Void.to_xdr_base64(Limits::none()).unwrap()}]
+                                })
+                            }
+                            "sendTransaction" => return wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                                "jsonrpc": "2.0", "id": body["id"], "error": {"code": -32602, "message": "submission boundary"}
+                            })),
+                            other => panic!("unexpected method {other}"),
+                        };
+                        let response = wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                            "jsonrpc": "2.0", "id": body["id"], "result": result
+                        }));
+                        if delayed && body["method"] == "simulateTransaction" {
+                            response.set_delay(Duration::from_secs(3))
+                        } else { response }
+                    }).mount(&server).await;
+                let timeout = Duration::from_secs(if delayed { 2 } else { 30 });
+                let error = deploy(server.uri(), timeout).await.unwrap_err();
+                assert_eq!(
+                    calls.load(std::sync::atomic::Ordering::SeqCst),
+                    if busy == 4 { 4 } else { 2 },
+                    "{error:?}"
+                );
+                if delayed {
+                    let expected = map_budget_elapsed(
+                        SequentialRpcBudgetElapsed {
+                            stage: if upload {
+                                "upload_simulate"
+                            } else {
+                                "deploy_simulate"
+                            },
+                            total_secs: 2,
+                        },
+                        "simulate",
+                    );
+                    assert_eq!(
+                        serde_json::to_value(&error).unwrap(),
+                        serde_json::to_value(expected).unwrap()
+                    );
+                } else if busy == 4 {
+                    assert!(
+                        matches!(
+                            error,
+                            SaError::DeploymentFailed {
+                                phase: "simulate",
+                                ..
+                            }
+                        ),
+                        "{error:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        stellar_agent_test_support::rpc_request_count(&server, "sendTransaction")
+                            .await,
+                        1,
+                        "{error:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deployment_simulates_retry_busy() {
+        check_deployment_busy(|url, timeout| async move {
+            let signer =
+                stellar_agent_network::signing::test_doubles::CountingSigner::new([0x61; 32]);
+            let mut args = dry_run_args(DeployerKeypair::from_signer(
+                "counting".to_owned(),
+                Box::new(signer),
+            ));
+            args.rpc_url = url;
+            args.timeout = timeout;
+            args.dry_run = false;
+            deploy_smart_account(args, None).await.map(|_| ())
+        })
+        .await;
     }
 
     /// Bytes that are a valid empty Wasm module and hash to another digest

@@ -1104,7 +1104,8 @@ pub async fn submit_signed_invoke(
     // reads, the ledger witness, optional unsigned recovery, signed re-simulation,
     // every signature and all steps before each send attempt.
     // Recovery consumes the remaining budget and keeps the same witness pair.
-    // Rule-expiry and multicall cross-RPC checks carry their own budgets.
+    // Rule-expiry and multicall hash reads carry their own budgets.
+    // The secondary simulation consumes the remaining pre-submit budget.
     // An in-flight send and confirmation polling use their separate timeout.
     let pre_submit_budget = PreSubmitBudget {
         deadline: tokio::time::Instant::now() + args.timeout,
@@ -1176,10 +1177,20 @@ pub async fn submit_signed_invoke(
         pre_submit_budget,
         "simulate_initial",
         "auth_payload",
-        server.simulate_transaction_envelope(&sim_envelope, None),
+        stellar_agent_network::retry::retry_preflight_busy(
+            Some(pre_submit_budget.deadline),
+            || server.simulate_transaction_envelope(&sim_envelope, None),
+        ),
     )
     .await?
-    .map_err(|e| auth_payload_err(format!("simulate_transaction_envelope failed: {e}")))?;
+    .map_err(|e| match e {
+        stellar_agent_network::retry::BusyRetryError::Rpc(e) => {
+            auth_payload_err(format!("simulate_transaction_envelope failed: {e}"))
+        }
+        stellar_agent_network::retry::BusyRetryError::Expired => {
+            pre_submit_budget.elapsed("simulate_initial", "auth_payload")
+        }
+    })?;
 
     // ── Step 3 continued: ledger witness + Option<*Check> dispatch ────────────
     //
@@ -1201,10 +1212,20 @@ pub async fn submit_signed_invoke(
             pre_submit_budget,
             "simulate_recovery",
             "auth_payload",
-            server.simulate_transaction_envelope(&sim_envelope, None),
+            stellar_agent_network::retry::retry_preflight_busy(
+                Some(pre_submit_budget.deadline),
+                || server.simulate_transaction_envelope(&sim_envelope, None),
+            ),
         )
         .await?
-        .map_err(|e| auth_payload_err(format!("simulate_transaction_envelope failed: {e}")))?;
+        .map_err(|e| match e {
+            stellar_agent_network::retry::BusyRetryError::Rpc(e) => {
+                auth_payload_err(format!("simulate_transaction_envelope failed: {e}"))
+            }
+            stellar_agent_network::retry::BusyRetryError::Expired => {
+                pre_submit_budget.elapsed("simulate_recovery", "auth_payload")
+            }
+        })?;
         validate_latest_ledger(sim_response.latest_ledger)?;
     }
     simulation_witness.check_simulation_height(sim_response.latest_ledger)?;
@@ -1273,12 +1294,23 @@ pub async fn submit_signed_invoke(
         let secondary_server = stellar_rpc_client::Client::new(secondary_rpc_url).map_err(|e| {
             auth_payload_err(format!("secondary RPC Client construction failed: {e}"))
         })?;
-        let secondary_sim = secondary_server
-            .simulate_transaction_envelope(&sim_envelope, None)
-            .await
-            .map_err(|e| {
-                crate::multicall::rpc_client_divergence("secondary RPC simulate failed", &e)
-            })?;
+        let secondary_sim = tokio::time::timeout_at(
+            pre_submit_budget.deadline,
+            stellar_agent_network::retry::retry_preflight_busy(
+                Some(pre_submit_budget.deadline),
+                || secondary_server.simulate_transaction_envelope(&sim_envelope, None),
+            ),
+        )
+        .await
+        .map_err(|_| {
+            crate::multicall::rpc_client_divergence(
+                "secondary RPC simulate failed",
+                &"deadline elapsed",
+            )
+        })?
+        .map_err(|e| {
+            crate::multicall::rpc_client_divergence("secondary RPC simulate failed", &e)
+        })?;
         crate::multicall::cross_rpc_compare_simulate_responses(&sim_response, &secondary_sim)?;
     }
 
@@ -4104,6 +4136,239 @@ mod tests {
 
         fn endpoint(ledger: u32) -> AuthTreeRpc {
             endpoint_on(TESTNET_PASSPHRASE, ledger)
+        }
+
+        async fn busy_relay(
+            upstream: String,
+            start: usize,
+            busy: usize,
+            delay: Duration,
+        ) -> wiremock::MockServer {
+            let server = wiremock::MockServer::start().await;
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(move |request: &wiremock::Request| {
+                    let body: serde_json::Value = request.body_json().unwrap();
+                    let simulation = body["method"] == "simulateTransaction";
+                    let n = if simulation { calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 } else { 0 };
+                    if (start..start + busy).contains(&n) {
+                        return wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                            "jsonrpc": "2.0", "id": body["id"], "error": {"code": -32004, "message": "preflight queue full"}
+                        }));
+                    }
+                    let answer: serde_json::Value = std::thread::scope(|scope| {
+                        scope.spawn(|| tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                            reqwest::Client::new().post(&upstream).json(&body).send().await.unwrap().json().await.unwrap()
+                        })).join().unwrap()
+                    });
+                    let response = wiremock::ResponseTemplate::new(200).set_body_json(answer);
+                    if simulation && n >= start + busy { response.set_delay(delay) } else { response }
+                }).mount(&server).await;
+            server
+        }
+
+        async fn submit_busy_path(
+            primary: &str,
+            secondary: &str,
+            multicall: bool,
+            timeout: Duration,
+        ) -> Result<SubmitInvokeResult, SaError> {
+            let target = wallet_strkey();
+            let path = if multicall {
+                SigningPath::Multicall
+            } else {
+                SigningPath::Single
+            };
+            let rule_ids = path.rule_ids();
+            let declared = [nested_call()];
+            let signer = RecordingSigner::new();
+            submit_signed_invoke(
+                SubmitInvokeArgs::builder()
+                    .admission(stellar_agent_network::SigningAdmission::NoValue(
+                        crate::signing::intent_test_helpers::no_value_admission(),
+                    ))
+                    .target_contract(&target)
+                    .auth_rule_ids(&rule_ids)
+                    .host_function(path.host_function())
+                    .sub_invocations(if multicall {
+                        DeclaredSubInvocations::Calls(&declared)
+                    } else {
+                        DeclaredSubInvocations::None
+                    })
+                    .signer(&signer)
+                    .primary_rpc_url(primary)
+                    .secondary_rpc_url(secondary)
+                    .network_passphrase(TESTNET_PASSPHRASE)
+                    .chain_id("stellar:testnet")
+                    .timeout(timeout)
+                    .op_label("busy_submit")
+                    .required_checks(if multicall { &["multicall"][..] } else { &[] })
+                    .maybe_multicall_check(multicall.then(|| MulticallCheck {
+                        registry_entry_address: target.clone(),
+                        registry_entry_wasm_sha256: MULTICALL_WASM_SHA256.to_owned(),
+                        network_passphrase: TESTNET_PASSPHRASE.to_owned(),
+                    }))
+                    .build(),
+            )
+            .await
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn initial_and_recovery_simulates_retry_busy() {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
+            for recovery in [false, true] {
+                for (busy, delayed) in [(1, false), (4, false), (1, true)] {
+                    let primary = endpoint(LEDGER)
+                        .simulation_response(move |n, response| {
+                            if recovery {
+                                recovery_response(RecoveryCase::Valid, n, response);
+                            }
+                        })
+                        .start()
+                        .await;
+                    let secondary = endpoint(LEDGER).start().await;
+                    let start = if recovery { 2 } else { 1 };
+                    let relay = busy_relay(
+                        primary.uri(),
+                        start,
+                        busy,
+                        if delayed {
+                            Duration::from_secs(3)
+                        } else {
+                            Duration::ZERO
+                        },
+                    )
+                    .await;
+                    let timeout = Duration::from_secs(if delayed { 2 } else { 30 });
+                    let result = submit_busy_path(
+                        &relay.uri(),
+                        &second_loopback_host(&secondary.uri()),
+                        false,
+                        timeout,
+                    )
+                    .await;
+                    let requests = stellar_agent_test_support::rpc_request_count(
+                        &relay,
+                        "simulateTransaction",
+                    )
+                    .await;
+                    if delayed {
+                        let budget = crate::managers::auth_entry::PreSubmitBudget {
+                            deadline: tokio::time::Instant::now(),
+                            total: timeout,
+                        };
+                        assert_eq!(
+                            serde_json::to_value(result.unwrap_err()).unwrap(),
+                            serde_json::to_value(budget.elapsed(
+                                if recovery {
+                                    "simulate_recovery"
+                                } else {
+                                    "simulate_initial"
+                                },
+                                "auth_payload"
+                            ))
+                            .unwrap()
+                        );
+                        assert_eq!(requests, start + 1);
+                    } else if busy == 4 {
+                        assert!(
+                            matches!(
+                                result,
+                                Err(SaError::AuthEntryConstructionFailed {
+                                    stage: "auth_payload",
+                                    ..
+                                })
+                            ),
+                            "{result:?}"
+                        );
+                        assert_eq!(requests, start + 3);
+                    } else {
+                        assert!(result.is_ok(), "{result:?}");
+                        assert_eq!(requests, if recovery { 4 } else { 3 });
+                    }
+                }
+            }
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn multicall_secondary_is_bounded() {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
+            for delayed in [false, true] {
+                let primary = endpoint(LEDGER).start().await;
+                let secondary = endpoint(LEDGER).start().await;
+                let relay = busy_relay(
+                    secondary.uri(),
+                    1,
+                    1,
+                    if delayed {
+                        Duration::from_secs(3)
+                    } else {
+                        Duration::ZERO
+                    },
+                )
+                .await;
+                let start = tokio::time::Instant::now();
+                let result = submit_busy_path(
+                    &primary.uri(),
+                    &second_loopback_host(&relay.uri()),
+                    true,
+                    Duration::from_secs(2),
+                )
+                .await;
+                if delayed {
+                    assert!(
+                        matches!(
+                            result,
+                            Err(SaError::MulticallFailed {
+                                phase: "rpc_divergence",
+                                ..
+                            })
+                        ),
+                        "{result:?}"
+                    );
+                    assert!(start.elapsed() < Duration::from_millis(2500));
+                } else {
+                    assert!(result.is_ok(), "{result:?}");
+                }
+                assert_eq!(
+                    stellar_agent_test_support::rpc_request_count(&relay, "simulateTransaction")
+                        .await,
+                    2
+                );
+            }
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn deadline_after_a_busy_sleep_keeps_the_stage_error() {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
+            let primary = endpoint(LEDGER).start().await;
+            let secondary = endpoint(LEDGER).start().await;
+            let relay = busy_relay(primary.uri(), 1, 1, Duration::from_secs(5)).await;
+            let start = tokio::time::Instant::now();
+            let timeout = Duration::from_millis(300);
+            let result = submit_busy_path(
+                &relay.uri(),
+                &second_loopback_host(&secondary.uri()),
+                false,
+                timeout,
+            )
+            .await;
+            let budget = crate::managers::auth_entry::PreSubmitBudget {
+                deadline: start + timeout,
+                total: timeout,
+            };
+            assert_eq!(
+                serde_json::to_value(result.unwrap_err()).unwrap(),
+                serde_json::to_value(budget.elapsed("simulate_initial", "auth_payload")).unwrap()
+            );
+            assert_eq!(
+                stellar_agent_test_support::rpc_request_count(&relay, "simulateTransaction").await,
+                2
+            );
+            assert!(start.elapsed() < Duration::from_millis(500));
         }
 
         /// A counting signer that keeps every authorization digest it signs,
