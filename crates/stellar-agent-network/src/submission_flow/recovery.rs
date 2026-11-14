@@ -1389,6 +1389,187 @@ pub(crate) mod tests {
         assert!(!fresh.approval_consumed, "a new receipt starts unconsumed");
     }
 
+    /// The complete M address of `id` on a fixed key.
+    fn muxed(id: u64) -> String {
+        format!(
+            "{}",
+            stellar_strkey::ed25519::MuxedAccount {
+                ed25519: [0xB7; 32],
+                id
+            }
+        )
+    }
+
+    /// Writes a sent pending receipt for attempt `n` at `100 + n` that
+    /// records `destination`.
+    fn receipt_to(rig: &Rig, n: u8, destination: Option<&str>) {
+        rig.receipts
+            .begin_submission_to(
+                &envelope_id(n),
+                &tx_hex(n),
+                SOURCE,
+                100 + i64::from(n),
+                0,
+                1,
+                None,
+                None,
+                destination,
+            )
+            .unwrap();
+        rig.receipts.mark_submitted(&envelope_id(n)).unwrap();
+    }
+
+    /// The serialized receipt of attempt `n` in the receipt file.
+    fn stored_json(rig: &Rig, n: u8) -> serde_json::Value {
+        let map: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&rig.receipt_bytes()).unwrap();
+        map[&envelope_id(n)].clone()
+    }
+
+    /// Repair of stored one-operation payment receipts to M0 and M17 keeps
+    /// the complete M address in the serialized receipt, and a receipt
+    /// without a destination keeps none. A refusal before the rename leaves
+    /// the bytes; a crash after the rename leaves the replacement with its
+    /// destination and the marker unset; the restart acknowledges, and a
+    /// repeated repair changes no byte.
+    #[test]
+    #[serial]
+    fn recovery_projection_keeps_the_stored_muxed_destination() {
+        let mut rig = Rig::new();
+        let (m0, m17) = (muxed(0), muxed(17));
+        let commits = [
+            commit_checked(&mut rig.fx, 1, Checked::Succeeded).1,
+            commit_checked(&mut rig.fx, 2, Checked::Failed).1,
+            commit_checked(&mut rig.fx, 3, Checked::NotIncluded).1,
+        ];
+        let stored = [Some(m0.as_str()), Some(m17.as_str()), None];
+        for (n, destination) in (1..=3).zip(stored) {
+            receipt_to(&rig, n, destination);
+        }
+        let assert_kept = |rig: &Rig, label: &str| {
+            for (n, destination) in (1..=3).zip(stored) {
+                let receipt = rig.receipt(n).unwrap();
+                assert_eq!(
+                    receipt.destination.as_deref(),
+                    destination,
+                    "{label}: attempt {n}"
+                );
+                assert_eq!(
+                    stored_json(rig, n)
+                        .get("destination")
+                        .and_then(|d| d.as_str()),
+                    destination,
+                    "{label}: serialized attempt {n}"
+                );
+            }
+        };
+
+        // A refusal before the rename leaves the bytes and the markers.
+        let before = rig.receipt_bytes();
+        let held = hold_receipt_lock(&rig.receipts);
+        let error = rig.repair(None).unwrap_err();
+        assert_eq!(error.code(), "submission.record_unavailable");
+        drop(held);
+        assert_eq!(rig.receipt_bytes(), before);
+        assert!((1..=3).all(|n| !rig.projected(n)));
+
+        // A crash after the rename leaves each replacement with its
+        // destination and the marker unset.
+        let crashed = {
+            let _armed = on_replacement(|| Err(record_unavailable("crash after the rename")));
+            rig.repair(None)
+        };
+        assert!(crashed.is_err());
+        rig.reopen();
+        assert!((1..=3).all(|n| !rig.projected(n)));
+        for (n, checked) in (1..=3).zip([Checked::Succeeded, Checked::Failed, Checked::NotIncluded])
+        {
+            assert_eq!(outcome(&rig.receipt(n).unwrap()), expected(checked));
+        }
+        assert_kept(&rig, "after the rename");
+
+        // The restart acknowledges once; a repeat changes no byte.
+        rig.reopen();
+        rig.repair(None).unwrap();
+        assert!((1..=3).all(|n| rig.projected(n)));
+        for (n, commit) in (1..=3).zip(commits) {
+            assert_linked(&rig.receipt(n).unwrap(), n, 100 + i64::from(n), commit);
+        }
+        assert_kept(&rig, "repaired");
+        let text = String::from_utf8(rig.receipt_bytes()).unwrap();
+        assert!(text.contains(&m0) && text.contains(&m17));
+        let bytes = rig.receipt_bytes();
+        let window = rig.window_bytes();
+        for _ in 0..2 {
+            rig.reopen();
+            rig.repair(None).unwrap();
+            assert_eq!(
+                rig.receipt_bytes(),
+                bytes,
+                "a repeated repair writes nothing"
+            );
+            assert_eq!(rig.window_bytes(), window);
+        }
+    }
+
+    /// A projection that carries a destination other than the stored one,
+    /// or one for a receipt stored without a destination, refuses with
+    /// `submission.record_unavailable` and the conflicting-identity detail,
+    /// and leaves the receipt bytes and the marker. A projection that
+    /// carries the stored destination repairs.
+    #[test]
+    #[serial]
+    fn recovery_projection_refuses_another_destination() {
+        let mut rig = Rig::new();
+        commit_checked(&mut rig.fx, 1, Checked::Succeeded);
+        commit_checked(&mut rig.fx, 2, Checked::Succeeded);
+        receipt_to(&rig, 1, Some(&muxed(17)));
+        receipt_to(&rig, 2, None);
+        let carrying = |n: u8, destination: &str| {
+            let mut projection = rig.decision(n).receipt_projection().unwrap();
+            projection.receipt.destination = Some(destination.to_owned());
+            projection
+        };
+        let bytes = rig.receipt_bytes();
+        for (n, destination) in [(1, muxed(18)), (1, muxed(0)), (2, muxed(17))] {
+            let error = repair_proof(
+                &rig.fx.store,
+                &rig.fx.profile,
+                &rig.receipts,
+                &rig.writer,
+                &rig.decision(n),
+                Ok(carrying(n, &destination)),
+            )
+            .unwrap_err();
+            assert_eq!(error.code(), "submission.record_unavailable");
+            assert!(
+                refusal_detail(&error).contains("conflicting identity"),
+                "{}",
+                refusal_detail(&error)
+            );
+            assert_eq!(rig.receipt_bytes(), bytes, "attempt {n} to {destination}");
+            assert!(!rig.projected(n));
+        }
+
+        repair_proof(
+            &rig.fx.store,
+            &rig.fx.profile,
+            &rig.receipts,
+            &rig.writer,
+            &rig.decision(1),
+            Ok(carrying(1, &muxed(17))),
+        )
+        .unwrap();
+        assert!(rig.projected(1));
+        rig.repair(None).unwrap();
+        assert_eq!(
+            rig.receipt(1).unwrap().destination.as_deref(),
+            Some(muxed(17).as_str())
+        );
+        assert_eq!(rig.receipt(2).unwrap().destination, None);
+        assert!(stored_json(&rig, 2).get("destination").is_none());
+    }
+
     /// Accounting expires first; each checked outcome then commits and is
     /// repaired, and the owed expiry delivered at dispatch completion keeps
     /// the checked status, release code and linkage. No charge revives and

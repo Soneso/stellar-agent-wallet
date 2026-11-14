@@ -255,6 +255,7 @@ pub struct SignedTestEnvelopeBuilder {
     network_passphrase: String,
     operation_source: Option<[u8; 32]>,
     muxed_source_id: Option<u64>,
+    muxed_destination_id: Option<u64>,
     claim_balance_id: Option<[u8; 32]>,
     fee_bump_source: Option<[u8; 32]>,
     inner_signatures: Option<Vec<SignatureSpec>>,
@@ -280,6 +281,7 @@ impl SignedTestEnvelopeBuilder {
             network_passphrase: TESTNET_PASSPHRASE.to_owned(),
             operation_source: None,
             muxed_source_id: None,
+            muxed_destination_id: None,
             claim_balance_id: None,
             fee_bump_source: None,
             inner_signatures: None,
@@ -311,6 +313,15 @@ impl SignedTestEnvelopeBuilder {
     #[must_use]
     pub fn muxed_source_id(mut self, id: u64) -> Self {
         self.muxed_source_id = Some(id);
+        self
+    }
+
+    /// Makes the payment destination a muxed account (`M...`) carrying `id`
+    /// over the same destination key. [`SignedTestEnvelope::destination`]
+    /// then returns the `M...` strkey.
+    #[must_use]
+    pub fn muxed_destination_id(mut self, id: u64) -> Self {
+        self.muxed_destination_id = Some(id);
         self
     }
 
@@ -474,7 +485,13 @@ impl SignedTestEnvelopeBuilder {
                 balance_id: ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash(balance_id)),
             }),
             None => OperationBody::Payment(PaymentOp {
-                destination: MuxedAccount::Ed25519(Uint256(self.destination)),
+                destination: match self.muxed_destination_id {
+                    Some(id) => MuxedAccount::MuxedEd25519(stellar_xdr::MuxedAccountMed25519 {
+                        id,
+                        ed25519: Uint256(self.destination),
+                    }),
+                    None => MuxedAccount::Ed25519(Uint256(self.destination)),
+                },
                 asset: Asset::Native,
                 amount: self.amount_stroops,
             }),
@@ -618,7 +635,16 @@ impl SignedTestEnvelopeBuilder {
             source: source_strkey,
             source_seed: self.source_seed,
             sequence: self.sequence,
-            destination: format!("{}", stellar_strkey::ed25519::PublicKey(self.destination)),
+            destination: match self.muxed_destination_id {
+                Some(id) => format!(
+                    "{}",
+                    stellar_strkey::ed25519::MuxedAccount {
+                        ed25519: self.destination,
+                        id,
+                    }
+                ),
+                None => format!("{}", stellar_strkey::ed25519::PublicKey(self.destination)),
+            },
             envelope_xdr,
             tx_hash_hex,
             ledger_entries_result: ledger_entries_result(&ledger_accounts),

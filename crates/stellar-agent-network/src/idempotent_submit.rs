@@ -301,13 +301,14 @@ pub async fn submit_transaction_idempotent(
 
     // ── Step 5: atomic winner/loser gate ───────────────────────────────────
     let outcome = store
-        .try_begin(
+        .try_begin_to(
             &envelope_hash,
             &tx_hash_hex,
             &source,
             sequence,
             max_time,
             recorded_at_ledger,
+            crate::submit::muxed_payment_destination(&envelope).as_deref(),
         )
         .map_err(|e| {
             WalletError::Internal(stellar_agent_core::error::InternalError::UnexpectedState {

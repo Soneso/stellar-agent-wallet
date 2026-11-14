@@ -90,6 +90,7 @@ pub const INBOX_STYLE: &str = r"
 .empty .buddy { width: 64px; margin: 0 auto; }
 .empty p { font-size: 13px; color: var(--muted-blue); margin-top: 8px; }
 .ap-meta.toolset-gate { overflow: visible; text-overflow: clip; white-space: normal; overflow-wrap: anywhere; }
+.ap-meta.muxed { overflow: visible; text-overflow: clip; white-space: normal; overflow-wrap: anywhere; }
 ";
 
 /// The approval detail page's own rules: the decision card, its amount
@@ -860,6 +861,13 @@ fn address_block(label: &str, value: &str) -> String {
     )
 }
 
+/// Renders the `Base account` row of a muxed destination, or nothing for a
+/// destination without one.
+fn base_account_block(base: Option<&str>) -> String {
+    base.map(|base| address_block("Base account", base))
+        .unwrap_or_default()
+}
+
 /// Renders the intent an entry is approved under: the amount headline, the
 /// untruncated primary address, and rows for the kind, network, source, the
 /// operation fields, the typed memo, the fee bound and the short policy
@@ -877,7 +885,17 @@ pub(crate) fn render_intent_html(nonce: &str, intent: &IntentView) -> String {
         } => (
             "Payment",
             amount_headline(*amount_stroops, asset),
-            address_block("Destination", destination),
+            format!(
+                "{}{}",
+                address_block("Destination", destination),
+                base_account_block(
+                    stellar_agent_core::payment_accounts::PaymentAccount::parse(destination)
+                        .ok()
+                        .filter(|account| account.muxed_id().is_some())
+                        .as_ref()
+                        .map(stellar_agent_core::payment_accounts::PaymentAccount::base_account)
+                )
+            ),
             [
                 fact_row("Asset", asset),
                 fact_row("Amount (stroops)", &amount_stroops.to_string()),
@@ -990,6 +1008,7 @@ pub fn render_summary_html(view: &PendingApprovalView) -> String {
         ApprovalSummaryView::Payment {
             source,
             to,
+            to_base,
             amount_stroops,
             asset,
             dest_asset,
@@ -1019,9 +1038,10 @@ pub fn render_summary_html(view: &PendingApprovalView) -> String {
             ));
             rows.push_str(&fact_row("Simulated seq num", &seq_num.to_string()));
             format!(
-                "{}{}{}",
+                "{}{}{}{}",
                 amount_headline(*amount_stroops, asset),
                 address_block("Destination", to),
+                base_account_block(to_base.as_deref()),
                 facts(&rows)
             )
         }
@@ -1117,6 +1137,8 @@ pub fn render_summary_html(view: &PendingApprovalView) -> String {
             package_shasum_short,
             capability,
             destination_redacted,
+            destination,
+            destination_base,
             asset,
             amount_min_stroops,
             amount_max_stroops,
@@ -1138,8 +1160,16 @@ pub fn render_summary_html(view: &PendingApprovalView) -> String {
                 &amount_max_stroops.to_string(),
             ));
             format!(
-                "{}{}",
-                address_block("Destination", destination_redacted),
+                "{}{}{}",
+                address_block(
+                    "Destination",
+                    if destination_base.is_some() {
+                        destination
+                    } else {
+                        destination_redacted
+                    }
+                ),
+                base_account_block(destination_base.as_deref()),
                 facts(&rows)
             )
         }
@@ -1720,6 +1750,63 @@ mod tests {
             "fee_bound_stroops": "300",
             "memo": memo,
         })
+    }
+
+    /// The mainnet consent page of a payment intent to M0 or M17 shows the
+    /// full M destination and a `Base account` row; a G destination shows no
+    /// base row.
+    #[test]
+    fn mainnet_consent_page_shows_the_muxed_base_account() {
+        use stellar_agent_core::approval::IntentView;
+        let dir = TempDir::new().unwrap();
+        let view = payment_view(&dir, false, NOW_MS);
+        let context = test_context();
+        let data = serde_json::json!({"nonce": view.approval_nonce});
+        // G, M0 and M17 of the key `[0xD6; 32]`.
+        let base = "GDLNNVWW23LNNVWW23LNNVWW23LNNVWW23LNNVWW23LNNVWW23LNMSZB";
+        let base_row = format!("Base account</div>\n      <div class=\"addr\">{base}</div>");
+        for (destination, muxed) in [
+            (base, false),
+            (
+                "MDLNNVWW23LNNVWW23LNNVWW23LNNVWW23LNNVWW23LNNVWW23LNMAAAAAAAAAAAAC7WQ",
+                true,
+            ),
+            (
+                "MDLNNVWW23LNNVWW23LNNVWW23LNNVWW23LNNVWW23LNNVWW23LNMAAAAAAAAAAACGXWU",
+                true,
+            ),
+        ] {
+            assert_eq!(
+                stellar_agent_core::payment_accounts::PaymentAccount::parse(destination)
+                    .unwrap()
+                    .muxed_id()
+                    .is_some(),
+                muxed
+            );
+            let intent = intent_of(serde_json::json!({
+                "base": intent_base(&serde_json::json!("none")),
+                "payload": {"pay": {
+                    "destination": destination,
+                    "asset": "native",
+                    "amount_stroops": "25000000",
+                }},
+            }));
+            let html = render_mainnet_consent_page(
+                &view,
+                &context,
+                &data,
+                Some("ab12"),
+                Some(&IntentView::new(&intent)),
+                ConsentPageMode::Inbox,
+                &neutral(),
+            );
+            assert!(
+                html.contains(&format!("<div class=\"addr\">{destination}</div>")),
+                "{destination}"
+            );
+            assert_eq!(html.contains(&base_row), muxed, "{destination}");
+            assert_eq!(html.contains("Base account"), muxed, "{destination}");
+        }
     }
 
     /// With an intent, the consent page shows the intent's rows and fee

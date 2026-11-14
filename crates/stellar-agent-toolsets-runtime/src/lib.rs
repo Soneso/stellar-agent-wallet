@@ -473,8 +473,9 @@ pub struct GatedInvokeParams<'a> {
     pub attestation_key: &'a [u8; 32],
     /// The binding under which the profile's grants are attested.
     pub attestation_binding: &'a stellar_agent_core::approval::AttestationBinding<'a>,
-    /// Canonical G-strkey destination from the AUTHORITATIVE envelope decode
-    /// (never from toolset-supplied args).
+    /// Canonical G-strkey or M-strkey destination from the AUTHORITATIVE
+    /// envelope decode (never from toolset-supplied args). An M-strkey keeps
+    /// its mux ID, and grants match it exactly.
     pub authoritative_destination: &'a str,
     /// Full `"code:issuer"` or `"XLM"` asset from the AUTHORITATIVE envelope.
     pub authoritative_asset: &'a str,

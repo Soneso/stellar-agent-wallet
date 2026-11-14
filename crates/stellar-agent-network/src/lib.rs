@@ -65,6 +65,9 @@ pub mod policy_state;
 pub mod policy_view;
 #[cfg(test)]
 mod poll_test_support;
+
+#[cfg(test)]
+mod muxed_destination_tests;
 pub mod redact;
 pub mod retry;
 pub mod rpc_endpoint;

@@ -1854,4 +1854,67 @@ mod tests {
     fn edited_mpp_recipient_renders_inconsistent() {
         assert_edited_mpp_inconsistent(false);
     }
+
+    /// The remote detail page shows the full M and a base
+    /// account row for a payment to M0 or M17, and no base row for a G.
+    #[test]
+    fn muxed_approval_shows_base_account() {
+        let key = [0xAE; 32];
+        let g = format!("{}", stellar_strkey::ed25519::PublicKey(key));
+        let base_row = format!("Base account</div>\n      <div class=\"addr\">{g}</div>");
+        for id in [None, Some(0), Some(17)] {
+            let destination = id.map_or_else(
+                || g.clone(),
+                |id| {
+                    format!(
+                        "{}",
+                        stellar_strkey::ed25519::MuxedAccount { ed25519: key, id }
+                    )
+                },
+            );
+            let mut builder = stellar_agent_network::builder::ClassicOpBuilder::new(
+                SOURCE_G,
+                41,
+                stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+                100,
+            );
+            builder
+                .payment(
+                    &destination,
+                    stellar_agent_core::StellarAmount::from_stroops(2_500_000),
+                    &stellar_agent_network::builder::Asset::Native,
+                )
+                .map(|_| ())
+                .unwrap();
+            let envelope = builder.build().unwrap();
+            let entry = PendingApproval::new_payment_pending(
+                envelope.clone(),
+                envelope.as_bytes(),
+                destination.clone(),
+                2_500_000,
+                "XLM".to_owned(),
+                None,
+                100,
+                42,
+                process_uid_for_attestation().unwrap(),
+                DEFAULT_TTL_MS,
+            )
+            .unwrap();
+            let dir = TempDir::new().unwrap();
+            let mut store = PendingApprovalStore::open(dir.path().join("mux.toml")).unwrap();
+            store.insert(entry, NOW_MS).unwrap();
+            let view = store.snapshot(NOW_MS).into_iter().next().unwrap();
+            let html = render_detail_page(
+                &view,
+                &test_context(),
+                &"c".repeat(64),
+                None,
+                None,
+                &neutral(),
+            );
+            assert!(html.contains(&destination), "{html}");
+            assert_eq!(html.contains(&base_row), id.is_some(), "{destination}");
+            assert_eq!(html.contains("Base account"), id.is_some(), "{destination}");
+        }
+    }
 }

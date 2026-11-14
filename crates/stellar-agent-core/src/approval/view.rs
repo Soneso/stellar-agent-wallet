@@ -117,6 +117,10 @@ pub enum ApprovalSummaryView {
         /// Destination as the envelope names it: a G-strkey, or an M-strkey
         /// for a muxed destination.
         to: String,
+        /// The G base account of a muxed `to`, shown on its own row so the
+        /// owner sees which account receives the funds. Absent for a G `to`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_base: Option<String>,
         /// Amount the source pays in stroops, decimal-string encoded on the
         /// wire (see [`stellar_agent_core::wire_stroops`](crate::wire_stroops)).
         /// For a path payment, the most it pays.
@@ -230,6 +234,9 @@ pub enum ApprovalSummaryView {
         destination: String,
         /// First-5-last-5 redaction of `destination` for diagnostics.
         destination_redacted: String,
+        /// The G base account of a muxed [`Self::ToolsetFirstInvokeGate::destination`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        destination_base: Option<String>,
         /// Asset identifier.
         asset: String,
         /// Minimum grant-bucket bound in stroops, decimal-string encoded.
@@ -520,6 +527,14 @@ fn intent_balance_strkey(balance_id: &str) -> String {
     format!("{}", stellar_strkey::ClaimableBalance::V0(hash))
 }
 
+/// The G base account of a muxed `M...` destination; `None` for any other.
+fn muxed_base(destination: &str) -> Option<String> {
+    crate::payment_accounts::PaymentAccount::parse(destination)
+        .ok()
+        .filter(|account| account.muxed_id().is_some())
+        .map(|account| account.base_account().to_owned())
+}
+
 /// The summary of a classic entry, decoded from its envelope, or
 /// [`ApprovalSummaryView::Inconsistent`] when the entry fails
 /// [`classic_entry_summary`].
@@ -549,6 +564,7 @@ fn classic_summary_view(kind: &ApprovalKind) -> ApprovalSummaryView {
             amount_stroops,
         } => ApprovalSummaryView::Payment {
             source,
+            to_base: muxed_base(&destination),
             to: destination,
             amount_stroops,
             asset,
@@ -566,6 +582,7 @@ fn classic_summary_view(kind: &ApprovalKind) -> ApprovalSummaryView {
             dest_amount_stroops,
         } => ApprovalSummaryView::Payment {
             source,
+            to_base: muxed_base(&destination),
             to: destination,
             amount_stroops: send_amount_stroops,
             asset: send_asset,
@@ -581,6 +598,7 @@ fn classic_summary_view(kind: &ApprovalKind) -> ApprovalSummaryView {
         } => ApprovalSummaryView::Payment {
             source,
             to: destination,
+            to_base: None,
             amount_stroops: starting_balance_stroops,
             asset: "XLM".to_owned(),
             dest_asset: None,
@@ -708,6 +726,7 @@ impl PendingApprovalView {
                     capability: capability.clone(),
                     destination: destination.clone(),
                     destination_redacted: redact_g_strkey(destination),
+                    destination_base: muxed_base(destination),
                     asset: asset.clone(),
                     amount_min_stroops: *amount_min_stroops,
                     amount_max_stroops: *amount_max_stroops,
@@ -872,6 +891,7 @@ mod tests {
             ApprovalSummaryView::Payment {
                 source: SOURCE.to_owned(),
                 to: DEST.to_owned(),
+                to_base: None,
                 amount_stroops: 2_500_000,
                 asset: "XLM".to_owned(),
                 dest_asset: None,
@@ -1247,6 +1267,7 @@ mod tests {
         let payment = ApprovalSummaryView::Payment {
             source: "GSOURCE".to_owned(),
             to: "GAAA".to_owned(),
+            to_base: None,
             amount_stroops: 1,
             asset: "XLM".to_owned(),
             dest_asset: None,
@@ -1386,6 +1407,7 @@ mod tests {
         let payment = ApprovalSummaryView::Payment {
             source: "GSOURCE".to_owned(),
             to: "GAAA".to_owned(),
+            to_base: None,
             amount_stroops: 9_007_199_254_740_993_i64, // 2^53 + 1
             asset: "XLM".to_owned(),
             dest_asset: Some("USDC:GISSUER".to_owned()),
@@ -1418,6 +1440,7 @@ mod tests {
             capability: "sign-payment".to_owned(),
             destination: DEST.to_owned(),
             destination_redacted: "GAAAA...ZZZZZ".to_owned(),
+            destination_base: None,
             asset: "XLM".to_owned(),
             amount_min_stroops: 0,
             amount_max_stroops: i64::MAX,
@@ -1652,6 +1675,7 @@ mod tests {
             ApprovalSummaryView::Payment {
                 source: SOURCE.to_owned(),
                 to: DEST.to_owned(),
+                to_base: None,
                 amount_stroops: 987_654_321,
                 asset: format!("USDC:{TESTNET_USDC_ISSUER}"),
                 dest_asset: None,
@@ -1741,6 +1765,7 @@ mod tests {
             ApprovalSummaryView::Payment {
                 source: SOURCE.to_owned(),
                 to: summary_to.clone(),
+                to_base: None,
                 amount_stroops: *summary_amount_stroops,
                 asset: summary_asset.clone(),
                 dest_asset: None,

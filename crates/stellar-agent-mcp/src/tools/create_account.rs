@@ -16,7 +16,7 @@ use crate::tools::common::{
     APPROVAL_TTL_MS, CLASSIC_SINGLE_OPERATION_COUNT, DEFAULT_NONCE_TTL_MS, DispatchOutcome,
     commit_envelope_and_verify_nonce, commit_path_error_result, ledger_err_result, nonce_id_prefix,
     redacted_wallet_error_envelope, resolve_classic_fee_per_op_stroops, total_classic_fee_stroops,
-    validate_g_strkey, verify_attestation_gate,
+    validate_g_strkey, validate_plain_account, verify_attestation_gate,
 };
 use stellar_agent_core::amount::McpAmountArgument;
 use stellar_agent_core::approval::retry::{
@@ -392,7 +392,7 @@ impl WalletServer {
         });
         // ── Validate G-strkeys ────────────────────────────────────────────────
         validate_g_strkey(&args.source, "source")?;
-        validate_g_strkey(&args.destination, "destination")?;
+        validate_plain_account(&args.destination, "destination")?;
 
         // ── Fetch source account state ────────────────────────────────────────
         let client = match self.write_primary_client() {
@@ -953,7 +953,7 @@ impl WalletServer {
         // malformed value as a redacted RPC-error business envelope instead of
         // this dedicated `invalid_params` protocol error.
         validate_g_strkey(&args.source, "source")?;
-        validate_g_strkey(&args.destination, "destination")?;
+        validate_plain_account(&args.destination, "destination")?;
 
         // Policy evaluates the account state that also supplies the rebuild's
         // sequence number. No nonce consumption, approval write or signing

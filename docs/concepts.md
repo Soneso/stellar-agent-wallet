@@ -213,6 +213,8 @@ them. A rule without a table, its allow list, and its caps are unaffected.
 Address kinds are alternatives. G_ACCOUNT covers G and M; C_ACCOUNT covers C and W.
 A destination is listed only when its kind is selected and its exact string or
 base G or C appears in the list. An exact M or W entry covers only that mux id.
+A G entry covers that G and every M on its key. An M entry leaves its G base
+and every other mux id on that key unlisted.
 Issuer and verified-domain checks also apply before the mode.
 A missing destination or asset, an unverified home domain, a reserved kind,
 or a gated-inflow failure refuses in every mode.

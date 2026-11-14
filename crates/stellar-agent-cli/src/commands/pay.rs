@@ -134,6 +134,7 @@ use clap::{ArgGroup, Args};
 use stellar_agent_core::StellarAmount;
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::{AuthError, FeeSource, NetworkError, ValidationError, WalletError};
+use stellar_agent_core::payment_accounts::PaymentAccount;
 use stellar_agent_core::policy::PolicyEngine;
 use stellar_agent_core::policy::v1::{AccountIdentityView, AccountReservesView};
 use stellar_agent_network::mainnet::MainnetConsumer;
@@ -1810,15 +1811,12 @@ async fn read_destination(
 }
 
 /// Account reads and witnesses address the G account underlying an M destination.
+///
+/// Input that is neither G nor M passes unchanged, so the read refuses it.
 fn payment_account_address(destination: &str) -> String {
-    stellar_strkey::ed25519::MuxedAccount::from_string(destination).map_or_else(
+    PaymentAccount::parse(destination).map_or_else(
         |_| destination.to_owned(),
-        |muxed| {
-            stellar_strkey::ed25519::PublicKey(muxed.ed25519)
-                .to_string()
-                .as_str()
-                .to_owned()
-        },
+        |address| address.base_account().to_owned(),
     )
 }
 
@@ -1826,7 +1824,7 @@ fn payment_account_address(destination: &str) -> String {
 struct PaymentObservations<'a> {
     /// The source account view the build or the staged gate read.
     source_view: &'a stellar_agent_network::AccountView,
-    /// The destination G account.
+    /// The destination as built; the witness observes its G base account.
     destination: &'a str,
     /// The destination view, `None` when the destination does not exist.
     dest_view: Option<&'a stellar_agent_network::AccountView>,
@@ -1905,7 +1903,7 @@ async fn payment_witness_inputs(
         inputs: PayWitnessInputs {
             source,
             destination: DestinationObservation::from_view(
-                observed.destination,
+                &payment_account_address(observed.destination),
                 observed.dest_view,
             ),
             memo: observed.memo,
@@ -6109,6 +6107,389 @@ pub(crate) mod tests {
         );
     }
 
+    /// Owner tests for muxed payment destinations at the CLI surface. Each
+    /// owner test uses its own destination key.
+    mod muxed_destination {
+        use super::witness_full::{ISSUER, Run, args, assert_refused, profile_for, run_stage};
+        use super::*;
+        use crate::test_rpc::{
+            ClassicRpc, account_key, account_xdr, fail_read_of, memo_required_xdr, methods, sent,
+            trustline_xdr,
+        };
+        use stellar_xdr::{
+            Limits, MuxedAccount as XdrMuxed, MuxedAccountMed25519, OperationBody, PaymentOp,
+            ReadXdr, TransactionEnvelope, Uint256,
+        };
+
+        fn g(key: [u8; 32]) -> String {
+            format!("{}", stellar_strkey::ed25519::PublicKey(key))
+        }
+
+        fn m(key: [u8; 32], id: u64) -> String {
+            format!(
+                "{}",
+                stellar_strkey::ed25519::MuxedAccount { ed25519: key, id }
+            )
+        }
+
+        /// G, M0 and M17 of `key`, with the XDR each must emit.
+        fn forms(key: [u8; 32]) -> [(String, XdrMuxed); 3] {
+            let muxed = |id| {
+                XdrMuxed::MuxedEd25519(MuxedAccountMed25519 {
+                    id,
+                    ed25519: Uint256(key),
+                })
+            };
+            [
+                (g(key), XdrMuxed::Ed25519(Uint256(key))),
+                (m(key, 0), muxed(0)),
+                (m(key, 17), muxed(17)),
+            ]
+        }
+
+        fn payment_of(envelope: &str) -> PaymentOp {
+            let TransactionEnvelope::Tx(envelope) =
+                TransactionEnvelope::from_xdr_base64(envelope, Limits::none()).unwrap()
+            else {
+                panic!("a v1 envelope");
+            };
+            let OperationBody::Payment(payment) = envelope.tx.operations[0].body.clone() else {
+                panic!("a payment");
+            };
+            payment
+        }
+
+        /// The payment the endpoint was asked to send.
+        async fn sent_payment(server: &MockServer) -> PaymentOp {
+            let sends: Vec<serde_json::Value> = server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter_map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).ok())
+                .filter(|body| body["method"] == "sendTransaction")
+                .collect();
+            assert_eq!(sends.len(), 1, "one send");
+            payment_of(sends[0]["params"]["transaction"].as_str().unwrap())
+        }
+
+        /// Every ledger key `server` was asked to read.
+        async fn read_keys(server: &MockServer) -> Vec<String> {
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter_map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).ok())
+                .filter(|body| body["method"] == "getLedgerEntries")
+                .flat_map(|body| {
+                    body["params"]["keys"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|k| k.as_str().map(str::to_owned))
+                })
+                .collect()
+        }
+
+        /// A primary and an oracle that both report the signer, the
+        /// destination base when `base` is set, and the signer's USD trustline.
+        async fn endpoints(signer: &EnvSigner, base: Option<&str>) -> (MockServer, MockServer) {
+            let accounts: Vec<&str> = std::iter::once(signer.g.as_str()).chain(base).collect();
+            let (key, entry) = trustline_xdr(&signer.g, "USD", ISSUER, 500_000_000, i64::MAX, 1);
+            let primary = ClassicRpc::testnet(&accounts)
+                .with_entry(key.clone(), entry.clone())
+                .serve()
+                .await;
+            let oracle = ClassicRpc::testnet(&accounts)
+                .with_entry(key, entry)
+                .serve()
+                .await;
+            (primary, oracle)
+        }
+
+        /// The test's one witnessing profile, re-pointed at `primary` and
+        /// `oracle`. The profile is built once per test, because building it
+        /// rotates the profile's audit key.
+        fn witnessing(
+            profile: &Profile,
+            primary: &MockServer,
+            oracle: &MockServer,
+            _audit: &tempfile::TempDir,
+        ) -> Profile {
+            let mut profile = profile.clone();
+            profile.rpc_url = primary.uri();
+            profile.oracle_provider_url = Some(url::Url::parse(&oracle.uri()).unwrap());
+            profile
+        }
+
+        /// A profile that witnesses every USD payment; native payments of
+        /// [`to`] reach the native floor.
+        async fn witness_profile_once(signer: &EnvSigner, audit: &tempfile::TempDir) -> Profile {
+            let placeholder = ClassicRpc::testnet(&[&signer.g]).serve().await;
+            let mut profile = profile_for(signer, &placeholder, Some(&placeholder), audit);
+            let usd = stellar_agent_core::asset_id::CanonicalAsset::parse_threshold_key(&format!(
+                "USD:{ISSUER}"
+            ))
+            .unwrap();
+            profile.cross_check_thresholds =
+                stellar_agent_core::cross_check::CrossCheckThresholds::new(
+                    [(usd, 1)].into_iter().collect(),
+                )
+                .unwrap();
+            profile
+        }
+
+        fn to(
+            signer: &EnvSigner,
+            primary: &MockServer,
+            destination: &str,
+            issued: bool,
+        ) -> PayArgs {
+            let mut args = args(signer, primary);
+            args.destination = destination.to_owned();
+            args.amount = "2000 XLM".to_owned();
+            if issued {
+                args.asset = format!("USD:{ISSUER}");
+                args.amount = "5 USD".to_owned();
+            }
+            args
+        }
+
+        fn assert_passed(run: &Run, label: &str) {
+            assert_eq!(run.code, 0, "{label}: {}", run.envelope);
+            assert_eq!(
+                run.envelope["data"]["cross_check"]["status"], "passed",
+                "{label}: {}",
+                run.envelope
+            );
+        }
+
+        /// CLI payment works. Build-only, the full pipeline, sign-only
+        /// and submit-only pay G, M0 and M17 in native and issued assets; the
+        /// decoded XDR keeps the key and ID and the witness passes on the base.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn cli_muxed_payment_pipeline() {
+            let key = [0xA5; 32];
+            let base = g(key);
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let signer = EnvSigner::new([0x5C; 32], "PAY_MUXED_PIPELINE_SK");
+            let once = witness_profile_once(&signer, &audit).await;
+            for issued in [false, true] {
+                for (destination, emitted) in forms(key) {
+                    let label = format!("{destination} issued={issued}");
+
+                    // Build-only emits the destination unchanged.
+                    let (primary, oracle) = endpoints(&signer, Some(&base)).await;
+                    let profile = witnessing(&once, &primary, &oracle, &audit);
+                    let mut build = to(&signer, &primary, &destination, issued);
+                    build.build_only = true;
+                    build.secret_env = None;
+                    let built = run_stage(&build, &profile).await;
+                    assert_eq!(built.code, 0, "{label}: {}", built.envelope);
+                    let unsigned = built.envelope["data"]["envelope_xdr"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    assert_eq!(payment_of(&unsigned).destination, emitted, "{label}");
+
+                    // The full pipeline sends its own amount, so its bytes
+                    // differ from the staged flow's, and witnesses the base.
+                    let (primary, oracle) = endpoints(&signer, Some(&base)).await;
+                    let profile = witnessing(&once, &primary, &oracle, &audit);
+                    let mut full = to(&signer, &primary, &destination, issued);
+                    full.amount = if issued { "6 USD" } else { "2001 XLM" }.to_owned();
+                    let full = run_stage(&full, &profile).await;
+                    assert_passed(&full, &label);
+                    assert_eq!(sent_payment(&primary).await.destination, emitted, "{label}");
+                    assert!(read_keys(&oracle).await.contains(&account_key(&base)));
+
+                    // Sign-only signs the built bytes; submit-only sends them.
+                    let (primary, oracle) = endpoints(&signer, Some(&base)).await;
+                    let profile = witnessing(&once, &primary, &oracle, &audit);
+                    let mut sign = to(&signer, &primary, &destination, issued);
+                    sign.sign_only = Some(unsigned.clone());
+                    let signed = run_stage(&sign, &profile).await;
+                    assert_passed(&signed, &label);
+                    let signed_xdr = signed.envelope["data"]["envelope_xdr"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    assert_eq!(payment_of(&signed_xdr).destination, emitted, "{label}");
+                    assert!(read_keys(&oracle).await.contains(&account_key(&base)));
+
+                    let (primary, oracle) = endpoints(&signer, Some(&base)).await;
+                    let profile = witnessing(&once, &primary, &oracle, &audit);
+                    let mut submit = to(&signer, &primary, &destination, issued);
+                    submit.secret_env = None;
+                    submit.submit_only = Some(signed_xdr);
+                    let submitted = run_stage(&submit, &profile).await;
+                    assert_passed(&submitted, &label);
+                    assert_eq!(sent_payment(&primary).await.destination, emitted, "{label}");
+                }
+            }
+        }
+
+        /// Destination reads use the base. The full pipeline
+        /// reads the G base of M0 and M17 on the primary and the oracle,
+        /// takes an absent base for absent, and refuses another failed read.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn muxed_destination_reads() {
+            let key = [0xA7; 32];
+            let base = g(key);
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let signer = EnvSigner::new([0x5D; 32], "PAY_MUXED_READS_SK");
+            let once = witness_profile_once(&signer, &audit).await;
+            for destination in [m(key, 0), m(key, 17)] {
+                for exists in [true, false] {
+                    let (primary, oracle) =
+                        endpoints(&signer, exists.then_some(base.as_str())).await;
+                    let profile = witnessing(&once, &primary, &oracle, &audit);
+                    let mut args = to(&signer, &primary, &destination, false);
+                    // Each send needs its own bytes in the shared receipt store.
+                    args.amount = if exists { "2000 XLM" } else { "2001 XLM" }.to_owned();
+                    let run = run_stage(&args, &profile).await;
+                    assert_passed(&run, &format!("{destination} exists={exists}"));
+                    for server in [&primary, &oracle] {
+                        assert!(read_keys(server).await.contains(&account_key(&base)));
+                    }
+                }
+                let (primary, oracle) = endpoints(&signer, Some(&base)).await;
+                fail_read_of(&primary, &account_key(&base)).await;
+                let profile = witnessing(&once, &primary, &oracle, &audit);
+                let run = run_stage(&to(&signer, &primary, &destination, false), &profile).await;
+                assert_refused(&run, "network.rpc_unreachable", &primary).await;
+            }
+        }
+
+        /// Only SEP-29 is skipped. M0 and M17 without a memo
+        /// read no data entry though their base sets the flag; the G base
+        /// without a memo refuses and with a memo pays.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn muxed_sep29_exception() {
+            let key = [0xA8; 32];
+            let base = g(key);
+            let (data_key, data_entry) = memo_required_xdr(&base);
+            let serve = |signer: &EnvSigner| {
+                ClassicRpc::testnet(&[&signer.g, &base])
+                    .with_entry(data_key.clone(), data_entry.clone())
+            };
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let signer = EnvSigner::new([0x5E; 32], "PAY_MUXED_SEP29_SK");
+            let once = witness_profile_once(&signer, &audit).await;
+            for destination in [m(key, 0), m(key, 17)] {
+                let primary = serve(&signer).serve().await;
+                let oracle = serve(&signer).serve().await;
+                let profile = witnessing(&once, &primary, &oracle, &audit);
+                let run = run_stage(&to(&signer, &primary, &destination, false), &profile).await;
+                assert_passed(&run, &destination);
+                for server in [&primary, &oracle] {
+                    assert!(
+                        !read_keys(server).await.contains(&data_key),
+                        "{destination}"
+                    );
+                }
+            }
+            let primary = serve(&signer).serve().await;
+            let oracle = serve(&signer).serve().await;
+            let profile = witnessing(&once, &primary, &oracle, &audit);
+            let run = run_stage(&to(&signer, &primary, &base, false), &profile).await;
+            assert_refused(&run, "validation.memo_required", &primary).await;
+            let mut with_memo = to(&signer, &primary, &base, false);
+            with_memo.memo_id = Some(7);
+            assert_passed(&run_stage(&with_memo, &profile).await, "G with a memo");
+        }
+
+        /// Safety gates stay. An oracle that disagrees on the
+        /// destination base, a primary serving another network, an oracle
+        /// that cannot be identified and a fee above the cap refuse M0 and
+        /// M17 with the code G gets, before the signer and the send.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn muxed_destination_safety_parity() {
+            let key = [0xB0; 32];
+            let base = g(key);
+            let mut codes = Vec::new();
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let signer = EnvSigner::new([0x5F; 32], "PAY_MUXED_SAFETY_SK");
+            let once = witness_profile_once(&signer, &audit).await;
+            for (destination, _) in forms(key) {
+                let mut seen: Vec<String> = Vec::new();
+                let refused = |run: &Run| {
+                    assert_eq!(run.code, 1, "{}", run.envelope);
+                    assert_eq!(run.signers, 0, "the refusal precedes the signer");
+                    run.envelope["error"]["code"].as_str().unwrap().to_owned()
+                };
+
+                // The oracle reports another home domain on the base.
+                let primary = ClassicRpc::testnet(&[&signer.g, &base]).serve().await;
+                let oracle = ClassicRpc::testnet(&[&signer.g])
+                    .with_entry(
+                        account_key(&base),
+                        account_xdr(&base, 100, 0, "example.org"),
+                    )
+                    .serve()
+                    .await;
+                let profile = witnessing(&once, &primary, &oracle, &audit);
+                let run = run_stage(&to(&signer, &primary, &destination, false), &profile).await;
+                seen.push(refused(&run));
+                assert!(!sent(&primary).await);
+
+                // The primary serves another network.
+                let rpc = ClassicRpc::testnet(&[&signer.g, &base]);
+                rpc.report("Test SDF Future Network ; October 2022");
+                let primary = rpc.serve().await;
+                let oracle = ClassicRpc::testnet(&[&signer.g, &base]).serve().await;
+                let profile = witnessing(&once, &primary, &oracle, &audit);
+                let run = run_stage(&to(&signer, &primary, &destination, false), &profile).await;
+                seen.push(refused(&run));
+                assert!(!sent(&primary).await);
+
+                // The oracle cannot be identified.
+                let primary = ClassicRpc::testnet(&[&signer.g, &base]).serve().await;
+                let rpc = ClassicRpc::testnet(&[&signer.g, &base]);
+                rpc.report("Test SDF Future Network ; October 2022");
+                let oracle = rpc.serve().await;
+                let profile = witnessing(&once, &primary, &oracle, &audit);
+                let run = run_stage(&to(&signer, &primary, &destination, false), &profile).await;
+                seen.push(refused(&run));
+                assert_eq!(methods(&oracle).await, ["getNetwork"]);
+
+                // A fee above the profile cap.
+                let primary = ClassicRpc::testnet(&[&signer.g, &base]).serve().await;
+                let oracle = ClassicRpc::testnet(&[&signer.g, &base]).serve().await;
+                let mut profile = witnessing(&once, &primary, &oracle, &audit);
+                profile.classic_max_fee_per_op_stroops = Some(100);
+                let mut expensive = to(&signer, &primary, &destination, false);
+                expensive.fee = Some("5000".to_owned());
+                let run = run_stage(&expensive, &profile).await;
+                seen.push(refused(&run));
+                assert!(!sent(&primary).await);
+                codes.push(seen);
+            }
+            assert_eq!(
+                codes[0],
+                [
+                    "simulation.divergence",
+                    "network.endpoint_network_mismatch",
+                    "network.witness_unavailable",
+                    "fees.percentile_exceeds_cap",
+                ],
+                "the G refusals"
+            );
+            assert_eq!(codes[0], codes[1], "M0 refuses as G does");
+            assert_eq!(codes[0], codes[2], "M17 refuses as G does");
+        }
+    }
+
     /// The mainnet pipeline over the fixture's stored profile, ceremony and
     /// routed endpoints.
     #[cfg(feature = "mainnet-write")]
@@ -8003,6 +8384,74 @@ pub(crate) mod tests {
                 run.envelope
             );
             assert!(fixture.sent_envelopes().await.is_empty());
+        }
+
+        /// A mainnet and a testnet payment to M0 and M17 of the allowlisted
+        /// base each write an audit payment leg whose `destination_sha256` is
+        /// the SHA-256 of the complete M address. No audit row holds the
+        /// complete address.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn muxed_payment_audit_leg_hashes_the_complete_destination() {
+            use sha2::Digest as _;
+            let key = stellar_strkey::ed25519::PublicKey::from_string(DESTINATION)
+                .unwrap()
+                .0;
+            let agent =
+                stellar_agent_test_support::signed_envelope::account_id_for_seed(AGENT_SEED);
+            for (name, id, testnet) in [
+                ("mainnet-pay-muxed-audit-m0", 0, false),
+                ("mainnet-pay-muxed-audit-m17", 17, false),
+                ("testnet-pay-muxed-audit-m0", 0, true),
+                ("testnet-pay-muxed-audit-m17", 17, true),
+            ] {
+                let destination = format!(
+                    "{}",
+                    stellar_strkey::ed25519::MuxedAccount { ed25519: key, id }
+                );
+                let spec = Spec::new(name).rules(vec![pay_rule("allow", "")]);
+                let spec = if testnet {
+                    spec.testnet()
+                        .primary(ClassicRpc::testnet(&[&agent, DESTINATION]))
+                } else {
+                    spec
+                };
+                let fixture = spec.build().await;
+                let mut args = if testnet {
+                    testnet_args(&fixture)
+                } else {
+                    mainnet_args(&fixture)
+                };
+                args.destination = destination.clone();
+
+                let run = run(&fixture, &args).await;
+
+                assert_eq!(run.code, 0, "{name}: {}", run.envelope);
+                assert_eq!(fixture.sent_envelopes().await.len(), 1, "{name}");
+                let redacted =
+                    stellar_agent_core::observability::redact_strkey_first5_last5(&destination);
+                let expected =
+                    stellar_agent_core::hex::encode(&sha2::Sha256::digest(destination.as_bytes()));
+                let rows = fixture.audit_rows("value_action_pending");
+                let legs: Vec<&Value> = rows
+                    .iter()
+                    .filter_map(|row| row["legs"].as_array())
+                    .flatten()
+                    .collect();
+                assert_eq!(legs.len(), 1, "{name}: {rows:?}");
+                assert_eq!(legs[0]["action"], "payment", "{name}");
+                assert_eq!(legs[0]["destination_redacted"], redacted.as_str(), "{name}");
+                assert_eq!(
+                    legs[0]["destination_sha256"],
+                    expected.as_str(),
+                    "{name}: the leg carries the complete destination's SHA-256"
+                );
+                let log = std::fs::read_to_string(&fixture.profile().audit_log_path).unwrap();
+                assert!(
+                    !log.contains(&destination),
+                    "{name}: no audit row holds the complete destination"
+                );
+            }
         }
 
         /// The total fee of every envelope the mocked endpoints build: one

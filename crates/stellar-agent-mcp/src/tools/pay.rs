@@ -18,7 +18,7 @@ use crate::tools::common::{
     commit_envelope_and_verify_nonce, commit_path_error_result, hash_to_lower_hex,
     ledger_err_result, nonce_id_prefix, redacted_wallet_error_envelope,
     resolve_classic_fee_per_op_stroops, total_classic_fee_stroops, validate_g_strkey,
-    verify_attestation_gate,
+    validate_payment_destination, verify_attestation_gate,
 };
 use stellar_agent_core::amount::McpMemoTextArgument;
 use stellar_agent_core::amount::StellarAmount;
@@ -94,11 +94,11 @@ pub struct StellarPayArgs {
     /// amount plus the transaction fee.
     pub source: String,
 
-    /// G-strkey of the recipient account.
+    /// G-strkey or M-strkey of the recipient account.
     ///
-    /// Must be a valid G-strkey.  The account does not need to exist on-chain
-    /// for non-native payments (but a CreateAccount op is needed for new
-    /// native-XLM accounts).
+    /// An M-strkey keeps its mux ID in the payment; ledger reads use its G
+    /// base account. The destination's base account must exist. Creating an
+    /// account is a separate operation.
     pub destination: String,
 
     /// Payment amount with explicit unit suffix.
@@ -209,7 +209,7 @@ pub struct StellarPayCommitArgs {
     /// G-strkey of the source (funding) account (same as simulate step).
     pub source: String,
 
-    /// G-strkey of the recipient account (same as simulate step).
+    /// G-strkey or M-strkey of the recipient account (same as simulate step).
     pub destination: String,
 
     /// Payment amount with explicit unit suffix (same as simulate step).
@@ -399,7 +399,8 @@ fn memo_summary(memo: &Memo) -> Option<String> {
 ///
 /// # Errors
 ///
-/// Returns `invalid asset: <code>` for an unparseable descriptor, and the
+/// Returns `invalid asset: <code>` for an unparseable descriptor, with the
+/// base-account reason appended for a muxed issuer, and the
 /// refusals of [`resolve_payment_amount`] for the amount.
 pub(crate) fn parse_asset_and_amount(
     asset: &str,
@@ -407,7 +408,10 @@ pub(crate) fn parse_asset_and_amount(
     amount_in_stroops: Option<String>,
 ) -> Result<(Asset, StellarAmount), rmcp::ErrorData> {
     let asset = Asset::parse(asset).map_err(|error| {
-        rmcp::ErrorData::invalid_params(format!("invalid asset: {}", error.code()), None)
+        rmcp::ErrorData::invalid_params(
+            crate::tools::common::asset_refusal_text("invalid asset", &error),
+            None,
+        )
     })?;
     let amount = resolve_payment_amount(amount, amount_in_stroops, &asset)?;
     Ok((asset, amount))
@@ -588,7 +592,8 @@ impl WalletServer {
     /// Returns a tool-level error (not a JSON-RPC error) when:
     /// - The policy engine denies the call.
     /// - `chain_id` does not match the profile's configured chain.
-    /// - `source` or `destination` are not valid G-strkeys.
+    /// - `source` is not a valid G-strkey or `destination` is not a valid G or
+    ///   M strkey.
     /// - `asset` cannot be parsed.
     /// - Multiple memo variants are provided simultaneously.
     /// - The SEP-29 check fails (`validation.memo_required`).
@@ -626,7 +631,10 @@ impl WalletServer {
         name = "stellar_pay",
         description = "Build a Payment transaction envelope and mint a single-use nonce \
                        (simulate step). Supports native XLM and non-native assets. \
-                       Runs SEP-29 memo-required enforcement at simulate time on the primary RPC. \
+                       The destination is a G or M address; an M address keeps its mux ID \
+                       and ledger reads use its G base account. \
+                       Runs SEP-29 memo-required enforcement at simulate time on the primary RPC \
+                       for a G destination; an M destination skips it. \
                        Returns {envelope_xdr, nonce, expires_at_unix_ms, simulation}. \
                        The result carries operational {latest_ledger, close_time_unix, \
                        close_lag_seconds}, the endpoint ledger the readiness check observed. \
@@ -661,9 +669,9 @@ impl WalletServer {
             "amount_stroops": payment_amount.as_stroops().to_string(),
             "asset": &args.asset,
         });
-        // ── Validate G-strkeys ────────────────────────────────────────────────
+        // ── Validate strkeys: a G source and a G or M destination ────────────
         validate_g_strkey(&args.source, "source")?;
-        validate_g_strkey(&args.destination, "destination")?;
+        let destination = validate_payment_destination(&args.destination, "destination")?;
 
         // ── Parse memo (mutual exclusivity check) ─────────────────────────────
         let memo = match parse_memo_fields(
@@ -792,8 +800,11 @@ impl WalletServer {
         // The source AccountView feeds the `minimum_reserve` criterion; the
         // destination's on-chain `home_domain` feeds `home_domain_resolved`. The
         // destination fetch is non-fatal: a not-yet-created destination has no
-        // home_domain, so `identity_view` is simply `None`.
-        let dest_view = fetch_account(&client, &args.destination, &[]).await.ok();
+        // home_domain, so `identity_view` is simply `None`. An M destination
+        // reads its G base account.
+        let dest_view = fetch_account(&client, destination.base_account(), &[])
+            .await
+            .ok();
         let source_adapter = crate::policy_adapter::AccountViewAdapter::new(&account_view);
         let dest_adapter = dest_view
             .as_ref()
@@ -1273,7 +1284,8 @@ impl WalletServer {
     ///   (`simulation.divergence`).
     /// - The policy engine denies the call (mainnet + destructive).
     /// - `chain_id` does not match the profile.
-    /// - `source` or `destination` are invalid G-strkeys.
+    /// - `source` is not a valid G-strkey or `destination` is not a valid G or
+    ///   M strkey.
     /// - The nonce is expired, replayed, or HMAC-mismatched.
     /// - The re-built envelope diverges from `envelope_xdr`.
     /// - The signing key does not match the source account.
@@ -1389,13 +1401,13 @@ impl WalletServer {
         // The call supplies chain_id because XDR contains no chain identifier.
         authoritative_args["chain_id"] = serde_json::Value::String(args.chain_id.clone());
 
-        // ── Validate G-strkeys ────────────────────────────────────────────────
+        // ── Validate strkeys: a G source and a G or M destination ────────────
         // Runs BEFORE the account fetch below: `fetch_account` itself parses
-        // `args.source`/`args.destination` via the same strkey check and would
-        // otherwise surface a malformed value as a redacted RPC-error business
-        // envelope instead of this dedicated `invalid_params` protocol error.
+        // `args.source` and the destination base via the same strkey check and
+        // would otherwise surface a malformed value as a redacted RPC-error
+        // business envelope instead of this dedicated `invalid_params` error.
         validate_g_strkey(&args.source, "source")?;
-        validate_g_strkey(&args.destination, "destination")?;
+        let destination = validate_payment_destination(&args.destination, "destination")?;
 
         // Policy evaluates the account state that also supplies the rebuild's
         // sequence number. No nonce consumption, approval write or signing
@@ -1466,8 +1478,9 @@ impl WalletServer {
         // simulate phase): a not-yet-created destination has no
         // `home_domain`, so `identity_view` is `None`. Any other read error
         // refuses with its own code, so a transient primary failure is never
-        // taken for absence and compared against the oracle as such.
-        let dest_view = match fetch_account(&client, &args.destination, &[]).await {
+        // taken for absence and compared against the oracle as such. An M
+        // destination reads its G base account.
+        let dest_view = match fetch_account(&client, destination.base_account(), &[]).await {
             Ok(view) => Some(view),
             Err(stellar_agent_core::WalletError::Network(
                 stellar_agent_core::error::NetworkError::AccountNotFound { .. },
@@ -1649,10 +1662,24 @@ impl WalletServer {
                     .clone()
                     .or_else(|| overridden_gate_effects.clone()),
             };
-        let audit_legs: Vec<stellar_agent_core::audit_log::ValueLegRecord> = gate_value_effects
+        // A payment leg with a destination records the SHA-256 of the
+        // complete destination and its redaction, never the clear text.
+        let audit_legs = gate_value_effects
             .as_ref()
-            .map(|effects| effects.legs().iter().map(Into::into).collect())
-            .unwrap_or_default();
+            .map_or(&[][..], |effects| effects.legs())
+            .iter()
+            .map(|leg| {
+                if leg.destination.is_some() {
+                    stellar_agent_core::audit_log::ValueLegRecord::from_payment_leg(leg)
+                } else {
+                    Ok(leg.into())
+                }
+            })
+            .collect::<Result<Vec<_>, _>>();
+        let audit_legs = match audit_legs {
+            Ok(legs) => legs,
+            Err(err) => return Ok(crate::tools::common::ledger_err_result(&err)),
+        };
 
         // Syntax parsing follows the policy gate; it consumes no nonce.
         let nonce = match stellar_agent_nonce::Nonce::from_base64(&args.nonce) {
@@ -1780,7 +1807,7 @@ impl WalletServer {
         let witness_inputs = stellar_agent_network::cross_check::PayWitnessInputs {
             source: source_observation,
             destination: stellar_agent_network::cross_check::DestinationObservation::from_view(
-                &args.destination,
+                destination.base_account(),
                 dest_view.as_ref(),
             ),
             memo: memo_observation,

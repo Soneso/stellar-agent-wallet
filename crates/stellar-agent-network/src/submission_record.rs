@@ -194,6 +194,12 @@ pub struct SubmissionIntent {
     /// send margin. Another submission carries the send-by instant its caller
     /// passed, converted at the moment the intent is built.
     pub send_by_ms: Option<u64>,
+
+    /// The full `M...` destination of a one-operation payment envelope,
+    /// decoded from the bytes about to be sent; `None` for every other
+    /// envelope, including one with several operations. The receipt claim
+    /// records it.
+    pub destination: Option<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1342,18 +1348,23 @@ impl WalletSubmissionRecorder<'_> {
     /// another receipt holds, and `submission.record_unavailable` when the
     /// receipt store fails. Nothing of this attempt exists then.
     fn claim_receipt(&self, intent: &SubmissionIntent) -> Result<(), WalletError> {
-        let claim = |releases: &dyn stellar_agent_core::profile::receipt::SequenceReleases| {
-            self.receipts.begin_submission_releasing(
-                &intent.envelope_hash,
-                &intent.tx_hash,
-                &intent.source,
-                intent.sequence,
-                intent.max_time,
-                intent.submission_ledger,
-                self.approval.as_ref().map(|a| a.approval_nonce.as_str()),
-                releases,
-            )
-        };
+        // The destination is decoded from the envelope about to be sent, so
+        // the receipt carries it whatever value legs the policy produced.
+        let destination = intent.destination.as_deref();
+        let claim =
+            |releases: Option<&dyn stellar_agent_core::profile::receipt::SequenceReleases>| {
+                self.receipts.begin_submission_to(
+                    &intent.envelope_hash,
+                    &intent.tx_hash,
+                    &intent.source,
+                    intent.sequence,
+                    intent.max_time,
+                    intent.submission_ledger,
+                    self.approval.as_ref().map(|a| a.approval_nonce.as_str()),
+                    releases,
+                    destination,
+                )
+            };
         let outcome = if self.profile.chain_id.is_mainnet() {
             let writer = self
                 .audit
@@ -1369,19 +1380,11 @@ impl WalletSubmissionRecorder<'_> {
                 &self.window,
                 self.profile,
                 &writer,
-                claim,
+                |releases| claim(Some(releases)),
             )
             .map_err(crate::operation_entry::operation_refusal)?
         } else {
-            self.receipts.begin_submission_with_approval(
-                &intent.envelope_hash,
-                &intent.tx_hash,
-                &intent.source,
-                intent.sequence,
-                intent.max_time,
-                intent.submission_ledger,
-                self.approval.as_ref().map(|a| a.approval_nonce.as_str()),
-            )
+            claim(None)
         };
         match outcome {
             Ok(BeginSubmissionOutcome::Recorded) => Ok(()),
@@ -2237,6 +2240,7 @@ mod tests {
                 submission_ledger: 1,
                 submission_anchor: None,
                 send_by_ms: None,
+                destination: None,
             };
             let binding = crate::IntentBinding::new(&exposure, &changed);
             let error = recorder
@@ -2419,6 +2423,7 @@ mod tests {
                 submission_ledger: 1,
                 submission_anchor: None,
                 send_by_ms: None,
+                destination: None,
             }
         };
         let intent = make_intent(&envelope);
@@ -2688,6 +2693,7 @@ mod tests {
             submission_ledger: 1,
             submission_anchor: None,
             send_by_ms: None,
+            destination: None,
         };
         recorder
             .pre_send_bound(&intent, &crate::IntentBinding::new(&exposure, &envelope))
@@ -3008,6 +3014,7 @@ mod tests {
                 submission_ledger: 1,
                 submission_anchor: None,
                 send_by_ms: None,
+                destination: None,
             };
             let result = recorder
                 .pre_send_bound(&intent, &crate::IntentBinding::new(&exposure, &envelope))
@@ -3109,6 +3116,7 @@ mod tests {
             submission_ledger: 123,
             submission_anchor: None,
             send_by_ms: None,
+            destination: None,
         };
         let audit_before = std::fs::read(&profile.audit_log_path).unwrap();
         let window_before = std::fs::read(dir.path().join("state.window")).unwrap();
@@ -3223,6 +3231,7 @@ mod tests {
             submission_ledger: 123,
             submission_anchor: None,
             send_by_ms: None,
+            destination: None,
         };
         recorder.pre_send(&intent).await.unwrap();
         recorder
@@ -3335,6 +3344,7 @@ mod tests {
                 submission_ledger: 123,
                 submission_anchor: None,
                 send_by_ms: None,
+                destination: None,
             };
             recorder.pre_send(&intent).await.unwrap();
             recorder
@@ -3418,6 +3428,7 @@ mod tests {
             submission_ledger: 123,
             submission_anchor: None,
             send_by_ms: Some(now + 1_000),
+            destination: None,
         };
         let unsent = intent("7a", "8b");
         recorder.pre_send(&unsent).await.unwrap();
@@ -3534,6 +3545,7 @@ mod tests {
             submission_ledger: 123,
             submission_anchor: None,
             send_by_ms: None,
+            destination: None,
         };
         recorder.pre_send(&intent).await.unwrap();
         std::fs::remove_file(receipts.file_path().unwrap()).unwrap();

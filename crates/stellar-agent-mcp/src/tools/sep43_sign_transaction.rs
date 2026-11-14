@@ -724,4 +724,135 @@ mod tests {
             "fail-closed approval refusal must not produce a signature; got: {text}"
         );
     }
+
+    /// Supplied XDR keeps M. Signing a supplied payment, both path
+    /// payments and an account merge to G, M0 and M17 returns the same
+    /// transaction bytes with one signature added.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn muxed_supplied_xdr_preserved() {
+        use base64::Engine as _;
+        use stellar_xdr::{
+            Asset, Limits, Memo, MuxedAccount, MuxedAccountMed25519, Operation, OperationBody,
+            PathPaymentStrictReceiveOp, PathPaymentStrictSendOp, PaymentOp, Preconditions, ReadXdr,
+            SequenceNumber, Transaction, TransactionEnvelope, TransactionExt,
+            TransactionV1Envelope, Uint256, WriteXdr,
+        };
+        stellar_agent_test_support::keyring_mock::install().ok();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = [0x5Bu8; 32];
+        let source = ed25519_dalek::SigningKey::from_bytes(&seed)
+            .verifying_key()
+            .to_bytes();
+        let derived_g = stellar_strkey::ed25519::PublicKey(source).to_string();
+        keyring_core::Entry::new("svc-s43tx-mux", &derived_g)
+            .unwrap()
+            .set_password(
+                stellar_strkey::ed25519::PrivateKey(seed)
+                    .as_unredacted()
+                    .to_string()
+                    .as_str(),
+            )
+            .unwrap();
+        let profile =
+            Profile::builder_testnet("svc-s43tx-mux", derived_g.as_str(), "n-svc", "n-acct")
+                .with_noop_engine()
+                .audit_log_path(dir.path().join("audit.jsonl"))
+                .build();
+        let coord = profile.audit_log_hash_chain_key_id.clone();
+        keyring_core::Entry::new(&coord.service, &coord.account)
+            .unwrap()
+            .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x41u8; 32]))
+            .unwrap();
+        crate::tools::identity_fixture::store_signer_identity(&profile, seed);
+        let server = crate::server::WalletServer::new(profile).expect("WalletServer::new");
+
+        let key = [0xAF; 32];
+        let destinations = [
+            MuxedAccount::Ed25519(Uint256(key)),
+            MuxedAccount::MuxedEd25519(MuxedAccountMed25519 {
+                id: 0,
+                ed25519: Uint256(key),
+            }),
+            MuxedAccount::MuxedEd25519(MuxedAccountMed25519 {
+                id: 17,
+                ed25519: Uint256(key),
+            }),
+        ];
+        for destination in destinations {
+            let bodies = [
+                OperationBody::Payment(PaymentOp {
+                    destination: destination.clone(),
+                    asset: Asset::Native,
+                    amount: 5,
+                }),
+                OperationBody::PathPaymentStrictReceive(PathPaymentStrictReceiveOp {
+                    send_asset: Asset::Native,
+                    send_max: 9,
+                    destination: destination.clone(),
+                    dest_asset: Asset::Native,
+                    dest_amount: 5,
+                    path: Vec::new().try_into().unwrap(),
+                }),
+                OperationBody::PathPaymentStrictSend(PathPaymentStrictSendOp {
+                    send_asset: Asset::Native,
+                    send_amount: 9,
+                    destination: destination.clone(),
+                    dest_asset: Asset::Native,
+                    dest_min: 5,
+                    path: Vec::new().try_into().unwrap(),
+                }),
+                OperationBody::AccountMerge(destination.clone()),
+            ];
+            for (sequence, body) in (1_i64..).zip(bodies) {
+                let tx = Transaction {
+                    source_account: MuxedAccount::Ed25519(Uint256(source)),
+                    fee: 100,
+                    seq_num: SequenceNumber(sequence),
+                    cond: Preconditions::None,
+                    memo: Memo::None,
+                    operations: vec![Operation {
+                        source_account: None,
+                        body,
+                    }]
+                    .try_into()
+                    .unwrap(),
+                    ext: TransactionExt::V0,
+                };
+                let unsigned = TransactionEnvelope::Tx(TransactionV1Envelope {
+                    tx: tx.clone(),
+                    signatures: Vec::new().try_into().unwrap(),
+                })
+                .to_xdr_base64(Limits::none())
+                .unwrap();
+                let result = server
+                    .call_stellar_sep43_sign_transaction(Sep43SignTransactionArgs {
+                        chain_id: "stellar:testnet".to_owned(),
+                        transaction_xdr: unsigned,
+                        network_passphrase: None,
+                        address: None,
+                    })
+                    .await
+                    .expect("sign");
+                let text = result.content[0].as_text().unwrap().text.clone();
+                assert_ne!(result.is_error, Some(true), "{text}");
+                let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+                let signed = json["data"]["signedTxXdr"]
+                    .as_str()
+                    .or_else(|| json["signedTxXdr"].as_str())
+                    .unwrap_or_else(|| panic!("{text}"));
+                let TransactionEnvelope::Tx(signed) =
+                    TransactionEnvelope::from_xdr_base64(signed, Limits::none()).unwrap()
+                else {
+                    panic!("a v1 envelope");
+                };
+                assert_eq!(signed.signatures.len(), 1);
+                assert_eq!(
+                    signed.tx.to_xdr(Limits::none()).unwrap(),
+                    tx.to_xdr(Limits::none()).unwrap(),
+                    "the signed operation bytes are the supplied ones: {destination:?}"
+                );
+            }
+        }
+    }
 }

@@ -97,6 +97,34 @@ pub(crate) struct SubmitRecord<'a> {
     pub now_ms: u64,
 }
 
+/// The audit legs of `effects` for a submission of `tool`.
+///
+/// A destination-bearing leg of `stellar_pay` or `stellar_pay_commit`
+/// takes [`ValueLegRecord::from_payment_leg`], which records the SHA-256 of
+/// the complete destination. Every other leg takes the generic conversion.
+///
+/// # Errors
+///
+/// `validation.address_invalid` when such a payment destination is not a
+/// canonical G or M address.
+fn audit_legs(
+    tool: &str,
+    effects: Option<&ValueEffects>,
+) -> Result<Vec<ValueLegRecord>, WalletError> {
+    let pay = matches!(tool, "stellar_pay" | "stellar_pay_commit");
+    effects
+        .map_or(&[][..], ValueEffects::legs)
+        .iter()
+        .map(|leg| {
+            if pay && leg.destination.is_some() {
+                ValueLegRecord::from_payment_leg(leg)
+            } else {
+                Ok(leg.into())
+            }
+        })
+        .collect()
+}
+
 /// Builds the recorder for one submission.
 ///
 /// The window entries come from the policy engine's own accounting for this
@@ -114,10 +142,7 @@ pub(crate) fn build_recorder(
 ) -> Result<WalletSubmissionRecorder<'_>, WalletError> {
     let receipts = open_receipts(&record.profile_name)?;
 
-    let legs: Vec<ValueLegRecord> = record
-        .effects
-        .map(|e| e.legs().iter().map(Into::into).collect())
-        .unwrap_or_default();
+    let legs = audit_legs(record.tool, record.effects)?;
 
     let engine = || {
         crate::commands::policy_engine::build_v1_policy_engine(
@@ -264,9 +289,7 @@ pub(crate) fn prepare_mainnet_recorder<'a>(
     let receipts = open_receipts(&profile_name)?;
     let now_ms = stellar_agent_network::mainnet::clock::now_ms()
         .map_err(|e| record_unavailable(format!("the clock could not be read: {e}")))?;
-    let legs: Vec<ValueLegRecord> = effects
-        .map(|e| e.legs().iter().map(Into::into).collect())
-        .unwrap_or_default();
+    let legs = audit_legs(tool, effects)?;
     Ok(PreparedMainnetRecorder {
         profile: context.profile(),
         tombstone: match authority {

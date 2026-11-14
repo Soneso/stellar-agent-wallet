@@ -132,6 +132,10 @@ struct RecordView {
     /// identifier proves nothing.
     #[serde(skip_serializing_if = "Option::is_none")]
     settlement_decision_id: Option<String>,
+    /// The full muxed `M...` payment destination the receipt records.
+    /// Absent for every other receipt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    destination: Option<String>,
 }
 
 /// Authenticated hold identity, available even when its receipt is absent.
@@ -273,6 +277,7 @@ fn record_view(receipt: &SubmissionReceipt, reservation_open: bool) -> RecordVie
         release_code: receipt.release_code.map(ReleaseEvidence::code),
         settlement_evidence: "unavailable",
         settlement_decision_id: receipt.settlement_decision_id.clone(),
+        destination: receipt.destination.clone(),
     }
 }
 

@@ -18,11 +18,13 @@ use std::{collections::HashMap, sync::Arc};
 
 use rmcp::ErrorData;
 use serde_json::Value;
+use stellar_agent_core::classic_address::require_account_id;
 use stellar_agent_core::error::{WalletError, WalletStateError};
 use stellar_agent_core::mainnet::decision::{
     EvaluationScope, MainnetDecision, MainnetEvaluationRequest, MainnetRefusal, evaluate_mainnet,
 };
 use stellar_agent_core::observability::redact_strkey_first5_last5 as redact_account_id_value;
+use stellar_agent_core::payment_accounts::PaymentAccount;
 use stellar_agent_core::policy::{
     ApprovalRequest, BuildRegistryError, Decision, DenyReason, McpToolRegistration, ToolDescriptor,
     policy_now_ms,
@@ -468,6 +470,71 @@ pub(crate) fn validate_g_strkey(value: &str, field_label: &str) -> Result<(), Er
         ));
     }
     Ok(())
+}
+
+/// Validates a payment destination as a `G...` or `M...` strkey, naming
+/// `field_label` in the refusal.
+///
+/// The returned address keeps the input string and its mux ID; ledger reads
+/// use its base account.
+///
+/// # Errors
+///
+/// Returns `rmcp::ErrorData::invalid_params` for any other input. The refusal
+/// carries the [`validate_g_strkey`] text and states that an M-strkey is also
+/// accepted. The input itself never appears in the refusal.
+pub(crate) fn validate_payment_destination(
+    value: &str,
+    field_label: &'static str,
+) -> Result<PaymentAccount, ErrorData> {
+    PaymentAccount::parse(value).map_err(|_| {
+        let detail = validate_g_strkey(value, field_label)
+            .err()
+            .map_or_else(String::new, |err| err.message.into_owned());
+        ErrorData::invalid_params(format!("{detail}; an M-strkey is also accepted"), None)
+    })
+}
+
+/// The text of an asset refusal at the MCP boundary: `"<prefix>: <code>"`,
+/// followed by the base-account reason when the issuer is a muxed address.
+///
+/// The asset refusal text holds only fixed sentences, so the rejected input
+/// never appears.
+pub(crate) fn asset_refusal_text(prefix: &str, error: &WalletError) -> String {
+    let muxed_issuer = matches!(
+        error,
+        WalletError::Validation(stellar_agent_core::error::ValidationError::AssetInvalid { field })
+            if field.contains(stellar_agent_core::classic_address::MUXED_ISSUER_REASON)
+    );
+    if muxed_issuer {
+        format!(
+            "{prefix}: {}: {}",
+            error.code(),
+            stellar_agent_core::classic_address::MUXED_ISSUER_REASON
+        )
+    } else {
+        format!("{prefix}: {}", error.code())
+    }
+}
+
+/// Validates a field that the protocol types as `AccountId`, naming
+/// `field_label` in the refusal.
+///
+/// # Errors
+///
+/// Returns `rmcp::ErrorData::invalid_params` with the `AccountId` reason for a
+/// valid `M...` input, and the [`validate_g_strkey`] refusal for other input.
+pub(crate) fn validate_plain_account(
+    value: &str,
+    field_label: &'static str,
+) -> Result<(), ErrorData> {
+    match require_account_id(value, field_label) {
+        Ok(_) => Ok(()),
+        Err(err) if PaymentAccount::parse(value).is_ok() => {
+            Err(ErrorData::invalid_params(err.to_string(), None))
+        }
+        Err(_) => validate_g_strkey(value, field_label),
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

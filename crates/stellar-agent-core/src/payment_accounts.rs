@@ -109,6 +109,15 @@ impl PaymentAccount {
             }
         }
     }
+
+    /// Returns the base G account as the XDR `AccountId` a plain account
+    /// field carries.
+    #[must_use]
+    pub fn base_account_id(&self) -> stellar_xdr::AccountId {
+        stellar_xdr::AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256(self.ed25519),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -153,6 +162,18 @@ mod tests {
             assert_eq!(xdr, expected, "{text}");
             // The XDR display renders the complete destination again.
             assert_eq!(xdr.to_string(), text);
+        }
+    }
+
+    #[test]
+    fn base_account_id_is_the_base_key_for_g_and_m() {
+        let expected = stellar_xdr::AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256(KEY),
+        ));
+        for text in [g(), m(0), m(17), m(u64::MAX)] {
+            let account = PaymentAccount::parse(&text).unwrap();
+            assert_eq!(account.base_account_id(), expected, "{text}");
+            assert_eq!(account.base_account_id().to_string(), g(), "{text}");
         }
     }
 
