@@ -96,6 +96,25 @@ impl OperationalReport {
         }
         let close_time_unix = ledger.latest_ledger_close_time.unsigned_abs();
         let latest_ledger = ledger.latest_ledger;
+        Self::from_close_time(latest_ledger, close_time_unix, now_unix)
+    }
+
+    pub(crate) fn from_health_observation(
+        observation: &crate::client::ObservedHealth,
+        now_unix: u64,
+    ) -> Result<Self, WalletError> {
+        let health = &observation.health;
+        if health.status != HEALTHY_STATUS {
+            return Err(not_ready("endpoint reports an unhealthy status".to_owned()));
+        }
+        Self::from_close_time(health.latest_ledger, observation.latest_close, now_unix)
+    }
+
+    fn from_close_time(
+        latest_ledger: u32,
+        close_time_unix: u64,
+        now_unix: u64,
+    ) -> Result<Self, WalletError> {
         let bound = MAX_LEDGER_CLOSE_LAG.as_secs();
         if close_time_unix > now_unix.saturating_add(bound) {
             return Err(not_ready(format!(
@@ -156,10 +175,6 @@ pub async fn operational_check_single(
 
 /// The answers behind one readiness report.
 pub(crate) struct ReadinessRead {
-    /// The health answer the report checks.
-    pub(crate) health: stellar_rpc_client::GetHealthResponse,
-    /// The oldest ledger the endpoint retains.
-    pub(crate) oldest_ledger: u32,
     /// The validated report.
     pub(crate) report: OperationalReport,
 }
@@ -269,11 +284,7 @@ async fn readiness_after_health(
     };
 
     let report = OperationalReport::from_ledger_observation(&health, &ledger, now_unix())?;
-    Ok(ReadinessRead {
-        health,
-        oldest_ledger: ledger.oldest_ledger,
-        report,
-    })
+    Ok(ReadinessRead { report })
 }
 
 /// The deadline a value ceremony's readiness check, and the account read

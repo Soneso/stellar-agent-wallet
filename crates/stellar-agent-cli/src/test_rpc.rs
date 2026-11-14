@@ -273,7 +273,10 @@ impl Respond for ClassicRpc {
                 "latestLedger": 1006,
                 "oldestLedger": 1
             }),
-            "getHealth" => health_result(&self.health_status.lock().unwrap()),
+            "getHealth" => health_result(
+                &self.health_status.lock().unwrap(),
+                now_secs() - *self.close_age_secs.lock().unwrap(),
+            ),
             "getLedgers" => ledgers_result(now_secs() - *self.close_age_secs.lock().unwrap()),
             "getLatestLedger" => json!({
                 "id": "00".repeat(32),
@@ -294,19 +297,21 @@ impl Respond for ClassicRpc {
 /// mocks answer those two methods with it.
 pub(crate) fn operational_result(rpc_method: &str) -> Option<Value> {
     match rpc_method {
-        "getHealth" => Some(health_result("healthy")),
+        "getHealth" => Some(health_result("healthy", now_secs())),
         "getLedgers" => Some(ledgers_result(now_secs())),
         _ => None,
     }
 }
 
 /// A `getHealth` answer reporting `status` with latest ledger 2000.
-fn health_result(status: &str) -> Value {
+fn health_result(status: &str, close_secs: u64) -> Value {
     json!({
         "status": status,
         "latestLedger": 2000,
         "oldestLedger": 1,
-        "ledgerRetentionWindow": 1999
+        "ledgerRetentionWindow": 1999,
+        "oldestLedgerCloseTime": 1,
+        "latestLedgerCloseTime": close_secs
     })
 }
 

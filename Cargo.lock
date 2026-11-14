@@ -4958,6 +4958,7 @@ dependencies = [
  "ed25519-dalek",
  "hmac 0.13.0",
  "http",
+ "http-body-util",
  "jsonrpsee-core",
  "jsonrpsee-http-client",
  "keyring-core",

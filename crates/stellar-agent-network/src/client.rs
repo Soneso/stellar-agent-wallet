@@ -672,30 +672,50 @@ impl StellarRpcClient {
         &self,
         hash: &stellar_xdr::Hash,
     ) -> Result<ObservedTransaction, NetworkError> {
+        self.recovery_transaction(hash)
+            .await
+            .map_err(|error| match error {
+                RecoveryReadError::Rpc(error) => {
+                    rpc_unreachable(&self.url, GET_TRANSACTION_FAILED, &error)
+                }
+                _ => NetworkError::RpcResponseMalformed {
+                    method: "getTransaction".to_owned(),
+                    detail: "the result is not a JSON object".to_owned(),
+                },
+            })
+    }
+
+    pub(crate) async fn recovery_transaction(
+        &self,
+        hash: &stellar_xdr::Hash,
+    ) -> Result<ObservedTransaction, RecoveryReadError> {
         let mut params = ObjectParams::new();
-        params.insert("hash", hash).map_err(|e| {
-            rpc_unreachable(
-                &self.url,
-                GET_TRANSACTION_FAILED,
-                &stellar_rpc_client::Error::JsonRpc(ClientError::ParseError(e)),
-            )
-        })?;
+        params
+            .insert("hash", hash)
+            .map_err(|_| RecoveryReadError::Shape)?;
         let answer: serde_json::Value = self
             .inner
             .client()
             .request("getTransaction", params)
             .await
-            .map_err(|e| {
-                rpc_unreachable(
-                    &self.url,
-                    GET_TRANSACTION_FAILED,
-                    &stellar_rpc_client::Error::JsonRpc(e),
-                )
-            })?;
-        ObservedTransaction::from_json(&answer).ok_or_else(|| NetworkError::RpcResponseMalformed {
-            method: "getTransaction".to_owned(),
-            detail: "the result is not a JSON object".to_owned(),
-        })
+            .map_err(stellar_rpc_client::Error::JsonRpc)?;
+        ObservedTransaction::from_json(&answer).ok_or(RecoveryReadError::Shape)
+    }
+
+    pub(crate) async fn recovery_health(&self) -> Result<ObservedHealth, RecoveryReadError> {
+        let answer: serde_json::Value = self
+            .inner
+            .client()
+            .request("getHealth", ObjectParams::new())
+            .await
+            .map_err(stellar_rpc_client::Error::JsonRpc)?;
+        ObservedHealth::from_json(&answer).ok_or(RecoveryReadError::Shape)
+    }
+
+    pub(crate) async fn recovery_identity(&self) -> Result<EndpointIdentity, RecoveryReadError> {
+        let network = self.inner.get_network().await?;
+        self.validate_mainnet_identity(&network)
+            .map_err(RecoveryReadError::Validation)
     }
 
     /// Issues `sendTransaction` for `envelope` through the RPC client's
@@ -859,24 +879,6 @@ impl StellarRpcClient {
             .await
     }
 
-    /// [`Self::mainnet_endpoint_identity`] with exactly one `getNetwork`
-    /// request and no retry, for a caller that counts every request it sends.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::mainnet_endpoint_identity`]; a failure that a retry might
-    /// have overcome is [`NetworkError::EndpointIdentityUnavailable`].
-    pub(crate) async fn mainnet_endpoint_identity_once(
-        &self,
-        deadline: Instant,
-    ) -> Result<EndpointIdentity, WalletError> {
-        let single = RetryPolicy {
-            max_attempts: 1,
-            ..RetryPolicy::default()
-        };
-        self.mainnet_identity_under(&single, deadline).await
-    }
-
     /// The mainnet identity check, its `getNetwork` request issued under
     /// `policy`.
     async fn mainnet_identity_under(
@@ -885,6 +887,13 @@ impl StellarRpcClient {
         deadline: Instant,
     ) -> Result<EndpointIdentity, WalletError> {
         let network = self.reported_network(policy, deadline).await?;
+        self.validate_mainnet_identity(&network)
+    }
+
+    fn validate_mainnet_identity(
+        &self,
+        network: &stellar_rpc_client::GetNetworkResponse,
+    ) -> Result<EndpointIdentity, WalletError> {
         if network.passphrase != MAINNET_PASSPHRASE {
             return Err(WalletError::Network(
                 NetworkError::EndpointNetworkMismatch {
@@ -893,7 +902,7 @@ impl StellarRpcClient {
                 },
             ));
         }
-        self.checked_identity(&network)
+        self.checked_identity(network)
     }
 
     /// Checks that the endpoint reports mainnet and a supported protocol.
@@ -1278,6 +1287,10 @@ pub struct ObservedTransaction {
     pub latest_ledger: Option<u32>,
     /// The endpoint's oldest retained ledger.
     pub oldest_ledger: Option<u32>,
+    /// The raw close time at the latest retention boundary.
+    pub latest_ledger_close_time: Option<serde_json::Value>,
+    /// The raw close time at the oldest retention boundary.
+    pub oldest_ledger_close_time: Option<serde_json::Value>,
 }
 
 impl ObservedTransaction {
@@ -1311,7 +1324,53 @@ impl ObservedTransaction {
             result_xdr: text("resultXdr"),
             latest_ledger: coverage("latestLedger"),
             oldest_ledger: coverage("oldestLedger"),
+            latest_ledger_close_time: object.get("latestLedgerCloseTime").cloned(),
+            oldest_ledger_close_time: object.get("oldestLedgerCloseTime").cloned(),
         })
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RecoveryReadError {
+    #[error(transparent)]
+    Rpc(Box<stellar_rpc_client::Error>),
+    #[error("the response has an invalid shape")]
+    Shape,
+    #[error(transparent)]
+    Validation(#[from] WalletError),
+}
+
+impl From<stellar_rpc_client::Error> for RecoveryReadError {
+    fn from(error: stellar_rpc_client::Error) -> Self {
+        Self::Rpc(Box::new(error))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ObservedHealth {
+    pub(crate) health: GetHealthResponse,
+    pub(crate) latest_close: u64,
+    pub(crate) oldest_close: u64,
+}
+
+impl ObservedHealth {
+    fn from_json(answer: &serde_json::Value) -> Option<Self> {
+        let time = |key: &str| {
+            let value = answer.get(key)?;
+            value.as_u64().or_else(|| value.as_str()?.parse().ok())
+        };
+        let observation = Self {
+            health: serde_json::from_value(answer.clone()).ok()?,
+            latest_close: time("latestLedgerCloseTime")?,
+            oldest_close: time("oldestLedgerCloseTime")?,
+        };
+        let health = &observation.health;
+        (health.oldest_ledger > 0
+            && health.latest_ledger >= health.oldest_ledger
+            && health.ledger_retention_window > 0
+            && observation.oldest_close > 0
+            && observation.latest_close >= observation.oldest_close)
+            .then_some(observation)
     }
 }
 

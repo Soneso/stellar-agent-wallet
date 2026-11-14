@@ -236,7 +236,7 @@ async fn endpoint(ledger: u32, close: u64, history: Arc<AtomicBool>) -> MockServ
         ("getNetwork", get_network_result(MAINNET_PASSPHRASE)),
         (
             "getHealth",
-            json!({"status":"healthy","latestLedger":ledger,"oldestLedger":1,"ledgerRetentionWindow":ledger}),
+            json!({"status":"healthy","latestLedger":ledger,"oldestLedger":1,"ledgerRetentionWindow":ledger,"latestLedgerCloseTime":close,"oldestLedgerCloseTime":1}),
         ),
     ] {
         Mock::given(method("POST"))
@@ -248,12 +248,14 @@ async fn endpoint(ledger: u32, close: u64, history: Arc<AtomicBool>) -> MockServ
     Mock::given(method("POST")).and(body_partial_json(json!({"method":"getLedgers"})))
         .respond_with(move |request: &wiremock::Request| {
             let request_body: Value = serde_json::from_slice(&request.body).unwrap();
-            if request_body["params"]["pagination"]["limit"] == 200 && !history.load(Ordering::SeqCst) {
+            if request_body["params"]["pagination"]["limit"] == 1 && !history.load(Ordering::SeqCst) {
                 return ResponseTemplate::new(500);
             }
+            let start = request_body["params"]["startLedger"].as_u64().unwrap();
+            assert!(start > 0 && start <= u64::from(ledger));
             EchoIdResponder::new(json!({
                 "latestLedger":ledger,"latestLedgerCloseTime":close.to_string(),"oldestLedger":1,"oldestLedgerCloseTime":1,"cursor":ledger.to_string(),
-                "ledgers":[{"sequence":ledger,"ledgerCloseTime":close.to_string(),"hash":"00".repeat(32),"headerXdr":"","metadataXdr":""}],
+                "ledgers":[{"sequence":start,"ledgerCloseTime":close.to_string(),"hash":"00".repeat(32),"headerXdr":"","metadataXdr":""}],
             })).respond(request)
         }).mount(&server).await;
     server
@@ -265,7 +267,7 @@ impl Endpoints {
         let oracle_history = Arc::new(AtomicBool::new(true));
         Self {
             primary: endpoint(12, close, Arc::clone(&primary_history)).await,
-            oracle: endpoint(14, close + 1, Arc::clone(&oracle_history)).await,
+            oracle: endpoint(14, close, Arc::clone(&oracle_history)).await,
             primary_history,
             oracle_history,
         }
@@ -284,13 +286,13 @@ async fn recovery_two_post_expiry_ledgers_release_only_the_sequence() {
         report.requests,
         RecoveryRequests {
             attempt: 2,
-            shared: 6
+            shared: 4
         }
     );
     let record = fx.record();
     let proof = record["attempts"][0]["sequence_released"].clone();
     assert_eq!(proof["primary_ledger"], 12);
-    assert_eq!(proof["witness_ledger"], 14);
+    assert_eq!(proof["witness_ledger"], 12);
     assert_eq!(proof["min_close_time_ms"], NOW);
     assert_eq!(proof["released_at_ms"], NOW);
     assert!(proof["commit_id"].as_str().is_some());
@@ -322,7 +324,7 @@ async fn recovery_two_post_expiry_ledgers_release_only_the_sequence() {
         released,
         vec![(
             Some(12),
-            Some(14),
+            Some(12),
             Some(NOW),
             proof["commit_id"].as_str().unwrap().to_owned()
         )]

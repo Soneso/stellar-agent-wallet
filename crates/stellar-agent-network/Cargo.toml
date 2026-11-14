@@ -66,6 +66,8 @@ jsonrpsee-http-client = { version = "=0.26.0", default-features = false }
 # Header names and values for a provider credential sent as a request header.
 # The same `http` instance stellar-rpc-client takes its `HeaderMap` from.
 http = "=1.4.2"
+# Identifies a streamed response that exceeds the transport limit.
+http-body-util = "=0.1.3"
 # Opt-in headless keyring store: init_platform_keyring_store dispatches
 # here when STELLAR_AGENT_KEYRING_BACKEND is set.
 stellar-agent-headless-keyring = { workspace = true }
