@@ -61,7 +61,8 @@ pub struct TrustlineAssetArg {
 /// `stellar:mainnet`).  The wallet resolves it against the loaded profile to
 /// obtain the RPC URL and network passphrase.
 ///
-/// The `account_id` field is a Stellar G-strkey (ed25519 public key, 56 chars).
+/// The `account_id` field is a Stellar G-strkey or M-strkey. An M-strkey reads
+/// its G base account and is echoed as given.
 ///
 /// The optional `assets` field lists non-native assets to query trustlines for.
 /// When absent or empty, only the native XLM balance is returned.  When present,
@@ -88,7 +89,8 @@ pub struct StellarBalancesArgs {
     /// Resolved against the loaded profile to determine the RPC endpoint.
     pub chain_id: String,
 
-    /// Stellar account G-strkey (ed25519 public key, 56 characters).
+    /// Stellar account G-strkey or M-strkey. An M-strkey reads its G base
+    /// account.
     ///
     /// Example: `GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN`
     pub account_id: String,
@@ -143,7 +145,7 @@ impl WalletServer {
     /// # Errors
     ///
     /// Returns a tool-level error (not a JSON-RPC error) when:
-    /// - `account_id` is not a valid G-strkey.
+    /// - `account_id` is not a valid G-strkey or M-strkey.
     /// - An entry in `assets` has an invalid code or issuer.
     /// - The RPC call fails (network error, account not found).
     /// - The policy engine denies the call (not currently possible for a
@@ -209,15 +211,11 @@ impl WalletServer {
             return e.into_result();
         }
 
-        // ── Validate G-strkey (strict G-only ed25519 public key) ────────────
-        // Uses ed25519::PublicKey::from_string (not the permissive Strkey::from_string
-        // which accepts S/M/C strkeys) so only G-strkeys are accepted.
-        if let Err(err) = stellar_strkey::ed25519::PublicKey::from_string(&args.account_id) {
-            return Err(rmcp::ErrorData::invalid_params(
-                format!("invalid account_id (expected G-strkey): {err}"),
-                None,
-            ));
-        }
+        // ── Validate G-strkey or M-strkey ────────────────────────────────────
+        // An M account reads its G base account; the response echoes the
+        // address as given. S, C, W and malformed input refuse unechoed.
+        let account =
+            crate::tools::common::validate_payment_destination(&args.account_id, "account_id")?;
 
         // ── DoS guard: asset count cap ───────────────────────────────────────
         // Stellar RPC getLedgerEntries max is 200 entries; we reserve headroom
@@ -244,7 +242,7 @@ impl WalletServer {
                 Ok(a) => trustline_assets.push(a),
                 Err(err) => {
                     return Err(rmcp::ErrorData::invalid_params(
-                        format!("invalid trustline asset: {}", err.code()),
+                        crate::tools::common::asset_refusal_text("invalid trustline asset", &err),
                         None,
                     ));
                 }
@@ -260,8 +258,9 @@ impl WalletServer {
             Err(err) => return crate::tools::common::rpc_client_failure(&err),
         };
 
-        match fetch_account(&client, &args.account_id, &trustline_assets).await {
-            Ok(view) => {
+        match fetch_account(&client, account.base_account(), &trustline_assets).await {
+            Ok(mut view) => {
+                account.canonical().clone_into(&mut view.account_id);
                 let envelope = stellar_agent_core::envelope::Envelope::ok(view);
                 let json = envelope
                     .to_json_pretty()

@@ -788,6 +788,7 @@ async fn submit_unauthorized(
                 submission_ledger,
                 submission_anchor: None,
                 send_by_ms: send_by.map(|send_by| send_by.unix_ms),
+                destination: muxed_payment_destination(envelope),
             };
 
             // The record is written before the send, so a submission whose
@@ -1079,6 +1080,7 @@ pub(crate) async fn authorized_submission(
                 submission_ledger,
                 submission_anchor,
                 send_by_ms: Some(send_by.unix_ms),
+                destination: muxed_payment_destination(envelope),
             };
             let authorization_id = authorization.id();
 
@@ -2204,6 +2206,34 @@ pub(crate) fn replay_identity(
     ))
 }
 
+/// The full `M...` destination of a one-operation payment envelope, or `None`
+/// for a plain destination and every other envelope.
+///
+/// A fee-bump's destination is its inner transaction's.
+pub(crate) fn muxed_payment_destination(envelope: &TransactionEnvelope) -> Option<String> {
+    let tx = match envelope {
+        TransactionEnvelope::Tx(v1) => &v1.tx,
+        TransactionEnvelope::TxFeeBump(fb) => {
+            let stellar_xdr::FeeBumpTransactionInnerTx::Tx(inner) = &fb.tx.inner_tx;
+            &inner.tx
+        }
+        TransactionEnvelope::TxV0(_) => return None,
+    };
+    let [operation] = tx.operations.as_slice() else {
+        return None;
+    };
+    let destination = match &operation.body {
+        stellar_xdr::OperationBody::Payment(op) => &op.destination,
+        stellar_xdr::OperationBody::PathPaymentStrictReceive(op) => &op.destination,
+        stellar_xdr::OperationBody::PathPaymentStrictSend(op) => &op.destination,
+        _ => return None,
+    };
+    match destination {
+        stellar_xdr::MuxedAccount::MuxedEd25519(_) => Some(destination.to_string()),
+        stellar_xdr::MuxedAccount::Ed25519(_) => None,
+    }
+}
+
 /// `SHA-256` over the signed envelope XDR, the identity of these exact bytes.
 ///
 /// This is the key the submission receipt and the window reservation are
@@ -3084,6 +3114,7 @@ mod tests {
             submission_ledger: 1,
             submission_anchor: None,
             send_by_ms: None,
+            destination: None,
         }
     }
 

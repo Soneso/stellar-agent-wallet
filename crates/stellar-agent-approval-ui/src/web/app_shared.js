@@ -275,7 +275,8 @@ var stellarAgentApproval = (function () {
     }
   }
 
-  // The row's identifying detail: toolset gates wrap; other kinds truncate.
+  // The row's identifying detail: toolset gates and muxed destinations wrap;
+  // other kinds truncate.
   function metaText(view) {
     var s = view.summary || {};
     switch (s.kind) {
@@ -305,7 +306,8 @@ var stellarAgentApproval = (function () {
       case "toolset_first_invoke_gate":
         return s.toolset_name + " " + s.package_version + " " + MIDDOT +
           " sha256 " + s.package_shasum_short + " " + MIDDOT +
-          " install " + s.install_id + " " + MIDDOT + " requests " + s.capability;
+          " install " + s.install_id + " " + MIDDOT + " requests " + s.capability +
+          " " + MIDDOT + " to " + (s.destination_base ? s.destination : s.destination_redacted);
       case "trustline_clawback_opt_in":
         return s.code + " " + MIDDOT + " " + s.issuer_redacted;
       case "inconsistent":
@@ -315,6 +317,14 @@ var stellarAgentApproval = (function () {
       default:
         return String(view.kind_name || "");
     }
+  }
+
+  // The base account of a muxed payment or toolset gate destination, or null.
+  function muxedBase(view) {
+    var s = view.summary || {};
+    var base = s.kind === "payment" ? s.to_base
+      : s.kind === "toolset_first_invoke_gate" ? s.destination_base : null;
+    return typeof base === "string" && base !== "" ? base : null;
   }
 
   // ── Inbox ──────────────────────────────────────────────────────────────
@@ -356,9 +366,18 @@ var stellarAgentApproval = (function () {
     title.textContent = headlineText(view);
     main.appendChild(title);
     var meta = document.createElement("div");
-    meta.className = "ap-meta" + (view.summary && view.summary.kind === "toolset_first_invoke_gate" ? " toolset-gate" : "");
+    var gate = view.summary && view.summary.kind === "toolset_first_invoke_gate";
+    var base = muxedBase(view);
+    meta.className = "ap-meta" + (gate ? " toolset-gate" : base ? " muxed" : "");
     meta.textContent = metaText(view);
     main.appendChild(meta);
+    if (base) {
+      // A muxed destination shows in full, with its base account on its own row.
+      var baseRow = document.createElement("div");
+      baseRow.className = "ap-meta muxed";
+      baseRow.textContent = "base account " + base;
+      main.appendChild(baseRow);
+    }
     row.appendChild(main);
 
     var expiry = document.createElement("div");

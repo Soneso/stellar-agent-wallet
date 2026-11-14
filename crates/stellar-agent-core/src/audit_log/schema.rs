@@ -7570,6 +7570,96 @@ mod tests {
         );
     }
 
+    /// Records keep the M. The audit form of a payment leg identifies the
+    /// full M0 and M17 destination by its SHA-256 and never records it in
+    /// clear text, a submission receipt carries the full M0 and M17
+    /// destination, the redacted form stays on every leg, and G, C and W legs
+    /// and legacy records keep their bytes.
+    #[test]
+    fn muxed_original_address_records() {
+        use crate::policy::v1::value::{ActionKind, ValueLeg};
+        use crate::profile::receipt::{BeginSubmissionOutcome, ReceiptStore};
+        use sha2::Digest as _;
+        let key = [0xAD; 32];
+        let m = |id: u64| {
+            format!(
+                "{}",
+                stellar_strkey::ed25519::MuxedAccount { ed25519: key, id }
+            )
+        };
+        let leg_to = |destination: &str| ValueLeg {
+            kind: ActionKind::Payment,
+            amount: Some(5),
+            asset: Some("native".to_owned()),
+            destination: Some(destination.to_owned()),
+        };
+        let record = |destination: &str| ValueLegRecord::from(&leg_to(destination));
+        let g = format!("{}", stellar_strkey::ed25519::PublicKey(key));
+        let sha = |text: &str| crate::hex::encode(&sha2::Sha256::digest(text.as_bytes()));
+        for id in [0, 17] {
+            let leg = ValueLegRecord::from_payment_leg(&leg_to(&m(id))).unwrap();
+            assert_eq!(leg.destination_sha256, Some(sha(&m(id))), "M{id}");
+            assert_ne!(leg.destination_sha256, Some(sha(&g)), "M{id}");
+            assert_ne!(leg.destination_sha256, Some(sha(&m(id + 1))), "M{id}");
+            let redacted = leg.destination_redacted.as_deref().unwrap();
+            assert!(redacted.contains("...") && redacted != m(id), "{redacted}");
+            let wire = serde_json::to_string(&leg).unwrap();
+            assert!(!wire.contains(&m(id)), "{wire}");
+            let back: ValueLegRecord = serde_json::from_str(&wire).unwrap();
+            assert_eq!(back, leg);
+        }
+        let c = format!("{}", stellar_strkey::Contract(key));
+        let w = format!(
+            "{}",
+            stellar_strkey::MuxedContract {
+                contract_id: key,
+                id: 17
+            }
+        );
+        for plain in [&g, &c, &w] {
+            let leg = record(plain);
+            assert_eq!(leg.destination_sha256, None, "{plain}");
+            let legacy = format!(
+                "{{\"action\":\"payment\",\"amount\":\"5\",\"asset\":\"native\",\
+                 \"destination_redacted\":\"{}\"}}",
+                crate::observability::redact_strkey_first5_last5(plain)
+            );
+            assert_eq!(serde_json::to_string(&leg).unwrap(), legacy, "{plain}");
+            let back: ValueLegRecord = serde_json::from_str(&legacy).unwrap();
+            assert_eq!(back, leg);
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = ReceiptStore::open_at(dir.path(), "records").unwrap();
+        let hash = |byte: u8| format!("{byte:02x}").repeat(32);
+        for (byte, destination) in [(1, Some(m(17))), (2, Some(m(0))), (3, None)] {
+            let outcome = store
+                .begin_submission_to(
+                    &hash(byte),
+                    &hash(byte + 16),
+                    &g,
+                    i64::from(byte),
+                    0,
+                    7,
+                    None,
+                    None,
+                    destination.as_deref(),
+                )
+                .unwrap();
+            assert!(matches!(outcome, BeginSubmissionOutcome::Recorded));
+            let receipt = store.get(&hash(byte)).unwrap().unwrap();
+            assert_eq!(receipt.destination, destination);
+            let wire = serde_json::to_string(&receipt).unwrap();
+            assert_eq!(wire.contains("\"destination\""), destination.is_some());
+            let mut legacy: serde_json::Value = serde_json::from_str(&wire).unwrap();
+            legacy.as_object_mut().unwrap().remove("destination");
+            let reread: crate::profile::receipt::SubmissionReceipt =
+                serde_json::from_value(legacy.clone()).unwrap();
+            assert_eq!(reread.destination, None);
+            assert_eq!(serde_json::to_value(&reread).unwrap(), legacy);
+        }
+    }
+
     mod witness_tests {
         #![allow(clippy::unwrap_used, reason = "test assertions")]
         use super::super::*;

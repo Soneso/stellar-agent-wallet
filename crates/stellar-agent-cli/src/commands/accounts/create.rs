@@ -613,12 +613,12 @@ fn resolve_new_account(args: &CreateArgs) -> Result<NewAccount, WalletError> {
             secret: Some(s_strkey),
         })
     } else {
-        // Positional arg — validate it is a G-strkey.
+        // Positional arg: the created account is an AccountId, so it must be
+        // a plain G-strkey and an M input refuses with that reason.
         let addr = args.new_account.as_deref().unwrap_or(""); // clap enforces account_group required; empty is unreachable.
 
-        stellar_strkey::ed25519::PublicKey::from_string(addr).map_err(|_| {
-            WalletError::Validation(ValidationError::address_argument("new_account"))
-        })?;
+        stellar_agent_core::classic_address::require_account_id(addr, "new_account")
+            .map_err(WalletError::Validation)?;
 
         Ok(NewAccount {
             g_strkey: addr.to_owned(),
@@ -2653,6 +2653,60 @@ pub(crate) mod tests {
             ),
             "expected AddressInvalid, got: {err:?}"
         );
+    }
+
+    /// The created account is an `AccountId`, so an M0 or M17
+    /// positional refuses with the field and the reason under the existing
+    /// code, and a secret-key-shaped input is not echoed.
+    #[test]
+    fn destination_plain_field_reason() {
+        let key = [0xA4; 32];
+        let with = |account: String| CreateArgs {
+            profile: None,
+            new_account: Some(account),
+            generate: false,
+            starting_balance: None,
+            sponsor: None,
+            secret_env: None,
+            sign_with_ledger: false,
+            account_index: 0,
+            fund_with_friendbot: true,
+            network: Some(TargetNetwork::Testnet),
+            friendbot_url: DEFAULT_FRIENDBOT_URL.to_owned(),
+            output: OutputFormat::Json,
+            timeout_seconds: None,
+            rpc_url: Some(crate::common::network::TESTNET_RPC_URL.to_owned()),
+            fee: None,
+            business_id: None,
+        };
+        let g = format!("{}", stellar_strkey::ed25519::PublicKey(key));
+        assert_eq!(resolve_new_account(&with(g.clone())).unwrap().g_strkey, g);
+        for id in [0, 17] {
+            let m = format!(
+                "{}",
+                stellar_strkey::ed25519::MuxedAccount { ed25519: key, id }
+            );
+            let Err(err) = resolve_new_account(&with(m.clone())) else {
+                panic!("M{id} must refuse");
+            };
+            assert_eq!(err.code(), "validation.address_invalid");
+            assert_eq!(
+                err.message(),
+                "new_account requires AccountId; a muxed ID cannot be encoded"
+            );
+            assert!(!err.message().contains(&m));
+        }
+        let secret = stellar_strkey::ed25519::PrivateKey(key)
+            .as_unredacted()
+            .to_string()
+            .as_str()
+            .to_owned();
+        let Err(err) = resolve_new_account(&with(secret.clone())) else {
+            panic!("a secret key must refuse");
+        };
+        assert_eq!(err.code(), "validation.address_invalid");
+        assert!(!err.message().contains(&secret));
+        assert!(!err.message().contains("muxed ID"));
     }
 
     /// When `--generate` is not set, the `NewAccount.secret` field is `None`,

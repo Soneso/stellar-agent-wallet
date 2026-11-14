@@ -157,6 +157,10 @@ pub mod protocol_consts;
 /// ([`payment_accounts::PaymentAccount`]).
 pub mod payment_accounts;
 
+/// Plain `AccountId` fields that refuse a muxed `M...` address
+/// ([`classic_address::require_account_id`]).
+pub mod classic_address;
+
 /// Strkey rendering for XDR `ScAddress` values
 /// ([`sc_address::scaddress_to_strkey`]).
 pub mod sc_address;

@@ -944,3 +944,90 @@ async fn probe_failure_leaves_no_receipt_and_the_retry_sends() {
         "the retry's receipt must be finalised"
     );
 }
+
+/// The receipt the idempotent fee-bump submit begins carries the full M
+/// destination of the inner payment, decoded from the supplied inner
+/// envelope. The repeated request returns the cached Success with one send.
+#[tokio::test]
+async fn fee_bump_idempotent_receipt_keeps_the_inner_muxed_destination() {
+    let inner_gstrkey = account_id_for_seed(INNER_SOURCE_SEED);
+    let fee_payer_gstrkey = account_id_for_seed(FEE_PAYER_SEED);
+    let fee_payer_key = stellar_strkey::ed25519::PublicKey::from_string(&fee_payer_gstrkey)
+        .unwrap()
+        .0;
+    let destination = format!(
+        "{}",
+        stellar_strkey::ed25519::MuxedAccount {
+            ed25519: fee_payer_key,
+            id: 17,
+        }
+    );
+    let inner_signer = SoftwareSigningKey::new_from_bytes(INNER_SOURCE_SEED);
+    let fp_signer = SoftwareSigningKey::new_from_bytes(FEE_PAYER_SEED);
+    let mut builder = ClassicOpBuilder::new(&inner_gstrkey, 140, TESTNET_PASSPHRASE, 100);
+    builder
+        .payment(&destination, StellarAmount::from_stroops(1), &Asset::Native)
+        .unwrap();
+    let inner_xdr = builder.build_and_sign(&inner_signer).await.unwrap();
+    let inner_key = inner_key_for(&inner_xdr);
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = ReceiptStore::open_at(dir.path(), "fb-muxed-destination").unwrap();
+    let server = MockServer::start().await;
+    mount_probe_and_signers(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "sendTransaction"})))
+        .respond_with(SubmissionEchoResponder::new(
+            send_pending_response(),
+            TESTNET_PASSPHRASE,
+        ))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getTransaction"})))
+        .respond_with(SubmissionEchoResponder::new(
+            get_success_response(),
+            TESTNET_PASSPHRASE,
+        ))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getHealth"})))
+        .respond_with(EchoIdResponder::new(get_health_ok_response()))
+        .mount(&server)
+        .await;
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+    for attempt in ["first", "repeated"] {
+        let result = submit_fee_bump_idempotent(
+            &client,
+            &inner_xdr,
+            &fee_payer_gstrkey,
+            500,
+            10_000,
+            TESTNET_PASSPHRASE,
+            &fp_signer,
+            &store,
+            100,
+            Duration::from_secs(30),
+        )
+        .await;
+        assert_eq!(result.unwrap().ledger, FAKE_LEDGER, "{attempt} request");
+    }
+    let sends = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| {
+            r.body_json::<serde_json::Value>()
+                .is_ok_and(|v| v["method"] == "sendTransaction")
+        })
+        .count();
+    assert_eq!(sends, 1, "the repeated request sends nothing");
+    let receipt = store.get(&inner_key).unwrap().unwrap();
+    assert_eq!(receipt.status, ReceiptStatus::Success);
+    assert_eq!(receipt.destination.as_deref(), Some(destination.as_str()));
+}

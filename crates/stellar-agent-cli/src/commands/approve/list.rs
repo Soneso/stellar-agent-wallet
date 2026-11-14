@@ -246,11 +246,18 @@ fn render_pending_row(view: &PendingApprovalView, now_ms: u64) -> String {
     format!("{nonce}  {kind:<24}  {summary}{reason}  (expires in {expires_in})")
 }
 
+/// The base-account note of a muxed destination, or nothing without one.
+fn base_account_note(base: Option<&str>) -> String {
+    base.map(|base| format!(" (base account {base})"))
+        .unwrap_or_default()
+}
+
 /// Renders a one-line, non-secret summary for a [`PendingApprovalView`].
 fn render_summary_line(view: &PendingApprovalView) -> String {
     match &view.summary {
         ApprovalSummaryView::Payment {
             to,
+            to_base,
             amount_stroops,
             asset,
             dest_asset: Some(dest_asset),
@@ -258,18 +265,21 @@ fn render_summary_line(view: &PendingApprovalView) -> String {
             memo,
             ..
         } => format!(
-            "pay up to {amount_stroops} stroops {asset} to {to}, who receives at least \
+            "pay up to {amount_stroops} stroops {asset} to {to}{}, who receives at least \
              {dest_amount} stroops {dest_asset}, memo {}",
+            base_account_note(to_base.as_deref()),
             memo.display()
         ),
         ApprovalSummaryView::Payment {
             to,
+            to_base,
             amount_stroops,
             asset,
             memo,
             ..
         } => format!(
-            "pay {amount_stroops} stroops {asset} to {to}, memo {}",
+            "pay {amount_stroops} stroops {asset} to {to}{}, memo {}",
+            base_account_note(to_base.as_deref()),
             memo.display()
         ),
         ApprovalSummaryView::Trustline {
@@ -312,9 +322,17 @@ fn render_summary_line(view: &PendingApprovalView) -> String {
             package_shasum_short,
             capability,
             destination_redacted,
+            destination,
+            destination_base,
             ..
         } => format!(
-            "toolset '{toolset_name}' {package_version} ({package_shasum_short}, install {install_id}) requests {capability} to {destination_redacted}"
+            "toolset '{toolset_name}' {package_version} ({package_shasum_short}, install {install_id}) requests {capability} to {}{}",
+            if destination_base.is_some() {
+                destination
+            } else {
+                destination_redacted
+            },
+            base_account_note(destination_base.as_deref())
         ),
         ApprovalSummaryView::TrustlineClawbackOptIn {
             code,
@@ -975,5 +993,126 @@ mod tests {
     #[test]
     fn list_renderers_keep_base_bytes() {
         assert_eq!(rendered_list_outputs(), BASE_LIST_OUTPUTS);
+    }
+
+    /// The owner sees the base. For a payment and a toolset grant to
+    /// M0 or M17, the approval UI, `approve list` and `approve run` show the
+    /// full M and a base account row; G payments and grants render without
+    /// one.
+    #[test]
+    fn muxed_approval_shows_base_account() {
+        use stellar_agent_core::approval::view::ApprovalSummaryView;
+        let key = [0xAE; 32];
+        let g = format!("{}", stellar_strkey::ed25519::PublicKey(key));
+        let m = |id: u64| {
+            format!(
+                "{}",
+                stellar_strkey::ed25519::MuxedAccount { ed25519: key, id }
+            )
+        };
+        let payment = |destination: &str| {
+            let mut builder = stellar_agent_network::builder::ClassicOpBuilder::new(
+                SOURCE_G,
+                41,
+                stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+                100,
+            );
+            builder
+                .payment(
+                    destination,
+                    stellar_agent_core::StellarAmount::from_stroops(2_500_000),
+                    &stellar_agent_network::builder::Asset::Native,
+                )
+                .map(|_| ())
+                .unwrap();
+            let envelope = builder.build().unwrap();
+            PendingApproval::new_payment_pending(
+                envelope.clone(),
+                envelope.as_bytes(),
+                destination.to_owned(),
+                2_500_000,
+                "XLM".to_owned(),
+                None,
+                100,
+                42,
+                uid(),
+                DEFAULT_TTL_MS,
+            )
+            .unwrap()
+        };
+        let gate = |destination: &str| {
+            PendingApproval::new_toolset_first_invoke_gate_pending(
+                "mux-tools".to_owned(),
+                "a".repeat(32),
+                "1.0.0".to_owned(),
+                "d".repeat(64),
+                "sign-payment".to_owned(),
+                destination.to_owned(),
+                "XLM".to_owned(),
+                0,
+                10,
+                uid(),
+                DEFAULT_TTL_MS,
+            )
+            .unwrap()
+        };
+        let context = {
+            let profile = stellar_agent_core::profile::schema::Profile::builder_testnet(
+                "svc", "default", "nonce", "default",
+            )
+            .build();
+            stellar_agent_core::approval::ApprovalContext::from_profile("render-test", &profile)
+        };
+        let base_row = format!("Base account</div>\n      <div class=\"addr\">{g}</div>");
+        for (destination, muxed) in [(g.clone(), false), (m(0), true), (m(17), true)] {
+            for entry in [payment(&destination), gate(&destination)] {
+                let dir = TempDir::new().unwrap();
+                {
+                    let mut store =
+                        PendingApprovalStore::open(dir.path().join("mux.toml")).unwrap();
+                    store.insert(entry.clone(), 0).unwrap();
+                }
+                // The entry survives a reload of the store file.
+                let store = PendingApprovalStore::open(dir.path().join("mux.toml")).unwrap();
+                let view = store.snapshot(0).remove(0);
+                let base = match &view.summary {
+                    ApprovalSummaryView::Payment { to, to_base, .. } => {
+                        assert_eq!(to, &destination);
+                        to_base.clone()
+                    }
+                    ApprovalSummaryView::ToolsetFirstInvokeGate {
+                        destination: shown,
+                        destination_base,
+                        ..
+                    } => {
+                        assert_eq!(shown, &destination);
+                        destination_base.clone()
+                    }
+                    other => panic!("{other:?}"),
+                };
+                assert_eq!(base, muxed.then(|| g.clone()), "{destination}");
+
+                let html = stellar_agent_approval_ui::render_summary_html(&view);
+                let line = render_summary_line(&view);
+                let mut sink = Vec::new();
+                crate::commands::approve::run::write_summary(&entry, &context, &mut sink).unwrap();
+                let run = String::from_utf8(sink).unwrap();
+                if muxed {
+                    assert!(html.contains(&destination), "{html}");
+                    assert!(html.contains(&base_row), "{html}");
+                    assert!(line.contains(&destination), "{line}");
+                    assert!(line.contains(&format!("(base account {g})")), "{line}");
+                    assert!(run.contains(&destination), "{run}");
+                    assert!(
+                        run.contains(&format!("  Base account:      {g}\n")),
+                        "{run}"
+                    );
+                } else {
+                    assert!(!html.contains("Base account"), "{html}");
+                    assert!(!line.contains("base account"), "{line}");
+                    assert!(!run.contains("Base account"), "{run}");
+                }
+            }
+        }
     }
 }

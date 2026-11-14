@@ -27,7 +27,9 @@
 //! on the already-signed envelope bytes.
 
 use stellar_agent_core::StellarAmount;
+use stellar_agent_core::classic_address::{MUXED_ISSUER_REASON, require_account_id};
 use stellar_agent_core::error::{InternalError, ProtocolError, ValidationError, WalletError};
+use stellar_agent_core::payment_accounts::PaymentAccount;
 use stellar_baselib::account::{Account, AccountBehavior};
 use stellar_baselib::asset::{Asset as BaselibAsset, AssetBehavior};
 use stellar_baselib::operation::Operation as BaselibOperation;
@@ -85,6 +87,25 @@ pub enum Asset {
         /// The issuer's G-strkey.
         issuer: String,
     },
+}
+
+/// Validates a plain issuer G-strkey, naming `field` in the refusal.
+///
+/// An `M...` issuer refuses with the `AccountId` reason. Every refusal keeps
+/// the asset error code and never echoes the input.
+fn plain_issuer(issuer: &str, field: &'static str) -> Result<(), WalletError> {
+    if require_account_id(issuer, "issuer").is_ok() {
+        return Ok(());
+    }
+    // A valid M issuer gets the base-account reason; other input gets the field.
+    let text = if PaymentAccount::parse(issuer).is_ok() {
+        format!("{field} ({MUXED_ISSUER_REASON})").into()
+    } else {
+        field.into()
+    };
+    Err(WalletError::Validation(ValidationError::AssetInvalid {
+        field: text,
+    }))
 }
 
 impl Asset {
@@ -158,12 +179,8 @@ impl Asset {
             }));
         }
 
-        // Validate issuer as a valid G-strkey.
-        stellar_strkey::ed25519::PublicKey::from_string(issuer).map_err(|_| {
-            WalletError::Validation(ValidationError::AssetInvalid {
-                field: "asset".into(),
-            })
-        })?;
+        // The issuer is an AccountId, so it must be a plain G-strkey.
+        plain_issuer(issuer, "asset")?;
 
         Ok(Self::Credit {
             code: code.to_owned(),
@@ -201,11 +218,7 @@ impl Asset {
                 field: "code".into(),
             }));
         }
-        stellar_strkey::ed25519::PublicKey::from_string(issuer).map_err(|_| {
-            WalletError::Validation(ValidationError::AssetInvalid {
-                field: "issuer".into(),
-            })
-        })?;
+        plain_issuer(issuer, "issuer")?;
         Ok(Self::Credit {
             code: code.to_owned(),
             issuer: issuer.to_owned(),
@@ -420,7 +433,7 @@ impl ClassicOpBuilder {
     /// # Errors
     ///
     /// - [`WalletError::Validation`] wrapping [`ValidationError::AddressInvalid`]
-    ///   if the destination G-strkey is invalid.
+    ///   if the destination is not a valid G-strkey or is a muxed `M...` address.
     /// - [`WalletError::Protocol`] wrapping [`ProtocolError::XdrCodecFailed`]
     ///   if XDR construction fails.
     ///
@@ -450,10 +463,8 @@ impl ClassicOpBuilder {
         destination: &str,
         starting_balance: StellarAmount,
     ) -> Result<&mut Self, WalletError> {
-        // Validate destination is a valid G-strkey.
-        stellar_strkey::ed25519::PublicKey::from_string(destination).map_err(|_| {
-            WalletError::Validation(ValidationError::address_argument("destination"))
-        })?;
+        // CreateAccountOp.destination is an AccountId, so an M input refuses.
+        require_account_id(destination, "destination")?;
 
         let stroops = starting_balance.as_stroops();
 
@@ -473,10 +484,13 @@ impl ClassicOpBuilder {
 
     /// Adds a payment operation.
     ///
+    /// The destination is a `G...` or `M...` strkey. An `M...` destination is
+    /// emitted unchanged in the `MuxedEd25519` arm with its key and ID.
+    ///
     /// # Errors
     ///
     /// - [`WalletError::Validation`] wrapping [`ValidationError::AddressInvalid`]
-    ///   if the destination is invalid.
+    ///   if the destination is not a valid G or M strkey.
     /// - [`WalletError::Protocol`] wrapping [`ProtocolError::XdrCodecFailed`]
     ///   if XDR construction fails.
     ///
@@ -508,8 +522,8 @@ impl ClassicOpBuilder {
         amount: StellarAmount,
         asset: &Asset,
     ) -> Result<&mut Self, WalletError> {
-        // Validate destination is a valid G-strkey.
-        stellar_strkey::ed25519::PublicKey::from_string(destination).map_err(|_| {
+        // PaymentOp.destination is a MuxedAccount: G or M, with the ID kept.
+        let destination = PaymentAccount::parse(destination).map_err(|_| {
             WalletError::Validation(ValidationError::address_argument("destination"))
         })?;
 
@@ -517,7 +531,7 @@ impl ClassicOpBuilder {
         let stroops = amount.as_stroops();
 
         let xdr_op = BaselibOperation::new()
-            .payment(destination, &baselib_asset, stroops)
+            .payment(destination.canonical(), &baselib_asset, stroops)
             .map_err(|_| {
                 WalletError::Protocol(ProtocolError::XdrCodecFailed {
                     detail: "payment op construction failed: amount must be nonnegative".to_owned(),

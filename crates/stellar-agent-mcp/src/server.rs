@@ -269,9 +269,19 @@ fn account_resource_id_from_uri(uri: &str) -> Result<&str, rmcp::ErrorData> {
     if account_id.is_empty() || account_id.contains('/') || account_id.contains('\\') {
         return Err(account_resource_invalid_account_id(uri));
     }
-    validate_account_resource_id(account_id)
+    stellar_agent_core::payment_accounts::PaymentAccount::parse(account_id)
         .map_err(|_| account_resource_invalid_account_id(uri))?;
     Ok(account_id)
+}
+
+/// The G account that a G or M account resource id names.
+///
+/// Enrolled accounts are plain G signing accounts, so an M resource id
+/// matches the enrollment of its base account.
+fn account_resource_base(account_id: &str) -> Option<String> {
+    stellar_agent_core::payment_accounts::PaymentAccount::parse(account_id)
+        .ok()
+        .map(|address| address.base_account().to_owned())
 }
 
 fn account_resource_invalid_account_id(uri: &str) -> rmcp::ErrorData {
@@ -1697,9 +1707,10 @@ impl ServerHandler for WalletServer {
             }
             uri if uri.starts_with(ACCOUNT_RESOURCE_PREFIX) => {
                 let account_id = account_resource_id_from_uri(uri)?;
+                let base = account_resource_base(account_id);
                 if !enrolled_account_ids(&self.profile)
                     .iter()
-                    .any(|enrolled| enrolled == account_id)
+                    .any(|enrolled| base.as_deref() == Some(enrolled.as_str()))
                 {
                     return Err(profile_resource_not_found(uri));
                 }
@@ -2233,6 +2244,49 @@ mod tests {
         assert_eq!(
             resource.raw.name,
             format!("Public account directory entry for `{SOURCE_G}`")
+        );
+    }
+
+    /// An M0 or M17 account resource id is accepted as
+    /// given and matches the enrollment of its G base; C, W and secret-key
+    /// ids are refused.
+    #[test]
+    fn muxed_destination_reads() {
+        let key = stellar_strkey::ed25519::PublicKey::from_string(SOURCE_G)
+            .unwrap()
+            .0;
+        for id in [0, 17] {
+            let muxed = format!(
+                "{}",
+                stellar_strkey::ed25519::MuxedAccount { ed25519: key, id }
+            );
+            let uri = account_resource_uri(&muxed);
+            assert_eq!(account_resource_id_from_uri(&uri).unwrap(), muxed);
+            assert_eq!(account_resource_base(&muxed).as_deref(), Some(SOURCE_G));
+        }
+        assert_eq!(account_resource_base(SOURCE_G).as_deref(), Some(SOURCE_G));
+        for refused in [
+            format!("{}", stellar_strkey::Contract(key)),
+            format!(
+                "{}",
+                stellar_strkey::MuxedContract {
+                    contract_id: key,
+                    id: 17
+                }
+            ),
+            stellar_strkey::ed25519::PrivateKey(key)
+                .as_unredacted()
+                .to_string()
+                .as_str()
+                .to_owned(),
+        ] {
+            let err = account_resource_id_from_uri(&account_resource_uri(&refused)).unwrap_err();
+            assert_eq!(err.message, "invalid_account_resource_id");
+        }
+        // Enrollment stays a plain G signing account.
+        assert_eq!(
+            enrolled_account_ids_from_profiles([&test_account_profile()]),
+            [SOURCE_G]
         );
     }
 

@@ -264,6 +264,10 @@ struct ClearData {
     cleared_from: String,
     /// Whether a spending-window reservation was released.
     reservation_released: bool,
+    /// The full muxed `M...` payment destination the receipt records.
+    /// Absent for every other receipt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    destination: Option<String>,
 }
 
 /// Runs the `tx receipt` subcommand group.
@@ -890,6 +894,7 @@ fn record_and_mark_clear_with(
         tx_hash_redacted,
         cleared_from,
         reservation_released,
+        destination: receipt.destination.clone(),
     })
 }
 

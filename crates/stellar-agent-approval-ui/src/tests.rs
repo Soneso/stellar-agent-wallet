@@ -558,7 +558,9 @@ pub(crate) fn unaffected_outputs() -> Vec<(&'static str, String)> {
     ]
 }
 
-/// The digests of [`unaffected_outputs`] as the base tree renders them.
+/// The pinned digests of [`unaffected_outputs`]. Each equals the base tree's
+/// rendering except `app_shared.js`, whose inbox rows show a muxed
+/// destination in full with its base account.
 const BASE_OUTPUTS: &[(&str, &str)] = &[
     (
         "summary",
@@ -602,7 +604,7 @@ const BASE_OUTPUTS: &[(&str, &str)] = &[
     ),
     (
         "app_shared.js",
-        "f9c45adf5967b8c9d4dcc542e2a8ce19adde305ea3425d7727b97cdfb370eee5",
+        "397e3e67eeb179a42fea056baab604db6d90b079aa6462b9e1c0161bb732ce9d",
     ),
     (
         "mainnet-presence.js",

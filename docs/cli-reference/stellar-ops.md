@@ -287,6 +287,15 @@ Sends a payment from a source account to a destination, enforcing SEP-29 memo-re
   return memo, and a muxed destination, read nothing.
 - **Destination read.** Only an absent destination account counts as absent. Any
   other failed destination read refuses with the read's own code.
+- **Muxed destinations.** `<DESTINATION>` is a G or M account. The payment
+  keeps an M address with its key and mux id, including id 0. Account, trustline,
+  and identity reads use its G base account. The payment carries the mux id,
+  and the recipient interprets it. SEP-29 lookup is skipped for M destinations
+  in every stage. An explicit
+  memo is sent as given, and a signed `memo_binding` on the G base still applies.
+  The mux id is never a transaction memo. C and W addresses are not classic
+  payment destinations and are refused. Account creation and asset issuers take
+  only a G account.
 - **Output.** The signing and submitting stages report the witness outcome as
   `data.cross_check`: `status` is `passed`, `skipped`, or `not_required`, with
   `reason`, `provider`, and `ledger` where they apply. `--output table` prints a
@@ -302,7 +311,7 @@ Argument groups (enforced by the parser):
 
 | Flag / arg | Meaning | Required | Default |
 |---|---|---|---|
-| `<DESTINATION>` (positional) | Destination account G-strkey | yes | none |
+| `<DESTINATION>` (positional) | Destination account G-strkey or M-strkey | yes | none |
 | `<AMOUNT>` (positional) | Use `"10 XLM"` for native or the exact, case-sensitive asset code for issued assets, such as `"10.5 USDC"` with `USDC:<issuer>` (raw stroop strings rejected). | yes | none |
 | `[ASSET]` (positional) | `native`, `XLM`, or `CODE:ISSUER_GSTRKEY` | optional | `native` |
 | `--profile <NAME>` | Profile to evaluate operator policy against | optional | `STELLAR_AGENT_PROFILE`, else `default` |

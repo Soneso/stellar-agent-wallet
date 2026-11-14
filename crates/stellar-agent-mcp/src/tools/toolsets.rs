@@ -698,12 +698,14 @@ impl WalletServer {
             .and_then(crate::tools::amount_wire::value_as_stroops_i64)
             .unwrap_or(0_i64);
 
-        // Validate: destination must be a G-strkey (ed25519 public key).
-        // Uses stellar_strkey to validate the base32 checksum and version byte,
-        // matching the validation used at other tool boundaries in this crate.
-        if stellar_strkey::ed25519::PublicKey::from_string(&destination).is_err() {
+        // Validate: the destination is a G or M classic account. The parser
+        // checks the base32 checksum and version byte. An M destination keeps
+        // its full string: a G grant covers it, and an M grant covers only its
+        // exact key and ID.
+        if stellar_agent_core::payment_accounts::PaymentAccount::parse(&destination).is_err() {
             return Err(rmcp::ErrorData::internal_error(
-                "simulation.divergence: envelope_xdr did not yield a valid G-strkey destination",
+                "simulation.divergence: envelope_xdr did not yield a valid G-strkey or M-strkey \
+                 destination",
                 None,
             ));
         }

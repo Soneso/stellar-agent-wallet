@@ -452,6 +452,7 @@ impl CheckedReceiptProjection {
             recovered_from_reservation: false,
             release_code,
             settlement_decision_id: Some(decision_id.clone()),
+            destination: None,
         };
         Self {
             receipt,
@@ -669,6 +670,20 @@ pub struct SubmissionReceipt {
     /// identifier alone supplies no settlement authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settlement_decision_id: Option<String>,
+
+    /// The full original payment destination when it is a muxed `M...`
+    /// account, decoded from the signed envelope of a one-operation payment.
+    ///
+    /// `None` for every other receipt, and absent from the serialized form
+    /// then, so G and C receipts and older receipts keep their bytes. Three
+    /// cases record none for an M payment: a transaction with several
+    /// operations, a receipt rebuilt from a reservation (reservation
+    /// repair, accounting-expiry projection, finalization of an absent
+    /// receipt), and an absent receipt that [`ReceiptStore::replace_checked`]
+    /// writes from the checked projection of a committed decision. A checked
+    /// replacement of a stored receipt keeps its destination.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
 }
 
 /// Serde default for [`SubmissionReceipt::submitted`].
@@ -691,6 +706,10 @@ fn receipt_submitted_default() -> bool {
 /// all others receive [`BeginOutcome::AlreadyPresent`].
 #[non_exhaustive]
 #[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one outcome per claim; boxing the receipt would change a public variant"
+)]
 pub enum BeginOutcome {
     /// The caller is the winner: a fresh `Pending` receipt was inserted.
     ///
@@ -1211,6 +1230,40 @@ impl ReceiptStore {
         max_time: u64,
         recorded_at_ledger: u32,
     ) -> Result<BeginOutcome, ReceiptStoreError> {
+        self.try_begin_to(
+            envelope_hash,
+            tx_hash,
+            source,
+            sequence,
+            max_time,
+            recorded_at_ledger,
+            None,
+        )
+    }
+
+    /// The claim of [`Self::try_begin`] that also records the full muxed
+    /// destination decoded from the supplied envelope on the new receipt.
+    ///
+    /// `destination` is `None` for every envelope without a muxed payment
+    /// destination. An existing receipt is returned unchanged.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::try_begin`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the receipt identity and its destination are one atomic claim"
+    )]
+    pub fn try_begin_to(
+        &self,
+        envelope_hash: &str,
+        tx_hash: &str,
+        source: &str,
+        sequence: i64,
+        max_time: u64,
+        recorded_at_ledger: u32,
+        destination: Option<&str>,
+    ) -> Result<BeginOutcome, ReceiptStoreError> {
         let mut session = self.write_session()?;
 
         // Atomic check-and-insert under the lock.
@@ -1227,6 +1280,7 @@ impl ReceiptStore {
             max_time,
             recorded_at_ledger,
             None,
+            destination,
         )?;
 
         Ok(BeginOutcome::Winner)
@@ -1279,6 +1333,7 @@ impl ReceiptStore {
             recovered_from_reservation: true,
             release_code: None,
             settlement_decision_id: None,
+            destination: None,
         };
         session
             .guard
@@ -1398,6 +1453,44 @@ impl ReceiptStore {
         approval_nonce: Option<&str>,
         releases: &dyn SequenceReleases,
     ) -> Result<BeginSubmissionOutcome, ReceiptStoreError> {
+        self.begin_submission_to(
+            envelope_hash,
+            tx_hash,
+            source,
+            sequence,
+            max_time,
+            recorded_at_ledger,
+            approval_nonce,
+            Some(releases),
+            None,
+        )
+    }
+
+    /// Claims a receipt as [`Self::begin_submission_releasing`] does and
+    /// records the original muxed destination on the new receipt.
+    ///
+    /// `releases` of `None` admits no released claimant. `destination` is the
+    /// full `M...` payment destination, or `None` for every other payment.
+    ///
+    /// # Errors
+    /// Returns a receipt-store error when the claim cannot be read or persisted.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the receipt identity, its release reader and its destination are one atomic claim"
+    )]
+    pub fn begin_submission_to(
+        &self,
+        envelope_hash: &str,
+        tx_hash: &str,
+        source: &str,
+        sequence: i64,
+        max_time: u64,
+        recorded_at_ledger: u32,
+        approval_nonce: Option<&str>,
+        releases: Option<&dyn SequenceReleases>,
+        destination: Option<&str>,
+    ) -> Result<BeginSubmissionOutcome, ReceiptStoreError> {
+        let releases = releases.unwrap_or(&NoSequenceReleases);
         let mut session = self.write_session()?;
         if let Some(nonce) = approval_nonce
             && let Some(existing) = session
@@ -1434,6 +1527,7 @@ impl ReceiptStore {
             max_time,
             recorded_at_ledger,
             approval_nonce,
+            destination,
         )?;
 
         Ok(BeginSubmissionOutcome::Recorded)
@@ -1629,6 +1723,7 @@ impl ReceiptStore {
                     recovered_from_reservation: true,
                     release_code: Some(ReleaseEvidence::AccountingExpired),
                     settlement_decision_id: decision_id,
+                    destination: None,
                 };
                 session
                     .guard
@@ -1644,9 +1739,11 @@ impl ReceiptStore {
     /// decision.
     ///
     /// Under the receipt write lock, a stored `ClearedByOperator` status and a
-    /// stored `approval_consumed = true` survive; every other field comes from
-    /// the projection. A merged receipt equal to the stored one is not
-    /// rewritten: the store confirms the file and its directory durable
+    /// stored `approval_consumed = true` survive. A projection without a
+    /// destination keeps the stored destination, and a receipt stored without
+    /// one keeps none. Every other field comes from the projection. A merged
+    /// receipt equal to the stored one is not rewritten: the store confirms
+    /// the file and its directory durable
     /// instead. Otherwise the receipt is replaced and the indexes rebuilt.
     ///
     /// A checked projection takes precedence over reconciliation and
@@ -1655,6 +1752,9 @@ impl ReceiptStore {
     ///
     /// # Errors
     ///
+    /// - [`ReceiptStoreError::InvalidTransition`] from `conflicting identity`
+    ///   if the projection carries a destination other than the stored one.
+    ///   Nothing is written.
     /// - [`ReceiptStoreError::MutexPoisoned`] if the lock is poisoned.
     /// - [`ReceiptStoreError::WriterLocked`] if another process holds the
     ///   sidecar lock for the whole retry window.
@@ -1673,6 +1773,14 @@ impl ReceiptStore {
         let key = projection.receipt.envelope_hash.as_str();
         let mut merged = projection.receipt.clone();
         if let Some(existing) = session.guard.map.get(key) {
+            if merged.destination.is_none() {
+                merged.destination.clone_from(&existing.destination);
+            } else if merged.destination != existing.destination {
+                return Err(ReceiptStoreError::InvalidTransition {
+                    from: "conflicting identity",
+                    to: "checked",
+                });
+            }
             if existing.status == ReceiptStatus::ClearedByOperator {
                 merged.status = ReceiptStatus::ClearedByOperator;
                 merged.ledger = None;
@@ -1744,6 +1852,7 @@ impl ReceiptStore {
                 recovered_from_reservation: false,
                 release_code: evidence,
                 settlement_decision_id: None,
+                destination: None,
             });
 
         session.guard.rebuild_indexes();
@@ -2265,6 +2374,7 @@ fn insert_pending(
     max_time: u64,
     recorded_at_ledger: u32,
     approval_nonce: Option<&str>,
+    destination: Option<&str>,
 ) -> Result<(), ReceiptStoreError> {
     let receipt = SubmissionReceipt {
         envelope_hash: envelope_hash.to_owned(),
@@ -2283,6 +2393,7 @@ fn insert_pending(
         recovered_from_reservation: false,
         release_code: None,
         settlement_decision_id: None,
+        destination: destination.map(str::to_owned),
     };
 
     guard.map.insert(envelope_hash.to_owned(), receipt);
@@ -2373,6 +2484,14 @@ fn persist_locked(guard: &mut MutexGuard<'_, StoreState>) -> Result<(), ReceiptS
             path: guard.file_path.clone(),
             source: e,
         })?;
+
+    #[cfg(test)]
+    if tests::BEFORE_RENAME_FAILS.get() {
+        return Err(ReceiptStoreError::Io {
+            path: guard.file_path.clone(),
+            source: std::io::Error::other("injected failure before receipt rename"),
+        });
+    }
 
     tmp.persist(&guard.file_path)
         .map_err(|e| ReceiptStoreError::Io {
@@ -2495,6 +2614,8 @@ mod tests {
         pub(super) static PERSIST_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         /// Whether a directory sync on this thread fails.
         pub(super) static DIRECTORY_SYNC_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Whether persistence stops immediately before the receipt rename.
+        pub(super) static BEFORE_RENAME_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     /// The checked projection of a decision on `HASH_A` with `status`.
@@ -2627,6 +2748,119 @@ mod tests {
         store.replace_checked(&projection).unwrap();
         assert_eq!(PERSIST_CALLS.get(), 0, "durability needs no rewrite");
         assert_eq!(store.get(HASH_A).unwrap(), Some(projection.receipt));
+    }
+
+    /// A checked replacement keeps the stored destination when the
+    /// projection carries none. A projection carrying another destination
+    /// refuses as a conflicting identity and writes nothing.
+    #[test]
+    fn replace_checked_keeps_the_stored_destination() {
+        const MUXED: &str = "MA3D5KRYM6CB7OWQ6TWYRR3Z4T7GNZLKERYNZGGA5SOAOPIFY6YQGAAAAAAAAAPCICBKU";
+        let (_dir, store) = open_temp_store();
+        store
+            .begin_submission_to(
+                HASH_A,
+                TX_HASH_A,
+                SOURCE_A,
+                SEQ_A,
+                1_700,
+                90,
+                None,
+                None,
+                Some(MUXED),
+            )
+            .unwrap();
+        let projection = checked(ReceiptStatus::Success, Some(120));
+        store.replace_checked(&projection).unwrap();
+        assert_eq!(
+            store.get(HASH_A).unwrap().unwrap().destination.as_deref(),
+            Some(MUXED)
+        );
+        let bytes = std::fs::read(store.file_path().unwrap()).unwrap();
+        let mut other = projection;
+        other.receipt.destination = Some(SOURCE_B.to_owned());
+        assert!(matches!(
+            store.replace_checked(&other),
+            Err(ReceiptStoreError::InvalidTransition {
+                from: "conflicting identity",
+                ..
+            })
+        ));
+        assert_eq!(std::fs::read(store.file_path().unwrap()).unwrap(), bytes);
+    }
+
+    /// A failure immediately before or after the rename preserves the
+    /// destination across a restart and repeated checked replacements.
+    #[test]
+    fn replace_checked_destination_survives_rename_failures() {
+        struct Disarm;
+        impl Drop for Disarm {
+            fn drop(&mut self) {
+                BEFORE_RENAME_FAILS.set(false);
+                DIRECTORY_SYNC_FAILS.set(false);
+            }
+        }
+        for id in [None, Some(0), Some(17)] {
+            for after_rename in [false, true] {
+                let destination = id.map(|id| {
+                    format!(
+                        "{}",
+                        stellar_strkey::ed25519::MuxedAccount {
+                            ed25519: [0xb7; 32],
+                            id,
+                        }
+                    )
+                });
+                let (dir, store) = open_temp_store();
+                store
+                    .begin_submission_to(
+                        HASH_A,
+                        TX_HASH_A,
+                        SOURCE_A,
+                        SEQ_A,
+                        1_700,
+                        90,
+                        None,
+                        None,
+                        destination.as_deref(),
+                    )
+                    .unwrap();
+                let before = std::fs::read(store.file_path().unwrap()).unwrap();
+                let projection = checked(ReceiptStatus::Success, Some(120));
+                let disarm = Disarm;
+                BEFORE_RENAME_FAILS.set(!after_rename);
+                DIRECTORY_SYNC_FAILS.set(after_rename);
+                assert!(matches!(
+                    store.replace_checked(&projection),
+                    Err(ReceiptStoreError::Io { .. })
+                ));
+                drop(disarm);
+                drop(store);
+
+                let store = ReceiptStore::open_at(dir.path(), "test").unwrap();
+                let receipt = store.get(HASH_A).unwrap().unwrap();
+                assert_eq!(receipt.destination, destination);
+                if after_rename {
+                    assert_eq!(receipt.status, ReceiptStatus::Success);
+                } else {
+                    assert_eq!(receipt.status, ReceiptStatus::Pending);
+                    assert_eq!(std::fs::read(store.file_path().unwrap()).unwrap(), before);
+                }
+                store.replace_checked(&projection).unwrap();
+                let bytes = std::fs::read(store.file_path().unwrap()).unwrap();
+                let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(
+                    json[HASH_A].get("destination").and_then(|v| v.as_str()),
+                    destination.as_deref()
+                );
+                assert_eq!(
+                    store.get(HASH_A).unwrap().unwrap().status,
+                    ReceiptStatus::Success
+                );
+                store.replace_checked(&projection).unwrap();
+                assert_eq!(std::fs::read(store.file_path().unwrap()).unwrap(), bytes);
+            }
+        }
     }
 
     /// A store reopened on the directory, as after a restart, confirms an
@@ -3626,6 +3860,7 @@ mod tests {
             recovered_from_reservation: false,
             release_code: None,
             settlement_decision_id: None,
+            destination: None,
         };
 
         let json = serde_json::to_string(&original).unwrap();
@@ -3666,6 +3901,7 @@ mod tests {
             recovered_from_reservation: false,
             release_code: None,
             settlement_decision_id: None,
+            destination: None,
         };
 
         let json = serde_json::to_string(&r).unwrap();

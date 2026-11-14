@@ -52,6 +52,8 @@ mod mainnet_oracle_required_integration;
 mod mainnet_presence_integration;
 #[path = "mcp/mpp_audit_anchor_integration.rs"]
 mod mpp_audit_anchor_integration;
+#[path = "mcp/muxed_destination_integration.rs"]
+mod muxed_destination_integration;
 #[path = "mcp/pay_commit_args_redrive_integration.rs"]
 mod pay_commit_args_redrive_integration;
 #[path = "mcp/pay_integration.rs"]

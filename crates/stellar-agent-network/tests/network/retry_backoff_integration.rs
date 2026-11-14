@@ -510,3 +510,69 @@ async fn idempotent_submit_success_path_no_regression() {
     );
     assert_eq!(result.unwrap().ledger, FAKE_LEDGER);
 }
+
+/// `submit_transaction_idempotent` begins the receipt with the full M
+/// destination decoded from the supplied envelope. The repeated request
+/// returns the cached Success with one send.
+#[tokio::test]
+async fn idempotent_submit_receipt_keeps_the_muxed_destination() {
+    let envelope = SignedTestEnvelope::builder(SOURCE_SEED)
+        .sequence(310)
+        .amount_stroops(7_000_000)
+        .muxed_destination_id(17)
+        .build();
+    assert!(envelope.destination().starts_with('M'));
+    let signed_xdr = envelope.envelope_xdr();
+    let envelope_hash = envelope_hash_for(signed_xdr);
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = ReceiptStore::open_at(dir.path(), "idempotent-muxed-destination").unwrap();
+    let server = MockServer::start().await;
+    mount_probe_and_signers(&server, &envelope).await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "sendTransaction"})))
+        .respond_with(EchoIdResponder::new(send_pending(&envelope)))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getTransaction"})))
+        .respond_with(EchoIdResponder::new(get_tx_success(&envelope)))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getHealth"})))
+        .respond_with(EchoIdResponder::new(get_health_within_window()))
+        .mount(&server)
+        .await;
+
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+    for attempt in ["first", "repeated"] {
+        let result = submit_transaction_idempotent(
+            &client,
+            signed_xdr,
+            Duration::from_secs(30),
+            TESTNET_PASSPHRASE,
+            &store,
+            300,
+        )
+        .await;
+        assert_eq!(result.unwrap().ledger, FAKE_LEDGER, "{attempt} request");
+    }
+    let sends = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| {
+            r.body_json::<serde_json::Value>()
+                .is_ok_and(|v| v["method"] == "sendTransaction")
+        })
+        .count();
+    assert_eq!(sends, 1, "the repeated request sends nothing");
+    let receipt = store.get(&envelope_hash).unwrap().unwrap();
+    assert!(matches!(receipt.status, ReceiptStatus::Success));
+    assert_eq!(receipt.destination.as_deref(), Some(envelope.destination()));
+}

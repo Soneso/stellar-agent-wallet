@@ -3819,3 +3819,296 @@ fn new_denials_serialize_exact_json() {
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Muxed destinations: each owner test uses its own destination key.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The `G...` strkey of `key`.
+fn g_of(key: [u8; 32]) -> String {
+    format!("{}", stellar_strkey::ed25519::PublicKey(key))
+}
+
+/// The `M...` strkey of `key` and `id`.
+fn m_of(key: [u8; 32], id: u64) -> String {
+    format!(
+        "{}",
+        stellar_strkey::ed25519::MuxedAccount { ed25519: key, id }
+    )
+}
+
+/// A memo binding on a G applies to every M on its key. An
+/// absent or wrong memo denies M0 and M17, the bound memo passes, and the
+/// mux ID is never taken for the memo.
+#[test]
+fn muxed_explicit_memo() {
+    let key = [0xA9; 32];
+    let criterion = MemoBindingCriterion::new(vec![
+        MemoBinding::new(&g_of(key), MemoRequirement::Id(17)).unwrap(),
+    ]);
+    let text = MemoBindingCriterion::new(vec![
+        MemoBinding::new(&g_of(key), MemoRequirement::Text("acct-9".to_owned())).unwrap(),
+    ]);
+    assert!(MemoBinding::new(&m_of(key, 0), MemoRequirement::Id(1)).is_err());
+    for id in [0, 17] {
+        let pay_to = vec![leg(ActionKind::Payment, 5, "native", Some(&m_of(key, id)))];
+        assert_eq!(
+            memo_decision(&criterion, pay_to.clone(), None).unwrap(),
+            mismatch("id"),
+            "M{id} without a memo is denied, even when its ID equals the bound one"
+        );
+        assert_eq!(
+            memo_decision(&criterion, pay_to.clone(), Some(ClassicMemo::Id(18))).unwrap(),
+            mismatch("id"),
+            "M{id} with a wrong memo is denied"
+        );
+        assert_eq!(
+            memo_decision(&criterion, pay_to.clone(), Some(ClassicMemo::Id(17))).unwrap(),
+            None,
+            "M{id} with the bound memo passes"
+        );
+        assert_eq!(
+            memo_decision(
+                &text,
+                pay_to.clone(),
+                Some(ClassicMemo::Text("acct-8".into()))
+            )
+            .unwrap(),
+            mismatch("text")
+        );
+        assert_eq!(
+            memo_decision(&text, pay_to, Some(ClassicMemo::Text("acct-9".into()))).unwrap(),
+            None
+        );
+    }
+    // Another key is unbound.
+    assert_eq!(
+        memo_decision(
+            &criterion,
+            vec![leg(
+                ActionKind::Payment,
+                5,
+                "native",
+                Some(&m_of([0xE9; 32], 17))
+            )],
+            None
+        )
+        .unwrap(),
+        None
+    );
+}
+
+/// An identity view for the base account `account`, verified by `listed`.
+struct MuxIdentity(String);
+
+impl AccountIdentityView for MuxIdentity {
+    fn home_domain(&self) -> Option<String> {
+        Some("example.com".to_owned())
+    }
+
+    fn account_id(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A counterparty cache that resolves every domain and lists one account.
+struct ListsAccount(String);
+
+impl CounterpartyCacheView for ListsAccount {
+    fn has_resolved(&self, _home_domain: &str) -> bool {
+        true
+    }
+
+    fn is_account_listed(&self, _home_domain: &str, account_id: &str) -> bool {
+        account_id == self.0
+    }
+}
+
+/// A policy with `criterion` on both pay tools.
+fn both_pay_tools(criterion: &str) -> PolicyEngineV1 {
+    engine(&v2(&format!(
+        "{}{}",
+        rule_for("stellar_pay", criterion, "allow"),
+        rule_for("stellar_pay_commit", criterion, "allow")
+    )))
+}
+
+/// The decision of a payment to `destination` under `engine`, which is the
+/// same for the prepare and the commit tool names.
+fn same_on_both(engine: &PolicyEngineV1, destination: &str) -> Decision {
+    let prepare = decide_on(engine, "stellar_pay", payment(5, destination));
+    let commit = decide_on(engine, "stellar_pay_commit", payment(5, destination));
+    assert_eq!(prepare, commit, "{destination}: prepare and commit agree");
+    prepare
+}
+
+/// The signed entry decides. An exact M entry lists only that key and
+/// ID; a G entry lists the G and every M on its key; other IDs, other keys,
+/// a missing entry and an unselected kind are unlisted under each mode; the
+/// issuer and domain conjunctions apply to M as to G.
+#[test]
+fn muxed_signed_policy_matrix() {
+    let key = [0xAA; 32];
+    let other = [0xEA; 32];
+    let (g, m0, m17, m18) = (g_of(key), m_of(key, 0), m_of(key, 17), m_of(key, 18));
+    let entry = |list: &str, mode: &str| {
+        format!(
+            "{{ kind = \"counterparty_allowlist\", kinds = [\"G_ACCOUNT\"], allowlist = [{list}], \
+             unlisted = {mode} }}"
+        )
+    };
+    let deny_mode = "{ mode = \"deny\" }";
+    let exact_m17 = both_pay_tools(&entry(&format!("\"{m17}\""), deny_mode));
+    assert_eq!(same_on_both(&exact_m17, &m17), Decision::Allow);
+    for unlisted in [&g, &m0, &m18, &m_of(other, 17), &g_of(other)] {
+        assert!(
+            matches!(
+                same_on_both(&exact_m17, unlisted),
+                Decision::Deny(DenyReason::CounterpartyDenied { .. })
+            ),
+            "{unlisted} is unlisted under an M17-only entry"
+        );
+    }
+    let base_g = both_pay_tools(&entry(&format!("\"{g}\""), deny_mode));
+    for listed in [&g, &m0, &m17, &m_of(key, u64::MAX)] {
+        assert_eq!(same_on_both(&base_g, listed), Decision::Allow, "{listed}");
+    }
+    assert!(matches!(
+        same_on_both(&base_g, &m_of(other, 17)),
+        Decision::Deny(_)
+    ));
+    let empty = both_pay_tools(&entry("", deny_mode));
+    assert!(matches!(same_on_both(&empty, &m17), Decision::Deny(_)));
+    let contracts_only = both_pay_tools(&format!(
+        "{{ kind = \"counterparty_allowlist\", kinds = [\"C_ACCOUNT\"], allowlist = [\"{m17}\"], \
+         unlisted = {deny_mode} }}"
+    ));
+    assert!(matches!(
+        same_on_both(&contracts_only, &m17),
+        Decision::Deny(_)
+    ));
+
+    // Unlisted approval and budget modes treat an unlisted M as an unlisted G.
+    let approval = both_pay_tools(&entry(&format!("\"{m17}\""), "{ mode = \"approval\" }"));
+    assert_eq!(same_on_both(&approval, &m17), Decision::Allow);
+    for unlisted in [&m18, &g] {
+        assert!(matches!(
+            same_on_both(&approval, unlisted),
+            Decision::RequireApproval(_)
+        ));
+    }
+    let budget_mode = both_pay_tools(&entry(
+        &format!("\"{m17}\""),
+        "{ mode = \"budget\", per_tx_stroops = 4, per_period_stroops = 8, window = \"1d\" }",
+    ));
+    for unlisted in [&m18, &g] {
+        assert!(matches!(
+            same_on_both(&budget_mode, unlisted),
+            Decision::Deny(DenyReason::UnlistedBudgetExceeded { .. })
+        ));
+    }
+    assert_eq!(same_on_both(&budget_mode, &m17), Decision::Allow);
+
+    // Issuer conjunction: a listed M with an unlisted issuer is not listed.
+    let issuer_list = allowlist(CounterpartyKind::KnownIssuer, &[&usd()]);
+    let issued_to = |asset: &str, destination: &str| {
+        ValueClass::single(leg(ActionKind::Payment, 1, asset, Some(destination)))
+    };
+    assert_eq!(
+        classify(&issuer_list, issued_to(&usd(), &m17), None, None).unwrap(),
+        Some(RecipientClass::Listed)
+    );
+    assert_eq!(
+        classify(
+            &issuer_list,
+            issued_to(&format!("EUR:{UNLISTED}"), &m17),
+            None,
+            None
+        )
+        .unwrap(),
+        Some(RecipientClass::Unlisted)
+    );
+
+    // Domain conjunction: the domain lists the base account; an M on it
+    // passes as the base passes, and an M on an unlisted base does not.
+    let domain = allowlist(CounterpartyKind::HomeDomain, &["example.com"]);
+    let lists_base = ListsAccount(g.clone());
+    for destination in [&g, &m0, &m17] {
+        assert_eq!(
+            classify(
+                &domain,
+                payment(1, destination),
+                Some(&MuxIdentity(g.clone())),
+                Some(&lists_base)
+            )
+            .unwrap(),
+            Some(RecipientClass::Listed),
+            "{destination}"
+        );
+    }
+    let other_base = g_of(other);
+    assert_eq!(
+        classify(
+            &domain,
+            payment(1, &m_of(other, 17)),
+            Some(&MuxIdentity(other_base)),
+            Some(&lists_base)
+        )
+        .unwrap(),
+        Some(RecipientClass::Unverifiable)
+    );
+}
+
+/// Accounting is shared. Debits to G, M0 and M17 of one key share the
+/// unlisted budget, and confirmed records charge each payment once under
+/// the same state key; an exact-M listed recipient spends no budget.
+#[test]
+fn muxed_budget_and_counterparty_accounting() {
+    let _clock = set_query_time_for_test(NOW_MS);
+    let key = [0xAB; 32];
+    let (g, m0, m17) = (g_of(key), m_of(key, 0), m_of(key, 17));
+    let listed = m_of(key, 99);
+    let criterion = format!(
+        "{{ kind = \"counterparty_allowlist\", kinds = [\"G_ACCOUNT\"], allowlist = [\"{listed}\"], \
+         unlisted = {{ mode = \"budget\", per_tx_stroops = 10, per_period_stroops = 20, \
+         window = \"1d\" }} }}"
+    );
+    let engine = engine_from_criteria(&criterion);
+    confirm(&engine, payment(8, &g));
+    confirm(&engine, payment(8, &m0));
+    assert_eq!(
+        engine
+            .state_store()
+            .query_window(&unlisted_key(), NOW_MS)
+            .unwrap(),
+        (16, 2),
+        "G and M0 debits charge one counter once each"
+    );
+    assert!(
+        matches!(
+            decide(&engine, payment(8, &m17)),
+            Decision::Deny(DenyReason::UnlistedBudgetExceeded { .. })
+        ),
+        "M17 shares the window G and M0 used"
+    );
+    assert_eq!(decide(&engine, payment(4, &m17)), Decision::Allow);
+    confirm(&engine, payment(4, &m17));
+    assert_eq!(
+        engine
+            .state_store()
+            .query_window(&unlisted_key(), NOW_MS)
+            .unwrap(),
+        (20, 3)
+    );
+    // The listed exact-M recipient is outside the unlisted budget.
+    let evaluated = strict(&engine, payment(9, &listed), None).unwrap();
+    assert_eq!(evaluated.decision, Decision::Allow);
+    assert_eq!(
+        evaluated.value_effects.as_ref().unwrap().recipient_class(),
+        Some(RecipientClass::Listed)
+    );
+    assert!(matches!(
+        decide(&engine, payment(1, &m_of(key, 100))),
+        Decision::Deny(DenyReason::UnlistedBudgetExceeded { .. })
+    ));
+}

@@ -799,7 +799,7 @@ fn render_rule_proposal_definition(definition: &ContextRuleProposalSnapshot) -> 
     clippy::too_many_lines,
     reason = "one arm per approval kind, each rendering every field it consents to"
 )]
-fn write_summary(
+pub(super) fn write_summary(
     entry: &PendingApproval,
     context: &stellar_agent_core::approval::ApprovalContext,
     out: &mut dyn Write,
@@ -851,13 +851,14 @@ fn write_summary(
                 } => {
                     let memo = esc(&summary.memo.display());
                     format!(
-                        "  To:                {to}\n  \
+                        "  To:                {to}\n{base}  \
                          Amount:            {amount}\n  \
                          Asset:             {asset}\n  \
                          Memo:              {memo}\n  \
                          Simulated fee:     {fee} stroops\n  \
                          Simulated seq num: {seq}",
                         to = esc(destination),
+                        base = base_account_line(destination),
                         amount = stroop_amount(*amount_stroops, asset),
                         asset = esc(asset),
                     )
@@ -872,7 +873,7 @@ fn write_summary(
                     let memo = esc(&summary.memo.display());
                     format!(
                         "  Kind:              path payment\n  \
-                         To:                {to}\n  \
+                         To:                {to}\n{base}  \
                          Amount:            {amount} at most\n  \
                          Asset:             {asset}\n  \
                          Receives:          {receives} at least\n  \
@@ -881,6 +882,7 @@ fn write_summary(
                          Simulated fee:     {fee} stroops\n  \
                          Simulated seq num: {seq}",
                         to = esc(destination),
+                        base = base_account_line(destination),
                         amount = stroop_amount(*send_amount_stroops, send_asset),
                         asset = esc(send_asset),
                         receives = stroop_amount(*dest_amount_stroops, dest_asset),
@@ -1009,15 +1011,22 @@ fn write_summary(
             // Redact destination to first-5-last-5.
             // Fields are rendered from VALIDATED STORED values — never from
             // agent-relayed content (wallet-owned rendering).
-            let dest_redacted = if destination.len() >= 10 {
-                format!(
-                    "{}...{}",
-                    &destination[..5],
-                    &destination[destination.len() - 5..]
-                )
-            } else {
-                "<redacted>".to_owned()
-            };
+            // A muxed destination shows in full with its base account, because
+            // the grant covers that exact key and ID only.
+            let dest_redacted =
+                if stellar_agent_core::payment_accounts::PaymentAccount::parse(destination)
+                    .is_ok_and(|account| account.muxed_id().is_some())
+                {
+                    destination.clone()
+                } else if destination.len() >= 10 {
+                    format!(
+                        "{}...{}",
+                        &destination[..5],
+                        &destination[destination.len() - 5..]
+                    )
+                } else {
+                    "<redacted>".to_owned()
+                };
             format!(
                 "  Kind:              ToolsetFirstInvokeGate\n  \
                  Toolset:           {toolset}\n  \
@@ -1025,7 +1034,7 @@ fn write_summary(
                  Package SHA-256:   {shasum_short}\n  \
                  Install identity:  {install_id}\n  \
                  Capability:        {capability}\n  \
-                 Destination:       {dest}\n  \
+                 Destination:       {dest}\n{base}  \
                  Asset:             {asset_text}\n  \
                  Amount max:        {amount_max}\n  \
                  Amount min:        {amount_min_stroops} stroops",
@@ -1035,6 +1044,7 @@ fn write_summary(
                 install_id = esc(install_id),
                 capability = esc(capability),
                 dest = esc(&dest_redacted),
+                base = base_account_line(destination),
                 asset_text = esc(asset),
                 amount_max = stroop_amount(*amount_max_stroops, asset),
             )
@@ -1204,6 +1214,16 @@ fn write_summary(
 /// What a claim summary shows for the balance's asset and amount: the claim
 /// transaction names the balance by id only.
 const CLAIM_VALUE_NOTE: &str = "not part of the signed claim transaction";
+
+/// The `Base account` line of a muxed destination, ending in a newline, or
+/// nothing for any other destination.
+fn base_account_line(destination: &str) -> String {
+    stellar_agent_core::payment_accounts::PaymentAccount::parse(destination)
+        .ok()
+        .filter(|account| account.muxed_id().is_some())
+        .map(|account| format!("  Base account:      {}\n", account.base_account()))
+        .unwrap_or_default()
+}
 
 /// An amount in stroops: `"<decimal> XLM (<n> stroops)"` for XLM, else
 /// `"<n> stroops"`.

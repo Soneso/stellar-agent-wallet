@@ -77,8 +77,85 @@ test("toolset gate row names the version, the shasum prefix and the install iden
   const row = renderedRow(view);
   assert.equal(row.headline, "Toolset capability request");
   assert.equal(row.meta, "pay-toolset 1.2.0 · sha256 0123456789ab · " +
-    "install fedcba9876543210fedcba9876543210 · requests sign-payment");
+    "install fedcba9876543210fedcba9876543210 · requests sign-payment · to GAAAA...AAAAA");
   assert.deepEqual(row.metaClasses, ["ap-meta", "toolset-gate"]);
+});
+
+// The inbox rules as the server serves them, from `INBOX_STYLE`.
+function inboxRules() {
+  const source = readFileSync(new URL("../templates.rs", import.meta.url), "utf8");
+  const start = source.indexOf('pub const INBOX_STYLE: &str = r"') + 'pub const INBOX_STYLE: &str = r"'.length;
+  const css = source.slice(start, source.indexOf('";', start));
+  return [...css.matchAll(/([^{}]+)\{([^}]*)\}/g)].map(([, selector, body]) => ({
+    selector: selector.trim(),
+    declarations: Object.fromEntries(body.split(";").map((d) => d.trim()).filter(Boolean)
+      .map((d) => [d.slice(0, d.indexOf(":")).trim(), d.slice(d.indexOf(":") + 1).trim()])),
+  }));
+}
+
+// The value of `property` for an element with `classes`, applying every
+// single compound class rule that matches, by specificity and then order.
+function resolved(classes, property) {
+  const matching = inboxRules()
+    .map((rule, order) => ({ ...rule, order, compound: rule.selector.split(".").filter(Boolean) }))
+    .filter((rule) => /^(\.[\w-]+)+$/.test(rule.selector) &&
+      rule.compound.every((name) => classes.includes(name)))
+    .sort((a, b) => a.compound.length - b.compound.length || a.order - b.order);
+  let value;
+  for (const rule of matching) {
+    if (property in rule.declarations) value = rule.declarations[property];
+  }
+  return value;
+}
+
+// Every child row of the rendered entry's main column.
+function renderedMain(view) {
+  function element() {
+    return { children: [], textContent: "", appendChild(child) { this.children.push(child); } };
+  }
+  globalThis.document = { createElement: element, createTextNode(text) {
+    return { textContent: text, children: [] };
+  }, getElementById() { return null; } };
+  const container = element();
+  renderers.renderInbox(container, [view]);
+  return container.children[0].children[1].children.slice(1)
+    .map((child) => ({ text: child.textContent, classes: child.className.split(" ") }));
+}
+
+const MUX_BASE = "GDK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LCRG";
+const MUX_17 = "MDK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5KAAAAAAAAAAACHBWG";
+
+test("toolset inbox keeps the full muxed destination", () => {
+  const rows = renderedMain({ kind_name: "ToolsetFirstInvokeGate", summary: {
+    kind: "toolset_first_invoke_gate", toolset_name: "pay-toolset", package_version: "1.2.0",
+    package_shasum_short: "0123456789ab", install_id: "fedcba9876543210fedcba9876543210",
+    capability: "sign-payment", destination_redacted: "MDK5L...HBWG", destination: MUX_17,
+    destination_base: MUX_BASE, asset: "XLM", amount_min_stroops: "1",
+    amount_max_stroops: "10000000",
+  }});
+  assert.ok(rows[0].text.endsWith(" · to " + MUX_17), "the shared local/remote inbox shows the full M destination");
+  assert.deepEqual(rows[1], { text: "base account " + MUX_BASE, classes: ["ap-meta", "muxed"] });
+  for (const row of rows) {
+    assert.equal(resolved(row.classes, "text-overflow"), "clip");
+    assert.equal(resolved(row.classes, "white-space"), "normal");
+  }
+});
+
+test("payment inbox does not clip a muxed address", () => {
+  const rows = renderedMain({ summary: { kind: "payment", to: MUX_17, to_base: MUX_BASE,
+    amount_stroops: "10000000", asset: "XLM", memo: { kind: "none" } } });
+  assert.equal(rows[0].text, "to " + MUX_17 + " · memo none");
+  assert.deepEqual(rows[1], { text: "base account " + MUX_BASE, classes: ["ap-meta", "muxed"] });
+  for (const row of rows) {
+    assert.equal(resolved(row.classes, "text-overflow"), "clip",
+      "the M payment inbox row does not use the clipping rule");
+    assert.equal(resolved(row.classes, "white-space"), "normal");
+  }
+  // A G payment row keeps its single clipped line.
+  const plain = renderedMain({ summary: { kind: "payment", to: MUX_BASE,
+    amount_stroops: "10000000", asset: "XLM", memo: { kind: "none" } } });
+  assert.deepEqual(plain, [{ text: "to " + MUX_BASE + " · memo none", classes: ["ap-meta"] }]);
+  assert.equal(resolved(plain[0].classes, "text-overflow"), "ellipsis");
 });
 
 // testdata/inbox_bidi.json is the inbox JSON the Rust test

@@ -2148,4 +2148,160 @@ mod tests {
         let store = ToolsetGrantStore::open(path, bad.expires_at_unix_ms).unwrap();
         assert!(store.is_empty(), "expired grants prune on load");
     }
+
+    /// A one-payment unsigned envelope to `destination`, as base64 XDR.
+    fn payment_envelope(destination: stellar_xdr::MuxedAccount) -> String {
+        use stellar_xdr::{
+            Limits, Memo, MuxedAccount, Operation, OperationBody, PaymentOp, Preconditions,
+            SequenceNumber, Transaction, TransactionEnvelope, TransactionExt,
+            TransactionV1Envelope, Uint256, WriteXdr,
+        };
+        TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx: Transaction {
+                source_account: MuxedAccount::Ed25519(Uint256([0x01; 32])),
+                fee: 100,
+                seq_num: SequenceNumber(9),
+                cond: Preconditions::None,
+                memo: Memo::None,
+                operations: vec![Operation {
+                    source_account: None,
+                    body: OperationBody::Payment(PaymentOp {
+                        destination,
+                        asset: stellar_xdr::Asset::Native,
+                        amount: 5,
+                    }),
+                }]
+                .try_into()
+                .unwrap(),
+                ext: TransactionExt::V0,
+            },
+            signatures: Vec::new().try_into().unwrap(),
+        })
+        .to_xdr_base64(Limits::none())
+        .unwrap()
+    }
+
+    /// Approvals bind the full ID. A grant, an intent digest and an
+    /// approval subject for M17 cover neither M18, the G base nor another
+    /// key; a grant for G covers every M on its key.
+    #[test]
+    fn muxed_approval_id_binding() {
+        use crate::approval::intent::{
+            ClassicIntent, IntentAsset, IntentBase, IntentPayload, MemoFact,
+        };
+        let key = [0xAC; 32];
+        let other = [0xEC; 32];
+        let g = |key: [u8; 32]| format!("{}", stellar_strkey::ed25519::PublicKey(key));
+        let m = |key: [u8; 32], id: u64| {
+            format!(
+                "{}",
+                stellar_strkey::ed25519::MuxedAccount { ed25519: key, id }
+            )
+        };
+        let attestation_key = [0x42; 32];
+        let binding = crate::approval::AttestationBinding::new("default", "stellar:testnet");
+        let grant_for = |destination: &str| {
+            build_attested_grant(
+                "my-toolset".to_owned(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                "1.0.0".to_owned(),
+                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
+                "sign-payment".to_owned(),
+                destination.to_owned(),
+                "XLM".to_owned(),
+                0,
+                10,
+                "1000".to_owned(),
+                NOW_MS,
+                86_400_000,
+                &attestation_key,
+                &binding,
+            )
+            .unwrap()
+        };
+        let covers = |grant: &ToolsetGrant, destination: &str| {
+            let query = GrantQuery {
+                destination,
+                ..test_query()
+            };
+            let matched = grant.matches(
+                query.toolset_name,
+                query.install_id,
+                query.package_version,
+                query.package_shasum,
+                query.capability,
+                destination,
+                query.asset,
+                query.amount_stroops,
+                query.now_unix_ms,
+            );
+            let dir = tempfile::TempDir::new().unwrap();
+            let store = store_with_grant(&dir, grant.clone());
+            let verified = store
+                .find_matching(&query, &attestation_key, &binding)
+                .is_some();
+            assert_eq!(matched, verified, "{destination}");
+            matched
+        };
+        let m17 = grant_for(&m(key, 17));
+        assert!(covers(&m17, &m(key, 17)));
+        for uncovered in [m(key, 18), m(key, 0), g(key), m(other, 17)] {
+            assert!(
+                !covers(&m17, &uncovered),
+                "the M17 grant covers {uncovered}"
+            );
+        }
+        let base = grant_for(&g(key));
+        assert!(covers(&base, &g(key)));
+        for covered in [m(key, 0), m(key, 17)] {
+            assert!(
+                covers(&base, &covered),
+                "the G grant does not cover {covered}"
+            );
+        }
+
+        let intent = |destination: String| {
+            ClassicIntent::new(
+                IntentBase::new(
+                    "stellar:testnet".to_owned(),
+                    g([0x01; 32]),
+                    [3; 32],
+                    100,
+                    MemoFact::None,
+                )
+                .unwrap(),
+                IntentPayload::Pay {
+                    destination,
+                    asset: IntentAsset::Native,
+                    amount_stroops: 5,
+                },
+            )
+            .unwrap()
+            .digest()
+        };
+        let subject = |destination: stellar_xdr::MuxedAccount| {
+            crate::approval::subject::approval_subject_classic(&payment_envelope(destination))
+        };
+        let muxed = |key: [u8; 32], id: u64| {
+            stellar_xdr::MuxedAccount::MuxedEd25519(stellar_xdr::MuxedAccountMed25519 {
+                id,
+                ed25519: stellar_xdr::Uint256(key),
+            })
+        };
+        let bound_intent = intent(m(key, 17));
+        let bound_subject = subject(muxed(key, 17));
+        for (destination, xdr) in [
+            (m(key, 18), muxed(key, 18)),
+            (m(key, 0), muxed(key, 0)),
+            (
+                g(key),
+                stellar_xdr::MuxedAccount::Ed25519(stellar_xdr::Uint256(key)),
+            ),
+            (m(other, 17), muxed(other, 17)),
+        ] {
+            assert_ne!(intent(destination.clone()), bound_intent, "{destination}");
+            assert_ne!(subject(xdr), bound_subject, "{destination}");
+        }
+        assert_eq!(intent(m(key, 17)), bound_intent);
+    }
 }

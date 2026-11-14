@@ -315,13 +315,14 @@ pub async fn submit_fee_bump_idempotent(
 
     // ── Step 5: atomic winner/loser gate ─────────────────────────────────────
     let outcome = store
-        .try_begin(
+        .try_begin_to(
             &inner_key,
             &outer_tx_hash_hex,
             &inner_source,
             inner_sequence,
             inner_max_time,
             recorded_at_ledger,
+            crate::submit::muxed_payment_destination(&inner_envelope_for_max_time).as_deref(),
         )
         .map_err(|e| {
             WalletError::Internal(InternalError::UnexpectedState {

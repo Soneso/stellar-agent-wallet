@@ -85,7 +85,8 @@ pub struct Sep7TxParams {
 /// The structured result of parsing a `web+stellar:pay?...` URI.
 #[derive(Debug, Clone)]
 pub struct Sep7PayParams {
-    /// Required payment destination — G-strkey or federated address.
+    /// Required payment destination: a G-strkey, an M-strkey with its mux ID,
+    /// or a federated address.
     pub destination: String,
 
     /// Optional amount.
@@ -390,11 +391,11 @@ fn parse_pay_params(
             param: "destination",
         })?;
 
-    // Validate destination: G-strkey or federation address (contains '*').
-    // Per sep-0007.md: destination must be a valid account ID or payment address.
+    // Validate destination: G-strkey, M-strkey or federation address
+    // (contains '*'). A payment destination is a MuxedAccount, so an M-strkey
+    // keeps its mux ID.
     if !destination.contains('*') {
-        // Not a federation address — validate as G-strkey.
-        validate_g_strkey_raw(&destination, "destination")?;
+        validate_payment_destination(&destination)?;
     }
 
     // amount — optional; validate as numeric if present.
@@ -409,7 +410,7 @@ fn parse_pay_params(
     // asset_issuer — optional; G-strkey; required if asset_code present and not XLM.
     let asset_issuer = params
         .remove("asset_issuer")
-        .map(|v| validate_g_strkey(v, "asset_issuer"))
+        .map(validate_plain_issuer)
         .transpose()?;
 
     // Validate asset_code + asset_issuer coherence.
@@ -599,6 +600,35 @@ fn validate_callback(callback: &str) -> Result<String, Sep7Error> {
 fn validate_g_strkey(value: String, param: &'static str) -> Result<String, Sep7Error> {
     validate_g_strkey_raw(&value, param)?;
     Ok(value)
+}
+
+/// Validates a non-federated payment destination as a G-strkey or M-strkey.
+///
+/// The XDR `MuxedAccount` parser verifies the checksum and trailing bits.
+fn validate_payment_destination(value: &str) -> Result<(), Sep7Error> {
+    <stellar_xdr::MuxedAccount as std::str::FromStr>::from_str(value)
+        .map(|_| ())
+        .map_err(|_| Sep7Error::InvalidParamValue {
+            param: "destination",
+            detail: "must be a valid Stellar G-strkey or M-strkey account".to_owned(),
+        })
+}
+
+/// Validates `asset_issuer` as a plain G-strkey.
+///
+/// An asset issuer is an `AccountId`, so a valid M-strkey refuses with that
+/// reason.
+fn validate_plain_issuer(value: String) -> Result<String, Sep7Error> {
+    let muxed = <stellar_xdr::MuxedAccount as std::str::FromStr>::from_str(&value);
+    if matches!(muxed, Ok(stellar_xdr::MuxedAccount::MuxedEd25519(_))) {
+        return Err(Sep7Error::InvalidParamValue {
+            param: "asset_issuer",
+            detail: "issuer requires AccountId; a muxed ID cannot be encoded; an issuer is a base \
+                     account"
+                .to_owned(),
+        });
+    }
+    validate_g_strkey(value, "asset_issuer")
 }
 
 fn validate_g_strkey_raw(value: &str, param: &'static str) -> Result<(), Sep7Error> {
@@ -1934,5 +1964,130 @@ mod tests {
             assert_no_marker(&error, CREDENTIAL_MARKER);
             assert_no_marker(&error, domain);
         }
+    }
+
+    /// A payment URI keeps an M destination. M0 and M17 parse with the
+    /// original destination and an explicit memo, and the signature,
+    /// federation, memo-coherence and plain issuer rules stay.
+    #[test]
+    fn sep7_muxed_destination() {
+        use base64::Engine as _;
+        use ed25519_dalek::Signer as _;
+        let key = [0xB1; 32];
+        let m = |id: u64| {
+            stellar_strkey::ed25519::MuxedAccount { ed25519: key, id }
+                .to_string()
+                .as_str()
+                .to_owned()
+        };
+        let pay = |uri: &str| match parse_sep7_uri(uri).unwrap() {
+            Sep7Request::Pay(params) => params,
+            Sep7Request::Tx(_) => panic!("expected pay"),
+        };
+        for id in [0, 17] {
+            let destination = m(id);
+            let plain = pay(&format!("web+stellar:pay?destination={destination}"));
+            assert_eq!(plain.destination, destination, "M{id} is kept");
+            let with_memo = pay(&format!(
+                "web+stellar:pay?destination={destination}&memo=88&memo_type=MEMO_ID"
+            ));
+            assert_eq!(with_memo.destination, destination);
+            assert_eq!(with_memo.memo.as_deref(), Some("88"));
+            assert_eq!(with_memo.memo_type, Some(MemoType::MemoId));
+            let text = pay(&format!(
+                "web+stellar:pay?destination={destination}&memo=hello&memo_type=MEMO_TEXT"
+            ));
+            assert_eq!(text.memo.as_deref(), Some("hello"));
+
+            let incoherent = parse_sep7_uri(&format!(
+                "web+stellar:pay?destination={destination}&memo_type=MEMO_TEXT"
+            ))
+            .unwrap_err();
+            assert!(matches!(
+                incoherent,
+                Sep7Error::InvalidParamValue { param: "memo", .. }
+            ));
+
+            let issuer = parse_sep7_uri(&format!(
+                "web+stellar:pay?destination={destination}&asset_code=USDC&asset_issuer={destination}"
+            ))
+            .unwrap_err();
+            assert!(
+                matches!(
+                    &issuer,
+                    Sep7Error::InvalidParamValue { param: "asset_issuer", detail }
+                        if detail == "issuer requires AccountId; a muxed ID cannot be encoded; \
+                                      an issuer is a base account"
+                ),
+                "{issuer:?}"
+            );
+            assert!(!issuer.to_string().contains(&destination));
+        }
+        assert_eq!(
+            pay("web+stellar:pay?destination=user*example.com").destination,
+            "user*example.com"
+        );
+        // C, W, a checksum-corrupt M and a secret key refuse unechoed.
+        let mut corrupt = m(17);
+        let last = corrupt.pop().unwrap();
+        corrupt.push(if last == 'A' { 'B' } else { 'A' });
+        let secret = stellar_strkey::ed25519::PrivateKey([0xB1; 32])
+            .as_unredacted()
+            .to_string()
+            .as_str()
+            .to_owned();
+        for refused in [
+            stellar_strkey::Contract(key)
+                .to_string()
+                .as_str()
+                .to_owned(),
+            stellar_strkey::MuxedContract {
+                contract_id: key,
+                id: 17,
+            }
+            .to_string()
+            .as_str()
+            .to_owned(),
+            corrupt,
+            secret,
+        ] {
+            let error =
+                parse_sep7_uri(&format!("web+stellar:pay?destination={refused}")).unwrap_err();
+            assert!(matches!(
+                error,
+                Sep7Error::InvalidParamValue {
+                    param: "destination",
+                    ..
+                }
+            ));
+            assert!(!error.to_string().contains(&refused));
+        }
+
+        // The signature covers the full M destination: a changed ID fails.
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[0x5A; 32]);
+        let signing_key = stellar_strkey::ed25519::PublicKey(signer.verifying_key().to_bytes())
+            .to_string()
+            .as_str()
+            .to_owned();
+        let toml = format!("URI_REQUEST_SIGNING_KEY = \"{signing_key}\"\n");
+        let unsigned = format!(
+            "web+stellar:pay?destination={}&origin_domain=example.com",
+            m(17)
+        );
+        let signature = base64::engine::general_purpose::STANDARD.encode(
+            signer
+                .sign(&crate::verify::build_signature_payload(&unsigned))
+                .to_bytes(),
+        );
+        let verify = |uri: &str| {
+            crate::verify::verify_against_toml_body(uri, "example.com", Some(&signature), &toml)
+                .unwrap()
+        };
+        assert_eq!(verify(&unsigned), crate::verify::SignatureStatus::Verified);
+        let moved = format!(
+            "web+stellar:pay?destination={}&origin_domain=example.com",
+            m(18)
+        );
+        assert_eq!(verify(&moved), crate::verify::SignatureStatus::Failed);
     }
 }
