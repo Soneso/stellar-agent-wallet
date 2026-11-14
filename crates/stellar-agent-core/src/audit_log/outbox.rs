@@ -47,7 +47,9 @@
 //!
 //! # Append
 //!
-//! A keyed append writes `{"k":"row","g":G,"s":S,"r":0,"body":B,"tag":"T"}`.
+//! An ordinary keyed append writes `{"k":"row","g":G,"s":S,"r":0,"body":B,"tag":"T"}`.
+//! Queued consent uses `r=1` and returns an [`OutboxRowRef`] after durability succeeds.
+//! The owner drain retains delivery evidence for those consent rows.
 //! The body is the entry's canonical JSON. The tag is lowercase hex HMAC-SHA256
 //! over `stellar-agent-outbox-row:v2`, big-endian u64 generation and sequence,
 //! one evidence byte, and the exact body bytes, without separators or newline.
@@ -725,6 +727,86 @@ fn row_digest(g: u64, s: u64, r: u8, entry: &AuditEntry) -> Result<[u8; 32], ser
     Ok(layout_digest(g, s, r, &entry.canonical_json_body()?))
 }
 
+/// The coordinates and digest of a durably queued consent row.
+///
+/// A reference identifies the row; delivery requires separate owner evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutboxRowRef {
+    generation: u64,
+    sequence: u64,
+    digest: [u8; 32],
+}
+
+impl OutboxRowRef {
+    /// The queue generation that contains the row.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The row's one-based position within its generation.
+    #[must_use]
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    /// The SHA-256 digest of the row without its tag or newline.
+    #[must_use]
+    pub fn digest(&self) -> &[u8; 32] {
+        &self.digest
+    }
+}
+
+impl serde::Serialize for OutboxRowRef {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct as _;
+        let mut wire = serializer.serialize_struct("OutboxRowRef", 3)?;
+        wire.serialize_field("g", &self.generation)?;
+        wire.serialize_field("s", &self.sequence)?;
+        wire.serialize_field(
+            "digest",
+            &format!("sha256:{}", crate::hex::encode(&self.digest)),
+        )?;
+        wire.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for OutboxRowRef {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            g: u64,
+            s: u64,
+            digest: String,
+        }
+        struct Object;
+        impl<'de> serde::de::Visitor<'de> for Object {
+            type Value = Wire;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an outbox row reference object")
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(self, map: M) -> Result<Wire, M::Error> {
+                serde::Deserialize::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+            }
+        }
+        let wire = deserializer.deserialize_map(Object)?;
+        let invalid =
+            || serde::de::Error::custom("outbox row digest is not sha256:<64 lowercase hex>");
+        let hex = wire.digest.strip_prefix("sha256:").ok_or_else(invalid)?;
+        if hex.len() != 64 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return Err(invalid());
+        }
+        Ok(Self {
+            generation: wire.g,
+            sequence: wire.s,
+            digest: crate::hex::decode_hex32(hex).map_err(|_| invalid())?,
+        })
+    }
+}
+
 fn layout_digest(g: u64, s: u64, r: u8, body: &[u8]) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(row_prefix(g, s, r));
@@ -1268,6 +1350,12 @@ impl AuditOutbox {
         &self.path
     }
 
+    /// Whether this outbox holds an audit key for authenticated rows.
+    #[must_use]
+    pub fn is_keyed(&self) -> bool {
+        self.key.is_some()
+    }
+
     /// Appends `entry` as one line and syncs it, under the outbox lock.
     ///
     /// `Ok` means the line is durable, and for an unkeyed outbox committed.
@@ -1302,6 +1390,21 @@ impl AuditOutbox {
     /// - [`WriterError::Io`] on any read, write, flush, or sync failure.
     pub fn append(&self, entry: &AuditEntry) -> Result<(), WriterError> {
         self.prepare_append()?.append(entry)
+    }
+
+    /// Queues an evidence-bearing consent row and returns its durable reference.
+    ///
+    /// After a failed rollback the caller gets the refusal while the row stays
+    /// and is delivered later, so a consumer keys on the reference.
+    ///
+    /// # Errors
+    /// Returns [`WriterError::KeyedLogNeedsKey`] before locking an unkeyed outbox.
+    /// Other refusals follow [`Self::append`], and return no reference.
+    pub fn append_queued(&self, entry: &AuditEntry) -> Result<OutboxRowRef, WriterError> {
+        if !self.is_keyed() {
+            return Err(queued_key_required());
+        }
+        self.prepare_append()?.append_queued(entry)
     }
 
     /// Acquires the outbox lock and loads the state needed for one append.
@@ -1481,7 +1584,23 @@ impl PreparedOutboxAppend<'_> {
     /// The row's measure and encoding run before the first write, so their
     /// refusals leave the outbox as preparation found it. The first write
     /// creates a missing file or drops a torn tail.
-    pub(crate) fn append(mut self, entry: &AuditEntry) -> Result<(), WriterError> {
+    pub(crate) fn append(self, entry: &AuditEntry) -> Result<(), WriterError> {
+        self.append_row(entry, 0).map(|_| ())
+    }
+
+    /// Writes an evidence-bearing row under the acquired lock.
+    pub(crate) fn append_queued(self, entry: &AuditEntry) -> Result<OutboxRowRef, WriterError> {
+        if !matches!(self.coordinates, Coordinates::Keyed { .. }) {
+            return Err(queued_key_required());
+        }
+        self.append_row(entry, 1)?.ok_or_else(queued_key_required)
+    }
+
+    fn append_row(
+        mut self,
+        entry: &AuditEntry,
+        r: u8,
+    ) -> Result<Option<OutboxRowRef>, WriterError> {
         #[cfg(test)]
         if test_seam::take_oversized(&self.outbox.path) {
             use super::writer::MAX_ROW_BYTES;
@@ -1491,8 +1610,16 @@ impl PreparedOutboxAppend<'_> {
             });
         }
         refuse_undeliverable_row(entry)?;
+        let reference = match &self.coordinates {
+            Coordinates::Keyed { g, s, .. } if r == 1 => Some(OutboxRowRef {
+                generation: *g,
+                sequence: *s,
+                digest: row_digest(*g, *s, r, entry).map_err(WriterError::Serialise)?,
+            }),
+            _ => None,
+        };
         let mut line = match &self.coordinates {
-            Coordinates::Keyed { key, g, s } => encode_tagged_row(key, *g, *s, 0, entry),
+            Coordinates::Keyed { key, g, s } => encode_tagged_row(key, *g, *s, r, entry),
             Coordinates::Committed(_) => serde_json::to_vec(entry),
         }
         .map_err(WriterError::Serialise)?;
@@ -1508,8 +1635,12 @@ impl PreparedOutboxAppend<'_> {
             }
         };
         repair_torn_tail(&file, &outbox.path, self.extent)?;
+        #[cfg(test)]
+        test_seam::run_append_step(&outbox.path, test_seam::AppendStep::Repaired);
         let keyed = matches!(self.coordinates, Coordinates::Keyed { .. });
         let appended = write_line(&mut file, &outbox.path, &line).and_then(|()| {
+            #[cfg(test)]
+            test_seam::run_append_step(&outbox.path, test_seam::AppendStep::FileSynced);
             // The directory sync makes the file's name durable before the
             // row is acknowledged. An append that created the file needs it,
             // and so does a keyed append after a publication whose own
@@ -1517,6 +1648,8 @@ impl PreparedOutboxAppend<'_> {
             if created || keyed {
                 sync_parent_dir(&outbox.path)?;
             }
+            #[cfg(test)]
+            test_seam::run_append_step(&outbox.path, test_seam::AppendStep::DirectorySynced);
             match &mut self.coordinates {
                 Coordinates::Committed(committed) => {
                     committed.push(&line[..line.len() - 1]);
@@ -1541,7 +1674,13 @@ impl PreparedOutboxAppend<'_> {
             }
             return Err(error);
         }
-        Ok(())
+        Ok(reference)
+    }
+}
+
+fn queued_key_required() -> WriterError {
+    WriterError::KeyedLogNeedsKey {
+        evidence: "a consent row that carries delivery evidence needs the audit key",
     }
 }
 
@@ -3083,6 +3222,39 @@ pub mod test_seam {
     #[cfg(test)]
     type Hook = Box<dyn FnOnce() + Send>;
 
+    #[cfg(test)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum AppendStep {
+        Repaired,
+        FileSynced,
+        DirectorySynced,
+    }
+
+    #[cfg(test)]
+    static APPEND_STEPS: Mutex<Vec<(PathBuf, AppendStep, Hook)>> = Mutex::new(Vec::new());
+
+    #[cfg(test)]
+    pub(crate) fn on_append_step(
+        path: &Path,
+        step: AppendStep,
+        hook: impl FnOnce() + Send + 'static,
+    ) {
+        if let Ok(mut hooks) = APPEND_STEPS.lock() {
+            hooks.push((path.to_path_buf(), step, Box::new(hook)));
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn run_append_step(path: &Path, step: AppendStep) {
+        let hook = APPEND_STEPS.lock().ok().and_then(|mut hooks| {
+            let index = hooks.iter().position(|(p, s, _)| p == path && *s == step)?;
+            Some(hooks.swap_remove(index).2)
+        });
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
     /// Hooks run by the next admission of an append to an outbox.
     #[cfg(test)]
     static ADMITTED: Mutex<Vec<(PathBuf, Hook)>> = Mutex::new(Vec::new());
@@ -3202,6 +3374,473 @@ mod tests {
 
     fn keyed_outbox(path: &Path, store: &Arc<InMemoryTipAnchorStore>) -> AuditOutbox {
         AuditOutbox::for_log_keyed(path, store.clone(), Zeroizing::new(ROW_KEY))
+    }
+
+    #[test]
+    fn queued_append_recovers_each_durable_boundary() {
+        use test_seam::AppendStep;
+        for step in [
+            AppendStep::Repaired,
+            AppendStep::FileSynced,
+            AppendStep::DirectorySynced,
+        ] {
+            let (_dir, path, store, writer) = keyed_fixture();
+            let outbox = keyed_outbox(&path, &store);
+            fs::write(outbox.path(), b"{\"torn\"").unwrap();
+            test_seam::on_append_step(outbox.path(), step, || panic!("test crash: queued append"));
+            let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                outbox.append_queued(&row("crash"))
+            }));
+            assert!(
+                stopped.is_err(),
+                "the append stops before returning a reference: {step:?}"
+            );
+            let expected = usize::from(step != AppendStep::Repaired);
+            assert_eq!(parse_lines(&outbox_bytes(&path)).lines.len(), expected);
+            drop(writer);
+            let mut restarted = reopen(&path, &store);
+            assert_eq!(delivered(&path, "crash"), expected);
+            assert_eq!(restarted.drain_outbox().unwrap(), 0);
+            outbox.append_queued(&row("retry")).unwrap();
+            assert_eq!(restarted.drain_outbox().unwrap(), 1);
+            assert_eq!(delivered(&path, "retry"), 1);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn queued_append_process() {
+        use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+        use std::os::unix::net::UnixStream;
+        let Ok(log) = std::env::var("QUEUED_TEST_LOG") else {
+            return;
+        };
+        let path = PathBuf::from(log);
+        let state = Arc::new(InMemoryTipAnchorStore::new());
+        let record = crate::audit_log::tip_anchor::CarrierRecord::parse(
+            &std::env::var("QUEUED_TEST_RECORD").unwrap(),
+        )
+        .unwrap();
+        state.store_carrier_record(&record).unwrap();
+        let mut stream = UnixStream::connect(std::env::var("QUEUED_TEST_SOCKET").unwrap()).unwrap();
+        let mut waiting = stream.try_clone().unwrap();
+        test_seam::on_contended(&outbox_lock_path(&path), move || {
+            waiting.write_all(b"waiting\n").unwrap();
+            let mut release = [0];
+            waiting.read_exact(&mut release).unwrap();
+        });
+        let reference = keyed_outbox(&path, &state)
+            .append_queued(&row(&std::env::var("QUEUED_TEST_ID").unwrap()))
+            .unwrap();
+        writeln!(stream, "{}", serde_json::to_string(&reference).unwrap()).unwrap();
+        let mut acknowledgement = String::new();
+        BufReader::new(stream)
+            .read_line(&mut acknowledgement)
+            .unwrap();
+        assert_eq!(acknowledgement, "received\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn two_processes_queue_distinct_references() {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        use std::os::unix::net::UnixListener;
+        let (dir, path, store, mut writer) = keyed_fixture();
+        let socket = dir.path().join("queue.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let record = store
+            .load_carrier_record()
+            .unwrap()
+            .unwrap()
+            .to_keyring_value()
+            .unwrap();
+        let outbox = keyed_outbox(&path, &store);
+        let held = outbox.prepare_append().unwrap();
+        let mut children = Vec::new();
+        for id in ["first", "second"] {
+            children.push(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "audit_log::outbox::tests::queued_append_process",
+                        "--nocapture",
+                    ])
+                    .env("QUEUED_TEST_LOG", &path)
+                    .env("QUEUED_TEST_RECORD", &record)
+                    .env("QUEUED_TEST_SOCKET", &socket)
+                    .env("QUEUED_TEST_ID", id)
+                    .env(OUTBOX_LOCK_WAIT_ENV, "30000")
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+        }
+        let mut streams = Vec::new();
+        for _ in 0..2 {
+            let mut stream = BufReader::new(listener.accept().unwrap().0);
+            let mut state = String::new();
+            stream.read_line(&mut state).unwrap();
+            assert_eq!(state, "waiting\n");
+            streams.push(stream);
+        }
+        drop(held);
+        for stream in &mut streams {
+            stream.get_mut().write_all(&[1]).unwrap();
+        }
+        let mut references = Vec::new();
+        for mut stream in streams {
+            let mut wire = String::new();
+            stream.read_line(&mut wire).unwrap();
+            references.push(serde_json::from_str::<OutboxRowRef>(&wire).unwrap());
+            stream.get_mut().write_all(b"received\n").unwrap();
+        }
+        for child in children {
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        references.sort_by_key(OutboxRowRef::sequence);
+        assert_eq!(
+            references
+                .iter()
+                .map(OutboxRowRef::sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(writer.drain_outbox().unwrap(), 2);
+        assert_eq!(delivered(&path, "first"), 1);
+        assert_eq!(delivered(&path, "second"), 1);
+        assert_eq!(
+            owner_state(&store).unwrap().recent,
+            references.iter().map(|r| *r.digest()).collect::<Vec<_>>()
+        );
+    }
+
+    fn reference_wire(g: u64, s: u64) -> String {
+        format!(
+            r#"{{"g":{g},"s":{s},"digest":"sha256:{}"}}"#,
+            "ab".repeat(32)
+        )
+    }
+
+    #[test]
+    fn outbox_row_reference_keeps_its_wire_bytes() {
+        for (g, s) in [(0, 0), (3, 7), (u64::MAX, u64::MAX)] {
+            let wire = reference_wire(g, s);
+            let reference: OutboxRowRef = serde_json::from_str(&wire).unwrap();
+            assert_eq!(reference.generation(), g);
+            assert_eq!(reference.sequence(), s);
+            assert_eq!(reference.digest(), &[0xab; 32]);
+            assert_eq!(serde_json::to_string(&reference).unwrap(), wire);
+            let reordered = format!(
+                " {{ \"digest\": \"sha256:{}\", \"s\":{s}, \"g\":{g} }} ",
+                "ab".repeat(32),
+            );
+            assert_eq!(
+                serde_json::from_str::<OutboxRowRef>(&reordered).unwrap(),
+                reference
+            );
+        }
+    }
+
+    #[test]
+    fn outbox_row_reference_refuses_every_other_form() {
+        let wire = reference_wire(3, 7);
+        for bad in [
+            "ab".repeat(32),
+            format!("SHA256:{}", "ab".repeat(32)),
+            format!("sha256:{}", "AB".repeat(32)),
+            format!("sha256:{}", "a".repeat(63)),
+            format!("sha256:{}", "a".repeat(65)),
+            format!("sha256:{}g", "a".repeat(63)),
+        ] {
+            let bad_wire = wire.replace(&format!("sha256:{}", "ab".repeat(32)), &bad);
+            let error = serde_json::from_str::<OutboxRowRef>(&bad_wire).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("outbox row digest is not sha256:<64 lowercase hex>")
+            );
+        }
+        for (field, value) in [("g", "3"), ("s", "7")] {
+            for bad in ["-1", "3.5", "\"3\"", "18446744073709551616", "null", "true"] {
+                let bad_wire = wire.replace(
+                    &format!("\"{field}\":{value}"),
+                    &format!("\"{field}\":{bad}"),
+                );
+                assert!(
+                    serde_json::from_str::<OutboxRowRef>(&bad_wire).is_err(),
+                    "{field}: {bad}"
+                );
+            }
+        }
+        for field in ["g", "s", "digest"] {
+            let mut value: serde_json::Value = serde_json::from_str(&wire).unwrap();
+            let member = value[field].clone();
+            value.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<OutboxRowRef>(value).is_err(),
+                "missing {field}"
+            );
+            let duplicate = wire.replacen('{', &format!("{{\"{field}\":{member},"), 1);
+            assert!(
+                serde_json::from_str::<OutboxRowRef>(&duplicate).is_err(),
+                "duplicate {field}"
+            );
+        }
+        let array = format!(r#"[3,7,"sha256:{}"]"#, "ab".repeat(32));
+        assert!(
+            serde_json::from_str::<OutboxRowRef>(&array).is_err(),
+            "object schema"
+        );
+        let unknown = wire.replacen('{', "{\"extra\":0,", 1);
+        assert!(
+            serde_json::from_str::<OutboxRowRef>(&unknown).is_err(),
+            "unknown field"
+        );
+    }
+
+    #[test]
+    fn a_queued_row_returns_the_digest_of_its_line() {
+        let (_dir, path, store, _writer) = cut_over_fixture();
+        store.forbid_outbox_items(true);
+        let accesses = store.outbox_item_accesses();
+        let reference = keyed_outbox(&path, &store)
+            .append_queued(&row("queued"))
+            .unwrap();
+        assert_eq!(store.outbox_item_accesses(), accesses);
+        let bytes = outbox_bytes(&path);
+        let lines = parse_lines(&bytes).lines;
+        let (flag, digest) = test_seam::delivered_row_digest(lines[1]).unwrap();
+        assert_eq!(reference.generation(), 1);
+        assert_eq!(reference.sequence(), 1);
+        assert_eq!(flag, 1);
+        assert_eq!(reference.digest(), &digest);
+    }
+
+    #[test]
+    fn consent_rows_carry_evidence_and_halt_rows_do_not() {
+        let (_dir, path, store, _writer) = keyed_fixture();
+        let outbox = keyed_outbox(&path, &store);
+        outbox.append_queued(&row("consent")).unwrap();
+        outbox.append(&row("ordinary")).unwrap();
+        let bytes = outbox_bytes(&path);
+        let lines = parse_lines(&bytes).lines;
+        assert_eq!(test_seam::delivered_row_digest(lines[0]).unwrap().0, 1);
+        assert_eq!(test_seam::delivered_row_digest(lines[1]).unwrap().0, 0);
+    }
+
+    #[test]
+    fn an_unkeyed_outbox_refuses_a_queued_append() {
+        let dir = TempDir::new().unwrap();
+        let path = log_path(&dir);
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let outbox = AuditOutbox::for_log(&path, store.clone());
+        assert!(!outbox.is_keyed());
+        let keyed = keyed_outbox(&path, &store);
+        assert!(keyed.is_keyed());
+        let debug = format!("{keyed:?}");
+        assert!(!debug.contains(&crate::hex::encode(&ROW_KEY)));
+        assert!(!debug.contains("key:"));
+        let error = outbox.append_queued(&row("refused")).unwrap_err();
+        assert!(matches!(
+            error,
+            WriterError::KeyedLogNeedsKey {
+                evidence: "a consent row that carries delivery evidence needs the audit key"
+            }
+        ));
+        assert!(!outbox.path().exists(), "no queue is created");
+        assert!(!outbox_lock_path(&path).exists(), "no lock is created");
+        crate::audit_log::test_helpers::enroll_carriers(&path, store.as_ref()).unwrap();
+        let prepared = outbox.prepare_append().unwrap();
+        let error = prepared.append_queued(&row("prepared")).unwrap_err();
+        assert!(matches!(
+            error,
+            WriterError::KeyedLogNeedsKey {
+                evidence: "a consent row that carries delivery evidence needs the audit key"
+            }
+        ));
+        assert!(!outbox.path().exists());
+        drop(outbox.prepare_append().unwrap());
+    }
+
+    #[test]
+    fn a_refused_queued_append_returns_no_reference() {
+        use test_seam::SyncStep;
+        for existing in [false, true] {
+            for fault in [SyncStep::File, SyncStep::Directory] {
+                let (_dir, path, store, mut writer) = keyed_fixture();
+                let outbox = keyed_outbox(&path, &store);
+                if existing {
+                    outbox.append(&row("kept")).unwrap();
+                    writer.drain_outbox().unwrap();
+                }
+                let before = outbox_bytes(&path);
+                test_seam::arm_sync_failure(outbox.path(), fault);
+                let result = outbox.append_queued(&row("refused"));
+                assert!(
+                    matches!(result, Err(WriterError::Io(_))),
+                    "{existing} {fault:?}: {result:?}"
+                );
+                assert_eq!(outbox_bytes(&path), before);
+                test_seam::record_syncs(outbox.path());
+                let reference = outbox.append_queued(&row("retry")).unwrap();
+                assert_eq!(reference.sequence(), 1);
+                #[cfg(unix)]
+                assert_eq!(
+                    test_seam::take_syncs(outbox.path()),
+                    vec![SyncStep::File, SyncStep::Directory]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_queued_append_refuses_a_changed_carrier_generation() {
+        let (_dir, path, store, _writer) = cut_over_fixture();
+        let before = outbox_bytes(&path);
+        let callback_store = store.clone();
+        test_seam::on_admitted(&outbox_path(&path), move || {
+            let mut record = callback_store.load_carrier_record().unwrap().unwrap();
+            record.generation += 1;
+            callback_store.store_carrier_record(&record).unwrap();
+        });
+        let result = keyed_outbox(&path, &store).append_queued(&row("retired"));
+        assert!(
+            matches!(result, Err(WriterError::CarrierGenerationChanged { .. })),
+            "{result:?}"
+        );
+        assert_eq!(outbox_bytes(&path), before);
+    }
+
+    #[test]
+    fn an_orphan_queued_row_drains_without_an_approval() {
+        let (_dir, path, store, writer) = keyed_fixture();
+        let reference = keyed_outbox(&path, &store)
+            .append_queued(&row("orphan"))
+            .unwrap();
+        drop(writer);
+        let mut restarted = reopen(&path, &store);
+        assert_eq!(delivered(&path, "orphan"), 1);
+        assert_eq!(
+            owner_state(&store).unwrap().recent,
+            vec![*reference.digest()]
+        );
+        assert_eq!(restarted.drain_outbox().unwrap(), 0);
+        assert_eq!(delivered(&path, "orphan"), 1);
+    }
+
+    #[test]
+    fn a_failed_rollback_returns_no_reference_and_the_row_drains() {
+        let (_dir, path, store, writer) = keyed_fixture();
+        let outbox = keyed_outbox(&path, &store);
+        test_seam::arm_sync_failure(outbox.path(), test_seam::SyncStep::File);
+        test_seam::arm_sync_failure(outbox.path(), test_seam::SyncStep::Rollback);
+        let result = outbox.append_queued(&row("orphan"));
+        assert!(matches!(result, Err(WriterError::Io(_))), "{result:?}");
+        let bytes = outbox_bytes(&path);
+        let lines = parse_lines(&bytes).lines;
+        assert_eq!(lines.len(), 1);
+        let digest = test_seam::delivered_row_digest(lines[0]).unwrap().1;
+        drop(writer);
+        let mut restarted = reopen(&path, &store);
+        assert_eq!(delivered(&path, "orphan"), 1);
+        assert_eq!(owner_state(&store).unwrap().recent, vec![digest]);
+        assert_eq!(restarted.drain_outbox().unwrap(), 0);
+    }
+
+    #[test]
+    fn a_queued_reference_waits_for_owner_commit() {
+        let (_dir, path, store, mut writer) = keyed_fixture();
+        let reference = keyed_outbox(&path, &store)
+            .append_queued(&row("anchored"))
+            .unwrap();
+        let before = outbox_bytes(&path);
+        store.fail_next_writes(3);
+        let result = writer.drain_outbox();
+        assert!(
+            matches!(result, Err(WriterError::TipAnchorStore(_))),
+            "{result:?}"
+        );
+        assert!(store.outbox_item_writes().is_empty());
+        assert_eq!(store.load_outbox_owner_state(1).unwrap(), None);
+        assert_eq!(outbox_bytes(&path), before);
+        assert_eq!(writer.drain_outbox().unwrap(), 1);
+        assert_eq!(
+            owner_state(&store).unwrap().recent,
+            vec![*reference.digest()]
+        );
+        assert_eq!(delivered(&path, "anchored"), 2);
+        assert_eq!(writer.drain_outbox().unwrap(), 0);
+    }
+
+    #[test]
+    fn a_queued_reference_survives_completed_key_rotation() {
+        let (_dir, path, store, writer) = cut_over_fixture();
+        drop(writer);
+        let mut rotation = AuditWriter::open_for_key_rotation(
+            path.clone(),
+            Some(Zeroizing::new(ROW_KEY)),
+            store.clone(),
+            crate::audit_log::BindingHistory::NotRecorded,
+        )
+        .unwrap();
+        let (waiting, ready) = std::sync::mpsc::channel();
+        test_seam::on_contended(&outbox_lock_path(&path), move || waiting.send(()).unwrap());
+        let reference = std::thread::scope(|scope| {
+            let append = scope.spawn(|| keyed_outbox(&path, &store).append_queued(&row("rotated")));
+            ready.recv().unwrap();
+            store.set_reload(Ok(Some(ROW_KEY)));
+            rotation.fence_outbox_for_key_change().unwrap();
+            store.set_reload(Ok(Some(NEXT_KEY)));
+            rotation
+                .switch_entry_tag_key(Zeroizing::new(NEXT_KEY), "rotation")
+                .unwrap();
+            crate::audit_log::resign_chain_root_sidecars(&path, &NEXT_KEY).unwrap();
+            drop(rotation);
+            append.join().unwrap().unwrap()
+        });
+        let bytes = outbox_bytes(&path);
+        let lines = parse_lines(&bytes).lines;
+        let decoded = decode_tagged(lines[1], 2, SuffixCheck::Keyed(Some(&NEXT_KEY)), 1, 1);
+        assert!(
+            decoded.is_ok(),
+            "the queued row authenticates under the reloaded key"
+        );
+        let entry = decoded.unwrap().entry;
+        assert_eq!(entry.request_id, "rotated");
+        assert_eq!(
+            test_seam::delivered_row_digest(lines[1]).unwrap().1,
+            *reference.digest()
+        );
+        assert!(matches!(
+            AuditWriter::open(
+                path.clone(),
+                Some(KeyedAuditAccess::new(
+                    Zeroizing::new(ROW_KEY),
+                    store.clone(),
+                ))
+            ),
+            Err(WriterError::AuditKeyReplaced)
+        ));
+        let mut writer = AuditWriter::open(
+            path.clone(),
+            Some(KeyedAuditAccess::new(
+                Zeroizing::new(NEXT_KEY),
+                store.clone(),
+            )),
+        )
+        .unwrap();
+        assert_eq!(delivered(&path, "rotated"), 1);
+        assert_eq!(
+            owner_state(&store).unwrap().recent,
+            vec![*reference.digest()]
+        );
+        assert_eq!(writer.drain_outbox().unwrap(), 0);
     }
 
     fn replace_tagged_line(path: &Path, store: &Arc<InMemoryTipAnchorStore>, line: &[u8]) {
