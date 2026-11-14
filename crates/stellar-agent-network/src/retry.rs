@@ -138,7 +138,9 @@ where
         if Instant::now() >= deadline {
             return Err(BusyRetryError::Expired);
         }
-        let error = match tokio::time::timeout_at(deadline, op()).await {
+        // The heap holds the request future, so each call site's future
+        // grows by a fixed amount and not by the request's size.
+        let error = match tokio::time::timeout_at(deadline, Box::pin(op())).await {
             Ok(Ok(value)) => return Ok(value),
             Ok(Err(error)) => error,
             Err(_) => return Err(BusyRetryError::Expired),
@@ -876,6 +878,35 @@ mod tests {
             }))
             .unwrap(),
         ))
+    }
+
+    /// A request whose future holds `N` bytes across a pending poll.
+    #[expect(
+        clippy::result_large_err,
+        reason = "the request returns the RPC error type the retry drives"
+    )]
+    async fn request_holding<const N: usize>() -> Result<u8, stellar_rpc_client::Error> {
+        let payload = [1u8; N];
+        tokio::task::yield_now().await;
+        Ok(std::hint::black_box(&payload)[0])
+    }
+
+    /// The retry future's size does not depend on the request future's size.
+    #[test]
+    fn the_retry_future_does_not_hold_the_request_future() {
+        const ALLOWANCE: usize = 64;
+        let large_request = request_holding::<65_536>();
+        assert!(std::mem::size_of_val(&large_request) >= 65_536);
+        drop(large_request);
+
+        let small = retry_preflight_busy(None, request_holding::<1>);
+        let large = retry_preflight_busy(None, request_holding::<65_536>);
+        let (small_size, large_size) =
+            (std::mem::size_of_val(&small), std::mem::size_of_val(&large));
+        assert!(
+            large_size.abs_diff(small_size) <= ALLOWANCE,
+            "the retry takes {small_size} bytes for a 1-byte request and {large_size} for a 65536-byte one"
+        );
     }
 
     #[tokio::test(start_paused = true)]
