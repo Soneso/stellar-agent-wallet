@@ -7716,6 +7716,19 @@ impl PreparedAuditEntry<'_> {
     pub fn write(self, entry: AuditEntry) -> Result<(), WriterError> {
         self.writer.commit_append(entry)
     }
+
+    /// Appends one row and requires its tip anchor to be current.
+    ///
+    /// The writer borrow covers both the append and the anchor requirement.
+    /// A writer without an anchor store completes after row durability.
+    ///
+    /// # Errors
+    /// Returns the errors of [`Self::write`] or [`AuditWriter::require_anchor_current`].
+    /// An anchor refusal can leave a durable row without a current anchor.
+    pub fn write_anchored(self, entry: AuditEntry) -> Result<(), WriterError> {
+        self.writer.commit_append(entry)?;
+        self.writer.require_anchor_current()
+    }
 }
 
 /// Metadata stored alongside each `Arc<Mutex<AuditWriter>>` in the registry.
@@ -14593,6 +14606,41 @@ mod tests {
         assert!(!writer.anchor_behind());
         assert_eq!(fs::read(&path).unwrap(), bytes);
         assert_eq!(store.peek(), Some(tip_of(&path)));
+    }
+
+    #[test]
+    fn write_anchored_refuses_an_owed_anchor() {
+        for strict in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("audit.jsonl");
+            let store = Arc::new(InMemoryTipAnchorStore::new());
+            let mut writer = keyed_anchor_writer(&path, &store);
+            let prepared = writer.prepare_entry().unwrap();
+            store.fail_next_writes(3);
+            let result = if strict {
+                prepared.write_anchored(make_entry("consent"))
+            } else {
+                prepared.write(make_entry("consent"))
+            };
+            if strict {
+                assert!(
+                    matches!(result, Err(WriterError::TipAnchorStore(_))),
+                    "{result:?}"
+                );
+            } else {
+                assert!(result.is_ok(), "{result:?}");
+            }
+            assert!(writer.anchor_behind());
+        }
+        let dir = TempDir::new().unwrap();
+        let mut writer = AuditWriter::open(dir.path().join("unanchored.jsonl"), None).unwrap();
+        assert!(
+            writer
+                .prepare_entry()
+                .unwrap()
+                .write_anchored(make_entry("consent"))
+                .is_ok()
+        );
     }
 
     #[test]

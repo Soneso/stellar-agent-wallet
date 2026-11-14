@@ -853,6 +853,18 @@ pub enum ApprovalFailure {
         "Mainnet consent uses the local passkey page; remote approval is unavailable for mainnet."
     )]
     MainnetRemoteUnsupported,
+    /// Delivery evidence is unavailable; prepare the operation again.
+    ///
+    /// The approval ends by expiry or revocation. Another ceremony refuses `approval.already_attested`.
+    #[error(
+        "delivery of this approval's consent row (generation {generation}, row {sequence}) cannot be confirmed; prepare the operation again"
+    )]
+    ConsentUndelivered {
+        /// The queue generation of the consent row.
+        generation: u64,
+        /// The row's position in that generation.
+        sequence: u64,
+    },
 }
 
 impl ApprovalFailure {
@@ -906,6 +918,7 @@ impl ApprovalFailure {
             Self::PresenceUnavailable => "approval.presence_unavailable",
             Self::PresenceCanceled => "approval.presence_canceled",
             Self::MainnetRemoteUnsupported => "approval.mainnet_remote_unsupported",
+            Self::ConsentUndelivered { .. } => "approval.consent_undelivered",
         }
     }
 }
@@ -2362,6 +2375,9 @@ fn fee_above_cap_text(per_op: DerivedFee, cap: u32, fee_source: &FeeSource) -> S
         ),
     }
 }
+
+/// The report code for a queued consent row, not an error.
+pub const AUDIT_OUTBOX_QUEUED: &str = "audit.outbox_queued";
 
 impl ValidationError {
     /// An [`Self::AddressInvalid`] that names an argument or field which must
@@ -4264,6 +4280,7 @@ mod tests {
         reason = "test-only panic in an unreachable match arm; documented in the arm body"
     )]
     fn validation_code_round_trip() {
+        assert_eq!(AUDIT_OUTBOX_QUEUED, "audit.outbox_queued");
         // Construct every variant; ensure the match is exhaustive.
         let cases: &[(ValidationError, &'static str)] = &[
             (
@@ -6800,6 +6817,14 @@ mod tests {
                 ApprovalFailure::MainnetRemoteUnsupported,
                 "approval.mainnet_remote_unsupported",
                 "Mainnet consent uses the local passkey page; remote approval is unavailable for mainnet.",
+            ),
+            (
+                ApprovalFailure::ConsentUndelivered {
+                    generation: 3,
+                    sequence: 7,
+                },
+                "approval.consent_undelivered",
+                "delivery of this approval's consent row (generation 3, row 7) cannot be confirmed; prepare the operation again",
             ),
         ];
         for (failure, code, message) in cases {

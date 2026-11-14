@@ -165,7 +165,7 @@ pub use entry::{AuditEntry, NewToolInvocation};
 pub use health::{AuditWriterHealth, AuditWriterHealthHandle};
 pub use lock::Carrier;
 pub use outbox::{
-    AuditOutbox, OutboxInspection, OutboxLoss, OutboxState, check_outbox_commitment,
+    AuditOutbox, OutboxInspection, OutboxLoss, OutboxRowRef, OutboxState, check_outbox_commitment,
     drain_lock_is_held, inspect_outbox, outbox_path,
 };
 pub use reader::{
