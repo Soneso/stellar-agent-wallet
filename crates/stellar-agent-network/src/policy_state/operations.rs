@@ -53,6 +53,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use stellar_agent_core::audit_log::AuditEntry;
 use stellar_agent_core::audit_log::schema::{EvidenceKind, OperationEvidenceRow};
+use stellar_agent_core::policy::pin::{self, PinScope};
 use stellar_agent_core::policy::state_lock::WindowStoreLock;
 use stellar_agent_core::profile::caip2::Caip2;
 use stellar_agent_core::profile::receipt::{
@@ -2982,6 +2983,10 @@ pub(super) struct Session<'s> {
     pub(super) original: &'s WireFile,
     pub(super) wire: WireFile,
     mint_expires: Option<u64>,
+    /// The window-state lock the step runs under and its store, for the
+    /// policy-pin comparison of a linked successor; `None` inside a
+    /// consumption commit.
+    held: Option<(&'s WindowStoreLock, &'s PersistedWindowStore)>,
     audit: AuditBatch<'s>,
     pub(super) changed: bool,
 }
@@ -3259,9 +3264,7 @@ impl Session<'_> {
                 .current_attempt()
                 .is_none_or(|attempt| attempt.not_included.is_none())
             {
-                return Err(unexpected(
-                    "a successor attempt needs its predecessor's non-inclusion evidence",
-                ));
+                return Err(WindowStoreError::RetryRefused);
             }
             // Only a checked non-inclusion permits a successor, and only
             // after the caller projected its decision onto the receipt.
@@ -3310,6 +3313,19 @@ impl Session<'_> {
                         linked.policy_digest,
                         linked.policy_sequence,
                     )?;
+                    // A linked successor skips the mint prechecks, so its
+                    // policy is compared with the current pin here, under
+                    // the lock this step holds.
+                    let (lock, store) = self
+                        .held
+                        .ok_or_else(|| unexpected("an admission ran without its lock"))?;
+                    pin::compare(
+                        lock,
+                        &PinScope::for_profile(store.path(), self.profile),
+                        linked.policy_sequence,
+                        &linked.policy_digest,
+                    )
+                    .map_err(super::ledger::pin_refusal)?;
                 }
                 linked.id
             }
@@ -4223,6 +4239,7 @@ pub(super) fn expose_in_consumption(
         original,
         wire: std::mem::take(wire),
         mint_expires: None,
+        held: None,
         audit: AuditBatch {
             request_id: exposure.request_id,
             chain_id: profile.chain_id.caip2_str(),
@@ -4345,6 +4362,7 @@ impl<'a> OperationRecorder<'a> {
                 original: &original,
                 wire: successor,
                 mint_expires,
+                held: Some((lock, store)),
                 audit: AuditBatch {
                     request_id: &self.request_id,
                     chain_id: profile.chain_id.caip2_str(),
@@ -4422,19 +4440,22 @@ impl<'a> OperationRecorder<'a> {
     /// operation's open authorizations and mints in the same commit; a
     /// successor needs its predecessor's checked non-inclusion with its
     /// projection marker and an unchanged policy, and is exempt from the
-    /// open-authorization cap.
+    /// open-authorization cap. A linked successor's policy must also match
+    /// the current policy pin, compared under the same lock.
     ///
     /// # Errors
     ///
     /// - `operation.capacity` with detail `envelope_size`.
     /// - `network.mainnet_authorization_refused` with precondition `expired`
     ///   for a waiting record past its waiting expiry or a record past its
-    ///   execution expiry.
+    ///   execution expiry, and with precondition `policy_pin_mismatch` for a
+    ///   linked successor whose policy the current pin no longer names.
     /// - `operation.business_id_conflict` for another envelope under an
     ///   `Envelope` record.
     /// - `operation.attempt_open` and `operation.attempt_limit`.
-    /// - `recovery.retry_refused` for a successor whose predecessor's checked
-    ///   non-inclusion has no projection marker.
+    /// - `recovery.retry_refused` for a successor whose predecessor has no
+    ///   current attempt, no non-inclusion proof, no checked decision, or no
+    ///   projection marker.
     /// - `internal.unexpected_state` for an edge outside the table or an
     ///   exposed authorization a remint would retire.
     /// - The mint's refusals and every store error. Nothing is written on a
@@ -11155,6 +11176,244 @@ pub(crate) mod tests {
         });
         fx.store.mint_authorization(&fx.profile, &linked).unwrap();
         assert_eq!(linked_begin(&mut fx, &handle).unwrap().attempt_index, 2);
+    }
+
+    /// Pins `sequence` and `digest` as another writer does, under its own
+    /// acquisition of the window-state lock.
+    fn repin_policy(fx: &Fx, sequence: i64, digest: [u8; 32]) {
+        let lock =
+            WindowStoreLock::acquire_for(fx.store.path(), &fx.profile.policy_window_state_key_id)
+                .unwrap();
+        pin::write_for_test(
+            &lock,
+            &PinScope::for_profile(fx.store.path(), &fx.profile),
+            &Pin::new(sequence, digest, owner_of(11)).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Opens the next attempt of `handle` under its linked authorization.
+    fn begin_linked(
+        fx: &mut Fx,
+        handle: &OperationHandle,
+    ) -> Result<AttemptStarted, WindowStoreError> {
+        fx.recorder().begin_attempt(
+            handle,
+            &AttemptRequest {
+                envelope: Some(AttemptEnvelope {
+                    xdr: "AAAAENVELOPE".to_owned(),
+                    unsigned_envelope_sha256: handle
+                        .unsigned_envelope_sha256()
+                        .unwrap_or([0xee; 32]),
+                }),
+                authorization: AttemptAuthorization::Linked,
+                send_by_ms: u64::MAX,
+            },
+        )
+    }
+
+    /// Links a minted authorization of `authority` to attempt 2 of `handle`.
+    fn link_next(
+        fx: &Fx,
+        handle: &OperationHandle,
+        n: u8,
+        authority: MintAuthority,
+    ) -> MintedRecord {
+        let mut linked = fx.mint_request(tx(n), authority, vec![]);
+        linked.operation = Some(OperationLink {
+            operation_id: handle.id(),
+            attempt_index: 2,
+        });
+        fx.store.mint_authorization(&fx.profile, &linked).unwrap()
+    }
+
+    /// A checked, projected classic non-inclusion of `order-{n}`.
+    fn projected_not_included(fx: &mut Fx, n: u8) -> OperationHandle {
+        let (handle, commit) = checked_not_included(fx, n);
+        fx.recorder()
+            .acknowledge_projection(handle.id(), 1, commit)
+            .unwrap();
+        handle
+    }
+
+    /// A reader-accepted classic `NotIncluded` record without a current
+    /// attempt, or whose current attempt holds no non-inclusion proof,
+    /// refuses a policy successor as `recovery.retry_refused`, repeatedly
+    /// and without a write. The attempt cap, the execution expiry and an
+    /// open attempt keep their codes.
+    #[test]
+    #[serial]
+    fn successor_without_attempt_or_proof_refuses_retry() {
+        type Strip = fn(&mut WireOperation);
+        let strips: [(&str, Strip); 2] = [
+            ("no current attempt", |record| record.attempts.clear()),
+            ("no non-inclusion proof", |record| {
+                let attempt = record.attempts.last_mut().unwrap();
+                attempt.not_included = None;
+                attempt.decision = None;
+            }),
+        ];
+        for (n, (case, strip)) in (1_u8..).zip(strips) {
+            let mut fx = Fx::new();
+            let handle = projected_not_included(&mut fx, n);
+            let id = handle.id();
+            let edit = |fx: &Fx, change: &dyn Fn(&mut WireOperation)| {
+                fx.rewrite(|wire| {
+                    change(
+                        section_mut(wire)
+                            .records
+                            .iter_mut()
+                            .find(|record| record.id == id)
+                            .unwrap(),
+                    );
+                });
+            };
+            edit(&fx, &|record| strip(record));
+            assert_eq!(fx.record(id).state, OperationState::NotIncluded, "{case}");
+            let before = fs::read(fx.store.path()).unwrap();
+            let generation = fx.generation();
+            for _ in 0..2 {
+                assert_eq!(
+                    successor_refusal(&mut fx, &handle),
+                    "recovery.retry_refused",
+                    "{case}"
+                );
+            }
+            assert_eq!(fs::read(fx.store.path()).unwrap(), before, "{case}");
+            assert_eq!(fx.generation(), generation, "{case}");
+
+            if !fx.record(id).attempts.is_empty() {
+                // Eight attempts without proof meet the cap first.
+                edit(&fx, &|record| {
+                    let first = record.attempts[0].clone();
+                    for index in 2..=8 {
+                        record.attempts.push(WireAttempt {
+                            index,
+                            evidence: Vec::new(),
+                            exposure: None,
+                            ..first.clone()
+                        });
+                    }
+                });
+                assert_eq!(
+                    successor_refusal(&mut fx, &handle),
+                    "operation.attempt_limit",
+                    "{case}"
+                );
+                edit(&fx, &|record| record.attempts.truncate(1));
+            }
+
+            // A passed execution end refuses before the proof check.
+            let now = fx.now();
+            edit(&fx, &|record| record.execution_expires_at_ms = Some(now));
+            let mint = fx.mint_request(tx(0x7e), fx.policy(), vec![]);
+            let expired = fx.begin_mint(&handle, &mint).unwrap_err();
+            assert!(
+                matches!(
+                    expired,
+                    WindowStoreError::AuthorizationRefused {
+                        precondition: MainnetPrecondition::Expired
+                    }
+                ),
+                "{case}: {expired:?}"
+            );
+            assert_eq!(
+                crate::operation_entry::operation_refusal(expired).code(),
+                "network.mainnet_authorization_refused",
+                "{case}"
+            );
+        }
+
+        let mut fx = Fx::new();
+        let handle = projected_not_included(&mut fx, 3);
+        assert_eq!(successor_refusal(&mut fx, &handle), "none");
+        assert_eq!(
+            successor_refusal(&mut fx, &handle),
+            "operation.attempt_open"
+        );
+    }
+
+    /// A policy authorization linked to attempt 2 under the predecessor's
+    /// policy refuses as `policy_pin_mismatch` after another writer changed
+    /// the pin. The refusal repeats, writes nothing, keeps the
+    /// authorization, and leaves nothing to repair after a restart; with
+    /// the pin unchanged the same admission starts attempt 2.
+    #[test]
+    #[serial]
+    fn linked_successor_refuses_a_changed_policy_pin() {
+        let pin_refused = |error: WindowStoreError| {
+            let WindowStoreError::AuthorizationRefused { precondition } = error else {
+                panic!("expected an authorization refusal, got {error:?}");
+            };
+            assert_eq!(precondition.label(), "policy_pin_mismatch");
+            assert_eq!(
+                crate::operation_entry::operation_refusal(error).code(),
+                "network.mainnet_authorization_refused"
+            );
+        };
+        let mut fx = Fx::new();
+        let handle = projected_not_included(&mut fx, 1);
+        let minted = link_next(&fx, &handle, 21, fx.policy());
+        repin_policy(&fx, 8, [8; 32]);
+        let before = fs::read(fx.store.path()).unwrap();
+        let generation = fx.generation();
+        let attempts = serde_json::to_vec(&fx.record(handle.id()).attempts).unwrap();
+        let authorization = fx.auth(minted.id);
+        for _ in 0..2 {
+            pin_refused(begin_linked(&mut fx, &handle).unwrap_err());
+            assert_eq!(fs::read(fx.store.path()).unwrap(), before);
+            assert_eq!(fx.generation(), generation);
+            assert_eq!(
+                serde_json::to_vec(&fx.record(handle.id()).attempts).unwrap(),
+                attempts
+            );
+            assert_eq!(fx.auth(minted.id), authorization);
+        }
+        // The mint path refuses the same pin in its prechecks.
+        let mint = fx.mint_request(tx(22), fx.policy(), vec![]);
+        pin_refused(fx.begin_mint(&handle, &mint).unwrap_err());
+        assert_eq!(fs::read(fx.store.path()).unwrap(), before);
+
+        // A fresh store at the same path reads the refused state unchanged.
+        let reopened = PersistedWindowStore::at_path(fx.store.path().to_path_buf());
+        let wire = reopened.read_for_inspection(&fx.profile).unwrap().unwrap();
+        assert_eq!(wire.generation, generation);
+        let record = records(&wire)
+            .iter()
+            .find(|record| record.id == handle.id())
+            .unwrap();
+        assert_eq!(record.state, OperationState::NotIncluded);
+        assert_eq!(serde_json::to_vec(&record.attempts).unwrap(), attempts);
+
+        let mut fx = Fx::new();
+        let handle = projected_not_included(&mut fx, 2);
+        let minted = link_next(&fx, &handle, 23, fx.policy());
+        let started = begin_linked(&mut fx, &handle).unwrap();
+        assert_eq!(started.attempt_index, 2);
+        let record = fx.record(handle.id());
+        assert_eq!(record.state, OperationState::Sending);
+        assert_eq!(record.attempts[1].authorization_id, minted.id);
+    }
+
+    /// A successor under a fresh approval authorization admits, minted in
+    /// the admission or linked before it, while the pin names its policy.
+    #[test]
+    #[serial]
+    fn approval_successor_admits_under_an_unchanged_pin() {
+        let mut fx = Fx::new();
+        let handle = projected_not_included(&mut fx, 1);
+        let mint = fx.mint_request(tx(21), fx.approval(), vec![]);
+        assert_eq!(fx.begin_mint(&handle, &mint).unwrap().attempt_index, 2);
+        assert_eq!(fx.record(handle.id()).state, OperationState::Sending);
+
+        let mut fx = Fx::new();
+        let handle = projected_not_included(&mut fx, 2);
+        let minted = link_next(&fx, &handle, 22, fx.approval());
+        assert_eq!(begin_linked(&mut fx, &handle).unwrap().attempt_index, 2);
+        assert_eq!(
+            fx.record(handle.id()).attempts[1].authorization_id,
+            minted.id
+        );
     }
 
     /// The successor's `not_included -> sending` row names the permitting
