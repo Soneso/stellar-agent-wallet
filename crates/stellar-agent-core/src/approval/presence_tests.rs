@@ -346,7 +346,7 @@ fn consent_subject_covers_supported_kinds_only() {
         "1.0.0".to_owned(),
         "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
         "sign-payment".to_owned(),
-        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_owned(),
         "XLM".to_owned(),
         0,
         1,

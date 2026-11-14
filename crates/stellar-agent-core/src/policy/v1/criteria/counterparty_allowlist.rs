@@ -1678,28 +1678,41 @@ mod tests {
             &[key_g()],
             UnlistedMode::Deny,
         );
-        for value in [pay_value(Some(&key_m(7)), "native"), ValueClass::ReadOnly] {
-            in_ctx(value, json!({"destination": key_m(7)}), |ctx| {
-                assert_eq!(criterion.evaluate_decision(ctx).unwrap(), Decision::Allow);
-            });
+        for id in [0, 7, u64::MAX] {
+            for value in [pay_value(Some(&key_m(id)), "native"), ValueClass::ReadOnly] {
+                in_ctx(value, json!({"destination": key_m(id)}), |ctx| {
+                    assert_eq!(
+                        criterion.evaluate_decision(ctx).unwrap(),
+                        Decision::Allow,
+                        "{id}"
+                    );
+                });
+            }
         }
     }
 
     #[test]
     fn muxed_entry_matches_only_its_id() {
-        let criterion = criterion_of(
-            &[CounterpartyKind::GAccount],
-            &[key_m(7)],
-            UnlistedMode::Deny,
-        );
-        for (d, class) in [
-            (key_m(7), RecipientClass::Listed),
-            (key_m(8), RecipientClass::Unlisted),
-            (key_g(), RecipientClass::Unlisted),
+        for (entry, others) in [
+            (7, [0, 8, u64::MAX]),
+            (0, [1, 7, u64::MAX]),
+            (u64::MAX, [0, 7, u64::MAX - 1]),
         ] {
-            in_ctx(pay_value(Some(&d), "native"), json!({}), |ctx| {
-                assert_eq!(criterion.recipient_class(ctx).unwrap(), Some(class), "{d}");
-            });
+            let criterion = criterion_of(
+                &[CounterpartyKind::GAccount],
+                &[key_m(entry)],
+                UnlistedMode::Deny,
+            );
+            let mut cases = vec![
+                (key_m(entry), RecipientClass::Listed),
+                (key_g(), RecipientClass::Unlisted),
+            ];
+            cases.extend(others.map(|id| (key_m(id), RecipientClass::Unlisted)));
+            for (d, class) in cases {
+                in_ctx(pay_value(Some(&d), "native"), json!({}), |ctx| {
+                    assert_eq!(criterion.recipient_class(ctx).unwrap(), Some(class), "{d}");
+                });
+            }
         }
     }
 

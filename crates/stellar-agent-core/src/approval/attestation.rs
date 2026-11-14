@@ -480,12 +480,15 @@ pub fn envelope_sha256(envelope_xdr_bytes: &[u8]) -> [u8; 32] {
 ///   || u32_be(len(package_version)) || package_version
 ///   || u32_be(len(package_shasum)) || package_shasum
 ///   || u32_be(len(capability))  || capability
-///   || u32_be(len(destination)) || destination   (canonical G-strkey)
+///   || u32_be(len(destination)) || destination   (stored text, G, M or C)
 ///   || u32_be(len(asset))       || asset          (code:issuer or "XLM")
 ///   || i64_be(amount_min_stroops)
 ///   || i64_be(amount_max_stroops)
 /// )
 /// ```
+///
+/// The digest binds the destination bytes exactly as stored. An M address
+/// and its base G account produce different digests.
 ///
 /// Length prefixes on every variable-length field prevent boundary-collision
 /// attacks (same discipline as the HMAC preimage for `PaymentSimulated`).
@@ -1553,6 +1556,34 @@ mod tests {
         assert_eq!(
             crate::hex::encode(&digest),
             "dccd9eda4dc17ccc1f28dd15165fa04ff5931d9ece9b35ec5bd65688ead35010"
+        );
+    }
+
+    /// The digest binds an M destination's exact bytes, which differ from the
+    /// digest of its base G account. Both values come from an independent
+    /// SHA-256 calculation over the documented preimage.
+    #[test]
+    fn the_gate_digest_binds_exact_m_and_g_destination_bytes() {
+        let digest = |destination: &str| {
+            crate::hex::encode(&compute_toolset_gate_digest(
+                "test-toolset",
+                &"a".repeat(32),
+                "1.0.0",
+                &"d".repeat(64),
+                "sign-payment",
+                destination,
+                "XLM",
+                0,
+                10_000_000,
+            ))
+        };
+        assert_eq!(
+            digest("MAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQD7777777777776QNE"),
+            "8837f5ba829b123362376492620c9a32163b265dcd8791e8ba80877b26cb16ca"
+        );
+        assert_eq!(
+            digest("GAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQDZ7H"),
+            "b7c855357f5088be7166c4f522d50e5080501b1ebcba6f972e36fdc3f85f126d"
         );
     }
 

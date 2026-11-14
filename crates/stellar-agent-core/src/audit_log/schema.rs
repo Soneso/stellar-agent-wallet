@@ -858,6 +858,63 @@ pub struct ValueLegRecord {
     /// leg has no destination. Never a full strkey.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub destination_redacted: Option<String>,
+    /// Lowercase hexadecimal SHA-256 of the complete payment destination's
+    /// UTF-8 bytes, which identifies an M address without recording it.
+    ///
+    /// Only [`ValueLegRecord::from_payment_leg`] sets it. A row written
+    /// without it reads as `None` and serializes without the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_sha256: Option<String>,
+}
+
+impl ValueLegRecord {
+    /// Builds the audit form of a classic payment leg with its destination
+    /// hash.
+    ///
+    /// The action, amount, and asset come from `leg` as in the [`From`]
+    /// conversion. The redaction and the hash come from the complete
+    /// canonical destination.
+    ///
+    /// # Errors
+    ///
+    /// Returns `validation.address_invalid` when the leg has no destination
+    /// or its destination is not a canonical G account or M address.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use stellar_agent_core::audit_log::ValueLegRecord;
+    /// use stellar_agent_core::policy::v1::value::{ActionKind, ValueLeg};
+    ///
+    /// let destination = "GAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQDZ7H";
+    /// let leg = ValueLeg {
+    ///     kind: ActionKind::Payment,
+    ///     amount: Some(10),
+    ///     asset: Some("native".to_owned()),
+    ///     destination: Some(destination.to_owned()),
+    /// };
+    /// let record = ValueLegRecord::from_payment_leg(&leg)?;
+    /// assert_eq!(record.destination_redacted.as_deref(), Some("GAAQC...QDZ7H"));
+    /// assert_eq!(record.destination_sha256.map(|hash| hash.len()), Some(64));
+    /// # Ok::<(), stellar_agent_core::WalletError>(())
+    /// ```
+    pub fn from_payment_leg(
+        leg: &crate::policy::v1::value::ValueLeg,
+    ) -> Result<ValueLegRecord, crate::error::WalletError> {
+        use sha2::Digest as _;
+        let destination = leg.destination.as_deref().ok_or_else(|| {
+            crate::error::ValidationError::address_argument("payment destination")
+        })?;
+        let account = crate::payment_accounts::PaymentAccount::parse(destination)?;
+        let canonical = account.canonical();
+        Ok(Self {
+            destination_redacted: Some(crate::observability::redact_strkey_first5_last5(canonical)),
+            destination_sha256: Some(crate::hex::encode(&sha2::Sha256::digest(
+                canonical.as_bytes(),
+            ))),
+            ..Self::from(leg)
+        })
+    }
 }
 
 impl From<&crate::policy::v1::value::ValueLeg> for ValueLegRecord {
@@ -870,6 +927,7 @@ impl From<&crate::policy::v1::value::ValueLeg> for ValueLegRecord {
                 .destination
                 .as_deref()
                 .map(crate::observability::redact_strkey_first5_last5),
+            destination_sha256: None,
         }
     }
 }
@@ -6796,6 +6854,7 @@ mod tests {
                 amount: Some(1_500_000_000),
                 asset: Some("native".to_owned()),
                 destination_redacted: Some("GAAAA...ZZZZZ".to_owned()),
+                destination_sha256: None,
             }],
             opaque_reason: None,
             transaction_hash_redacted: "aabb1122...ccdd3344".to_owned(),
@@ -6884,6 +6943,7 @@ mod tests {
                 amount: Some(2_500_000),
                 asset: Some("CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA".to_owned()),
                 destination_redacted: Some("GBPXX...MWIVL".to_owned()),
+                destination_sha256: None,
             }],
             network: "stellar:testnet".to_owned(),
             scheme: "exact".to_owned(),
@@ -7349,6 +7409,129 @@ mod tests {
         assert!(
             s.contains("\"9223372036854775808\""),
             "amount must serialize as a decimal string beyond i64 range: {s}"
+        );
+    }
+
+    /// The G account of the key `[1; 32]` and its M addresses with IDs zero
+    /// and `u64::MAX`, each with the SHA-256 of its UTF-8 bytes from an
+    /// independent calculation.
+    const PAYMENT_DESTINATIONS: [(&str, &str); 3] = [
+        (
+            "GAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQDZ7H",
+            "85a9f00609ab4eb40a277132a2a1d8b0195f9242e6d304b837f9542010feba7a",
+        ),
+        (
+            "MAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAAAAAAAAAAAABAXI",
+            "6c1fbca75b9ef827bf5c2cfa0463c0872bab256271e4c33b78d3969f1dad7a45",
+        ),
+        (
+            "MAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQD7777777777776QNE",
+            "0a74e8528a9ef1ef73cafc13768bb9870a88e8ce6e2846be7a33a84e94a19c56",
+        ),
+    ];
+
+    fn payment_leg(destination: Option<&str>) -> crate::policy::v1::value::ValueLeg {
+        crate::policy::v1::value::ValueLeg {
+            kind: crate::policy::v1::value::ActionKind::Payment,
+            amount: Some(9_223_372_036_854_775_808),
+            asset: Some("USDC:GABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEJXA".to_owned()),
+            destination: destination.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn payment_leg_hashes_match_independent_sha256_and_differ_by_id() {
+        let mut hashes = std::collections::BTreeSet::new();
+        for (destination, expected) in PAYMENT_DESTINATIONS {
+            let record = ValueLegRecord::from_payment_leg(&payment_leg(Some(destination))).unwrap();
+            assert_eq!(
+                record.destination_sha256.as_deref(),
+                Some(expected),
+                "{destination}"
+            );
+            assert_eq!(
+                record.destination_redacted,
+                Some(crate::observability::redact_strkey_first5_last5(
+                    destination
+                ))
+            );
+            hashes.insert(expected);
+        }
+        assert_eq!(hashes.len(), 3, "an ID-only change changes the hash");
+    }
+
+    #[test]
+    fn payment_leg_records_keep_the_legs_action_amount_and_asset() {
+        use crate::policy::v1::value::ActionKind;
+        let (destination, _) = PAYMENT_DESTINATIONS[2];
+        for kind in [ActionKind::Payment, ActionKind::AccountCreation] {
+            let leg = crate::policy::v1::value::ValueLeg {
+                kind,
+                ..payment_leg(Some(destination))
+            };
+            let record = ValueLegRecord::from_payment_leg(&leg).unwrap();
+            assert_eq!(record.action, ValueActionKind::from(kind));
+            assert_eq!(record.amount, Some(9_223_372_036_854_775_808));
+            assert_eq!(
+                record.asset.as_deref(),
+                Some("USDC:GABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEJXA")
+            );
+        }
+    }
+
+    #[test]
+    fn payment_leg_serialization_holds_no_complete_destination() {
+        for (destination, expected) in PAYMENT_DESTINATIONS {
+            let record = ValueLegRecord::from_payment_leg(&payment_leg(Some(destination))).unwrap();
+            let wire = serde_json::to_string(&record).unwrap();
+            assert!(!wire.contains(destination), "{wire}");
+            assert!(
+                wire.contains(&format!("\"destination_sha256\":\"{expected}\"")),
+                "{wire}"
+            );
+            let reread: ValueLegRecord = serde_json::from_str(&wire).unwrap();
+            assert_eq!(reread, record);
+        }
+    }
+
+    #[test]
+    fn payment_leg_records_refuse_a_missing_or_non_payment_destination() {
+        let (g, _) = PAYMENT_DESTINATIONS[0];
+        let corrupted = format!("{}A", &g[..55]);
+        let contract = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+        for destination in [
+            None,
+            Some(contract),
+            Some(corrupted.as_str()),
+            Some("example.com"),
+        ] {
+            let err = ValueLegRecord::from_payment_leg(&payment_leg(destination)).unwrap_err();
+            assert_eq!(err.code(), "validation.address_invalid", "{destination:?}");
+        }
+    }
+
+    /// A row without the field reads as `None` and writes the same bytes.
+    /// The generic conversion records no hash, also for a payment leg.
+    #[test]
+    fn rows_without_a_destination_hash_keep_their_wire_bytes() {
+        let historical = r#"{"action":"payment","amount":"10","asset":"native","destination_redacted":"GAAQC...QDZ7H"}"#;
+        let record: ValueLegRecord = serde_json::from_str(historical).unwrap();
+        assert_eq!(record.destination_sha256, None);
+        assert_eq!(serde_json::to_string(&record).unwrap(), historical);
+        let (destination, _) = PAYMENT_DESTINATIONS[2];
+        let generic = ValueLegRecord::from(&payment_leg(Some(destination)));
+        assert_eq!(generic.destination_sha256, None);
+        let x402 = crate::policy::v1::value::ValueLeg {
+            kind: crate::policy::v1::value::ActionKind::X402Payment,
+            amount: Some(10),
+            asset: Some("native".to_owned()),
+            destination: Some(
+                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
+            ),
+        };
+        assert_eq!(
+            serde_json::to_string(&ValueLegRecord::from(&x402)).unwrap(),
+            r#"{"action":"x402_payment","amount":"10","asset":"native","destination_redacted":"CAAAA...AD2KM"}"#
         );
     }
 

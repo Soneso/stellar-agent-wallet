@@ -100,11 +100,12 @@ pub fn envelope(source: &str, body: OperationBody, memo: Memo, fee: u32, seq_num
     .expect("fixture envelope encodes")
 }
 
-/// A `Payment` envelope.
+/// A `Payment` envelope to a G account or an M address.
 ///
 /// # Panics
 ///
-/// Panics when an account is not a G-strkey, an asset is not `"XLM"` or
+/// Panics when the source or an issuer is not a G-strkey, the destination is
+/// not a canonical G or M address, an asset is not `"XLM"` or
 /// `"CODE:Gissuer"`, or a memo exceeds 28 bytes.
 #[must_use]
 pub fn payment_envelope(
@@ -119,7 +120,9 @@ pub fn payment_envelope(
     envelope(
         source,
         OperationBody::Payment(PaymentOp {
-            destination: MuxedAccount::Ed25519(Uint256(account_bytes(destination))),
+            destination: crate::payment_accounts::PaymentAccount::parse(destination)
+                .expect("fixture destination is a G or M address")
+                .to_muxed_account(),
             asset: asset(asset_id),
             amount: amount_stroops,
         }),
@@ -195,7 +198,8 @@ pub fn balance_ids(balance_hash: [u8; 32]) -> (String, String) {
 ///
 /// # Panics
 ///
-/// Panics when an account is not a G-strkey, an asset is not `"XLM"` or
+/// Panics when the source or an issuer is not a G-strkey, the destination is
+/// not a canonical G or M address, an asset is not `"XLM"` or
 /// `"CODE:Gissuer"`, or a memo exceeds 28 bytes.
 #[must_use]
 pub fn payment_pending(

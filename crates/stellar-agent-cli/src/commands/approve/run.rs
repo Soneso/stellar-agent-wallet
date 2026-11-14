@@ -420,6 +420,8 @@ async fn approve_mainnet(
 ) -> Result<MainnetApproved, WalletError> {
     render_summary(entry, context);
     stellar_agent_core::approval::verify_entry_terms(&entry.kind)?;
+    // The stored payment destination refuses before presence starts.
+    stellar_agent_core::approval::verify_stored_destination(&entry.kind)?;
     if let Some(Err(error)) = classic_entry_summary(&entry.kind) {
         return Err(error);
     }
@@ -624,6 +626,8 @@ fn prompt_approval(
 ) -> Result<bool, WalletError> {
     render_summary(entry, context);
     stellar_agent_core::approval::verify_entry_terms(&entry.kind)?;
+    // The stored payment destination refuses before the audit sink opens.
+    stellar_agent_core::approval::verify_stored_destination(&entry.kind)?;
     if let Some(Err(error)) = classic_entry_summary(&entry.kind) {
         return Err(error);
     }
@@ -1688,6 +1692,101 @@ mod tests {
                 .unwrap_or_default()
                 .contains("approval_attested")
         );
+    }
+
+    /// Replaces the stored summary destination `good` of the only entry in
+    /// `path` with text whose checksum fails.
+    fn corrupt_stored_summary(path: &Path, good: &str) {
+        let line = format!("summary_to = \"{good}\"");
+        let text = std::fs::read_to_string(path).unwrap();
+        assert_eq!(text.matches(&line).count(), 1);
+        let last = if good.ends_with('A') { "B" } else { "A" };
+        let bad = format!("summary_to = \"{}{last}\"", &good[..55]);
+        std::fs::write(path, text.replace(&line, &bad)).unwrap();
+    }
+
+    /// A mainnet CLI approval of a payment whose stored summary destination
+    /// fails its checksum refuses before any presence step starts, and writes
+    /// no audit bytes.
+    #[tokio::test]
+    #[serial]
+    async fn mainnet_approval_refuses_a_refused_destination_before_presence() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fixture = stellar_agent_core::approval::mainnet_fixtures::MainnetConsentFixture::new(
+            "approve-bad-destination",
+        );
+        let entry = fixture.payment(DEFAULT_TTL_MS);
+        let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
+        store
+            .insert(entry.clone(), timefmt::now_unix_ms().unwrap())
+            .unwrap();
+        drop(store);
+        corrupt_stored_summary(
+            &fixture.store_path(),
+            stellar_agent_core::approval::mainnet_fixtures::ALLOWED_DESTINATION,
+        );
+        let stored = std::fs::read(fixture.store_path()).unwrap();
+        let audit = std::fs::read(fixture.audit_path()).unwrap_or_default();
+        let store = PendingApprovalStore::open(fixture.store_path()).unwrap();
+        let entry = store.get(&entry.approval_nonce).unwrap().clone();
+        let context = ApprovalContext::from_profile(fixture.name(), fixture.profile());
+        let started = std::sync::Arc::new(AtomicBool::new(false));
+        let seen = started.clone();
+        let _driver = crate::common::mainnet_presence::driver::install(Box::new(move |_| {
+            seen.store(true, Ordering::SeqCst);
+            Err(WalletError::Approval(
+                ApprovalFailure::PresenceBrowserRequired,
+            ))
+        }));
+        let error = approve_mainnet(
+            store,
+            &fixture.store_path(),
+            &entry,
+            &context,
+            fixture.profile(),
+            OpenMode::Private,
+        )
+        .await
+        .err()
+        .expect("a refused destination refuses the approval");
+        assert_eq!(error.code(), "approval.entry_inconsistent");
+        assert!(!started.load(Ordering::SeqCst), "no presence step starts");
+        assert_eq!(
+            std::fs::read(fixture.audit_path()).unwrap_or_default(),
+            audit
+        );
+        assert_eq!(std::fs::read(fixture.store_path()).unwrap(), stored);
+    }
+
+    /// A testnet CLI approval of a payment whose stored summary destination
+    /// fails its checksum refuses before the audit sink opens.
+    #[test]
+    #[serial]
+    fn approval_refuses_a_refused_destination_before_the_audit_sink() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let name = "approve-bad-destination";
+        let profile = consent_profile(name, &dir, true);
+        let (store, entry) = pending_store(&dir);
+        drop(store);
+        let path = dir.path().join("approvals.toml");
+        corrupt_stored_summary(&path, DEST_G);
+        let stored = std::fs::read(&path).unwrap();
+        assert!(!profile.audit_log_path.exists());
+        let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+        let entry = store.get(&entry.approval_nonce).unwrap().clone();
+        let context = ApprovalContext::from_profile(name, &profile);
+        let error = match prompt_approval(&entry, &context, true) {
+            Err(error) => error,
+            Ok(_) => approve_in_process(name, &profile, &mut store, &entry).unwrap_err(),
+        };
+        assert_eq!(error.code(), "approval.entry_inconsistent");
+        assert!(
+            !profile.audit_log_path.exists(),
+            "a refused destination opens no audit sink"
+        );
+        drop(store);
+        assert_eq!(std::fs::read(&path).unwrap(), stored);
     }
 
     /// The MCP preparation completes through bare approval and the browser listener.

@@ -938,7 +938,7 @@ pub fn repair_approval_consumption(
             ConsumedOutcome::Unknown
         };
         store
-            .consume(nonce, &receipt.tx_hash, outcome)
+            .record_sent_consumption(nonce, &receipt.tx_hash, outcome)
             .map_err(|e| {
                 record_unavailable(format!("approval consumption could not be written: {e}"))
             })?;
@@ -1983,6 +1983,79 @@ mod tests {
                 .unwrap(),
             BeginSubmissionOutcome::DuplicateApproval(_)
         ));
+    }
+
+    /// The repair of a sent payment completes whatever the stored summary
+    /// destination holds: a checksum-bad stored destination is consumed, and
+    /// the receipt acknowledges the consumption obligation.
+    #[test]
+    fn consumption_repair_completes_for_a_refused_stored_destination() {
+        use stellar_agent_core::approval::{ApprovalKind, PendingApproval, PendingApprovalStore};
+        use stellar_agent_core::profile::receipt::BeginSubmissionOutcome;
+        let dir = tempfile::tempdir().unwrap();
+        let receipts = ReceiptStore::open_at(dir.path(), "repair").unwrap();
+        let approvals = dir.path().join("approvals");
+        let path = approvals.join("repair.toml");
+        let good = stellar_strkey::ed25519::PublicKey([0x21; 32])
+            .to_string()
+            .to_string();
+        let entry = PendingApproval::new_payment_pending(
+            "b64xdr".to_owned(),
+            b"repair-envelope",
+            good.clone(),
+            1_000_000,
+            "XLM".to_owned(),
+            None,
+            100,
+            7,
+            "1000".to_owned(),
+            600_000,
+        )
+        .unwrap();
+        let nonce = entry.approval_nonce.clone();
+        let tx_hash = "a".repeat(64);
+        assert!(matches!(
+            receipts
+                .begin_submission_with_approval(
+                    "envelope",
+                    &tx_hash,
+                    "source",
+                    1,
+                    0,
+                    100,
+                    Some(&nonce)
+                )
+                .unwrap(),
+            BeginSubmissionOutcome::Recorded
+        ));
+        receipts.mark_submitted("envelope").unwrap();
+        {
+            let mut inbox = PendingApprovalStore::open(path.clone()).unwrap();
+            let now = entry.created_at_unix_ms;
+            inbox.insert(entry, now).unwrap();
+        }
+        let bad = format!("{}A", &good[..55]);
+        assert_ne!(bad, good);
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, text.replace(&good, &bad)).unwrap();
+        let inbox = PendingApprovalStore::open(path.clone()).unwrap();
+        assert!(
+            stellar_agent_core::approval::verify_stored_destination(
+                &inbox.get(&nonce).unwrap().kind
+            )
+            .is_err()
+        );
+        drop(inbox);
+
+        repair_approval_consumption(&receipts, "envelope", &approvals, "repair").unwrap();
+        let receipt = receipts.get("envelope").unwrap().unwrap();
+        assert!(receipt.approval_consumed);
+        let inbox = PendingApprovalStore::open(path).unwrap();
+        let kind = &inbox.get(&nonce).unwrap().kind;
+        assert!(
+            matches!(kind, ApprovalKind::Consumed { tx_hash: consumed, .. } if consumed == &tx_hash),
+            "{kind:?}"
+        );
     }
 
     #[tokio::test]

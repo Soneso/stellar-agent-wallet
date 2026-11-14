@@ -153,6 +153,10 @@ pub mod hex;
 /// `DEFAULT_CLASSIC_FEE_STROOPS`) colocated for single-source-of-truth imports.
 pub mod protocol_consts;
 
+/// Canonical G and M destinations of classic payments
+/// ([`payment_accounts::PaymentAccount`]).
+pub mod payment_accounts;
+
 /// Strkey rendering for XDR `ScAddress` values
 /// ([`sc_address::scaddress_to_strkey`]).
 pub mod sc_address;

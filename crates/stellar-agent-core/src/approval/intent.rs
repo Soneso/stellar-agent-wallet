@@ -21,7 +21,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use stellar_strkey::ed25519::{MuxedAccount, PublicKey};
+use stellar_strkey::ed25519::PublicKey;
 
 use super::witness::ApprovedKind;
 use crate::policy::v1::{ActionKind, ValueLeg};
@@ -176,7 +176,7 @@ pub enum IntentError {
     /// The account creation destination is not a G strkey.
     #[error("account creation destination must be a G strkey")]
     InvalidCreateAccountDestination,
-    /// The payment destination is not a G or M strkey.
+    /// The payment destination is not a canonical G account or M address.
     #[error("payment destination must be a G or M strkey")]
     InvalidPayDestination,
     /// A decoded strkey re-encodes differently.
@@ -360,11 +360,8 @@ impl ClassicIntent {
                 asset,
                 amount_stroops,
             } => {
-                let encoded = PublicKey::from_string(destination)
-                    .map(|key| format!("{key}"))
-                    .or_else(|_| MuxedAccount::from_string(destination).map(|key| format!("{key}")))
+                crate::payment_accounts::PaymentAccount::parse(destination)
                     .map_err(|_| IntentError::InvalidPayDestination)?;
-                check_canonical(destination, &encoded)?;
                 check_asset(asset)?;
                 check_amount(*amount_stroops)?;
             }
@@ -593,6 +590,7 @@ mod tests {
     use super::*;
     use serde_json::{Value, json};
     use std::collections::BTreeSet;
+    use stellar_strkey::ed25519::MuxedAccount as MuxedKey;
 
     use super::super::fixtures::intent::{VECTORS, fixture, vectors};
 
@@ -829,6 +827,31 @@ mod tests {
                 InvalidPayDestination,
             ),
             (
+                0,
+                "/payload/pay/destination",
+                json!(stellar_strkey::Contract([5; 32]).to_string().as_str()),
+                InvalidPayDestination,
+            ),
+            (
+                0,
+                "/payload/pay/destination",
+                json!(
+                    stellar_strkey::MuxedContract {
+                        contract_id: [5; 32],
+                        id: 1
+                    }
+                    .to_string()
+                    .as_str()
+                ),
+                InvalidPayDestination,
+            ),
+            (
+                0,
+                "/payload/pay/destination",
+                json!(format!("{}A", &OTHER[..55])),
+                InvalidPayDestination,
+            ),
+            (
                 2,
                 "/payload/create_account/destination",
                 muxed.clone(),
@@ -1049,6 +1072,38 @@ mod tests {
                 serde_json::from_value::<ClassicIntent>(raw).is_ok(),
                 "{path}"
             );
+        }
+    }
+
+    #[test]
+    fn pay_destinations_accept_g_and_m_with_id_zero_and_the_maximum_id() {
+        let key = PublicKey::from_string(OTHER).unwrap().0;
+        for destination in [
+            OTHER.to_owned(),
+            MuxedKey {
+                ed25519: key,
+                id: 0,
+            }
+            .to_string()
+            .to_string(),
+            MuxedKey {
+                ed25519: key,
+                id: u64::MAX,
+            }
+            .to_string()
+            .to_string(),
+        ] {
+            let mut raw = wire(0);
+            *raw.pointer_mut("/payload/pay/destination").unwrap() = json!(destination);
+            let intent = build(&raw).unwrap();
+            let IntentPayload::Pay {
+                destination: stored,
+                ..
+            } = intent.payload()
+            else {
+                unreachable!()
+            };
+            assert_eq!(stored, &destination);
         }
     }
 

@@ -358,7 +358,7 @@ async fn insert_payment_simulated(store: &Arc<Mutex<PendingApprovalStore>>) -> S
     let entry = PendingApproval::new_payment_pending(
         envelope_xdr_b64,
         envelope_xdr_bytes,
-        "GAAAA...BBBBB".to_string(),
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_string(),
         1_000_000,
         "XLM".to_string(),
         None,

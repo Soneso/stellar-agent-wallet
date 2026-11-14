@@ -9147,6 +9147,7 @@ mod tests {
                         amount: Some(10),
                         asset: Some("native".to_owned()),
                         destination_redacted: None,
+                        destination_sha256: None,
                     }],
                     "aaaaaaaa...aaaaaaaa",
                     "GAAAA...AAAWHF",

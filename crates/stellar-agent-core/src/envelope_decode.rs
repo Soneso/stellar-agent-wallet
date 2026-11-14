@@ -186,9 +186,10 @@ pub fn stroops_to_human(stroops: i64) -> String {
 /// component; this function extracts that 32-byte array and encodes it as a
 /// G-strkey via [`stellar_strkey::ed25519::PublicKey`].
 ///
-/// `MuxedEd25519` carries an additional `id` mux-component; that component is
-/// discarded here because the policy engine works at the G-strkey granularity
-/// (all muxed sub-accounts share the same on-chain account entry).
+/// `MuxedEd25519` carries an additional `id`, which this function discards.
+/// It resolves source accounts: every M address of an account signs with
+/// the same key and spends from the same account entry. Payment destinations
+/// keep the complete M address through `muxed_account_to_display_strkey`.
 ///
 /// This function is **infallible** for inputs from XDR decode: the XDR decoder
 /// enforces exact 32-byte layout for ed25519 keys, and `format!("{}", PublicKey(bytes))`
@@ -358,14 +359,15 @@ pub enum MemoKind {
 ///
 /// [`decode_authoritative_args`] reports an id memo as `memo: null`, so the
 /// absence of a memo cannot be read from its output. This shape keeps the
-/// memo kind and whether the destination is muxed.
+/// memo kind and whether the destination is an M address. The output's
+/// `destination` holds the complete M address with its ID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PaymentMemoShape {
     /// The transaction's memo kind.
     pub memo: MemoKind,
-    /// Whether the payment's destination is a muxed (`M...`) account, which
-    /// carries its memo in the muxed id.
+    /// Whether the payment's destination is an M address, whose ID names a
+    /// recipient within its base G account.
     pub destination_muxed: bool,
 }
 
@@ -523,7 +525,7 @@ fn decode_single_operation(
 ///   "chain_id": "<from caller — not encoded in XDR>",
 ///   "source": "G...",
 ///   "total_fee_stroops": <u32>,
-///   "destination": "G...",
+///   "destination": "G..." | "M...",
 ///   "amount_stroops": "<decimal i64 stroops>",
 ///   "asset": "XLM" | "CODE:Gissuer",
 ///   "memo": "text" | null,
@@ -582,9 +584,9 @@ fn decode_single_operation(
 /// - [`EnvelopeDecodeError::NotTransactionV1`] — envelope is not a `Tx` v1 envelope.
 /// - [`EnvelopeDecodeError::UnexpectedOperationCount`] — transaction has ≠ 1 operations.
 /// - [`EnvelopeDecodeError::OperationKindMismatch`] — op body does not match the tool.
-/// - `EnvelopeDecodeError::SourceAccountEncodeFailed` — source G-strkey encode error.
-/// - `EnvelopeDecodeError::DestinationAccountEncodeFailed` — destination G-strkey encode error.
 /// - [`EnvelopeDecodeError::IssuerEncodeFailed`] — asset issuer G-strkey encode error.
+///   Source and destination accounts always encode: the source as its G
+///   account, a payment destination as its complete G or M address.
 /// - Note: `Memo::Hash` and `Memo::Return` keep `memo = null` and additionally
 ///   surface `memo_hash` / `memo_return`; a tampered memo XDR is still caught by
 ///   the caller's envelope-rebuild divergence check.

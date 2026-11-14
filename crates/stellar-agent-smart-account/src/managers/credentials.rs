@@ -5409,7 +5409,7 @@ registered_at_unix_ms = 1700000000000
         let payment_entry = PendingApproval::new_payment_pending(
             "AAAAAQAAAA==".to_owned(), // dummy XDR b64
             b"dummy-xdr-bytes",
-            "GBH...DEST".to_owned(),
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_owned(),
             10_000_000,
             "XLM".to_owned(),
             None,
@@ -5530,7 +5530,7 @@ registered_at_unix_ms = 1700000000000
         let payment_entry = PendingApproval::new_payment_pending(
             "AAAAAQAAAA==".to_owned(),
             b"dummy-xdr-bytes",
-            "GBH...DEST".to_owned(),
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_owned(),
             10_000_000,
             "XLM".to_owned(),
             None,

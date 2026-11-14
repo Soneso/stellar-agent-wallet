@@ -2165,6 +2165,73 @@ mod tests {
         });
     }
 
+    /// A stored summary destination that fails its checksum is an ordinary
+    /// entry: the remote reject challenge finds it and the reject writes the
+    /// tombstone. An approve over the shown view answers `inconsistent` from
+    /// the attestation check and changes nothing.
+    #[test]
+    #[serial]
+    fn a_refused_destination_is_rejected_remotely_and_never_approved() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let fx = fixture("refused-destination");
+            let store_path = fx.state.ctx.store_path.clone();
+            let nonce = insert_payment_entry(&store_path);
+            let good = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
+            let line = format!("summary_to = \"{good}\"");
+            let text = std::fs::read_to_string(&store_path).unwrap();
+            assert_eq!(text.matches(&line).count(), 1);
+            let bad = format!("summary_to = \"{}A\"", &good[..55]);
+            std::fs::write(&store_path, text.replace(&line, &bad)).unwrap();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
+            let cookie = login(&router, &fx.state, &fx.authenticator).await;
+            let csrf = get_csrf(&router, &fx.state, &cookie, &nonce).await;
+            let shown = get_view_digest(&router, &fx.state, &cookie, &nonce)
+                .await
+                .expect("the page shows the envelope terms");
+
+            let resp =
+                post_challenge(&router, &fx.state, &cookie, &csrf, &nonce, Some(&shown)).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let challenge = challenge_of(&body_json(resp).await);
+            let assertion = fx.authenticator.sign_valid(&challenge, RP_ID, ORIGIN, 2);
+            let resp = post_decision(
+                &router,
+                &fx.state,
+                &cookie,
+                &csrf,
+                &nonce,
+                decision_body("approve", &assertion),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(body_json(resp).await["status"], "inconsistent");
+            assert_entry_untouched(&store_path, &nonce);
+            assert_eq!(fx.audit_rows("approval_attested_remote"), 0);
+
+            let resp = post_challenge(&router, &fx.state, &cookie, &csrf, &nonce, None).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let challenge = challenge_of(&body_json(resp).await);
+            let assertion = fx.authenticator.sign_valid(&challenge, RP_ID, ORIGIN, 3);
+            let resp = post_decision(
+                &router,
+                &fx.state,
+                &cookie,
+                &csrf,
+                &nonce,
+                decision_body("reject", &assertion),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(body_json(resp).await["status"], "rejected");
+            let store = PendingApprovalStore::open(store_path.clone()).unwrap();
+            assert!(matches!(
+                store.get(&nonce).unwrap().kind,
+                ApprovalKind::Rejected { .. }
+            ));
+        });
+    }
+
     fn decision_body(decision: &str, assertion: &crate::wire::AssertionWire) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
             "decision": decision,
@@ -3772,7 +3839,7 @@ mod tests {
             context.endpoint_host = "https://remote-rpc.example".to_owned();
             context.signer_account = Some("GREMOTEENROLLED".to_owned());
             let entry = stellar_agent_core::approval::PendingApproval::new_payment_pending(
-                "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAAAQAAAAAAAAAAAAAAAQAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAABAAAAAAMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAAAAAAAAAAAAD0JAAAAAAAAAAAA=".to_owned(), b"AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAAAQAAAAAAAAAAAAAAAQAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAABAAAAAAMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAAAAAAAAAAAAD0JAAAAAAAAAAAA=", "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(), 1_000_000, "XLM".to_owned(), None, 100, 1, "1000".to_owned(), stellar_agent_core::approval::DEFAULT_TTL_MS,
+                "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAAAQAAAAAAAAAAAAAAAQAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAABAAAAAAMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAAAAAAAAAAAAD0JAAAAAAAAAAAA=".to_owned(), b"AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAAAQAAAAAAAAAAAAAAAQAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAABAAAAAAMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAAAAAAAAAAAAD0JAAAAAAAAAAAA=", "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_owned(), 1_000_000, "XLM".to_owned(), None, 100, 1, "1000".to_owned(), stellar_agent_core::approval::DEFAULT_TTL_MS,
             ).unwrap();
             let nonce = entry.approval_nonce.clone();
             let mut store = PendingApprovalStore::open(fx.state.ctx.store_path.clone()).unwrap();

@@ -273,7 +273,7 @@ mod tests {
             let mut grants = ToolsetGrantStore::open(grants_path.clone(), now).unwrap();
             let grant = serde_json::from_value(serde_json::json!({
                 "grant_id": "AAAAAAAAAAAAAAAAAAAAAA", "toolset_name": "fixture", "capability": "sign-payment",
-                "destination": "fixture-destination", "asset": "XLM", "amount_min_stroops": 0,
+                "destination": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF", "asset": "XLM", "amount_min_stroops": 0,
                 "amount_max_stroops": 100, "granted_at_unix_ms": now, "expires_at_unix_ms": now + 60_000,
                 "process_uid_at_grant": "1000", "attestation_blob_b64": null, "attestation_version": 3
             })).unwrap();
@@ -355,6 +355,51 @@ mod tests {
                 .pending,
             0
         );
+    }
+
+    /// A decided approval whose stored summary destination fails its checksum
+    /// is still a decided record: the acknowledged loss revokes it, and a
+    /// later repair of the summary text brings no consent back.
+    #[test]
+    #[serial_test::serial]
+    fn acknowledging_a_loss_revokes_a_decided_approval_with_a_refused_destination() {
+        keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (args, profile) = fixture(dir.path());
+        let permissions = Permissions::seed(dir.path());
+        let good = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+        let bad = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVA";
+        let text = std::fs::read_to_string(&permissions.approvals_path).unwrap();
+        let decided_at = text.find(&permissions.decided).unwrap();
+        let summary_at = decided_at + text[decided_at..].find(good).unwrap();
+        let edited = format!(
+            "{}{bad}{}",
+            &text[..summary_at],
+            &text[summary_at + good.len()..]
+        );
+        std::fs::write(&permissions.approvals_path, &edited).unwrap();
+        let approvals = PendingApprovalStore::open(permissions.approvals_path.clone()).unwrap();
+        let entry = approvals.get(&permissions.decided).unwrap();
+        assert!(entry.attestation_blob_b64.is_some());
+        assert!(stellar_agent_core::approval::verify_stored_destination(&entry.kind).is_err());
+        drop(approvals);
+
+        queue_and_lose(&profile);
+        let result = permissions.acknowledge(&args, &profile).unwrap();
+        assert_eq!(
+            (
+                result.report.revoked_approvals,
+                result.report.revoked_grants
+            ),
+            (1, 1)
+        );
+        let after = std::fs::read_to_string(&permissions.approvals_path).unwrap();
+        assert!(!after.contains(&permissions.decided), "{after}");
+        assert!(!after.contains(bad), "{after}");
+        std::fs::write(&permissions.approvals_path, after.replace(bad, good)).unwrap();
+        let approvals = PendingApprovalStore::open(permissions.approvals_path.clone()).unwrap();
+        assert!(approvals.get(&permissions.decided).is_none());
+        assert!(approvals.get(&permissions.undecided).is_some());
     }
 
     /// An intact queue is no loss: the verb refuses with its own code before

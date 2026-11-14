@@ -225,7 +225,10 @@ pub enum ApprovalSummaryView {
         install_id: String,
         /// Signing-adjacent capability token requested.
         capability: String,
-        /// First-5-last-5 redacted destination G-strkey.
+        /// Complete destination from the validated stored terms: a G or M
+        /// address for `sign-payment`, or a C-strkey for `sign-rule-create`.
+        destination: String,
+        /// First-5-last-5 redaction of `destination` for diagnostics.
         destination_redacted: String,
         /// Asset identifier.
         asset: String,
@@ -703,6 +706,7 @@ impl PendingApprovalView {
                     package_version: package_version.clone(),
                     package_shasum_short: package_shasum.chars().take(12).collect(),
                     capability: capability.clone(),
+                    destination: destination.clone(),
                     destination_redacted: redact_g_strkey(destination),
                     asset: asset.clone(),
                     amount_min_stroops: *amount_min_stroops,
@@ -990,6 +994,77 @@ mod tests {
         ));
     }
 
+    /// The M address of the key of [`DEST`] with ID `u64::MAX`.
+    fn dest_m_max() -> String {
+        let key = stellar_strkey::ed25519::PublicKey::from_string(DEST)
+            .unwrap()
+            .0;
+        stellar_strkey::ed25519::MuxedAccount {
+            ed25519: key,
+            id: u64::MAX,
+        }
+        .to_string()
+        .to_string()
+    }
+
+    /// The payment view reads the destination from the envelope, so a stored
+    /// summary that names the base account does not change it. The toolset
+    /// view carries the validated stored destination in full.
+    #[test]
+    fn payment_and_toolset_views_carry_the_complete_maximum_id_m_address() {
+        let muxed = dest_m_max();
+        let dir = TempDir::new().unwrap();
+        let mut store = open_store(&dir);
+        let envelope = fixtures::payment_envelope(SOURCE, &muxed, "XLM", 1_000, None, 100, 1);
+        let payment = PendingApproval::new_payment_pending(
+            envelope.clone(),
+            envelope.as_bytes(),
+            DEST.to_owned(),
+            1_000,
+            "XLM".to_owned(),
+            None,
+            100,
+            1,
+            uid(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        let gate = PendingApproval::new_toolset_first_invoke_gate_pending(
+            "my-toolset".to_owned(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "1.0.0".to_owned(),
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
+            "sign-payment".to_owned(),
+            muxed.clone(),
+            "XLM".to_owned(),
+            0,
+            1_000_000,
+            uid(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        store.insert(payment, TEST_NOW_MS).unwrap();
+        store.insert(gate, TEST_NOW_MS).unwrap();
+        let views = store.snapshot(TEST_NOW_MS);
+        assert_eq!(views.len(), 2);
+        for view in &views {
+            match &view.summary {
+                ApprovalSummaryView::Payment { to, .. } => assert_eq!(to, &muxed),
+                ApprovalSummaryView::ToolsetFirstInvokeGate {
+                    destination,
+                    destination_redacted,
+                    ..
+                } => {
+                    assert_eq!(destination, &muxed);
+                    assert_eq!(destination_redacted, &redact_g_strkey(&muxed));
+                    let json = serde_json::to_value(&view.summary).unwrap();
+                    assert_eq!(json["destination"], muxed.as_str());
+                }
+                other => panic!("unexpected summary {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn snapshot_renders_toolset_first_invoke_gate() {
         let dir = TempDir::new().unwrap();
@@ -1000,7 +1075,7 @@ mod tests {
             "1.0.0".to_owned(),
             "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
             "sign-payment".to_owned(),
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_owned(),
             "XLM".to_owned(),
             0,
             1_000_000,
@@ -1341,6 +1416,7 @@ mod tests {
             package_shasum_short: "d".repeat(12),
             install_id: "a".repeat(32),
             capability: "sign-payment".to_owned(),
+            destination: DEST.to_owned(),
             destination_redacted: "GAAAA...ZZZZZ".to_owned(),
             asset: "XLM".to_owned(),
             amount_min_stroops: 0,
@@ -2118,7 +2194,7 @@ mod tests {
             "1.0.0".to_owned(),
             "d".repeat(64),
             "sign-payment".to_owned(),
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_owned(),
             "XLM".to_owned(),
             0,
             1_000_000,

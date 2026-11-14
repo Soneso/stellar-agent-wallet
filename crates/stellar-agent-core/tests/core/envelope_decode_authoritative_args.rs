@@ -25,6 +25,8 @@
 //! 8. Operation count ≠ 1 → `UnexpectedOperationCount`
 //! 9. `Memo::Hash` → `MemoUnsupportedForReDerive`
 //! 10. Unsupported tool name → `UnsupportedTool`
+//! 11. Payment and both path payments keep complete, distinct M destinations
+//!     in the args and in each policy value leg
 
 #![allow(
     clippy::unwrap_used,
@@ -549,4 +551,115 @@ fn payment_memo_shape_refuses_a_non_payment_operation() {
             ..
         })
     ));
+}
+
+/// `DEST_G` as an M address with `id`.
+fn dest_m(id: u64) -> MuxedAccount {
+    MuxedAccount::MuxedEd25519(MuxedAccountMed25519 {
+        id,
+        ed25519: Uint256(g_to_bytes(DEST_G)),
+    })
+}
+
+/// Decodes one payment-kind operation to `destination` and returns the
+/// authoritative args and the destination of each policy value leg.
+fn decode_to(
+    body: impl Fn(MuxedAccount) -> OperationBody,
+    destination: MuxedAccount,
+) -> (serde_json::Value, Vec<String>) {
+    use stellar_agent_core::policy::v1::value::{ValueClass, derive_value_class};
+    let op = Operation {
+        source_account: None,
+        body: body(destination),
+    };
+    let env = build_tx1_envelope(SOURCE_G, op, Memo::None);
+    let args = decode_authoritative_args(&to_b64(&env), "stellar_pay_commit").unwrap();
+    let ValueClass::Value(effects) = derive_value_class("stellar_pay_commit", &args) else {
+        panic!("a payment derives value effects");
+    };
+    let legs = effects
+        .legs()
+        .iter()
+        .map(|leg| leg.destination.clone().unwrap())
+        .collect();
+    (args, legs)
+}
+
+/// Asserts that an ID-only change keeps every other decoded term, changes
+/// the destination, and reaches each policy value leg.
+fn assert_ids_stay_distinct(body: impl Fn(MuxedAccount) -> OperationBody, legs_per_payment: usize) {
+    let mut seen = Vec::new();
+    let (base_args, _) = decode_to(&body, g_to_muxed(DEST_G));
+    for destination in [g_to_muxed(DEST_G), dest_m(0), dest_m(u64::MAX)] {
+        let expected = destination.to_string();
+        let (args, legs) = decode_to(&body, destination);
+        assert_eq!(args["destination"], expected.as_str());
+        assert_eq!(args["source"], SOURCE_G);
+        assert_eq!(legs, vec![expected.clone(); legs_per_payment]);
+        let mut others = args.clone();
+        let mut base = base_args.clone();
+        others.as_object_mut().unwrap().remove("destination");
+        base.as_object_mut().unwrap().remove("destination");
+        assert_eq!(others, base, "an ID-only change keeps every other term");
+        seen.push(expected);
+    }
+    assert!(seen[1].starts_with('M') && seen[2].starts_with('M'));
+    assert_eq!(
+        seen.iter().collect::<std::collections::BTreeSet<_>>().len(),
+        3
+    );
+}
+
+#[test]
+fn a_payment_keeps_distinct_m_destinations_and_value_legs() {
+    let usdc = || {
+        Asset::CreditAlphanum4(stellar_xdr::AlphaNum4 {
+            asset_code: stellar_xdr::AssetCode4(*b"USDC"),
+            issuer: g_to_account_id(USDC_ISSUER_G),
+        })
+    };
+    assert_ids_stay_distinct(
+        |destination| {
+            OperationBody::Payment(PaymentOp {
+                destination,
+                asset: usdc(),
+                amount: 25_000_000,
+            })
+        },
+        1,
+    );
+}
+
+#[test]
+fn a_strict_receive_path_payment_keeps_distinct_m_destinations_and_value_legs() {
+    assert_ids_stay_distinct(
+        |destination| {
+            OperationBody::PathPaymentStrictReceive(stellar_xdr::PathPaymentStrictReceiveOp {
+                send_asset: Asset::Native,
+                send_max: 30_000_000,
+                destination,
+                dest_asset: Asset::Native,
+                dest_amount: 20_000_000,
+                path: VecM::default(),
+            })
+        },
+        2,
+    );
+}
+
+#[test]
+fn a_strict_send_path_payment_keeps_distinct_m_destinations_and_value_legs() {
+    assert_ids_stay_distinct(
+        |destination| {
+            OperationBody::PathPaymentStrictSend(stellar_xdr::PathPaymentStrictSendOp {
+                send_asset: Asset::Native,
+                send_amount: 30_000_000,
+                destination,
+                dest_asset: Asset::Native,
+                dest_min: 20_000_000,
+                path: VecM::default(),
+            })
+        },
+        2,
+    );
 }

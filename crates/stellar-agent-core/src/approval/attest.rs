@@ -548,6 +548,8 @@ pub enum ConsentAuthorization<'a> {
 ///   (`approval.entry_inconsistent`).
 ///   `ApprovalKind::Rejected` and `ApprovalKind::Consumed` are tombstones and
 ///   can never be attested.
+/// - A stored payment destination that is not a canonical G account or M
+///   address (`approval.entry_inconsistent`), before any row or store change.
 /// - A surface and approver that do not belong together, or a remote
 ///   approver whose credential ID is malformed (`approval.user_mismatch`).
 /// - An entry that changed since validation: `approval.not_found`,
@@ -584,6 +586,7 @@ pub fn attest_and_persist(
     authorization: ConsentAuthorization<'_>,
     persist_toolset_grant: impl FnOnce(&ToolsetGrantRequest<'_>, &[u8; 32]) -> Result<(), String>,
 ) -> Result<Option<String>, WalletError> {
+    super::verify_stored_destination(&entry.kind)?;
     let approver = match authorization {
         ConsentAuthorization::Standard(_) if binding.chain_id == MAINNET_CHAIN_ID => {
             return Err(WalletError::Approval(ApprovalFailure::PresenceRequired));
@@ -1073,6 +1076,8 @@ pub(crate) fn refuse_unless_still_pending(
 ///
 /// # Errors
 /// `approval.wrong_kind` for a kind other than a payment, claim or trustline;
+/// `approval.entry_inconsistent`, before the audit sink or any row, when the
+/// stored payment destination is not a canonical G account or M address;
 /// otherwise the errors of the mainnet path of [`attest_and_persist`].
 #[allow(
     clippy::too_many_arguments,
@@ -1098,6 +1103,7 @@ pub fn attest_mainnet_confirmation(
             detail: "mainnet confirmation requires a classic transaction".to_owned(),
         }));
     }
+    super::verify_stored_destination(&entry.kind)?;
     attest_mainnet_presence(
         store,
         entry,
@@ -1346,11 +1352,17 @@ fn attest_mainnet_presence(
 
 /// Maps a pending-store failure to its `approval.*` refusal.
 ///
-/// `NotFound`, `Expired` and `AlreadyAttested` keep their own codes; every
-/// other store failure is `approval.record_failed` with the store's message.
+/// `NotFound`, `Expired` and `AlreadyAttested` keep their own codes, and a
+/// refused stored destination is `approval.entry_inconsistent`. Every other
+/// store failure is `approval.record_failed` with the store's message.
 #[must_use]
 pub fn record_error(e: &ApprovalError) -> WalletError {
     match e {
+        ApprovalError::DestinationRefused { .. } => {
+            WalletError::Approval(ApprovalFailure::EntryInconsistent {
+                detail: e.to_string(),
+            })
+        }
         ApprovalError::NotFound => WalletError::Approval(ApprovalFailure::NotFound {
             detail: "entry disappeared between lookup and record".to_owned(),
         }),
@@ -1548,6 +1560,58 @@ mod tests {
     /// Opens an unkeyed audit writer on a log inside `dir`.
     fn test_audit_writer(dir: &TempDir) -> AuditWriter {
         AuditWriter::open(dir.path().join("audit").join("audit.jsonl"), None).unwrap()
+    }
+
+    /// An entry whose stored summary destination fails its checksum refuses
+    /// attestation with `approval.entry_inconsistent`, before any consent row
+    /// or store change.
+    #[test]
+    #[serial_test::serial]
+    fn attestation_refuses_a_refused_stored_destination() {
+        keyring_mock::install().unwrap();
+        let raw_key = seed_key_32("stellar-agent-attestation-core-test-refused", "default");
+        let dir = TempDir::new().unwrap();
+        let mut audit_writer = test_audit_writer(&dir);
+        let path = dir.path().join("default.toml");
+        let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+        let mut entry = make_entry(DEFAULT_TTL_MS);
+        store
+            .insert(entry.clone(), timefmt::now_unix_ms().unwrap())
+            .unwrap();
+        drop(store);
+        let bad = format!(
+            "{}{}",
+            &DEST[..55],
+            if DEST.ends_with('A') { "B" } else { "A" }
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        let edited = text.replace(
+            &format!("summary_to = \"{DEST}\""),
+            &format!("summary_to = \"{bad}\""),
+        );
+        assert_ne!(edited, text);
+        std::fs::write(&path, &edited).unwrap();
+        let ApprovalKind::PaymentSimulated { summary_to, .. } = &mut entry.kind else {
+            unreachable!()
+        };
+        summary_to.clone_from(&bad);
+        let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+        let rows_before = audit_writer.end_offset();
+        let err = attest_and_persist(
+            &mut store,
+            &entry,
+            &raw_key,
+            &crate::approval::AttestationBinding::new("a", "stellar:testnet"),
+            Surface::Cli,
+            ConsentAudit::Writer(&mut audit_writer),
+            ConsentAuthorization::Standard(&AttestedApprover::Local),
+            |_req, _key| Err("must not be called for PaymentSimulated".to_owned()),
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "approval.entry_inconsistent");
+        assert_eq!(audit_writer.end_offset(), rows_before);
+        drop(store);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
     }
 
     #[test]
@@ -2093,7 +2157,7 @@ mod tests {
             "1.0.0".to_owned(),
             "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
             "sign-payment".to_owned(),
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_owned(),
             "XLM".to_owned(),
             0,
             1_000_000,
@@ -2149,7 +2213,7 @@ mod tests {
             "1.0.0".to_owned(),
             "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
             "sign-payment".to_owned(),
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_owned(),
             "XLM".to_owned(),
             0,
             1_000_000,
@@ -2491,7 +2555,7 @@ mod tests {
                     "1.0.0".to_owned(),
                     "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
                     "sign-payment".to_owned(),
-                    "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                    "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_owned(),
                     "XLM".to_owned(),
                     0,
                     1_000_000,
@@ -3431,6 +3495,77 @@ mod tests {
         }
     }
 
+    /// Mainnet approval, through the direct confirmation and through the
+    /// mainnet branch of [`attest_and_persist`], refuses a payment whose
+    /// stored summary destination fails its checksum, before any audit write
+    /// or row.
+    #[test]
+    #[serial_test::serial]
+    fn mainnet_confirmation_refuses_a_refused_stored_destination() {
+        use crate::approval::mainnet_fixtures::{ATTESTATION_KEY, MainnetConsentFixture};
+        for confirmation in [true, false] {
+            let fixture = MainnetConsentFixture::new("confirm-destination");
+            let policy = fixture.current_policy();
+            let mut payment = fixture.payment(DEFAULT_TTL_MS);
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("pending.toml");
+            let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+            store
+                .insert(payment.clone(), payment.created_at_unix_ms)
+                .unwrap();
+            drop(store);
+            let ApprovalKind::PaymentSimulated { summary_to, .. } = &mut payment.kind else {
+                unreachable!()
+            };
+            let good = summary_to.clone();
+            let last = if good.ends_with('A') { "B" } else { "A" };
+            summary_to.replace_range(55.., last);
+            let text = std::fs::read_to_string(&path).unwrap();
+            let edited = text.replace(&good, summary_to);
+            std::fs::write(&path, &edited).unwrap();
+            let presence = fixture.presence(&payment, &policy);
+            let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+            let mut writer = test_audit_writer(&dir);
+            let error = if confirmation {
+                attest_mainnet_confirmation(
+                    &mut store,
+                    &payment,
+                    &ATTESTATION_KEY,
+                    &fixture.binding(),
+                    ConsentAudit::Writer(&mut writer),
+                    "stellar_pay_commit",
+                    &policy,
+                    presence,
+                )
+                .unwrap_err()
+            } else {
+                attest_and_persist(
+                    &mut store,
+                    &payment,
+                    &ATTESTATION_KEY,
+                    &fixture.binding(),
+                    Surface::Cli,
+                    ConsentAudit::Writer(&mut writer),
+                    ConsentAuthorization::Mainnet {
+                        presence,
+                        policy: &policy,
+                    },
+                    |_req, _key| Err("must not be called for PaymentSimulated".to_owned()),
+                )
+                .unwrap_err()
+            };
+            assert_eq!(
+                error.code(),
+                "approval.entry_inconsistent",
+                "{confirmation}"
+            );
+            assert_eq!(writer.end_offset(), 0, "{confirmation}");
+            assert!(consent_rows(&dir).is_empty(), "{confirmation}");
+            drop(store);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+        }
+    }
+
     /// The direct mainnet confirmation admits only classic transactions.
     #[test]
     #[serial_test::serial]
@@ -4039,7 +4174,7 @@ mod tests {
             "1.0.0".to_owned(),
             "d".repeat(64),
             "sign-payment".to_owned(),
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_owned(),
             "XLM".to_owned(),
             0,
             1_000_000,

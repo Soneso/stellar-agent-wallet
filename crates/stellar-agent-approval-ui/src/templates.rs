@@ -1120,6 +1120,7 @@ pub fn render_summary_html(view: &PendingApprovalView) -> String {
             asset,
             amount_min_stroops,
             amount_max_stroops,
+            ..
         } => {
             let mut rows = String::new();
             rows.push_str(&fact_row("Toolset", toolset_name));
@@ -1958,7 +1959,7 @@ mod tests {
             "1.0.0".to_owned(),
             "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
             "sign-payment".to_owned(),
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_owned(),
             "XLM".to_owned(),
             0,
             1_000_000,

@@ -2885,7 +2885,7 @@ attestation_version = 3
         .unwrap();
 
         assert_eq!(grant.toolset_name, "my-toolset");
-        assert_eq!(grant.capability, "sign-payment");
+        assert_eq!(grant.capability(), "sign-payment");
 
         // The stored HMAC verifies under the issuing key and fails under another key.
         assert!(

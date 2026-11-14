@@ -1883,7 +1883,7 @@ mod tests {
             "1.0.0".to_owned(),
             "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
             "sign-payment".to_owned(),
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_owned(),
             "XLM".to_owned(),
             0,
             1_000_000,
@@ -2021,6 +2021,45 @@ mod tests {
             } => assert_eq!(b, first_blob),
             other => panic!("expected AlreadyResolved with blob, got {other:?}"),
         }
+    }
+
+    /// A stored payment summary whose destination fails its checksum is an
+    /// ordinary entry: approving it refuses with `approval.entry_inconsistent`
+    /// and changes nothing, and rejecting it writes the tombstone.
+    #[test]
+    #[serial]
+    fn a_refused_destination_refuses_approval_and_accepts_rejection() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let fx = fixture("refused-destination");
+        let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
+        let bad = format!("{}A", &DEST_G[..55]);
+        let text = std::fs::read_to_string(&fx.ctx.store_path).unwrap();
+        let line = format!("summary_to = \"{DEST_G}\"");
+        assert_eq!(text.matches(&line).count(), 1);
+        let edited = text.replace(&line, &format!("summary_to = \"{bad}\""));
+        std::fs::write(&fx.ctx.store_path, &edited).unwrap();
+
+        let outcome = apply_decision(
+            &fx.ctx,
+            approve_shown(&fx.ctx, nonce.clone()),
+            RequestIdentity::Local,
+        );
+        assert_eq!(outcome, Outcome::Inconsistent);
+        assert_eq!(std::fs::read_to_string(&fx.ctx.store_path).unwrap(), edited);
+
+        let outcome = apply_decision(
+            &fx.ctx,
+            Decision::Reject {
+                nonce: nonce.clone(),
+            },
+            RequestIdentity::Local,
+        );
+        assert_eq!(outcome, Outcome::Rejected);
+        let store = PendingApprovalStore::open(fx.ctx.store_path.clone()).unwrap();
+        assert!(matches!(
+            store.get(&nonce).unwrap().kind,
+            ApprovalKind::Rejected { .. }
+        ));
     }
 
     #[test]
@@ -3055,7 +3094,7 @@ mod tests {
                     "1.0.0".to_owned(),
                     "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
                     "sign-payment".to_owned(),
-                    "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                    "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_owned(),
                     "XLM".to_owned(),
                     0,
                     1_000_000,

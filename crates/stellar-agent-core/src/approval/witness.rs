@@ -876,6 +876,9 @@ fn read_mainnet_record<'a>(
             detail: "no pending approval with that nonce".to_owned(),
         })
     })?;
+    // The receipt check below also verifies the entry terms; this check is
+    // defense in depth and refuses before any digest is computed.
+    super::verify_stored_destination(&record.kind)?;
     if let Some(summary) = super::attest::classic_entry_summary(&record.kind) {
         summary?;
     }
@@ -1543,6 +1546,51 @@ mod tests {
             .code(),
             "approval.entry_inconsistent"
         );
+    }
+
+    /// A genuine mainnet consent whose stored summary destination then fails
+    /// its checksum yields no witness: the lookup refuses it with
+    /// `approval.entry_inconsistent` and the store stays unchanged.
+    #[test]
+    #[serial]
+    fn a_refused_stored_destination_yields_no_witness() {
+        let fixture = MainnetConsentFixture::new(NAME);
+        let entry = fixture.payment(DEFAULT_TTL_MS);
+        let Consented {
+            store,
+            nonce,
+            blob,
+            policy,
+        } = consent(&fixture, &entry);
+        drop(store);
+        let ApprovalKind::PaymentSimulated { summary_to, .. } = &entry.kind else {
+            unreachable!()
+        };
+        let path = fixture.store_path();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let line = format!("summary_to = \"{summary_to}\"");
+        assert_eq!(text.matches(&line).count(), 1);
+        let last = if summary_to.ends_with('A') { "B" } else { "A" };
+        let bad = format!("summary_to = \"{}{last}\"", &summary_to[..55]);
+        let edited = text.replace(&line, &bad);
+        std::fs::write(&path, &edited).unwrap();
+        let record = Consented {
+            store: PendingApprovalStore::open(path.clone()).unwrap(),
+            nonce,
+            blob,
+            policy,
+        };
+        let err = verify(
+            &fixture,
+            &record,
+            &payment_expectation(&entry),
+            &record.policy,
+            now(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "approval.entry_inconsistent");
+        drop(record);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
     }
 
     fn x402_entry() -> PendingApproval {

@@ -7,6 +7,8 @@ Core library for the stellar-agent-wallet: signing, policy engine, smart account
 
 This is the primary public API of the workspace and the wallet's mostly synchronous layer; it creates no async runtime of its own. It provides typed amounts (`StellarAmount`), the error taxonomy (`WalletError`), the JSON envelope (`Envelope`), observability primitives, smart-account auth-digest and context-rule-ID helpers, per-profile configuration, and the policy and proof types for mainnet authorization. Wallet unlock and seed access are synchronous. `rpc_budget::bound_stage` is async and requires a Tokio runtime.
 
+`payment_accounts::PaymentAccount` parses the canonical G account or M address a classic payment pays. An M address keeps its ID, including ID zero. A `sign-payment` grant for a G account covers that account and its M addresses, and a grant for an M address covers only that address. Grant attestations bind the stored destination bytes exactly. Consent views carry the complete validated destination. `ValueLegRecord::from_payment_leg` adds an optional SHA-256 of the payment destination to an audit leg, and rows without it read and serialize unchanged.
+
 External consumers embed this crate alongside `stellar-agent-network` to sign and submit transactions without spawning the CLI subprocess; see `examples/embed/` in the repository for a complete walkthrough. Network transport, transaction assembly, and signing live in `stellar-agent-network`.
 
 It is part of the stellar-agent-wallet workspace and backs the `stellar-agent-cli` and `stellar-agent-mcp` binaries.
