@@ -50,7 +50,7 @@ use keyring_core::Entry as KeyringEntry;
 use zeroize::Zeroizing;
 
 use crate::audit_log::entry::AuditEntry;
-use crate::audit_log::outbox::{AuditOutbox, PreparedOutboxAppend};
+use crate::audit_log::outbox::{AuditOutbox, OutboxRowRef, PreparedOutboxAppend};
 use crate::audit_log::writer::{
     AuditWriter, PreparedAuditEntry, WriterError, audit_writer_refusal,
 };
@@ -410,6 +410,10 @@ pub const ATTESTATION_KEY_FIELD: &str = "attestation_key_id";
 ///
 /// The row is durable in the log or in the log's outbox before the approval
 /// takes effect, and a sink that refuses refuses the approval.
+/// Reference-returning mainnet attesters require a current direct anchor.
+/// Compatibility wrappers use the writer's best-effort anchor.
+/// Durable producers retain queued references so consumers can refuse consent without delivery evidence.
+/// Only reference-returning attesters request queued delivery evidence.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ConsentAudit<'a> {
@@ -430,10 +434,16 @@ impl ConsentAudit<'_> {
         }
     }
 
-    fn write(&mut self, entry: AuditEntry) -> Result<(), WriterError> {
+    fn write<const STRICT: bool>(
+        &mut self,
+        entry: AuditEntry,
+    ) -> Result<Option<OutboxRowRef>, WriterError> {
         match self {
-            Self::Writer(writer) => writer.write_entry(entry),
-            Self::Outbox(outbox) => outbox.append(&entry),
+            Self::Writer(writer) => writer.write_entry(entry).map(|()| None),
+            Self::Outbox(outbox) if STRICT && outbox.is_keyed() => {
+                outbox.append_queued(&entry).map(Some)
+            }
+            Self::Outbox(outbox) => outbox.append(&entry).map(|()| None),
         }
     }
 }
@@ -445,10 +455,12 @@ enum PreparedConsentAudit<'a> {
 }
 
 impl PreparedConsentAudit<'_> {
-    fn write(self, entry: AuditEntry) -> Result<(), WriterError> {
+    fn write(self, entry: AuditEntry, strict: bool) -> Result<Option<OutboxRowRef>, WriterError> {
         match self {
-            Self::Writer(writer) => writer.write(entry),
-            Self::Outbox(outbox) => outbox.append(&entry),
+            Self::Writer(writer) if strict => writer.write_anchored(entry).map(|()| None),
+            Self::Writer(writer) => writer.write(entry).map(|()| None),
+            Self::Outbox(append) if strict => append.append_queued(&entry).map(Some),
+            Self::Outbox(append) => append.append(&entry).map(|()| None),
         }
     }
 }
@@ -582,10 +594,67 @@ pub fn attest_and_persist(
     key_bytes: &[u8],
     binding: &super::AttestationBinding<'_>,
     surface: Surface,
-    mut audit: ConsentAudit<'_>,
+    audit: ConsentAudit<'_>,
     authorization: ConsentAuthorization<'_>,
     persist_toolset_grant: impl FnOnce(&ToolsetGrantRequest<'_>, &[u8; 32]) -> Result<(), String>,
 ) -> Result<Option<String>, WalletError> {
+    attest_and_persist_impl::<false>(
+        store,
+        entry,
+        key_bytes,
+        binding,
+        surface,
+        audit,
+        authorization,
+        persist_toolset_grant,
+    )
+    .map(|(attestation, _)| attestation)
+}
+
+/// Attests consent and returns its surfaced attestation and optional queued row reference.
+///
+/// Durable producers retain the reference for delivery enforcement by consumers.
+/// Direct rows return no reference. The compatibility wrapper uses ordinary append.
+///
+/// # Errors
+/// Returns the refusals of [`attest_and_persist`].
+/// Mainnet direct rows also refuse if their tip anchor cannot be made current.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "every attester passes the store, entry, key, binding and surface explicitly"
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one arm per attestable kind, each in the re-read, row, persist order"
+)]
+pub fn attest_and_persist_with_row(
+    store: &mut PendingApprovalStore,
+    entry: &PendingApproval,
+    key: &[u8],
+    binding: &super::AttestationBinding<'_>,
+    surface: Surface,
+    audit: ConsentAudit<'_>,
+    auth: ConsentAuthorization<'_>,
+    grant: impl FnOnce(&ToolsetGrantRequest<'_>, &[u8; 32]) -> Result<(), String>,
+) -> Result<(Option<String>, Option<OutboxRowRef>), WalletError> {
+    attest_and_persist_impl::<true>(store, entry, key, binding, surface, audit, auth, grant)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "one arm per attestable kind keeps the validation, row and persistence order"
+)]
+fn attest_and_persist_impl<const STRICT: bool>(
+    store: &mut PendingApprovalStore,
+    entry: &PendingApproval,
+    key_bytes: &[u8],
+    binding: &super::AttestationBinding<'_>,
+    surface: Surface,
+    mut audit: ConsentAudit<'_>,
+    authorization: ConsentAuthorization<'_>,
+    persist_toolset_grant: impl FnOnce(&ToolsetGrantRequest<'_>, &[u8; 32]) -> Result<(), String>,
+) -> Result<(Option<String>, Option<OutboxRowRef>), WalletError> {
     super::verify_stored_destination(&entry.kind)?;
     let approver = match authorization {
         ConsentAuthorization::Standard(_) if binding.chain_id == MAINNET_CHAIN_ID => {
@@ -594,7 +663,7 @@ pub fn attest_and_persist(
         ConsentAuthorization::Standard(approver) => approver,
         ConsentAuthorization::Mainnet { presence, policy } => {
             let gated_tool = mainnet_gated_tool(&entry.kind)?;
-            return attest_mainnet_presence(
+            return attest_mainnet_presence::<STRICT>(
                 store, entry, key_bytes, binding, surface, &mut audit, presence, policy,
                 gated_tool, None,
             );
@@ -605,7 +674,7 @@ pub fn attest_and_persist(
             admission,
         } => {
             let gated_tool = mainnet_gated_tool(&entry.kind)?;
-            return attest_mainnet_presence(
+            return attest_mainnet_presence::<STRICT>(
                 store,
                 entry,
                 key_bytes,
@@ -629,7 +698,7 @@ pub fn attest_and_persist(
     //
     // Every arm writes the consent row before it persists anything, so an
     // approval never takes effect without its row.
-    let surfaced_attestation: Option<String> = match &entry.kind {
+    let surfaced_attestation = match &entry.kind {
         ApprovalKind::X402Payment {
             intent_digest,
             root_invocation_xdr,
@@ -652,7 +721,7 @@ pub fn attest_and_persist(
                 home_domain.as_deref(),
                 chain.network_passphrase(),
             )?;
-            attest_envelope_and_persist(
+            attest_envelope_and_persist::<STRICT>(
                 store,
                 entry,
                 key_arr,
@@ -670,7 +739,7 @@ pub fn attest_and_persist(
         ApprovalKind::PaymentSimulated {
             envelope_sha256_hex,
             ..
-        } => attest_envelope_and_persist(
+        } => attest_envelope_and_persist::<STRICT>(
             store,
             entry,
             key_arr,
@@ -686,7 +755,7 @@ pub fn attest_and_persist(
         ApprovalKind::TrustlineSimulated {
             envelope_sha256_hex,
             ..
-        } => attest_envelope_and_persist(
+        } => attest_envelope_and_persist::<STRICT>(
             store,
             entry,
             key_arr,
@@ -702,7 +771,7 @@ pub fn attest_and_persist(
         ApprovalKind::ClaimSimulated {
             envelope_sha256_hex,
             ..
-        } => attest_envelope_and_persist(
+        } => attest_envelope_and_persist::<STRICT>(
             store,
             entry,
             key_arr,
@@ -754,7 +823,7 @@ pub fn attest_and_persist(
                 process_uid: &entry.process_uid,
                 now_unix_ms: now_ms,
             };
-            emit_attested_audit(
+            let outbox_row = emit_attested_audit::<STRICT>(
                 &mut audit,
                 profile,
                 "ToolsetFirstInvokeGate",
@@ -787,7 +856,7 @@ pub fn attest_and_persist(
 
             // The first-invoke gate reads the persisted grant from the grant
             // store at re-invoke time; the agent presents no attestation here.
-            None
+            (None, outbox_row)
         }
         ApprovalKind::TrustlineClawbackOptIn {
             network,
@@ -810,7 +879,7 @@ pub fn attest_and_persist(
                 &entry.attested_lifetime(),
                 approver,
             );
-            emit_attested_audit(
+            let outbox_row = emit_attested_audit::<STRICT>(
                 &mut audit,
                 profile,
                 "TrustlineClawbackOptIn",
@@ -831,7 +900,7 @@ pub fn attest_and_persist(
 
             // The trustline clawback opt-in gate recomputes the digest and
             // verifies the stored blob; the agent presents no attestation here.
-            None
+            (None, outbox_row)
         }
         ApprovalKind::RuleProposalSimulated {
             proposal_sha256, ..
@@ -854,7 +923,7 @@ pub fn attest_and_persist(
                 .iter()
                 .map(|b| format!("{b:02x}"))
                 .collect::<String>();
-            emit_attested_audit(
+            let outbox_row = emit_attested_audit::<STRICT>(
                 &mut audit,
                 profile,
                 "RuleProposalSimulated",
@@ -872,7 +941,7 @@ pub fn attest_and_persist(
                     now_ms,
                 )
                 .map_err(|e| record_error(&e))?;
-            Some(URL_SAFE_NO_PAD.encode(attestation_blob))
+            (Some(URL_SAFE_NO_PAD.encode(attestation_blob)), outbox_row)
         }
         ApprovalKind::MppChargeSimulated {
             prepared_artifact_hash,
@@ -889,7 +958,7 @@ pub fn attest_and_persist(
                 &entry.attested_lifetime(),
                 approver,
             );
-            emit_attested_audit(
+            let outbox_row = emit_attested_audit::<STRICT>(
                 &mut audit,
                 profile,
                 "MppChargeSimulated",
@@ -911,7 +980,7 @@ pub fn attest_and_persist(
                 approver,
                 now_ms,
             )?;
-            Some(URL_SAFE_NO_PAD.encode(attestation_blob))
+            (Some(URL_SAFE_NO_PAD.encode(attestation_blob)), outbox_row)
         }
         ApprovalKind::Rejected { .. } => {
             return Err(rejected_error());
@@ -1088,11 +1157,57 @@ pub fn attest_mainnet_confirmation(
     entry: &PendingApproval,
     key_bytes: &[u8],
     binding: &super::AttestationBinding<'_>,
-    mut audit: ConsentAudit<'_>,
+    audit: ConsentAudit<'_>,
     gated_tool: &str,
     policy: &VerifiedPolicy,
     presence: VerifiedMainnetPresence,
 ) -> Result<(), WalletError> {
+    attest_mainnet_confirmation_impl::<false>(
+        store, entry, key_bytes, binding, audit, gated_tool, policy, presence,
+    )
+    .map(|_| ())
+}
+
+/// Attests a direct mainnet confirmation and returns its optional queued consent reference.
+///
+/// Durable producers retain the reference for delivery enforcement by consumers.
+///
+/// # Errors
+/// Returns the refusals of [`attest_mainnet_confirmation`].
+/// Direct rows also refuse if their tip anchor cannot be made current.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the store, entry, key, binding, sink, tool, policy and proof are each explicit"
+)]
+pub fn attest_mainnet_confirmation_with_row(
+    store: &mut PendingApprovalStore,
+    entry: &PendingApproval,
+    key_bytes: &[u8],
+    binding: &super::AttestationBinding<'_>,
+    audit: ConsentAudit<'_>,
+    gated_tool: &str,
+    policy: &VerifiedPolicy,
+    presence: VerifiedMainnetPresence,
+) -> Result<Option<OutboxRowRef>, WalletError> {
+    attest_mainnet_confirmation_impl::<true>(
+        store, entry, key_bytes, binding, audit, gated_tool, policy, presence,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the shared implementation keeps the attester inputs explicit"
+)]
+fn attest_mainnet_confirmation_impl<const STRICT: bool>(
+    store: &mut PendingApprovalStore,
+    entry: &PendingApproval,
+    key_bytes: &[u8],
+    binding: &super::AttestationBinding<'_>,
+    mut audit: ConsentAudit<'_>,
+    gated_tool: &str,
+    policy: &VerifiedPolicy,
+    presence: VerifiedMainnetPresence,
+) -> Result<Option<OutboxRowRef>, WalletError> {
     if !matches!(
         entry.kind,
         ApprovalKind::PaymentSimulated { .. }
@@ -1104,7 +1219,7 @@ pub fn attest_mainnet_confirmation(
         }));
     }
     super::verify_stored_destination(&entry.kind)?;
-    attest_mainnet_presence(
+    attest_mainnet_presence::<STRICT>(
         store,
         entry,
         key_bytes,
@@ -1116,7 +1231,7 @@ pub fn attest_mainnet_confirmation(
         gated_tool,
         None,
     )
-    .map(|_| ())
+    .map(|(_, outbox_row)| outbox_row)
 }
 
 /// The commit tool a mainnet consent to `kind` gates.
@@ -1166,7 +1281,7 @@ fn mainnet_gated_tool(kind: &ApprovalKind) -> Result<&'static str, WalletError> 
     clippy::too_many_arguments,
     reason = "the store, entry, key, binding, surface, sink, proof, policy, tool and admission are each explicit"
 )]
-fn attest_mainnet_presence(
+fn attest_mainnet_presence<const STRICT: bool>(
     store: &mut PendingApprovalStore,
     entry: &PendingApproval,
     key_bytes: &[u8],
@@ -1177,7 +1292,7 @@ fn attest_mainnet_presence(
     policy: &VerifiedPolicy,
     gated_tool: &str,
     admission: Option<&super::presence_policy::PolicyAdmission>,
-) -> Result<Option<String>, WalletError> {
+) -> Result<(Option<String>, Option<OutboxRowRef>), WalletError> {
     let parts = presence.into_parts();
     // A remote surface records mainnet consent only from the listener of the
     // signed origin, whose receipts carry its identity.
@@ -1311,7 +1426,10 @@ fn attest_mainnet_presence(
     };
 
     let row_ms = timefmt::now_unix_ms().map_err(|e| map_clock_error(&e))?;
-    if std::time::Instant::now() >= parts.deadline
+    let row_instant = std::time::Instant::now();
+    #[cfg(test)]
+    let row_instant = consent_test_seam::row_instant(&current.approval_nonce, row_instant);
+    if row_instant >= parts.deadline
         || row_ms < parts.receipt.issued_at_unix_ms()
         || row_ms >= parts.receipt.expires_at_unix_ms()
     {
@@ -1327,14 +1445,16 @@ fn attest_mainnet_presence(
         binding.chain_id,
         super::presence::presence_audit(&stored, &parts.receipt),
     );
-    audit.write(row).map_err(|e| {
+    let outbox_row = audit.write(row, STRICT).map_err(|e| {
         tracing::warn!(
             error = %e,
             approval_kind = current.kind.kind_name(),
-            "mainnet approval attest: the consent row was not written; nothing is persisted"
+            "mainnet approval attest: the consent sink refuses; nothing is persisted"
         );
         audit_writer_refusal(binding.profile_name, &e)
     })?;
+    #[cfg(test)]
+    consent_test_seam::run(store.path());
     store
         .record_mainnet_attestation_at(
             &current.approval_nonce,
@@ -1344,10 +1464,11 @@ fn attest_mainnet_presence(
             row_ms,
         )
         .map_err(|e| record_error(&e))?;
-    Ok(match current.kind {
+    let attestation = match current.kind {
         ApprovalKind::TrustlineClawbackOptIn { .. } => None,
         _ => Some(URL_SAFE_NO_PAD.encode(attestation_blob)),
-    })
+    };
+    Ok((attestation, outbox_row))
 }
 
 /// Maps a pending-store failure to its `approval.*` refusal.
@@ -1389,7 +1510,7 @@ pub fn record_error(e: &ApprovalError) -> WalletError {
     clippy::too_many_arguments,
     reason = "shared envelope attestation uses the caller's binding and consent context"
 )]
-fn attest_envelope_and_persist(
+fn attest_envelope_and_persist<const STRICT: bool>(
     store: &mut PendingApprovalStore,
     entry: &PendingApproval,
     key: &[u8; 32],
@@ -1401,7 +1522,7 @@ fn attest_envelope_and_persist(
     envelope_sha256_hex: &str,
     kind_name: &str,
     gated_tool: &str,
-) -> Result<Option<String>, WalletError> {
+) -> Result<(Option<String>, Option<OutboxRowRef>), WalletError> {
     let operator_credential_id_b64url = approver_matches_surface(surface, approver)?;
     if let Some(consistency) = classic_entry_summary(&entry.kind) {
         consistency?;
@@ -1416,7 +1537,7 @@ fn attest_envelope_and_persist(
         &entry.attested_lifetime(),
         approver,
     );
-    emit_attested_audit(
+    let outbox_row = emit_attested_audit::<STRICT>(
         audit,
         binding.profile_name,
         kind_name,
@@ -1433,7 +1554,7 @@ fn attest_envelope_and_persist(
         approver,
         now_ms,
     )?;
-    Ok(Some(URL_SAFE_NO_PAD.encode(attestation_blob)))
+    Ok((Some(URL_SAFE_NO_PAD.encode(attestation_blob)), outbox_row))
 }
 
 /// Helper: records an HMAC attestation blob and its approver on the store
@@ -1460,7 +1581,7 @@ fn record_attestation_on_store(
     clippy::too_many_arguments,
     reason = "flat row fields mirror the ApprovalAttested event schema"
 )]
-fn emit_attested_audit(
+fn emit_attested_audit<const STRICT: bool>(
     audit: &mut ConsentAudit<'_>,
     profile: &str,
     approval_kind: &str,
@@ -1469,7 +1590,7 @@ fn emit_attested_audit(
     approval_nonce: &str,
     surface: Surface,
     operator_credential_id_b64url: Option<&str>,
-) -> Result<(), WalletError> {
+) -> Result<Option<OutboxRowRef>, WalletError> {
     let entry = match operator_credential_id_b64url {
         Some(cred_id) => AuditEntry::new_approval_attested_remote(
             approval_kind,
@@ -1488,7 +1609,7 @@ fn emit_attested_audit(
             uuid::Uuid::new_v4().to_string(),
         ),
     };
-    audit.write(entry).map_err(|e| {
+    audit.write::<STRICT>(entry).map_err(|e| {
         tracing::warn!(
             error = %e,
             approval_kind,
@@ -1501,6 +1622,50 @@ fn emit_attested_audit(
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+pub(super) mod consent_test_seam {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    type Hook = Box<dyn FnOnce() + Send>;
+    static HOOKS: Mutex<Vec<(PathBuf, Hook)>> = Mutex::new(Vec::new());
+    static CLOCKS: Mutex<Vec<(String, Instant)>> = Mutex::new(Vec::new());
+
+    pub(in crate::approval) fn advance_clock(nonce: &str, now: Instant) {
+        if let Ok(mut clocks) = CLOCKS.lock() {
+            clocks.push((nonce.to_owned(), now));
+        }
+    }
+
+    pub(super) fn row_instant(nonce: &str, now: Instant) -> Instant {
+        CLOCKS
+            .lock()
+            .ok()
+            .and_then(|mut clocks| {
+                let index = clocks.iter().position(|(n, _)| n == nonce)?;
+                Some(clocks.swap_remove(index).1)
+            })
+            .unwrap_or(now)
+    }
+
+    pub(super) fn run(path: &Path) {
+        let hook = HOOKS.lock().ok().and_then(|mut hooks| {
+            let index = hooks.iter().position(|(p, _)| p == path)?;
+            Some(hooks.swap_remove(index).1)
+        });
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    pub(in crate::approval) fn on_written(path: &Path, hook: impl FnOnce() + Send + 'static) {
+        if let Ok(mut hooks) = HOOKS.lock() {
+            hooks.push((path.to_path_buf(), Box::new(hook)));
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1612,6 +1777,38 @@ mod tests {
         assert_eq!(audit_writer.end_offset(), rows_before);
         drop(store);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+    }
+
+    #[test]
+    fn reference_attestation_checks_destination_before_authorization() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pending.toml");
+        let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+        let mut entry = make_entry(DEFAULT_TTL_MS);
+        store
+            .insert(entry.clone(), entry.created_at_unix_ms)
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let ApprovalKind::PaymentSimulated { summary_to, .. } = &mut entry.kind else {
+            unreachable!()
+        };
+        let last = if summary_to.ends_with('A') { "B" } else { "A" };
+        summary_to.replace_range(55.., last);
+        let mut writer = test_audit_writer(&dir);
+        let error = attest_and_persist_with_row(
+            &mut store,
+            &entry,
+            &[0x42; 32],
+            &super::super::AttestationBinding::new("a", MAINNET_CHAIN_ID),
+            Surface::Cli,
+            ConsentAudit::Writer(&mut writer),
+            ConsentAuthorization::Standard(&AttestedApprover::Local),
+            |_, _| panic!("a refused destination cannot persist a grant"),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "approval.entry_inconsistent");
+        assert_eq!(writer.end_offset(), 0);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
     #[test]
@@ -2605,6 +2802,170 @@ mod tests {
         ]
     }
 
+    #[test]
+    fn the_attester_returns_the_queued_reference() {
+        for (kind, entry) in every_attestable_kind() {
+            for keyed in [false, true] {
+                let dir = TempDir::new().unwrap();
+                let mut store =
+                    PendingApprovalStore::open(dir.path().join("pending.toml")).unwrap();
+                store
+                    .insert(entry.clone(), entry.created_at_unix_ms)
+                    .unwrap();
+                let outbox = outbox_with_key(
+                    &dir.path().join("audit").join("audit.jsonl"),
+                    0,
+                    keyed.then_some([0x42; 32]),
+                );
+                let (surfaced, reference) = attest_and_persist_with_row(
+                    &mut store,
+                    &entry,
+                    &[0x42; 32],
+                    &binding(),
+                    Surface::Cli,
+                    ConsentAudit::Outbox(&outbox),
+                    ConsentAuthorization::Standard(&AttestedApprover::Local),
+                    |_, _| Ok(()),
+                )
+                .unwrap();
+                assert_eq!(reference.is_some(), keyed, "{kind}");
+                if let Some(reference) = reference {
+                    let bytes = std::fs::read(outbox.path()).unwrap();
+                    let digest = crate::audit_log::outbox::test_seam::delivered_row_digest(
+                        bytes.strip_suffix(b"\n").unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(digest, (1, *reference.digest()), "{kind}");
+                    assert_eq!((reference.generation(), reference.sequence()), (0, 1));
+                }
+                let expected = !matches!(
+                    entry.kind,
+                    ApprovalKind::ToolsetFirstInvokeGate { .. }
+                        | ApprovalKind::TrustlineClawbackOptIn { .. }
+                );
+                assert_eq!(surfaced.is_some(), expected, "{kind}");
+            }
+            let dir = TempDir::new().unwrap();
+            let mut store = PendingApprovalStore::open(dir.path().join("pending.toml")).unwrap();
+            store
+                .insert(entry.clone(), entry.created_at_unix_ms)
+                .unwrap();
+            let mut writer = test_audit_writer(&dir);
+            let (_, reference) = attest_and_persist_with_row(
+                &mut store,
+                &entry,
+                &[0x42; 32],
+                &binding(),
+                Surface::Cli,
+                ConsentAudit::Writer(&mut writer),
+                ConsentAuthorization::Standard(&AttestedApprover::Local),
+                |_, _| Ok(()),
+            )
+            .unwrap();
+            assert_eq!(reference, None, "{kind}");
+        }
+    }
+
+    #[test]
+    fn the_compatibility_wrappers_keep_their_results() {
+        for (kind, entry) in every_attestable_kind() {
+            let mut results = Vec::new();
+            for wrapper in [false, true] {
+                let dir = TempDir::new().unwrap();
+                let mut store =
+                    PendingApprovalStore::open(dir.path().join("pending.toml")).unwrap();
+                store
+                    .insert(entry.clone(), entry.created_at_unix_ms)
+                    .unwrap();
+                let mut writer = test_audit_writer(&dir);
+                let result = if wrapper {
+                    attest_and_persist(
+                        &mut store,
+                        &entry,
+                        &[0x42; 32],
+                        &binding(),
+                        Surface::Cli,
+                        ConsentAudit::Writer(&mut writer),
+                        ConsentAuthorization::Standard(&AttestedApprover::Local),
+                        |_, _| Ok(()),
+                    )
+                    .unwrap()
+                } else {
+                    attest_and_persist_with_row(
+                        &mut store,
+                        &entry,
+                        &[0x42; 32],
+                        &binding(),
+                        Surface::Cli,
+                        ConsentAudit::Writer(&mut writer),
+                        ConsentAuthorization::Standard(&AttestedApprover::Local),
+                        |_, _| Ok(()),
+                    )
+                    .unwrap()
+                    .0
+                };
+                results.push(result);
+            }
+            assert_eq!(results[0], results[1], "{kind}");
+        }
+
+        for direct in [false, true] {
+            for wrapper in [false, true] {
+                let (_, entry) = every_attestable_kind().into_iter().next().unwrap();
+                let dir = TempDir::new().unwrap();
+                let store_path = dir.path().join("pending.toml");
+                let mut store = PendingApprovalStore::open(store_path.clone()).unwrap();
+                store
+                    .insert(entry.clone(), entry.created_at_unix_ms)
+                    .unwrap();
+                let before = std::fs::read(&store_path).unwrap();
+                let outbox = outbox_with_key(
+                    &dir.path().join("queued").join("audit.jsonl"),
+                    crate::audit_log::outbox::MAX_OUTBOX_ROWS,
+                    Some([0x42; 32]),
+                );
+                let mut writer = test_audit_writer(&dir);
+                writer.set_fail_after_entry_before_sidecar(true);
+                let audit = if direct {
+                    ConsentAudit::Writer(&mut writer)
+                } else {
+                    ConsentAudit::Outbox(&outbox)
+                };
+                let result = if wrapper {
+                    attest_and_persist(
+                        &mut store,
+                        &entry,
+                        &[0x42; 32],
+                        &binding(),
+                        Surface::Cli,
+                        audit,
+                        ConsentAuthorization::Standard(&AttestedApprover::Local),
+                        |_, _| panic!("no grant"),
+                    )
+                } else {
+                    attest_and_persist_with_row(
+                        &mut store,
+                        &entry,
+                        &[0x42; 32],
+                        &binding(),
+                        Surface::Cli,
+                        audit,
+                        ConsentAuthorization::Standard(&AttestedApprover::Local),
+                        |_, _| panic!("no grant"),
+                    )
+                    .map(|(blob, _)| blob)
+                };
+                let error = result.unwrap_err();
+                if direct {
+                    assert_eq!(error.code(), "audit.chain_key_unavailable");
+                } else {
+                    assert_eq!(error.code(), "audit.outbox_full");
+                }
+                assert_eq!(std::fs::read(&store_path).unwrap(), before);
+            }
+        }
+    }
+
     /// Whether the store at `path`, read back from disk, still holds `nonce`
     /// as an unattested pending entry.
     fn still_pending(path: &std::path::Path, nonce: &str) -> bool {
@@ -2712,10 +3073,17 @@ mod tests {
     /// An outbox for the log at `log`, with its carriers enrolled and `rows`
     /// consent rows queued.
     fn outbox_with_rows(log: &std::path::Path, rows: usize) -> AuditOutbox {
+        outbox_with_key(log, rows, None)
+    }
+
+    fn outbox_with_key(log: &std::path::Path, rows: usize, key: Option<[u8; 32]>) -> AuditOutbox {
         let store =
             std::sync::Arc::new(crate::audit_log::tip_anchor::InMemoryTipAnchorStore::new());
         crate::audit_log::test_helpers::enroll_carriers(log, store.as_ref()).unwrap();
-        let outbox = AuditOutbox::for_log(log, store);
+        let outbox = match key {
+            Some(key) => AuditOutbox::for_log_keyed(log, store, Zeroizing::new(key)),
+            None => AuditOutbox::for_log(log, store),
+        };
         for index in 0..rows {
             outbox
                 .append(&AuditEntry::new_approval_attested(
@@ -2914,7 +3282,11 @@ mod tests {
                 .insert(entry.clone(), entry.created_at_unix_ms)
                 .unwrap();
             let stored_before = std::fs::read(&store_path).unwrap();
-            let outbox = outbox_with_rows(&dir.path().join("audit").join("audit.jsonl"), rows);
+            let outbox = outbox_with_key(
+                &dir.path().join("audit").join("audit.jsonl"),
+                rows,
+                Some([0x5a; 32]),
+            );
             let queued = std::fs::read(outbox.path()).unwrap_or_default();
             let presence = fixture.presence(&entry, &policy);
             let err = attest_mainnet_confirmation(

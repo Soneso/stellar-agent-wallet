@@ -1302,8 +1302,866 @@ fn consent_rows(path: &std::path::Path) -> Vec<serde_json::Value> {
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .map(|row| {
+            if row["k"] == "row" {
+                row["body"].clone()
+            } else {
+                row
+            }
+        })
         .filter(|row| row["kind"] == "approval_attested")
         .collect()
+}
+
+#[test]
+#[serial]
+fn consent_store_crashes_preserve_atomic_replacement() {
+    use crate::approval::store::persist_test_seam::{self, Step};
+    use crate::audit_log::{
+        AuditOutbox, AuditWriter, BindingHistory, tip_anchor::InMemoryTipAnchorStore,
+    };
+    for queued in [false, true] {
+        for step in [
+            Step::TemporarySynced,
+            Step::Renamed,
+            Step::FileSynced,
+            Step::DirectorySynced,
+        ] {
+            let fixture = MainnetConsentFixture::new(PROFILE);
+            let policy = fixture.current_policy();
+            let entry = fixture.payment(DEFAULT_TTL_MS);
+            let anchors = Arc::new(InMemoryTipAnchorStore::new());
+            let mut writer = AuditWriter::open_with_tip_anchor(
+                fixture.audit_path(),
+                Some(zeroize::Zeroizing::new([0x5a; 32])),
+                anchors.clone(),
+                BindingHistory::NotRecorded,
+            )
+            .unwrap();
+            let outbox = AuditOutbox::for_log_keyed(
+                &fixture.audit_path(),
+                anchors,
+                zeroize::Zeroizing::new([0x5a; 32]),
+            );
+            let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
+            store.insert(entry.clone(), now_ms()).unwrap();
+            let before = std::fs::read(fixture.store_path()).unwrap();
+            persist_test_seam::on_step(&fixture.store_path(), step, || {
+                panic!("test crash: approval replacement")
+            });
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::approval::attest::attest_and_persist_with_row(
+                    &mut store,
+                    &entry,
+                    &ATTESTATION_KEY,
+                    &fixture.binding(),
+                    Surface::Cli,
+                    if queued {
+                        ConsentAudit::Outbox(&outbox)
+                    } else {
+                        ConsentAudit::Writer(&mut writer)
+                    },
+                    ConsentAuthorization::Mainnet {
+                        presence: fixture.presence(&entry, &policy),
+                        policy: &policy,
+                    },
+                    |_, _| panic!("no grant"),
+                )
+            }));
+            assert!(result.is_err(), "replacement stops at {step:?}");
+            drop(store);
+            let mut reopened = PendingApprovalStore::open(fixture.store_path()).unwrap();
+            let record = reopened.get(&entry.approval_nonce).unwrap();
+            let published = step != Step::TemporarySynced;
+            assert_eq!(
+                record.mainnet_presence.is_some(),
+                published,
+                "publication boundary: {step:?}"
+            );
+            assert_eq!(record.attestation_blob_b64.is_some(), published);
+            if published {
+                let bytes = std::fs::read(fixture.store_path()).unwrap();
+                let error = crate::approval::attest::attest_and_persist_with_row(
+                    &mut reopened,
+                    &entry,
+                    &ATTESTATION_KEY,
+                    &fixture.binding(),
+                    Surface::Cli,
+                    ConsentAudit::Writer(&mut writer),
+                    ConsentAuthorization::Mainnet {
+                        presence: fixture.presence(&entry, &policy),
+                        policy: &policy,
+                    },
+                    |_, _| panic!("no grant"),
+                )
+                .unwrap_err();
+                assert_eq!(error.code(), "approval.already_attested");
+                assert_eq!(std::fs::read(fixture.store_path()).unwrap(), bytes);
+            } else {
+                assert_eq!(std::fs::read(fixture.store_path()).unwrap(), before);
+            }
+            drop(reopened);
+            if matches!(step, Step::Renamed | Step::FileSynced) {
+                std::fs::write(fixture.store_path(), &before).unwrap();
+                let lost_rename = PendingApprovalStore::open(fixture.store_path()).unwrap();
+                let record = lost_rename.get(&entry.approval_nonce).unwrap();
+                assert!(record.mainnet_presence.is_none());
+                assert!(record.attestation_blob_b64.is_none());
+            }
+            assert_eq!(
+                writer.drain_outbox().unwrap(),
+                usize::from(queued && !published)
+            );
+            assert_eq!(consent_rows(&fixture.audit_path()).len(), 1);
+        }
+    }
+}
+
+#[test]
+#[serial]
+fn a_direct_mainnet_consent_needs_a_current_anchor() {
+    use crate::audit_log::{AuditWriter, BindingHistory, tip_anchor::InMemoryTipAnchorStore};
+    let fixture = MainnetConsentFixture::new(PROFILE);
+    let policy = fixture.current_policy();
+    let entry = fixture.payment(DEFAULT_TTL_MS);
+    let anchors = Arc::new(InMemoryTipAnchorStore::new());
+    let mut writer = AuditWriter::open_with_tip_anchor(
+        fixture.audit_path(),
+        Some(zeroize::Zeroizing::new([0x5a; 32])),
+        anchors.clone(),
+        BindingHistory::NotRecorded,
+    )
+    .unwrap();
+    assert!(
+        !writer
+            .stored_anchor_disagrees(BindingHistory::NotRecorded)
+            .unwrap()
+    );
+    let log_before = std::fs::read(fixture.audit_path()).unwrap();
+    let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
+    store.insert(entry.clone(), now_ms()).unwrap();
+    let before = std::fs::read(fixture.store_path()).unwrap();
+    anchors.fail_next_writes(3);
+    let result = crate::approval::attest::attest_and_persist_with_row(
+        &mut store,
+        &entry,
+        &ATTESTATION_KEY,
+        &fixture.binding(),
+        Surface::Cli,
+        ConsentAudit::Writer(&mut writer),
+        ConsentAuthorization::Mainnet {
+            presence: fixture.presence(&entry, &policy),
+            policy: &policy,
+        },
+        |_, _| panic!("no grant"),
+    );
+    let error = result.unwrap_err();
+    assert_eq!(error.code(), "audit.chain_key_unavailable");
+    assert!(error.to_string().contains("audit.tip_anchor_unavailable"));
+    assert_eq!(std::fs::read(fixture.store_path()).unwrap(), before);
+    assert!(
+        store
+            .get(&entry.approval_nonce)
+            .unwrap()
+            .attestation_blob_b64
+            .is_none()
+    );
+    drop(store);
+    drop(writer);
+    std::fs::write(fixture.audit_path(), log_before).unwrap();
+    let _writer = AuditWriter::open_with_tip_anchor(
+        fixture.audit_path(),
+        Some(zeroize::Zeroizing::new([0x5a; 32])),
+        anchors,
+        BindingHistory::NotRecorded,
+    )
+    .unwrap();
+    let reopened = PendingApprovalStore::open(fixture.store_path()).unwrap();
+    assert!(
+        reopened
+            .get(&entry.approval_nonce)
+            .unwrap()
+            .mainnet_presence
+            .is_none()
+    );
+    let ApprovalKind::PaymentSimulated {
+        envelope_xdr_b64, ..
+    } = &entry.kind
+    else {
+        panic!("payment");
+    };
+    assert!(
+        crate::approval::witness::verify_approval(
+            &reopened,
+            fixture.profile(),
+            fixture.name(),
+            &entry.approval_nonce,
+            &[0; 32],
+            &crate::approval::witness::ApprovalExpectation {
+                kind: crate::approval::witness::ApprovedKind::Payment,
+                subject: crate::approval::subject::approval_subject_classic(envelope_xdr_b64),
+            },
+            &policy,
+            now_ms(),
+        )
+        .is_err()
+    );
+
+    for confirmation in [false, true] {
+        let fixture = MainnetConsentFixture::new(PROFILE);
+        let policy = fixture.current_policy();
+        let entry = fixture.payment(DEFAULT_TTL_MS);
+        let anchors = Arc::new(InMemoryTipAnchorStore::new());
+        let mut writer = AuditWriter::open_with_tip_anchor(
+            fixture.audit_path(),
+            Some(zeroize::Zeroizing::new([0x5a; 32])),
+            anchors.clone(),
+            BindingHistory::NotRecorded,
+        )
+        .unwrap();
+        let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
+        store.insert(entry.clone(), now_ms()).unwrap();
+        anchors.fail_next_writes(3);
+        let result = if confirmation {
+            crate::approval::attest::attest_mainnet_confirmation(
+                &mut store,
+                &entry,
+                &ATTESTATION_KEY,
+                &fixture.binding(),
+                ConsentAudit::Writer(&mut writer),
+                "stellar_pay_commit",
+                &policy,
+                fixture.presence(&entry, &policy),
+            )
+        } else {
+            attest_and_persist(
+                &mut store,
+                &entry,
+                &ATTESTATION_KEY,
+                &fixture.binding(),
+                Surface::Cli,
+                ConsentAudit::Writer(&mut writer),
+                ConsentAuthorization::Mainnet {
+                    presence: fixture.presence(&entry, &policy),
+                    policy: &policy,
+                },
+                |_, _| panic!("no grant"),
+            )
+            .map(|blob| assert!(blob.is_some()))
+        };
+        assert!(result.is_ok(), "confirmation={confirmation}: {result:?}");
+        assert_eq!(consent_rows(&fixture.audit_path()).len(), 1);
+        assert!(
+            store
+                .get(&entry.approval_nonce)
+                .unwrap()
+                .attestation_blob_b64
+                .is_some()
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn wrapper_outbox_unkeyed_mainnet_matches_head() {
+    use crate::approval::attest::{
+        attest_and_persist_with_row, attest_mainnet_confirmation,
+        attest_mainnet_confirmation_with_row,
+    };
+    use crate::audit_log::{AuditOutbox, tip_anchor::InMemoryTipAnchorStore};
+
+    for confirmation in [false, true] {
+        let fixture = MainnetConsentFixture::new(PROFILE);
+        let policy = fixture.current_policy();
+        let entry = fixture.payment(DEFAULT_TTL_MS);
+        let anchors = Arc::new(InMemoryTipAnchorStore::new());
+        crate::audit_log::test_helpers::enroll_carriers(&fixture.audit_path(), anchors.as_ref())
+            .unwrap();
+        let outbox = AuditOutbox::for_log(&fixture.audit_path(), anchors);
+        let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
+        store.insert(entry.clone(), now_ms()).unwrap();
+        let before = std::fs::read(fixture.store_path()).unwrap();
+        let strict = if confirmation {
+            attest_mainnet_confirmation_with_row(
+                &mut store,
+                &entry,
+                &ATTESTATION_KEY,
+                &fixture.binding(),
+                ConsentAudit::Outbox(&outbox),
+                "stellar_pay_commit",
+                &policy,
+                fixture.presence(&entry, &policy),
+            )
+            .map(|_| ())
+        } else {
+            attest_and_persist_with_row(
+                &mut store,
+                &entry,
+                &ATTESTATION_KEY,
+                &fixture.binding(),
+                Surface::Cli,
+                ConsentAudit::Outbox(&outbox),
+                ConsentAuthorization::Mainnet {
+                    presence: fixture.presence(&entry, &policy),
+                    policy: &policy,
+                },
+                |_, _| panic!("no grant"),
+            )
+            .map(|_| ())
+        };
+        assert_eq!(strict.unwrap_err().code(), "audit.chain_key_unavailable");
+        assert!(!outbox.path().exists());
+        assert_eq!(std::fs::read(fixture.store_path()).unwrap(), before);
+
+        let result = if confirmation {
+            attest_mainnet_confirmation(
+                &mut store,
+                &entry,
+                &ATTESTATION_KEY,
+                &fixture.binding(),
+                ConsentAudit::Outbox(&outbox),
+                "stellar_pay_commit",
+                &policy,
+                fixture.presence(&entry, &policy),
+            )
+        } else {
+            attest_and_persist(
+                &mut store,
+                &entry,
+                &ATTESTATION_KEY,
+                &fixture.binding(),
+                Surface::Cli,
+                ConsentAudit::Outbox(&outbox),
+                ConsentAuthorization::Mainnet {
+                    presence: fixture.presence(&entry, &policy),
+                    policy: &policy,
+                },
+                |_, _| panic!("no grant"),
+            )
+            .map(|blob| assert!(blob.is_some()))
+        };
+        assert_eq!(result.map_err(|error| error.code()), Ok(()));
+        let bytes = std::fs::read(outbox.path()).unwrap();
+        let row: crate::audit_log::AuditEntry = serde_json::from_slice(&bytes).unwrap();
+        let mut expected = serde_json::to_vec(&row).unwrap();
+        expected.push(b'\n');
+        assert_eq!(bytes, expected);
+        assert_eq!(consent_rows(outbox.path()).len(), 1);
+        let stored = store.get(&entry.approval_nonce).unwrap();
+        assert!(stored.attestation_blob_b64.is_some());
+        assert!(stored.mainnet_presence.is_some());
+    }
+}
+
+#[test]
+#[serial]
+#[allow(
+    clippy::too_many_lines,
+    reason = "each wrapper and reference entry shares the input and reader checks"
+)]
+fn wrapper_outbox_keyed_markers_and_readers() {
+    use crate::approval::attest::{
+        attest_and_persist_with_row, attest_mainnet_confirmation_with_row,
+    };
+    use crate::audit_log::{
+        AuditEntry, AuditOutbox, outbox::test_seam, tip_anchor::InMemoryTipAnchorStore,
+    };
+
+    for mode in ["standard", "mainnet", "confirmation"] {
+        let fixture = MainnetConsentFixture::new(PROFILE);
+        let policy = fixture.current_policy();
+        let entry = fixture.payment(DEFAULT_TTL_MS);
+        let anchors = Arc::new(InMemoryTipAnchorStore::new());
+        crate::audit_log::test_helpers::enroll_carriers(&fixture.audit_path(), anchors.as_ref())
+            .unwrap();
+        let outbox = AuditOutbox::for_log_keyed(
+            &fixture.audit_path(),
+            anchors.clone(),
+            zeroize::Zeroizing::new([0x5a; 32]),
+        );
+        let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
+        store.insert(entry.clone(), now_ms()).unwrap();
+        if mode == "confirmation" {
+            crate::approval::attest::attest_mainnet_confirmation(
+                &mut store,
+                &entry,
+                &ATTESTATION_KEY,
+                &fixture.binding(),
+                ConsentAudit::Outbox(&outbox),
+                "stellar_pay_commit",
+                &policy,
+                fixture.presence(&entry, &policy),
+            )
+            .unwrap();
+        } else {
+            let binding = if mode == "standard" {
+                AttestationBinding::new(PROFILE, "stellar:testnet")
+            } else {
+                fixture.binding()
+            };
+            attest_and_persist(
+                &mut store,
+                &entry,
+                &ATTESTATION_KEY,
+                &binding,
+                Surface::Cli,
+                ConsentAudit::Outbox(&outbox),
+                if mode == "standard" {
+                    ConsentAuthorization::Standard(&AttestedApprover::Local)
+                } else {
+                    ConsentAuthorization::Mainnet {
+                        presence: fixture.presence(&entry, &policy),
+                        policy: &policy,
+                    }
+                },
+                |_, _| panic!("no grant"),
+            )
+            .unwrap();
+        }
+        let bytes = std::fs::read(outbox.path()).unwrap();
+        let line = bytes.strip_suffix(b"\n").unwrap();
+        let wire: serde_json::Value = serde_json::from_slice(line).unwrap();
+        assert_eq!(wire["r"], 0);
+        let row: AuditEntry = serde_json::from_value(wire["body"].clone()).unwrap();
+        assert_eq!(
+            line,
+            test_seam::tagged_row(&[0x5a; 32], 0, 1, 0, &row).unwrap()
+        );
+
+        let baseline_path = fixture.audit_path().with_file_name("baseline.jsonl");
+        let baseline_anchors = Arc::new(InMemoryTipAnchorStore::new());
+        crate::audit_log::test_helpers::enroll_carriers(&baseline_path, baseline_anchors.as_ref())
+            .unwrap();
+        let baseline = AuditOutbox::for_log_keyed(
+            &baseline_path,
+            baseline_anchors.clone(),
+            zeroize::Zeroizing::new([0x5a; 32]),
+        );
+        baseline.append(&row).unwrap();
+        let baseline_bytes = std::fs::read(baseline.path()).unwrap();
+        assert_eq!(
+            baseline_bytes.strip_suffix(b"\n").unwrap(),
+            test_seam::tagged_row(&[0x5a; 32], 0, 1, 0, &row).unwrap()
+        );
+        assert_eq!(bytes, baseline_bytes);
+        assert_eq!(
+            read_wrapper_outbox(&fixture.audit_path(), &anchors, &row, 0),
+            read_wrapper_outbox(&baseline_path, &baseline_anchors, &row, 0)
+        );
+
+        let strict_path = fixture.audit_path().with_file_name("strict.jsonl");
+        let strict_anchors = Arc::new(InMemoryTipAnchorStore::new());
+        crate::audit_log::test_helpers::enroll_carriers(&strict_path, strict_anchors.as_ref())
+            .unwrap();
+        let strict_outbox = AuditOutbox::for_log_keyed(
+            &strict_path,
+            strict_anchors.clone(),
+            zeroize::Zeroizing::new([0x5a; 32]),
+        );
+        let mut strict_store =
+            PendingApprovalStore::open(fixture.store_path().with_file_name("strict.toml")).unwrap();
+        strict_store.insert(entry.clone(), now_ms()).unwrap();
+        let reference = if mode == "confirmation" {
+            attest_mainnet_confirmation_with_row(
+                &mut strict_store,
+                &entry,
+                &ATTESTATION_KEY,
+                &fixture.binding(),
+                ConsentAudit::Outbox(&strict_outbox),
+                "stellar_pay_commit",
+                &policy,
+                fixture.presence(&entry, &policy),
+            )
+            .unwrap()
+        } else {
+            let binding = if mode == "standard" {
+                AttestationBinding::new(PROFILE, "stellar:testnet")
+            } else {
+                fixture.binding()
+            };
+            attest_and_persist_with_row(
+                &mut strict_store,
+                &entry,
+                &ATTESTATION_KEY,
+                &binding,
+                Surface::Cli,
+                ConsentAudit::Outbox(&strict_outbox),
+                if mode == "standard" {
+                    ConsentAuthorization::Standard(&AttestedApprover::Local)
+                } else {
+                    ConsentAuthorization::Mainnet {
+                        presence: fixture.presence(&entry, &policy),
+                        policy: &policy,
+                    }
+                },
+                |_, _| panic!("no grant"),
+            )
+            .unwrap()
+            .1
+        };
+        assert!(reference.is_some());
+        let strict_bytes = std::fs::read(strict_outbox.path()).unwrap();
+        let strict_line = strict_bytes.strip_suffix(b"\n").unwrap();
+        let strict_wire: serde_json::Value = serde_json::from_slice(strict_line).unwrap();
+        assert_eq!(strict_wire["r"], 1);
+        let strict_row: AuditEntry = serde_json::from_value(strict_wire["body"].clone()).unwrap();
+        assert_eq!(
+            strict_line,
+            test_seam::tagged_row(&[0x5a; 32], 0, 1, 1, &strict_row).unwrap()
+        );
+        read_wrapper_outbox(&strict_path, &strict_anchors, &strict_row, 1);
+    }
+}
+
+fn read_wrapper_outbox(
+    path: &std::path::Path,
+    state: &Arc<crate::audit_log::tip_anchor::InMemoryTipAnchorStore>,
+    row: &crate::audit_log::AuditEntry,
+    marker: usize,
+) -> Vec<serde_json::Value> {
+    use crate::audit_log::{
+        AuditEntry, AuditWriter, BindingHistory, WriterError,
+        outbox::{OutboxBatch, check_outbox_commitment, inspect_outbox},
+        tip_anchor::TipAnchorStore,
+    };
+    let inspection = inspect_outbox(path).unwrap();
+    assert_eq!(inspection.pending, 1);
+    assert!(inspection.unparseable_lines.is_empty());
+    check_outbox_commitment(path, state.as_ref()).unwrap();
+    let batch = OutboxBatch::read_locked(path, state.as_ref()).unwrap();
+    assert!(matches!(
+        batch.parse_entries(None),
+        Err(WriterError::OutboxUnusable {
+            reason: "tagged record without an audit key",
+            ..
+        })
+    ));
+    let decoded = batch.parse_entries(Some(&[0x5a; 32])).unwrap();
+    assert_eq!(decoded.len(), 1);
+    assert_eq!(
+        decoded[0].canonical_json_body().unwrap(),
+        row.canonical_json_body().unwrap()
+    );
+    drop(batch);
+    let mut writer = AuditWriter::open_with_tip_anchor(
+        path.to_owned(),
+        Some(zeroize::Zeroizing::new([0x5a; 32])),
+        state.clone(),
+        BindingHistory::NotRecorded,
+    )
+    .unwrap();
+    let delivered = consent_rows(path);
+    assert_eq!(delivered.len(), 1);
+    let decoded: AuditEntry = serde_json::from_value(delivered[0].clone()).unwrap();
+    assert_eq!(
+        decoded.canonical_json_body().unwrap(),
+        row.canonical_json_body().unwrap()
+    );
+    let owner: serde_json::Value =
+        serde_json::from_str(&state.load_outbox_owner_state(1).unwrap().unwrap()).unwrap();
+    assert_eq!(owner["recent"].as_array().unwrap().len(), marker);
+    assert_eq!(writer.drain_outbox().unwrap(), 0);
+    delivered
+}
+
+#[test]
+#[serial]
+fn a_mainnet_consent_refuses_an_unkeyed_outbox() {
+    use crate::audit_log::{AuditOutbox, tip_anchor::InMemoryTipAnchorStore};
+    let fixture = MainnetConsentFixture::new(PROFILE);
+    let policy = fixture.current_policy();
+    let entry = fixture.payment(DEFAULT_TTL_MS);
+    let anchors = Arc::new(InMemoryTipAnchorStore::new());
+    crate::audit_log::test_helpers::enroll_carriers(&fixture.audit_path(), anchors.as_ref())
+        .unwrap();
+    let outbox = AuditOutbox::for_log(&fixture.audit_path(), anchors);
+    let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
+    store.insert(entry.clone(), now_ms()).unwrap();
+    let before = std::fs::read(fixture.store_path()).unwrap();
+    let error = crate::approval::attest::attest_and_persist_with_row(
+        &mut store,
+        &entry,
+        &ATTESTATION_KEY,
+        &fixture.binding(),
+        Surface::Cli,
+        ConsentAudit::Outbox(&outbox),
+        ConsentAuthorization::Mainnet {
+            presence: fixture.presence(&entry, &policy),
+            policy: &policy,
+        },
+        |_, _| panic!("no grant"),
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), "audit.chain_key_unavailable");
+    assert!(!outbox.path().exists());
+    assert_eq!(std::fs::read(fixture.store_path()).unwrap(), before);
+    let (blob, reference) = crate::approval::attest::attest_and_persist_with_row(
+        &mut store,
+        &entry,
+        &ATTESTATION_KEY,
+        &AttestationBinding::new(PROFILE, "stellar:testnet"),
+        Surface::Cli,
+        ConsentAudit::Outbox(&outbox),
+        ConsentAuthorization::Standard(&AttestedApprover::Local),
+        |_, _| panic!("no grant"),
+    )
+    .unwrap();
+    assert!(blob.is_some());
+    assert_eq!(reference, None);
+}
+
+#[test]
+#[serial]
+fn the_attester_returns_the_queued_reference_on_mainnet() {
+    use crate::approval::attest::attest_and_persist_with_row;
+    use crate::audit_log::{AuditOutbox, tip_anchor::InMemoryTipAnchorStore};
+    let source = stellar_strkey::ed25519::PublicKey([1; 32]).to_string();
+    let uid = process_uid_for_attestation().unwrap();
+    let entries = [
+        payment(),
+        claim_entry(),
+        fixtures::trustline_pending(
+            &source,
+            "USD",
+            &source,
+            Some(100),
+            100,
+            7,
+            uid,
+            DEFAULT_TTL_MS,
+        ),
+        opt_in(MAINNET_CHAIN_ID),
+        x402_entry(),
+    ];
+    for entry in entries {
+        for direct in [false, true] {
+            let fixture = MainnetConsentFixture::new(PROFILE);
+            let policy = fixture.current_policy();
+            let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
+            store.insert(entry.clone(), now_ms()).unwrap();
+            let anchors = Arc::new(InMemoryTipAnchorStore::new());
+            crate::audit_log::test_helpers::enroll_carriers(
+                &fixture.audit_path(),
+                anchors.as_ref(),
+            )
+            .unwrap();
+            let outbox = AuditOutbox::for_log_keyed(
+                &fixture.audit_path(),
+                anchors,
+                zeroize::Zeroizing::new([0x5a; 32]),
+            );
+            let mut writer = fixture.audit_writer();
+            let (blob, reference) = attest_and_persist_with_row(
+                &mut store,
+                &entry,
+                &ATTESTATION_KEY,
+                &fixture.binding(),
+                Surface::Cli,
+                if direct {
+                    ConsentAudit::Writer(&mut writer)
+                } else {
+                    ConsentAudit::Outbox(&outbox)
+                },
+                ConsentAuthorization::Mainnet {
+                    presence: fixture.presence(&entry, &policy),
+                    policy: &policy,
+                },
+                |_, _| panic!("no grant"),
+            )
+            .unwrap();
+            assert_eq!(reference.is_some(), !direct, "{}", entry.kind.kind_name());
+            assert_eq!(
+                blob.is_some(),
+                !matches!(entry.kind, ApprovalKind::TrustlineClawbackOptIn { .. })
+            );
+            if let Some(reference) = reference {
+                let bytes = std::fs::read(outbox.path()).unwrap();
+                assert_eq!(
+                    crate::audit_log::outbox::test_seam::delivered_row_digest(
+                        bytes.strip_suffix(b"\n").unwrap()
+                    )
+                    .unwrap(),
+                    (1, *reference.digest())
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[serial]
+fn the_confirmation_returns_the_queued_reference() {
+    use crate::approval::attest::attest_mainnet_confirmation_with_row;
+    use crate::audit_log::{AuditOutbox, tip_anchor::InMemoryTipAnchorStore};
+    for (wrapper, direct) in [(false, false), (false, true), (true, false), (true, true)] {
+        let fixture = MainnetConsentFixture::new(PROFILE);
+        let policy = fixture.current_policy();
+        let entry = fixture.payment(DEFAULT_TTL_MS);
+        let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
+        store.insert(entry.clone(), now_ms()).unwrap();
+        let anchors = Arc::new(InMemoryTipAnchorStore::new());
+        crate::audit_log::test_helpers::enroll_carriers(&fixture.audit_path(), anchors.as_ref())
+            .unwrap();
+        let outbox = AuditOutbox::for_log_keyed(
+            &fixture.audit_path(),
+            anchors,
+            zeroize::Zeroizing::new([0x5a; 32]),
+        );
+        let mut writer = fixture.audit_writer();
+        let audit = if direct {
+            ConsentAudit::Writer(&mut writer)
+        } else {
+            ConsentAudit::Outbox(&outbox)
+        };
+        if wrapper {
+            let result = crate::approval::attest::attest_mainnet_confirmation(
+                &mut store,
+                &entry,
+                &ATTESTATION_KEY,
+                &fixture.binding(),
+                audit,
+                "stellar_pay",
+                &policy,
+                fixture.presence(&entry, &policy),
+            );
+            assert!(result.is_ok());
+        } else {
+            let reference = attest_mainnet_confirmation_with_row(
+                &mut store,
+                &entry,
+                &ATTESTATION_KEY,
+                &fixture.binding(),
+                audit,
+                "stellar_pay",
+                &policy,
+                fixture.presence(&entry, &policy),
+            )
+            .unwrap();
+            assert_eq!(reference.is_some(), !direct);
+        }
+        assert!(
+            store
+                .get(&entry.approval_nonce)
+                .unwrap()
+                .mainnet_presence
+                .is_some()
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn consent_crash_boundaries_keep_approval_state_consistent() {
+    use crate::audit_log::{
+        AuditOutbox, AuditWriter, BindingHistory, tip_anchor::InMemoryTipAnchorStore,
+    };
+    for boundary in ["direct-row", "direct-anchor", "queue"] {
+        let fixture = MainnetConsentFixture::new(PROFILE);
+        let policy = fixture.current_policy();
+        let entry = fixture.payment(DEFAULT_TTL_MS);
+        let anchors = Arc::new(InMemoryTipAnchorStore::new());
+        let mut writer = AuditWriter::open_with_tip_anchor(
+            fixture.audit_path(),
+            Some(zeroize::Zeroizing::new([0x5a; 32])),
+            anchors.clone(),
+            BindingHistory::NotRecorded,
+        )
+        .unwrap();
+        let outbox = AuditOutbox::for_log_keyed(
+            &fixture.audit_path(),
+            anchors.clone(),
+            zeroize::Zeroizing::new([0x5a; 32]),
+        );
+        let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
+        store.insert(entry.clone(), now_ms()).unwrap();
+        let before = std::fs::read(fixture.store_path()).unwrap();
+        if boundary == "direct-row" {
+            writer.set_fail_after_entry_before_sidecar(true);
+        } else {
+            crate::approval::attest::consent_test_seam::on_written(&fixture.store_path(), || {
+                panic!("test crash: consent persistence")
+            });
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::approval::attest::attest_and_persist_with_row(
+                &mut store,
+                &entry,
+                &ATTESTATION_KEY,
+                &fixture.binding(),
+                Surface::Cli,
+                if boundary == "queue" {
+                    ConsentAudit::Outbox(&outbox)
+                } else {
+                    ConsentAudit::Writer(&mut writer)
+                },
+                ConsentAuthorization::Mainnet {
+                    presence: fixture.presence(&entry, &policy),
+                    policy: &policy,
+                },
+                |_, _| panic!("no grant"),
+            )
+        }));
+        if boundary == "direct-row" {
+            assert!(result.unwrap().is_err());
+        } else {
+            assert!(
+                result.is_err(),
+                "consent stops before persistence: {boundary}"
+            );
+        }
+        assert_eq!(std::fs::read(fixture.store_path()).unwrap(), before);
+        drop(store);
+        drop(writer);
+        let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
+        assert!(
+            store
+                .get(&entry.approval_nonce)
+                .unwrap()
+                .mainnet_presence
+                .is_none()
+        );
+        let mut writer = AuditWriter::open_with_tip_anchor(
+            fixture.audit_path(),
+            Some(zeroize::Zeroizing::new([0x5a; 32])),
+            anchors,
+            BindingHistory::NotRecorded,
+        )
+        .unwrap();
+        assert_eq!(consent_rows(&fixture.audit_path()).len(), 1);
+        assert_eq!(writer.drain_outbox().unwrap(), 0);
+        let consent = || ConsentAuthorization::Mainnet {
+            presence: fixture.presence(&entry, &policy),
+            policy: &policy,
+        };
+        crate::approval::attest::attest_and_persist_with_row(
+            &mut store,
+            &entry,
+            &ATTESTATION_KEY,
+            &fixture.binding(),
+            Surface::Cli,
+            ConsentAudit::Writer(&mut writer),
+            consent(),
+            |_, _| panic!("no grant"),
+        )
+        .unwrap();
+        drop(store);
+        let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
+        let durable = std::fs::read(fixture.store_path()).unwrap();
+        let error = crate::approval::attest::attest_and_persist_with_row(
+            &mut store,
+            &entry,
+            &ATTESTATION_KEY,
+            &fixture.binding(),
+            Surface::Cli,
+            ConsentAudit::Writer(&mut writer),
+            consent(),
+            |_, _| panic!("no grant"),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "approval.already_attested");
+        assert_eq!(std::fs::read(fixture.store_path()).unwrap(), durable);
+        assert_eq!(consent_rows(&fixture.audit_path()).len(), 2);
+    }
 }
 
 /// A standard approver on a mainnet binding refuses for every attestable
@@ -1600,28 +2458,27 @@ fn attest_with_held_outbox(expire: bool, draining: bool) {
     let fixture = MainnetConsentFixture::new(PROFILE);
     let policy = fixture.current_policy();
     let mut entry = fixture.payment(DEFAULT_TTL_MS);
-    let ttl = Duration::from_millis(MAINNET_PRESENCE_CHALLENGE_TTL_MS);
     entry.created_at_unix_ms -= MAINNET_PRESENCE_CHALLENGE_TTL_MS;
     let anchors = Arc::new(InMemoryTipAnchorStore::new());
     let mut writer = AuditWriter::open_with_tip_anchor(
         fixture.audit_path(),
-        None,
+        Some(zeroize::Zeroizing::new([0x5a; 32])),
         anchors.clone(),
         BindingHistory::NotRecorded,
     )
     .unwrap();
-    let outbox = AuditOutbox::for_log(&fixture.audit_path(), anchors);
+    let outbox = AuditOutbox::for_log_keyed(
+        &fixture.audit_path(),
+        anchors,
+        zeroize::Zeroizing::new([0x5a; 32]),
+    );
     let lock =
         crate::audit_log::test_helpers::hold_audit_lock(&outbox_lock_path(&fixture.audit_path()))
             .unwrap();
     let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
     store.insert(entry.clone(), now_ms()).unwrap();
     let before = std::fs::read(fixture.store_path()).unwrap();
-    let issued = if expire {
-        Instant::now() - ttl + Duration::from_secs(1)
-    } else {
-        Instant::now()
-    };
+    let issued = Instant::now();
     let issued_ms = now_ms();
     let pending = issue_mainnet_presence(
         &entry,
@@ -1640,15 +2497,17 @@ fn attest_with_held_outbox(expire: bool, draining: bool) {
         1,
     );
     let presence = verify_mainnet_presence(pending, input(&assertion), issued_ms, issued).unwrap();
-    let release_at = if expire {
-        presence.deadline + Duration::from_millis(100)
-    } else {
-        Instant::now() + Duration::from_millis(100)
-    };
-    let release = std::thread::spawn(move || {
-        std::thread::sleep(release_at.saturating_duration_since(Instant::now()));
-        drop(lock);
-    });
+    let deadline = presence.deadline;
+    let nonce = entry.approval_nonce.clone();
+    crate::audit_log::outbox::test_seam::on_contended(
+        &outbox_lock_path(&fixture.audit_path()),
+        move || {
+            if expire {
+                crate::approval::attest::consent_test_seam::advance_clock(&nonce, deadline);
+            }
+            drop(lock);
+        },
+    );
     assert!(
         Instant::now() < presence.deadline,
         "proof is alive at entry"
@@ -1670,7 +2529,6 @@ fn attest_with_held_outbox(expire: bool, draining: bool) {
         },
         |_, _| panic!("no grant"),
     );
-    release.join().unwrap();
     let stored = store.get(&entry.approval_nonce).unwrap();
     if expire {
         assert_eq!(result.unwrap_err().code(), "approval.presence_expired");

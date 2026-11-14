@@ -5292,6 +5292,12 @@ impl std::fmt::Debug for PendingApprovalStore {
 }
 
 impl PendingApprovalStore {
+    /// The path that scopes test-only persistence faults.
+    #[cfg(test)]
+    pub(super) fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Opens the approval store at `path`.
     ///
     /// Creates the parent directory with mode `0o700` on Unix.  Acquires an
@@ -6697,14 +6703,20 @@ impl PendingApprovalStore {
 
         std::io::Write::write_all(&mut tmp, content.as_bytes()).map_err(ApprovalError::from_io)?;
         tmp.as_file().sync_data().map_err(ApprovalError::from_io)?;
+        #[cfg(test)]
+        persist_test_seam::run(&self.path, persist_test_seam::Step::TemporarySynced);
 
         // Atomic rename.
         let final_path = tmp
             .persist(&self.path)
             .map_err(|e| ApprovalError::from_io(e.error))?;
+        #[cfg(test)]
+        persist_test_seam::run(&self.path, persist_test_seam::Step::Renamed);
 
         // fsync the final file handle.
         final_path.sync_data().map_err(ApprovalError::from_io)?;
+        #[cfg(test)]
+        persist_test_seam::run(&self.path, persist_test_seam::Step::FileSynced);
 
         // fsync parent directory to commit the directory entry change. Opening
         // a directory path via `std::fs::File::open` requires
@@ -6720,8 +6732,43 @@ impl PendingApprovalStore {
             let parent_file = fs::File::open(parent).map_err(ApprovalError::from_io)?;
             parent_file.sync_data().map_err(ApprovalError::from_io)?;
         }
+        #[cfg(test)]
+        persist_test_seam::run(&self.path, persist_test_seam::Step::DirectorySynced);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(super) mod persist_test_seam {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Step {
+        TemporarySynced,
+        Renamed,
+        FileSynced,
+        DirectorySynced,
+    }
+
+    type Hook = Box<dyn FnOnce() + Send>;
+    static HOOKS: Mutex<Vec<(PathBuf, Step, Hook)>> = Mutex::new(Vec::new());
+
+    pub(crate) fn on_step(path: &Path, step: Step, hook: impl FnOnce() + Send + 'static) {
+        if let Ok(mut hooks) = HOOKS.lock() {
+            hooks.push((path.to_path_buf(), step, Box::new(hook)));
+        }
+    }
+
+    pub(super) fn run(path: &Path, step: Step) {
+        let hook = HOOKS.lock().ok().and_then(|mut hooks| {
+            let index = hooks.iter().position(|(p, s, _)| p == path && *s == step)?;
+            Some(hooks.swap_remove(index).2)
+        });
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 }
 

@@ -15,6 +15,7 @@ use stellar_agent_core::approval::{
     verify_attestation,
     witness::{ApprovalWitness, ApprovedKind},
 };
+use stellar_agent_core::audit_log::OutboxRowRef;
 use stellar_agent_core::policy::state_lock::WindowStoreLock;
 use stellar_agent_core::profile::{
     Profile, name::profile_name_for_approval, owner_key::OwnerKeyContext,
@@ -87,6 +88,9 @@ pub struct ConsentPayload {
     pub receipt: MainnetPresenceReceipt,
     /// The signed inbox process identifier.
     pub process_uid: String,
+    /// The retained queued consent reference for delivery enforcement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbox_row: Option<OutboxRowRef>,
 }
 
 impl std::fmt::Debug for ConsentPayload {
@@ -918,6 +922,7 @@ pub(in crate::policy_state) mod tests {
                 attestation,
                 receipt,
                 process_uid: entry.process_uid.clone(),
+                outbox_row: None,
             },
         )
     }
@@ -1356,6 +1361,7 @@ pub(in crate::policy_state) mod tests {
             attestation: version_5,
             receipt: receipt.clone(),
             process_uid: entry.process_uid.clone(),
+            outbox_row: None,
         };
         assert!(
             ApprovalRecorder::new(&store, fixture.profile(), &mut rows, "request")
@@ -1368,6 +1374,7 @@ pub(in crate::policy_state) mod tests {
             attestation,
             receipt: receipt.clone(),
             process_uid: entry.process_uid.clone(),
+            outbox_row: None,
         };
         let view = ApprovalRecorder::new(&store, fixture.profile(), &mut rows, "request")
             .record_consent(id, &witness, &payload)
@@ -1631,6 +1638,12 @@ pub(in crate::policy_state) mod tests {
         c.execution_expires_at_ms = u64::MAX;
         let payload = c.payload.as_mut().unwrap();
         payload.process_uid = "\u{0001}".repeat(PROCESS_UID_MAX);
+        payload.outbox_row = Some(
+            serde_json::from_value(serde_json::json!({
+                "g": u64::MAX, "s": u64::MAX, "digest": format!("sha256:{}", "ff".repeat(32)),
+            }))
+            .unwrap(),
+        );
         let mut receipt = serde_json::to_value(&payload.receipt).unwrap();
         receipt["version"] = serde_json::json!(2);
         receipt["policy_sequence"] = serde_json::json!(i64::MIN);
@@ -1664,5 +1677,74 @@ pub(in crate::policy_state) mod tests {
             serde_json::from_slice::<WireApproval>(&bytes).unwrap(),
             record
         );
+    }
+
+    fn queued_reference(sequence: u64) -> OutboxRowRef {
+        serde_json::from_value(serde_json::json!({
+            "g": 3, "s": sequence, "digest": format!("sha256:{}", "ab".repeat(32)),
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    #[serial]
+    fn consent_payload_keeps_its_bytes_without_a_reference() {
+        let mut fx = Fx::new(300_000);
+        let expected = format!(
+            "{{\"attestation\":\"{}\",\"receipt\":{},\"process_uid\":{}}}",
+            stellar_agent_core::hex::encode(&fx.payload.attestation),
+            serde_json::to_string(&fx.payload.receipt).unwrap(),
+            serde_json::to_string(&fx.payload.process_uid).unwrap(),
+        );
+        assert_eq!(serde_json::to_string(&fx.payload).unwrap(), expected);
+        assert_eq!(
+            serde_json::from_str::<ConsentPayload>(&expected).unwrap(),
+            fx.payload
+        );
+        fx.open();
+        fx.payload.outbox_row = Some(queued_reference(7));
+        let consent = fx.consent().record.consent.unwrap();
+        assert_eq!(consent.payload, Some(fx.payload.clone()));
+        let stored = fx.wire();
+        assert_eq!(
+            stored.approvals.unwrap().records[0]
+                .consent
+                .as_ref()
+                .unwrap()
+                .payload,
+            Some(fx.payload.clone())
+        );
+        let round_trip: ConsentPayload =
+            serde_json::from_slice(&serde_json::to_vec(&fx.payload).unwrap()).unwrap();
+        assert_eq!(round_trip, fx.payload);
+        let mut malformed = serde_json::to_value(&fx.payload).unwrap();
+        malformed["outbox_row"]["digest"] = "sha256:AB".into();
+        assert!(serde_json::from_value::<ConsentPayload>(malformed).is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn a_second_consent_keeps_its_receipt_rule() {
+        let mut fx = Fx::new(300_000);
+        fx.open();
+        fx.payload.outbox_row = Some(queued_reference(7));
+        let first = fx.consent();
+        let before = fx.bytes();
+        fx.payload.outbox_row = Some(queued_reference(8));
+        assert_eq!(
+            fx.consent(),
+            first,
+            "same receipt keeps the original payload"
+        );
+        assert_eq!(fx.bytes(), before);
+        let (witness, mut payload) = proof(&fx.fixture, &fx.entry, "second.toml");
+        payload.outbox_row = Some(queued_reference(9));
+        assert_ne!(payload.receipt.digest(), fx.payload.receipt.digest());
+        let id = fx.id();
+        assert!(matches!(
+            fx.recorder().record_consent(id, &witness, &payload),
+            Err(WindowStoreError::UnexpectedState { .. })
+        ));
+        assert_eq!(fx.bytes(), before);
     }
 }
