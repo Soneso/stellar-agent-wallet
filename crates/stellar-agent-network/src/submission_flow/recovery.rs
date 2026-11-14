@@ -18,17 +18,23 @@ use crate::policy_state::{
     WindowStoreError,
 };
 
+/// The maximum number of repair decisions named in a diagnostic detail.
+const REPAIR_DECISION_DETAIL_LIMIT: usize = 16;
+
 /// A checked receipt repair pass that refuses at least one decision, or
 /// refuses its verified read.
 ///
-/// It names each decision by its commit id: those the pass repaired and
-/// those it refused, each with the refusal's code and detail. It holds no
-/// receipt or window content.
+/// It retains every repaired and refused decision. Its display names the
+/// first `REPAIR_DECISION_DETAIL_LIMIT` decisions with exact total counts.
+/// Each displayed refusal carries its code and detail. It holds no receipt
+/// or window content.
 #[derive(Debug)]
 pub(crate) struct RepairRefused {
     repaired: Vec<CommitId>,
     /// Each refusal in pass order; `None` names the verified read.
     refused: Vec<(Option<CommitId>, WalletError)>,
+    /// The bounded prefix of decisions in their stored order.
+    displayed: Vec<CommitId>,
 }
 
 impl RepairRefused {
@@ -54,6 +60,7 @@ impl std::fmt::Display for RepairRefused {
         let hex = |commits: &[CommitId]| {
             commits
                 .iter()
+                .filter(|commit| self.displayed.contains(commit))
                 .map(CommitId::to_hex)
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -66,6 +73,9 @@ impl std::fmt::Display for RepairRefused {
             self.refused.len()
         )?;
         for (commit, error) in &self.refused {
+            if commit.is_some_and(|commit| !self.displayed.contains(&commit)) {
+                continue;
+            }
             let subject = commit.map_or_else(
                 || "the verified window read".to_owned(),
                 |commit| format!("decision {}", commit.to_hex()),
@@ -76,6 +86,16 @@ impl std::fmt::Display for RepairRefused {
                 error.code(),
                 refusal_detail(error)
             )?;
+        }
+        let omitted = self.repaired.len()
+            + self
+                .refused
+                .iter()
+                .filter(|(commit, _)| commit.is_some())
+                .count()
+            - self.displayed.len();
+        if omitted > 0 {
+            write!(f, "; and {omitted} more decisions")?;
         }
         Ok(())
     }
@@ -103,8 +123,8 @@ impl std::fmt::Display for RepairRefused {
 ///
 /// # Errors
 ///
-/// [`RepairRefused`] after every decision is attempted, naming the repaired
-/// and the refused decisions; its first refusal is the earliest. An
+/// [`RepairRefused`] after every decision is attempted, retaining the repaired
+/// and refused decisions; its first refusal is the earliest. An
 /// incomplete decision refuses with `submission.record_unavailable` and
 /// detail `missing_projection_fact:<field>`. A replacement or an
 /// acknowledgement refuses with its receipt-store or window-store refusal.
@@ -122,6 +142,7 @@ pub(crate) fn repair_committed_receipts(
         .map_err(|error| RepairRefused {
             repaired: Vec::new(),
             refused: vec![(None, window_refusal(&error))],
+            displayed: Vec::new(),
         })?;
     let mut repaired = Vec::new();
     let mut refused = Vec::new();
@@ -141,7 +162,15 @@ pub(crate) fn repair_committed_receipts(
     if refused.is_empty() {
         Ok(())
     } else {
-        Err(RepairRefused { repaired, refused })
+        Err(RepairRefused {
+            repaired,
+            refused,
+            displayed: decisions
+                .iter()
+                .take(REPAIR_DECISION_DETAIL_LIMIT)
+                .map(|decision| decision.commit_id)
+                .collect(),
+        })
     }
 }
 
@@ -166,7 +195,7 @@ fn repair_proof(
     #[cfg(test)]
     tests::after_replacement()?;
     let mut guard = writer.lock().map_err(|_| {
-        record_unavailable("the audit writer mutex is poisoned, so the projection stays owed")
+        record_unavailable("the audit writer mutex is poisoned; acknowledgement is unavailable")
     })?;
     OperationRecorder::new(
         window,
@@ -614,6 +643,215 @@ pub(crate) mod tests {
 
     async fn requests(server: &MockServer) -> usize {
         server.received_requests().await.unwrap().len()
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn recovery_dispatch_keeps_both_refusals() {
+        let mut rig = Rig::new();
+        unknown_named(&mut rig.fx, 1);
+        let (_, missing_ledger) =
+            historical_without(&mut rig.fx, 2, Checked::NotIncluded, "submission_ledger");
+        let (_, repaired) = commit_checked(&mut rig.fx, 3, Checked::Succeeded);
+        let (_, missing_source) =
+            historical_without(&mut rig.fx, 4, Checked::NotIncluded, "source");
+        rig.reopen();
+        let (primary, client) = endpoint().await;
+        let (oracle, oracle_client) = endpoint().await;
+        for (server, passphrase) in [
+            (
+                &primary,
+                stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE,
+            ),
+            (&oracle, "wrong"),
+        ] {
+            Mock::given(method("POST"))
+                .and(body_partial_json(json!({"method": "getNetwork"})))
+                .respond_with(EchoIdResponder::new(
+                    stellar_agent_test_support::signed_envelope::get_network_result(passphrase),
+                ))
+                .mount(server)
+                .await;
+        }
+        for _ in 0..2 {
+            let pass = reconcile_pass(
+                &rig.fx.profile,
+                &rig.fx.store,
+                &client,
+                Some(&oracle_client),
+                Some(&rig.receipts),
+                T0,
+                || Ok(Arc::clone(&rig.writer)),
+            )
+            .await;
+            let ReconcilePass::RecoveryFailed { error, .. } = &pass else {
+                panic!("both stages refuse: {pass:?}");
+            };
+            assert_eq!(error.code(), "network.witness_unavailable");
+            let detail = error.to_string();
+            for (commit, fragment) in [
+                (
+                    repaired,
+                    format!("1 repaired [{}], 2 refused", repaired.to_hex()),
+                ),
+                (
+                    missing_ledger,
+                    format!(
+                        "decision {} refused with submission.record_unavailable: missing_projection_fact:submission_ledger",
+                        missing_ledger.to_hex()
+                    ),
+                ),
+                (
+                    missing_source,
+                    format!(
+                        "decision {} refused with submission.record_unavailable: missing_projection_fact:source",
+                        missing_source.to_hex()
+                    ),
+                ),
+            ] {
+                assert!(
+                    detail.contains(&fragment),
+                    "complete repair detail: {detail}"
+                );
+                assert_eq!(detail.matches(&commit.to_hex()).count(), 1);
+            }
+            let (warnings, guard) = stellar_agent_test_support::WarningCapture::capture(None);
+            finish_reconciliation(
+                &rig.fx.profile,
+                "ops",
+                &rig.fx.store,
+                Some(&rig.receipts),
+                &pass,
+                || Ok(Arc::clone(&rig.writer)),
+            )
+            .unwrap();
+            drop(guard);
+            let seen = warnings.seen();
+            let logged = seen
+                .iter()
+                .find(|fields| fields.get("error") == Some(&detail))
+                .unwrap();
+            assert_eq!(
+                logged.get("code").map(String::as_str),
+                Some("\"network.witness_unavailable\"")
+            );
+            assert_eq!(
+                logged.get("message").map(String::as_str),
+                Some("recovery: the stage refused; every sequence stays held"),
+                "a refusal before a sequence commit keeps the all-held warning"
+            );
+            assert!(rig.projected(3) && !rig.projected(2) && !rig.projected(4));
+            rig.reopen();
+        }
+        assert_eq!(requests(&primary).await, 2);
+        assert_eq!(requests(&oracle).await, 2);
+    }
+
+    fn assert_bounded_repair_detail(count: u8) {
+        let mut rig = Rig::new();
+        for n in 1..=count {
+            historical_without(&mut rig.fx, n, Checked::Succeeded, "source");
+        }
+        let decisions = OperationStatus::new(&rig.fx.store, &rig.fx.profile)
+            .committed_decisions(None)
+            .unwrap();
+        assert_eq!(decisions.len(), usize::from(count));
+        let refused = rig.repair(None).unwrap_err();
+        let error = RecoveryError::Store(WindowStoreError::Invalid {
+            detail: "sequence commit refused".to_owned(),
+        })
+        .with_context(refused.to_string());
+        let RecoveryError::Context { detail, .. } = &error else {
+            panic!("the repair report supplies error context");
+        };
+        let mut expected = format!("checked receipt repair: 0 repaired [], {count} refused");
+        for decision in &decisions[..16] {
+            expected.push_str(&format!(
+                "; decision {} refused with submission.record_unavailable: missing_projection_fact:source",
+                decision.commit_id.to_hex()
+            ));
+        }
+        expected.push_str(&format!("; and {} more decisions", count - 16));
+        assert_eq!(
+            detail, &expected,
+            "the repair detail has the exact bounded text"
+        );
+        for decision in &decisions[16..] {
+            assert!(
+                !error.to_string().contains(&decision.commit_id.to_hex()),
+                "no decision beyond the stored prefix appears in the error"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn recovery_repair_detail_bounds_17_refusals() {
+        assert_bounded_repair_detail(17);
+    }
+
+    #[test]
+    #[serial]
+    fn recovery_repair_detail_bounds_40_refusals() {
+        assert_bounded_repair_detail(40);
+    }
+
+    #[test]
+    #[serial]
+    fn recovery_poisoned_writer_reports_unknown_acknowledgement() {
+        let mut rig = Rig::new();
+        commit_checked(&mut rig.fx, 1, Checked::NotIncluded);
+        commit_checked(&mut rig.fx, 2, Checked::Succeeded);
+        rig.repair(Some(1)).unwrap();
+        let before = (rig.window_bytes(), rig.audit_bytes());
+        let anchors = Arc::clone(rig.writer.lock().unwrap().tip_anchor_store().unwrap());
+        let writer = Arc::clone(&rig.writer);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = writer.lock().unwrap();
+                panic!("poison the writer");
+            })
+            .join()
+            .is_err()
+        );
+        for _ in 0..2 {
+            let error = rig.repair(None).unwrap_err();
+            assert_eq!(error.code(), "submission.record_unavailable");
+            let detail = error.to_string();
+            assert_eq!(
+                detail
+                    .matches("the audit writer mutex is poisoned; acknowledgement is unavailable")
+                    .count(),
+                2,
+                "a poisoned writer makes no marker-state claim: {detail}"
+            );
+            assert!(!detail.contains("stays owed"));
+            assert!(rig.projected(1) && !rig.projected(2));
+            assert!(rig.receipt(1).is_some() && rig.receipt(2).is_some());
+            assert_eq!((rig.window_bytes(), rig.audit_bytes()), before);
+            rig.reopen();
+        }
+        drop(rig.writer);
+        rig.writer = Arc::new(Mutex::new(
+            AuditWriter::open(
+                rig.fx.profile.audit_log_path.clone(),
+                Some(KeyedAuditAccess::new(
+                    zeroize::Zeroizing::new([0x5c; 32]),
+                    anchors,
+                )),
+            )
+            .unwrap(),
+        ));
+        rig.repair(None).unwrap();
+        assert!(rig.projected(1) && rig.projected(2));
+        let after = (rig.window_bytes(), rig.receipt_bytes(), rig.audit_bytes());
+        rig.reopen();
+        rig.repair(None).unwrap();
+        assert_eq!(
+            (rig.window_bytes(), rig.receipt_bytes(), rig.audit_bytes()),
+            after
+        );
+        assert_eq!(after.2, before.1);
     }
 
     /// Only committed attempts get a checked receipt. Missing and edited
@@ -1474,6 +1712,34 @@ pub(crate) mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn recovery_missing_sequence_evidence_precedes_completion() {
+        use crate::policy_state::recovery::{
+            RecoveryEndpoint, RecoveryFailure, RecoveryMethod, RecoveryReason,
+        };
+
+        let mut rig = Rig::new();
+        unknown_named(&mut rig.fx, 1);
+        let (_server, client) = endpoint().await;
+        let pass = rig.dispatch(&client, Some(&rig.receipts), false).await;
+        assert!(
+            matches!(
+                pass,
+                ReconcilePass::RecoveryFailed {
+                    error: RecoveryError::NeedsEvidence(RecoveryFailure {
+                        reason: RecoveryReason::MissingField,
+                        endpoint: RecoveryEndpoint::Oracle,
+                        method: RecoveryMethod::GetNetwork,
+                        ledger: None,
+                    }),
+                    ..
+                }
+            ),
+            "missing sequence evidence refuses a pass with successful repair: {pass:?}"
         );
     }
 

@@ -186,7 +186,7 @@ impl<'a> EndpointPair<'a> {
     }
 }
 
-/// Why recovery cannot supply all requested evidence.
+/// Why recovery cannot supply all requested evidence, including durable partial progress.
 #[derive(Debug, thiserror::Error)]
 pub enum RecoveryError {
     /// The window store refuses the snapshot or a commit.
@@ -198,6 +198,18 @@ pub enum RecoveryError {
     /// A bounded read cannot obtain required evidence.
     #[error("recovery needs evidence: {0:?}")]
     NeedsEvidence(RecoveryFailure),
+    /// A refusal with diagnostic context from the remaining recovery work.
+    #[error("{source}; {detail}")]
+    Context {
+        /// The refusal whose stable code remains authoritative.
+        #[source]
+        source: Box<RecoveryError>,
+        /// Verified progress or a bounded receipt repair report.
+        /// Repair counts include every decision. Entries name the first
+        /// `REPAIR_DECISION_DETAIL_LIMIT` (16) decisions in stored order,
+        /// followed by one item stating how many more decisions exist.
+        detail: String,
+    },
 }
 
 impl RecoveryError {
@@ -208,6 +220,14 @@ impl RecoveryError {
             Self::Store(error) => error.submission_code(),
             Self::EndpointIdentity(error) => error.code(),
             Self::NeedsEvidence(_) => "recovery.needs_evidence",
+            Self::Context { source, .. } => source.code(),
+        }
+    }
+
+    pub(crate) fn with_context(self, detail: String) -> Self {
+        Self::Context {
+            source: Box::new(self),
+            detail,
         }
     }
 }
@@ -1421,7 +1441,41 @@ pub async fn recover_sequences(
         &mut *writer,
         uuid::Uuid::new_v4().to_string(),
     );
-    Ok(commit_batch(&mut recorder, batch)?)
+    commit_sequence_batch(
+        &mut recorder,
+        batch,
+        &OperationStatus::new(store, profile),
+        &attempts,
+    )
+}
+
+/// A failed commit can select either durable image. One verified read
+/// describes all selected sequences while the caller still holds the writer.
+fn commit_sequence_batch(
+    recorder: &mut OperationRecorder<'_>,
+    batch: Batch,
+    status: &OperationStatus<'_>,
+    attempts: &[RecoveryAttempt],
+) -> Result<RecoveryReport, RecoveryError> {
+    commit_batch(recorder, batch).map_err(|error| {
+        RecoveryError::from(error).with_context(sequence_failure_detail(status, attempts))
+    })
+}
+
+fn sequence_failure_detail(status: &OperationStatus<'_>, attempts: &[RecoveryAttempt]) -> String {
+    let (states, refusal) = match status.sequence_release_states(attempts) {
+        Ok(states) => (states, String::new()),
+        Err(error) => (
+            vec![None; attempts.len()],
+            format!("; progress read refused with {}", error.submission_code()),
+        ),
+    };
+    let released = states.iter().filter(|state| **state == Some(true)).count();
+    let held = states.iter().filter(|state| **state == Some(false)).count();
+    let unavailable = states.iter().filter(|state| state.is_none()).count();
+    format!(
+        "selected sequences: {released} released, {held} held, {unavailable} unavailable{refusal}"
+    )
 }
 
 /// One attempt's evaluated pass: its evidence commit and, when the evidence
@@ -3589,6 +3643,372 @@ mod tests {
             "pending",
         )
         .unwrap()
+    }
+
+    fn selected_batch(attempts: &[RecoveryAttempt]) -> Batch {
+        Batch {
+            inputs: attempts
+                .iter()
+                .map(|attempt| {
+                    let mut input = release_input(attempt);
+                    input.expected_attempt = Some(attempt.clone());
+                    (attempt.operation_id, attempt.attempt_index, input)
+                })
+                .collect(),
+            ..Batch::default()
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn recovery_partial_sequence_failure_reports_verified_progress() {
+        let mut fx = Fx::new();
+        unknown_named(&mut fx, 1);
+        unknown_named(&mut fx, 2);
+        let store = fx.store.clone();
+        let profile = fx.profile.clone();
+        let status = OperationStatus::new(&store, &profile);
+        let attempts = status.recovery_snapshot(None).unwrap();
+        assert_eq!(attempts.len(), 2);
+        // A separate recorder commits from the same initial view.
+        let other_store = PersistedWindowStore::at_path(store.path().to_owned());
+        let mut other_sink = super::super::operations::tests::Sink::default();
+        OperationRecorder::new(&other_store, &profile, &mut other_sink, "other")
+            .record_evidence(
+                attempts[1].operation_id,
+                attempts[1].attempt_index,
+                &pending(
+                    &attempts[1],
+                    NOW,
+                    "evidence_pending",
+                    "endpoint_unreachable",
+                ),
+            )
+            .unwrap();
+        let other_record = fx.record(attempts[1].operation_id);
+        let error = commit_sequence_batch(
+            &mut fx.recorder(),
+            selected_batch(&attempts),
+            &status,
+            &attempts,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "submission.record_unavailable");
+        assert!(
+            error
+                .to_string()
+                .contains("selected sequences: 1 released, 1 held, 0 unavailable"),
+            "one selected sequence is released and the other is held: {error}"
+        );
+        assert_eq!(
+            serde_json::to_value(fx.record(attempts[1].operation_id)).unwrap(),
+            serde_json::to_value(other_record).unwrap()
+        );
+        let pass = crate::submission_flow::ReconcilePass::RecoveryFailed {
+            legacy: Default::default(),
+            error,
+        };
+        let (warnings, guard) = stellar_agent_test_support::WarningCapture::capture(None);
+        crate::submission_flow::finish_reconciliation(&profile, "ops", &store, None, &pass, || {
+            panic!("no accounting obligation needs a writer")
+        })
+        .unwrap();
+        drop(guard);
+        let messages = format!("{:?}", warnings.seen());
+        assert!(
+            messages.contains("1 released, 1 held, 0 unavailable"),
+            "{messages}"
+        );
+        assert!(
+            !messages.contains("every sequence stays held"),
+            "{messages}"
+        );
+        let release = fx.record(attempts[0].operation_id).attempts[0]
+            .sequence_released
+            .clone();
+        assert!(release.is_some());
+        for clock in [NOW - 60_000, NOW + 365 * 24 * 60 * 60 * 1_000] {
+            fx.clock.set(clock);
+            let reopened = PersistedWindowStore::at_path(store.path().to_owned());
+            let reopened_status = OperationStatus::new(&reopened, &profile);
+            assert_eq!(
+                sequence_failure_detail(&reopened_status, &attempts),
+                "selected sequences: 1 released, 1 held, 0 unavailable"
+            );
+        }
+        fx.clock.set(NOW);
+        let fresh = status.recovery_snapshot(None).unwrap();
+        assert_eq!(fresh.len(), 1);
+        commit_sequence_batch(&mut fx.recorder(), selected_batch(&fresh), &status, &fresh).unwrap();
+        assert_eq!(
+            sequence_failure_detail(&status, &attempts),
+            "selected sequences: 2 released, 0 held, 0 unavailable"
+        );
+        assert_eq!(
+            fx.record(attempts[0].operation_id).attempts[0].sequence_released,
+            release
+        );
+        let before = (std::fs::read(store.path()).unwrap(), fx.sink.entries.len());
+        let stale = commit_sequence_batch(
+            &mut fx.recorder(),
+            selected_batch(&attempts),
+            &status,
+            &attempts,
+        )
+        .unwrap_err();
+        assert!(
+            stale
+                .to_string()
+                .contains("2 released, 0 held, 0 unavailable")
+        );
+        assert_eq!(
+            (std::fs::read(store.path()).unwrap(), fx.sink.entries.len()),
+            before
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn recovery_sequence_failure_keeps_unavailable_state_unknown() {
+        let mut fx = Fx::new();
+        let attempt = stored_attempt(&mut fx);
+        let status = OperationStatus::new(&fx.store, &fx.profile);
+        let mut missing = attempt.clone();
+        missing.attempt_index += 1;
+        assert_eq!(
+            sequence_failure_detail(&status, &[missing]),
+            "selected sequences: 0 released, 0 held, 1 unavailable",
+            "an unavailable attempt is not held"
+        );
+        let mut changed = attempt.clone();
+        if let ExposureIdentity::Classic { tx_hash, .. } = &mut changed.exposure {
+            tx_hash[0] ^= 1;
+        }
+        assert_eq!(
+            sequence_failure_detail(&status, &[changed]),
+            "selected sequences: 0 released, 0 held, 1 unavailable"
+        );
+        let mut bytes = std::fs::read(fx.store.path()).unwrap();
+        bytes[0] ^= 1;
+        std::fs::write(fx.store.path(), &bytes).unwrap();
+        let read_code = status
+            .recovery_snapshot(None)
+            .unwrap_err()
+            .submission_code();
+        let detail = sequence_failure_detail(&status, &[attempt]);
+        assert_eq!(
+            detail,
+            format!(
+                "selected sequences: 0 released, 0 held, 1 unavailable; progress read refused with {read_code}"
+            )
+        );
+        let error = RecoveryError::from(WindowStoreError::Invalid {
+            detail: "commit refused".to_owned(),
+        })
+        .with_context(detail);
+        assert_eq!(error.code(), "submission.record_unavailable");
+        assert_eq!(std::fs::read(fx.store.path()).unwrap(), bytes);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn recovery_sequence_failure_reads_the_commit_point() {
+        use super::super::store::{
+            COMMIT_FAULT_AFTER_COUNTER, COMMIT_FAULT_AFTER_PREPARED, arm_accounting_fault,
+        };
+        for seam in [COMMIT_FAULT_AFTER_PREPARED, COMMIT_FAULT_AFTER_COUNTER] {
+            let mut fx = Fx::new();
+            let attempt = stored_attempt(&mut fx);
+            let store = fx.store.clone();
+            let profile = fx.profile.clone();
+            let attempts = [attempt];
+            let error = {
+                let _armed = arm_accounting_fault(seam);
+                commit_sequence_batch(
+                    &mut fx.recorder(),
+                    selected_batch(&attempts),
+                    &OperationStatus::new(&store, &profile),
+                    &attempts,
+                )
+                .unwrap_err()
+            };
+            let expected = if seam == COMMIT_FAULT_AFTER_COUNTER {
+                "selected sequences: 1 released, 0 held, 0 unavailable"
+            } else {
+                "selected sequences: 0 released, 1 held, 0 unavailable"
+            };
+            assert!(
+                error.to_string().contains(expected),
+                "the committed image decides release progress: {error}"
+            );
+            let (warnings, guard) = stellar_agent_test_support::WarningCapture::capture(None);
+            crate::submission_flow::warn_status_recovery_refusal("ops", &error);
+            drop(guard);
+            let seen = warnings.seen();
+            let logged = seen.first().unwrap();
+            assert!(
+                logged
+                    .get("error")
+                    .is_some_and(|detail| detail.contains(expected)),
+                "the status warning retains durable progress: {seen:?}"
+            );
+            if seam == COMMIT_FAULT_AFTER_COUNTER {
+                assert!(
+                    logged
+                        .get("message")
+                        .is_some_and(|message| { !message.contains("every sequence stays held") }),
+                    "the status warning does not call a committed release held: {seen:?}"
+                );
+            }
+            let reopened = PersistedWindowStore::at_path(store.path().to_owned());
+            let status = OperationStatus::new(&reopened, &profile);
+            assert_eq!(sequence_failure_detail(&status, &attempts), expected);
+            let fresh = status.recovery_snapshot(None).unwrap();
+            commit_sequence_batch(&mut fx.recorder(), selected_batch(&fresh), &status, &fresh)
+                .unwrap();
+            assert_eq!(
+                sequence_failure_detail(&status, &attempts),
+                "selected sequences: 1 released, 0 held, 0 unavailable"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn recovery_entry_reports_progress_after_counter_commit() {
+        use super::super::operations::tests::unknown_with;
+        use super::super::store::{COMMIT_FAULT_AFTER_COUNTER, arm_accounting_fault};
+        use crate::submission_flow::{ReconcilePass, finish_reconciliation};
+
+        let mut fx = Fx::new();
+        let id = unknown_with(&mut fx, 1, NOW / 1_000 - 10, vec![]).id();
+        let primary = endpoint(7, NOW / 1_000).await;
+        let oracle = endpoint(8, NOW / 1_000).await;
+        let primary_client = StellarRpcClient::new(&primary.uri()).unwrap();
+        let oracle_client = StellarRpcClient::new(&oracle.uri()).unwrap();
+        let writer = crate::submission_flow::recovery::tests::writer_at(&fx.profile.audit_log_path);
+        let error = {
+            let _armed = arm_accounting_fault(COMMIT_FAULT_AFTER_COUNTER);
+            recover_sequences(
+                &fx.store,
+                &fx.profile,
+                EndpointPair::from_clients(&primary_client, Some(&oracle_client)),
+                &writer,
+                None,
+            )
+            .await
+            .unwrap_err()
+        };
+        let expected = "selected sequences: 1 released, 0 held, 0 unavailable";
+        assert!(
+            error.to_string().contains(expected),
+            "the recovery entry reports the committed release: {error}"
+        );
+        assert_eq!(error.code(), "submission.record_unavailable");
+        assert!(fx.record(id).attempts[0].sequence_released.is_some());
+        let pass = ReconcilePass::RecoveryFailed {
+            legacy: Default::default(),
+            error,
+        };
+        let (warnings, guard) = stellar_agent_test_support::WarningCapture::capture(None);
+        finish_reconciliation(&fx.profile, "ops", &fx.store, None, &pass, || {
+            Ok(Arc::clone(&writer))
+        })
+        .unwrap();
+        drop(guard);
+        let seen = warnings.seen();
+        let logged = seen
+            .iter()
+            .find(|fields| fields.contains_key("error"))
+            .unwrap();
+        assert!(
+            logged
+                .get("error")
+                .is_some_and(|detail| detail.contains(expected)),
+            "the completion warning reports the committed release: {seen:?}"
+        );
+        assert_eq!(
+            logged.get("message").map(String::as_str),
+            Some("recovery: the stage refused; durable progress appears in the detail")
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn recovery_dispatch_store_context_precedes_repair_refusal() {
+        use super::super::operations::tests::{Checked, historical_without, unknown_with};
+        use super::super::store::{COMMIT_FAULT_AFTER_COUNTER, arm_accounting_fault};
+
+        let mut fx = Fx::new();
+        unknown_with(&mut fx, 1, NOW / 1_000 - 10, vec![]);
+        let (_, refused) = historical_without(&mut fx, 2, Checked::NotIncluded, "source");
+        let primary = endpoint(7, NOW / 1_000).await;
+        let client = StellarRpcClient::new(&primary.uri()).unwrap();
+        let writer = crate::submission_flow::recovery::tests::writer_at(&fx.profile.audit_log_path);
+        let home = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let receipts = crate::submission_flow::open_receipts("ops").unwrap();
+        let pass = {
+            let _armed = arm_accounting_fault(COMMIT_FAULT_AFTER_COUNTER);
+            crate::submission_flow::reconcile_pass(
+                &fx.profile,
+                &fx.store,
+                &client,
+                Some(&client),
+                Some(&receipts),
+                NOW,
+                || Ok(Arc::clone(&writer)),
+            )
+            .await
+        };
+        let crate::submission_flow::ReconcilePass::RecoveryFailed {
+            error: RecoveryError::Context { source, detail },
+            ..
+        } = pass
+        else {
+            panic!("the sequence refusal retains repair context: {pass:?}");
+        };
+        assert!(detail.contains(&refused.to_hex()));
+        assert!(detail.contains("missing_projection_fact:source"));
+        let RecoveryError::Context { source, detail } = *source else {
+            panic!("the sequence progress remains authoritative: {source:?}");
+        };
+        assert!(matches!(*source, RecoveryError::Store(_)));
+        assert_eq!(
+            detail,
+            "selected sequences: 1 released, 0 held, 0 unavailable"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn recovery_progress_counts_only_matched_stored_releases() {
+        let (mut fx, id, _) = unmatched_release_fixture();
+        let attempts = OperationStatus::new(&fx.store, &fx.profile)
+            .recovery_snapshot(None)
+            .unwrap();
+        assert_eq!(
+            sequence_failure_detail(&OperationStatus::new(&fx.store, &fx.profile), &attempts),
+            "selected sequences: 0 released, 1 held, 0 unavailable"
+        );
+        fx.recorder()
+            .record_evidence(
+                id,
+                1,
+                &EvidenceInput {
+                    sequence_released: Some(SequenceReleaseInput {
+                        primary_ledger: 60,
+                        witness_ledger: 60,
+                        min_close_time_ms: NOW,
+                    }),
+                    ..EvidenceInput::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            sequence_failure_detail(&OperationStatus::new(&fx.store, &fx.profile), &attempts),
+            "selected sequences: 1 released, 0 held, 0 unavailable"
+        );
     }
 
     #[test]

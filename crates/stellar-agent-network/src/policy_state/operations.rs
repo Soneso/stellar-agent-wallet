@@ -5028,6 +5028,34 @@ impl<'a> OperationStatus<'a> {
         self.unknown_attempts(tx_hash, true)
     }
 
+    /// Reads selected release markers together, including terminal attempts.
+    /// An absent attempt or changed exposure has an unavailable marker.
+    pub(super) fn sequence_release_states(
+        &self,
+        attempts: &[RecoveryAttempt],
+    ) -> Result<Vec<Option<bool>>, WindowStoreError> {
+        let wire = self.store.read_for_inspection(self.profile)?;
+        Ok(attempts
+            .iter()
+            .map(|selected| {
+                let record = records(wire.as_ref()?)
+                    .iter()
+                    .find(|record| record.id == selected.operation_id)?;
+                let attempt = record.attempts.iter().find(|attempt| {
+                    attempt.index == selected.attempt_index
+                        && attempt.exposure.as_ref().map(|exposure| &exposure.identity)
+                            == Some(&selected.exposure)
+                })?;
+                Some(
+                    attempt
+                        .sequence_released
+                        .as_ref()
+                        .is_some_and(SequenceReleased::is_matched),
+                )
+            })
+            .collect())
+    }
+
     fn unknown_attempts(
         &self,
         tx_hash: Option<&[u8; 32]>,
