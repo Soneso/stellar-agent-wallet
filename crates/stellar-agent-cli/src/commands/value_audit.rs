@@ -525,6 +525,9 @@ mod tests {
     #[test]
     #[serial]
     fn emit_value_audit_row_writes_through_real_acquisition_path() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
 
         let dir = tempfile::tempdir().expect("tmp dir");
@@ -579,6 +582,9 @@ mod tests {
     #[test]
     #[serial]
     fn require_value_audit_writer_refuses_when_key_unminted() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
 
         let dir = tempfile::tempdir().expect("tmp dir");
@@ -606,6 +612,9 @@ mod tests {
     #[test]
     #[serial]
     fn require_value_audit_writer_returns_writer_when_key_seeded() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
 
         let dir = tempfile::tempdir().expect("tmp dir");
@@ -659,6 +668,9 @@ mod tests {
     #[test]
     #[serial]
     fn for_origin_persisted_refuses_when_key_unminted() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
 
         let dir = tempfile::tempdir().expect("tmp dir");
@@ -686,6 +698,9 @@ mod tests {
     #[test]
     #[serial]
     fn for_origin_synthesized_stays_fail_open_when_key_unminted() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
 
         let dir = tempfile::tempdir().expect("tmp dir");
@@ -713,6 +728,9 @@ mod tests {
     #[test]
     #[serial]
     fn for_origin_synthesized_returns_writer_when_key_seeded() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
 
         let dir = tempfile::tempdir().expect("tmp dir");
@@ -1009,6 +1027,9 @@ mod tests {
     #[test]
     #[serial]
     fn require_value_audit_writer_refuses_after_the_log_is_replaced_underneath_it() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
 
         let dir = tempfile::tempdir().expect("tmp dir");
@@ -1114,6 +1135,9 @@ mod tests {
     #[test]
     #[serial]
     fn require_value_audit_writer_adopts_an_existing_unanchored_log() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
 
         let dir = tempfile::tempdir().expect("tmp dir");
@@ -1140,6 +1164,9 @@ mod tests {
     #[test]
     #[serial]
     fn require_value_audit_writer_refuses_a_signed_log_without_an_anchor() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
 
         let dir = tempfile::tempdir().expect("tmp dir");
@@ -1198,6 +1225,9 @@ mod tests {
     #[test]
     #[serial]
     fn the_pre_flight_passes_a_binding_refusal_through() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = bound_then_repointed("binding-preflight", dir.path());
@@ -1210,6 +1240,9 @@ mod tests {
     #[test]
     #[serial]
     fn the_pre_flight_records_an_absent_binding() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = keyed_profile("binding-preflight-absent", dir.path());
@@ -1232,6 +1265,9 @@ mod tests {
     #[test]
     #[serial]
     fn the_strict_helper_passes_a_binding_refusal_through() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = bound_then_repointed("binding-strict", dir.path());
@@ -1249,6 +1285,9 @@ mod tests {
     #[test]
     #[serial]
     fn the_strict_helper_under_check_only_records_no_binding() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = keyed_profile("binding-strict-check-only", dir.path());
@@ -1281,6 +1320,9 @@ mod tests {
     #[test]
     #[serial]
     fn the_strict_helper_keeps_chain_key_unavailable_for_other_failures() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let mut profile = Profile::builder_testnet("binding-strict-nokey", "a", "n", "n").build();
@@ -1302,6 +1344,9 @@ mod tests {
     #[test]
     #[serial]
     fn an_undecodable_audit_key_names_investigation_before_minting() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let name = "undecodable-audit-key";
@@ -1334,6 +1379,9 @@ mod tests {
     #[test]
     #[serial]
     fn best_effort_returns_a_binding_refusal_instead_of_an_unkeyed_writer() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = bound_then_repointed("binding-best-effort", dir.path());
@@ -1353,6 +1401,9 @@ mod tests {
     #[test]
     #[serial]
     fn an_unkeyed_open_failure_reports_the_io_condition() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let blocker = dir.path().join("not-a-directory");
@@ -1383,6 +1434,9 @@ mod tests {
     #[test]
     #[serial]
     fn the_best_effort_fallback_refuses_a_keyed_log() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::tip_anchor::{
             InMemoryTipAnchorStore, KeyedAuditAccess, TipAnchorStore,
         };
@@ -1423,6 +1477,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_synthesized_origin_records_no_binding() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = keyed_profile("binding-synthesized", dir.path());
@@ -1449,6 +1506,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_synthesized_origin_refuses_a_changed_binding() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = bound_then_repointed("binding-synthesized-changed", dir.path());
@@ -1468,6 +1528,9 @@ mod tests {
     #[test]
     #[serial]
     fn get_or_open_unkeyed_records_and_checks_no_binding() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = bound_then_repointed("binding-unkeyed", dir.path());

@@ -4341,7 +4341,11 @@ mod tests {
     /// the evaluation of the generated body allows a typical payment to a
     /// listed recipient without approval.
     #[test]
+    #[serial_test::serial]
     fn approval_threshold_admits_typical_payment() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let listed = account(7);
         let mut inputs: Vec<PresetInput> = PRESETS
             .iter()
@@ -4761,7 +4765,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn generated_rules_meet_mainnet_rule_minimum() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let profile = mainnet_profile();
         let mut inputs = usdc_inputs();
         inputs.push(xlm_input("shop-week", "500", "10"));
@@ -5009,7 +5017,11 @@ mod tests {
     /// alternatives, and an M address matches its exact entry or its base G.
     /// An entry of an unselected kind is unlisted.
     #[test]
+    #[serial_test::serial]
     fn summary_treats_address_kinds_as_alternatives() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (g, m, c) = (account(7), muxed(8, 5), contract(3));
         let body = policy_body(PROFILE, &derived("api-day", false, true));
         let mut main = body.clone();
@@ -5139,7 +5151,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn x402_floor_note_matches_evaluation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let listed = account(7);
         let derived = derived("api-week", false, true);
         let body = listed_body(&derived, &listed);
@@ -5173,7 +5189,11 @@ mod tests {
     /// A floor on the authenticated x402 rule only: the exemption names the
     /// floor-free tool, and the floored tool is stated as denying every call.
     #[test]
+    #[serial_test::serial]
     fn x402_floor_note_names_floor_free_tools() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let listed = account(7);
         let body = edit_rules(
             &listed_body(&derived("compute-week", false, true), &listed),
@@ -5236,7 +5256,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn x402_approval_note_matches_evaluation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let listed = account(7);
         let base = listed_body(&derived("shop-week", false, true), &listed);
         let approval_notes = |summary: &SpendingSummary| -> Vec<String> {
@@ -5521,7 +5545,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn summary_recipients_intersect_within_rule() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (first, second) = (account(7), account(9));
         let body = listed_body(&derived("compute-week", false, true), &first);
         let listed = |summary: &SpendingSummary| -> Vec<(String, Agreed<Treatment>)> {
@@ -5563,7 +5591,11 @@ mod tests {
     /// rule, in both criterion orders: each recipient's stated treatment is
     /// the evaluation's.
     #[test]
+    #[serial_test::serial]
     fn summary_treats_each_recipient_by_every_criterion() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (a, b, c) = (account(7), account(9), account(11));
         for mode in ["budget", "approval"] {
             for second_first in [false, true] {
@@ -5634,7 +5666,11 @@ mod tests {
     /// For every body, a tool the summary names in `unlisted_tools` admits an
     /// unlisted recipient, and every other tool denies one.
     #[test]
+    #[serial_test::serial]
     fn summary_unlisted_statement_matches_evaluation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let listed = account(7);
         let unlisted = account(9);
         let compute = listed_body(&derived("compute-week", false, true), &listed);
@@ -5706,7 +5742,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn summary_floor_is_highest_within_rule() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let listed = account(7);
         let body = listed_body(&derived("compute-week", false, true), &listed);
         assert_eq!(summary_of(&body).balance_floor_xlm.as_deref(), Some("4.5"));
@@ -5838,7 +5878,11 @@ mod tests {
     /// An unrestricted pay rule beside budgeted rules: the unlisted caps and
     /// the exhaustion behavior differ per tool, and the summary states each.
     #[test]
+    #[serial_test::serial]
     fn summary_unlisted_caps_per_tool() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (listed, unlisted) = (account(7), account(9));
         let body = edit_rules(
             &listed_body(&derived("api-week", true, true), &listed),
@@ -6081,7 +6125,11 @@ mod tests {
     /// identifier: the evaluation keeps two counters, and the 1d bound is
     /// their sum, labeled as such. Under one identifier the counter is shared.
     #[test]
+    #[serial_test::serial]
     fn summary_sums_separate_counters() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         const PAY: &str = "stellar_pay";
         const COMMIT: &str = "stellar_pay_commit";
         let listed = account(7);
@@ -6171,7 +6219,11 @@ mod tests {
     /// A 5m cap below the per-payment cap: the summary states the window, the
     /// largest payment it leaves, and its bound.
     #[test]
+    #[serial_test::serial]
     fn summary_states_every_window() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let classic = format!("USDC:{ISSUER}");
         let listed = account(7);
         let body = plain_body(&[plain_rule(
@@ -6229,7 +6281,11 @@ mod tests {
     /// A `require_approval` rule requires approval for every amount; a `deny`
     /// rule leaves its tool uncovered.
     #[test]
+    #[serial_test::serial]
     fn summary_reflects_rule_decision() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let classic = format!("USDC:{ISSUER}");
         let listed = account(7);
         let body = plain_body(&[
@@ -6281,7 +6337,11 @@ mod tests {
 
     /// Floors and bounds that differ per tool are stated per tool.
     #[test]
+    #[serial_test::serial]
     fn summary_floors_and_bounds_agree_or_per_tool() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let classic = format!("USDC:{ISSUER}");
         let listed = account(7);
         let floor =
@@ -6383,7 +6443,11 @@ mod tests {
     /// fit the budget's counter, at most 0.1 each and 0.5 per day. With no
     /// listed recipient the listed class pays 0; with one, 0.2 and 2.
     #[test]
+    #[serial_test::serial]
     fn summary_bounds_the_unlisted_class_by_its_counter() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let unlisted = account(9);
         for net in [Net::Mainnet, Net::Testnet] {
             let body = net.body(&policy_body(PROFILE, &derived("api-day", true, true)));
@@ -6465,7 +6529,11 @@ mod tests {
     /// A daily rate of one call at a per-payment cap of 1: the daily bound
     /// is 1, not the amount cap of 3.
     #[test]
+    #[serial_test::serial]
     fn summary_bounds_by_every_rate_window() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let classic = format!("USDC:{ISSUER}");
         let listed = account(7);
         for net in [Net::Mainnet, Net::Testnet] {
@@ -6505,7 +6573,11 @@ mod tests {
     /// and 2 and a per-payment cap of 0.5, at most 0.75 passes per day, and
     /// 0.25 then 0.5 reaches it.
     #[test]
+    #[serial_test::serial]
     fn summary_counts_every_writer_of_a_counter() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let classic = format!("USDC:{ISSUER}");
         let listed = account(7);
         for net in [Net::Mainnet, Net::Testnet] {
@@ -6558,7 +6630,11 @@ mod tests {
     /// the bound. Two payments of 1 to an address in no list pass, and the
     /// stated bound is not below them, in both criterion orders.
     #[test]
+    #[serial_test::serial]
     fn summary_leaves_a_conditional_budget_out_of_the_bound() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let classic = format!("USDC:{ISSUER}");
         let outsider = account(9);
         let list = format!(
@@ -6641,7 +6717,11 @@ mod tests {
     /// the budget: the unlisted class holds it, while the listed class and
     /// addresses in no list pay nothing.
     #[test]
+    #[serial_test::serial]
     fn summary_counts_a_listed_recipient_paid_through_the_budget() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let classic = format!("USDC:{ISSUER}");
         let (named, budget_listed) = (account(9), account(7));
         let criteria = [
@@ -6761,7 +6841,11 @@ mod tests {
     /// 280 USDC per minute without approval. The evaluation pays it and
     /// never passes it. The largest admitted payment stays the per-payment cap.
     #[test]
+    #[serial_test::serial]
     fn unattended_bounds_exclude_approved_payments() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let body = with_every_address_form(&policy_body(
             PROFILE,
             &derived("business-week", false, true),
@@ -7475,7 +7559,11 @@ mod tests {
     /// family of signed bodies, on mainnet and on a testnet subset. Every
     /// stated bound of a mainnet body holds against payment sequences.
     #[test]
+    #[serial_test::serial]
     fn summary_statements_match_evaluation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let bodies = generated_bodies();
         let (mut cases, mut bounds, mut sequences, mut unreachable) = (0, 0, 0, 0);
         let mut staged = 0;
@@ -8024,7 +8112,11 @@ mod tests {
     /// repeated criteria, per-payment caps, decisions, and recipient
     /// classifications, and holds the generated preset bodies.
     #[test]
+    #[serial_test::serial]
     fn summary_bounds_match_payment_sequences() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         const PAY: &str = "stellar_pay";
         const COMMIT: &str = "stellar_pay_commit";
         let mut family: Vec<(Net, String)> = Vec::new();
@@ -8314,7 +8406,11 @@ mod tests {
     /// Every preset and unlisted choice on a signed and verified policy with
     /// one listed G recipient. The amounts and decisions are literals.
     #[test]
+    #[serial_test::serial]
     fn preset_evaluation_matrix() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for (name, unlisted_budget, expected) in MATRIX {
             assert_eq!(
                 matrix_run(name, unlisted_budget),

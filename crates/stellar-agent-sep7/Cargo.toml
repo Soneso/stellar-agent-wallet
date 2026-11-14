@@ -43,6 +43,7 @@ test-helpers = []
 testnet-acceptance = []
 
 [dev-dependencies]
+stellar-agent-network = { path = "../stellar-agent-network", features = ["test-helpers"] }
 stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["test-helpers"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 # OS CSPRNG for generating ed25519 test keys in the adversarial suite.

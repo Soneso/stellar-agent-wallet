@@ -73,6 +73,7 @@ fn an_engine_build_leaves_another_profiles_older_form_entry() {
     let other_owner = KeyringEntryRef::default_owner_key("owner-b");
     put(&other_owner, &URL_SAFE_NO_PAD.encode([0x62; 32]));
 
+    stellar_agent_test_support::sandbox::mark_sandbox(home.path()).expect("mark fixture directory");
     let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
         .args([
             "pay",
@@ -106,6 +107,7 @@ fn an_engine_build_leaves_another_profiles_older_form_entry() {
         stored(&other_owner) == Some(URL_SAFE_NO_PAD.encode([0x62; 32])),
         "the sibling entry stays byte-identical"
     );
+    stellar_agent_test_support::sandbox::mark_sandbox(home.path()).expect("mark fixture directory");
     let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
         .args([
             "pay",

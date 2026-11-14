@@ -2160,6 +2160,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn bound_mismatch_refuses_at_gate_and_bind() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::signed_intent::test_helpers::intent_fixture_kind;
         use stellar_agent_core::policy::v1::{CheckedSizing, SizingBasis};
         use stellar_agent_core::profile::caip2::Caip2;
@@ -2267,6 +2270,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn entryless_admission_commits_progress() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy_state::ChainScope;
         use crate::signing::ledger_witness::LedgerWitnessCapability;
         use stellar_agent_core::policy::v1::{CheckedSizing, SizingBasis};
@@ -2369,6 +2375,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn final_submission_links_and_charges_once() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::signed_intent::test_helpers::intent_fixture_plan;
         use stellar_agent_core::policy::v1::criteria::{
             WindowLimit,
@@ -2763,6 +2772,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn different_final_intent_cannot_consume_reservation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert_different_final_intent_cannot_consume_reservation().await;
     }
 
@@ -3076,6 +3088,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn scope_refusals_preserve_submission_state_and_warn_for_outcomes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::profile::caip2::Caip2;
         use stellar_agent_test_support::log_capture::CaptureWriter;
         stellar_agent_test_support::keyring_mock::install().unwrap();
@@ -3191,6 +3206,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn entryless_submission_reads_no_window_state() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::profile::caip2::Caip2;
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -3378,6 +3396,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn an_unsent_outcome_unwinds_the_record() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::policy::v1::criteria::state_store::{
             StateKey, WindowEntry, WindowLimit,
         };
@@ -3582,6 +3603,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn duplicate_backstop_keeps_the_pending_row_open() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert_duplicate_backstop_keeps_the_pending_row_open(None, || {}).await;
     }
 
@@ -3593,6 +3617,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn an_uncovered_duplicate_keeps_the_pending_row_open() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::tip_anchor::{
             InMemoryTipAnchorStore, KeyedAuditAccess, TipAnchorStore,
         };
@@ -3781,6 +3808,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn a_grant_is_consumed_with_the_submission() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let fx = LedgerFixture::new("consume", NOW);
             let sub = submission();
             let holds = holds(&fx, 100);
@@ -3842,6 +3872,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn sign_failure_records_not_sent_with_an_always_row() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let fx = LedgerFixture::new("operation-sign-failure", NOW);
             let sub = submission();
             let (attempt, authorization) = fx.linked_attempt(sub.binding.clone(), &[], "order-1");
@@ -3885,6 +3918,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn outcome_maps_not_sent_and_every_other_arm() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let sub = submission();
             let tx_hash = sub.intent.tx_hash.clone();
             let arms = [
@@ -3969,6 +4005,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn zero_entry_path_records_both_stages() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let fx = LedgerFixture::new("operation-zero-entry", NOW);
             let sub = submission();
             let (attempt, authorization) = fx.linked_attempt(sub.binding.clone(), &[], "order-1");
@@ -4008,6 +4047,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn an_empty_entries_grant_still_consumes() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let fx = LedgerFixture::new("consume-empty", NOW);
             let sub = submission();
             let (id, authorization) = grant(&fx, &sub, &[], "approval-1");
@@ -4029,6 +4071,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn a_second_grant_after_a_lost_receipt_refuses_at_the_window_check() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let fx = LedgerFixture::new("consume-lost-receipt", NOW);
             let sub = submission();
             let holds = holds(&fx, 100);
@@ -4075,6 +4120,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn a_duplicate_at_the_consumption_takes_the_receipt_stage() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let fx = LedgerFixture::new("consume-duplicate", NOW);
             let sub = submission();
             let holds = holds(&fx, 100);
@@ -4164,6 +4212,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn an_empty_recorder_preserves_a_lost_receipts_open_row() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             empty_recorder_duplicate(false, true).await;
         }
 
@@ -4172,6 +4223,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn duplicate_reservation_precedes_the_entries_comparison() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             empty_recorder_duplicate(true, true).await;
         }
 
@@ -4180,6 +4234,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn duplicate_reservation_refuses_an_authorization_without_holds() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             empty_recorder_duplicate(true, false).await;
         }
 
@@ -4187,6 +4244,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn an_empty_recorder_consumes_unheld_bytes_after_a_lost_receipt() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let fx = LedgerFixture::new("consume-empty-unheld", NOW);
             let first_sub = submission();
             let entries = holds(&fx, 100);
@@ -4268,6 +4328,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn stateless_duplicate_refuses_before_a_new_row() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             stateless_duplicate(false, false).await;
         }
 
@@ -4276,6 +4339,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn stateless_duplicate_refuses_before_an_uncovered_tip() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             stateless_duplicate(true, false).await;
         }
 
@@ -4284,6 +4350,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn stateless_duplicate_refuses_before_a_tip_error() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             stateless_duplicate(false, true).await;
         }
 
@@ -4292,6 +4361,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn endpoint_outcomes_keep_stateless_consumption_open() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             for (label, outcome) in [
                 (
                     "rejected",
@@ -4359,6 +4431,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn a_settlement_lookup_error_takes_the_receipt_stage() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let fx = LedgerFixture::new("consume-settlement-error", NOW);
             let sub = submission();
             let (id, authorization) = grant(&fx, &sub, &[], "approval-1");
@@ -4389,6 +4464,9 @@ mod tests {
         #[test]
         #[serial]
         fn the_precheck_reads_through_the_held_guard() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let fx = LedgerFixture::new("consume-settlement-bound", NOW);
             let sub = submission();
             let recorder = fx.recorder(vec![], Some(Arc::clone(&fx.writer)));
@@ -4428,6 +4506,9 @@ mod tests {
         #[test]
         #[serial]
         fn a_quarantined_forged_quarantine_row_leaves_the_precheck_refusing() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             use stellar_agent_core::audit_log::tip_anchor::InMemoryTipAnchorStore;
             use stellar_agent_core::audit_log::writer::ReanchorAcknowledgement;
             use stellar_agent_core::audit_log::{KeyedAuditAccess, TipAnchorStore};
@@ -4483,6 +4564,9 @@ mod tests {
         #[test]
         #[serial]
         fn the_settlement_lookup_requires_the_writer_guard() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let fx = LedgerFixture::new("consume-settlement-guard", NOW);
             let sub = submission();
             let recorder = fx.recorder(vec![], Some(Arc::clone(&fx.writer)));
@@ -4532,6 +4616,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn stateless_fresh_bytes_consume_after_a_lost_receipt() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let fx = LedgerFixture::new("consume-stateless-fresh", NOW);
             let original = submission();
             let (first, authorization) = grant(&fx, &original, &[], "approval-1");
@@ -4570,6 +4657,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn an_uncovered_tip_closes_a_fresh_submissions_row() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let fx = LedgerFixture::new("consume-uncovered", NOW);
             let sub = submission();
             let (id, authorization) = grant(&fx, &sub, &[], "approval-1");
@@ -4594,6 +4684,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn a_failed_mark_submitted_releases_the_converted_holds() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let fx = LedgerFixture::new("consume-mark-submitted", NOW);
             let sub = submission();
             let holds = holds(&fx, 100);
@@ -4652,6 +4745,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn a_public_not_sent_report_after_the_receipt_mark_releases_nothing() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let fx = LedgerFixture::new("consume-mark-race", NOW);
             let sub = submission();
             let holds = total_holds(&fx);
@@ -4687,6 +4783,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn a_failed_mark_submitted_releases_the_total_debit() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let fx = LedgerFixture::new("consume-mark-total", NOW);
             let sub = submission();
             let holds = total_holds(&fx);
@@ -4716,6 +4815,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn a_reported_non_send_keeps_the_authorized_total_debit() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let fx = LedgerFixture::new("consume-not-sent-total", NOW);
             let sub = submission();
             let holds = total_holds(&fx);
@@ -4742,6 +4844,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn a_duplicate_sequence_refuses_before_the_consumption() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let fx = LedgerFixture::new("consume-sequence", NOW);
             let sub = submission();
             let holds = holds(&fx, 100);
@@ -4774,6 +4879,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn a_missing_audit_writer_refuses_before_anything_is_recorded() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let fx = LedgerFixture::new("consume-no-writer", NOW);
             let sub = submission();
             let holds = holds(&fx, 100);
@@ -4798,6 +4906,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn an_anchor_that_does_not_cover_the_row_refuses_before_the_consumption() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let fx = LedgerFixture::new("consume-anchor", NOW);
             let sub = submission();
             let holds = holds(&fx, 100);
@@ -4830,6 +4941,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn the_unsent_capability_releases_the_total_only_before_the_send() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             use stellar_agent_core::policy::v1::criteria::state_store::{
                 StateKey, WindowEntry, WindowLimit,
             };
@@ -4883,6 +4997,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn a_reservation_epoch_refusal_keeps_its_code() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             use stellar_agent_core::policy::v1::criteria::state_store::{
                 StateKey, WindowEntry, WindowLimit,
             };
@@ -4929,6 +5046,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn a_pending_row_that_cannot_be_appended_refuses_before_the_consumption() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let fx = LedgerFixture::new("consume-append", NOW);
             let sub = submission();
             let holds = holds(&fx, 100);
@@ -4962,6 +5082,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn a_pending_row_append_failure_takes_the_receipt_stage() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let fx = LedgerFixture::new("consume-append-transient", NOW);
             let sub = submission();
             let holds = holds(&fx, 100);
@@ -4996,6 +5119,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn authorized_branch_hashes_grant_entries() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let fx = LedgerFixture::new("consume-grant-entries", NOW);
             let sub = submission();
             let (id, mut authorization) = grant(&fx, &sub, &holds(&fx, 100), "approval-1");
@@ -5032,6 +5158,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn authorized_pending_row_carries_the_provenance() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let fx = LedgerFixture::new("authorized-provenance", NOW);
             let sub = submission();
             let (_, authorization) = grant(&fx, &sub, &holds(&fx, 100), "approval-1");
@@ -5068,6 +5197,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn authorized_recorder_retains_minted_exposure() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             for success in [true, false] {
                 let fx = LedgerFixture::new("authorized-settle", NOW);
                 let sub = submission();
@@ -5116,6 +5248,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn a_reported_rejection_retains_the_converted_rows() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let fx = LedgerFixture::new("authorized-rejected", NOW);
             let sub = submission();
             let (id, authorization) = grant(&fx, &sub, &holds(&fx, 100), "approval-1");
@@ -5181,6 +5316,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn used_authorization_is_not_consumed_twice() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             for has_holds in [true, false] {
                 let fx = LedgerFixture::new("used-once", NOW);
                 let sub = submission();
@@ -5270,6 +5408,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn audit_facts_of_another_log_are_refused() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let fx = LedgerFixture::new("consume-other-log", NOW);
             let sub = submission();
             let holds = holds(&fx, 100);
@@ -5292,6 +5433,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn audit_facts_of_another_segment_are_refused() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let fx = LedgerFixture::new("consume-other-segment", NOW);
             let sub = submission();
             let holds = holds(&fx, 100);

@@ -535,7 +535,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn from_profile_copies_identity_and_secondary() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for chain in [Caip2::Testnet, Caip2::Mainnet] {
             let mut profile = profile(chain);
             let context = NetworkContext::from_profile(&profile);
@@ -553,7 +557,11 @@ mod tests {
     /// The primary credential of the profile binds to its `rpc_url`; a
     /// context from `new` and a profile without a record bind none.
     #[test]
+    #[serial_test::serial]
     fn from_profile_binds_the_primary_credential() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::profile::schema::{
             KeyringEntryRef, PrimaryProviderRecord, RpcCredentialPlacement,
         };
@@ -592,7 +600,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn with_secondary_sets_and_clears_command_endpoint() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let context = NetworkContext::from_profile(&profile(Caip2::Testnet))
             .with_secondary(Some("https://command-secondary.example".to_owned()));
         assert_eq!(
@@ -603,7 +615,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn testnet_passphrase_is_canonical() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert_eq!(
             NetworkContext::from_profile(&profile(Caip2::Testnet)).network_passphrase(),
             TESTNET_PASSPHRASE
@@ -611,7 +627,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn mainnet_passphrase_is_derived_from_chain() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut profile = profile(Caip2::Mainnet);
         profile.network_passphrase = "not the passphrase".to_owned();
         assert_eq!(
@@ -669,7 +689,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn mainnet_write_refuses_without_reading_inputs() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (dir, profile, resolved) = stored_context_profile();
         let error = NetworkContext::mainnet_write(
             &profile,
@@ -699,7 +723,11 @@ mod tests {
 
     #[cfg(feature = "mainnet-write")]
     #[test]
+    #[serial_test::serial]
     fn context_accepts_flag_named_mainnet_profile() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (dir, profile, resolved) = stored_context_profile();
         let context = NetworkContext::mainnet_write(
             &profile,
@@ -721,7 +749,11 @@ mod tests {
 
     #[cfg(feature = "mainnet-write")]
     #[test]
+    #[serial_test::serial]
     fn context_refuses_env_and_default_sources() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::profile::name::ProfileNameSource;
         let (dir, profile, mut resolved) = stored_context_profile();
         for source in [ProfileNameSource::Env, ProfileNameSource::Default] {
@@ -740,7 +772,11 @@ mod tests {
 
     #[cfg(feature = "mainnet-write")]
     #[test]
+    #[serial_test::serial]
     fn context_refuses_default_name() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (dir, profile, mut resolved) = stored_context_profile();
         resolved.name = "default".into();
         assert_eq!(
@@ -756,7 +792,11 @@ mod tests {
 
     #[cfg(feature = "mainnet-write")]
     #[test]
+    #[serial_test::serial]
     fn context_refuses_endpoint_flags() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (dir, profile, resolved) = stored_context_profile();
         for flags in [
             MainnetEndpointFlags {
@@ -781,7 +821,11 @@ mod tests {
 
     #[cfg(feature = "mainnet-write")]
     #[test]
+    #[serial_test::serial]
     fn context_refuses_merged_view_differing_from_disk() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (dir, profile, resolved) = stored_context_profile();
         let mut merged = profile.clone();
         merged.rpc_url = "https://other.invalid".into();
@@ -809,7 +853,11 @@ mod tests {
 
     #[cfg(feature = "mainnet-write")]
     #[test]
+    #[serial_test::serial]
     fn context_refuses_testnet_snapshot() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (dir, _, resolved) = stored_context_profile();
         let profile = Profile::builder_testnet_named("context", "s", "a", "n", "a").build();
         stellar_agent_core::profile::loader::save_to_dir("context", &profile, dir.path()).unwrap();
@@ -826,7 +874,11 @@ mod tests {
 
     #[cfg(feature = "mainnet-write")]
     #[test]
+    #[serial_test::serial]
     fn context_refuses_derived_name_mismatch() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (dir, mut profile, resolved) = stored_context_profile();
         profile.policy_owner_key_id =
             stellar_agent_core::profile::schema::KeyringEntryRef::default_owner_key("other");
@@ -844,7 +896,11 @@ mod tests {
 
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
+    #[serial_test::serial]
     async fn network_context_routes_the_primary() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_test_support::{EchoIdResponder, signed_envelope::get_network_result};
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::body_partial_json(
@@ -875,7 +931,11 @@ mod tests {
 
     #[cfg(feature = "mainnet-write")]
     #[test]
+    #[serial_test::serial]
     fn unmapped_host_uses_the_profile_endpoint() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (dir, profile, resolved) = stored_context_profile();
         let context =
             NetworkContext::mainnet_write(&profile, &resolved, dir.path(), Default::default())

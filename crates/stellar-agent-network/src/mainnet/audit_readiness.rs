@@ -478,6 +478,9 @@ mod tests {
     #[test]
     #[serial]
     fn the_keyring_backed_writer_yields_the_proof() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let name = "readiness-accept";
@@ -526,6 +529,9 @@ mod tests {
     #[test]
     #[serial]
     fn readiness_refuses_an_edited_middle_archive() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::{
             rotation::test_seam::set_rotation_threshold,
             test_helpers::rotated_archives_newest_first,
@@ -567,6 +573,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_headless_keyring_backend_refuses_mainnet_readiness() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let name = "readiness-headless";
@@ -609,6 +618,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_cached_writer_with_an_injected_anchor_store_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let name = "readiness-injected";
@@ -690,6 +702,9 @@ mod tests {
     #[test]
     #[serial]
     fn the_proof_keeps_the_writer_alive() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let name = "readiness-lease";
@@ -706,6 +721,9 @@ mod tests {
     #[test]
     #[serial]
     fn replacing_the_writer_cannot_reuse_its_provenance() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::AuditWriter;
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
@@ -773,6 +791,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_keyring_writer_at_another_path_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::AuditWriter;
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
@@ -820,6 +841,9 @@ mod tests {
     #[test]
     #[serial]
     fn an_evicted_registry_writer_refuses_readiness() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let name = "readiness-evicted";
@@ -836,6 +860,9 @@ mod tests {
     #[test]
     #[serial]
     fn fresh_facts_refuse_an_uncovered_tip_and_accept_its_repair() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = TempDir::new().unwrap();
         let name = "readiness-lag";
         let path = dir.path().join("audit").join(format!("{name}.jsonl"));
@@ -875,6 +902,9 @@ mod tests {
     #[test]
     #[serial]
     fn fresh_facts_refuse_a_log_without_tags_in_force() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::{AuditWriter, BindingHistory};
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();

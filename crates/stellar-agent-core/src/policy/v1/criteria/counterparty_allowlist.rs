@@ -1399,7 +1399,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn muxed_payment_decoder_keeps_exact_destination() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_xdr::*;
         let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
             tx: Transaction {
@@ -1444,7 +1448,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn muxed_contract_base_and_exact_entries_match_on_both_paths() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use RecipientClass::{Listed, Unlisted};
         for (list, classes) in [
             (vec![key_c()], [Listed, Listed, Unlisted, Listed]),
@@ -1483,7 +1491,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn muxed_contract_own_kind_and_unlisted_modes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for mode in every_mode() {
             let criterion =
                 criterion_of(&[CounterpartyKind::GAccount], &[key_w(3, 7)], mode.clone());
@@ -1519,7 +1531,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn muxed_contract_preserves_non_address_conjunctions() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::value::ActionKind;
         for mode in every_mode() {
             for kinds in [
@@ -1615,7 +1631,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn g_and_c_alternatives_are_both_listed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let criterion = criterion_of(
             &[CounterpartyKind::GAccount, CounterpartyKind::CAccount],
             &[key_g(), key_c()],
@@ -1633,7 +1653,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn unselected_kind_destination_escalates_under_approval() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let criterion = criterion_of(
             &[CounterpartyKind::GAccount],
             &[key_g()],
@@ -1648,7 +1672,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn same_payload_does_not_match_across_forms() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for (kind, entry, destination) in [
             (
                 CounterpartyKind::CAccount,
@@ -1672,7 +1700,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn muxed_destination_matches_base_g_on_both_paths() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let criterion = criterion_of(
             &[CounterpartyKind::GAccount],
             &[key_g()],
@@ -1692,7 +1724,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn muxed_entry_matches_only_its_id() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for (entry, others) in [
             (7, [0, 8, u64::MAX]),
             (0, [1, 7, u64::MAX]),
@@ -1717,7 +1753,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn issuer_check_is_conjoined_before_mode() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let asset = format!("USD:{}", key_i());
         for mode in [
             UnlistedMode::Deny,
@@ -1765,7 +1805,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn denial_names_destination_kind() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for (kinds, d, tag) in [
             (vec![CounterpartyKind::GAccount], key_c(), "C_ACCOUNT"),
             (vec![CounterpartyKind::CAccount], key_g(), "G_ACCOUNT"),
@@ -1781,7 +1825,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn non_destination_forms_error_without_input() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let inputs = [
             format!("{}", stellar_strkey::PreAuthTx([4; 32])),
             format!("{}", stellar_strkey::HashX([4; 32])),
@@ -1830,7 +1878,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn raw_path_keeps_denials_and_missing_field_errors() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for mode in every_mode() {
             let criterion = criterion_of(&[CounterpartyKind::GAccount], &[], mode);
             in_ctx(
@@ -1861,7 +1913,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn address_order_and_duplicates_run_one_check() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use CounterpartyKind::{CAccount as C, GAccount as G, KnownIssuer as I};
         for list in [vec![key_g(), key_c()], vec![]] {
             for mode in every_mode() {
@@ -1915,7 +1971,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn no_address_kind_runs_no_address_check() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for kinds in [vec![], vec![CounterpartyKind::KnownIssuer]] {
             let criterion = criterion_of(&kinds, &[], UnlistedMode::Deny);
             for d in [key_g(), key_c(), "not-a-strkey".to_owned()] {
@@ -1933,7 +1993,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn first_denial_follows_kind_order() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use CounterpartyKind::{GAccount as G, KnownIssuer as I};
         for (kinds, tag, d) in [
             (vec![I, G], "KNOWN_ISSUER", key_i()),
@@ -1954,7 +2018,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn first_denial_follows_kind_order_under_approval() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use CounterpartyKind::{GAccount as G, KnownIssuer as I};
         for (kinds, tag, d) in [
             (vec![I, G], "KNOWN_ISSUER", key_i()),
@@ -1982,7 +2050,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn listed_entry_of_unselected_kind_is_unlisted() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let criterion = criterion_of(
             &[CounterpartyKind::GAccount],
             &[key_c()],
@@ -2001,7 +2073,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn reserved_kinds_refuse_in_every_mode_without_debits() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for reserved in [
             CounterpartyKind::Sep10Identity,
             CounterpartyKind::OneTimeAddress,
@@ -2040,7 +2116,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn entries_compare_byte_for_byte() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for entry in [
             format!(" {}", key_g()),
             format!("{} ", key_g()),
@@ -2058,7 +2138,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn missing_destination_uses_first_address_tag() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use CounterpartyKind::{CAccount as C, GAccount as G};
         for (kinds, tag) in [(vec![C, G], "C_ACCOUNT"), (vec![G, C], "G_ACCOUNT")] {
             for mode in every_mode() {
@@ -2078,7 +2162,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn overlay_accumulates_g_and_c_transfers() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let criterion = criterion_of(
             &[CounterpartyKind::GAccount, CounterpartyKind::CAccount],
             &[],
@@ -2106,7 +2194,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn gated_inflow_failure_refuses_in_every_mode() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for mode in every_mode() {
             let criterion = criterion_of(
                 &[CounterpartyKind::GAccount, CounterpartyKind::KnownIssuer],
@@ -2210,8 +2302,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn g_account_in_allowlist_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -2226,8 +2321,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn g_account_not_in_allowlist_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -2245,8 +2343,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn c_account_in_allowlist_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -2261,8 +2362,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn c_account_not_in_allowlist_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -2282,8 +2386,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn known_issuer_in_allowlist_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -2301,8 +2408,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn known_issuer_bare_g_strkey_allowlist_entry_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -2324,8 +2434,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn known_issuer_not_in_allowlist_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -2345,8 +2458,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn unsupported_kind_returns_counterparty_kind_unsupported() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -2362,8 +2478,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn invalid_g_strkey_in_args_returns_evaluation_failed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -2381,8 +2500,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn native_asset_skips_known_issuer_check() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -2400,8 +2522,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn known_issuer_debit_leg_with_no_asset_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
 
         let tool = make_tool("stellar_dex_trade");
@@ -2430,8 +2555,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn approval_trustline_commit_known_issuer_gates_decoded_inflow() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_trustline_commit");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -2477,8 +2605,11 @@ mod tests {
     /// `gate_inflows` defaults to `false`: an inflow leg from an issuer NOT on
     /// the allowlist is allowed — pins today's debit-only scoping unchanged.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn gate_inflows_default_false_allows_unknown_issuer_inflow() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::value::{ValueClass, ValueEffects};
 
         let tool = make_tool("stellar_dex_trade");
@@ -2504,8 +2635,11 @@ mod tests {
     /// `gate_inflows = true`: an inflow leg from an issuer NOT on the
     /// allowlist denies, with a `value` detail distinct from a debit denial.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn gate_inflows_true_denies_unknown_issuer_inflow() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::value::{ValueClass, ValueEffects};
 
         let tool = make_tool("stellar_dex_trade");
@@ -2538,8 +2672,11 @@ mod tests {
 
     /// `gate_inflows = true`: an inflow leg from an ALLOWLISTED issuer passes.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn gate_inflows_true_allows_allowlisted_issuer_inflow() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::value::{ValueClass, ValueEffects};
 
         let tool = make_tool("stellar_dex_trade");
@@ -2565,8 +2702,11 @@ mod tests {
     /// fail-closed, the same posture as the existing asset-`None` debit
     /// handling.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn gate_inflows_true_asset_none_inflow_denies_fail_closed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::value::{ValueClass, ValueEffects};
 
         let tool = make_tool("stellar_dex_trade");
@@ -2602,8 +2742,11 @@ mod tests {
     /// unlisted-issuer debit still denies with the plain (non-inflow) `value`
     /// shape, exactly as it does with `gate_inflows` unset.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn gate_inflows_true_debit_leg_behavior_unchanged() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
 
         let tool = make_tool("stellar_dex_trade");
@@ -2753,8 +2896,11 @@ mod tests {
     /// asserted domain is on the operator's allowlist — matching the domain
     /// on-chain proves nothing without cache verification.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn home_domain_self_asserted_only_with_no_cache_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -2788,8 +2934,11 @@ mod tests {
     /// in the counterparty cache, the counterparty account is listed in that
     /// domain's `ACCOUNTS`, and the domain is on the operator's allowlist.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn home_domain_cache_verified_and_allowlisted_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -2817,8 +2966,11 @@ mod tests {
     /// distinguishable from an unverified-domain deny (the operator can tell
     /// "verified but not on our allowlist" from "not verified at all").
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn home_domain_cache_verified_but_not_allowlisted_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -2860,8 +3012,11 @@ mod tests {
     /// Cache absent entirely (`ctx.counterparty_cache = None`) denies as
     /// unverified, distinct from a populated-but-empty/miss cache.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn home_domain_cache_absent_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -2895,8 +3050,11 @@ mod tests {
     /// unverified, with a detail that names the missing live entry and the
     /// refresh command for that domain.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn home_domain_without_live_cache_entry_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -2936,8 +3094,11 @@ mod tests {
     /// anti-spoofing case #49 closes: an attacker account cannot borrow an
     /// already-cached, legitimate operator's `home_domain` string.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn home_domain_resolved_but_account_not_listed_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -2982,8 +3143,11 @@ mod tests {
     /// the allowlist entry `"circle.com"` because byte-equality comparison
     /// distinguishes `'1'` (0x31) from `'l'` (0x6C).
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn home_domain_digit_one_homoglyph_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -3027,8 +3191,11 @@ mod tests {
     /// enforcement converts this to a `CounterpartyDenied` outcome with a
     /// REDACTED value.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn home_domain_cyrillic_non_ascii_denies_with_redacted_value() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -3063,8 +3230,11 @@ mod tests {
     /// On-chain home_domain with mixed case must match a lowercase-normalised
     /// allowlist entry (RFC 4343 DNS case-insensitivity).
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn home_domain_mixed_case_matches_lowercase_allowlist_entry() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -3097,8 +3267,11 @@ mod tests {
     /// An account with no home domain cannot be matched against an allowlist of
     /// trusted operators.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn home_domain_none_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -3124,8 +3297,11 @@ mod tests {
     /// resolved.  `account_view` alone is not sufficient to unlock HOME_DOMAIN
     /// matching; `identity_view` must be set.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn home_domain_no_identity_view_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -3149,8 +3325,11 @@ mod tests {
     /// Mixed-kinds criterion: both `G_ACCOUNT` and `HOME_DOMAIN` are enabled.
     /// Verifies that both checks fire in order and that the first denial wins.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn mixed_kinds_g_account_and_home_domain_both_checked() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -3179,8 +3358,11 @@ mod tests {
 
     /// Mixed-kinds: G_ACCOUNT denies first — HOME_DOMAIN check is never reached.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn mixed_kinds_g_account_denies_before_home_domain() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -3227,8 +3409,11 @@ mod tests {
     /// (`derive_value_class` falls through to `ReadOnly` for any name outside
     /// its match arms) must deny fail-closed rather than passing silently.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn moves_value_tool_with_unpopulated_effects_denies_unsizable() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool_with_kind(
             "stellar_dex_trade",
             crate::policy::ToolValueKind::MovesValue,
@@ -3250,8 +3435,11 @@ mod tests {
 
     /// An opaque-signing call on the single-tx path must deny fail-closed.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn opaque_sign_call_denies_unsizable_on_single_tx() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_sep43_sign_transaction");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -3272,8 +3460,11 @@ mod tests {
     /// single-leg pay/create call is checked identically to the raw-args
     /// path (byte-identical outcome for the existing pay tests above).
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn g_account_over_effects_single_leg_matches_raw_args_outcome() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -3296,8 +3487,11 @@ mod tests {
     /// (`CounterpartyDenied`) rather than erroring: a counterparty-bearing
     /// action with no resolvable counterparty cannot satisfy an allowlist.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn g_account_over_effects_missing_destination_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
 
         let tool = make_tool("stellar_multicall");

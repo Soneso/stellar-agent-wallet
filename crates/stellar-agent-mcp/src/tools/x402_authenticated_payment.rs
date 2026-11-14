@@ -1587,23 +1587,27 @@ thread_local! {
 mod approval_boundary_tests {
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn x402_queue_reads_no_signer_and_runs_no_identity_gate() {
         crate::tools::x402_create_payment::approval_tests::queue_key_case(true).await;
     }
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn authenticated_x402_queue_skips_sep10() {
         crate::tools::x402_create_payment::approval_tests::queue_key_case(true).await;
     }
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn approval_expiring_during_preparation_signs_nothing() {
         crate::tools::x402_create_payment::approval_tests::expiry_case(true, false).await;
     }
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn key_read_crossing_expiry_signs_nothing() {
         crate::tools::x402_create_payment::approval_tests::expiry_case(true, true).await;
     }
@@ -1747,6 +1751,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn muxed_contract_payment_refuses_before_state() {
         let home = tempfile::tempdir().unwrap();
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
@@ -1970,7 +1975,11 @@ mod tests {
     #[cfg(not(feature = "mainnet-write"))]
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn mainnet_profile_refuses_before_signing_no_signature_produced() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = make_mainnet_server();
         let args = X402AuthenticatedPaymentArgs {
             chain_id: "stellar:mainnet".to_owned(),
@@ -2007,7 +2016,11 @@ mod tests {
     /// Queueing requires no keys and persists the complete payment intent.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn require_approval_verdict_queues_the_payment_and_signs_nothing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let home = tempfile::tempdir().unwrap();
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
@@ -2055,6 +2068,7 @@ mod tests {
     /// authority.
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn x402_home_domain_marker_is_not_logged() {
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fixture = crate::tools::message_signing_tests::Fixture::new();
@@ -2103,7 +2117,11 @@ mod tests {
     /// `audit.chain_key_unavailable`.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn policy_denial_precedes_the_audit_preflight() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use std::sync::Arc;
         stellar_agent_test_support::keyring_mock::install().ok();
         let profile = Profile::builder_testnet(
@@ -2143,7 +2161,11 @@ mod tests {
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn a_mainnet_server_without_a_context_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = make_mainnet_server();
         assert!(server.mainnet_context.is_none());
         let result = server

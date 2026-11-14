@@ -223,6 +223,9 @@ fn payment_envelope_xdr(source: &str, dest: &str, amount_stroops: i64) -> String
 #[tokio::test]
 #[serial]
 async fn dangerous_key_tojson_rejected_ungated() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     setup_mock_keyring();
     let tmp = TempDir::new().unwrap();
     let toolsets_root = tmp.path().to_path_buf();
@@ -257,6 +260,9 @@ async fn dangerous_key_tojson_rejected_ungated() {
 #[tokio::test]
 #[serial]
 async fn dangerous_key_then_rejected_ungated() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     setup_mock_keyring();
     let tmp = TempDir::new().unwrap();
     let toolsets_root = tmp.path().to_path_buf();
@@ -282,6 +288,9 @@ async fn dangerous_key_then_rejected_ungated() {
 #[tokio::test]
 #[serial]
 async fn dangerous_key_proto_rejected_ungated() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     setup_mock_keyring();
     let tmp = TempDir::new().unwrap();
     let toolsets_root = tmp.path().to_path_buf();
@@ -307,6 +316,9 @@ async fn dangerous_key_proto_rejected_ungated() {
 #[tokio::test]
 #[serial]
 async fn dangerous_key_nested_in_array_rejected_ungated() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     setup_mock_keyring();
     let tmp = TempDir::new().unwrap();
     let toolsets_root = tmp.path().to_path_buf();
@@ -350,6 +362,9 @@ async fn dangerous_key_nested_in_array_rejected_ungated() {
 #[tokio::test]
 #[serial]
 async fn benign_payload_passes_ungated() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     setup_mock_keyring();
     let tmp = TempDir::new().unwrap();
     let toolsets_root = tmp.path().to_path_buf();
@@ -389,6 +404,9 @@ async fn benign_payload_passes_ungated() {
 #[tokio::test]
 #[serial]
 async fn chain_id_injected_and_dangerous_key_still_caught() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     setup_mock_keyring();
     let tmp = TempDir::new().unwrap();
     let toolsets_root = tmp.path().to_path_buf();
@@ -441,6 +459,7 @@ async fn chain_id_injected_and_dangerous_key_still_caught() {
 #[tokio::test]
 #[serial]
 async fn dangerous_key_tojson_rejected_gated() {
+    let _root = crate::common::isolated_data_root();
     use stellar_agent_core::approval::{
         PendingApprovalStore, TOOLSET_GRANT_DEFAULT_TTL_MS, ToolsetGrantStore,
         build_attested_grant, process_uid_for_attestation,
@@ -536,6 +555,7 @@ async fn dangerous_key_tojson_rejected_gated() {
 #[tokio::test]
 #[serial]
 async fn dangerous_key_chain_id_injected_gated_still_caught() {
+    let _root = crate::common::isolated_data_root();
     use stellar_agent_core::approval::{
         PendingApprovalStore, TOOLSET_GRANT_DEFAULT_TTL_MS, ToolsetGrantStore,
         build_attested_grant, process_uid_for_attestation,
@@ -633,6 +653,7 @@ async fn dangerous_key_chain_id_injected_gated_still_caught() {
 #[tokio::test]
 #[serial]
 async fn malicious_toolset_keystore_read_refused() {
+    let _root = crate::common::isolated_data_root();
     setup_mock_keyring();
     let tmp = TempDir::new().unwrap();
     let toolsets_root = tmp.path().to_path_buf();
@@ -668,6 +689,7 @@ async fn malicious_toolset_keystore_read_refused() {
 #[tokio::test]
 #[serial]
 async fn malicious_toolset_tx_resign_refused() {
+    let _root = crate::common::isolated_data_root();
     setup_mock_keyring();
     let tmp = TempDir::new().unwrap();
     let toolsets_root = tmp.path().to_path_buf();
@@ -723,6 +745,7 @@ async fn malicious_toolset_tx_resign_refused() {
 #[tokio::test]
 #[serial]
 async fn malicious_toolset_declares_real_cap_names_denylist_tool() {
+    let _root = crate::common::isolated_data_root();
     setup_mock_keyring();
     let tmp = TempDir::new().unwrap();
     let toolsets_root = tmp.path().to_path_buf();
@@ -763,6 +786,7 @@ async fn malicious_toolset_declares_real_cap_names_denylist_tool() {
 #[tokio::test]
 #[serial]
 async fn malicious_toolset_gated_no_grant() {
+    let _root = crate::common::isolated_data_root();
     setup_gated_mock_keyring();
     let tmp = TempDir::new().unwrap();
     let toolsets_root = tmp.path().to_path_buf();
@@ -812,6 +836,7 @@ async fn malicious_toolset_gated_no_grant() {
 #[tokio::test]
 #[serial]
 async fn malicious_toolset_policy_mutate_refused() {
+    let _root = crate::common::isolated_data_root();
     use stellar_agent_toolsets_runtime::matrix::{
         OBSERVE_EVENT_GRANTS, PROPOSE_TRANSACTION_GRANTS, READ_BALANCE_GRANTS,
         SUGGEST_DESTINATION_GRANTS,
@@ -891,6 +916,9 @@ async fn malicious_toolset_policy_mutate_refused() {
 #[tokio::test]
 #[serial]
 async fn secret_in_sibling_field_never_in_error() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     setup_mock_keyring();
     let tmp = TempDir::new().unwrap();
     let toolsets_root = tmp.path().to_path_buf();
@@ -940,6 +968,9 @@ async fn secret_in_sibling_field_never_in_error() {
 #[tokio::test]
 #[serial]
 async fn depth_at_max_plus_1_rejected_ungated() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     setup_mock_keyring();
     let tmp = TempDir::new().unwrap();
     let toolsets_root = tmp.path().to_path_buf();
@@ -982,6 +1013,9 @@ async fn depth_at_max_plus_1_rejected_ungated() {
 #[tokio::test]
 #[serial]
 async fn wide_payload_over_node_cap_rejected_ungated() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     setup_mock_keyring();
     let tmp = TempDir::new().unwrap();
     let toolsets_root = tmp.path().to_path_buf();

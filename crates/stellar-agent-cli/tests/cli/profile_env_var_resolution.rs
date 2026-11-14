@@ -151,6 +151,7 @@ fn run_cli_with_env(
     overlay: &[(&str, &str)],
 ) -> Run {
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
+    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
     let mut command = Command::new(bin_path);
     command
         .args(args)

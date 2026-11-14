@@ -1719,6 +1719,7 @@ mod tests {
     }
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn verified_opt_in_uses_the_override_and_rejects_expiry_and_forgery()
     -> Result<(), Box<dyn std::error::Error>> {
         use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -1825,7 +1826,12 @@ mod tests {
     /// event carries the asset or the chain id the caller supplied.
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn trustline_asset_marker_is_not_echoed() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_test_support::CaptureWriter;
         use stellar_agent_test_support::rejected_value::{
             CREDENTIAL_MARKER, assert_no_marker_in_text,

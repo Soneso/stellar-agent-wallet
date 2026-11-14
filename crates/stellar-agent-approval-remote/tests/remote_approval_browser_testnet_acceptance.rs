@@ -599,6 +599,7 @@ async fn remote_approval_browser_drives_real_payment_commit() {
     }
     let _stellar_agent_home_guard = StellarAgentHomeGuard;
     unsafe {
+        stellar_agent_test_support::sandbox::mark_sandbox(tls_home_dir.path()).unwrap();
         std::env::set_var("STELLAR_AGENT_HOME", tls_home_dir.path());
     }
 

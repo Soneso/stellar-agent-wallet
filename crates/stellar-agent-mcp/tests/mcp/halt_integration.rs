@@ -593,6 +593,9 @@ async fn the_signer_read_and_request_witnesses_count_an_unhalted_call() {
 #[tokio::test]
 #[serial]
 async fn serve_on_until_returns_after_the_shutdown_future_resolves() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let server = WalletServer::new(
         Profile::builder_testnet_named("shutdown-future", "svc", "acct", "nonce-svc", "nonce-acct")
             .with_noop_engine()
@@ -637,6 +640,9 @@ async fn serve_on_until_returns_after_the_shutdown_future_resolves() {
 #[tokio::test]
 #[serial]
 async fn serve_on_until_returns_after_the_shutdown_wait_when_the_session_cannot_stop() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let server = WalletServer::new(
         Profile::builder_testnet_named("shutdown-wait", "svc", "acct", "nonce-svc", "nonce-acct")
             .with_noop_engine()
@@ -703,6 +709,9 @@ const TRANSPORT_SOURCE: &str = include_str!("../../src/transport.rs");
 #[tokio::test]
 #[serial]
 async fn serve_on_until_returns_before_initialization_on_shutdown() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     assert_eq!(
         TRANSPORT_SOURCE.matches(".serve_with_ct(").count(),
         1,
@@ -826,6 +835,7 @@ impl HeadlessHome {
 
     /// The binary bound to this home and the headless keyring.
     fn command(&self) -> Command {
+        stellar_agent_test_support::sandbox::mark_sandbox(self.home.path()).unwrap();
         let mut command = crate::common::server_binary::server_command();
         command
             .args(["--profile", PROFILE])

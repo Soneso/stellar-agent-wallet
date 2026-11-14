@@ -21,6 +21,9 @@ use crate::helpers::{
 #[test]
 #[serial]
 fn unregistered_tool_rejected_before_key_state() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
 
     // Intentionally do NOT seed a key — if key state were engaged, the call
@@ -52,6 +55,9 @@ fn unregistered_tool_rejected_before_key_state() {
 #[test]
 #[serial]
 fn rejected_input_nonce_tool() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     capture_refusal(|| {
         let profile = make_profile("refusal-marker");
         let mint = NonceMint::from_profile(&profile, "nonce-test").expect("mint configuration");

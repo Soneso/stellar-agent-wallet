@@ -91,6 +91,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn intent_view_reads_without_writing_and_refuses_tampering() {
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -199,6 +200,7 @@ mod tests {
     }
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn intent_views_report_horizons_without_mutation() {
         use stellar_agent_network::intent_view_test_helpers::IntentViewFixture;
         for mode in ["invoke", "done", "unset", "unclassified"] {

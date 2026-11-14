@@ -535,14 +535,24 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn enabled_profile_allows_startup() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let profile = testnet_profile();
         assert!(!profile.mcp_disabled);
         assert_eq!(mcp_disabled_refusal(&profile), None);
     }
 
     #[test]
+    #[serial_test::serial]
     fn disabled_profile_refuses_startup_with_wire_code() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut profile = testnet_profile();
         profile.mcp_disabled = true;
         assert_eq!(
@@ -554,13 +564,23 @@ mod tests {
     // ── D6: selected name vs. the name derived from the profile's contents ───
 
     #[test]
+    #[serial_test::serial]
     fn matching_names_produce_no_refusal() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let profile = named_profile("alice");
         assert_eq!(profile_name_mismatch_refusal(&profile, "alice"), None);
     }
 
     #[test]
+    #[serial_test::serial]
     fn copied_profile_file_refuses_without_naming_either_profile() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // The realistic path: `default.toml` copied to `alice.toml` without
         // re-deriving its keyring coordinates.
         let profile = named_profile("default");
@@ -584,7 +604,12 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn noop_engine_profile_is_checked_too() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // The check must not be attached to the V1 policy-engine derivation:
         // Noop profiles never reach it, yet the approval-store derivation —
         // which resolves a mismatch to `default` — runs for every engine.
@@ -603,7 +628,12 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn absent_owner_key_prefix_is_a_mismatch_not_a_default() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut profile = named_profile("alice");
         profile.policy_owner_key_id =
             stellar_agent_core::profile::schema::KeyringEntryRef::new("hand-written", "default");
@@ -621,7 +651,12 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn the_synthesised_first_run_profile_reconciles_as_default() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // The MCP server's no-name startup path loads or synthesises `default`;
         // that profile must pass the reconciliation check unchanged.
         let profile = named_profile("default");

@@ -85,6 +85,18 @@ Rules:
   D13 every declared feature is classified as product or test; product
       features reach no test features or optional test packages, and no
       non-optional normal or build dependency enables either
+
+  D15 is a lexical storage guard beside runtime refusal of unmarked storage,
+      paths outside permitted sandbox roots, and implicit wallet path fallbacks.
+      It recognizes apple_native_keyring_store, dbus_secret_service_keyring_store,
+      windows_native_keyring_store, security_framework (except base::Error),
+      dbus_secret_service, dbus, windows_sys paths and imports containing
+      Credentials, ProjectDirs, BaseDirs, UserDirs, directories, dirs, home_dir
+      calls and home imports, storage dependency renames in member manifests
+      and root workspace.dependencies, platform suffix literals, and the
+      stellar-agent or Soneso.stellar-agent component literals in join,
+      PathBuf::from and Path::new calls outside production resolvers and
+      documentation; live grants and marker ownership retain their boundaries.
 """
 import argparse
 import ast
@@ -100,7 +112,7 @@ import sys
 import tomllib
 
 FEATURE = 'mainnet-write'
-TEST_FEATURES = ('test-helpers', 'test-hooks', 'test-loopback', 'testnet-acceptance',
+TEST_FEATURES = ('live-platform-keyring', 'test-helpers', 'test-hooks', 'test-loopback', 'testnet-acceptance',
                  'testnet-helpers', 'testnet-integration', 'wiremock-helpers',
                  'verifier-registry', 'operator-enroll-browser-acceptance')
 PRODUCT_FEATURES = ('default', 'mainnet-write', 'deploy-cli')
@@ -162,6 +174,9 @@ TESTNET_ACTIVATION_ALLOWANCE = tuple(
     ('testnet.yml', job, TESTNET_DRIVER) for job in ('acceptance-1', 'acceptance-2'))
 TESTNET_FEATURES_FUNCTION = '''suite_features() {
   local crate="$1" feature="$2"
+  if [ "${STELLAR_AGENT_TEST_KEYRING-}" = platform ] && grep -qE '^live-platform-keyring *=' "crates/$crate/Cargo.toml"; then
+    feature="$feature,live-platform-keyring"
+  fi
   if [ "$MAINNET_WRITE" = "on" ] && grep -qE '^mainnet-write *=' "crates/$crate/Cargo.toml"; then
     printf 'mainnet-write,%s\\n' "$feature"
   else
@@ -411,7 +426,7 @@ def refused_value(name, value):
 
 def source_files(root, names):
     for directory, dirs, files in os.walk(root):
-        dirs[:] = [d for d in dirs if d not in ('target', 'node_modules', '.git')]
+        dirs[:] = [d for d in dirs if d not in ('target', 'node_modules', '.git', '.claude', '.codex')]
         for name in names:
             if name in files:
                 yield pathlib.Path(directory) / name
@@ -1581,9 +1596,143 @@ class Checker:
                         dependency, tests, test_packages=TEST_PACKAGES):
                     self.fail('D13', f'{name}: {dependency["kind"] or "normal"} dependency {dependency["name"]} enables test code')
 
+    def D14(self):
+        """Every development graph enables storage isolation."""
+        protected = {'stellar-agent-' + name for name in ('core', 'network', 'headless-keyring', 'smart-account')}
+        storage = protected | {'directories', 'apple-native-keyring-store', 'dbus-secret-service-keyring-store', 'windows-native-keyring-store'}
+        for member in self.packages:
+            for target in ('x86_64-unknown-linux-gnu', 'aarch64-apple-darwin', 'x86_64-pc-windows-msvc'):
+                for flags in ([], ['--no-default-features']):
+                    args = ['tree', '--locked', '--offline', '-p', member, '--target', target,
+                            '-e', 'normal,build,dev', '--prefix', 'depth', '-f', '{p}|{f}', *flags]
+                    for line in run_cargo(self.root, args).splitlines():
+                        match = re.match(r'\d+(\S+) v[^|]+\|([^ ]*)', line)
+                        if match and match[1] in protected and 'test-helpers' not in match[2].split(','):
+                            self.fail('D14', f'{member} {target} {flags}: {match[1]} lacks isolation')
+        for target in ('x86_64-unknown-linux-gnu', 'aarch64-apple-darwin', 'x86_64-pc-windows-msvc'):
+            data = json.loads(run_cargo(self.root, ['metadata', '--locked', '--offline', '--all-features',
+                                                   '--filter-platform', target, '--format-version', '1']))
+            names = {package['id']: package['name'] for package in data['packages']}
+            nodes = {node['id']: node for node in data['resolve']['nodes']}
+            pending = [dependency['pkg'] for node in nodes.values() for dependency in node['deps']
+                       if any(kind['kind'] == 'build' for kind in dependency['dep_kinds'])]
+            visited = set()
+            while pending:
+                package = pending.pop()
+                if package in visited:
+                    continue
+                visited.add(package)
+                if names[package] in storage:
+                    self.fail('D14', f'{target}: build dependency reaches {names[package]}')
+                pending.extend(dependency['pkg'] for dependency in nodes[package]['deps']
+                               if any(kind['kind'] in (None, 'build') for kind in dependency['dep_kinds']))
+        for row in inventory(self.root, self.workflows, self.scripts):
+            if 'live-platform-keyring' not in row['command']:
+                continue
+            allowed = row['job'] == 'platform-keyring' or row['source'] == TESTNET_DRIVER
+            compile_only = '--no-run' in row['command'] or re.search(r'cargo (clippy|doc|check)\b', row['command'])
+            if not allowed and not compile_only:
+                self.fail('D14', f'live execution outside acceptance: {row["command"]}')
+
+    def D15(self):
+        """Storage constructors and live grants stay inside their boundaries."""
+        network = 'crates/stellar-agent-network/src/keyring.rs'
+        core = 'crates/stellar-agent-core/src/profile/schema.rs'
+        headless = 'crates/stellar-agent-headless-keyring/src/lib.rs'
+        roundtrip = 'crates/stellar-agent-network/tests/keyring_platform.rs'
+        acceptance = {
+            'crates/stellar-agent-cli/src/main.rs',
+            'crates/stellar-agent-cli/tests/pay_policy_v1_testnet_acceptance.rs',
+            'crates/stellar-agent-cli/tests/pay_timeout_reconcile_testnet_acceptance.rs',
+            'crates/stellar-agent-cli/tests/profile_init_enroll_signer_testnet_acceptance.rs',
+        }
+        acceptance_children = acceptance | {
+            'crates/stellar-agent-cli/tests/claim_testnet_acceptance.rs',
+            'crates/stellar-agent-cli/tests/cap85_external_ref_cli_testnet_acceptance.rs',
+            'crates/stellar-agent-cli/tests/smart_account_execute_testnet_acceptance.rs',
+            'crates/stellar-agent-cli/tests/cli_submit_only_network_binding_testnet_acceptance.rs',
+        }
+        native = r'\b(?:apple_native_keyring_store|dbus_secret_service_keyring_store|windows_native_keyring_store|security_framework(?!\s*::\s*base\s*::\s*Error\b)|dbus_secret_service|dbus)\b|\bwindows_sys\b[^;]*\bCredentials\b'
+        resolver = r'\b(?:ProjectDirs|BaseDirs|UserDirs|directories\s*::|dirs\s*::|home_dir\s*\()|\bextern\s+crate\s+(?:directories|dirs)\b'
+        resolver += r'|\buse\s+[^;]*\b(?:home\s*::|home_dir\b|dirs\s*::|directories\s*::)[^;]*;'
+        live = r'\b(?:init_platform_keyring_store_live|LivePlatformKeyring)\b'
+        storage_packages = {'apple-native-keyring-store', 'dbus-secret-service-keyring-store',
+                            'windows-native-keyring-store', 'security-framework',
+                            'dbus-secret-service', 'dbus', 'windows-sys', 'directories', 'dirs'}
+        manifests = list((self.root / 'crates').glob('*/Cargo.toml'))
+        if (self.root / 'Cargo.toml').is_file():
+            manifests.append(self.root / 'Cargo.toml')
+        for manifest in manifests:
+            def check_renames(table):
+                for name, value in table.items():
+                    if isinstance(value, dict):
+                        if value.get('package') in storage_packages and name != value['package']:
+                            self.fail('D15', f'{manifest.relative_to(self.root)}: renamed storage dependency')
+                        check_renames(value)
+            tables = tomllib.loads(manifest.read_text())
+            if manifest == self.root / 'Cargo.toml':
+                tables = tables.get('workspace', {}).get('dependencies', {})
+            check_renames(tables)
+        for path in (self.root / 'crates').rglob('*.rs'):
+            relative = path.relative_to(self.root).as_posix()
+            source = path.read_text()
+            code, strings = rust_code(source)
+            if '--test-live-platform-keyring' in code and relative not in acceptance_children:
+                self.fail('D15', f'{relative}: live child entry outside acceptance')
+            bare = list(code)
+            for start, end, _ in strings:
+                bare[start:end] = ' ' * (end - start)
+            bare = ''.join(bare)
+            def body(name, kind='fn'):
+                match = re.search(r'\b' + kind + ' ' + name + r'\b[^;]*?\{', bare)
+                if not match:
+                    return (-1, -1)
+                depth = 1
+                for end in range(match.end(), len(bare)):
+                    depth += (bare[end] == '{') - (bare[end] == '}')
+                    if not depth:
+                        return (match.start(), end)
+                raise ValueError(f'{relative}: unclosed storage body')
+            regions = {}
+            if relative == network:
+                regions[native] = body('construct_native_store')
+                regions[live] = body('live', 'mod')
+                for call in re.finditer(r'\bconstruct_native_store\b', bare):
+                    if re.search(r'\bfn\s+$', bare[:call.start()]):
+                        continue
+                    allowed_calls = (body('init_production_store'), regions[live])
+                    if not any(start <= call.start() < end for start, end in allowed_calls):
+                        self.fail('D15', f'{relative}: native factory call outside its entry points')
+            if relative == 'crates/stellar-agent-cli/src/main.rs':
+                regions[live] = body('live_acceptance_entry')
+            if relative in (core, headless):
+                regions[resolver] = body('production_data_root' if relative == core else 'canonical_data_root')
+            for start, _, literal in strings:
+                component = literal in ('stellar-agent', 'Soneso.stellar-agent') and re.search(
+                    r'(?:\.\s*join|PathBuf\s*::\s*from|Path\s*::\s*new)\s*\(\s*$', bare[:start])
+                if component or any(suffix in literal for suffix in ('Soneso.stellar-agent', '.local/share/stellar-agent')):
+                    low, high = regions.get(resolver, (-1, -1))
+                    if not low <= start < high:
+                        self.fail('D15', f'{relative}: platform wallet suffix outside production resolver')
+            for pattern in (native, resolver, live):
+                for match in re.finditer(pattern, bare):
+                    allowed = pattern == live and (relative == roundtrip or relative in acceptance - {'crates/stellar-agent-cli/src/main.rs'})
+                    start, end = regions.get(pattern, (-1, -1))
+                    if not allowed and not start <= match.start() < end:
+                        self.fail('D15', f'{relative}:{source.count(chr(10), 0, match.start()) + 1}: storage escape')
+            # Imports retain their source paths, including renamed and public imports.
+            # Doc code has no constructor allowance, including no-run examples.
+            docs = '\n'.join(re.sub(r'^\s*//[/!] ?', '', line) for line in source.splitlines()
+                             if re.match(r'^\s*//[/!]', line))
+            for block in re.findall(r'```[^\n]*\n(.*?)```', docs, re.S):
+                if re.search(native + '|' + resolver + '|' + live, rust_code(block)[0]):
+                    self.fail('D15', f'{relative}: storage constructor in documentation')
+            if '.stellar-agent-test-sandbox' in code and relative not in (core, headless, 'crates/stellar-agent-test-support/src/sandbox.rs'):
+                self.fail('D15', f'{relative}: sandbox marker outside its owner')
+
     def run(self):
         self.workflows, self.scripts = workflow_inputs(self.root)
-        for number in range(1, 14):
+        for number in range(1, 16):
             rule = f'D{number}'
             try:
                 getattr(self, rule)()
@@ -1645,8 +1794,8 @@ INVOCATIONS = [
     {'workflow': 'ci.yml', 'job': 'windows-storage', 'step': 'MCP binary and console-event tests, feature on (unbounded compile phase)', 'source': 'ci.yml', 'command': 'cargo test -p stellar-agent-cli -p stellar-agent-mcp --target x86_64-pc-windows-msvc --features test-helpers --no-run', 'relied_on': 'on', 'selection': ['-p', 'stellar-agent-cli', '-p', 'stellar-agent-mcp'], 'features': ['--features', 'test-helpers'], 'edges': 'normal,build,dev', 'target': 'x86_64-pc-windows-msvc', 'bins': None, 'runner': 'windows-2025'},
     {'workflow': 'ci.yml', 'job': 'windows-storage', 'step': 'MCP console-event shutdown tests, feature on', 'source': 'ci.yml', 'command': 'cargo test -p stellar-agent-cli -p stellar-agent-mcp --target x86_64-pc-windows-msvc --features test-helpers --test mcp -- halt_integration::windows_', 'relied_on': 'on', 'selection': ['-p', 'stellar-agent-cli', '-p', 'stellar-agent-mcp'], 'features': ['--features', 'test-helpers'], 'edges': 'normal,build,dev', 'target': 'x86_64-pc-windows-msvc', 'bins': None, 'runner': 'windows-2025'},
     {'workflow': 'ci.yml', 'job': 'windows-storage', 'step': 'MCP console-event shutdown tests, feature on', 'source': 'ci.yml', 'command': 'cargo test -p stellar-agent-cli -p stellar-agent-mcp --target x86_64-pc-windows-msvc --features test-helpers --test mcp -- common::child_process::windows_tests:: common::child_process::pseudo_console::tests::', 'relied_on': 'on', 'selection': ['-p', 'stellar-agent-cli', '-p', 'stellar-agent-mcp'], 'features': ['--features', 'test-helpers'], 'edges': 'normal,build,dev', 'target': 'x86_64-pc-windows-msvc', 'bins': None, 'runner': 'windows-2025'},
-    {'workflow': 'ci.yml', 'job': 'platform-keyring', 'step': 'Build the platform keyring test', 'source': 'ci.yml', 'command': 'cargo test -p stellar-agent-network --test keyring_platform --no-run', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-network'], 'features': [], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
-    {'workflow': 'ci.yml', 'job': 'platform-keyring', 'step': 'Run the platform keyring round trip', 'source': 'ci.yml', 'command': 'cargo test -p stellar-agent-network --test keyring_platform -- --ignored --exact keyring_platform_roundtrip', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-network'], 'features': [], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'ci.yml', 'job': 'platform-keyring', 'step': 'Build the platform keyring test', 'source': 'ci.yml', 'command': 'cargo test -p stellar-agent-network --features live-platform-keyring --test keyring_platform --no-run', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-network'], 'features': ['--features', 'live-platform-keyring'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'ci.yml', 'job': 'platform-keyring', 'step': 'Run the platform keyring round trip', 'source': 'ci.yml', 'command': 'cargo test -p stellar-agent-network --features live-platform-keyring --test keyring_platform -- --ignored --exact keyring_platform_roundtrip', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-network'], 'features': ['--features', 'live-platform-keyring'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
     {'workflow': 'ci.yml', 'job': 'release-shape', 'step': 'Build and check the release binaries', 'source': '.github/scripts/release/check-host.sh', 'command': 'cargo build --locked -p stellar-agent-cli', 'relied_on': 'on', 'selection': ['-p', 'stellar-agent-cli'], 'features': [], 'edges': 'normal,build', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
     {'workflow': 'ci.yml', 'job': 'feature-on-test', 'step': 'Check network feature forwarding in isolation', 'source': 'ci.yml', 'command': 'cargo check -p stellar-agent-network --features mainnet-write', 'relied_on': 'on', 'selection': ['-p', 'stellar-agent-network'], 'features': ['--features', 'mainnet-write'], 'edges': 'normal,build', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
     {'workflow': 'ci.yml', 'job': 'test', 'step': 'Check each test-support feature set', 'source': 'ci.yml', 'command': 'cargo check -p stellar-agent-test-support --no-default-features --features "test-helpers"', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-test-support'], 'features': ['--no-default-features', '--features', 'test-helpers'], 'edges': 'normal,build', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
@@ -1655,10 +1804,10 @@ INVOCATIONS = [
     {'workflow': 'ci.yml', 'job': 'test', 'step': 'Check each test-support feature set', 'source': 'ci.yml', 'command': 'cargo check -p stellar-agent-test-support --no-default-features --features "wiremock-helpers"', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-test-support'], 'features': ['--no-default-features', '--features', 'wiremock-helpers'], 'edges': 'normal,build', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
     {'workflow': 'ci.yml', 'job': 'test', 'step': 'Check each test-support feature set', 'source': 'ci.yml', 'command': 'cargo check -p stellar-agent-test-support --no-default-features', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-test-support'], 'features': ['--no-default-features'], 'edges': 'normal,build', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
     {'workflow': 'ci.yml', 'job': 'test', 'step': 'Run the test-support Friendbot unit tests', 'source': 'ci.yml', 'command': 'cargo test -p stellar-agent-test-support --no-default-features --features testnet-helpers --lib', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-test-support'], 'features': ['--no-default-features', '--features', 'testnet-helpers'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': [], 'runner': 'ubuntu-24.04'},
-    {'workflow': 'ci.yml', 'job': 'feature-on-clippy', 'step': 'Run clippy', 'source': 'ci.yml', 'command': 'cargo clippy --workspace --all-targets --features "mainnet-write,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-integration,testnet-helpers,verifier-registry,wiremock-helpers,deploy-cli,operator-enroll-browser-acceptance" -- -D warnings', 'relied_on': 'on', 'selection': ['--workspace'], 'features': ['--features', 'mainnet-write,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-integration,testnet-helpers,verifier-registry,wiremock-helpers,deploy-cli,operator-enroll-browser-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
-    {'workflow': 'ci.yml', 'job': 'clippy', 'step': 'Run clippy', 'source': 'ci.yml', 'command': 'cargo clippy --workspace --all-targets --no-default-features --features "test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-integration,testnet-helpers,verifier-registry,wiremock-helpers,deploy-cli,operator-enroll-browser-acceptance" -- -D warnings', 'relied_on': 'off', 'selection': ['--workspace'], 'features': ['--no-default-features', '--features', 'test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-integration,testnet-helpers,verifier-registry,wiremock-helpers,deploy-cli,operator-enroll-browser-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
-    {'workflow': 'ci.yml', 'job': 'feature-on-doc', 'step': 'Build the rustdoc', 'source': 'ci.yml', 'command': 'cargo doc --workspace --no-deps --features "mainnet-write,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-integration,testnet-helpers,verifier-registry,wiremock-helpers,deploy-cli,operator-enroll-browser-acceptance"', 'relied_on': 'on', 'selection': ['--workspace'], 'features': ['--features', 'mainnet-write,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-integration,testnet-helpers,verifier-registry,wiremock-helpers,deploy-cli,operator-enroll-browser-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
-    {'workflow': 'ci.yml', 'job': 'doc', 'step': 'Build the rustdoc', 'source': 'ci.yml', 'command': 'cargo doc --workspace --no-deps --no-default-features --features "test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-integration,testnet-helpers,verifier-registry,wiremock-helpers,deploy-cli,operator-enroll-browser-acceptance"', 'relied_on': 'off', 'selection': ['--workspace'], 'features': ['--no-default-features', '--features', 'test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-integration,testnet-helpers,verifier-registry,wiremock-helpers,deploy-cli,operator-enroll-browser-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'ci.yml', 'job': 'feature-on-clippy', 'step': 'Run clippy', 'source': 'ci.yml', 'command': 'cargo clippy --workspace --all-targets --features "mainnet-write,live-platform-keyring,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-integration,testnet-helpers,verifier-registry,wiremock-helpers,deploy-cli,operator-enroll-browser-acceptance" -- -D warnings', 'relied_on': 'on', 'selection': ['--workspace'], 'features': ['--features', 'mainnet-write,live-platform-keyring,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-integration,testnet-helpers,verifier-registry,wiremock-helpers,deploy-cli,operator-enroll-browser-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'ci.yml', 'job': 'clippy', 'step': 'Run clippy', 'source': 'ci.yml', 'command': 'cargo clippy --workspace --all-targets --no-default-features --features "live-platform-keyring,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-integration,testnet-helpers,verifier-registry,wiremock-helpers,deploy-cli,operator-enroll-browser-acceptance" -- -D warnings', 'relied_on': 'off', 'selection': ['--workspace'], 'features': ['--no-default-features', '--features', 'live-platform-keyring,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-integration,testnet-helpers,verifier-registry,wiremock-helpers,deploy-cli,operator-enroll-browser-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'ci.yml', 'job': 'feature-on-doc', 'step': 'Build the rustdoc', 'source': 'ci.yml', 'command': 'cargo doc --workspace --no-deps --features "mainnet-write,live-platform-keyring,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-integration,testnet-helpers,verifier-registry,wiremock-helpers,deploy-cli,operator-enroll-browser-acceptance"', 'relied_on': 'on', 'selection': ['--workspace'], 'features': ['--features', 'mainnet-write,live-platform-keyring,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-integration,testnet-helpers,verifier-registry,wiremock-helpers,deploy-cli,operator-enroll-browser-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'ci.yml', 'job': 'doc', 'step': 'Build the rustdoc', 'source': 'ci.yml', 'command': 'cargo doc --workspace --no-deps --no-default-features --features "live-platform-keyring,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-integration,testnet-helpers,verifier-registry,wiremock-helpers,deploy-cli,operator-enroll-browser-acceptance"', 'relied_on': 'off', 'selection': ['--workspace'], 'features': ['--no-default-features', '--features', 'live-platform-keyring,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-integration,testnet-helpers,verifier-registry,wiremock-helpers,deploy-cli,operator-enroll-browser-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
     {'workflow': 'coverage.yml', 'job': 'coverage-on', 'step': 'Measure feature-on offline line coverage', 'source': 'coverage.yml', 'command': 'cargo llvm-cov --workspace --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov-feature-on.json', 'relied_on': 'on', 'selection': ['--workspace'], 'features': ['--features', 'mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
     {'workflow': 'coverage.yml', 'job': 'coverage-off', 'step': 'Measure offline line coverage', 'source': 'coverage.yml', 'command': 'cargo llvm-cov --workspace --no-default-features --features test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov-feature-off.json', 'relied_on': 'off', 'selection': ['--workspace'], 'features': ['--no-default-features', '--features', 'test-helpers,test-hooks,test-loopback,verifier-registry'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
     {'workflow': 'ci.yml', 'job': 'feature-on-test', 'step': 'Run the offline tests', 'source': 'ci.yml', 'command': 'cargo test --workspace --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry', 'relied_on': 'on', 'selection': ['--workspace'], 'features': ['--features', 'mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},

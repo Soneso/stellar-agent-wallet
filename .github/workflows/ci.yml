@@ -34,7 +34,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  FEATURES_EXCEPT_MAINNET_WRITE: test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-integration,testnet-helpers,verifier-registry,wiremock-helpers,deploy-cli,operator-enroll-browser-acceptance
+  FEATURES_EXCEPT_MAINNET_WRITE: live-platform-keyring,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-integration,testnet-helpers,verifier-registry,wiremock-helpers,deploy-cli,operator-enroll-browser-acceptance
 
 jobs:
   fmt:
@@ -564,7 +564,7 @@ jobs:
           prefix-key: platform-keyring
           save-if: ${{ github.event_name == 'push' }}
       - name: Build the platform keyring test
-        run: cargo test -p stellar-agent-network --test keyring_platform --no-run
+        run: cargo test -p stellar-agent-network --features live-platform-keyring --test keyring_platform --no-run
       # The round trip is an ignored test, so a run that executes no test
       # fails on the count check.
       - name: Run the platform keyring round trip
@@ -572,7 +572,7 @@ jobs:
           set -o pipefail
           dbus-run-session -- bash -c '
             openssl rand -hex 16 | gnome-keyring-daemon --components=secrets --daemonize --unlock >/dev/null
-            cargo test -p stellar-agent-network --test keyring_platform -- --ignored --exact keyring_platform_roundtrip
+            cargo test -p stellar-agent-network --features live-platform-keyring --test keyring_platform -- --ignored --exact keyring_platform_roundtrip
           ' 2>&1 | tee keyring-platform.log
           grep -q 'test result: ok. 1 passed' keyring-platform.log
 

@@ -914,6 +914,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn reconcile_pass_runs_expire_due() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::mainnet::fixtures::{self, LedgerFixture, TTL_MS};
         const NOW: u64 = 1_800_000_000_000;
         let fx = LedgerFixture::new("reconcile-expire", NOW);
@@ -972,6 +975,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn settlement_oracle_preserves_the_configured_mainnet_client() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::profile::schema::{PrimaryProviderRecord, ProviderRecord};
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -999,6 +1005,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn stage_marked_recorder_marks_only_the_authorized_pre_send() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::mainnet::fixtures::{self, LedgerFixture};
         let fx = LedgerFixture::new("stage-mark", 1000);
         let unsigned = fixtures::unsigned_envelope();

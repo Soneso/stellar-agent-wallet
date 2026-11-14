@@ -2308,6 +2308,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn multi_signer_complete_empty_signers_guard() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let (simulation, envelope) = contexts();
         let partial = build_authorization_entry(
@@ -2359,6 +2362,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn multi_signer_complete_two_signers_assembles_correct_auth_payload() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         use ed25519_dalek::{Signature, Verifier, VerifyingKey};
         use stellar_agent_network::SoftwareSigningKey;
@@ -2497,6 +2503,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn delegated_g_key_entry_shape_and_signature_verify() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         use ed25519_dalek::{Signature, Verifier, VerifyingKey};
         use sha2::{Digest as _, Sha256};
@@ -2734,6 +2743,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn complete_authorization_entry_signs_and_assembles_authpayload() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         use ed25519_dalek::{Signature, Verifier, VerifyingKey};
         use stellar_agent_network::SoftwareSigningKey;
@@ -3006,6 +3018,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn collect_mixed_signer_entries_gkey_only_for_delegated() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         use stellar_agent_network::SoftwareSigningKey;
 
@@ -3479,6 +3494,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn complete_authorization_entry_refuses_a_different_checked_rule() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let partial = partial_on(TESTNET_PASSPHRASE);
         let mut other = partial.clone();
@@ -3508,6 +3526,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn multi_signer_completion_refuses_a_different_checked_account() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let partial = partial_on(TESTNET_PASSPHRASE);
         let mut other = partial.clone();
@@ -3537,6 +3558,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn ed25519_rule_signing_refuses_a_different_checked_network() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let (simulation, envelope) = contexts();
         let checked = crate::submit::checked_context_for_test(
@@ -3575,6 +3599,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn complete_authorization_entry_signs_a_testnet_partial() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let signer = CountingSigner::new([0x41; 32]);
 
@@ -3602,6 +3629,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn complete_authorization_entry_refuses_a_mainnet_partial_before_any_key_access() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let signer = CountingSigner::new([0x41; 32]);
 
@@ -3622,6 +3652,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn complete_authorization_entry_refuses_a_tampered_digest_before_any_key_access() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let signer = CountingSigner::new([0x41; 32]);
 
@@ -3650,6 +3683,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn complete_authorization_entry_multi_signer_signs_a_testnet_partial() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let a = CountingSigner::new([0x42; 32]);
         let b = CountingSigner::new([0x43; 32]);
@@ -3685,6 +3721,9 @@ mod tests {
     #[serial_test::serial]
     async fn complete_authorization_entry_multi_signer_refuses_a_mainnet_partial_before_any_key_access()
      {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let a = CountingSigner::new([0x42; 32]);
         let b = CountingSigner::new([0x43; 32]);
@@ -3706,6 +3745,9 @@ mod tests {
     #[serial_test::serial]
     async fn complete_authorization_entry_multi_signer_refuses_a_tampered_digest_before_any_key_access()
      {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let a = CountingSigner::new([0x42; 32]);
         let b = CountingSigner::new([0x43; 32]);
@@ -3734,6 +3776,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn collect_mixed_signer_entries_signs_a_testnet_partial_with_the_testnet_passphrase() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let signer = CountingSigner::new([0x44; 32]);
 
@@ -3764,6 +3809,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn collect_mixed_signer_entries_refuses_the_mainnet_passphrase_before_any_key_access() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let signer = CountingSigner::new([0x44; 32]);
 
@@ -3785,6 +3833,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn collect_mixed_signer_entries_refuses_a_mainnet_partial_before_any_key_access() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let signer = CountingSigner::new([0x44; 32]);
 
@@ -3806,6 +3857,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn collect_mixed_signer_entries_refuses_a_tampered_digest_before_any_key_access() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let signer = CountingSigner::new([0x44; 32]);
 
@@ -3836,6 +3890,9 @@ mod tests {
     #[serial_test::serial]
     async fn collect_mixed_signer_entries_refuses_a_passphrase_of_another_network_before_any_key_access()
      {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let signer = CountingSigner::new([0x44; 32]);
 
@@ -3868,6 +3925,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn sign_with_ed25519_rule_refuses_the_mainnet_passphrase_before_any_key_access() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let (simulation, envelope) = contexts();
         let signer = CountingSigner::new([0x45; 32]);
@@ -3899,6 +3959,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn build_and_sign_delegated_g_key_entry_signs_on_testnet() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let signer = CountingSigner::new([0x46; 32]);
         let partial = partial_on(TESTNET_PASSPHRASE);
@@ -3931,6 +3994,9 @@ mod tests {
     #[serial_test::serial]
     async fn build_and_sign_delegated_g_key_entry_refuses_the_mainnet_passphrase_before_any_key_access()
      {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let signer = CountingSigner::new([0x46; 32]);
         let partial = partial_on(TESTNET_PASSPHRASE);
@@ -3954,6 +4020,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn the_gate_refuses_what_the_plan_does_not_name() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         admission_fixture::assert_envelope_bounds_refuse_before_signing().await;
         let partial = partial_on(TESTNET_PASSPHRASE);

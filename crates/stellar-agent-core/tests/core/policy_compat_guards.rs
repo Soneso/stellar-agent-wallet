@@ -317,7 +317,11 @@ fn address_assert_mode(decision: &stellar_agent_core::policy::Decision, mode: &s
 }
 
 #[test]
+#[serial_test::serial]
 fn signed_raw_muxed_destination_matches_exact_or_base_entry() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::policy::{Decision, PolicyEngine};
     for fixture in ["g_entry_deny", "m_entry_deny"] {
         let engine = address_engine(fixture);
@@ -341,7 +345,11 @@ fn signed_raw_muxed_destination_matches_exact_or_base_entry() {
     }
 }
 #[test]
+#[serial_test::serial]
 fn signed_raw_g_and_c_destinations_are_listed() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::policy::{Decision, PolicyEngine};
     let engine = address_engine("g_c_entries_deny");
     for destination in [address_g(), address_c()] {
@@ -365,7 +373,11 @@ fn signed_raw_g_and_c_destinations_are_listed() {
 }
 
 #[test]
+#[serial_test::serial]
 fn v1_address_alternatives_and_rule_approval() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::policy::{Decision, PolicyEngine};
     use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
     for fixture in ["g_entry_deny", "m_entry_deny", "g_c_entries_deny"] {
@@ -474,7 +486,11 @@ fn v1_address_alternatives_and_rule_approval() {
     }
 }
 #[test]
+#[serial_test::serial]
 fn signed_unlisted_g_reaches_unlisted_mode() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     for list in ["empty", "other"] {
         for mode in ["approval", "budget"] {
             let engine = address_engine(&format!("g_c_{list}_{mode}"));
@@ -486,7 +502,11 @@ fn signed_unlisted_g_reaches_unlisted_mode() {
     }
 }
 #[test]
+#[serial_test::serial]
 fn signed_unlisted_issuer_reaches_unlisted_mode() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let asset = format!("USD:{}", stellar_strkey::ed25519::PublicKey([2; 32]));
     for mode in ["approval", "budget"] {
         let engine = address_engine(&format!("issuer_{mode}"));
@@ -516,7 +536,11 @@ impl stellar_agent_core::policy::v1::CounterpartyCacheView for AddressCache {
     }
 }
 #[test]
+#[serial_test::serial]
 fn signed_verified_domain_reaches_unlisted_mode() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::policy::{Decision, PolicyEngine};
     let identity = AddressIdentity(address_g());
     for list in ["listed", "empty"] {
@@ -574,7 +598,11 @@ fn signed_verified_domain_reaches_unlisted_mode() {
     }
 }
 #[test]
+#[serial_test::serial]
 fn signed_mixed_g_c_debits_and_bundle_admit() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::policy::{
         Decision,
         v1::{
@@ -668,7 +696,11 @@ fn signed_mixed_g_c_debits_and_bundle_admit() {
 }
 
 #[test]
+#[serial_test::serial]
 fn muxed_bundle_signed_policy_guards_value_the_transfer() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::policy::{
         Decision,
         v1::bundle::{BundleStateOverlay, BundleView, decompose_bundle_calls},
@@ -777,7 +809,11 @@ fn muxed_bundle_signed_policy_guards_value_the_transfer() {
     assert!(mismatches.is_empty(), "{mismatches:?}");
 }
 #[test]
+#[serial_test::serial]
 fn muxed_bundle_shares_the_overlay_and_records_confirmed_inners() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::policy::{
         Decision,
         v1::bundle::{BundleStateOverlay, BundleView, decompose_bundle_calls},
@@ -847,7 +883,11 @@ fn muxed_bundle_shares_the_overlay_and_records_confirmed_inners() {
 }
 
 #[test]
+#[serial_test::serial]
 fn signed_x402_contract_under_g_only_reaches_mode() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::policy::PolicyEngine;
     let native = stellar_agent_core::asset_id::CanonicalAsset::Native
         .sac_contract_id(stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE)
@@ -880,7 +920,11 @@ fn signed_x402_contract_under_g_only_reaches_mode() {
 }
 
 #[test]
+#[serial_test::serial]
 fn signed_x402_muxed_destinations_keep_policy_bytes_and_decisions() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::policy::{Decision, PolicyEngine};
     let asset = stellar_agent_core::asset_id::CanonicalAsset::Native
         .sac_contract_id(TESTNET_PASSPHRASE)
@@ -957,7 +1001,11 @@ fn signed(raw: &str, key: &SigningKey) -> String {
 }
 
 #[test]
+#[serial_test::serial]
 fn existing_v2_loads_unchanged() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let key = owner_key();
     let document = load_signed_policy_text(
         &signed(FIXTURE, &key),
@@ -1001,7 +1049,11 @@ fn existing_v2_canonical_bytes_and_digest_match_literals() {
 }
 
 #[test]
+#[serial_test::serial]
 fn counterparty_deny_mode_is_byte_identical() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let key = owner_key();
     let document = load_signed_policy_text(
         &signed(FIXTURE, &key),
@@ -1100,7 +1152,11 @@ fn absent_origin_keys_keep_canonical_bytes() {
 }
 
 #[test]
+#[serial_test::serial]
 fn absent_origin_keys_keep_evaluation() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::policy::{
         ApprovalRequest, Decision, PolicyEngine,
         v1::{PolicyEngineV1, criteria::counterparty_allowlist::RecipientClass},
@@ -1414,7 +1470,11 @@ fn shared_evaluate(
 /// Equal budget tables on `stellar_pay` and `stellar_x402_create_payment`
 /// load and draw on one counter.
 #[test]
+#[serial_test::serial]
 fn equal_budget_tables_share_one_counter() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::policy::{Decision, UnlistedBound};
     let engine = shared_engine(
         SHARED_BUDGET,
@@ -1453,7 +1513,11 @@ fn equal_budget_tables_share_one_counter() {
 
 /// Equal `deny` tables on two rules load, and a listed recipient passes.
 #[test]
+#[serial_test::serial]
 fn equal_deny_tables_load_and_allow_listed() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::policy::Decision;
     let engine = shared_engine(
         SHARED_DENY,
@@ -1470,7 +1534,11 @@ fn equal_deny_tables_load_and_allow_listed() {
 /// Equal `approval` tables on two rules load, and an unlisted recipient
 /// requires approval.
 #[test]
+#[serial_test::serial]
 fn equal_approval_tables_load_and_escalate() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::policy::Decision;
     let engine = shared_engine(
         SHARED_APPROVAL,

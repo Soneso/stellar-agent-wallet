@@ -745,8 +745,9 @@ fn owner_pubkey_raw(
     verb: &str,
 ) -> Result<(zeroize::Zeroizing<String>, OwnerKeySource), String> {
     #[cfg(any(test, feature = "test-helpers"))]
-    if let Some(path) = std::env::var_os("STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE") {
-        let path = std::path::PathBuf::from(path);
+    if let Some(path) = stellar_agent_core::profile::schema::sandboxed_override(
+        "STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE",
+    ) {
         return std::fs::read_to_string(&path)
             .map(zeroize::Zeroizing::new)
             .map(|raw| {
@@ -1182,6 +1183,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn noop_engine_succeeds_for_all_verbs() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         for verb in ["lend", "vault", "trade", "bridge", "trustline"] {
             let profile = make_profile(
@@ -1198,6 +1202,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn engine_selection_refuses_unreadable_owner_state() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let profile = make_profile(PolicyEngineKind::Noop, "stellar-agent-owner-unreadable");
         let entry = &profile.policy_owner_key_id;
@@ -1312,7 +1319,11 @@ mod tests {
     /// When the service field does not carry `OWNER_KEY_SERVICE_PREFIX`, the
     /// builder returns `Err` and the message names the verb.
     #[test]
+    #[serial_test::serial]
     fn v1_wrong_prefix_returns_err_naming_verb() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for verb in ["lend", "vault", "trade", "bridge", "trustline"] {
             let profile = make_profile(PolicyEngineKind::V1, "wrong-prefix-default");
             let result = build_v1_policy_engine(verb, &PolicyEngineKind::V1, &profile, "default");
@@ -1343,6 +1354,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn v1_missing_keyring_returns_err_naming_verb() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // Use a random profile name so the test is independent of any real
         // keyring state on the test machine.
         let profile_name = "test-nonexistent-profile-9f2a";
@@ -1376,7 +1390,11 @@ mod tests {
     // ── Error messages carry no secret material ───────────────────────────────
 
     #[test]
+    #[serial_test::serial]
     fn v1_wrong_prefix_error_carries_no_key_material() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let profile = make_profile(PolicyEngineKind::V1, "wrong-prefix-default");
         let msg = err_msg(build_v1_policy_engine(
             "lend",
@@ -1630,7 +1648,11 @@ decision = "allow"
     }
 
     #[test]
+    #[serial_test::serial]
     fn pay_gate_under_cap_allows() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let engine = per_tx_cap_engine("stellar_pay", 1_000_000_000); // 100 XLM cap
         let profile = parity_profile();
         // Mirrors `crate::commands::pay::evaluate_pay_policy`'s policy_args shape.
@@ -1662,7 +1684,11 @@ decision = "allow"
     }
 
     #[test]
+    #[serial_test::serial]
     fn pay_gate_over_cap_denies_with_mcp_wire_code() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let engine = per_tx_cap_engine("stellar_pay", 1_000_000_000); // 100 XLM cap
         let profile = parity_profile();
         let policy_args = pay_policy_args(1_500_000_000, "native", PARITY_DEST_G);
@@ -1686,7 +1712,11 @@ decision = "allow"
     }
 
     #[test]
+    #[serial_test::serial]
     fn pay_gate_floor_without_account_read_refuses_with_account_code() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::policy::v1::criteria::balance_floor::BalanceFloorCriterion;
         let rule = PolicyRule {
             r#match: RuleMatch {
@@ -1723,7 +1753,11 @@ decision = "allow"
     }
 
     #[test]
+    #[serial_test::serial]
     fn create_gate_under_cap_allows() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let engine = per_tx_cap_engine("stellar_create_account", 1_000_000_000); // 100 XLM cap
         let profile = parity_profile();
         // Mirrors `crate::commands::accounts::create::evaluate_create_policy`'s
@@ -1759,7 +1793,11 @@ decision = "allow"
     }
 
     #[test]
+    #[serial_test::serial]
     fn create_gate_over_cap_denies_with_mcp_wire_code() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let engine = per_tx_cap_engine("stellar_create_account", 1_000_000_000); // 100 XLM cap
         let profile = parity_profile();
         let policy_args = create_policy_args(1_500_000_000, PARITY_DEST_G);
@@ -1783,7 +1821,11 @@ decision = "allow"
     }
 
     #[test]
+    #[serial_test::serial]
     fn claim_gate_per_tx_cap_not_applicable_allows() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // stellar_claim derives a non-debit Claim leg (`derive_value_class`), so
         // a per_tx_cap rule never matches it — parity with the MCP twin, which
         // is equally not-applicable for the same reason.
@@ -1822,7 +1864,11 @@ decision = "allow"
     }
 
     #[test]
+    #[serial_test::serial]
     fn noop_engine_allow_surfaces_no_gate_sized_effects() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // The no-op engine allows every call but sizes no value, so the gate
         // returns `Ok(None)`; the value-verb handlers then record an audit row
         // with no legs rather than re-deriving them from args.
@@ -1848,7 +1894,11 @@ decision = "allow"
     }
 
     #[test]
+    #[serial_test::serial]
     fn claim_gate_explicit_deny_rule_denies_with_wire_code() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // Proves the claim verb is genuinely wired to the engine: an explicit
         // deny-decision rule matching `stellar_claim` (no criteria — an
         // unconditional deny) must refuse the CLI call with that rule's wire
@@ -1980,7 +2030,11 @@ decision = "allow"
     /// the criterion returns `CriterionEvaluationFailed` and every call with
     /// the criterion configured denies).
     #[test]
+    #[serial_test::serial]
     fn pay_gate_minimum_reserve_satisfied_allows() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let engine = minimum_reserve_engine("stellar_pay", 0);
         let profile = parity_profile();
         let policy_args = pay_policy_args(500_000_000, "native", PARITY_DEST_G);
@@ -2010,7 +2064,11 @@ decision = "allow"
     /// denies with the criterion's own wire code — proving the view actually
     /// feeds the criterion, not merely that a non-`None` value was passed.
     #[test]
+    #[serial_test::serial]
     fn pay_gate_minimum_reserve_violated_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let engine = minimum_reserve_engine("stellar_pay", 0);
         let profile = parity_profile();
         let policy_args = pay_policy_args(500_000_000, "native", PARITY_DEST_G);
@@ -2051,7 +2109,11 @@ decision = "allow"
     /// `identity_view` — showing `identity_view` was genuinely consulted,
     /// not merely non-`None`.
     #[test]
+    #[serial_test::serial]
     fn pay_gate_home_domain_resolved_reads_identity_view() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let engine = home_domain_engine("stellar_pay");
         let profile = parity_profile();
         let policy_args = pay_policy_args(500_000_000, "native", PARITY_DEST_G);
@@ -2096,7 +2158,11 @@ decision = "allow"
     /// denies — `claim` supplies `account_view` (no `identity_view`; claim has
     /// no destination concept), mirroring its MCP twin.
     #[test]
+    #[serial_test::serial]
     fn claim_gate_minimum_reserve_violated_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let engine = minimum_reserve_engine("stellar_claim", 0);
         let profile = parity_profile();
         let policy_args = claim_policy_args(&"0".repeat(72));
@@ -2126,7 +2192,11 @@ decision = "allow"
     /// `account_view` for the SPONSOR (no `identity_view`; the new account
     /// does not yet exist), mirroring its MCP twin.
     #[test]
+    #[serial_test::serial]
     fn create_gate_minimum_reserve_violated_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let engine = minimum_reserve_engine("stellar_create_account", 0);
         let profile = parity_profile();
         let policy_args = create_policy_args(500_000_000, PARITY_DEST_G);
@@ -2155,7 +2225,11 @@ decision = "allow"
     /// allows — `trustline` supplies `account_view` (the source), matching
     /// its MCP twin.
     #[test]
+    #[serial_test::serial]
     fn trustline_gate_minimum_reserve_satisfied_allows() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let engine = minimum_reserve_engine("stellar_trustline", 0);
         let profile = parity_profile();
         let policy_args = trustline_policy_args(PARITY_DEST_G, "native");
@@ -2183,7 +2257,11 @@ decision = "allow"
     /// satisfy denies with the criterion's own wire code — proving the view
     /// actually feeds the criterion.
     #[test]
+    #[serial_test::serial]
     fn trustline_gate_minimum_reserve_violated_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let engine = minimum_reserve_engine("stellar_trustline", 0);
         let profile = parity_profile();
         let policy_args = trustline_policy_args(PARITY_DEST_G, "native");
@@ -2214,7 +2292,11 @@ decision = "allow"
     /// let an issuer alias an allowlisted domain), so a `home_domain_resolved`
     /// rule configured on this verb denies with the identity_view gap.
     #[test]
+    #[serial_test::serial]
     fn trustline_gate_identity_class_criterion_fails_closed_without_identity_view() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let engine = home_domain_engine("stellar_trustline");
         let profile = parity_profile();
         let policy_args = trustline_policy_args(PARITY_DEST_G, "native");
@@ -2263,7 +2345,11 @@ decision = "allow"
     }
 
     #[test]
+    #[serial_test::serial]
     fn with_value_gate_under_cap_allows() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let engine = per_tx_cap_engine("stellar_dex_trade", 1_000_000_000); // 100 XLM cap
         let profile = parity_profile();
         let policy_args = serde_json::json!({ "from_address": PARITY_DEST_G });
@@ -2280,7 +2366,11 @@ decision = "allow"
     }
 
     #[test]
+    #[serial_test::serial]
     fn with_value_gate_over_cap_denies_with_mcp_wire_code() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let engine = per_tx_cap_engine("stellar_dex_trade", 1_000_000_000); // 100 XLM cap
         let profile = parity_profile();
         let policy_args = serde_json::json!({ "from_address": PARITY_DEST_G });
@@ -2411,6 +2501,20 @@ decision = "allow"
             .unwrap()
             .set_password(value)
             .unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn owner_pubkey_override_outside_a_sandbox_is_ignored() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let file = temporary.path().join("owner.txt");
+        std::fs::write(&file, "file-owner").unwrap();
+        put_owner_entry("isolated-owner", "keyring-owner");
+        let _env = TestEnvVarGuard::set("STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE", file.as_os_str());
+        let (raw, source) = owner_pubkey_raw("isolated-owner", "pay").unwrap();
+        assert_eq!(source, OwnerKeySource::Keyring);
+        assert_eq!(raw.as_str(), "keyring-owner");
     }
 
     /// An older-form entry refuses the build and stays byte-identical.
@@ -3257,6 +3361,9 @@ decision = "allow"
     #[test]
     #[serial_test::serial]
     fn mainnet_policy_refusals_render_today() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::TempDir::new().expect("tempdir");
         let profile = make_profile(PolicyEngineKind::V1, "stellar-agent-owner-guard");
         let verified = refusal_guard_policy(dir.path(), &profile);
@@ -3314,6 +3421,9 @@ decision = "allow"
     #[test]
     #[serial_test::serial]
     fn an_evaluator_error_refuses_as_engine_required() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::TempDir::new().expect("tempdir");
         let profile = make_profile(PolicyEngineKind::V1, "stellar-agent-owner-guard");
         let verified = refusal_guard_policy(dir.path(), &profile);
@@ -3348,6 +3458,9 @@ decision = "allow"
         reason = "the closure preserves the typed evaluation result"
     )]
     fn mainnet_gate_clock_failure_renders_wallet_clock_error() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::TempDir::new().expect("tempdir");
         let profile = make_profile(PolicyEngineKind::V1, "stellar-agent-owner-guard");
         let verified = refusal_guard_policy(dir.path(), &profile);
@@ -3389,7 +3502,11 @@ decision = "allow"
     /// instant cannot be read, although the same calls allow under a
     /// readable clock and no criterion reads time.
     #[test]
+    #[serial_test::serial]
     fn off_mainnet_clock_failure_renders_wallet_clock_error() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let profile = parity_profile();
         let pay_engine = per_tx_cap_engine("stellar_pay", 1_000_000_000);
         let trade_engine = per_tx_cap_engine("stellar_dex_trade", 1_000_000_000);
@@ -3464,7 +3581,11 @@ decision = "allow"
     /// to it passes and one stroop more refuses, for a profile cap absent,
     /// below, equal to and above the signed cap.
     #[test]
+    #[serial_test::serial]
     fn the_effective_cap_is_the_enforced_cap() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::error::FeeSource;
         use stellar_agent_network::fees::check_classic_fee_cap_signed;
         let signed = 500;

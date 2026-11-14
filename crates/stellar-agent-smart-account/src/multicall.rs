@@ -509,6 +509,16 @@ impl MulticallRegistry {
         // Honour the env-var override (test isolation + operator flexibility).
         // The const `STELLAR_AGENT_MULTICALL_REGISTRY_TOML_ENV` is the canonical
         // env-var name; rustdoc on the const describes this behaviour.
+        #[cfg(any(test, feature = "test-helpers"))]
+        let actual_path: std::borrow::Cow<'_, Path> =
+            stellar_agent_core::profile::schema::sandboxed_override(
+                STELLAR_AGENT_MULTICALL_REGISTRY_TOML_ENV,
+            )
+            .map_or(
+                std::borrow::Cow::Borrowed(config_path),
+                std::borrow::Cow::Owned,
+            );
+        #[cfg(not(any(test, feature = "test-helpers")))]
         let actual_path: std::borrow::Cow<'_, Path> =
             match std::env::var(STELLAR_AGENT_MULTICALL_REGISTRY_TOML_ENV) {
                 Ok(override_str) if !override_str.is_empty() => {
@@ -2645,6 +2655,55 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn networks_override_outside_a_sandbox_is_ignored() {
+        const EXPECTED: &str = "STELLAR_AGENT_TEST_OVERRIDE_EXPECTED";
+        const SUPPLIED: &str = "STELLAR_AGENT_TEST_OVERRIDE_SUPPLIED";
+        if let Some(expected) = std::env::var_os(EXPECTED) {
+            let supplied = PathBuf::from(std::env::var_os(SUPPLIED).unwrap());
+            assert_eq!(
+                MulticallRegistry::load(&supplied).unwrap().config_path,
+                PathBuf::from(expected),
+                "override must remain inside a marked sandbox"
+            );
+            return;
+        }
+        let temporary = TempDir::new().unwrap();
+        let supplied = temporary.path().join("supplied.toml");
+        let override_path = temporary.path().join("override.toml");
+        std::fs::write(&supplied, "").unwrap();
+        std::fs::write(&override_path, "").unwrap();
+        let probe = |selected: &Path, expected: &Path| {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "multicall::tests::networks_override_outside_a_sandbox_is_ignored",
+                    "--nocapture",
+                ])
+                .env(STELLAR_AGENT_MULTICALL_REGISTRY_TOML_ENV, selected)
+                .env(EXPECTED, expected)
+                .env(SUPPLIED, &supplied)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        probe(&override_path, &supplied);
+        stellar_agent_test_support::sandbox::mark_sandbox(temporary.path()).unwrap();
+        probe(&override_path, &override_path);
+        probe(&temporary.path().join("child/../override.toml"), &supplied);
+        #[cfg(unix)]
+        {
+            let link = temporary.path().join("linked.toml");
+            std::os::unix::fs::symlink(&override_path, &link).unwrap();
+            probe(&link, &supplied);
+        }
+    }
 
     // ── Verifier status phase, unsizable calls and argument forms ────────────
 

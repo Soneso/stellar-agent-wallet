@@ -335,8 +335,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn current_list_and_enrollment_admit_a_credential() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = fixture();
         f.allow(&[credential_id(1)]);
         f.enroll(1);
@@ -351,8 +354,11 @@ mod tests {
     /// Removing one ID from the list refuses that credential at the next
     /// check and leaves a credential still listed admitted.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn unaffected_credential_survives_allowlist_edit() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = fixture();
         f.allow(&[credential_id(1), credential_id(2)]);
         f.enroll(1);
@@ -377,8 +383,11 @@ mod tests {
 
     /// An allowlisted ID whose enrollment was removed refuses.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn removed_enrollment_refuses_an_allowlisted_credential() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = fixture();
         f.allow(&[credential_id(1)]);
         f.enroll(1);
@@ -399,8 +408,11 @@ mod tests {
     /// Every read failure and every configuration change refuses after a
     /// successful read; none returns the earlier authorization.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn authorization_read_failure_never_uses_startup_copy() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let id = credential_id(1);
         let check = |f: &Fixture, chain: Caip2| {
             code(f.authority.require_credential(&id, chain, Some(RP_ID)))

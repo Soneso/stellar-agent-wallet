@@ -205,7 +205,8 @@ mainnet-write = ["stellar-agent-core/mainnet-write", "stellar-agent-network/main
 # Exposes test-only helpers (e.g. run_startup_advisory_with_allowlist) under a
 # feature gate. Enabled in the [dev-dependencies] of consumers that need the
 # injection API.
-test-helpers = ["stellar-agent-mcp/test-helpers"]
+test-helpers = ["stellar-agent-mcp/test-helpers", "stellar-agent-core/test-helpers"]
+live-platform-keyring = ["test-helpers", "stellar-agent-network/live-platform-keyring"]
 # Gate end-to-end testnet acceptance tests that require a live Friendbot + RPC.
 # These tests are NOT run under default `cargo test`; invoke with:
 #   cargo test -p stellar-agent-cli --no-default-features --features testnet-acceptance \

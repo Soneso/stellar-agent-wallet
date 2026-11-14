@@ -11154,6 +11154,9 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn a_held_lock_context_without_a_named_rule_refuses_rule_lock_missing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let (manager, _dir) = lock_test_manager();
         let guards = manager
@@ -11186,6 +11189,9 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn a_held_lock_context_for_another_account_refuses_rule_lock_missing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let (manager, _dir) = lock_test_manager();
         let guards = manager
@@ -11216,6 +11222,9 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn a_held_lock_context_from_another_log_refuses_rule_lock_missing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let (lending, _lending_dir) = lock_test_manager();
         let (checking, _checking_dir) = lock_test_manager();
@@ -11245,6 +11254,9 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn a_held_lock_context_without_a_pin_check_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let (manager, _dir) = lock_test_manager();
         let guards = manager
@@ -11270,7 +11282,11 @@ pub(crate) mod tests {
     /// acquisition of an overlapping set waits for the first and refuses at
     /// stage `rule_lock` when its budget ends, releasing what it took.
     #[tokio::test]
+    #[serial_test::serial]
     async fn rule_lock_acquisition_is_sorted_and_bounded() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (manager, _dir) = lock_test_manager();
         let held = manager
             .acquire_rule_locks(LOCK_TEST_ACCOUNT, [3, 1, 3], lock_test_budget())
@@ -13890,7 +13906,11 @@ pub(crate) mod tests {
 
     /// The manager guard refuses mainnet and accepts testnet.
     #[tokio::test]
+    #[serial_test::serial]
     async fn refuse_mainnet_write_refuses_only_a_mainnet_manager() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = wiremock::MockServer::start().await;
         let dir = tempfile::tempdir().unwrap();
         assert!(matches!(
@@ -14024,7 +14044,11 @@ pub(crate) mod tests {
 
     /// The testnet write passes its guard and reaches the first RPC.
     #[tokio::test]
+    #[serial_test::serial]
     async fn add_signer_reaches_rpc_on_testnet() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert_testnet_write_reaches_rpc(|manager, signer| async move {
             manager
                 .add_signer(
@@ -14044,7 +14068,11 @@ pub(crate) mod tests {
 
     /// The testnet write passes its guard and reaches the first RPC.
     #[tokio::test]
+    #[serial_test::serial]
     async fn remove_signer_reaches_rpc_on_testnet() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert_testnet_write_reaches_rpc(|manager, signer| async move {
             manager
                 .remove_signer(testnet_target(), 1, 2, &signer, "req-remove".to_owned())
@@ -14055,7 +14083,11 @@ pub(crate) mod tests {
 
     /// The testnet write passes its guard and reaches the first RPC.
     #[tokio::test]
+    #[serial_test::serial]
     async fn set_threshold_reaches_rpc_on_testnet() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert_testnet_write_reaches_rpc(|manager, signer| async move {
             manager
                 .set_threshold(testnet_target(), 1, 1, &signer, "req-threshold".to_owned())
@@ -14066,7 +14098,11 @@ pub(crate) mod tests {
 
     /// The testnet write passes its guard and reaches the first RPC.
     #[tokio::test]
+    #[serial_test::serial]
     async fn set_spending_limit_reaches_rpc_on_testnet() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert_testnet_write_reaches_rpc(|manager, signer| async move {
             manager
                 .set_spending_limit(
@@ -14084,7 +14120,11 @@ pub(crate) mod tests {
 
     /// The testnet write passes its guard and reaches the first RPC.
     #[tokio::test]
+    #[serial_test::serial]
     async fn set_weighted_threshold_reaches_rpc_on_testnet() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert_testnet_write_reaches_rpc(|manager, signer| async move {
             manager
                 .set_weighted_threshold(
@@ -14102,7 +14142,11 @@ pub(crate) mod tests {
 
     /// The testnet write passes its guard and reaches the first RPC.
     #[tokio::test]
+    #[serial_test::serial]
     async fn set_signer_weight_reaches_rpc_on_testnet() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert_testnet_write_reaches_rpc(|manager, signer| async move {
             manager
                 .set_signer_weight(
@@ -14123,7 +14167,11 @@ pub(crate) mod tests {
 
     /// The testnet write passes its guard and reaches the first RPC.
     #[tokio::test]
+    #[serial_test::serial]
     async fn batch_add_signers_reaches_rpc_on_testnet() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert_testnet_write_reaches_rpc(|manager, signer| async move {
             manager
                 .batch_add_signers(

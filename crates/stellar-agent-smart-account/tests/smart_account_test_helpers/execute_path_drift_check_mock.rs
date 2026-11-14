@@ -1873,6 +1873,9 @@ fn assert_the_drift_row_alone_keeps_the_observed_hash(
 #[tokio::test]
 #[serial_test::serial]
 async fn verifier_drift_refuses_before_simulation_with_the_callers_request_id() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(chain_with_rule_one(webauthn_hash())).await;
     h.baseline_v2(1);
@@ -1934,6 +1937,9 @@ async fn verifier_drift_refuses_before_simulation_with_the_callers_request_id() 
 #[tokio::test]
 #[serial_test::serial]
 async fn policy_drift_refuses_before_simulation_with_the_callers_request_id() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(chain_with_rule_one(webauthn_hash())).await;
     h.baseline_v2(1);
@@ -2013,6 +2019,9 @@ fn match_events<'a>(logs: &'a str, kind: &str) -> Vec<&'a str> {
 #[test]
 #[serial_test::serial]
 fn a_verifier_matching_rule_one_and_drifting_from_rule_two_logs_no_observed_hash() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let observed = webauthn_hash();
     let (err, logs) = rpc_mock_helpers::wallet_traced(async {
@@ -2072,6 +2081,9 @@ fn a_verifier_matching_rule_one_and_drifting_from_rule_two_logs_no_observed_hash
 #[test]
 #[serial_test::serial]
 fn a_policy_matching_rule_one_and_drifting_from_rule_two_logs_no_observed_hash() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let observed = KNOWN_WASM_HASH;
     let (err, logs) = rpc_mock_helpers::wallet_traced(async {
@@ -2149,6 +2161,9 @@ fn a_policy_matching_rule_one_and_drifting_from_rule_two_logs_no_observed_hash()
 #[tokio::test]
 #[serial_test::serial]
 async fn a_repointed_external_reference_refuses_with_the_observed_executable() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let chain = Chain::default()
         .with_rule(
@@ -2199,6 +2214,9 @@ async fn a_repointed_external_reference_refuses_with_the_observed_executable() {
 #[tokio::test]
 #[serial_test::serial]
 async fn an_rpc_failure_during_the_check_refuses_and_sends_nothing() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(chain_with_rule_one(webauthn_hash())).await;
     h.baseline_v2(1);
@@ -2240,6 +2258,9 @@ async fn an_rpc_failure_during_the_check_refuses_and_sends_nothing() {
 #[tokio::test]
 #[serial_test::serial]
 async fn multiple_pins_and_an_audit_integrity_error_refuse_as_unavailable() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(chain_with_rule_one(webauthn_hash())).await;
     h.baseline_v2(1);
@@ -2292,6 +2313,9 @@ async fn multiple_pins_and_an_audit_integrity_error_refuse_as_unavailable() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_rule_without_a_pin_record_signs() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(chain_with_rule_one(webauthn_hash())).await;
     h.baseline_v2(1);
@@ -2308,6 +2332,9 @@ async fn a_rule_without_a_pin_record_signs() {
 #[tokio::test]
 #[serial_test::serial]
 async fn rule_zero_only_signs_without_a_check() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(Chain::default()).await;
     h.submit(&[0], None).await.unwrap();
@@ -2320,6 +2347,9 @@ async fn rule_zero_only_signs_without_a_check() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_newer_pins_updated_row_is_the_record_the_check_reads() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(chain_with_rule_one(ed25519_hash())).await;
     h.baseline_v2(1);
@@ -2352,6 +2382,9 @@ async fn a_newer_pins_updated_row_is_the_record_the_check_reads() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_verifier_shared_by_two_rules_is_observed_once() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let chain = Chain::default()
         .with_rule(
@@ -2422,6 +2455,9 @@ fn stage_of(err: &SaError) -> &'static str {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_non_zero_rule_without_a_check_is_refused_before_io() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let signer = SoftwareSigningKey::new_from_bytes(SEED);
     for ids in [vec![3], vec![0, 3], vec![3, 0]] {
@@ -2438,6 +2474,9 @@ async fn a_non_zero_rule_without_a_check_is_refused_before_io() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_migrating_rule_must_be_the_only_authorizing_rule() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(Chain::default()).await;
     let signer = SoftwareSigningKey::new_from_bytes(SEED);
@@ -2613,6 +2652,9 @@ fn pins_updated_fields(
 #[tokio::test]
 #[serial_test::serial]
 async fn a_signer_on_the_existing_verifier_keeps_the_pins_and_writes_the_row() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(true).await;
     add_external_signer(&h, &verifier_v(), "req-add-same", false)
@@ -2634,6 +2676,9 @@ async fn a_signer_on_the_existing_verifier_keeps_the_pins_and_writes_the_row() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_signer_on_a_second_verifier_writes_two_pins_and_the_next_verb_refuses() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(true).await;
     add_external_signer(&h, &verifier_w(), "req-add-second", false)
@@ -2668,6 +2713,9 @@ async fn a_signer_on_a_second_verifier_writes_two_pins_and_the_next_verb_refuses
 #[tokio::test]
 #[serial_test::serial]
 async fn a_passkey_signer_added_to_a_pinned_rule_pins_its_verifier() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(true).await;
     add_signer_value(&h, passkey_signer(), "req-add-passkey", false)
@@ -2697,6 +2745,9 @@ async fn a_passkey_signer_added_to_a_pinned_rule_pins_its_verifier() {
 #[tokio::test]
 #[serial_test::serial]
 async fn an_unknown_new_verifier_needs_the_override() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(true).await;
     let err = add_external_signer(&h, &contract(0x22), "req-add-unknown", false)
@@ -2745,6 +2796,9 @@ async fn an_unknown_new_verifier_needs_the_override() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_signer_add_on_an_unpinned_rule_writes_no_row() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(false).await;
     add_external_signer(&h, &verifier_w(), "req-add-unpinned", false)
@@ -2761,6 +2815,9 @@ async fn a_signer_add_on_an_unpinned_rule_writes_no_row() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_signer_add_writes_the_override_row_between_the_add_and_the_pins() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(true).await;
     add_external_signer(&h, &contract(0x22), "req-add-order", true)
@@ -2784,6 +2841,9 @@ async fn a_signer_add_writes_the_override_row_between_the_add_and_the_pins() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_signer_add_over_a_version_2_baseline_records_the_confirmed_set() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(true).await;
     let id = add_external_signer(&h, &verifier_v(), "req-add-v2", false)
@@ -2847,6 +2907,9 @@ async fn a_signer_add_over_a_version_2_baseline_records_the_confirmed_set() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_refused_batch_writes_no_override_row_for_an_admitted_verifier() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(true).await;
     let undecodable = contract(0x23);
@@ -3049,6 +3112,9 @@ const PAIR_ROWS: [&str; 4] = [
 #[tokio::test]
 #[serial_test::serial]
 async fn a_migration_pair_records_its_rows_in_order_under_the_rule_lock() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(true).await;
     on_send_one_pair(&h);
@@ -3174,6 +3240,9 @@ fn assert_first_pair_refused_unsent(
 #[tokio::test]
 #[serial_test::serial]
 async fn a_migration_pair_refuses_before_any_send() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let plan = migration_plan(webauthn_hash(), ed25519_hash());
 
@@ -3272,6 +3341,9 @@ async fn a_migration_pair_refuses_before_any_send() {
 #[tokio::test]
 #[serial_test::serial]
 async fn an_add_refused_after_the_removal_returns_the_pending_add_that_completes_the_pair() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(true).await;
     on_send_one_pair(&h);
@@ -3354,6 +3426,9 @@ async fn an_add_refused_after_the_removal_returns_the_pending_add_that_completes
 #[tokio::test]
 #[serial_test::serial]
 async fn a_removal_whose_row_is_refused_stops_the_pair_with_the_pending_add() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(false).await;
     on_send_one_pair(&h);
@@ -3391,6 +3466,9 @@ async fn a_removal_whose_row_is_refused_stops_the_pair_with_the_pending_add() {
 #[tokio::test]
 #[serial_test::serial]
 async fn the_refresh_drops_the_dead_source_pin_and_the_recovery_add_signs() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(true).await;
     on_send_one_pair(&h);
@@ -3527,6 +3605,9 @@ fn pin_record_fields(entry: &AuditEntry) -> PinRecordFields {
 #[tokio::test]
 #[serial_test::serial]
 async fn the_dead_pin_drop_keeps_the_policy_pins_references_and_override_flags() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let mut chain = Chain::default()
         .with_rule(1, signer_add_rule_before())
@@ -3653,6 +3734,9 @@ async fn the_dead_pin_drop_keeps_the_policy_pins_references_and_override_flags()
 #[tokio::test]
 #[serial_test::serial]
 async fn a_refresh_keeps_a_two_verifier_record_of_a_rule_without_external_signers() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let chain = Chain::default()
         .with_rule(
@@ -3695,6 +3779,9 @@ async fn a_refresh_keeps_a_two_verifier_record_of_a_rule_without_external_signer
 #[tokio::test]
 #[serial_test::serial]
 async fn a_refresh_keeps_the_verifier_pin_of_a_rule_with_a_live_external_signer() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(false).await;
     h.pin_created(
@@ -3730,6 +3817,9 @@ async fn a_refresh_keeps_the_verifier_pin_of_a_rule_with_a_live_external_signer(
 #[tokio::test]
 #[serial_test::serial]
 async fn a_removal_whose_confirmed_state_is_wrong_stops_with_the_record_repointed() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(true).await;
     let result = migrate(
@@ -3774,6 +3864,9 @@ async fn a_removal_whose_confirmed_state_is_wrong_stops_with_the_record_repointe
 #[tokio::test]
 #[serial_test::serial]
 async fn a_change_after_the_removal_refuses_the_add_before_it_is_sent() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(false).await;
     on_send_one_pair(&h);
@@ -3823,6 +3916,9 @@ async fn a_change_after_the_removal_refuses_the_add_before_it_is_sent() {
 #[tokio::test]
 #[serial_test::serial]
 async fn an_add_whose_confirmed_state_is_wrong_refuses_without_a_pending_add() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(false).await;
     h.on_send(
@@ -3867,6 +3963,9 @@ async fn an_add_whose_confirmed_state_is_wrong_refuses_without_a_pending_add() {
 #[tokio::test]
 #[serial_test::serial]
 async fn two_pairs_on_one_rule_each_compare_against_the_newest_row() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(true).await;
     let plan = migration_plan_two_signers(&h, &verifier_w());
@@ -3944,6 +4043,9 @@ async fn two_pairs_on_one_rule_each_compare_against_the_newest_row() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_second_pair_whose_plan_does_not_match_stops_after_the_first() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(false).await;
     let plan = migration_plan_two_signers(&h, &verifier_v());
@@ -3968,6 +4070,9 @@ async fn a_second_pair_whose_plan_does_not_match_stops_after_the_first() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_migration_skips_the_verifier_check_of_the_migrating_rule() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(false).await;
     h.pin_created(
@@ -4011,6 +4116,9 @@ async fn a_migration_skips_the_verifier_check_of_the_migrating_rule() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_migration_still_checks_the_migrating_rules_policies() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(false).await;
     h.pin_created(
@@ -4044,6 +4152,9 @@ async fn a_migration_still_checks_the_migrating_rules_policies() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_migration_on_an_unpinned_rule_writes_no_row() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(false).await;
     on_send_one_pair(&h);
@@ -4074,6 +4185,9 @@ async fn a_migration_on_an_unpinned_rule_writes_no_row() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_secondary_behind_the_removal_is_read_again_and_the_pair_completes() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(true).await;
     on_send_one_pair(&h);
@@ -4118,6 +4232,9 @@ async fn a_secondary_behind_the_removal_is_read_again_and_the_pair_completes() {
 #[tokio::test]
 #[serial_test::serial]
 async fn an_unresolved_removal_repoints_the_record_and_returns_the_pending_add() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::with_timeout(signer_add_chain(), Duration::from_secs(2)).await;
     h.baseline_v2(1);
@@ -4180,6 +4297,9 @@ async fn an_unresolved_removal_repoints_the_record_and_returns_the_pending_add()
 #[tokio::test]
 #[serial_test::serial]
 async fn a_rule_manager_without_a_signers_manager_refuses_a_non_zero_rule() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     use stellar_agent_smart_account::managers::rules::{
         ContextRuleManager, ContextRuleManagerConfig,
@@ -4393,6 +4513,9 @@ fn after_threshold_attach(policies: Vec<ScAddress>) -> AfterSend {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_policy_added_to_a_pinned_rule_is_pinned_and_checked() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = policy_harness(vec![]).await;
     h.baseline_v2(1);
@@ -4425,6 +4548,9 @@ async fn a_policy_added_to_a_pinned_rule_is_pinned_and_checked() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_second_policy_writes_two_pins_and_the_next_verb_refuses() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = policy_harness(vec![policy_p()]).await;
     h.set_threshold(&policy_p(), 1, 1);
@@ -4469,6 +4595,9 @@ async fn a_second_policy_writes_two_pins_and_the_next_verb_refuses() {
 #[tokio::test]
 #[serial_test::serial]
 async fn an_unknown_new_policy_needs_the_override() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = policy_harness(vec![]).await;
     h.baseline_v2(1);
@@ -4519,6 +4648,9 @@ async fn an_unknown_new_policy_needs_the_override() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_policy_add_on_an_unpinned_rule_writes_no_row() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = policy_harness(vec![]).await;
     h.baseline_v2(1);
@@ -4535,6 +4667,9 @@ async fn a_policy_add_on_an_unpinned_rule_writes_no_row() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_policy_add_writes_the_override_row_before_the_policy_row() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = policy_harness(vec![]).await;
     h.baseline_v2(1);
@@ -4560,6 +4695,9 @@ async fn a_policy_add_writes_the_override_row_before_the_policy_row() {
 #[tokio::test]
 #[serial_test::serial]
 async fn removing_the_pinned_policy_clears_its_pin() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = policy_harness(vec![policy_p()]).await;
     h.set_threshold(&policy_p(), 1, 1);
@@ -4599,6 +4737,9 @@ async fn removing_the_pinned_policy_clears_its_pin() {
 #[tokio::test]
 #[serial_test::serial]
 async fn removing_a_drifted_only_policy_drops_its_pin() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = policy_harness(vec![policy_p()]).await;
     h.pin_created(
@@ -4652,6 +4793,9 @@ async fn removing_a_drifted_only_policy_drops_its_pin() {
 #[tokio::test]
 #[serial_test::serial]
 async fn removing_an_unreadable_only_policy_refuses_before_submission() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = policy_harness(vec![policy_p()]).await;
     h.set_threshold(&policy_p(), 1, 1);
@@ -4684,6 +4828,9 @@ async fn removing_an_unreadable_only_policy_refuses_before_submission() {
 #[tokio::test]
 #[serial_test::serial]
 async fn removing_one_of_two_policies_drops_the_pin_of_its_hash() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = policy_harness(vec![policy_p(), policy_q()]).await;
     h.set_threshold(&policy_p(), 1, 1);
@@ -4715,6 +4862,9 @@ async fn removing_one_of_two_policies_drops_the_pin_of_its_hash() {
 #[tokio::test]
 #[serial_test::serial]
 async fn removing_an_unpinned_policy_beside_a_pinned_one_keeps_the_pin() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = policy_harness(vec![policy_p(), policy_r()]).await;
     h.set_threshold(&policy_p(), 1, 1);
@@ -4748,6 +4898,9 @@ async fn removing_an_unpinned_policy_beside_a_pinned_one_keeps_the_pin() {
 #[tokio::test]
 #[serial_test::serial]
 async fn removing_a_policy_no_pin_of_two_matches_writes_no_row() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = policy_harness(vec![policy_r()]).await;
     h.baseline_v2(1);
@@ -4791,6 +4944,9 @@ async fn removing_a_policy_no_pin_of_two_matches_writes_no_row() {
 #[test]
 #[serial_test::serial]
 fn removing_a_policy_no_pin_matches_logs_no_hash_and_the_next_verb_refuses() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let removed = [0xdd_u8; 32];
     let (err, logs) = rpc_mock_helpers::wallet_traced(async {
@@ -4843,6 +4999,9 @@ fn removing_a_policy_no_pin_matches_logs_no_hash_and_the_next_verb_refuses() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_policy_pin_with_no_live_policy_refuses_and_sends_nothing() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = policy_harness(vec![]).await;
     h.baseline_v2(1);
@@ -4879,6 +5038,9 @@ async fn a_policy_pin_with_no_live_policy_refuses_and_sends_nothing() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_rule_without_policies_or_policy_pins_signs() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = policy_harness(vec![]).await;
     h.baseline_v2(1);
@@ -4892,6 +5054,9 @@ async fn a_rule_without_policies_or_policy_pins_signs() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_policy_added_with_no_live_policy_replaces_a_stale_pin() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = policy_harness(vec![]).await;
     h.baseline_v2(1);
@@ -4924,6 +5089,9 @@ async fn a_policy_added_with_no_live_policy_replaces_a_stale_pin() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_policy_added_after_the_last_of_two_pinned_policies_replaces_both_pins() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = policy_harness(vec![]).await;
     h.baseline_v2(1);
@@ -4956,6 +5124,9 @@ async fn a_policy_added_after_the_last_of_two_pinned_policies_replaces_both_pins
 #[tokio::test]
 #[serial_test::serial]
 async fn a_policy_added_with_no_live_policy_drops_a_stale_reference_pin() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = policy_harness(vec![]).await;
     h.baseline_v2(1);
@@ -5007,6 +5178,9 @@ async fn a_policy_added_with_no_live_policy_drops_a_stale_reference_pin() {
 #[tokio::test]
 #[serial_test::serial]
 async fn verify_pins_names_the_verifier_failure_beside_a_drifted_policy() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let undecodable_policy = contract(0x33);
     let h = policy_harness(vec![undecodable_policy.clone(), policy_p()]).await;
@@ -5046,6 +5220,9 @@ async fn verify_pins_names_the_verifier_failure_beside_a_drifted_policy() {
 #[tokio::test]
 #[serial_test::serial]
 async fn verify_pins_reports_drift_for_a_policy_pin_with_no_live_policy() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = policy_harness(vec![]).await;
     h.pin_created(
@@ -5080,6 +5257,9 @@ async fn verify_pins_reports_drift_for_a_policy_pin_with_no_live_policy() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_migration_refuses_a_rule_whose_pinned_policy_is_absent() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let chain = Chain::default()
         .with_rule(
@@ -5292,6 +5472,9 @@ fn rows_of(h: &Harness, request_id: &str) -> Vec<AuditEntry> {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_version_1_baseline_refuses_each_signer_verb_before_any_rpc() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     for verb in VERBS {
         let h = Harness::new(verb_chain()).await;
@@ -5320,6 +5503,9 @@ async fn a_version_1_baseline_refuses_each_signer_verb_before_any_rpc() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_chain_change_before_submission_refuses_each_signer_verb() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     for verb in VERBS {
         let h = verb_harness().await;
@@ -5361,6 +5547,9 @@ async fn a_chain_change_before_submission_refuses_each_signer_verb() {
 #[tokio::test]
 #[serial_test::serial]
 async fn each_confirmed_signer_verb_records_its_version_2_state_row() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     for verb in VERBS {
         let h = verb_harness().await;
@@ -5413,6 +5602,9 @@ async fn each_confirmed_signer_verb_records_its_version_2_state_row() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_confirmed_state_that_is_not_the_intended_change_refuses_each_signer_verb() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     for verb in VERBS {
         let h = verb_harness().await;
@@ -5449,6 +5641,9 @@ async fn a_confirmed_state_that_is_not_the_intended_change_refuses_each_signer_v
 #[tokio::test]
 #[serial_test::serial]
 async fn an_add_the_chain_assigns_another_id_refuses_with_the_hash() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = verb_harness().await;
     let mut signers = verb_signers();
@@ -5480,6 +5675,9 @@ async fn an_add_the_chain_assigns_another_id_refuses_with_the_hash() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_batch_returns_the_observed_ids_in_input_order() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = verb_harness().await;
     let mut signers = verb_signers();
@@ -5516,6 +5714,9 @@ async fn a_batch_returns_the_observed_ids_in_input_order() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_secondary_behind_for_one_read_is_read_again_and_the_row_is_written() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = verb_harness().await;
     h.after_send_state(&Verb::Add.intended());
@@ -5550,6 +5751,9 @@ async fn a_secondary_behind_for_one_read_is_read_again_and_the_row_is_written() 
 #[tokio::test]
 #[serial_test::serial]
 async fn a_secondary_that_stays_behind_fails_at_stage_observe() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::with_timeout(verb_chain(), Duration::from_secs(2)).await;
     h.baseline_v2(1);
@@ -5585,6 +5789,9 @@ async fn a_secondary_that_stays_behind_fails_at_stage_observe() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_slow_secondary_behind_the_confirmation_is_named_when_the_budget_ends() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::with_timeout(verb_chain(), Duration::from_secs(3)).await;
     h.baseline_v2(1);
@@ -5618,6 +5825,9 @@ async fn a_slow_secondary_behind_the_confirmation_is_named_when_the_budget_ends(
 #[tokio::test]
 #[serial_test::serial]
 async fn a_secondary_threshold_read_behind_repeats_its_observation() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = verb_harness().await;
     h.after_send_state(&Verb::SetThreshold.intended());
@@ -5664,6 +5874,9 @@ async fn a_secondary_threshold_read_behind_repeats_its_observation() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_policy_list_changed_during_a_repeated_observation_refuses_at_stage_observe() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = verb_harness().await;
     h.after_send_state(&Verb::SetThreshold.intended());
@@ -5707,6 +5920,9 @@ async fn a_policy_list_changed_during_a_repeated_observation_refuses_at_stage_ob
 #[tokio::test]
 #[serial_test::serial]
 async fn endpoints_that_disagree_after_a_repeated_observation_refuse_at_stage_observe() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::with_secondary(verb_chain(), verb_chain()).await;
     h.baseline_v2(1);
@@ -5815,6 +6031,9 @@ fn assert_return_shape_refusal(err: &SaError, expected_reason: &str) {
 #[tokio::test]
 #[serial_test::serial]
 async fn an_add_whose_simulated_return_is_not_a_u32_refuses_before_signing() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = verifierless_pinned_rule().await;
     h.set_simulated_return("add_signer", ScVal::Void);
@@ -5852,6 +6071,9 @@ async fn an_add_whose_simulated_return_is_not_a_u32_refuses_before_signing() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_confirmed_passkey_add_that_fails_to_record_still_pins_its_verifier() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     for batch in [false, true] {
         let h = verifierless_pinned_harness().await;
@@ -5967,6 +6189,9 @@ async fn a_confirmed_passkey_add_that_fails_to_record_still_pins_its_verifier() 
 #[tokio::test]
 #[serial_test::serial]
 async fn a_signer_set_check_over_a_version_2_row_freezes_the_view_ledger_and_row() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = verb_harness().await;
     // Rule read, then threshold read, per endpoint; the secondary's
@@ -6011,6 +6236,9 @@ async fn a_signer_set_check_over_a_version_2_row_freezes_the_view_ledger_and_row
 #[tokio::test]
 #[serial_test::serial]
 async fn a_signer_add_whose_row_is_refused_fails_at_stage_write() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = verb_harness().await;
     h.after_send_state(&Verb::Add.intended());
@@ -6039,6 +6267,9 @@ async fn a_signer_add_whose_row_is_refused_fails_at_stage_write() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_list_whose_baseline_row_is_refused_fails_at_stage_write() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(verb_chain()).await;
     h.poison_audit_writer_at("get_context_rule");
@@ -6066,6 +6297,9 @@ async fn a_list_whose_baseline_row_is_refused_fails_at_stage_write() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_removal_on_a_weighted_only_rule_refuses_before_submission() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let weighted = contract(0x35);
     let chain = Chain::default()
@@ -6097,6 +6331,9 @@ async fn a_removal_on_a_weighted_only_rule_refuses_before_submission() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_policyless_rule_accepts_a_removal_and_refuses_a_threshold_change() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let policyless = || Chain::default().with_rule(1, rule_with_ids(1, verb_signers(), vec![]));
     let h = Harness::new(policyless()).await;
@@ -6128,6 +6365,9 @@ async fn a_policyless_rule_accepts_a_removal_and_refuses_a_threshold_change() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_list_on_a_policyless_rule_writes_a_version_2_baseline_without_a_threshold() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h =
         Harness::new(Chain::default().with_rule(1, rule_with_ids(1, verb_signers(), vec![]))).await;
@@ -6168,6 +6408,9 @@ async fn a_list_on_a_policyless_rule_writes_a_version_2_baseline_without_a_thres
 #[tokio::test]
 #[serial_test::serial]
 async fn a_list_over_an_existing_row_reports_the_comparison_and_writes_nothing() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let list = |h: &Harness| {
         let manager = Arc::clone(&h.manager);
@@ -6216,6 +6459,9 @@ async fn a_list_over_an_existing_row_reports_the_comparison_and_writes_nothing()
 #[tokio::test]
 #[serial_test::serial]
 async fn a_refresh_over_a_matching_version_1_baseline_records_version_2() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(verb_chain()).await;
     h.baseline_v1(1);
@@ -6251,6 +6497,9 @@ async fn a_refresh_over_a_matching_version_1_baseline_records_version_2() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_refresh_over_a_diverged_version_1_baseline_needs_the_flag() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(verb_chain()).await;
     h.baseline_v1(1);
@@ -6309,6 +6558,9 @@ async fn a_refresh_over_a_diverged_version_1_baseline_needs_the_flag() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_contract_delegate_reads_in_version_2_and_is_not_comparable_with_version_1() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let delegate = contract(0x55);
     let chain = || {
@@ -6412,6 +6664,9 @@ async fn a_contract_delegate_reads_in_version_2_and_is_not_comparable_with_versi
 #[tokio::test]
 #[serial_test::serial]
 async fn two_allowlisted_threshold_policies_refuse_the_observation() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let p2 = contract(0x36);
     let chain = Chain::default()
@@ -6446,6 +6701,9 @@ async fn two_allowlisted_threshold_policies_refuse_the_observation() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_policy_without_an_instance_is_readable_and_not_the_threshold_policy() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let absent = contract(0x37);
     let chain = Chain::default()
@@ -6480,6 +6738,9 @@ async fn a_policy_without_an_instance_is_readable_and_not_the_threshold_policy()
 #[tokio::test]
 #[serial_test::serial]
 async fn the_endpoints_disagreeing_on_the_threshold_refuse_with_rpc_divergence() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let secondary = || verb_chain().with_threshold(&policy_p(), 1, 3);
     let h = Harness::with_secondary(verb_chain(), secondary()).await;
@@ -6524,6 +6785,9 @@ async fn the_endpoints_disagreeing_on_the_threshold_refuse_with_rpc_divergence()
 #[tokio::test]
 #[serial_test::serial]
 async fn the_endpoints_disagreeing_on_the_policy_list_refuse_with_rpc_divergence() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let q = contract(0x31);
     let secondary = verb_chain()
@@ -6736,6 +7000,9 @@ fn install_state_mismatch(err: &SaError) -> (Option<u32>, &str) {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_confirmed_install_records_its_baseline_after_the_created_row() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(install_chain()).await;
     h.after_send_state(&installed(
@@ -6789,6 +7056,9 @@ async fn a_confirmed_install_records_its_baseline_after_the_created_row() {
 #[tokio::test]
 #[serial_test::serial]
 async fn an_install_with_the_simple_threshold_policy_baselines_its_threshold() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(install_chain()).await;
     h.after_send_state(&installed(
@@ -6839,6 +7109,9 @@ fn assert_mismatch_without_baseline(h: &Harness, err: &SaError, request_id: &str
 #[tokio::test]
 #[serial_test::serial]
 async fn an_install_whose_served_threshold_differs_refuses_with_the_rule_id() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(install_chain()).await;
     h.after_send_state(&installed(
@@ -6866,6 +7139,9 @@ async fn an_install_whose_served_threshold_differs_refuses_with_the_rule_id() {
 #[tokio::test]
 #[serial_test::serial]
 async fn an_install_whose_served_threshold_policy_differs_refuses() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(install_chain()).await;
     h.after_send_state(&installed(
@@ -6893,6 +7169,9 @@ async fn an_install_whose_served_threshold_policy_differs_refuses() {
 #[tokio::test]
 #[serial_test::serial]
 async fn an_install_whose_served_signers_differ_in_one_identity_refuses() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(install_chain()).await;
     h.after_send_state(&installed(
@@ -6924,6 +7203,9 @@ async fn an_install_whose_served_signers_differ_in_one_identity_refuses() {
 #[tokio::test]
 #[serial_test::serial]
 async fn an_install_whose_return_carries_no_rule_id_refuses_without_one() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(install_chain()).await;
     h.set_simulated_return("add_context_rule", ScVal::Void);
@@ -6962,6 +7244,9 @@ async fn an_install_whose_return_carries_no_rule_id_refuses_without_one() {
 #[tokio::test]
 #[serial_test::serial]
 async fn an_install_whose_baseline_row_is_refused_fails_at_stage_write() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(install_chain()).await;
     h.after_send_state(&installed(vec![delegated_account(0x13)], vec![], &[]));
@@ -7000,6 +7285,9 @@ async fn an_install_whose_baseline_row_is_refused_fails_at_stage_write() {
 #[tokio::test]
 #[serial_test::serial]
 async fn an_install_whose_secondary_stays_behind_fails_at_stage_observe() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::with_timeout(install_chain(), Duration::from_secs(2)).await;
     h.after_send_state(&installed(vec![delegated_account(0x13)], vec![], &[]));
@@ -7041,6 +7329,9 @@ async fn an_install_whose_secondary_stays_behind_fails_at_stage_observe() {
 #[tokio::test]
 #[serial_test::serial]
 async fn an_install_and_its_simulation_without_a_signers_manager_refuse_before_any_rpc() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(install_chain()).await;
     let manager = rule_manager_without_signers_manager(&h);
@@ -7113,6 +7404,9 @@ fn assert_build_refusal(h: &Harness, err: &SaError, reason: &str) {
 #[tokio::test]
 #[serial_test::serial]
 async fn two_simple_threshold_policies_refuse_an_install_and_its_simulation() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(install_chain()).await;
     let definition = || {
@@ -7142,6 +7436,9 @@ async fn two_simple_threshold_policies_refuse_an_install_and_its_simulation() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_malformed_threshold_parameter_refuses_an_install_and_its_simulation() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(install_chain()).await;
     let definition = || {
@@ -7172,6 +7469,9 @@ async fn a_malformed_threshold_parameter_refuses_an_install_and_its_simulation()
 #[tokio::test]
 #[serial_test::serial]
 async fn a_policy_address_listed_twice_refuses_an_install_before_submission() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(install_chain()).await;
     let definition = || {
@@ -7197,6 +7497,9 @@ async fn a_policy_address_listed_twice_refuses_an_install_before_submission() {
 #[tokio::test]
 #[serial_test::serial]
 async fn an_external_signer_with_empty_key_data_refuses_an_install_before_submission() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(install_chain()).await;
     let err = install(
@@ -7226,6 +7529,9 @@ async fn an_external_signer_with_empty_key_data_refuses_an_install_before_submis
 #[tokio::test]
 #[serial_test::serial]
 async fn a_contract_delegate_installs_and_its_baseline_carries_it() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let delegate = contract(0x77);
     let h = Harness::new(install_chain()).await;
@@ -7326,6 +7632,9 @@ fn observation(policy: &ScAddress, threshold: u32) -> Option<ThresholdObservatio
 #[tokio::test]
 #[serial_test::serial]
 async fn a_threshold_attach_records_the_threshold_before_the_policy_row() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = threshold_policy_harness(vec![], &[]).await;
     h.baseline_v2(1);
@@ -7371,6 +7680,9 @@ fn assert_refused_before_submission(h: &Harness, err: &SaError, function: &str, 
 #[tokio::test]
 #[serial_test::serial]
 async fn a_threshold_attach_on_a_rule_with_a_threshold_policy_refuses() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = threshold_policy_harness(vec![policy_p2()], &[(policy_p2(), 1)]).await;
     h.baseline_v2(1);
@@ -7400,6 +7712,9 @@ async fn a_threshold_attach_on_a_rule_with_a_threshold_policy_refuses() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_threshold_attach_on_a_rule_whose_signers_changed_refuses() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = threshold_policy_harness(vec![], &[]).await;
     h.baseline_v2(1);
@@ -7446,6 +7761,9 @@ async fn a_threshold_attach_on_a_rule_whose_signers_changed_refuses() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_threshold_attach_with_a_malformed_parameter_refuses() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = threshold_policy_harness(vec![], &[]).await;
     h.baseline_v2(1);
@@ -7465,6 +7783,9 @@ async fn a_threshold_attach_with_a_malformed_parameter_refuses() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_confirmed_threshold_attach_whose_threshold_differs_refuses_with_the_hash() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = threshold_policy_harness(vec![], &[]).await;
     h.baseline_v2(1);
@@ -7512,6 +7833,9 @@ async fn a_confirmed_threshold_attach_whose_threshold_differs_refuses_with_the_h
 #[tokio::test]
 #[serial_test::serial]
 async fn a_threshold_attach_whose_simulated_return_is_not_a_u32_refuses_before_signing() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = threshold_policy_harness(vec![], &[]).await;
     h.baseline_v2(1);
@@ -7542,6 +7866,9 @@ async fn a_threshold_attach_whose_simulated_return_is_not_a_u32_refuses_before_s
 #[tokio::test]
 #[serial_test::serial]
 async fn a_threshold_attach_without_a_version_2_baseline_refuses() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = threshold_policy_harness(vec![], &[]).await;
     let err = add_policy_with(
@@ -7578,6 +7905,9 @@ async fn a_threshold_attach_without_a_version_2_baseline_refuses() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_direct_attach_whose_simulated_return_is_not_a_u32_refuses_before_signing() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = threshold_policy_harness(vec![], &[]).await;
     h.baseline_v2(1);
@@ -7603,6 +7933,9 @@ async fn a_direct_attach_whose_simulated_return_is_not_a_u32_refuses_before_sign
 #[tokio::test]
 #[serial_test::serial]
 async fn a_spending_limit_attach_writes_no_state_row_and_keeps_its_pin_rows() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = threshold_policy_harness(vec![], &[]).await;
     h.baseline_v2(1);
@@ -7628,6 +7961,9 @@ async fn a_spending_limit_attach_writes_no_state_row_and_keeps_its_pin_rows() {
 #[tokio::test]
 #[serial_test::serial]
 async fn the_policy_verbs_without_a_signers_manager_refuse_before_any_rpc() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = threshold_policy_harness(vec![policy_p()], &[(policy_p(), 1)]).await;
     let manager = rule_manager_without_signers_manager(&h);
@@ -7682,6 +8018,9 @@ async fn the_policy_verbs_without_a_signers_manager_refuse_before_any_rpc() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_threshold_detach_records_the_cleared_threshold_before_the_policy_row() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = threshold_policy_harness(vec![policy_p()], &[(policy_p(), 2)]).await;
     h.baseline_v2(1);
@@ -7723,6 +8062,9 @@ async fn a_threshold_detach_records_the_cleared_threshold_before_the_policy_row(
 #[tokio::test]
 #[serial_test::serial]
 async fn a_confirmed_threshold_detach_whose_threshold_stays_refuses_with_the_hash() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = threshold_policy_harness(vec![policy_p()], &[(policy_p(), 2)]).await;
     h.baseline_v2(1);
@@ -7766,6 +8108,9 @@ async fn a_confirmed_threshold_detach_whose_threshold_stays_refuses_with_the_has
 #[tokio::test]
 #[serial_test::serial]
 async fn a_detach_whose_policy_starts_identifying_after_the_comparison_refuses() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let chain = Chain::default()
         .with_rule(1, rule_one_with_policies(vec![policy_p()]))
@@ -7798,6 +8143,9 @@ async fn a_detach_whose_policy_starts_identifying_after_the_comparison_refuses()
 #[tokio::test]
 #[serial_test::serial]
 async fn a_rule_with_two_threshold_policies_detaches_one_of_them() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = threshold_policy_harness(
         vec![policy_p(), policy_p2()],
@@ -7842,6 +8190,9 @@ async fn a_rule_with_two_threshold_policies_detaches_one_of_them() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_repair_detach_on_a_rule_whose_signers_changed_refuses_before_submission() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = threshold_policy_harness(
         vec![policy_p(), policy_p2()],
@@ -7887,6 +8238,9 @@ async fn a_repair_detach_on_a_rule_whose_signers_changed_refuses_before_submissi
 #[tokio::test]
 #[serial_test::serial]
 async fn a_repair_detach_whose_confirmed_state_is_not_the_remaining_policy_refuses() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = threshold_policy_harness(
         vec![policy_p(), policy_p2()],
@@ -7923,6 +8277,9 @@ async fn a_repair_detach_whose_confirmed_state_is_not_the_remaining_policy_refus
 #[tokio::test]
 #[serial_test::serial]
 async fn three_threshold_policies_refuse_the_detach() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = threshold_policy_harness(
         vec![policy_p(), policy_p2(), policy_p3()],
@@ -7949,6 +8306,9 @@ async fn three_threshold_policies_refuse_the_detach() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_missing_rule_and_an_unattached_policy_id_refuse_the_removal() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = threshold_policy_harness(vec![policy_p()], &[(policy_p(), 1)]).await;
     let signer = SoftwareSigningKey::new_from_bytes(SEED);
@@ -8010,6 +8370,9 @@ async fn a_missing_rule_and_an_unattached_policy_id_refuse_the_removal() {
 #[tokio::test]
 #[serial_test::serial]
 async fn an_install_whose_secondary_lags_one_read_is_baselined() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(install_chain()).await;
     h.after_send_state(&installed(vec![delegated_account(0x13)], vec![], &[]));
@@ -8044,6 +8407,9 @@ async fn an_install_whose_secondary_lags_one_read_is_baselined() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_threshold_attach_whose_secondary_threshold_read_lags_is_recorded() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = threshold_policy_harness(vec![], &[]).await;
     h.baseline_v2(1);
@@ -8112,6 +8478,9 @@ fn diverged_rows(h: &Harness, request_id: &str) -> Vec<u32> {
 #[tokio::test]
 #[serial_test::serial]
 async fn every_distinct_auth_rule_is_read_and_compared() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(two_rule_chain()).await;
     h.baseline_v2(1);
@@ -8157,6 +8526,9 @@ async fn every_distinct_auth_rule_is_read_and_compared() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_missing_baseline_never_signs_or_baselines() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(two_rule_chain()).await;
     let err = h.submit(&[1], Some("req-no-baseline")).await.unwrap_err();
@@ -8184,6 +8556,9 @@ async fn a_missing_baseline_never_signs_or_baselines() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_version_1_row_on_an_auth_rule_compares_and_signs() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(verb_chain()).await;
     h.baseline_v1(1);
@@ -8205,6 +8580,9 @@ async fn a_version_1_row_on_an_auth_rule_compares_and_signs() {
 #[tokio::test]
 #[serial_test::serial]
 async fn an_identity_change_on_an_auth_rule_refuses_with_the_diverged_row() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(two_rule_chain()).await;
     h.baseline_v2(2);
@@ -8237,6 +8615,9 @@ async fn an_identity_change_on_an_auth_rule_refuses_with_the_diverged_row() {
 #[tokio::test]
 #[serial_test::serial]
 async fn rpc_disagreement_and_a_poisoned_writer_refuse_distinctly() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let mut secondary = two_rule_chain();
     secondary.rules.insert(2, rule_two_with_another_key());
@@ -8275,6 +8656,9 @@ async fn rpc_disagreement_and_a_poisoned_writer_refuse_distinctly() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_slow_comparison_elapses_at_signer_set_compare() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::with_budget(verb_chain(), Duration::from_secs(1)).await;
     h.baseline_v2(1);
@@ -8307,6 +8691,9 @@ async fn a_slow_comparison_elapses_at_signer_set_compare() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_spent_budget_elapses_at_baseline_read() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::with_budget(verb_chain(), Duration::ZERO).await;
     h.baseline_v2(1);
@@ -8335,6 +8722,9 @@ async fn a_spent_budget_elapses_at_baseline_read() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_held_rule_lock_refuses_at_rule_lock_until_it_is_released() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::with_budget(two_rule_chain(), Duration::from_secs(1)).await;
     h.baseline_v2(1);
@@ -8375,6 +8765,9 @@ async fn a_held_rule_lock_refuses_at_rule_lock_until_it_is_released() {
 #[tokio::test]
 #[serial_test::serial]
 async fn the_submit_path_releases_its_locks_before_the_send() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(two_rule_chain()).await;
     h.baseline_v2(1);
@@ -8407,6 +8800,9 @@ async fn the_submit_path_releases_its_locks_before_the_send() {
 #[tokio::test]
 #[serial_test::serial]
 async fn coexisting_faults_refuse_in_the_check_order() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(two_rule_chain()).await;
     h.baseline_v2(2);
@@ -8452,6 +8848,9 @@ async fn coexisting_faults_refuse_in_the_check_order() {
 #[tokio::test]
 #[serial_test::serial]
 async fn rule_zero_beside_rule_one_checks_rule_one_only() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let chain = two_rule_chain().with_rule(0, rule(0, vec![delegated_signer()], vec![]));
     let h = Harness::with_timeout(chain, Duration::from_secs(2)).await;
@@ -8482,6 +8881,9 @@ async fn rule_zero_beside_rule_one_checks_rule_one_only() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_rule_verbs_slow_comparison_elapses_at_signer_set_compare() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::with_budget(verb_chain(), Duration::from_secs(1)).await;
     h.baseline_v2(1);
@@ -8587,6 +8989,9 @@ impl SubmissionRecorder for CountingRecorder {
 #[tokio::test]
 #[serial_test::serial]
 async fn cap_refusal_precedes_any_signed_authorization() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     for arm in [1, 2] {
         let h = Harness::new(two_rule_chain()).await;
@@ -8626,6 +9031,9 @@ async fn cap_refusal_precedes_any_signed_authorization() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_refused_submission_leaves_no_record_and_a_sent_one_does() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let recorder = CountingRecorder::default();
 
@@ -8723,6 +9131,9 @@ async fn attach_threshold_under(
 #[tokio::test]
 #[serial_test::serial]
 async fn an_attach_under_an_unbaselined_auth_rule_refuses_missing_baseline() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(attach_chain()).await;
     h.baseline_v2(1);
@@ -8749,6 +9160,9 @@ async fn an_attach_under_an_unbaselined_auth_rule_refuses_missing_baseline() {
 #[tokio::test]
 #[serial_test::serial]
 async fn an_attach_under_a_diverged_auth_rule_refuses_with_the_diverged_row() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(attach_chain()).await;
     h.baseline_v2(1);
@@ -8781,6 +9195,9 @@ async fn an_attach_under_a_diverged_auth_rule_refuses_with_the_diverged_row() {
 #[tokio::test]
 #[serial_test::serial]
 async fn an_attach_under_a_baselined_auth_rule_compares_it_and_signs() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(attach_chain()).await;
     h.baseline_v2(1);
@@ -8885,6 +9302,9 @@ async fn set_spending_limit_of(
 #[tokio::test]
 #[serial_test::serial]
 async fn a_spending_limit_retune_under_an_unbaselined_admin_rule_refuses() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(spending_limit_chain()).await;
     h.set_simulated_return("get_spending_limit_data", spending_limit_data(1_000, 100));
@@ -8910,6 +9330,9 @@ async fn a_spending_limit_retune_under_an_unbaselined_admin_rule_refuses() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_spending_limit_retune_waits_for_its_admin_rules_lock() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::with_timeout(spending_limit_chain(), Duration::from_millis(300)).await;
     h.set_simulated_return("get_spending_limit_data", spending_limit_data(1_000, 100));
@@ -9045,6 +9468,9 @@ fn assert_the_added_verifier_pin_survives(h: &Harness, removal: &str, add: &str)
 #[tokio::test]
 #[serial_test::serial]
 async fn a_direct_removal_racing_a_verifier_add_keeps_the_added_pin() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(spending_limit_chain()).await;
     h.pin_created(
@@ -9105,6 +9531,9 @@ fn threshold_race_chain() -> Chain {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_threshold_detach_racing_a_verifier_add_keeps_the_added_pin() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(threshold_race_chain()).await;
     h.pin_created(1, vec![], vec![full(&KNOWN_WASM_HASH)], vec![], vec![]);
@@ -9153,6 +9582,9 @@ async fn a_threshold_detach_racing_a_verifier_add_keeps_the_added_pin() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_signer_add_racing_a_direct_removal_keeps_its_pin() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(spending_limit_chain()).await;
     h.pin_created(
@@ -9214,6 +9646,9 @@ fn crossed_spending_limit_chain() -> Chain {
 #[tokio::test]
 #[serial_test::serial]
 async fn crossed_retunes_complete_without_a_deadlock() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::with_timeout(crossed_spending_limit_chain(), Duration::from_secs(2)).await;
     h.baseline_v2(1);
@@ -9260,6 +9695,9 @@ async fn crossed_retunes_complete_without_a_deadlock() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_direct_attach_without_a_baseline_refuses() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = policy_harness(vec![]).await;
     let err = add_policy(&h, &policy_q(), "req-direct-missing", false)
@@ -9275,6 +9713,9 @@ async fn a_direct_attach_without_a_baseline_refuses() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_direct_attach_over_a_version_1_baseline_refuses() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = threshold_policy_harness(vec![policy_p2()], &[(policy_p2(), 1)]).await;
     h.baseline_v1(1);
@@ -9334,6 +9775,9 @@ async fn refresh(
 #[tokio::test]
 #[serial_test::serial]
 async fn a_live_verifier_the_record_does_not_pin_refuses_the_submission() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = absent_verifier_pin_harness().await;
     let err = h
@@ -9374,6 +9818,9 @@ async fn a_live_verifier_the_record_does_not_pin_refuses_the_submission() {
 #[tokio::test]
 #[serial_test::serial]
 async fn verify_pins_reports_drift_for_a_live_verifier_the_record_does_not_pin() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = absent_verifier_pin_harness().await;
     let result = h
@@ -9400,6 +9847,9 @@ async fn verify_pins_reports_drift_for_a_live_verifier_the_record_does_not_pin()
 #[tokio::test]
 #[serial_test::serial]
 async fn a_refresh_pins_the_live_verifier_of_a_record_that_pins_none() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = absent_verifier_pin_harness().await;
     let outcome = refresh(&h, RefreshOptions::new(false), "req-repair")
@@ -9430,6 +9880,9 @@ async fn a_refresh_pins_the_live_verifier_of_a_record_that_pins_none() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_diverged_refresh_pins_the_live_verifier_only_with_the_flag() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = absent_verifier_pin_harness().await;
     h.set_rule(
@@ -9481,6 +9934,9 @@ async fn a_diverged_refresh_pins_the_live_verifier_only_with_the_flag() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_refresh_leaves_a_record_with_a_verifier_pin_or_no_record_alone() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(absent_verifier_pin_chain()).await;
     h.baseline_v2(1);
@@ -9540,6 +9996,9 @@ async fn a_refresh_leaves_a_record_with_a_verifier_pin_or_no_record_alone() {
 #[tokio::test]
 #[serial_test::serial]
 async fn two_signers_on_one_verifier_are_pinned_once() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let chain = absent_verifier_pin_chain().with_rule(
         1,
@@ -9597,6 +10056,9 @@ fn absent_verifier_pin_chain_on(verifier: &ScAddress, entries: Vec<Value>) -> Ch
 #[tokio::test]
 #[serial_test::serial]
 async fn a_refresh_pins_an_unknown_verifier_only_with_its_override() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let unknown = [0xdd; 32];
     let h = Harness::new(absent_verifier_pin_chain_on(
@@ -9648,6 +10110,9 @@ async fn a_refresh_pins_an_unknown_verifier_only_with_its_override() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_refresh_pins_a_mutable_verifier_only_with_its_override() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(absent_verifier_pin_chain_on(
         &verifier_v(),
@@ -9715,6 +10180,9 @@ async fn a_refresh_pins_a_mutable_verifier_only_with_its_override() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_refresh_refuses_a_wasm_verifier_and_a_reference_on_one_hash() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let chain = absent_verifier_pin_chain()
         .with_rule(
@@ -9771,6 +10239,9 @@ async fn a_refresh_refuses_a_wasm_verifier_and_a_reference_on_one_hash() {
 #[tokio::test]
 #[serial_test::serial]
 async fn two_references_on_one_tag_share_one_pin_and_record_both_overrides() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let chain = absent_verifier_pin_chain()
         .with_rule(
@@ -9838,6 +10309,9 @@ async fn two_references_on_one_tag_share_one_pin_and_record_both_overrides() {
 #[tokio::test]
 #[serial_test::serial]
 async fn two_signers_on_one_mutable_verifier_are_probed_once() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let entries = || {
         vec![
@@ -9907,6 +10381,9 @@ async fn two_signers_on_one_mutable_verifier_are_probed_once() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_refresh_refuses_live_verifiers_running_two_executables() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let chain = absent_verifier_pin_chain()
         .with_rule(
@@ -9952,6 +10429,9 @@ async fn a_refresh_refuses_live_verifiers_running_two_executables() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_revoked_pinned_verifier_refuses_before_simulation() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(chain_with_rule_one([0xee; 32])).await;
     h.baseline_v2(1);
@@ -9986,6 +10466,9 @@ async fn a_revoked_pinned_verifier_refuses_before_simulation() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_revoked_new_verifier_is_refused_with_every_override() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     for pinned in [false, true] {
         let h = Harness::new(signer_add_chain().with_wasm(&verifier_w(), [0xee; 32])).await;
@@ -10036,6 +10519,9 @@ async fn a_revoked_new_verifier_is_refused_with_every_override() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_migration_away_from_a_revoked_verifier_signs() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(signer_add_chain().with_wasm(&verifier_v(), [0xee; 32])).await;
     h.baseline_v2(1);
@@ -10065,6 +10551,9 @@ async fn a_migration_away_from_a_revoked_verifier_signs() {
 #[tokio::test]
 #[serial_test::serial]
 async fn quorum_collection_refuses_a_revoked_signing_rule() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     use stellar_agent_smart_account::managers::auth_entry::test_helpers::{
         baseline_authorization_simulation, matching_envelope_context,
@@ -10149,6 +10638,9 @@ fn twin_of(hash: [u8; 32], fill: u8) -> [u8; 32] {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_migration_to_an_equal_prefix_destination_pins_its_full_hash() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let twin = twin_of(PINNED, 0x43);
     let h = Harness::new(
@@ -10215,6 +10707,9 @@ async fn a_migration_to_an_equal_prefix_destination_pins_its_full_hash() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_refresh_refuses_live_verifiers_whose_hashes_share_only_a_prefix() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let twin = twin_of(PINNED, 0x43);
     let chain = Chain::default()
@@ -10266,6 +10761,9 @@ async fn a_refresh_refuses_live_verifiers_whose_hashes_share_only_a_prefix() {
 #[tokio::test]
 #[serial_test::serial]
 async fn signer_adds_keep_equal_prefix_verifier_pins_distinct() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let twin = twin_of(PINNED, 0x43);
     let second_twin = twin_of(PINNED, 0x44);
@@ -10331,6 +10829,9 @@ async fn signer_adds_keep_equal_prefix_verifier_pins_distinct() {
 #[tokio::test]
 #[serial_test::serial]
 async fn removing_a_policy_drops_only_the_full_hash_match_of_two_equal_prefix_pins() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let twin = twin_of(PINNED, 0x43);
     let policy_s = contract(0x33);
@@ -10400,6 +10901,9 @@ fn pin_created_prefix(h: &Harness, rule_id: u32, verifier: [u8; 32], policy: [u8
 #[tokio::test]
 #[serial_test::serial]
 async fn an_incomplete_pin_record_refuses_signing_with_no_signature_and_no_send() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(chain_with_rule_one(webauthn_hash())).await;
     h.baseline_v2(1);
@@ -10460,6 +10964,9 @@ async fn an_incomplete_pin_record_refuses_signing_with_no_signature_and_no_send(
 #[tokio::test]
 #[serial_test::serial]
 async fn an_incomplete_pin_record_refuses_a_migration_with_no_signature_and_no_send() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(false).await;
     pin_created_prefix(&h, 1, webauthn_hash(), KNOWN_WASM_HASH);
@@ -10562,6 +11069,9 @@ async fn weighted_harness(threshold: u32) -> Harness {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_threshold_above_the_weight_sum_stays_out_of_the_refusal() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let (capture, _guard) = stellar_agent_test_support::log_capture::WarningCapture::capture(None);
     let h = weighted_harness(2).await;
@@ -10599,6 +11109,9 @@ async fn a_threshold_above_the_weight_sum_stays_out_of_the_refusal() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_weight_below_the_threshold_stays_out_of_the_refusal() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let (capture, _guard) = stellar_agent_test_support::log_capture::WarningCapture::capture(None);
     let h = weighted_harness(500_000).await;
@@ -10641,6 +11154,9 @@ const MISSING_BASELINE: &str = "rule_id must identify a rule with a recorded sig
 #[tokio::test]
 #[serial_test::serial]
 async fn a_missing_baseline_of_a_spending_limit_retune_names_no_rule() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let (capture, _guard) = stellar_agent_test_support::log_capture::WarningCapture::capture(None);
     let h = Harness::new(spending_limit_chain()).await;
@@ -10665,6 +11181,9 @@ async fn a_missing_baseline_of_a_spending_limit_retune_names_no_rule() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_missing_baseline_of_a_signer_verb_names_no_rule() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let (capture, _guard) = stellar_agent_test_support::log_capture::WarningCapture::capture(None);
     let chain = Chain::default().with_rule(
@@ -10697,6 +11216,9 @@ async fn a_missing_baseline_of_a_signer_verb_names_no_rule() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_non_positive_limit_stays_out_of_the_refusal() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     use stellar_agent_smart_account::managers::signers::SPENDING_LIMIT_POSITIVE_REASON;
 
@@ -10737,6 +11259,9 @@ async fn a_non_positive_limit_stays_out_of_the_refusal() {
 #[test]
 #[serial_test::serial]
 fn a_mismatched_operation_id_stays_out_of_the_refusal() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     use stellar_agent_smart_account::error::TimelockExecuteFailureReason;
     use stellar_agent_smart_account::timelock::{

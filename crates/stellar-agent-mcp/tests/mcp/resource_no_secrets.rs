@@ -42,11 +42,14 @@ fn usage_md_no_profile_paths() {
     // Profile-file path patterns, matching the canonical data-root shapes
     // the wallet actually derives per platform.
     assert!(
-        !content.contains(".local/share/stellar-agent"),
+        !content.contains(stellar_agent_test_support::sandbox::LINUX_WALLET_SUFFIX.trim()),
         "usage.md must not contain Linux profile state directory paths"
     );
     assert!(
-        !content.contains("Application Support/Soneso.stellar-agent"),
+        !content.contains(&format!(
+            "Application Support/{}",
+            stellar_agent_test_support::sandbox::MACOS_WALLET_SUFFIX.trim()
+        )),
         "usage.md must not contain macOS profile state directory paths"
     );
     assert!(

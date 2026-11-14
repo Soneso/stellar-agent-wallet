@@ -2086,7 +2086,11 @@ mod tests {
 
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn resolve_signers_rejects_empty() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
         let err = resolve_signers(&[], &server).unwrap_err();
         assert!(err.message.contains("non-empty"));
@@ -2094,7 +2098,11 @@ mod tests {
 
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn resolve_signers_rejects_over_oz_max_signers() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
         let signers: Vec<RuleCreateSignerArg> = (0..=OZ_MAX_SIGNERS)
             .map(|_| RuleCreateSignerArg::Delegated {
@@ -2107,7 +2115,11 @@ mod tests {
 
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn resolve_signers_delegated_tags_proposer_when_address_matches_profile() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
         let signers = vec![RuleCreateSignerArg::Delegated {
             address: TEST_G.to_owned(),
@@ -2123,7 +2135,11 @@ mod tests {
 
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn resolve_signers_delegated_does_not_tag_proposer_for_a_different_address() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
         let signers = vec![RuleCreateSignerArg::Delegated {
             address: TEST_G_2.to_owned(),
@@ -2136,7 +2152,11 @@ mod tests {
     /// signer, in both the typed definition and the snapshot.
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn resolve_signers_delegated_accepts_a_c_strkey() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
         let signers = vec![
             RuleCreateSignerArg::Delegated {
@@ -2163,7 +2183,11 @@ mod tests {
     /// A muxed M-strkey delegate is refused with the signer's index.
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn resolve_signers_delegated_refuses_an_m_strkey() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
         let muxed = format!(
             "{}",
@@ -2191,7 +2215,11 @@ mod tests {
 
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn resolve_signers_delegated_rejects_invalid_strkey() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
         let signers = vec![RuleCreateSignerArg::Delegated {
             address: "not-a-strkey".to_owned(),
@@ -2210,7 +2238,11 @@ mod tests {
     /// proceeds without it.
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn only_an_account_delegate_is_the_fallback_signer() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
         let external = RuleCreateSignerArg::External {
             verifier: TEST_C.to_owned(),
@@ -2243,7 +2275,11 @@ mod tests {
 
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn resolve_signers_external_valid() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
         let signers = vec![RuleCreateSignerArg::External {
             verifier: TEST_C.to_owned(),
@@ -2260,7 +2296,11 @@ mod tests {
 
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn resolve_signers_external_rejects_invalid_verifier_strkey() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
         let signers = vec![RuleCreateSignerArg::External {
             verifier: "not-a-strkey".to_owned(),
@@ -2272,7 +2312,11 @@ mod tests {
 
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn resolve_signers_external_rejects_invalid_hex() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
         let signers = vec![RuleCreateSignerArg::External {
             verifier: TEST_C.to_owned(),
@@ -2287,7 +2331,11 @@ mod tests {
 
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn resolve_signers_external_rejects_oversized_pubkey() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
         let signers = vec![RuleCreateSignerArg::External {
             verifier: TEST_C.to_owned(),
@@ -2432,7 +2480,11 @@ mod tests {
 
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn propose_time_and_snapshot_definitions_encode_the_same_install_arguments() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_smart_account::managers::rules::build_add_context_rule_args_for_test;
 
         let (server, _dir) = test_server();
@@ -2605,7 +2657,11 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn commit_unknown_nonce_is_indistinguishable_approval_required() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
 
         let result = server
@@ -2621,7 +2677,11 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn commit_expired_entry_is_indistinguishable_approval_required() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
 
         let nonce = insert_rule_proposal_entry(&server, "stellar:testnet", None, 0);
@@ -2635,7 +2695,11 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn commit_rejected_tombstone_returns_distinguishable_rejected() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
 
         let nonce = insert_rule_proposal_entry(&server, "stellar:testnet", None, DEFAULT_TTL_MS);
@@ -2669,7 +2733,11 @@ mod tests {
     /// the agent grant itself permanent authority.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn commit_via_public_handler_with_allow_engine_still_requires_attestation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
 
         let nonce = insert_rule_proposal_entry(&server, "stellar:testnet", None, DEFAULT_TTL_MS);
@@ -2688,7 +2756,11 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn commit_wrong_kind_entry_is_indistinguishable_approval_required() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
 
         // Insert a PaymentSimulated entry under the nonce the commit call
@@ -2724,7 +2796,11 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn commit_chain_id_mismatch_is_simulation_divergence() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
 
         // The presented chain_id ("stellar:testnet") must itself match the
@@ -2742,7 +2818,11 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn commit_digest_mismatch_is_simulation_divergence() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
 
         // Store an entry whose recorded digest does NOT match what
@@ -2767,7 +2847,11 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn commit_missing_attestation_when_required_is_indistinguishable_approval_required() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
 
         let nonce = insert_rule_proposal_entry(&server, "stellar:testnet", None, DEFAULT_TTL_MS);
@@ -2784,7 +2868,11 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn commit_malformed_attestation_base64_is_indistinguishable_approval_required() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
 
         let nonce = insert_rule_proposal_entry(&server, "stellar:testnet", None, DEFAULT_TTL_MS);
@@ -2803,7 +2891,11 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn commit_wrong_attestation_is_indistinguishable_approval_required() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().ok();
 
         let (server, _dir) = test_server();
@@ -2831,7 +2923,11 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn propose_refuses_mainnet_chain_id() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
         let json = serde_json::json!({
             "chain_id": "stellar:mainnet",
@@ -2853,7 +2949,11 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn commit_refuses_mainnet_chain_id() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
         // The mainnet refusal fires before any nonce lookup, so an
         // arbitrary/never-inserted nonce is sufficient for this test.
@@ -2880,7 +2980,11 @@ mod tests {
     /// the commit refuses there.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn commit_logs_a_consent_row_queued_after_its_pre_flight_before_the_signer_loads() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::{Arc, Mutex};
 
@@ -3331,7 +3435,11 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn a_definition_swapped_after_approval_does_not_install() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::approval::{
             ApprovalKind, AttestedApprover, ConsentAudit, ConsentAuthorization, Surface,
             attest_and_persist,
@@ -3423,13 +3531,21 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn a_restored_pending_store_does_not_rearm_a_spent_rule_approval() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         restored_commit_is_spent(false).await;
     }
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn a_spent_record_survives_a_new_server() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         restored_commit_is_spent(true).await;
     }
 
@@ -3439,7 +3555,11 @@ mod tests {
     /// alone keeps the approval from a second install.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn a_pruned_approval_stays_refused_when_the_clock_moves_back() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let rpc = FirstContactRpc::start();
         let (server, args, store_path, record) =
@@ -3547,13 +3667,21 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn a_spent_record_write_failure_refuses_before_the_install() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         spent_record_failure_refuses(true).await;
     }
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn a_spent_record_read_failure_refuses_before_the_install() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         spent_record_failure_refuses(false).await;
     }
 
@@ -3561,7 +3689,11 @@ mod tests {
     /// commit, and the stored marker keeps the approval spent.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn a_marker_stored_before_a_write_error_keeps_the_approval_spent() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let rpc = FirstContactRpc::start();
         let (server, args, store_path, record) =
@@ -3613,13 +3745,21 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn a_malformed_spent_record_refuses_before_the_install() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stored_record_refuses("not-a-record", "it does not parse").await;
     }
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn a_full_spent_record_refuses_before_the_install() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stored_record_refuses(
             &live_spent_record(MAX_SPENT_RULE_APPROVALS),
             "it is full until an approval expires",
@@ -3667,7 +3807,11 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn the_spent_record_lock_spans_the_load_and_the_store() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let rpc = FirstContactRpc::start();
         let (mut server, args, _store_path) = attested_commit_with_enrolled_signer(
@@ -3696,7 +3840,11 @@ mod tests {
     /// take it refuses and leaves the record as it stands.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn a_held_spent_record_lock_refuses_before_the_install() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let rpc = FirstContactRpc::start();
         let (server, args, store_path, record) =
@@ -3721,7 +3869,11 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn profiles_sharing_a_coordinate_both_keep_their_markers() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let rpc = FirstContactRpc::start();
         let shared = KeyringEntryRef::new("stellar-agent-attestation-shared", "default");
@@ -3780,7 +3932,11 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn a_rule_approval_issued_before_the_upgrade_cannot_be_committed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::approval::{
             ApprovalKind, AttestationBinding, AttestedApprover, compute_attestation_v4,
         };
@@ -3839,7 +3995,11 @@ mod tests {
     /// connection.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn a_failed_install_spends_the_rule_approval() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let rpc = FirstContactRpc::start();
         let (server, args, store_path) = attested_commit_with_enrolled_signer(
@@ -3905,7 +4065,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn a_consume_write_failure_refuses_before_the_install() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use std::os::unix::fs::PermissionsExt as _;
 
         let dir = tempfile::tempdir().unwrap();
@@ -3941,7 +4105,11 @@ mod tests {
     /// the expected form or constraint, and no refusal repeats the argument.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn rule_create_marker_is_not_echoed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_test_support::rejected_value::{
             CREDENTIAL_MARKER, assert_no_marker_in_text,
         };

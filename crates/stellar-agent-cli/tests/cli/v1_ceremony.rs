@@ -237,6 +237,8 @@ impl IsolatedHome {
     /// The `stellar-agent` command with the isolated environment applied.
     #[must_use]
     pub fn command(&self, args: &[&str]) -> Command {
+        stellar_agent_test_support::sandbox::mark_sandbox(self.path())
+            .expect("mark fixture directory");
         let mut command = Command::new(env!("CARGO_BIN_EXE_stellar-agent"));
         command
             .args(args)

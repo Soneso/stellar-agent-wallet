@@ -830,6 +830,8 @@ mod tests {
     #[test]
     #[serial]
     fn loads_beside_a_reader_take_the_exclusive_lock_only_to_write() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let f = Fixture::new();
         f.seed_pin();
         let window = f.dir.path().join("state.window");
@@ -869,6 +871,9 @@ mod tests {
     #[test]
     #[serial]
     fn owner_rotation_required_preserves_pin_in_both_modes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = Fixture::new();
         f.seed_pin();
         let before = f.pin();
@@ -882,6 +887,9 @@ mod tests {
     #[test]
     #[serial]
     fn owner_rotation_advances_and_reloads_with_the_new_owner() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = Fixture::new();
         f.seed_pin();
         let before = f.pin();
@@ -909,6 +917,9 @@ mod tests {
     #[test]
     #[serial]
     fn owner_rotation_invalid_statements_preserve_pin_in_both_modes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = Fixture::new();
         f.seed_pin();
         let before = f.pin();
@@ -955,6 +966,9 @@ mod tests {
     #[test]
     #[serial]
     fn pin_absent_refuses_a_verified_enablement_in_both_modes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::{
             mainnet::enablement::{read_enablement_nonce, verify_enablement},
             profile::{loader, name::ProfileNameSource, schema::mainnet_enablement_entry_ref},
@@ -1010,6 +1024,9 @@ mod tests {
     #[test]
     #[serial]
     fn absent_pin_without_enablement_keeps_first_use() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = Fixture::new();
         f.load(&f.body(7), &f.old, PinMode::CompareOnly).unwrap();
         assert_eq!(f.pin(), PinState::Absent);
@@ -1023,6 +1040,9 @@ mod tests {
     #[test]
     #[serial]
     fn malformed_owner_rotation_refuses_at_parse_in_both_modes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = Fixture::new();
         f.seed_pin();
         let before = f.pin();
@@ -1050,6 +1070,9 @@ mod tests {
     #[test]
     #[serial]
     fn an_unreadable_enablement_nonce_refuses_an_absent_pin() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = Fixture::new();
         let coordinate = crate::profile::schema::mainnet_enablement_entry_ref(
             &f.profile.policy_window_state_key_id,

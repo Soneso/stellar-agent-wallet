@@ -1100,6 +1100,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn an_invalidated_classic_authorization_never_reaches_the_signer() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let f = fixtures::LedgerFixture::new("invalidated-classic", NOW);
             let (envelope, auth) = ledger_authorization(&f);
             crate::mainnet::resolve::invalidate_unconsumed(
@@ -1139,6 +1142,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn a_classic_claim_that_fails_to_persist_never_reaches_the_signer() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let f = fixtures::LedgerFixture::new("unpersisted-classic", NOW);
             let (envelope, auth) = ledger_authorization(&f);
             let signer = CountingSigner::new(SIGNER_SEED);
@@ -1161,6 +1167,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn a_changed_policy_pin_at_the_classic_claim_never_reaches_the_signer() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let f = fixtures::LedgerFixture::new("repinned-classic", NOW);
             let (envelope, auth) = ledger_authorization(&f);
             f.repin([0x5a; 32]);
@@ -1182,6 +1191,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn muxed_contract_authorized_signature_refuses_without_consuming() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let f = fixtures::LedgerFixture::new("muxed", NOW);
             let signer = CountingSigner::new(SIGNER_SEED);
             let TransactionEnvelope::Tx(mut v1) = TransactionEnvelope::from_xdr_base64(
@@ -1220,6 +1232,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn a_classic_authorization_signs_once() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let f = fixtures::LedgerFixture::new("classic-once", NOW);
             let (envelope, auth) = ledger_authorization(&f);
             let signer = CountingSigner::new(SIGNER_SEED);
@@ -1261,6 +1276,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn a_late_classic_signature_is_discarded() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let f = fixtures::LedgerFixture::new("late-classic", NOW);
             let (envelope, auth) = ledger_authorization(&f);
             let signer = CountingSigner::advancing_clock_to(SIGNER_SEED, auth.expires_at_ms());
@@ -1284,6 +1302,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn the_authorized_sibling_signs_once_under_the_mainnet_payload() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let _clock = set_now_ms_for_test(NOW);
             let case = Case::new();
             let signer = CountingSigner::new(SIGNER_SEED);
@@ -1319,6 +1340,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn another_consumer_is_refused() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let _clock = set_now_ms_for_test(NOW);
             let case = Case::new();
             let signer = CountingSigner::new(SIGNER_SEED);
@@ -1337,6 +1361,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn another_transaction_hash_is_refused() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let _clock = set_now_ms_for_test(NOW);
             let case = Case::new();
             let signer = CountingSigner::new(SIGNER_SEED);
@@ -1362,6 +1389,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn a_pre_signed_envelope_is_refused() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let _clock = set_now_ms_for_test(NOW);
             let case = Case::new();
             let signer = CountingSigner::new(SIGNER_SEED);
@@ -1382,6 +1412,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn another_source_is_refused() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let _clock = set_now_ms_for_test(NOW);
             let case = Case::new();
             let signer = CountingSigner::new(SIGNER_SEED);
@@ -1405,6 +1438,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn another_sequence_is_refused() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let _clock = set_now_ms_for_test(NOW);
             let case = Case::new();
             let signer = CountingSigner::new(SIGNER_SEED);
@@ -1430,6 +1466,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn another_signer_key_is_refused() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let _clock = set_now_ms_for_test(NOW);
             let case = Case::new();
             let signer = CountingSigner::new(OTHER_SEED);
@@ -1448,6 +1487,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn an_expired_authorization_is_refused() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let _clock = set_now_ms_for_test(NOW + TTL_MS);
             let case = Case::new();
             let signer = CountingSigner::new(SIGNER_SEED);
@@ -1467,6 +1509,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn an_authorization_on_testnet_is_refused() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let _clock = set_now_ms_for_test(NOW);
             let case = Case::new();
             let signer = CountingSigner::new(SIGNER_SEED);
@@ -1487,6 +1532,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn an_authorization_bound_to_another_chain_is_refused() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let _clock = set_now_ms_for_test(NOW);
             let case = Case::new();
             let signer = CountingSigner::new(SIGNER_SEED);
@@ -1508,6 +1556,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn a_fee_bump_envelope_is_refused() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let _clock = set_now_ms_for_test(NOW);
             let case = Case::new();
             let signer = CountingSigner::new(SIGNER_SEED);
@@ -1533,6 +1584,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn a_fee_bump_refuses_before_chain_consumer_and_expiry_checks() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let _clock = set_now_ms_for_test(NOW + TTL_MS);
             let case = Case::new();
             let signer = CountingSigner::new(SIGNER_SEED);
@@ -1568,6 +1622,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn a_bad_signature_is_refused_after_signing() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let _clock = set_now_ms_for_test(NOW);
             let case = Case::new();
             let signer = CountingSigner::corrupting(SIGNER_SEED);

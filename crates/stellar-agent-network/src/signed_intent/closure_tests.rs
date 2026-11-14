@@ -278,6 +278,9 @@ fn witness(arrival: u64) -> LedgerWitnessCapability {
 #[tokio::test]
 #[serial_test::serial]
 async fn entryless_admission_commits_progress() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let scratch = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
     std::fs::create_dir_all(&scratch).unwrap();
@@ -413,6 +416,9 @@ async fn entryless_admission_commits_progress() {
 #[test]
 #[serial_test::serial]
 fn envelope_bound_mismatch_keeps_admitted_charge() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_xdr::{LedgerBounds, Preconditions, PreconditionsV2, VecM};
 
     let set_bound = |envelope: &mut TransactionEnvelope, maximum: Option<u32>| {

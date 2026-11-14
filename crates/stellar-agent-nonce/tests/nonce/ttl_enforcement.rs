@@ -17,6 +17,9 @@ const MAX_TTL_MS: u64 = NonceMint::MAX_TTL_MS;
 #[test]
 #[serial]
 fn mint_rejects_ttl_exceeded() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let key = [0xA1u8; 32];
     let profile = make_profile("ttl-exceeded");
@@ -48,6 +51,9 @@ fn mint_rejects_ttl_exceeded() {
 #[test]
 #[serial]
 fn mint_rejects_ttl_too_short() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let key = [0xA2u8; 32];
     let profile = make_profile("ttl-too-short");
@@ -79,6 +85,9 @@ fn mint_rejects_ttl_too_short() {
 #[test]
 #[serial]
 fn mint_accepts_min_ttl() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let key = [0xA3u8; 32];
     let profile = make_profile("ttl-min");
@@ -97,6 +106,9 @@ fn mint_accepts_min_ttl() {
 #[test]
 #[serial]
 fn mint_accepts_max_ttl() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let key = [0xA4u8; 32];
     let profile = make_profile("ttl-max");
@@ -115,6 +127,9 @@ fn mint_accepts_max_ttl() {
 #[test]
 #[serial]
 fn mint_rejects_already_expired() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let key = [0xA5u8; 32];
     let profile = make_profile("ttl-already-expired");

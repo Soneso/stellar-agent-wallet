@@ -77,6 +77,8 @@ impl Binary {
 
     /// Points the command at the scratch home and the test keyring.
     fn isolate(&self, command: &mut Command) {
+        stellar_agent_test_support::sandbox::mark_sandbox(self.home.path())
+            .expect("mark fixture directory");
         command
             .current_dir(self.home.path())
             .env("STELLAR_AGENT_HOME", self.home.path())

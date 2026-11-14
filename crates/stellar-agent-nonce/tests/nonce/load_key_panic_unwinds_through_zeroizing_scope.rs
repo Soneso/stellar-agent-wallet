@@ -43,6 +43,9 @@ impl Drop for DropSentinel {
 #[test]
 #[serial]
 fn panic_in_load_key_fires_zeroizing_drop() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let key = [0xB7u8; 32];
     let profile = make_profile("panic-injection-nonce");

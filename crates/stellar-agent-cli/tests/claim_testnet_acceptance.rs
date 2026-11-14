@@ -226,6 +226,7 @@ async fn t3_cli_single_shot_happy_path() {
 
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
     let output = Command::new(bin_path)
+        .args(cfg!(feature = "live-platform-keyring").then_some("--test-live-platform-keyring"))
         .args([
             "claim",
             &balance_id_hex72,

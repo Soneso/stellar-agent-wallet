@@ -952,6 +952,9 @@ mod tests {
     #[test]
     #[serial]
     fn load_audit_hmac_key_surfaces_interactive_session_required() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().ok();
         let profile = audit_key_test_profile("deploy-c-audit-no-logon-test");
         let entry_ref = &profile.audit_log_hash_chain_key_id;
@@ -975,6 +978,9 @@ mod tests {
     #[test]
     #[serial]
     fn load_audit_hmac_key_surfaces_platform_error() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().ok();
         let profile = audit_key_test_profile("deploy-c-audit-platform-err-test");
         let entry_ref = &profile.audit_log_hash_chain_key_id;
@@ -1085,6 +1091,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn deploy_c_external_genesis_without_ack_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().ok();
         let (mut args, _env_guard) = deploy_args(None, true);
         args.initial_signer = None;
@@ -1179,6 +1188,7 @@ mod tests {
         stellar_agent_test_support::keyring_mock::install().ok();
 
         let dir = TempDir::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let profile = profile_with_audit_path(
             "deploy-c-audit-dry-run-test",
             dir.path().join("deploy-c-dry-run.jsonl"),
@@ -1217,6 +1227,7 @@ mod tests {
         stellar_agent_test_support::keyring_mock::install().ok();
 
         let dir = TempDir::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let profile = profile_with_audit_path(
             "deploy-c-audit-failure-test",
             dir.path().join("deploy-c-failure.jsonl"),

@@ -3260,6 +3260,7 @@ mod signed_intent_observation_tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn dispatch_observation_is_optional_but_verification_is_required() {
         use stellar_agent_core::policy::v1::criteria::{
             per_period_cap::Window, rate_limit::RateLimitCriterion,
@@ -3485,12 +3486,14 @@ pub(crate) mod tests {
     )]
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn expired_x402_proof_keeps_the_entry() {
         crate::tools::x402_create_payment::approval_tests::subject_gate_case(true).await;
     }
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn x402_approval_subjects_do_not_cross_tools_or_networks() {
         crate::tools::x402_create_payment::approval_tests::subject_gate_case(false).await;
     }
@@ -3545,7 +3548,11 @@ pub(crate) mod tests {
     use stellar_agent_core::AuthError;
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn g_c_m_payees_do_not_build_an_eligibility_client() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let profile = Profile::builder_testnet_named("muxed", "s", "a", "n", "a").build();
         let attempts = std::cell::Cell::new(0);
         for payee in [
@@ -3751,7 +3758,11 @@ pub(crate) mod tests {
     /// An unset `submit_timeout_seconds` gives the 60-second default and a
     /// configured one its own value.
     #[test]
+    #[serial_test::serial]
     fn submit_timeout_resolves_the_default_and_the_configured_value() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct").build();
         profile.submit_timeout_seconds = None;
         assert_eq!(submit_timeout(&profile), std::time::Duration::from_secs(60));
@@ -3996,6 +4007,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn dispatch_gate_profile_chain_validation_precedes_evaluation() {
         let home = tempfile::tempdir().expect("isolated home");
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
@@ -4041,6 +4053,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn dispatch_gate_profile_chain_exact_allow_both_branches() {
         use stellar_agent_core::policy::v1::value::derive_value_class;
         let home = tempfile::tempdir().expect("isolated home");
@@ -4091,6 +4104,7 @@ pub(crate) mod tests {
     /// testnet outcome carries its instant and no mainnet decision.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn off_mainnet_clock_failure_renders_wallet_clock_error() {
         use stellar_agent_core::policy::v1::value::derive_value_class;
         let home = tempfile::tempdir().expect("isolated home");
@@ -4143,6 +4157,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn dispatch_gate_profile_chain_cap_precedes_wildcard_both_branches() {
         use stellar_agent_core::policy::v1::value::derive_value_class;
         let home = tempfile::tempdir().expect("isolated home");
@@ -4196,6 +4211,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn dispatch_gate_profile_chain_mainnet_read_only_and_testnet_control() {
         let home = tempfile::tempdir().expect("isolated home");
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
@@ -4230,6 +4246,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn dispatch_gate_profile_chain_tool_without_chain_argument() {
         let home = tempfile::tempdir().expect("isolated home");
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
@@ -4449,7 +4466,11 @@ pub(crate) mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn dispatch_gate_decision_allow_proceeds() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // The testnet profile + NoopPolicyEngine returns Allow for all tools.
         // Explicitly set Noop so WalletServer::new succeeds without a signed
         // policy file on disk (PolicyEngineKind::default() is V1).
@@ -4476,7 +4497,11 @@ pub(crate) mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn dispatch_gate_wires_counterparty_cache_snapshot_into_policy() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().ok();
         let observed = Arc::new(AtomicBool::new(false));
         let engine = CacheAssertingPolicyEngine {
@@ -4503,7 +4528,11 @@ pub(crate) mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn dispatch_gate_decision_deny_per_tx_cap_emits_wire_code() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().ok();
         let deny_reason = DenyReason::PerTxCapExceeded {
             asset: "XLM".into(),
@@ -4528,7 +4557,11 @@ pub(crate) mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn dispatch_gate_decision_deny_counterparty_denied_redacts_g_strkey() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().ok();
         let full_strkey = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
         let deny_reason = DenyReason::CounterpartyDenied {
@@ -4582,7 +4615,11 @@ pub(crate) mod tests {
     /// engine error generically.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn dispatch_gate_defi_tool_minimum_reserve_fails_closed_with_no_account_view() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::policy::v1::criteria::MinimumReserveCriterion;
         use stellar_agent_core::policy::v1::{ValueClass, ValueEffects};
         use stellar_agent_core::{PolicyDocument, PolicyEngineV1, PolicyRule, RuleMatch, ScopeId};
@@ -4655,7 +4692,11 @@ pub(crate) mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn dispatch_gate_decision_require_approval_returns_outcome() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().ok();
         let req = ApprovalRequest::new("test-nonce-abc".into(), 120);
         let engine = MockPolicyEngine::returns(Ok(Decision::RequireApproval(req)));
@@ -4681,7 +4722,11 @@ pub(crate) mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn paired_commit_outcome_requires_decodable_commit_arguments() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().ok();
         let req = ApprovalRequest::new("commit-nonce".into(), 120);
         let engine = MockPolicyEngine::returns(Ok(Decision::RequireApproval(req)));
@@ -4758,7 +4803,11 @@ pub(crate) mod tests {
 
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn load_attestation_key_decode_failure_holds_no_diagnostic() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().ok();
         let mut profile =
             Profile::builder_testnet("svc-attest-decode", "acct-attest-decode", "n-svc", "n-acct")
@@ -4789,7 +4838,11 @@ pub(crate) mod tests {
 
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn load_attestation_key_answers_owner_key_forms_uniformly() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let mut profile = stellar_agent_core::profile::schema::Profile::builder_testnet_named(
             "mcp-attest-forms",
@@ -4883,7 +4936,11 @@ pub(crate) mod tests {
     /// refusal does not carry the nonce.
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn approval_nonce_marker_is_not_logged() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use base64::Engine as _;
         use stellar_agent_test_support::CaptureWriter;
         use stellar_agent_test_support::rejected_value::{
@@ -4939,7 +4996,10 @@ pub(crate) mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn verify_attestation_gate_debug_logs_omit_absolute_paths() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         use base64::Engine as _;
         use stellar_agent_test_support::CaptureWriter;
         use tracing_subscriber::fmt::Subscriber;
@@ -5002,7 +5062,11 @@ pub(crate) mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn mcp_tools_common_propagates_clock_error_from_injected_failing_clock() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use base64::Engine as _;
         use stellar_agent_core::approval::{
             DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore, process_uid_for_attestation,
@@ -5088,7 +5152,11 @@ pub(crate) mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn verify_attestation_gate_rejects_rule_proposal_simulated_entry() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use base64::Engine as _;
         use stellar_agent_core::approval::rule_proposal::{
             ContextRuleProposalSnapshot, RuleProposalContextType, RuleProposalSigner,
@@ -5186,7 +5254,10 @@ pub(crate) mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn core_minted_testnet_attestation_verifies_through_verify_attestation_gate() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         use base64::Engine as _;
         use stellar_agent_core::approval::{
             DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore, Surface, attest_and_persist,
@@ -5313,7 +5384,10 @@ pub(crate) mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn attestation_gate_rejects_cross_profile_and_both_cross_chain_bindings() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         use base64::Engine as _;
         use stellar_agent_core::approval::{
             DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore, Surface, attest_and_persist,
@@ -5514,7 +5588,11 @@ pub(crate) mod tests {
     // path continues to work as a policy gate.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn dispatch_gate_unexpected_decision_fail_closed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().ok();
         // Simulate the policy engine returning Err (the current fail-closed path
         // for an unimplemented engine).  The dispatch gate must propagate it as
@@ -5856,6 +5934,7 @@ pub(crate) mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn attestation_gate_expected_kind_matrix() {
         let dir = tempfile::tempdir().unwrap();
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
@@ -5917,6 +5996,7 @@ pub(crate) mod tests {
     /// A durable receipt reports consumption even while the approval store is locked.
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn an_owed_approval_is_consumed_before_reopening_the_approval_store() {
         use stellar_agent_core::approval::PendingApprovalStore;
         use stellar_agent_core::profile::receipt::ReceiptStore;
@@ -5989,6 +6069,7 @@ pub(crate) mod tests {
     /// attestation keeps `policy.approval_required`.
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn consumed_receipt_refuses_after_gc_without_the_inbox() {
         use stellar_agent_core::approval::{ConsumedOutcome, PendingApprovalStore};
         use stellar_agent_core::profile::receipt::ReceiptStore;
@@ -6088,6 +6169,7 @@ pub(crate) mod tests {
     /// An unreadable receipt store refuses even a valid, unspent approval.
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn an_unreadable_receipt_store_refuses_a_valid_attestation() {
         use stellar_agent_core::profile::receipt::ReceiptStore;
 
@@ -6123,6 +6205,7 @@ pub(crate) mod tests {
     /// and leaves the store unchanged.
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn a_refused_stored_destination_refuses_the_commit_with_its_code() {
         let dir = tempfile::tempdir().unwrap();
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
@@ -6168,6 +6251,7 @@ pub(crate) mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn trustline_terminal_states_preserve_gate_errors() {
         use stellar_agent_core::approval::{ConsumedOutcome, DEFAULT_TTL_MS, PendingApprovalStore};
         use stellar_agent_core::profile::receipt::{BeginSubmissionOutcome, ReceiptStore};
@@ -6668,6 +6752,7 @@ pub(crate) mod tests {
 
         #[test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         fn startup_retains_authority_and_rechecks_unchanged_facts() {
             let f = Fixture::new(|raw| raw);
             let guard = f
@@ -6699,6 +6784,7 @@ pub(crate) mod tests {
 
         #[test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         fn mainnet_admission_identifies_each_missing_startup_authority() {
             use stellar_agent_network::mainnet::MainnetConsumer;
             let f = Fixture::new(|raw| raw);
@@ -6749,6 +6835,7 @@ pub(crate) mod tests {
         /// before any seed read.
         #[test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         fn mainnet_oracle_required_admission_refuses_each_write_consumer() {
             use stellar_agent_network::mainnet::MainnetConsumer;
             let f = Fixture::with_profile(
@@ -6784,6 +6871,7 @@ pub(crate) mod tests {
 
         #[test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         fn rotated_enablement_requires_restart_before_action_access() {
             let f = Fixture::new(|raw| raw);
             let guard = f
@@ -6808,6 +6896,7 @@ pub(crate) mod tests {
 
         #[test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         fn resigned_policy_requires_restart_without_advancing_pin() {
             let f = Fixture::new(|raw| raw);
             let guard = f
@@ -6831,6 +6920,7 @@ pub(crate) mod tests {
 
         #[test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         fn compare_only_reverification_refuses_a_missing_lock_without_creating_it() {
             let f = Fixture::new(|raw| raw);
             let guard = f
@@ -6876,6 +6966,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn dispatch_carries_evaluation_ttls_and_exact_confirmation_scope() {
             /// Asserts that `outcome` of `tool` is `Allow` with 600,000 ms
             /// under an allowing rule, and otherwise the rule's approval
@@ -6996,6 +7087,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn paired_ttl_preserves_the_minimum_for_every_decision_order() {
             for (prepare, commit, expected) in [
                 (None, Some(60_u32), 60),
@@ -7093,6 +7185,7 @@ pub(crate) mod tests {
         /// on mainnet, with its 600,000 ms and its mainnet decision.
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn paired_allow_stays_allow_on_mainnet() {
             let f = Fixture::new(|raw| raw);
             let outcome = f
@@ -7271,6 +7364,7 @@ pub(crate) mod tests {
         /// or refusal.
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_authority_maps_every_case() {
             let cases = authority_cases().await;
             let expected = [
@@ -7304,6 +7398,7 @@ pub(crate) mod tests {
         /// consent and no tombstone.
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_authority_never_writes_the_approval_store() {
             // Each case compares the store bytes before and after its call.
             assert_eq!(authority_cases().await.len(), 10);
@@ -7313,6 +7408,7 @@ pub(crate) mod tests {
         /// denial's code and persists no approval.
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn paired_preparation_denial_persists_no_approval() {
             for tool in Tool::ALL {
                 let rpc = wiremock::MockServer::start().await;
@@ -7353,6 +7449,7 @@ pub(crate) mod tests {
         /// of the two rules and the reason of the governing rule.
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn paired_preparation_persists_the_minimum_lifetime_and_reason() {
             for (prepare, commit, ttl_ms, reason) in [
                 (Some(120_u32), Some(60_u32), 60_000, "commit rule"),
@@ -7416,6 +7513,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn paired_decode_failure_refuses_before_pending_persistence() {
             let f = Fixture::new(|raw| raw);
             let outcome = f
@@ -7451,6 +7549,7 @@ pub(crate) mod tests {
         /// policy, evaluated at the outcome's instant for the classic scope.
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_gate_clock_failure_renders_wallet_clock_error() {
             let f = Fixture::new(|raw| raw);
             let broken = stellar_agent_core::policy::v1::criteria::state_store::set_policy_clock_error_for_test();
@@ -7491,6 +7590,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_gate_returns_a_real_classic_witness_and_checks_subject() {
             use stellar_agent_core::approval::{PendingApproval, process_uid_for_attestation};
             let f = Fixture::new(|raw| require_approval_rules(&raw, &["stellar_pay_commit"], 600));
@@ -7544,6 +7644,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn paired_denial_and_evaluation_failure_leave_no_pending_approval() {
             for denial in [true, false] {
                 let f = Fixture::new(|raw| {
@@ -7598,6 +7699,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_gate_checks_kind_age_terminal_states_and_keys() {
             use stellar_agent_core::approval::{
                 ConsumedOutcome, PendingApproval, PendingApprovalStore, process_uid_for_attestation,
@@ -9095,6 +9197,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_previews_carry_the_deadline() {
             let now = stellar_agent_core::timefmt::now_unix_ms().unwrap() + CLOCK_LEAD_MS;
             let _clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(now);
@@ -9109,6 +9212,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_time_bounds_prepare_and_commit_preserve_the_deadline() {
             let now = stellar_agent_core::timefmt::now_unix_ms().unwrap() + CLOCK_LEAD_MS;
             let clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(now);
@@ -9139,6 +9243,7 @@ pub(crate) mod tests {
         /// and nothing is sent.
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_time_bounds_commit_after_the_deadline_signs_nothing() {
             use stellar_agent_network::mainnet::resolve::MAINNET_CLASSIC_DEADLINE_SECONDS;
             let now = stellar_agent_core::timefmt::now_unix_ms().unwrap() + CLOCK_LEAD_MS;
@@ -9168,6 +9273,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn commit_refuses_an_untimed_envelope() {
             let now = stellar_agent_core::timefmt::now_unix_ms().unwrap() + CLOCK_LEAD_MS;
             let _clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(now);
@@ -9187,21 +9293,25 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_pay_accepts_and_consumes_once() {
             accept(Tool::Pay).await;
         }
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_claim_accepts_and_consumes_once() {
             accept(Tool::Claim).await;
         }
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_create_account_accepts_and_consumes_once() {
             accept(Tool::CreateAccount).await;
         }
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_trustline_accepts_and_consumes_once() {
             accept(Tool::Trustline).await;
         }
@@ -9248,6 +9358,7 @@ pub(crate) mod tests {
         /// unattested and writes no audit row.
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn a_remote_listener_records_no_mainnet_consent() {
             use base64::Engine as _;
             use stellar_agent_core::approval::{
@@ -9340,6 +9451,7 @@ pub(crate) mod tests {
         /// commits on the same server state once that writer drops.
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn a_held_listener_writer_refuses_a_mainnet_commit_until_it_drops() {
             let run = ClassicRun::with(Tool::Pay, |raw| raw, |_| {}, |_| {}).await;
             let xdr = run.args["envelope_xdr"].as_str().unwrap().to_owned();
@@ -9406,6 +9518,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_classic_commits_refuse_changed_enablement_or_policy() {
             for tool in Tool::ALL {
                 for change in ["enablement", "policy"] {
@@ -9433,6 +9546,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_classic_commits_refuse_malformed_envelopes_and_mismatched_arguments() {
             for tool in Tool::ALL {
                 let run = ClassicRun::new(tool).await;
@@ -9497,6 +9611,7 @@ pub(crate) mod tests {
         /// shows that it does.
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_pay_commit_refuses_a_mismatched_unit_before_the_freshness_check() {
             let run = ClassicRun::new(Tool::Pay).await;
             let owner = KeyringEntryRef::default_owner_key("operator");
@@ -9532,6 +9647,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_classic_commits_probe_the_endpoint_before_reading() {
             for tool in Tool::ALL {
                 let run = ClassicRun::new(tool).await;
@@ -9560,6 +9676,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_classic_commits_require_their_approval_before_the_protocol_nonce() {
             for tool in Tool::ALL {
                 let run = ClassicRun::new(tool).await;
@@ -9606,6 +9723,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_classic_commits_refuse_a_commit_time_denial_or_evaluation_failure() {
             for tool in Tool::ALL {
                 let run = ClassicRun::with(
@@ -9652,6 +9770,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_classic_commits_refuse_signed_fee_and_rebuild_changes() {
             for tool in Tool::ALL {
                 let run = ClassicRun::new(tool).await;
@@ -9750,6 +9869,7 @@ pub(crate) mod tests {
         /// issuer that enabled clawback.
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_classic_commits_refuse_changed_ledger_state() {
             use stellar_xdr::*;
             for tool in [Tool::Pay, Tool::Claim, Tool::Trustline] {
@@ -9803,6 +9923,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_classic_commits_refuse_a_disagreeing_witness() {
             for tool in [Tool::Pay, Tool::Claim, Tool::Trustline] {
                 let run = ClassicRun::new(tool).await;
@@ -9828,6 +9949,7 @@ pub(crate) mod tests {
         /// carries a memo and pays exactly the floor.
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_pay_requires_a_bound_oracle_witness() {
             let floor = stellar_agent_core::profile::schema::MINIMUM_FLOOR;
             let run = ClassicRun::with(
@@ -9856,6 +9978,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_classic_commits_refuse_without_audit_readiness() {
             for tool in Tool::ALL {
                 let run = ClassicRun::new(tool).await;
@@ -9871,6 +9994,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_classic_commits_refuse_changed_protocol_nonces() {
             for tool in Tool::ALL {
                 let run = ClassicRun::new(tool).await;
@@ -9928,6 +10052,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_classic_commits_refuse_a_changed_enrollment() {
             use stellar_agent_core::profile::signer_identity::SignerIdentityRecord;
             for tool in Tool::ALL {
@@ -9974,6 +10099,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_classic_recorder_preparation_refuses_before_mint() {
             for tool in Tool::ALL {
                 let run = ClassicRun::new(tool).await;
@@ -10015,6 +10141,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_classic_resolver_refusals_keep_their_codes() {
             for tool in Tool::ALL {
                 let run = ClassicRun::new(tool).await;
@@ -10050,6 +10177,7 @@ pub(crate) mod tests {
         /// the source balance dropped, before anything is authorized.
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_classic_resolver_reevaluates_the_policy_atomically() {
             use stellar_xdr::*;
             for tool in Tool::ALL {
@@ -10102,6 +10230,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_lazy_signer_failure_keeps_the_claimed_spend() {
             for tool in Tool::ALL {
                 let run = ClassicRun::new(tool).await;
@@ -10134,6 +10263,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_classic_pre_send_failure_keeps_the_primary_error_and_the_claim() {
             for tool in Tool::ALL {
                 let run = ClassicRun::new(tool).await;
@@ -10155,6 +10285,7 @@ pub(crate) mod tests {
         /// claim.
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_submit_expiry_refuses_before_pre_send() {
             for tool in Tool::ALL {
                 let run = ClassicRun::new(tool).await;
@@ -10205,6 +10336,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_submit_passphrase_change_refuses_before_pre_send() {
             for tool in Tool::ALL {
                 let run = ClassicRun::new(tool).await;
@@ -10222,6 +10354,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_classic_refused_send_keeps_the_converted_rows() {
             for tool in Tool::ALL {
                 let run = ClassicRun::new(tool).await;
@@ -10260,6 +10393,7 @@ pub(crate) mod tests {
         /// pending: a reported failure does not release possible spending.
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_classic_failure_the_oracle_confirms_keeps_the_converted_rows() {
             for tool in Tool::ALL {
                 let run = ClassicRun::new(tool).await;
@@ -10290,6 +10424,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_classic_consumption_without_send_keeps_the_primary_error_and_spends_the_approval_nonce()
          {
             for tool in Tool::ALL {
@@ -10377,6 +10512,7 @@ pub(crate) mod tests {
         /// keeps its holds.
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_classic_cleanup_failure_keeps_the_primary_error() {
             for tool in Tool::ALL {
                 let run = ClassicRun::new(tool).await;
@@ -10438,6 +10574,7 @@ pub(crate) mod tests {
         #[cfg(unix)]
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_classic_receipt_held_approval_refuses_a_replay() {
             for tool in Tool::ALL {
                 let run = ClassicRun::new(tool).await;
@@ -10495,6 +10632,7 @@ pub(crate) mod tests {
         /// enablement verify: the mainnet context cannot be built.
         #[test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         fn selected_startup_propagates_a_context_construction_failure() {
             let f = Fixture::new(|raw| raw);
             let mut merged = (*f.server.profile).clone();
@@ -10529,6 +10667,7 @@ pub(crate) mod tests {
         /// another entry holding another key.
         #[test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         fn freshness_reads_the_owner_entry_startup_reads() {
             let f = Fixture::with_profile(
                 |raw| raw,
@@ -10726,6 +10865,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_x402_consumes_intent_and_child_before_release() {
             let run = X402Run::new().await;
             let at_signing = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -10930,6 +11070,7 @@ pub(crate) mod tests {
         /// payment's authorizations carry the home-domain scope.
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn x402_allow_pays_in_one_call_with_nothing_pending() {
             let run = X402Run::allowed().await;
             let (pin, pinned) = pin_policy_clock();
@@ -11031,6 +11172,7 @@ pub(crate) mod tests {
         /// refuses.
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn x402_allow_with_supplied_proof_verifies_and_spends_it() {
             let run = X402Run::allowed().await;
             let forged = x402_pending_entry(&run.f, None);
@@ -11146,6 +11288,7 @@ pub(crate) mod tests {
         /// approval once.
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn x402_require_approval_records_its_decision_and_provenance() {
             let run = X402Run::new().await;
             let store = stellar_agent_core::approval::PendingApprovalStore::open(
@@ -11219,6 +11362,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn muxed_approval_preserves_full_destination() {
             crate::tools::x402_authenticated_mainnet_tests::assert_muxed_approval_path(false).await;
         }
@@ -11229,6 +11373,7 @@ pub(crate) mod tests {
         /// request and mints nothing.
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn x402_policy_payment_checks_startup_freshness_before_preparation() {
             let run = X402Run::allowed().await;
             put(
@@ -11273,6 +11418,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_x402_payment_call_refuses_changed_enablement_or_policy() {
             for change in ["enablement", "policy"] {
                 let run = X402Run::new().await;
@@ -11299,6 +11445,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_x402_signer_failure_keeps_the_claimed_spend_before_transmission() {
             let run = X402Run::new().await;
             let key = &run.f.server.security_profile().mcp_signer_default;
@@ -11371,6 +11518,7 @@ pub(crate) mod tests {
         /// identity and latest ledger bounded it.
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_x402_authorized_row_records_the_transmitted_expiration_ledger() {
             let run = X402Run::new().await;
             let result = run.pay().await;
@@ -11397,6 +11545,7 @@ pub(crate) mod tests {
         /// debit, and mints no child.
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_x402_resimulation_failure_retains_used_intent() {
             for other_authorization in [false, true] {
                 let run = X402Run::new().await;
@@ -11430,6 +11579,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_x402_unavailable_anchor_at_the_transmit_gate_keeps_the_claimed_intent() {
             let run = X402Run::new().await;
             let profile = run.f.server.security_profile();
@@ -11472,6 +11622,7 @@ pub(crate) mod tests {
         #[cfg(unix)]
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_x402_tombstone_failure_keeps_both_records_used() {
             let run = X402Run::new().await;
             let guard = HookGuard::default();
@@ -11873,6 +12024,7 @@ pub(crate) mod tests {
         /// signature expiration ledger the intent was resolved for.
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn the_authorized_signer_signs_the_bound_entry() {
             let signing = sign_under_intent(BOUND_ENTRY, BOUND_ENTRY).await;
             signing
@@ -11888,6 +12040,7 @@ pub(crate) mod tests {
         /// the intent was resolved for, before the signer is called.
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn the_authorized_signer_refuses_another_nonce() {
             let signing = sign_under_intent(BOUND_ENTRY, (BOUND_ENTRY.0 + 1, BOUND_ENTRY.1)).await;
             assert_refused_before_the_signer(&signing, "entry_nonce");
@@ -11898,6 +12051,7 @@ pub(crate) mod tests {
         /// signer is called.
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn the_authorized_signer_refuses_another_expiration_ledger() {
             let signing = sign_under_intent(BOUND_ENTRY, (BOUND_ENTRY.0, BOUND_ENTRY.1 + 1)).await;
             assert_refused_before_the_signer(&signing, "entry_expiration");
@@ -11907,6 +12061,7 @@ pub(crate) mod tests {
         /// payer's own account.
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn the_authorized_signer_signs_an_entry_bound_to_the_payer() {
             let signing = sign_departing(
                 BOUND_ENTRY,
@@ -11930,6 +12085,7 @@ pub(crate) mod tests {
         /// both still reports the address.
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn the_authorized_signer_refuses_an_entry_bound_to_another_address() {
             for expected_signer in [None, Some([0x77; 32])] {
                 let signing = sign_departing(
@@ -11955,6 +12111,7 @@ pub(crate) mod tests {
         /// the signer is called.
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn the_authorized_signer_refuses_another_expected_signer() {
             let signing = sign_departing(
                 BOUND_ENTRY,
@@ -11970,6 +12127,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_x402_transmit_gate_keeps_the_claimed_intent() {
             use stellar_agent_network::mainnet::MainnetConsumer;
             use stellar_agent_x402::exact::{X402MainnetProofs, create_payment_authorized};
@@ -12050,6 +12208,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_x402_policy_denial_refuses_before_the_intent() {
             let rpc = wiremock::MockServer::start().await;
             let f = routed_fixture(
@@ -12112,6 +12271,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_x402_missing_approval_refuses_before_the_intent() {
             let run = X402Run::new().await;
             let unknown = base64::Engine::encode(
@@ -12127,6 +12287,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_x402_overlong_approval_refuses_the_intent_and_logs_once() {
             use stellar_agent_core::approval::{PendingApproval, process_uid_for_attestation};
             let run = X402Run::new().await;
@@ -12181,6 +12342,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_x402_first_simulation_failure_keeps_its_code() {
             let run = X402Run::new().await;
             run.control
@@ -12261,6 +12423,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         async fn mainnet_gate_preserves_overlong_approval_for_resolver_refusal() {
             use stellar_agent_core::approval::{PendingApproval, process_uid_for_attestation};
             use stellar_agent_network::mainnet::resolve::{TxSignRequest, resolve_tx_sign};
@@ -12358,6 +12521,7 @@ pub(crate) mod tests {
 
         #[test]
         #[serial_test::serial(keyring)]
+        #[serial_test::serial]
         fn mainnet_nonce_minter_uses_the_disk_snapshot() {
             let f = Fixture::new(|raw| raw);
             let mut merged = (*f.server.profile).clone();

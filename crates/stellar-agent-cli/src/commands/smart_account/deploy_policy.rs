@@ -510,6 +510,8 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn dry_run_derives_address_without_network_for_each_kind() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let _guard = EnvGuard::set(TEST_DEPLOYER_ENV_VAR, &test_deployer_skey());
         for kind in [
             PolicyKindArg::SimpleThreshold,

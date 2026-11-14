@@ -442,6 +442,10 @@ pub const OWNER_KEY_SERVICE_PREFIX: &str = "stellar-agent-owner-";
 /// # Examples
 ///
 /// ```
+/// # #[serial_test::serial]
+/// # fn main() {
+/// # let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+/// # let _storage_home = stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
 /// use stellar_agent_core::profile::name::derive_profile_name_from_owner_key;
 /// use stellar_agent_core::profile::schema::Profile;
 ///
@@ -449,6 +453,7 @@ pub const OWNER_KEY_SERVICE_PREFIX: &str = "stellar-agent-owner-";
 ///     .with_profile_name("alice")
 ///     .build();
 /// assert_eq!(derive_profile_name_from_owner_key(&profile), Some("alice"));
+/// # }
 /// ```
 #[must_use]
 pub fn derive_profile_name_from_owner_key(profile: &Profile) -> Option<&str> {
@@ -599,6 +604,10 @@ impl std::fmt::Display for ProfileNameMismatch {
 /// # Examples
 ///
 /// ```
+/// # #[serial_test::serial]
+/// # fn main() {
+/// # let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+/// # let _storage_home = stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
 /// use stellar_agent_core::profile::name::{
 ///     ProfileStateLayout, profile_name_mismatch_refusal,
 /// };
@@ -617,6 +626,7 @@ impl std::fmt::Display for ProfileNameMismatch {
 ///         .message(ProfileStateLayout::DerivedThroughout)
 ///         .contains("profile init --profile <name>")
 /// );
+/// # }
 /// ```
 #[must_use]
 pub fn profile_name_mismatch_refusal(
@@ -650,8 +660,12 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn mainnet_selection_flag_passes_for_both_chains_and_default_name() {
+        let storage_sandbox =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use super::super::caip2::Caip2;
         for chain in [Caip2::Testnet, Caip2::Mainnet] {
             for name in ["alice", "default"] {
@@ -666,8 +680,12 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn mainnet_selection_environment_refuses() {
+        let storage_sandbox =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use super::super::caip2::Caip2;
         let resolved = resolve_from_parts(None, Some("alice".to_owned()));
         let err = check_mainnet_selection(&selection_profile(Caip2::Mainnet, "alice"), &resolved)
@@ -686,8 +704,12 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn mainnet_selection_default_refuses() {
+        let storage_sandbox =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use super::super::caip2::Caip2;
         let resolved = resolve_from_parts(None, None);
         let err = check_mainnet_selection(&selection_profile(Caip2::Mainnet, "default"), &resolved)
@@ -703,8 +725,12 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn testnet_selection_environment_and_default_pass() {
+        let storage_sandbox =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use super::super::caip2::Caip2;
         for resolved in [
             resolve_from_parts(None, Some("alice".to_owned())),
@@ -1091,15 +1117,23 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn matching_names_produce_no_refusal() {
+        let storage_sandbox =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let profile = named_profile("alice");
         assert_eq!(profile_name_mismatch_refusal(&profile, "alice"), None);
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn copied_profile_file_refuses_and_names_the_field() {
+        let storage_sandbox =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // The realistic path: `default.toml` copied to `alice.toml` without
         // re-deriving its keyring coordinates.
         let profile = named_profile("default");
@@ -1138,8 +1172,12 @@ mod tests {
     /// A seed pasted into the owner-key coordinate or typed as the profile
     /// name never reaches the refusal, its `Debug`, or either layout's text.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn a_mismatch_never_repeats_the_service_or_the_name() {
+        let storage_sandbox =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_test_support::rejected_value::{assert_no_marker_in_text, seed_marker};
         let seed = seed_marker();
         let mut profile = named_profile("alice");
@@ -1166,8 +1204,12 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn each_layout_states_its_own_state_placement() {
+        let storage_sandbox =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // The two surfaces do not key their per-profile state the same way, so
         // one message cannot be truthful for both. The MCP reads and writes all
         // of it under the derived name; the CLI keys the approval store and
@@ -1199,8 +1241,12 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn noop_engine_profile_is_checked_too() {
+        let storage_sandbox =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // The check must not be attached to the V1 policy-engine derivation:
         // Noop profiles never reach it, yet the approval-store derivation —
         // which resolves a mismatch to `default` — runs for every engine.
@@ -1216,8 +1262,12 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn absent_owner_key_prefix_is_a_mismatch_not_a_default() {
+        let storage_sandbox =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut profile = named_profile("alice");
         profile.policy_owner_key_id =
             crate::profile::schema::KeyringEntryRef::new("hand-written", "default");
@@ -1244,8 +1294,12 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn a_prefixless_service_never_resolves_to_the_default_profile() {
+        let storage_sandbox =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // The failure this guards: treating a prefix-less coordinate as
         // `"default"` would let a hand-written profile silently operate on the
         // default profile's state under any requested name.
@@ -1259,8 +1313,12 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn the_synthesised_first_run_profile_reconciles_as_default() {
+        let storage_sandbox =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // The zero-config startup path loads or synthesises `default`; that
         // profile must pass the reconciliation check unchanged.
         let profile = named_profile("default");
@@ -1268,8 +1326,12 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn the_display_rendering_carries_no_state_layout_claim() {
+        let storage_sandbox =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // `Display` is layout-independent by construction: a caller that has
         // not chosen a `ProfileStateLayout` must not emit a claim about where
         // the operator's state lives.
@@ -1282,8 +1344,12 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn the_derived_name_matches_the_constructor_it_inverts() {
+        let storage_sandbox =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // The constructor and this inverse are the two halves of one contract;
         // pinning them against each other is what keeps the prefix single.
         let coord = crate::profile::schema::KeyringEntryRef::default_owner_key("acme");

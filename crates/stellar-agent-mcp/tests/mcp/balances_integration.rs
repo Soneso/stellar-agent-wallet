@@ -195,7 +195,11 @@ fn stellar_balances_args_with_assets_deserialises_ok() {
 /// `stellar_balances` rejects a structurally valid signing-key strkey at the
 /// MCP `account_id` boundary.
 #[tokio::test]
+#[serial_test::serial]
 async fn stellar_balances_rejects_s_strkey_account_id_with_invalid_params() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     assert_balances_account_id_invalid_params(disposable_s_strkey()).await;
 }
 
@@ -203,7 +207,11 @@ async fn stellar_balances_rejects_s_strkey_account_id_with_invalid_params() {
 /// and the largest ID: it reads the G base account from a local mock endpoint and
 /// echoes the address as given.
 #[tokio::test]
+#[serial_test::serial]
 async fn stellar_balances_reads_the_base_of_an_m_strkey_account_id() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::profile::schema::Profile;
     use stellar_agent_mcp::server::{StellarBalancesArgs, WalletServer};
     use stellar_agent_test_support::xdr_fixtures::{
@@ -284,7 +292,11 @@ async fn stellar_balances_reads_the_base_of_an_m_strkey_account_id() {
 /// `stellar_balances` rejects a structurally valid contract strkey at the MCP
 /// `account_id` boundary.
 #[tokio::test]
+#[serial_test::serial]
 async fn stellar_balances_rejects_c_strkey_account_id_with_invalid_params() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     assert_balances_account_id_invalid_params(disposable_c_strkey()).await;
 }
 
@@ -410,7 +422,11 @@ fn asset_from_code_and_issuer_accepts_valid_args() {
 /// and requested trustline from wiremock, and returns the standard JSON
 /// envelope.
 #[tokio::test]
+#[serial_test::serial]
 async fn stellar_balances_dispatch_returns_native_and_trustline_from_wiremock() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use serde_json::json;
     use stellar_agent_core::profile::schema::Profile;
     use stellar_agent_mcp::server::{StellarBalancesArgs, TrustlineAssetArg, WalletServer};
@@ -497,7 +513,11 @@ async fn stellar_balances_dispatch_returns_native_and_trustline_from_wiremock() 
 /// envelope keeps only the host and port of both URLs. The profile points at
 /// the loopback server, so the test reaches no external network.
 #[tokio::test]
+#[serial_test::serial]
 async fn stellar_balances_error_envelope_keeps_only_host_and_port_of_echoed_urls() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::profile::schema::Profile;
     use stellar_agent_mcp::server::{StellarBalancesArgs, WalletServer};
     use wiremock::matchers::{method, path, query_param};
@@ -588,7 +608,11 @@ async fn stellar_balances_error_envelope_keeps_only_host_and_port_of_echoed_urls
 /// MAX_TRUSTLINE_ASSETS_PER_CALL` as a pure predicate; this test invokes the
 /// actual handler path via `WalletServer::call_stellar_balances`.
 #[tokio::test]
+#[serial_test::serial]
 async fn stellar_balances_rejects_when_assets_exceed_cap() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::profile::schema::Profile;
     use stellar_agent_mcp::server::{StellarBalancesArgs, TrustlineAssetArg, WalletServer};
 
@@ -648,7 +672,11 @@ async fn stellar_balances_rejects_when_assets_exceed_cap() {
 /// is a successful dispatch (the handler returns either `Ok(CallToolResult)`
 /// or a tool-level error inside `Ok`, but NOT `Err(invalid_params)`).
 #[tokio::test]
+#[serial_test::serial]
 async fn stellar_balances_accepts_assets_at_cap() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::profile::schema::Profile;
     use stellar_agent_mcp::server::{StellarBalancesArgs, TrustlineAssetArg, WalletServer};
     use stellar_agent_test_support::xdr_fixtures::EchoIdResponder;

@@ -932,8 +932,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn classify_value_value_effects_are_sized() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = tool_with_kind("stellar_pay", ToolValueKind::MovesValue);
         let profile = Profile::builder_testnet("alice", "acct", "n-svc", "n-acct").build();
         let args = json!({});
@@ -949,8 +952,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn classify_value_moves_value_tool_without_effects_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // A MovesValue tool whose dispatch site resolved ReadOnly is a forgotten
         // population; fail-closed deny rather than a silent pass.
         let tool = tool_with_kind("stellar_blend_lend", ToolValueKind::MovesValue);
@@ -965,8 +971,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn classify_value_read_only_tool_is_not_applicable() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = tool_with_kind("stellar_balances", ToolValueKind::ReadOnly);
         let profile = Profile::builder_testnet("alice", "acct", "n-svc", "n-acct").build();
         let args = json!({});
@@ -976,8 +985,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn classify_value_opaque_denies_on_single_tx_and_in_bundle() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::bundle::{BundleStateOverlay, BundleView, InnerOpDescriptor};
 
         let tool = tool_with_kind("stellar_sep43_sign_transaction", ToolValueKind::OpaqueSign);

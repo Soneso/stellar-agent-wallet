@@ -740,10 +740,15 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn the_refusal_message_does_not_leak_the_home_directory() {
-        let home_dir = std::env::var("HOME").expect("HOME is set in the test environment");
+        let home = tempfile::tempdir().expect("temporary home");
+        let _h = stellar_agent_test_support::env_guard::ScopedEnvVar::new(
+            "HOME",
+            Some(home.path().as_os_str()),
+        );
+        let home_dir = home.path().to_string_lossy();
         // The profile directory the loader reports lives under $HOME on every
         // platform this suite runs on, so a leak would surface that prefix.
-        let store = std::path::Path::new(&home_dir).join("stellar-agent-redaction-probe");
+        let store = home.path().join("stellar-agent-redaction-probe");
         let _home_guard = stellar_agent_test_support::StellarAgentHomeGuard::new(&store);
 
         let err = load_profile_or_synthesize_testnet(&resolved(
@@ -758,7 +763,7 @@ mod tests {
             "the refusal must state that the requested profile is absent: {message}"
         );
         assert!(
-            !message.contains(&home_dir),
+            !message.contains(home_dir.as_ref()),
             "the refusal must not carry the operator's home directory: {message}"
         );
         assert!(
@@ -862,7 +867,12 @@ mod tests {
     /// treating it as absent and substituting the permissive zero-config
     /// profile would answer under a policy gate the operator never chose.
     #[test]
+    #[serial_test::serial]
     fn a_mismatched_profile_refuses_through_the_synthesis_helper() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let copied = |_name: &str| {
             Ok(Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
                 .with_profile_name("default")
@@ -897,7 +907,12 @@ mod tests {
     /// the absent-file fallback only; a file that exists and names another
     /// profile is a refusal on every provenance.
     #[test]
+    #[serial_test::serial]
     fn a_mismatched_profile_is_not_replaced_by_synthesis_when_unnamed() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let copied = |_name: &str| {
             Ok(Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
                 .with_profile_name("someone-else")
@@ -915,7 +930,12 @@ mod tests {
     /// A self-consistent profile passes: the control that proves the refusal
     /// above is not firing on every load.
     #[test]
+    #[serial_test::serial]
     fn a_self_consistent_profile_is_not_refused() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let own = |name: &str| {
             Ok(Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
                 .with_profile_name(name)
@@ -1018,7 +1038,12 @@ mod tests {
     /// still refused. A check inside the closure would be bypassed by every
     /// test that supplies one.
     #[test]
+    #[serial_test::serial]
     fn the_injected_loader_is_not_where_the_reconciliation_lives() {
+        let storage_sandbox =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let unchecked = |_name: &str| {
             Ok(Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
                 .with_profile_name("default")
@@ -1039,7 +1064,12 @@ mod tests {
     /// valid name here would let a hand-written profile operate on the default
     /// profile's state under any requested name.
     #[test]
+    #[serial_test::serial]
     fn a_service_without_the_prefix_refuses_rather_than_defaulting() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let hand_written = |_name: &str| {
             let mut profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
                 .with_profile_name("default")
@@ -1073,7 +1103,12 @@ mod tests {
     /// one; a message claiming all state moves to the derived name would be
     /// untrue here.
     #[test]
+    #[serial_test::serial]
     fn the_cli_refusal_states_the_cli_state_layout() {
+        let storage_sandbox =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let copied = |_name: &str| {
             Ok(Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
                 .with_profile_name("default")
@@ -1122,7 +1157,12 @@ mod tests {
     /// path pasted into it must not reach stdout through the refusal, in the
     /// message or in the `Display` rendering.
     #[test]
+    #[serial_test::serial]
     fn the_mismatch_message_omits_a_path_in_the_service_field() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let home_dir = std::env::var("HOME").expect("HOME is set in the test environment");
         let mut profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
             .with_profile_name("alice")
@@ -1154,7 +1194,12 @@ mod tests {
     /// The mismatch keeps its own wire code through the typed-envelope path
     /// as well as the raw-code path, so an agent sees one code either way.
     #[test]
+    #[serial_test::serial]
     fn the_mismatch_code_is_the_same_on_both_rendering_paths() {
+        let storage_sandbox =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let copied = |_name: &str| {
             Ok(Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
                 .with_profile_name("default")

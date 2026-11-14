@@ -2263,6 +2263,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn recovery_success_keeps_debit_and_failure_keeps_only_fee_and_counts() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use super::super::operations::tests::{agreed, bucket_rows, decide, decided_attempt};
         use super::super::store::RecordStatus;
         let mut fx = Fx::new();
@@ -2345,6 +2348,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn recovery_non_inclusion_releases_all_holds_and_native_amounts() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use super::super::operations::tests::{
             bucket_rows, decide, decided_attempt, not_included_proof,
         };
@@ -2789,6 +2795,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn recovery_history_loss_disables_only_complete_history() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let original = stored_attempt(&mut fx);
         let mut input = pending(&original, NOW, "evidence_pending", "history");
@@ -2926,6 +2935,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn recovery_counter_and_pass_state_follow_evidence_classification() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let good = included("SUCCESS", result_text(true, 50));
         let mut late = good.clone();
         late.ledger = Some(41);
@@ -3028,6 +3040,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn recovery_transaction_pruning_sets_sticky_history_loss() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use super::super::operations::tests::decided_attempt;
         let pruned = [absent(21, 60), absent(5, 61)];
         let evaluated = evaluate_outcome(
@@ -3083,6 +3098,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn recovery_partial_pruned_answer_sets_sticky_history_loss() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use super::super::operations::tests::decided_attempt;
         let mut fx = Fx::new();
         let (_, attempt) = decided_attempt(&mut fx, 1);
@@ -3267,6 +3285,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn recovery_success_after_accounting_expiry_commits() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use super::super::operations::tests::agreed;
         assert_outcome_after_accounting_expiry(
             "success",
@@ -3279,6 +3300,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn recovery_failure_after_accounting_expiry_commits() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use super::super::operations::tests::agreed;
         assert_outcome_after_accounting_expiry(
             "failure",
@@ -3295,6 +3319,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn recovery_account_non_inclusion_after_accounting_expiry_commits() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use super::super::operations::tests::not_included_proof;
         assert_outcome_after_accounting_expiry(
             "account non-inclusion",
@@ -3308,6 +3335,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn recovery_history_non_inclusion_after_accounting_expiry_commits() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use super::super::operations::EndpointCoverage;
         let coverage = |latest| EndpointCoverage {
             first_ledger: 10,
@@ -3331,6 +3361,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn recovery_bucket_horizon_keeps_classic_outcome_and_native_obligation_open() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use super::super::operations::tests::{bucket_rows, decided_attempt, envelope_id};
         use super::super::store::RecordStatus;
         let mut fx = Fx::new();
@@ -3663,6 +3696,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn recovery_partial_sequence_failure_reports_verified_progress() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         unknown_named(&mut fx, 1);
         unknown_named(&mut fx, 2);
@@ -3771,6 +3807,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn recovery_sequence_failure_keeps_unavailable_state_unknown() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let attempt = stored_attempt(&mut fx);
         let status = OperationStatus::new(&fx.store, &fx.profile);
@@ -3814,6 +3853,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn recovery_sequence_failure_reads_the_commit_point() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use super::super::store::{
             COMMIT_FAULT_AFTER_COUNTER, COMMIT_FAULT_AFTER_PREPARED, arm_accounting_fault,
         };
@@ -3877,6 +3919,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn recovery_entry_reports_progress_after_counter_commit() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         use super::super::operations::tests::unknown_with;
         use super::super::store::{COMMIT_FAULT_AFTER_COUNTER, arm_accounting_fault};
         use crate::submission_flow::{ReconcilePass, finish_reconciliation};
@@ -3937,6 +3981,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn recovery_dispatch_store_context_precedes_repair_refusal() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         use super::super::operations::tests::{Checked, historical_without, unknown_with};
         use super::super::store::{COMMIT_FAULT_AFTER_COUNTER, arm_accounting_fault};
 
@@ -3984,6 +4030,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn recovery_progress_counts_only_matched_stored_releases() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let (mut fx, id, _) = unmatched_release_fixture();
         let attempts = OperationStatus::new(&fx.store, &fx.profile)
             .recovery_snapshot(None)
@@ -4015,6 +4063,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn recovery_stale_snapshot_cannot_replace_a_newer_commit() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut fx = Fx::new();
         let original = stored_attempt(&mut fx);
         let mut diagnostic = pending(&original, NOW, "evidence_pending", &"x".repeat(1_000));
@@ -4074,6 +4124,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn recovery_interrupted_batch_keeps_the_latest_observation() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut fx = Fx::new();
         let attempt = stored_attempt(&mut fx);
         let old = WindowObservation {
@@ -4106,6 +4158,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn recovery_sequence_release_audited_without_new_rows() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut fx = Fx::new();
         let attempt = stored_attempt(&mut fx);
         let input = release_input(&attempt);
@@ -4167,6 +4221,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn recovery_state_only_update_appends_nothing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let attempt = stored_attempt(&mut fx);
         fx.sink.entries.clear();
@@ -4204,6 +4261,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn recovery_release_append_failure_commits_nothing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let attempt = stored_attempt(&mut fx);
         let before = std::fs::read(fx.store.path()).unwrap();
@@ -4219,6 +4279,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn recovery_outcome_classes_and_pass_time_survive_restart() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let attempt = stored_attempt(&mut fx);
         for (index, class) in [
@@ -4336,6 +4399,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn recovery_submission_readiness_persists_last_observation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::SubmissionRecorder;
         use crate::mainnet::fixtures;
         let (fx, attempt, intent) = exposed_fixture("recovery-observation").await;
@@ -4373,6 +4439,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn recovery_sequence_reuse_keeps_replay_approval_and_hold_guards() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use super::super::operations::{
             BusinessId, IntentSlot, OpenOutcome, OpenRequest, OperationKind, OperationTool,
         };
@@ -4486,6 +4555,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn recovery_claim_takes_window_then_receipt_and_one_claim_wins() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::profile::receipt::BeginSubmissionOutcome;
         let (fx, attempt, intent) = exposed_fixture("recovery-locks").await;
         {
@@ -4566,6 +4638,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn recovery_pass_persists_last_observation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let primary = endpoint(7, NOW / 1_000).await;
         let oracle = endpoint(8, NOW / 1_000).await;
@@ -4606,6 +4681,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn recovery_legacy_stage_runs_unchanged_before_recovery() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::mainnet::fixtures::{self, LedgerFixture};
         let fx = LedgerFixture::new("recovery-nonempty-stages", NOW);
         let primary = endpoint(7, NOW / 1_000).await;
@@ -4720,6 +4798,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn recovery_idle_stage_sends_no_request() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // No operation record exists, so the recovery snapshot is empty.
         let fx = crate::mainnet::fixtures::LedgerFixture::new("recovery-idle", NOW);
         assert!(
@@ -4772,6 +4853,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn recovery_refused_stage_keeps_the_legacy_report() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::policy::v1::criteria::state_store::{
             StateKey, WindowEntry, WindowLimit,
         };
@@ -4890,6 +4974,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn recovery_empty_pass_acquires_one_writer() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let fx = crate::mainnet::fixtures::LedgerFixture::new("recovery-stages", NOW);
         let client = StellarRpcClient::new("http://127.0.0.1:1").unwrap();
         let expected = fx
@@ -4933,6 +5020,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn recovery_targeted_status_evaluates_only_the_requested_attempt() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         unknown_named(&mut fx, 1);
         unknown_named(&mut fx, 2);
@@ -4988,6 +5078,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn recovery_status_labels_missing_sequence_evidence() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         use super::super::operations::tests::{Checked, historical_without};
         let mut fx = Fx::new();
         historical_without(&mut fx, 1, Checked::NotIncluded, "submission_ledger");
@@ -5120,6 +5212,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn recovery_interrupted_attempt_keeps_its_state() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let attempt = stored_attempt(&mut fx);
         fx.recorder()
@@ -5214,6 +5309,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn run_records_preserve_driver_requests_and_evidence_bytes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use super::super::operations::tests::unknown_with;
         for shape in ["absent", "opaque", "running", "stopped", "exhausted"] {
             let mut fx = Fx::new();
@@ -5340,7 +5438,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn recovery_pair_construction_sends_nothing_and_verifies_each_identity_once() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let primary = endpoint(7, NOW / 1_000).await;
         let oracle = endpoint(8, NOW / 1_000).await;
         let secondary = endpoint(9, NOW / 1_000).await;
@@ -5651,6 +5753,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn recovery_target_coverage_waits_for_equal_tips() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         for primary_ahead in [true, false] {
             for saved_upper in [false, true] {
                 for outcomes in [false, true] {
@@ -5913,6 +6017,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn recovery_unmatched_stored_release_keeps_debit_when_target_unreadable() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let (mut fx, id, account) = unmatched_release_fixture();
         let attempts = OperationStatus::new(&fx.store, &fx.profile)
             .outcome_snapshot(None)
@@ -5988,6 +6094,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn recovery_unmatched_stored_release_reads_target_once_then_decides() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let (mut fx, id, account) = unmatched_release_fixture();
         for pass in 0..3 {
             let [primary, oracle] = unmatched_release_endpoints(&account, [60, 60]).await;
@@ -6102,6 +6210,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn recovery_history_failures_keep_each_reads_reason() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         for parse_first in [true, false] {
             let mut fx = Fx::new();
             let ids = [
@@ -6721,6 +6831,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn recovery_released_attempts_free_their_slots() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let mut ids = Vec::new();
         for n in 1..=5 {
@@ -6767,6 +6880,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn recovery_endpoint_identity_refusal_refuses_the_pass() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let id = unknown_with(&mut fx, 1, NOW / 1_000 - 10, vec![]).id();
         let (writer, _) = crate::mainnet::fixtures::keyed_writer(&fx.profile.audit_log_path);
@@ -6843,6 +6959,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn recovery_release_admits_a_second_envelope_through_the_recorder() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::SubmissionRecorder;
         use crate::mainnet::fixtures;
         let (fx, attempt, first) = exposed_fixture("recovery-reuse").await;
@@ -6921,6 +7040,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn recovery_status_keeps_its_answer_when_recovery_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let id = unknown_with(&mut fx, 1, NOW / 1_000 - 10, vec![]).id();
         let snapshot = OperationStatus::new(&fx.store, &fx.profile)

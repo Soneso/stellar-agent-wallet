@@ -252,6 +252,9 @@ fn assert_divergence_raw_row(entries: &[AuditEntry], request_id: &str, op: &str)
 #[tokio::test]
 #[serial_test::serial]
 async fn install_rule_divergence_failure_emits_via_self_audit_writer() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let fixture = build_fixture().await;
     let request_id = Uuid::new_v4().to_string();
@@ -290,6 +293,9 @@ async fn install_rule_divergence_failure_emits_via_self_audit_writer() {
 #[tokio::test]
 #[serial_test::serial]
 async fn delete_rule_divergence_failure_emits_via_self_audit_writer() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let fixture = build_fixture().await;
     let request_id = Uuid::new_v4().to_string();
@@ -326,6 +332,9 @@ async fn delete_rule_divergence_failure_emits_via_self_audit_writer() {
 #[tokio::test]
 #[serial_test::serial]
 async fn update_name_divergence_failure_emits_via_self_audit_writer() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let fixture = build_fixture().await;
     let request_id = Uuid::new_v4().to_string();
@@ -363,6 +372,9 @@ async fn update_name_divergence_failure_emits_via_self_audit_writer() {
 #[tokio::test]
 #[serial_test::serial]
 async fn update_valid_until_divergence_failure_emits_via_self_audit_writer() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let fixture = build_fixture().await;
     let request_id = Uuid::new_v4().to_string();

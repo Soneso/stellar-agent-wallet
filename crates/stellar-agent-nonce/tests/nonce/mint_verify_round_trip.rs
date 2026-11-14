@@ -13,6 +13,9 @@ use crate::helpers::{
 #[test]
 #[serial]
 fn mint_verify_round_trip_happy_path() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let key = [0xABu8; 32];
     let profile = make_profile("round-trip");
@@ -51,6 +54,9 @@ fn mint_verify_round_trip_happy_path() {
 #[test]
 #[serial]
 fn nonce_base64_encoding_survives_round_trip() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let key = [0x55u8; 32];
     let profile = make_profile("b64-round-trip");

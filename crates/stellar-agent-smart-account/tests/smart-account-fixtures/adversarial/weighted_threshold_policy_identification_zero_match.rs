@@ -31,7 +31,11 @@ use super::rpc_mock_helpers::{
 /// One policy address present but its wasm hash is not in the allowlist →
 /// `WeightedThresholdNotInstalled` (zero-match, fail-closed).
 #[tokio::test]
+#[serial_test::serial]
 async fn unknown_wasm_hash_returns_weighted_threshold_not_installed() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
 
     let policy = policy_sc_address();
@@ -85,7 +89,11 @@ async fn unknown_wasm_hash_returns_weighted_threshold_not_installed() {
 /// there is nothing to check, and the operator action is identical to the
 /// zero-match case.
 #[tokio::test]
+#[serial_test::serial]
 async fn empty_policies_list_returns_weighted_threshold_not_installed() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
 
     let cr_xdr = build_context_rule_scval_xdr(1, &signer_set_n_of_n(1), &[]);

@@ -347,7 +347,11 @@ mod tests {
     /// hash passes unchanged.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn receipt_fields_are_escaped_and_bounded() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let profile = stellar_agent_core::profile::schema::Profile::builder_testnet(
             "stellar-agent-signer-receipt",

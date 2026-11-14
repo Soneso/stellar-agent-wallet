@@ -194,6 +194,9 @@ async fn recording_server() -> (
 #[tokio::test]
 #[serial]
 async fn create_account_commit_with_payment_xdr_returns_simulation_divergence() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
     let server = WalletServer::new(testnet_profile()).expect("WalletServer::new");
 
@@ -241,6 +244,9 @@ async fn create_account_commit_with_payment_xdr_returns_simulation_divergence() 
 #[tokio::test]
 #[serial]
 async fn create_account_commit_policy_engine_sees_xdr_destination_not_caller_destination() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
     let (server, engine, _endpoint) = recording_server().await;
 
@@ -297,6 +303,9 @@ async fn create_account_commit_policy_engine_sees_xdr_destination_not_caller_des
 #[tokio::test]
 #[serial]
 async fn create_account_commit_policy_engine_sees_xdr_balance_not_caller_balance() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
     let (server, engine, _endpoint) = recording_server().await;
 

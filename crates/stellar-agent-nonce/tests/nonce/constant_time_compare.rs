@@ -24,6 +24,9 @@ use crate::helpers::{
 #[test]
 #[serial]
 fn bit_flipped_tag_returns_hmac_mismatch() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let key = [0x77u8; 32];
     let profile = make_profile("constant-time");
@@ -78,6 +81,9 @@ fn bit_flipped_tag_returns_hmac_mismatch() {
 #[test]
 #[serial]
 fn last_tag_byte_flip_returns_hmac_mismatch() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let key = [0x88u8; 32];
     let profile = make_profile("constant-time-last-byte");

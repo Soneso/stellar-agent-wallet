@@ -122,6 +122,9 @@ mod tests {
     #[serial_test::serial]
     #[allow(clippy::unwrap_used, clippy::panic, reason = "test assertions")]
     fn contended_sink_queues_a_tagged_row_with_the_loaded_key() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use base64::Engine as _;
         use stellar_agent_core::audit_log::AuditEntry;
         stellar_agent_test_support::keyring_mock::install().unwrap();
@@ -206,6 +209,9 @@ mod tests {
     #[serial_test::serial]
     #[allow(clippy::unwrap_used, clippy::panic, reason = "test assertions")]
     fn contended_enqueue_verifies_without_loss() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::{AuditEntry, TipAnchorStore, check_outbox_commitment};
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -263,6 +269,9 @@ mod tests {
     #[serial_test::serial]
     #[allow(clippy::unwrap_used, clippy::panic, reason = "test assertions")]
     fn a_standalone_writer_holder_keeps_direct_access() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::{AuditEntry, TipAnchorStore};
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let dir = tempfile::tempdir().unwrap();

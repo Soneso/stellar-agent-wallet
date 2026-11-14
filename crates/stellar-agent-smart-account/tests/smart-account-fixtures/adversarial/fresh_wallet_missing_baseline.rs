@@ -88,6 +88,9 @@ fn zero_sc_address() -> ScAddress {
 #[tokio::test]
 #[serial_test::serial]
 async fn verify_returns_missing_baseline_on_empty_audit_log() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
 
@@ -118,6 +121,9 @@ async fn verify_returns_missing_baseline_on_empty_audit_log() {
 #[tokio::test]
 #[serial_test::serial]
 async fn missing_baseline_wire_code_is_correct() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
 
@@ -151,6 +157,9 @@ async fn missing_baseline_wire_code_is_correct() {
 #[tokio::test]
 #[serial_test::serial]
 async fn missing_baseline_is_per_rule() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
 

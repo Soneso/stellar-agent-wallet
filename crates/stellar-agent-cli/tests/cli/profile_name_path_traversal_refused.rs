@@ -33,7 +33,10 @@ use serde_json::Value;
 /// `(exit_code, parsed_stdout_json)`.
 fn run_show(profile: &str) -> (i32, Value) {
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
+    let home = tempfile::tempdir().expect("fixture directory");
+    stellar_agent_test_support::sandbox::mark_sandbox(home.path()).expect("mark fixture directory");
     let output = Command::new(bin_path)
+        .env("STELLAR_AGENT_HOME", home.path())
         .args(["profile", "show", "--profile", profile])
         // Never touch the login keychain: the refusal happens before any
         // keyring access, and this keeps the subprocess hermetic regardless.

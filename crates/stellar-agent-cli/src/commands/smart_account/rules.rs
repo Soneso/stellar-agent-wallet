@@ -5632,7 +5632,10 @@ mod tests {
     /// `--kind raw` without `--policy-address` is refused before any network
     /// call.
     #[tokio::test]
+    #[serial_test::serial]
     async fn add_policy_raw_requires_policy_address() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut args = add_policy_args(PolicyKind::Raw);
         args.install_param = Some("AAAAAA==".to_owned());
         let code = add_policy_run(&args).await;
@@ -5642,7 +5645,10 @@ mod tests {
     /// `--kind spending-limit` without `--limit` is refused before any network
     /// call.
     #[tokio::test]
+    #[serial_test::serial]
     async fn add_policy_spending_limit_requires_limit() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut args = add_policy_args(PolicyKind::SpendingLimit);
         args.period = Some(17_280);
         let code = add_policy_run(&args).await;
@@ -5655,7 +5661,10 @@ mod tests {
     /// `--kind spending-limit` combined with the raw-mode `--policy-address`
     /// flag is refused (mode conflict) before any network call.
     #[tokio::test]
+    #[serial_test::serial]
     async fn add_policy_spending_limit_rejects_raw_flags() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut args = add_policy_args(PolicyKind::SpendingLimit);
         args.limit = Some(10_000_000);
         args.period = Some(17_280);
@@ -5672,6 +5681,8 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn add_policy_spending_limit_missing_registry_fails_closed() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let dir = tempfile::tempdir().unwrap();
         let registry_path = dir.path().join("networks.toml");
 
@@ -5706,7 +5717,10 @@ mod tests {
     /// `--kind spending-limit --limit 0` is refused before any registry lookup
     /// or network call (OZ `InvalidLimitOrPeriod` pre-flight).
     #[tokio::test]
+    #[serial_test::serial]
     async fn add_policy_spending_limit_rejects_zero_limit() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut args = add_policy_args(PolicyKind::SpendingLimit);
         args.limit = Some(0);
         args.period = Some(17_280);
@@ -5717,7 +5731,10 @@ mod tests {
     /// `--kind spending-limit --limit -1` is refused before any registry
     /// lookup or network call.
     #[tokio::test]
+    #[serial_test::serial]
     async fn add_policy_spending_limit_rejects_negative_limit() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut args = add_policy_args(PolicyKind::SpendingLimit);
         args.limit = Some(-1);
         args.period = Some(17_280);
@@ -5728,7 +5745,10 @@ mod tests {
     /// `--kind spending-limit --period 0` is refused before any registry
     /// lookup or network call.
     #[tokio::test]
+    #[serial_test::serial]
     async fn add_policy_spending_limit_rejects_zero_period() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut args = add_policy_args(PolicyKind::SpendingLimit);
         args.limit = Some(10_000_000);
         args.period = Some(0);
@@ -5741,7 +5761,10 @@ mod tests {
     /// `--kind simple-threshold` without `--threshold` is refused before any
     /// network call.
     #[tokio::test]
+    #[serial_test::serial]
     async fn add_policy_simple_threshold_requires_threshold() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let args = add_policy_args(PolicyKind::SimpleThreshold);
         let code = add_policy_run(&args).await;
         assert_eq!(
@@ -5755,7 +5778,10 @@ mod tests {
     /// even when `--policy` is supplied, so no registry access is needed for
     /// this assertion).
     #[tokio::test]
+    #[serial_test::serial]
     async fn add_policy_simple_threshold_rejects_zero_threshold() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut args = add_policy_args(PolicyKind::SimpleThreshold);
         args.threshold = Some(0);
         args.policy = Some(ADD_POLICY_TEST_ACCOUNT.to_owned());
@@ -5766,7 +5792,10 @@ mod tests {
     /// `--kind simple-threshold` combined with the raw-mode `--policy-address`
     /// flag is refused (mode conflict) before any network call.
     #[tokio::test]
+    #[serial_test::serial]
     async fn add_policy_simple_threshold_rejects_raw_flags() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut args = add_policy_args(PolicyKind::SimpleThreshold);
         args.threshold = Some(2);
         args.policy_address = Some(ADD_POLICY_TEST_ACCOUNT.to_owned());
@@ -5782,6 +5811,8 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn add_policy_simple_threshold_missing_registry_fails_closed() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let dir = tempfile::tempdir().unwrap();
         let registry_path = dir.path().join("networks.toml");
 
@@ -5815,7 +5846,10 @@ mod tests {
     /// `--kind weighted-threshold` without `--threshold` is refused before any
     /// network call.
     #[tokio::test]
+    #[serial_test::serial]
     async fn add_policy_weighted_threshold_requires_threshold() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut args = add_policy_args(PolicyKind::WeightedThreshold);
         args.weighted_signer_delegated = vec![format!("{ADD_POLICY_TEST_ACCOUNT_G}=1")];
         let code = add_policy_run(&args).await;
@@ -5828,7 +5862,10 @@ mod tests {
     /// `--kind weighted-threshold` without any `--weighted-signer-*` flag is
     /// refused before any network call.
     #[tokio::test]
+    #[serial_test::serial]
     async fn add_policy_weighted_threshold_requires_a_signer() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut args = add_policy_args(PolicyKind::WeightedThreshold);
         args.threshold = Some(1);
         let code = add_policy_run(&args).await;
@@ -5841,7 +5878,10 @@ mod tests {
     /// `--kind weighted-threshold` combined with the raw-mode `--policy-address`
     /// flag is refused (mode conflict) before any network call.
     #[tokio::test]
+    #[serial_test::serial]
     async fn add_policy_weighted_threshold_rejects_raw_flags() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut args = add_policy_args(PolicyKind::WeightedThreshold);
         args.threshold = Some(1);
         args.weighted_signer_delegated = vec![format!("{ADD_POLICY_TEST_ACCOUNT_G}=1")];
@@ -5856,7 +5896,10 @@ mod tests {
     /// A malformed `--weighted-signer-delegated` flag (missing `=<weight>`) is
     /// refused before any network call.
     #[tokio::test]
+    #[serial_test::serial]
     async fn add_policy_weighted_threshold_rejects_malformed_signer_flag() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut args = add_policy_args(PolicyKind::WeightedThreshold);
         args.threshold = Some(1);
         args.weighted_signer_delegated = vec![ADD_POLICY_TEST_ACCOUNT_G.to_owned()];
@@ -5869,7 +5912,10 @@ mod tests {
 
     /// A non-numeric weight suffix is refused before any network call.
     #[tokio::test]
+    #[serial_test::serial]
     async fn add_policy_weighted_threshold_rejects_non_numeric_weight() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut args = add_policy_args(PolicyKind::WeightedThreshold);
         args.threshold = Some(1);
         args.weighted_signer_delegated = vec![format!("{ADD_POLICY_TEST_ACCOUNT_G}=not-a-number")];
@@ -5882,6 +5928,8 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn add_policy_weighted_threshold_missing_registry_fails_closed() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let dir = tempfile::tempdir().unwrap();
         let registry_path = dir.path().join("networks.toml");
 
@@ -6012,7 +6060,10 @@ mod tests {
     /// An invalid `--source-account` G-strkey is refused before any manager
     /// construction or network call.
     #[tokio::test]
+    #[serial_test::serial]
     async fn get_spending_limit_run_rejects_invalid_source_account() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let args = GetSpendingLimitArgs {
             common: CommonRulesReadArgs {
                 profile: None,
@@ -6124,7 +6175,10 @@ mod tests {
 
     /// `--limit 0` is refused before any signer resolution or network call.
     #[tokio::test]
+    #[serial_test::serial]
     async fn set_spending_limit_rejects_zero_limit() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let args = set_spending_limit_args(0);
         let code = set_spending_limit_run(&args).await;
         assert_eq!(code, 1, "limit == 0 must be refused");
@@ -6132,7 +6186,10 @@ mod tests {
 
     /// `--limit -1` is refused before any signer resolution or network call.
     #[tokio::test]
+    #[serial_test::serial]
     async fn set_spending_limit_rejects_negative_limit() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let args = set_spending_limit_args(-1);
         let code = set_spending_limit_run(&args).await;
         assert_eq!(code, 1, "negative limit must be refused");

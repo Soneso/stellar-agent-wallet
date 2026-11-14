@@ -1925,6 +1925,10 @@ pub struct Evaluation {
 /// # Examples
 ///
 /// ```
+/// # #[serial_test::serial]
+/// # fn main() {
+/// # let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+/// # let _storage_home = stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
 /// use stellar_agent_core::policy::{
 ///     Decision, McpToolRegistration, NoopPolicyEngine, PolicyEngine, ToolDescriptor,
 /// };
@@ -1959,6 +1963,7 @@ pub struct Evaluation {
 ///     value_kind: stellar_agent_core::policy::ToolValueKind::ReadOnly,
 /// });
 /// assert!(engine.evaluate(&write_tool, &args, &profile_mainnet, None, None, None, None, None, 0).is_err());
+/// # }
 /// ```
 pub struct NoopPolicyEngine;
 
@@ -2091,8 +2096,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn testnet_destructive_tool_allowed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let engine = NoopPolicyEngine;
         let result = engine.evaluate(
             &destructive_tool(),
@@ -2109,8 +2117,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn testnet_read_tool_allowed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let engine = NoopPolicyEngine;
         let result = engine.evaluate(
             &read_tool(),
@@ -2127,8 +2138,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn mainnet_read_tool_allowed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let engine = NoopPolicyEngine;
         let result = engine.evaluate(
             &read_tool(),
@@ -2145,8 +2159,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn mainnet_destructive_tool_not_implemented() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let engine = NoopPolicyEngine;
         let result = engine.evaluate(
             &destructive_tool(),

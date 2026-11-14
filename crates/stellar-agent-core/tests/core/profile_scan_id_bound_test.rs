@@ -137,7 +137,11 @@ fn write_temp_toml(content: &str) -> (tempfile::NamedTempFile, std::path::PathBu
 /// u32::MAX would cause ~4.3B simulate calls per `smart-account list-rules` invocation.
 /// The bounds check prevents this at profile-load, never reaching the manager layer.
 #[test]
+#[serial_test::serial]
 fn t10a_u32_max_scan_id_rejected() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let toml = toml_with_scan_id(u32::MAX as u64);
     let (_file, path) = write_temp_toml(&toml);
 
@@ -169,7 +173,11 @@ fn t10a_u32_max_scan_id_rejected() {
 /// T-10b: `smart_account_max_context_rule_scan_id = 10001` (just above the bound)
 /// is rejected with `ProfileLoadError::InvalidScanIdBound`.
 #[test]
+#[serial_test::serial]
 fn t10b_just_above_bound_rejected() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let toml = toml_with_scan_id(10_001);
     let (_file, path) = write_temp_toml(&toml);
 
@@ -187,7 +195,11 @@ fn t10b_just_above_bound_rejected() {
 /// T-10c: `smart_account_max_context_rule_scan_id = 10000` (exactly the bound)
 /// is accepted.
 #[test]
+#[serial_test::serial]
 fn t10c_exactly_at_bound_accepted() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let toml = toml_with_scan_id(10_000);
     let (_file, path) = write_temp_toml(&toml);
 
@@ -206,7 +218,11 @@ fn t10c_exactly_at_bound_accepted() {
 /// T-10d: `smart_account_max_context_rule_scan_id = 1` (well within bounds)
 /// is accepted.
 #[test]
+#[serial_test::serial]
 fn t10d_small_value_accepted() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let toml = toml_with_scan_id(1);
     let (_file, path) = write_temp_toml(&toml);
 
@@ -225,7 +241,11 @@ fn t10d_small_value_accepted() {
 /// T-10e: A profile TOML without `smart_account_max_context_rule_scan_id` is
 /// accepted; the field defaults to `None`.
 #[test]
+#[serial_test::serial]
 fn t10e_field_absent_defaults_to_none() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let toml = toml_without_scan_id();
     let (_file, path) = write_temp_toml(toml);
 

@@ -215,7 +215,11 @@ mod tests {
     /// A type 9 preimage over the approved invocation, under the bound nonce
     /// and signature expiration ledger, is accepted.
     #[test]
+    #[serial_test::serial]
     fn the_approved_preimage_is_accepted() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let case = Case::new();
         let mainnet = network_id(MAINNET_PASSPHRASE);
         case.check(
@@ -231,7 +235,11 @@ mod tests {
     /// invocation under the bound nonce and signature expiration ledger is
     /// accepted as well.
     #[test]
+    #[serial_test::serial]
     fn the_approved_address_bound_preimage_is_accepted() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let case = Case::new();
         let mainnet = network_id(MAINNET_PASSPHRASE);
         case.check(
@@ -252,7 +260,11 @@ mod tests {
     /// The approved invocation under another nonce is another authorization
     /// entry, which the host would settle on its own.
     #[test]
+    #[serial_test::serial]
     fn another_nonce_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let case = Case::new();
         let mainnet = network_id(MAINNET_PASSPHRASE);
         for version in [AuthCredentialsVersion::V1, AuthCredentialsVersion::V2] {
@@ -280,7 +292,11 @@ mod tests {
     /// The approved invocation under another signature expiration ledger,
     /// earlier or later, is refused.
     #[test]
+    #[serial_test::serial]
     fn another_expiration_ledger_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let case = Case::new();
         let mainnet = network_id(MAINNET_PASSPHRASE);
         for version in [AuthCredentialsVersion::V1, AuthCredentialsVersion::V2] {
@@ -306,7 +322,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn another_root_invocation_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let case = Case::new();
         let mainnet = network_id(MAINNET_PASSPHRASE);
         let changed = invocation("transfer_from", vec![invocation("approve", vec![])]);
@@ -322,7 +342,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn another_sub_invocation_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let case = Case::new();
         let mainnet = network_id(MAINNET_PASSPHRASE);
         let changed = invocation("transfer", vec![invocation("burn", vec![])]);
@@ -338,7 +362,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn another_consumer_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let case = Case::new();
         let mainnet = network_id(MAINNET_PASSPHRASE);
         assert_eq!(
@@ -353,7 +381,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn an_expired_authorization_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let case = Case::new();
         let mainnet = network_id(MAINNET_PASSPHRASE);
         assert_eq!(
@@ -370,7 +402,11 @@ mod tests {
     /// A preimage carrying another network id than the expected one is
     /// refused even when both are known networks.
     #[test]
+    #[serial_test::serial]
     fn a_preimage_of_another_network_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let case = Case::new();
         assert_eq!(
             refused(case.check(
@@ -389,7 +425,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn a_testnet_preimage_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let case = Case::new();
         let testnet = network_id(TESTNET_PASSPHRASE);
         assert_eq!(
@@ -404,7 +444,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn an_unknown_network_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let case = Case::new();
         let unknown = network_id("Standalone Network ; February 2017");
         assert_eq!(
@@ -419,7 +463,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn a_preimage_of_another_type_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let case = Case::new();
         let mainnet = network_id(MAINNET_PASSPHRASE);
         let other = HashIdPreimage::ContractId(HashIdPreimageContractId {

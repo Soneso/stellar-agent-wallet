@@ -398,6 +398,9 @@ mod authorized {
     #[test]
     #[serial]
     fn the_mainnet_transaction_payload_is_the_bound_hash() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let _clock = set_now_ms_for_test(NOW);
         let case = Case::new();
         let payload = TxSigningPayload::authorized(
@@ -415,6 +418,9 @@ mod authorized {
     #[test]
     #[serial]
     fn another_transaction_hash_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let _clock = set_now_ms_for_test(NOW);
         let case = Case::new();
         let authorization = case.transaction(|_, binding| {
@@ -433,6 +439,9 @@ mod authorized {
     #[test]
     #[serial]
     fn a_non_mainnet_authorization_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let _clock = set_now_ms_for_test(NOW);
         let case = Case::new();
         let authorization = case.transaction(|header, _| header.chain = Caip2::Testnet);
@@ -447,6 +456,9 @@ mod authorized {
     #[test]
     #[serial]
     fn a_fee_bump_is_refused_under_a_transaction_authorization() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let _clock = set_now_ms_for_test(NOW);
         let case = Case::new();
         assert!(matches!(
@@ -462,6 +474,9 @@ mod authorized {
     #[tokio::test]
     #[serial]
     async fn the_approved_preimage_signs_once_and_yields_the_signed_intent() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let _clock = set_now_ms_for_test(NOW);
         for version in [AuthCredentialsVersion::V1, AuthCredentialsVersion::V2] {
             let case = Case::new();
@@ -495,6 +510,9 @@ mod authorized {
     #[test]
     #[serial]
     fn a_preimage_the_authorization_does_not_name_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let _clock = set_now_ms_for_test(NOW);
         let case = Case::new();
         let agent_account = account_of(agent());
@@ -573,6 +591,9 @@ mod authorized {
     #[test]
     #[serial]
     fn a_preimage_bound_to_another_address_is_refused_first() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let _clock = set_now_ms_for_test(NOW);
         let case = Case::new();
         let other = fixtures::public_key(OTHER_SEED);
@@ -600,6 +621,9 @@ mod authorized {
     #[test]
     #[serial]
     fn another_expected_signer_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let _clock = set_now_ms_for_test(NOW);
         let case = Case::new();
         for version in [AuthCredentialsVersion::V1, AuthCredentialsVersion::V2] {
@@ -622,6 +646,9 @@ mod authorized {
     #[test]
     #[serial]
     fn the_constructor_reads_the_mainnet_clock() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let case = Case::new();
         let build = || {
             SorobanAuthPayload::authorized(
@@ -654,6 +681,9 @@ mod authorized {
     #[tokio::test]
     #[serial]
     async fn the_signing_call_refuses_another_signer_key() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let _clock = set_now_ms_for_test(NOW);
         let case = Case::new();
         let payload = SorobanAuthPayload::authorized(
@@ -730,6 +760,9 @@ mod authorized {
     #[tokio::test]
     #[serial]
     async fn forwarding_a_mainnet_transaction_checks_the_software_key() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let _clock = set_now_ms_for_test(NOW);
         for seed in [OTHER_SEED, SIGNER_SEED] {
             let case = Case::new();
@@ -771,6 +804,9 @@ mod authorized {
     #[tokio::test]
     #[serial]
     async fn forwarding_a_mainnet_payload_to_another_software_key_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let _clock = set_now_ms_for_test(NOW);
         for version in [AuthCredentialsVersion::V1, AuthCredentialsVersion::V2] {
             let case = Case::new();
@@ -800,6 +836,9 @@ mod authorized {
     #[tokio::test]
     #[serial]
     async fn forwarding_a_mainnet_payload_to_the_same_software_key_matches() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let _clock = set_now_ms_for_test(NOW);
         for version in [AuthCredentialsVersion::V1, AuthCredentialsVersion::V2] {
             let case = Case::new();
@@ -831,6 +870,9 @@ mod authorized {
     #[tokio::test]
     #[serial]
     async fn the_signing_call_rechecks_freshness_on_the_mainnet_clock() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let clock = set_now_ms_for_test(NOW);
         let case = Case::new();
         let payload = SorobanAuthPayload::authorized(
@@ -855,6 +897,9 @@ mod authorized {
     #[tokio::test]
     #[serial]
     async fn an_invalidated_soroban_payload_never_reaches_the_signer() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = fixtures::LedgerFixture::new("invalidated-soroban", NOW);
         let auth = f.mint_soroban(&invocation("transfer"), NONCE, EXPIRATION_LEDGER, 70);
         let id = auth.id();
@@ -885,6 +930,9 @@ mod authorized {
     #[tokio::test]
     #[serial]
     async fn a_soroban_claim_that_fails_to_persist_never_reaches_the_signer() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = fixtures::LedgerFixture::new("unpersisted-soroban", NOW);
         let auth = f.mint_soroban(&invocation("transfer"), NONCE, EXPIRATION_LEDGER, 70);
         let id = auth.id();
@@ -911,6 +959,9 @@ mod authorized {
     #[tokio::test]
     #[serial]
     async fn a_late_soroban_signature_is_discarded() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = fixtures::LedgerFixture::new("late-soroban", NOW);
         let auth = f.mint_soroban(&invocation("transfer"), NONCE, EXPIRATION_LEDGER, 70);
         let id = auth.id();
@@ -937,6 +988,9 @@ mod authorized {
     #[tokio::test]
     #[serial]
     async fn a_signature_that_does_not_verify_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let _clock = set_now_ms_for_test(NOW);
         let case = Case::new();
         let payload = SorobanAuthPayload::authorized(

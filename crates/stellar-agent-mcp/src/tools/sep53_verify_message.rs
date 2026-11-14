@@ -284,7 +284,11 @@ mod tests {
     /// data: { valid: true }, request_id }` envelope.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn valid_signature_verifies_under_normalised_envelope() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let verifying_key = signing_key.verifying_key();
         let message = b"hello stellar";
@@ -329,7 +333,11 @@ mod tests {
     /// (`sep53.invalid_public_key`), not a JSON-RPC protocol error.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn invalid_public_key_is_business_error() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = make_server();
         let args = Sep53VerifyMessageArgs {
             chain_id: "stellar:testnet".to_owned(),
@@ -350,7 +358,11 @@ mod tests {
     /// public key is `sep53.verify_failed`, not a JSON-RPC protocol error.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn wrong_signature_is_verify_failed_business_error() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let verifying_key = signing_key.verifying_key();
         let public_key = stellar_strkey::ed25519::PublicKey(verifying_key.to_bytes()).to_string();
@@ -377,7 +389,11 @@ mod tests {
     /// no refusal repeats the argument or the byte the decoder stopped at.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn sep53_verify_marker_is_not_echoed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_test_support::rejected_value::{
             CREDENTIAL_MARKER, assert_no_marker_in_text,
         };

@@ -242,6 +242,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn the_gate_refuses_what_the_plan_does_not_name() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         super::super::intent_test_helpers::assert_envelope_bounds_refuse_before_signing().await;
         let address = ScAddress::Contract(ContractId(Hash([1; 32])));
@@ -292,6 +295,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn a_refused_request_keeps_the_proof_and_multiplicity_is_exact() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let address = ScAddress::Contract(ContractId(Hash([1; 32])));
         let descriptor = SignerDescriptor::External {
@@ -337,6 +343,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn an_envelope_outside_the_plan_refuses_before_exposure() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         for kind in [0, 1, 2] {
             let (plan, envelope) =
@@ -389,6 +398,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn bound_mismatch_refuses_at_gate_and_bind() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         use stellar_agent_network::signing::test_doubles::CountingSigner;
         use stellar_agent_network::signing::{Signer, TxSigningPayload};

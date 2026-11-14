@@ -73,6 +73,9 @@ fn selected(fx: &Fx) -> RecoveryAttempt {
 #[test]
 #[serial]
 fn run_wire_and_exposure() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (fx, id, attempt) = fixture();
     let before = std::fs::read(fx.store.path()).unwrap();
     assert_eq!(fx.wire().version, WIRE_VERSION_TOTAL_EPOCH);
@@ -114,6 +117,9 @@ fn run_wire_and_exposure() {
 #[test]
 #[serial]
 fn run_record_validation() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (fx, id, attempt) = fixture();
     let valid = stopped(id, &attempt);
     assert!(read(id, &attempt, &valid.to_string()).record().is_some());
@@ -379,6 +385,9 @@ fn contextual_schedule_table() {
 #[test]
 #[serial]
 fn exhausted_reader() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (_fx, id, attempt) = fixture();
     for count in [0_u8, 3, 15, 16, 17] {
         for phase in ["running", "stopped", "resolved"] {
@@ -437,6 +446,9 @@ fn exhausted_reader() {
 #[test]
 #[serial]
 fn checked_schedule_arithmetic() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     for error in [
         recovery_deadline(u64::MAX).unwrap_err(),
         recovery_retry_time(u64::MAX, 0).unwrap_err(),
@@ -488,6 +500,9 @@ fn checked_schedule_arithmetic() {
 #[test]
 #[serial]
 fn lease_and_clock_view() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (_fx, id, attempt) = fixture();
     let snapshot = read(id, &attempt, &running(id, &attempt).to_string());
     for now in [21000, 50000, u64::MAX] {
@@ -525,6 +540,9 @@ fn lease_and_clock_view() {
 #[test]
 #[serial]
 fn supported_identity_surface_and_maximum_valid_run() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (_fx, id, attempt) = fixture();
     let unsupported = ExposureIdentity::X402 {
         authorization_id: attempt.authorization_id,
@@ -611,6 +629,9 @@ fn supported_identity_surface_and_maximum_valid_run() {
 #[test]
 #[serial]
 fn run_decisions_preserve_bytes_and_win_over_spent_runs() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use crate::policy_state::operations::tests::{agreed, decide, decided_attempt};
     for count in [3, 16] {
         for phase in ["running", "stopped", "opaque"] {
@@ -695,6 +716,9 @@ fn run_decisions_preserve_bytes_and_win_over_spent_runs() {
 #[test]
 #[serial]
 fn opaque_generation_and_stale_snapshot() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use crate::policy_state::store::{
         COMMIT_FAULT_AFTER_COUNTER, COMMIT_FAULT_AFTER_PREPARED, COMMIT_FAULT_COMPACTION,
         arm_accounting_fault,
@@ -841,6 +865,9 @@ fn opaque_generation_and_stale_snapshot() {
 #[test]
 #[serial]
 fn run_snapshot_each_field_refuses_stale_evidence() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (mut fx, id, attempt) = fixture();
     fx.rewrite(|wire| install(wire, id, &stopped(id, &attempt).to_string()));
     let snapshot = selected(&fx);
@@ -917,6 +944,9 @@ fn run_snapshot_each_field_refuses_stale_evidence() {
 #[test]
 #[serial]
 fn typed_safe_refusal() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (_fx, id, attempt) = fixture();
     for secret in ["é".repeat(400), "🔐".repeat(400), "\\\"".repeat(400)] {
         let raw = serde_json::to_string(&secret).unwrap();
@@ -944,6 +974,9 @@ fn typed_safe_refusal() {
 #[test]
 #[serial]
 fn run_context_contract() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (_fx, id, attempt) = fixture();
     for (stage, method) in [
         ("hash", "get_transaction"),
@@ -1066,6 +1099,9 @@ fn run_context_contract() {
 #[test]
 #[serial]
 fn valid_run_generation_seams() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use crate::policy_state::store::{
         COMMIT_FAULT_AFTER_COUNTER, COMMIT_FAULT_AFTER_PREPARED, COMMIT_FAULT_COMPACTION,
         arm_accounting_fault,
@@ -1132,6 +1168,9 @@ fn valid_run_generation_seams() {
 #[test]
 #[serial]
 fn isolated_run_preserves_expiry_and_clear_lifecycle() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use crate::policy_state::operations::{ClearForm, OperationState, TransitionEvidence};
     let (mut fx, id, _) = fixture();
     let raw = "{ \"version\":99,\"automatic_runs\":2 }";

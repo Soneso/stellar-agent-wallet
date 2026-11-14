@@ -177,6 +177,10 @@ impl AuditBinding {
     /// # Examples
     ///
     /// ```
+    /// # #[serial_test::serial]
+    /// # fn main() {
+    /// # let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    /// # let _storage_home = stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     /// use stellar_agent_core::audit_log::binding::AuditBinding;
     /// use stellar_agent_core::profile::schema::Profile;
     ///
@@ -185,6 +189,7 @@ impl AuditBinding {
     /// assert_eq!(binding.audit_key, profile.audit_log_hash_chain_key_id);
     /// let parsed = AuditBinding::parse(&binding.to_keyring_value()).unwrap();
     /// assert_eq!(parsed, binding);
+    /// # }
     /// ```
     #[must_use]
     pub fn for_profile(profile: &Profile) -> Self {
@@ -250,8 +255,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn the_wire_form_is_the_documented_json() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let binding = AuditBinding::for_profile(&profile("/var/log/alice.jsonl"));
         let value: serde_json::Value =
             serde_json::from_str(&binding.to_keyring_value()).expect("JSON");
@@ -277,8 +285,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn the_digest_follows_the_lexically_normalized_path() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let plain = AuditBinding::for_profile(&profile("/var/log/alice.jsonl"));
         let dotted = AuditBinding::for_profile(&profile("/var/log/./x/../alice.jsonl"));
         let other = AuditBinding::for_profile(&profile("/var/log/bob.jsonl"));
@@ -287,8 +298,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn parsing_is_strict() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let good = AuditBinding::for_profile(&profile("/a.jsonl")).to_keyring_value();
         assert!(AuditBinding::parse(&good).is_ok());
         let upper = good.replace(
@@ -321,8 +335,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn classification_covers_every_record() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let expected = AuditBinding::for_profile(&profile("/a.jsonl"));
         let other = AuditBinding::for_profile(&profile("/b.jsonl"));
         assert_eq!(

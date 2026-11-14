@@ -33,24 +33,36 @@ fn held_through(phase: &'static str) {
 #[test]
 #[serial]
 fn enablement_holds_the_guard_through_pin() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     held_through("pin");
 }
 
 #[test]
 #[serial]
 fn enablement_holds_the_guard_through_nonce() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     held_through("nonce");
 }
 
 #[test]
 #[serial]
 fn enablement_holds_the_guard_through_replace() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     held_through("replace");
 }
 
 #[test]
 #[serial]
 fn enablement_takes_the_guard() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fixture = Fixture::new();
     let before = std::fs::read(fixture.path()).unwrap();
     let _guard = acquire(&fixture.path()).unwrap();
@@ -103,6 +115,9 @@ fn changed_during_preview(fixture: &Fixture, action: impl FnOnce(), detail: &str
 #[test]
 #[serial]
 fn enablement_refuses_a_changed_body() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fixture = Fixture::new();
     changed_during_preview(
         &fixture,
@@ -123,6 +138,9 @@ fn enablement_refuses_a_changed_body() {
 #[test]
 #[serial]
 fn enablement_refuses_a_changed_nonce() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fixture = Fixture::new();
     let before = std::fs::read(fixture.path()).unwrap();
     changed_during_preview(
@@ -144,6 +162,9 @@ fn enablement_refuses_a_changed_nonce() {
 #[test]
 #[serial]
 fn enablement_refuses_a_changed_pin() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fixture = Fixture::new();
     let before = std::fs::read(fixture.path()).unwrap();
     changed_during_preview(
@@ -162,6 +183,9 @@ fn enablement_refuses_a_changed_pin() {
 #[test]
 #[serial]
 fn enablement_check_takes_no_guard() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mut fixture = Fixture::new();
     fixture.args.check = true;
     let _guard = acquire(&fixture.path()).unwrap();
@@ -172,6 +196,9 @@ fn enablement_check_takes_no_guard() {
 #[test]
 #[serial]
 fn enablement_state_takes_no_guard() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mut fixture = Fixture::new();
     fixture.args.state = true;
     let _guard = acquire(&fixture.path()).unwrap();
@@ -182,6 +209,9 @@ fn enablement_state_takes_no_guard() {
 #[test]
 #[serial]
 fn read_pin_checked_refuses_missing_lock() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fixture = Fixture::new();
     let coordinate = stellar_agent_core::profile::schema::policy_pin_entry_ref(
         &fixture.profile.policy_window_state_key_id,
@@ -205,6 +235,9 @@ fn read_pin_checked_refuses_missing_lock() {
 #[test]
 #[serial]
 fn read_pin_checked_uses_pin_read_failure() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fixture = Fixture::new();
     fixture.put_pin(1);
     let coordinate = stellar_agent_core::profile::schema::policy_pin_entry_ref(
@@ -221,6 +254,9 @@ fn read_pin_checked_uses_pin_read_failure() {
 #[test]
 #[serial]
 fn authoring_nonce_recheck_refuses_concurrent_state() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use std::sync::atomic::{AtomicUsize, Ordering};
     let profile = Fixture::profile();
     let coordinate = mainnet_enablement_entry_ref(&profile.policy_window_state_key_id);
@@ -228,31 +264,42 @@ fn authoring_nonce_recheck_refuses_concurrent_state() {
     let probes = Arc::new(AtomicUsize::new(0));
     let count = probes.clone();
     keyring_mock::install_with_read_hooks(vec![keyring_mock::ReadHook::new(
-        &coordinate.service, &coordinate.account, Arc::new(move || {
+        &coordinate.service,
+        &coordinate.account,
+        Arc::new(move || {
             if count.fetch_add(1, Ordering::SeqCst) == 1 {
                 put(&hook_coordinate, "concurrent-nonce");
             }
         }),
-    )]).unwrap();
+    )])
+    .unwrap();
     let fixture = Fixture::seeded(profile);
     fixture.sign(&unbound_body(false));
     let before = std::fs::read(fixture.path()).unwrap();
     let failure = fixture.run().unwrap_err();
-    assert_eq!(failure, precondition("policy_state: changed during enablement"));
+    assert_eq!(
+        failure,
+        precondition("policy_state: changed during enablement")
+    );
     assert_eq!(probes.load(Ordering::SeqCst), 2);
     assert_eq!(fixture.pin(), PinState::Absent);
-    assert_eq!(get(&fixture.nonce_ref()).as_deref(), Some("concurrent-nonce"));
+    assert_eq!(
+        get(&fixture.nonce_ref()).as_deref(),
+        Some("concurrent-nonce")
+    );
     assert_eq!(std::fs::read(fixture.path()).unwrap(), before);
     assert!(!fixture.dir.path().join("audit.jsonl").exists());
 }
 
 fn read_failure_during_preview(fixture: &Fixture, action: impl FnOnce()) -> Failure {
-    let mut writer = AtPreview { action: Some(action), bytes: Vec::new() };
+    let mut writer = AtPreview {
+        action: Some(action),
+        bytes: Vec::new(),
+    };
     let failure = fixture.run_into(&mut writer).unwrap_err();
     let shown: serde_json::Value = serde_json::from_slice(&writer.bytes).unwrap();
-    let envelope = serde_json::to_value(failure_envelope(
-        failure.0, failure.1.clone(), Some(&shown),
-    )).unwrap();
+    let envelope =
+        serde_json::to_value(failure_envelope(failure.0, failure.1.clone(), Some(&shown))).unwrap();
     assert_eq!(envelope["error"]["details"]["preview"], shown);
     assert!(!fixture.dir.path().join("audit.jsonl").exists());
     assert!(acquire(&fixture.path()).is_ok());
@@ -262,6 +309,9 @@ fn read_failure_during_preview(fixture: &Fixture, action: impl FnOnce()) -> Fail
 #[test]
 #[serial]
 fn authoring_nonce_read_error_keeps_its_detail() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fixture = Fixture::new();
     let before = std::fs::read(fixture.path()).unwrap();
     let coordinate = fixture.nonce_ref();
@@ -287,6 +337,9 @@ fn fixture_with_optional_nonce(present: bool) -> Fixture {
 #[test]
 #[serial]
 fn authoring_busy_state_lock_keeps_its_code() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     for present in [false, true] {
         let fixture = fixture_with_optional_nonce(present);
         let before = std::fs::read(fixture.path()).unwrap();
@@ -294,9 +347,13 @@ fn authoring_busy_state_lock_keeps_its_code() {
         let nonce = get(&fixture.nonce_ref());
         let held = RefCell::new(None);
         let failure = read_failure_during_preview(&fixture, || {
-            *held.borrow_mut() = Some(WindowStoreLock::acquire_for(
-                &fixture.window, &fixture.profile.policy_window_state_key_id,
-            ).unwrap());
+            *held.borrow_mut() = Some(
+                WindowStoreLock::acquire_for(
+                    &fixture.window,
+                    &fixture.profile.policy_window_state_key_id,
+                )
+                .unwrap(),
+            );
         });
         assert_eq!(failure.0, "policy.state_lock_busy");
         assert!(!failure.1.contains("changed during enablement"));
@@ -310,6 +367,9 @@ fn authoring_busy_state_lock_keeps_its_code() {
 #[test]
 #[serial]
 fn authoring_unusable_pin_keeps_its_recovery() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     for present in [false, true] {
         let fixture = fixture_with_optional_nonce(present);
         let before = std::fs::read(fixture.path()).unwrap();
@@ -324,7 +384,11 @@ fn authoring_unusable_pin_keeps_its_recovery() {
         let error = read_pin_without_creating(&fixture.window, &fixture.profile).unwrap_err();
         assert_eq!(failure, pin_read_failure("operator", error));
         assert_eq!(failure.0, "policy.pin_unusable");
-        assert!(failure.1.contains("Rerun this command once the keyring is reachable"));
+        assert!(
+            failure
+                .1
+                .contains("Rerun this command once the keyring is reachable")
+        );
         assert_eq!(get(&coordinate).as_deref(), Some("invalid pin"));
         assert_eq!(get(&fixture.nonce_ref()), nonce);
         assert_eq!(std::fs::read(fixture.path()).unwrap(), before);
@@ -334,6 +398,9 @@ fn authoring_unusable_pin_keeps_its_recovery() {
 #[test]
 #[serial]
 fn authoring_policy_read_error_keeps_its_detail() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fixture = Fixture::new();
     let failure = read_failure_during_preview(&fixture, || {
         std::fs::write(fixture.path(), [0xff]).unwrap();

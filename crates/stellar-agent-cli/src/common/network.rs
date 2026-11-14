@@ -319,7 +319,11 @@ mod tests {
     /// The flag wins; without it the profile's `submit_timeout_seconds`
     /// applies, then 60 seconds.
     #[test]
+    #[serial_test::serial]
     fn submit_timeout_prefers_the_flag_then_the_profile_then_sixty() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut profile =
             stellar_agent_core::profile::Profile::builder_testnet("timeout", "s", "n", "a").build();
         profile.submit_timeout_seconds = Some(17);
@@ -451,7 +455,11 @@ mod flag_rules_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn absent_flags_copy_all_profile_fields() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = profile(false);
         let c = network_context_for_command(&p, "flags", flags()).unwrap();
         assert_eq!(c.chain_id, p.chain_id);
@@ -460,7 +468,11 @@ mod flag_rules_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn matching_testnet_flag_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert!(
             network_context_for_command(
                 &profile(false),
@@ -475,7 +487,11 @@ mod flag_rules_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn testnet_profile_mainnet_flag_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let error = network_context_for_command(
             &profile(false),
             "flags",
@@ -489,7 +505,11 @@ mod flag_rules_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn mainnet_profile_testnet_flag_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let error = network_context_for_command(
             &profile(true),
             "flags",
@@ -503,7 +523,11 @@ mod flag_rules_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn testnet_endpoint_flags_override_only_endpoints() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = profile(false);
         let c = network_context_for_command(
             &p,
@@ -534,7 +558,11 @@ mod flag_rules_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn mainnet_equal_primary_flag_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert!(matches!(
             network_context_for_command(
                 &profile(true),
@@ -551,7 +579,11 @@ mod flag_rules_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn mainnet_equal_secondary_flag_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert!(matches!(
             network_context_for_command(
                 &profile(true),

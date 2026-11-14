@@ -53,6 +53,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", 
 
 [features]
 test-helpers = [
+    "dep:tempfile",
     "dep:async-trait",
     "dep:base64",
     "dep:ed25519-dalek",

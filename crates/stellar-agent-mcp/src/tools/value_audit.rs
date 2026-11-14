@@ -557,7 +557,11 @@ mod tests {
     /// and creates nothing at the repointed path.
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn the_pre_flight_passes_a_binding_refusal_through() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let profile = bound_then_repointed("mcp-binding-preflight", dir.path());
@@ -572,7 +576,11 @@ mod tests {
     /// The strict helper passes a binding refusal through and writes nothing.
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn the_strict_helper_passes_a_binding_refusal_through() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let profile = bound_then_repointed("mcp-binding-strict", dir.path());
@@ -591,7 +599,11 @@ mod tests {
     /// on both helpers.
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn other_keyed_access_failures_keep_chain_key_unavailable() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let mut profile =

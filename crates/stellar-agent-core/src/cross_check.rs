@@ -582,8 +582,11 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn requirement_direct_contract_and_native_sac_use_their_thresholds() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let asset =
             CanonicalAsset::contract(&stellar_strkey::Contract([9; 32]).to_string()).unwrap();
         let mut profile = Profile::builder_testnet("signer", "witness", "nonce", "witness").build();

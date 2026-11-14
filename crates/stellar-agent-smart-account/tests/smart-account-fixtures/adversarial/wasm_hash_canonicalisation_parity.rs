@@ -119,7 +119,11 @@ fn verifier_addr() -> ScAddress {
 /// regression-locks against a hypothetical canonicalisation bug that
 /// off-by-ones the hash format identically on both sides.
 #[tokio::test]
+#[serial_test::serial]
 async fn wasm_hash_canonicalisation_parity_byte_identical_no_drift_and_idempotent() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let verifier = verifier_addr();
     let pinned_hash = VERIFIER_ALLOWLIST[0].wasm_hash;
 
@@ -253,7 +257,11 @@ fn wasm_hash_pin_wire_form_is_deterministic_and_round_trips() {
 /// the drift-check path carries the EXACT bytes returned by the mock RPC,
 /// not a normalised form.
 #[tokio::test]
+#[serial_test::serial]
 async fn wasm_hash_cache_carries_bytes_unmodified_from_rpc() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let verifier = verifier_addr();
     let pinned_hash = VERIFIER_ALLOWLIST[0].wasm_hash;
 

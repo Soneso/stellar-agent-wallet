@@ -237,8 +237,11 @@ mod tests {
 
     /// Single-tx path passes unconditionally.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn single_tx_bundle_none_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool();
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -249,8 +252,11 @@ mod tests {
 
     /// Inner under cap passes.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn inner_under_cap_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool();
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -267,8 +273,11 @@ mod tests {
 
     /// Inner exactly at cap passes (strict > boundary).
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn inner_exactly_at_cap_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool();
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -288,8 +297,11 @@ mod tests {
 
     /// First over-cap inner is denied at correct index.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn first_over_cap_inner_denied_at_correct_index() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool();
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -326,8 +338,11 @@ mod tests {
 
     /// Asset mismatch inners are skipped.
     #[test]
-    #[serial_test::parallel]
+    #[serial_test::serial]
     fn asset_mismatch_inners_skipped() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool();
         let profile = make_profile();
         let store = PolicyStateStore::new();

@@ -13,6 +13,9 @@ use crate::helpers::{init_mock, make_profile};
 #[test]
 #[serial]
 fn osrng_key_is_32_bytes_base64() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let profile = make_profile("osrng-keygen");
 

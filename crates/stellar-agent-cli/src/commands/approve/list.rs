@@ -1000,7 +1000,10 @@ mod tests {
     /// full M and a base account row; G payments and grants render without
     /// one.
     #[test]
+    #[serial_test::serial]
     fn muxed_approval_shows_base_account() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         use stellar_agent_core::approval::view::ApprovalSummaryView;
         let key = [0xAE; 32];
         let g = format!("{}", stellar_strkey::ed25519::PublicKey(key));

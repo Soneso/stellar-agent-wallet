@@ -2002,7 +2002,11 @@ pub(super) mod approval_tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn authenticated_identity_failure_keeps_the_approval() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fixture = crate::tools::message_signing_tests::Fixture::new();
         fixture.seed_signer();
@@ -2381,12 +2385,14 @@ pub(super) mod approval_tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn approval_expiring_during_preparation_signs_nothing() {
         expiry_case(false, false).await;
     }
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn key_read_crossing_expiry_signs_nothing() {
         expiry_case(false, true).await;
     }
@@ -2593,6 +2599,7 @@ pub(super) mod approval_tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn x402_writer_reads_insert_clock_after_open() {
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fixture = crate::tools::message_signing_tests::Fixture::new();
@@ -2742,12 +2749,14 @@ pub(super) mod approval_tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn x402_queue_reads_no_signer_and_runs_no_identity_gate() {
         queue_key_case(false).await;
     }
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn pre_sign_check_is_absent_without_an_approval_requirement() {
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let mut fixture = crate::tools::message_signing_tests::Fixture::new();
@@ -2951,12 +2960,14 @@ pub(super) mod approval_tests {
 
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn x402_crash_after_spend_prevents_retry_release() {
         crash_case("spend");
     }
 
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn x402_crash_after_audit_prevents_retry_release() {
         crash_case("audit");
     }
@@ -2982,6 +2993,7 @@ pub(super) mod approval_tests {
 
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn one_x402_approval_has_one_spend_winner() {
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fixture = crate::tools::message_signing_tests::Fixture::new();
@@ -3040,6 +3052,7 @@ pub(super) mod approval_tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     #[ignore = "child helper requires an isolated approval fixture"]
     async fn x402_private_directory_child() {
         let directory = std::env::var("X402_QUEUE_DIRECTORY").expect("child fixture");
@@ -3141,6 +3154,7 @@ pub(super) mod approval_tests {
 
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn spend_refuses_a_spent_approval() {
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fixture = crate::tools::message_signing_tests::Fixture::new();
@@ -3167,6 +3181,7 @@ pub(super) mod approval_tests {
 
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn spend_refuses_what_is_not_a_live_attested_x402_approval() {
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fixture = crate::tools::message_signing_tests::Fixture::new();
@@ -3292,6 +3307,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn muxed_contract_payment_refuses_before_state() {
         let home = tempfile::tempdir().unwrap();
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
@@ -3339,6 +3355,7 @@ mod tests {
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn muxed_contract_mainnet_payment_refuses_before_state() {
         use crate::tools::common::tests::mainnet::{
             authorizations, mount_rpc, routed_fixture, x402_args,
@@ -3852,7 +3869,11 @@ mod tests {
     /// proves the refusal fires before key access.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn mainnet_profile_refuses_before_signing_no_signature_produced() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = make_mainnet_server();
         let args = X402CreatePaymentArgs {
             approval_nonce: None,
@@ -3888,7 +3909,11 @@ mod tests {
     /// Queueing requires no keys and persists the complete payment intent.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn require_approval_verdict_queues_the_payment_and_signs_nothing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let home = tempfile::tempdir().unwrap();
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
@@ -3933,7 +3958,11 @@ mod tests {
     /// Half proofs refuse without creating an approval.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn require_approval_half_proof_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().ok();
         let home = tempfile::tempdir().unwrap();
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
@@ -3964,7 +3993,11 @@ mod tests {
     /// The testnet payment's authorized row records the policy's `Allow`.
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn testnet_authorized_row_records_the_allow_decision() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().ok();
         let server = make_require_approval_server();
         let requirements =
@@ -4026,6 +4059,7 @@ mod tests {
     /// the field and the configured signer, without the argument.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn x402_address_marker_is_not_echoed() {
         use stellar_agent_test_support::rejected_value::{
             CREDENTIAL_MARKER, assert_no_marker_in_text,
@@ -4065,7 +4099,11 @@ mod tests {
     /// must never be masked by `audit.chain_key_unavailable`.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn policy_denial_precedes_the_audit_preflight() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use std::sync::Arc;
         stellar_agent_test_support::keyring_mock::install().ok();
         let profile = Profile::builder_testnet(
@@ -4125,6 +4163,7 @@ mod tests {
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn mainnet_preparation_persists_intent_without_rpc_or_signing() {
         use crate::tools::common::tests::mainnet::Fixture;
         use std::sync::atomic::Ordering;
@@ -4250,6 +4289,7 @@ mod tests {
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn mainnet_partial_approval_and_minimum_reserve_persist_nothing() {
         use crate::tools::common::tests::mainnet::Fixture;
         let f = Fixture::new(|raw| raw);
@@ -4318,6 +4358,7 @@ mod tests {
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn mainnet_x402_witness_binds_the_plain_intent() {
         use crate::tools::common::{
             GatedApprovalKind, tests::mainnet::Fixture, verify_attestation_subject_gate,
@@ -4390,6 +4431,7 @@ mod tests {
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn mainnet_x402_gate_refuses_changed_intents_and_authenticated_subjects() {
         use crate::tools::common::{
             GatedApprovalKind, tests::mainnet::Fixture, verify_attestation_subject_gate,
@@ -4592,6 +4634,7 @@ mod tests {
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn mainnet_payment_call_refuses_tampered_arguments_without_payment_rpc() {
         use crate::tools::common::tests::mainnet::{X402Run, authorizations, x402_args};
         let run = X402Run::new().await;
@@ -4698,7 +4741,11 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn x402_requirements_marker_is_not_echoed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let capture = stellar_agent_test_support::log_capture::CaptureWriter::new();
         let subscriber = tracing_subscriber::fmt()

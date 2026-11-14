@@ -91,6 +91,7 @@ test-helpers = [
 ]
 
 [dev-dependencies]
+stellar-agent-core = { path = ".", features = ["test-helpers"] }
 proptest = { workspace = true }
 stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["test-helpers"] }
 serial_test = { workspace = true }

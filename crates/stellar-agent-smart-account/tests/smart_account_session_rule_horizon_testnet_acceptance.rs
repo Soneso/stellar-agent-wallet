@@ -238,6 +238,8 @@ async fn h_a_install_horizon_exceeded() {
         sa_strkey, signer_g, valid_until_str, TESTNET_RPC_URL, signer_env_var
     );
 
+    stellar_agent_test_support::sandbox::require_isolated_executable(&binary)
+        .expect("isolated acceptance child");
     let output = std::process::Command::new(&binary)
         .args([
             "smart-account",
@@ -404,6 +406,8 @@ async fn h_b_update_horizon_exceeded() {
     // threshold-policy and therefore bypasses the signer-divergence check.
     // This lets us reach the horizon-cap gate (which fires inside simulate)
     // without needing a pre-seeded audit-log baseline for rule 1.
+    stellar_agent_test_support::sandbox::require_isolated_executable(&binary)
+        .expect("isolated acceptance child");
     let output = std::process::Command::new(&binary)
         .args([
             "smart-account",

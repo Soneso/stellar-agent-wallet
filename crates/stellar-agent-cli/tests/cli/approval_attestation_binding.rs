@@ -196,6 +196,7 @@ fn approve_binary_case(mainnet: bool, case: ApprovalCase) {
     } else {
         &nonce
     };
+    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
     let mut command = Command::new(env!("CARGO_BIN_EXE_stellar-agent"));
     command.args(["approve", "--id", requested_nonce, "--profile", name]);
     if !matches!(case, ApprovalCase::ClosedStdin) {

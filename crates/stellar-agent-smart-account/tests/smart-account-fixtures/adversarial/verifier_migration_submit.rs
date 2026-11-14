@@ -157,7 +157,11 @@ fn mock_signer_g() -> String {
 /// Verifier diversification: a migration compares each rule with its state
 /// row before anything is sent.
 #[tokio::test]
+#[serial_test::serial]
 async fn submit_refuses_the_first_step_without_a_state_row_before_any_rpc() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let server = MockServer::start().await;
 
     let signer_g = mock_signer_g();

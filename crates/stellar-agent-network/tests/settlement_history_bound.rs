@@ -391,6 +391,9 @@ mod authorized {
     #[tokio::test]
     #[serial]
     async fn an_authorized_original_past_ledger_retention_refuses_its_resend() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = AuthorizedSubmissionFixture::new("bound-authorized-original", NOW);
         let envelope = fx.envelope(100, NOW / 1000 + 30 * 86_400);
         let (server, client) = endpoint(&envelope).await;
@@ -436,6 +439,9 @@ mod authorized {
     #[tokio::test]
     #[serial]
     async fn an_aged_original_in_the_oldest_archive_refuses_an_authorized_resend() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         aged_original_refuses_its_resend("bound-aged-original", 0).await;
     }
 
@@ -445,6 +451,9 @@ mod authorized {
     #[tokio::test]
     #[serial]
     async fn an_aged_original_past_stopped_pruning_refuses_an_authorized_resend() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         aged_original_refuses_its_resend("bound-aged-excess", 2).await;
     }
 
@@ -493,6 +502,9 @@ mod authorized {
     #[tokio::test]
     #[serial]
     async fn a_settled_original_with_a_lost_receipt_lets_the_resend_through() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for (label, amount) in [("submitted", 100), ("failed", 200)] {
             let fx = AuthorizedSubmissionFixture::new(&format!("bound-settled-{label}"), NOW);
             let envelope = fx.envelope(amount, NOW / 1000 + 30 * 86_400);
@@ -526,6 +538,9 @@ mod authorized {
     #[tokio::test]
     #[serial]
     async fn a_lazily_indexed_writer_reads_only_to_its_tip_on_the_authorized_path() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let fx = AuthorizedSubmissionFixture::new("bound-lazy-tip", NOW);
         let envelope = fx.envelope(100, NOW / 1000 + 30 * 86_400);
         let (server, client) = endpoint(&envelope).await;
@@ -559,6 +574,9 @@ mod authorized {
     #[tokio::test]
     #[serial]
     async fn ledger_inspection_fails_on_an_unreadable_window_store() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let fx = AuthorizedSubmissionFixture::new("bound-inspection", NOW);
         let envelope = fx.envelope(100, NOW / 1000 + 30 * 86_400);
         let (_server, client) = endpoint(&envelope).await;

@@ -69,7 +69,11 @@ mod tests {
     use super::*;
 
     #[test]
+    #[serial_test::serial]
     fn dispatch_testnet_returns_correct_network_fields() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::profile::schema::Profile;
 
         let profile = Profile::builder_testnet("svc", "acct", "nonce-svc", "nonce-acct").build();
@@ -83,7 +87,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn dispatch_mainnet_returns_correct_network_fields() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::profile::schema::Profile;
 
         let profile = Profile::builder_mainnet(

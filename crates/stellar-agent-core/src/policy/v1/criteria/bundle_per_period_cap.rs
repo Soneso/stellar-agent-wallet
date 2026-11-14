@@ -390,6 +390,9 @@ mod tests {
     #[test]
     #[serial]
     fn single_tx_bundle_none_always_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool();
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -408,6 +411,9 @@ mod tests {
     #[test]
     #[serial]
     fn empty_bundle_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool();
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -432,6 +438,9 @@ mod tests {
     #[test]
     #[serial]
     fn three_inners_under_cap_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool();
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -461,6 +470,9 @@ mod tests {
     #[test]
     #[serial]
     fn fourth_inner_tips_cap_denied_at_index_3() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool();
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -508,6 +520,9 @@ mod tests {
     #[test]
     #[serial]
     fn period_used_from_state_store_adds_to_bundle_total() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool();
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -554,6 +569,9 @@ mod tests {
     #[test]
     #[serial]
     fn asset_mismatch_inners_not_counted() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool();
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -582,6 +600,9 @@ mod tests {
     #[test]
     #[serial]
     fn generic_inners_not_counted() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool();
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -622,6 +643,9 @@ mod tests {
     #[test]
     #[serial]
     fn xlm_configured_matches_native_inners() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool();
         let profile = make_profile();
         let store = PolicyStateStore::new();

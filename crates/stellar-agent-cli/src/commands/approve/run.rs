@@ -1441,7 +1441,11 @@ mod tests {
     ];
 
     #[test]
+    #[serial_test::serial]
     fn summary_renderer_keeps_base_bytes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert_eq!(rendered_summary_outputs(), BASE_SUMMARY_OUTPUTS);
     }
 
@@ -1783,6 +1787,8 @@ mod tests {
     #[test]
     #[serial]
     fn approval_refuses_a_refused_destination_before_the_audit_sink() {
+        let guard_home = tempfile::tempdir().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let name = "approve-bad-destination";
@@ -1921,6 +1927,9 @@ mod tests {
     #[test]
     #[serial]
     fn store_level_local_approval_is_refused_on_mainnet() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let svc = "stellar-agent-attestation-run-test-mainnet";
         seed_key_32(svc, "default");
@@ -1972,6 +1981,9 @@ mod tests {
     #[test]
     #[serial]
     fn run_yes_with_valid_pending_records_attestation_store_level() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let svc = "stellar-agent-attestation-run-test-valid";
         let raw_key = seed_key_32(svc, "default");
@@ -2152,7 +2164,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn prompt_approval_auto_approve_returns_true() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let entry = make_entry(DEFAULT_TTL_MS);
         let approved = prompt_approval(&entry, &test_context(), true).unwrap();
         assert!(approved);
@@ -2173,7 +2189,11 @@ mod tests {
     /// wiring itself lives in `render_summary` and is verified structurally
     /// (`render_json` is the sole stdout writer in `run()`).
     #[test]
+    #[serial_test::serial]
     fn write_summary_payment_writes_block_to_sink() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let entry = make_entry(DEFAULT_TTL_MS);
         let mut sink: Vec<u8> = Vec::new();
         write_summary(&entry, &test_context(), &mut sink).expect("write to in-memory sink");
@@ -2241,7 +2261,11 @@ mod tests {
     /// digest) must each keep their 2-space indent through the multi-line
     /// `format!` continuation.
     #[test]
+    #[serial_test::serial]
     fn write_summary_rule_proposal_fields_are_indented() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let definition = ContextRuleProposalSnapshot::new(
             RuleProposalContextType::CallContract {
                 contract: RULE_TEST_C_ADDR.to_owned(),
@@ -2541,7 +2565,11 @@ mod tests {
         assert!(!rendered_no_warn.contains("accept_unknown_verifier is set"));
     }
     #[test]
+    #[serial_test::serial]
     fn approval_prompt_shows_rule_reason_and_expiry() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let request = stellar_agent_core::policy::ApprovalRequest::new(String::new(), 617)
             .with_reason("Treasury review\nconfirm".to_owned());
         let entry = make_entry(DEFAULT_TTL_MS).with_policy_request(&request);
@@ -2559,7 +2587,11 @@ mod tests {
     /// A claim shows the envelope's source and balance id; the stored summary
     /// source and balance id are not shown.
     #[test]
+    #[serial_test::serial]
     fn write_summary_claim_shows_the_envelope_source_only() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut entry = fixtures::claim_pending(
             SOURCE_G,
             [0x0a; 32],
@@ -2688,6 +2720,9 @@ mod tests {
     #[test]
     #[serial]
     fn with_a_free_writer_the_row_is_written_then_the_approval_persisted() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = consent_profile("approve-free", &dir, true);
@@ -2719,6 +2754,9 @@ mod tests {
     #[test]
     #[serial]
     fn beside_a_draining_writer_the_row_is_queued_and_its_next_acquisition_logs_it() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = consent_profile("approve-queued", &dir, true);
@@ -2779,6 +2817,9 @@ mod tests {
     #[test]
     #[serial]
     fn beside_a_writer_that_does_not_drain_the_approval_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = consent_profile("approve-locked", &dir, true);
@@ -2818,6 +2859,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_sidecar_lock_held_briefly_is_waited_out_and_the_row_written() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = consent_profile("approve-brief", &dir, true);
@@ -2845,6 +2889,9 @@ mod tests {
     #[test]
     #[serial]
     fn without_an_audit_key_the_approval_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = consent_profile("approve-no-key", &dir, false);
@@ -2858,6 +2905,9 @@ mod tests {
     #[test]
     #[serial]
     fn on_a_rolled_back_log_the_approval_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = consent_profile("approve-rolled-back", &dir, true);
@@ -2902,6 +2952,9 @@ mod tests {
     #[test]
     #[serial]
     fn on_a_changed_binding_the_approval_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::AuditBinding;
         use stellar_agent_network::keyring::KeyringAuditBindingStore;
 
@@ -2934,6 +2987,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_failing_outbox_append_refuses_and_the_entry_stays_pending() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let profile = consent_profile("approve-outbox-fails", &dir, true);
@@ -2970,7 +3026,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn write_summary_trustline_writes_block_to_sink() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for (limit, shown) in [
             (None, "unlimited"),
             (Some(0), "0 stroops (removes the trustline)"),
@@ -3022,7 +3082,11 @@ mod tests {
     /// says that its asset and amount are not part of it, whatever the
     /// stored summary holds.
     #[test]
+    #[serial_test::serial]
     fn claim_summary_says_asset_and_amount_are_not_signed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for value in [None, Some(("XLM", 1_000_000))] {
             let mut entry = fixtures::claim_pending(
                 SOURCE_G,
@@ -3080,7 +3144,11 @@ mod tests {
     /// The `approve` summary shows the envelope's destination, amount, asset
     /// and memo when the stored summary fields name another payment.
     #[test]
+    #[serial_test::serial]
     fn approve_summary_shows_the_envelope_payment_not_the_stored_summary() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut entry = fixtures::payment_pending(
             SOURCE_G,
             DEST_G,
@@ -3125,7 +3193,11 @@ mod tests {
     /// A memo holding cursor-up and erase-line sequences renders as escaped
     /// text on its own line, and the only Amount line is the envelope's.
     #[test]
+    #[serial_test::serial]
     fn approve_escapes_control_sequences_in_a_memo() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let memo = "\u{1b}[1A\u{1b}[2KAmount: 0.1 XLM";
         let envelope =
             fixtures::payment_envelope(SOURCE_G, DEST_G, "XLM", 5_000_000_000, Some(memo), 100, 2);
@@ -3166,7 +3238,11 @@ mod tests {
     /// An edited rule proposal renders as inconsistent, shows no edited term,
     /// and is refused before any prompt, `--yes` included.
     #[test]
+    #[serial_test::serial]
     fn an_edited_rule_proposal_renders_as_inconsistent_and_is_never_prompted() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut entry = fixtures::rule_proposal_pending();
         if let ApprovalKind::RuleProposalSimulated { definition, .. } = &mut entry.kind {
             definition.name = "replacement-rule".to_owned();
@@ -3188,7 +3264,11 @@ mod tests {
     /// inconsistent, shows neither transaction's terms, and is refused before
     /// any prompt, `--yes` included.
     #[test]
+    #[serial_test::serial]
     fn an_inconsistent_entry_renders_as_such_and_is_never_prompted() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut entry = make_entry(DEFAULT_TTL_MS);
         let other = fixtures::payment_envelope(SOURCE_G, OTHER_G, "XLM", 9, None, 100, 1);
         let ApprovalKind::PaymentSimulated {
@@ -3215,7 +3295,11 @@ mod tests {
 
     /// An unedited payment renders its envelope terms.
     #[test]
+    #[serial_test::serial]
     fn an_unedited_payment_renders_its_stored_values() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let entry = fixtures::payment_pending(
             SOURCE_G,
             DEST_G,
@@ -3246,7 +3330,11 @@ mod tests {
 
     /// The MPP charge prompt names every charge term, escaped.
     #[test]
+    #[serial_test::serial]
     fn mpp_charge_summary_renders_its_terms() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
         let recipient = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
         let entry = stellar_agent_core::approval::fixtures::bind_mpp_entry(
@@ -3294,7 +3382,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn approve_renders_x402_payee_and_amount() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_xdr::{
             AccountId, ContractId, Hash, InvokeContractArgs, PublicKey, ScAddress, ScVal,
             SorobanAuthorizedFunction, SorobanAuthorizedInvocation, Uint256,
@@ -3366,7 +3458,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn muxed_destinations_keep_their_full_cli_summary() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_test_support::xdr_fixtures::{
             destination_transfer, muxed_contract_address,
         };
@@ -3428,7 +3524,11 @@ mod tests {
     /// Mainnet with `--yes` refuses whatever the terminal, naming the
     /// passkey assertion that consent requires.
     #[test]
+    #[serial_test::serial]
     fn mainnet_refuses_yes_on_a_terminal() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for terminal in [(true, true), (false, false)] {
             assert_eq!(
                 approve_rule(true, true, terminal),
@@ -3445,7 +3545,11 @@ mod tests {
     /// Mainnet without `--yes` passes the rule without a terminal check:
     /// terminal input is no mainnet consent, so a terminal is not required.
     #[test]
+    #[serial_test::serial]
     fn mainnet_without_yes_checks_no_terminal() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for terminal in [(false, true), (true, false), (false, false), (true, true)] {
             assert_eq!(approve_rule(true, false, terminal), Ok(()), "{terminal:?}");
         }
@@ -3453,7 +3557,11 @@ mod tests {
 
     /// Testnet keeps `--yes` and checks no terminal.
     #[test]
+    #[serial_test::serial]
     fn testnet_keeps_yes_without_a_terminal() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert_eq!(approve_rule(false, true, (false, false)), Ok(()));
         assert_eq!(approve_rule(false, false, (false, false)), Ok(()));
     }
@@ -3486,11 +3594,19 @@ mod tests {
         );
     }
     #[test]
+    #[serial_test::serial]
     fn edited_mpp_amount_renders_inconsistent() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert_edited_mpp_inconsistent(true);
     }
     #[test]
+    #[serial_test::serial]
     fn edited_mpp_recipient_renders_inconsistent() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert_edited_mpp_inconsistent(false);
     }
 

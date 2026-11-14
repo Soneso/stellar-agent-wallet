@@ -436,6 +436,56 @@ else
   fail "(i) control: STELLAR_AGENT_TEST_KEYRING=platform: exit $rc, output:"
   printf '%s\n' "$out" >&2
 fi
+# (j) Every suite receives a marked home below target/tmp/test-sandboxes;
+# the platform leg receives its permit and each declared live feature.
+cat > "$STUB/cargo" <<'STUB_EOF'
+#!/usr/bin/env bash
+root=$(cd "$(dirname "$0")/../../.." && pwd)
+case "${STELLAR_AGENT_HOME-}" in
+  "$root"/target/tmp/test-sandboxes/*) ;;
+  *) echo 'error: could not compile fixture: sandbox root missing'; exit 101 ;;
+esac
+if [ ! -f "$STELLAR_AGENT_HOME/.stellar-agent-test-sandbox" ]; then
+  echo 'error: could not compile fixture: sandbox marker missing'; exit 101
+fi
+if [ "${STELLAR_AGENT_TEST_KEYRING-}" = platform ]; then
+  if [ "${STELLAR_AGENT_TEST_LIVE_PLATFORM_KEYRING-}" != real-platform-keyring ]; then
+    echo 'error: could not compile fixture: live permit missing'; exit 101
+  fi
+  suite_crate=''
+  next_crate=0
+  for arg in "$@"; do
+    if [ "$next_crate" = 1 ]; then suite_crate=$arg; next_crate=0; fi
+    [ "$arg" != -p ] || next_crate=1
+  done
+  if grep -qE '^live-platform-keyring *=' "$root/crates/$suite_crate/Cargo.toml"; then
+    case "$*" in
+      *live-platform-keyring*) ;;
+      *) echo 'error: could not compile fixture: live feature missing'; exit 101 ;;
+    esac
+  fi
+fi
+echo "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out"
+STUB_EOF
+for mainnet_write in off on; do
+  for keyring in headless platform; do
+    if [ "$keyring" = platform ]; then
+      out=$(env -u STELLAR_AGENT_TEST_LIVE_PLATFORM_KEYRING PATH="$STUB:$PATH" \
+        STELLAR_AGENT_TEST_KEYRING=platform MAINNET_WRITE="$mainnet_write" FILTER='' SHARE='' \
+        PACE=0 RETRY_COOLDOWN=0 BROWSER_RETRY_COOLDOWN=0 bash "$DRIVER" 2>&1)
+    else
+      out=$(env -u STELLAR_AGENT_TEST_KEYRING -u STELLAR_AGENT_TEST_LIVE_PLATFORM_KEYRING \
+        PATH="$STUB:$PATH" MAINNET_WRITE="$mainnet_write" FILTER='' SHARE='' \
+        PACE=0 RETRY_COOLDOWN=0 BROWSER_RETRY_COOLDOWN=0 bash "$DRIVER" 2>&1)
+    fi
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      pass "(j) every suite receives marked storage and the selected permit/features: $mainnet_write $keyring"
+    else
+      fail "(j) suite storage contract: $mainnet_write $keyring exit $rc: $out"
+    fi
+  done
+done
 rm -f "$STUB/sleep" "$STUB/sleeps" "$STUB/summary"
 rm -f "$STUB/cargo" "$STUB/args"
 rmdir "$STUB"

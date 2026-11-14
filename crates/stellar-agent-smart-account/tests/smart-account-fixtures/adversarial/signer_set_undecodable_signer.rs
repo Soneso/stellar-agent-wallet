@@ -67,7 +67,11 @@ async fn simulate_count(server: &MockServer) -> usize {
 /// Both servers serve the full observation sequence (the rule, then the
 /// threshold), so the refusal is the decoder's and not a missing response.
 #[tokio::test]
+#[serial_test::serial]
 async fn list_signers_refuses_a_rule_with_an_undecodable_signer() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
 
     let policy = policy_sc_address();
