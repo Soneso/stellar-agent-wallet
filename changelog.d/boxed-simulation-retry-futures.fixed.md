@@ -1,1 +1,1 @@
-- Keep each busy simulation request on the heap, so smart-account submissions fit a 2 MiB stack in debug builds.
+- Keep each request future of a busy-simulation retry on the heap, so the futures of the submission paths no longer grow by the size of the request.

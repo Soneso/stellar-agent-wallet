@@ -880,6 +880,35 @@ mod tests {
         ))
     }
 
+    /// A request whose future holds `N` bytes across a pending poll.
+    #[expect(
+        clippy::result_large_err,
+        reason = "the request returns the RPC error type the retry drives"
+    )]
+    async fn request_holding<const N: usize>() -> Result<u8, stellar_rpc_client::Error> {
+        let payload = [1u8; N];
+        tokio::task::yield_now().await;
+        Ok(std::hint::black_box(&payload)[0])
+    }
+
+    /// The retry future's size does not depend on the request future's size.
+    #[test]
+    fn the_retry_future_does_not_hold_the_request_future() {
+        const ALLOWANCE: usize = 64;
+        let large_request = request_holding::<65_536>();
+        assert!(std::mem::size_of_val(&large_request) >= 65_536);
+        drop(large_request);
+
+        let small = retry_preflight_busy(None, request_holding::<1>);
+        let large = retry_preflight_busy(None, request_holding::<65_536>);
+        let (small_size, large_size) =
+            (std::mem::size_of_val(&small), std::mem::size_of_val(&large));
+        assert!(
+            large_size.abs_diff(small_size) <= ALLOWANCE,
+            "the retry takes {small_size} bytes for a 1-byte request and {large_size} for a 65536-byte one"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn busy_then_answer_is_retried() {
         let mut calls = 0;
