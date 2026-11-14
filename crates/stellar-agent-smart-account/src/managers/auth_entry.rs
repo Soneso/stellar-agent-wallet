@@ -1568,7 +1568,7 @@ impl PreSubmitBudget {
 
     /// The refusal of a pre-submit stage `stage` that met the deadline,
     /// reported at `elapse_stage`.
-    fn elapsed(self, stage: &'static str, elapse_stage: &'static str) -> SaError {
+    pub(crate) fn elapsed(self, stage: &'static str, elapse_stage: &'static str) -> SaError {
         SaError::AuthEntryConstructionFailed {
             stage: elapse_stage,
             redacted_reason: format!(
@@ -1747,13 +1747,18 @@ pub(crate) async fn resimulate_with_signed_auth(
         budget,
         "simulate_resimulate",
         "auth_payload",
-        server.simulate_transaction_envelope(&resim_envelope, None),
+        stellar_agent_network::retry::retry_preflight_busy(Some(budget.deadline), || {
+            server.simulate_transaction_envelope(&resim_envelope, None)
+        }),
     )
     .await?
-    .map_err(|e| {
-        auth_payload_err(format!(
+    .map_err(|e| match e {
+        stellar_agent_network::retry::BusyRetryError::Rpc(e) => auth_payload_err(format!(
             "re-simulate: simulate_transaction_envelope failed: {e}"
-        ))
+        )),
+        stellar_agent_network::retry::BusyRetryError::Expired => {
+            budget.elapsed("simulate_resimulate", "auth_payload")
+        }
     })?;
 
     if let Some(sim_error) = &resim_response.error {
@@ -4136,5 +4141,146 @@ mod tests {
             ),
             other => panic!("expected the simulate refusal, got {other:?}"),
         }
+    }
+
+    async fn busy_resimulation(
+        server: &wiremock::MockServer,
+        budget: PreSubmitBudget,
+    ) -> Result<stellar_rpc_client::SimulateTransactionResponse, SaError> {
+        use crate::managers::rules::event_reason_tests::{
+            SAC, SMART_ACCOUNT, address, address_entry,
+        };
+        let source = stellar_strkey::ed25519::PublicKey([7; 32]).to_string();
+        resimulate_with_signed_auth(
+            &Client::new(&server.uri()).unwrap(),
+            &StellarRpcClient::new(&server.uri()).unwrap(),
+            &address(SAC),
+            ScSymbol::try_from("transfer").unwrap(),
+            VecM::default(),
+            vec![address_entry(address(SMART_ACCOUNT), &address(SAC), vec![])],
+            &source,
+            TESTNET_PASSPHRASE,
+            budget,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn busy_resimulation_fails_as_transport() {
+        use crate::managers::rules::event_reason_tests::{
+            RPC30_ERROR, busy_replies, read_only_server, refusal_result, rpc30_events,
+        };
+        let source = stellar_strkey::ed25519::PublicKey([7; 32]).to_string();
+        for busy in [1, 4] {
+            let server =
+                read_only_server(&source, refusal_result(RPC30_ERROR, &rpc30_events())).await;
+            busy_replies(&server, busy).await;
+            let budget = PreSubmitBudget {
+                deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+                total: std::time::Duration::from_secs(30),
+            };
+            let error = crate::managers::rules::event_reason_tests::drive_busy_paused(
+                busy_resimulation(&server, budget),
+            )
+            .await
+            .unwrap_err();
+            if busy == 1 {
+                assert!(
+                    matches!(error, SaError::DeploymentFailed { phase: "simulate", ref redacted_reason } if redacted_reason.contains("[OZ:SpendingLimitExceeded]")),
+                    "{error:?}"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        error,
+                        SaError::AuthEntryConstructionFailed {
+                            stage: "auth_payload",
+                            ..
+                        }
+                    ),
+                    "{error:?}"
+                );
+                assert!(tokio::time::Instant::now() < budget.deadline);
+            }
+            assert_eq!(
+                stellar_agent_test_support::rpc_request_count(&server, "simulateTransaction").await,
+                if busy == 1 { 2 } else { 4 }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resimulation_expiry_keeps_the_stage_error() {
+        use crate::managers::rules::event_reason_tests::{
+            busy_replies, read_only_server, successful_read_result,
+        };
+        let source = stellar_strkey::ed25519::PublicKey([7; 32]).to_string();
+        let server = read_only_server(&source, successful_read_result()).await;
+        wiremock::Mock::given(wiremock::matchers::body_partial_json(
+            serde_json::json!({"method": "simulateTransaction"}),
+        ))
+        .respond_with(|request: &wiremock::Request| {
+            let body: serde_json::Value = request.body_json().unwrap();
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0", "id": body["id"], "result": successful_read_result()
+                }))
+                .set_delay(std::time::Duration::from_secs(3))
+        })
+        .with_priority(2)
+        .mount(&server)
+        .await;
+        busy_replies(&server, 1).await;
+        let start = tokio::time::Instant::now();
+        let budget = PreSubmitBudget {
+            deadline: start + std::time::Duration::from_secs(2),
+            total: std::time::Duration::from_secs(2),
+        };
+        let error = busy_resimulation(&server, budget).await.unwrap_err();
+        assert_eq!(
+            serde_json::to_value(&error).unwrap(),
+            serde_json::to_value(budget.elapsed("simulate_resimulate", "auth_payload")).unwrap()
+        );
+        assert!(start.elapsed() < std::time::Duration::from_millis(2500));
+    }
+
+    #[tokio::test]
+    async fn busy_resimulation_reuses_the_envelope() {
+        use crate::managers::rules::event_reason_tests::{
+            RPC30_ERROR, busy_replies, read_only_server, refusal_result, rpc30_events,
+        };
+        let source = stellar_strkey::ed25519::PublicKey([7; 32]).to_string();
+        let server = read_only_server(&source, refusal_result(RPC30_ERROR, &rpc30_events())).await;
+        busy_replies(&server, 2).await;
+        let budget = PreSubmitBudget {
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            total: std::time::Duration::from_secs(30),
+        };
+        let error = busy_resimulation(&server, budget).await.unwrap_err();
+        assert!(matches!(
+            error,
+            SaError::DeploymentFailed {
+                phase: "simulate",
+                ..
+            }
+        ));
+        let bodies: Vec<serde_json::Value> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.body_json().unwrap())
+            .collect();
+        let envelopes: Vec<_> = bodies
+            .iter()
+            .filter(|r| r["method"] == "simulateTransaction")
+            .map(|r| &r["params"]["transaction"])
+            .collect();
+        assert_eq!(envelopes.len(), 3);
+        assert!(envelopes.windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!(
+            stellar_agent_test_support::rpc_request_count(&server, "getLedgerEntries").await,
+            1
+        );
     }
 }

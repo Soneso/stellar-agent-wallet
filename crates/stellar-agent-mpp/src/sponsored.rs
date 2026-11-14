@@ -73,10 +73,11 @@ impl SponsoredRpc for StellarSponsoredRpc {
         &self,
         envelope: &TransactionEnvelope,
     ) -> Result<SimulateTransactionResponse, MppError> {
-        self.client
-            .simulate_transaction_envelope(envelope, None)
-            .await
-            .map_err(|_error| simulation_error())
+        stellar_agent_network::retry::retry_preflight_busy(None, || {
+            self.client.simulate_transaction_envelope(envelope, None)
+        })
+        .await
+        .map_err(|_error| simulation_error())
     }
 }
 
@@ -844,6 +845,60 @@ pub(crate) mod tests {
 
     const CONTRACT: &str = "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA";
     const RECIPIENT: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+
+    #[tokio::test]
+    async fn sponsored_simulate_retries_busy() {
+        for busy in [1, 4] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(stellar_agent_test_support::EchoIdResponder::new(
+                    serde_json::json!({
+                        "latestLedger": 123, "minResourceFee": "100",
+                        "results": [{"auth": [], "xdr": "AAAAAQ=="}]
+                    }),
+                ))
+                .mount(&server)
+                .await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(|request: &wiremock::Request| {
+                    let body: serde_json::Value = request.body_json().expect("request");
+                    wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "jsonrpc": "2.0", "id": body["id"],
+                        "error": {"code": -32004, "message": "preflight queue full"}
+                    }))
+                })
+                .with_priority(1)
+                .up_to_n_times(busy)
+                .mount(&server)
+                .await;
+            let mut account =
+                stellar_baselib::account::Account::new(RECIPIENT, "0").expect("account");
+            let envelope = TransactionBuilder::new(&mut account, TESTNET_PASSPHRASE, None)
+                .fee(100_u32)
+                .add_operation(Operation {
+                    source_account: None,
+                    body: OperationBody::Inflation,
+                })
+                .build_for_simulation()
+                .to_envelope()
+                .expect("envelope");
+            let rpc = StellarSponsoredRpc {
+                client: stellar_rpc_client::Client::new(&server.uri()).expect("client"),
+            };
+            let result = rpc.simulate(&envelope).await;
+            if busy == 1 {
+                assert_eq!(result.expect("simulation").latest_ledger, 123);
+            } else {
+                let error = result.expect_err("busy refusal");
+                assert_eq!(error.code(), simulation_error().code());
+                assert_eq!(error.message(), simulation_error().message());
+            }
+            assert_eq!(
+                server.received_requests().await.expect("requests").len(),
+                if busy == 1 { 2 } else { 4 }
+            );
+        }
+    }
     const TRANSACTION_DATA: &str = "AAAAAAAAAAIAAAAGAAAAAcwD/nT9D7Dc2LxRdab+2vEUF8B+XoN7mQW21oxPT8ALAAAAFAAAAAEAAAAHy8vNUZ8vyZ2ybPHW0XbSrRtP7gEWsJ6zDzcfY9P8z88AAAABAAAABgAAAAHMA/50/Q+w3Ni8UXWm/trxFBfAfl6De5kFttaMT0/ACwAAABAAAAABAAAAAgAAAA8AAAAHQ291bnRlcgAAAAASAAAAAAAAAAAg4dbAxsGAGICfBG3iT2cKGYQ6hK4sJWzZ6or1C5v6GAAAAAEAHfKyAAAFiAAAAIgAAAAAAAAAAw==";
 
     pub(crate) struct DeterministicRpc {

@@ -39,6 +39,7 @@
 //! Each call site selects its classifier:
 //! - [`is_retryable_send_error`] for `send_transaction`.
 //! - [`is_retryable_poll_error`] for `get_transaction` / `get_health`.
+//! - [`is_preflight_busy`] for `simulateTransaction`, through [`retry_preflight_busy`].
 //! - `is_retryable_identity_error` for `getNetwork`. It matches the send
 //!   classifier except that `JsonRpc(ParseError(_))` and an HTTP 401 or 403
 //!   answer are not retryable.
@@ -54,6 +55,106 @@ use std::time::Duration;
 
 use rand_core::{OsRng, RngCore};
 use tokio::time::Instant;
+
+/// The JSON-RPC code for a full simulation queue.
+pub const PREFLIGHT_BUSY_CODE: i32 = -32004;
+
+const SIMULATE_BUSY_ATTEMPTS: u32 = 4;
+const SIMULATE_BUSY_BASE_DELAY: Duration = Duration::from_millis(250);
+const SIMULATE_BUSY_MAX_DELAY: Duration = Duration::from_secs(1);
+
+/// The total simulation bound when the caller supplies no deadline.
+pub const SIMULATE_BUSY_TOTAL_BOUND: Duration = Duration::from_secs(60);
+
+/// Whether the RPC error reports a full simulation queue.
+pub fn is_preflight_busy(error: &stellar_rpc_client::Error) -> bool {
+    matches!(
+        error,
+        stellar_rpc_client::Error::JsonRpc(jsonrpsee_core::ClientError::Call(object))
+            if object.code() == PREFLIGHT_BUSY_CODE
+    )
+}
+
+/// Why a bounded simulation retry returns no response.
+#[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "callers retain the RPC error type for their existing mappings"
+)]
+pub enum BusyRetryError {
+    /// The request fails or exhausts its busy retries.
+    Rpc(stellar_rpc_client::Error),
+    /// The deadline expires before a response arrives.
+    Expired,
+}
+
+impl std::fmt::Display for BusyRetryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rpc(error) => error.fmt(formatter),
+            Self::Expired => formatter.write_str("deadline elapsed"),
+        }
+    }
+}
+
+/// Retries a busy simulation within one absolute deadline.
+///
+/// The closure contains only the RPC request and borrows an envelope built before this call.
+/// Signatures, admission, approvals, and budget holds stay outside the closure.
+///
+/// # Errors
+/// Returns the request error on exhaustion or a non-busy error, and [`BusyRetryError::Expired`] on expiry.
+#[expect(
+    clippy::result_large_err,
+    reason = "the helper preserves the RPC error for each caller's typed mapping"
+)]
+pub async fn retry_preflight_busy<F, Fut, T>(
+    deadline: Option<Instant>,
+    op: F,
+) -> Result<T, BusyRetryError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, stellar_rpc_client::Error>>,
+{
+    retry_preflight_busy_with_delay(deadline, jitter_delay, op).await
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "the helper preserves the RPC error for each caller's typed mapping"
+)]
+async fn retry_preflight_busy_with_delay<F, Fut, T>(
+    deadline: Option<Instant>,
+    mut delay_for: impl FnMut(u32, Duration, Duration) -> Duration,
+    mut op: F,
+) -> Result<T, BusyRetryError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, stellar_rpc_client::Error>>,
+{
+    let deadline = deadline.unwrap_or_else(|| Instant::now() + SIMULATE_BUSY_TOTAL_BOUND);
+    let mut attempt = 0;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(BusyRetryError::Expired);
+        }
+        let error = match tokio::time::timeout_at(deadline, op()).await {
+            Ok(Ok(value)) => return Ok(value),
+            Ok(Err(error)) => error,
+            Err(_) => return Err(BusyRetryError::Expired),
+        };
+        if !is_preflight_busy(&error) || attempt + 1 >= SIMULATE_BUSY_ATTEMPTS {
+            return Err(BusyRetryError::Rpc(error));
+        }
+        let delay = delay_for(attempt, SIMULATE_BUSY_BASE_DELAY, SIMULATE_BUSY_MAX_DELAY);
+        if Instant::now() + delay >= deadline {
+            return Err(BusyRetryError::Rpc(error));
+        }
+        tracing::debug!(target: "simulate_busy_retry", attempt, "waiting to retry busy simulation");
+        tokio::time::sleep(delay).await;
+        attempt += 1;
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // RetryPolicy
@@ -767,6 +868,201 @@ mod tests {
     use tokio::time::Instant;
 
     use super::*;
+
+    fn call_error(code: i32) -> stellar_rpc_client::Error {
+        stellar_rpc_client::Error::JsonRpc(jsonrpsee_core::ClientError::Call(
+            serde_json::from_value(serde_json::json!({
+                "code": code, "message": "preflight queue full"
+            }))
+            .unwrap(),
+        ))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn busy_then_answer_is_retried() {
+        let mut calls = 0;
+        let result = retry_preflight_busy(None, || {
+            calls += 1;
+            std::future::ready(if calls < 3 {
+                Err(call_error(-32004))
+            } else {
+                Ok(7)
+            })
+        })
+        .await;
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(calls, 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn busy_stops_at_the_attempt_cap() {
+        let start = Instant::now();
+        let mut calls = 0;
+        let mut delays = Vec::new();
+        let result = retry_preflight_busy_with_delay(
+            None,
+            |attempt, base, max| {
+                delays.push((attempt, base, max));
+                (base * 2_u32.pow(attempt)).min(max)
+            },
+            || {
+                calls += 1;
+                std::future::ready(Err::<(), _>(call_error(-32004)))
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(BusyRetryError::Rpc(ref e)) if is_preflight_busy(e)));
+        assert_eq!(calls, 4);
+        assert_eq!(
+            delays,
+            (0..3)
+                .map(|i| (i, Duration::from_millis(250), Duration::from_secs(1)))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(start.elapsed(), Duration::from_millis(1750));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn busy_stops_when_the_sleep_does_not_fit() {
+        for (delay, expected_calls, elapsed) in [(100, 1, 0), (40, 3, 80)] {
+            let start = Instant::now();
+            let mut calls = 0;
+            let result = retry_preflight_busy_with_delay(
+                Some(start + Duration::from_millis(100)),
+                |_, _, _| Duration::from_millis(delay),
+                || {
+                    calls += 1;
+                    std::future::ready(Err::<(), _>(call_error(-32004)))
+                },
+            )
+            .await;
+            assert!(matches!(result, Err(BusyRetryError::Rpc(ref e)) if is_preflight_busy(e)));
+            assert_eq!(calls, expected_calls);
+            assert_eq!(start.elapsed(), Duration::from_millis(elapsed));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_deadline_dispatches_nothing() {
+        let mut calls = 0;
+        let result = retry_preflight_busy(Some(Instant::now()), || {
+            calls += 1;
+            std::future::ready(Ok::<_, stellar_rpc_client::Error>(7))
+        })
+        .await;
+        assert!(matches!(result, Err(BusyRetryError::Expired)));
+        assert_eq!(calls, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_attempt_is_cut_at_the_deadline() {
+        for busy_first in [false, true] {
+            let start = Instant::now();
+            let mut calls = 0;
+            let result = retry_preflight_busy_with_delay(
+                Some(start + Duration::from_millis(200)),
+                |_, _, _| Duration::from_millis(100),
+                || {
+                    calls += 1;
+                    let busy = busy_first && calls == 1;
+                    async move {
+                        tokio::time::sleep(Duration::from_millis(if busy { 50 } else { 500 }))
+                            .await;
+                        if busy { Err(call_error(-32004)) } else { Ok(7) }
+                    }
+                },
+            )
+            .await;
+            assert!(matches!(result, Err(BusyRetryError::Expired)));
+            assert_eq!(start.elapsed(), Duration::from_millis(200));
+            assert_eq!(calls, if busy_first { 2 } else { 1 });
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unbounded_call_gets_the_total_bound() {
+        let start = Instant::now();
+        let mut calls = 0;
+        let result = retry_preflight_busy_with_delay(
+            None,
+            |_, _, _| Duration::from_secs(1),
+            || {
+                calls += 1;
+                async {
+                    tokio::time::sleep(Duration::from_secs(25)).await;
+                    Err::<(), _>(call_error(-32004))
+                }
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(BusyRetryError::Expired)));
+        assert!(start.elapsed() <= Duration::from_secs(60));
+        assert!(calls <= 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_the_busy_code_is_retried() {
+        for transport in [false, true] {
+            let mut calls = 0;
+            let result = retry_preflight_busy(None, || {
+                calls += 1;
+                let error = if transport {
+                    stellar_rpc_client::Error::JsonRpc(jsonrpsee_core::ClientError::Transport(
+                        Box::new(std::io::Error::from(std::io::ErrorKind::ConnectionRefused)),
+                    ))
+                } else {
+                    call_error(-32602)
+                };
+                std::future::ready(Err::<(), _>(error))
+            })
+            .await;
+            assert!(matches!(result, Err(BusyRetryError::Rpc(_))));
+            assert_eq!(calls, 1);
+        }
+        let mut calls = 0;
+        let response = retry_preflight_busy(None, || {
+            calls += 1;
+            std::future::ready(Ok::<_, stellar_rpc_client::Error>(
+                stellar_rpc_client::SimulateTransactionResponse {
+                    error: Some("preflight queue full".to_owned()),
+                    ..Default::default()
+                },
+            ))
+        })
+        .await
+        .unwrap();
+        assert_eq!(response.error.as_deref(), Some("preflight queue full"));
+        assert_eq!(calls, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn busy_does_not_dispatch_after_a_late_wake() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let sleeping = Arc::new(tokio::sync::Notify::new());
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let task = tokio::spawn({
+            let calls = calls.clone();
+            let sleeping = sleeping.clone();
+            async move {
+                retry_preflight_busy_with_delay(
+                    Some(deadline),
+                    |_, _, _| {
+                        sleeping.notify_one();
+                        Duration::from_millis(50)
+                    },
+                    || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        std::future::ready(Err::<(), _>(call_error(-32004)))
+                    },
+                )
+                .await
+            }
+        });
+        sleeping.notified().await;
+        tokio::time::advance(Duration::from_millis(200)).await;
+        assert!(matches!(task.await.unwrap(), Err(BusyRetryError::Expired)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 
     // ─── is_retryable_send_error ─────────────────────────────────────────────
 

@@ -43,7 +43,10 @@
 use std::time::Duration;
 
 use sha2::{Digest as _, Sha256};
-use stellar_agent_core::rpc_budget::{SequentialRpcBudget, bound_stage};
+use stellar_agent_core::rpc_budget::{
+    SequentialRpcBudget, SequentialRpcBudgetElapsed, bound_stage,
+};
+use stellar_agent_network::retry::{BusyRetryError, retry_preflight_busy};
 use stellar_agent_network::{
     StellarRpcClient, fetch_account, signing::envelope_signing::attach_signature,
     submit_transaction_and_wait,
@@ -399,16 +402,28 @@ async fn deploy_timelock_controller_body(
                 phase: "build",
                 redacted_reason: format!("upload to_envelope (pre-sim) failed: {e}"),
             })?;
+        let upload_stage = "upload_simulate";
         let upload_sim = bound_stage(
             deploy_budget,
-            "upload_simulate",
-            rpc_server.simulate_transaction_envelope(&upload_envelope, None),
+            upload_stage,
+            retry_preflight_busy(Some(deploy_budget.deadline), || {
+                rpc_server.simulate_transaction_envelope(&upload_envelope, None)
+            }),
         )
         .await
         .map_err(|elapsed| map_budget_elapsed(elapsed, "simulate"))?
-        .map_err(|e| SaError::DeploymentFailed {
-            phase: "simulate",
-            redacted_reason: format!("upload simulate_transaction_envelope failed: {e}"),
+        .map_err(|e| match e {
+            BusyRetryError::Rpc(e) => SaError::DeploymentFailed {
+                phase: "simulate",
+                redacted_reason: format!("upload simulate_transaction_envelope failed: {e}"),
+            },
+            BusyRetryError::Expired => map_budget_elapsed(
+                SequentialRpcBudgetElapsed {
+                    stage: upload_stage,
+                    total_secs: deploy_budget.total.as_secs(),
+                },
+                "simulate",
+            ),
         })?;
 
         if let Some(sim_error) = &upload_sim.error {
@@ -663,16 +678,28 @@ async fn deploy_timelock_controller_body(
         phase: "build",
         redacted_reason: format!("deploy to_envelope (pre-sim) failed: {e}"),
     })?;
+    let deploy_stage = "deploy_simulate";
     let sim_response = bound_stage(
         deploy_budget,
-        "deploy_simulate",
-        rpc_server.simulate_transaction_envelope(&deploy_envelope_pre, None),
+        deploy_stage,
+        retry_preflight_busy(Some(deploy_budget.deadline), || {
+            rpc_server.simulate_transaction_envelope(&deploy_envelope_pre, None)
+        }),
     )
     .await
     .map_err(|elapsed| map_budget_elapsed(elapsed, "simulate"))?
-    .map_err(|e| SaError::DeploymentFailed {
-        phase: "simulate",
-        redacted_reason: format!("deploy simulate_transaction_envelope failed: {e}"),
+    .map_err(|e| match e {
+        BusyRetryError::Rpc(e) => SaError::DeploymentFailed {
+            phase: "simulate",
+            redacted_reason: format!("deploy simulate_transaction_envelope failed: {e}"),
+        },
+        BusyRetryError::Expired => map_budget_elapsed(
+            SequentialRpcBudgetElapsed {
+                stage: deploy_stage,
+                total_secs: deploy_budget.total.as_secs(),
+            },
+            "simulate",
+        ),
     })?;
 
     if let Some(sim_error) = &sim_response.error {
@@ -857,6 +884,38 @@ mod tests {
     /// Runs the deployment for `network_passphrase` with a counting deployer
     /// and a mock endpoint that answers nothing. Returns the result, the
     /// deployer's key accesses and the requests the endpoint received.
+    #[tokio::test]
+    async fn deployment_simulates_retry_busy() {
+        crate::deployment::deploy::tests::check_deployment_busy(|url, timeout| async move {
+            let signer =
+                stellar_agent_network::signing::test_doubles::CountingSigner::new([0x61; 32]);
+            deploy_timelock_controller(TimelockControllerDeployArgs {
+                deployer: crate::deployment::deploy::DeployerKeypair::from_signer(
+                    "counting".to_owned(),
+                    Box::new(signer),
+                ),
+                network_passphrase: stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE
+                    .to_owned(),
+                rpc_url: url,
+                timeout,
+                fee: ResolvedFeePerOp {
+                    stroops: 100,
+                    percentile_label: "profile_default".to_owned(),
+                },
+                dry_run: false,
+                min_delay: 0,
+                proposers: vec![
+                    stellar_agent_test_support::signed_envelope::account_id_for_seed([0x61; 32]),
+                ],
+                executors: vec![],
+                admin: None,
+            })
+            .await
+            .map(|_| ())
+        })
+        .await;
+    }
+
     async fn deploy_on(
         network_passphrase: &str,
         dry_run: bool,

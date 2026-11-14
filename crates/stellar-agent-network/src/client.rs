@@ -520,9 +520,20 @@ impl StellarRpcClient {
         &self,
         envelope: &TransactionEnvelope,
     ) -> Result<SimulateTransactionResponse, NetworkError> {
-        self.witness_simulate(envelope)
+        crate::retry::retry_preflight_busy(None, || self.witness_simulate(envelope))
             .await
-            .map_err(|e| rpc_unreachable(&self.url, SIMULATE_TRANSACTION_FAILED, &e))
+            .map_err(|e| match e {
+                crate::retry::BusyRetryError::Rpc(e) => {
+                    rpc_unreachable(&self.url, SIMULATE_TRANSACTION_FAILED, &e)
+                }
+                crate::retry::BusyRetryError::Expired => rpc_unreachable(
+                    &self.url,
+                    SIMULATE_TRANSACTION_FAILED,
+                    &stellar_rpc_client::Error::JsonRpc(jsonrpsee_core::ClientError::Custom(
+                        "deadline elapsed".to_owned(),
+                    )),
+                ),
+            })
     }
 
     /// Simulates `envelope` as [`Self::simulate_transaction_envelope`] does
@@ -533,6 +544,7 @@ impl StellarRpcClient {
     /// The request is the same: the envelope as given and no `authMode`
     /// field. The answer's `error` string holds the scrubbed form of the
     /// endpoint's text.
+    /// [`Self::simulate_transaction_envelope`] supplies busy retries around this single request.
     #[allow(
         clippy::result_large_err,
         reason = "the witness classifies the raw transport error before mapping it"
@@ -1387,6 +1399,67 @@ mod tests {
     use crate::redact::rpc_error_fixtures::{
         ECHOED_URL, ENDPOINT, ENDPOINT_AUTHORITY, ERROR_OBJECTS, assert_scrubbed, call_error,
     };
+
+    #[tokio::test]
+    async fn wallet_simulate_retries_busy() {
+        use stellar_baselib::{
+            account::{Account, AccountBehavior},
+            transaction::TransactionBehavior,
+            transaction_builder::{TransactionBuilder, TransactionBuilderBehavior},
+        };
+        for busy in [2, 4] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(stellar_agent_test_support::EchoIdResponder::new(
+                    serde_json::json!({
+                        "latestLedger": 123, "minResourceFee": "100",
+                        "results": [{"auth": [], "xdr": "AAAAAQ=="}]
+                    }),
+                ))
+                .mount(&server)
+                .await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(|request: &wiremock::Request| {
+                    let body: serde_json::Value = request.body_json().unwrap();
+                    wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "jsonrpc": "2.0", "id": body["id"],
+                        "error": {"code": -32004, "message": "preflight queue full"}
+                    }))
+                })
+                .with_priority(1)
+                .up_to_n_times(busy)
+                .mount(&server)
+                .await;
+            let source = stellar_strkey::ed25519::PublicKey([7; 32]).to_string();
+            let mut account = Account::new(&source, "0").unwrap();
+            let envelope =
+                TransactionBuilder::new(&mut account, "Test SDF Network ; September 2015", None)
+                    .fee(100_u32)
+                    .add_operation(stellar_xdr::Operation {
+                        source_account: None,
+                        body: stellar_xdr::OperationBody::Inflation,
+                    })
+                    .build_for_simulation()
+                    .to_envelope()
+                    .unwrap();
+            let result = StellarRpcClient::new(&server.uri())
+                .unwrap()
+                .simulate_transaction_envelope(&envelope)
+                .await;
+            if busy == 2 {
+                assert_eq!(result.unwrap().latest_ledger, 123);
+            } else {
+                assert!(
+                    matches!(result, Err(NetworkError::RpcUnreachable { ref reason, .. }) if reason.starts_with("simulateTransaction failed: ")),
+                    "{result:?}"
+                );
+            }
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                if busy == 2 { 3 } else { 4 }
+            );
+        }
+    }
 
     /// Coverage ledgers survive only as positive 32-bit numbers: missing and
     /// invalid values stay absent, equal values both survive, and the raw

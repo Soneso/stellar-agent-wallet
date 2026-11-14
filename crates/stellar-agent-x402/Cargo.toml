@@ -48,7 +48,7 @@ tracing = { workspace = true }
 stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["wiremock-helpers"] }
 # test-hooks counts StellarRpcClient constructions, so the tests show that
 # `create_payment` builds no client of its own.
-stellar-agent-network = { path = "../stellar-agent-network", features = ["test-hooks"] }
+stellar-agent-network = { path = "../stellar-agent-network", features = ["test-hooks", "test-helpers"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 # The testnet legs read the ledgers a payment checked from its debug event.
 tracing = { workspace = true }

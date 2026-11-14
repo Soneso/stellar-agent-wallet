@@ -389,11 +389,10 @@ enum ReadFailure {
     /// HTTP 401 or 403: the oracle refused the credential, and the same
     /// request gets the same answer.
     Credential(u16),
-    /// The request did not complete: a connection failure, a timeout, or an
-    /// HTTP 429 or 5xx answer. Another attempt can succeed.
+    /// A connection failure, timeout, HTTP 429 or 5xx, or full simulation queue permits another attempt.
     Transport,
     /// The oracle returns an unusable answer. Examples include a body that
-    /// is not JSON or exceeds the size limit, a JSON-RPC error object, a
+    /// is not JSON or exceeds the size limit, a JSON-RPC error other than a busy answer, a
     /// mismatched response id, or any other status. Repeating the request
     /// only spends the deadline on the same answer.
     InvalidAnswer,
@@ -420,6 +419,7 @@ fn classify_read(error: &stellar_rpc_client::Error) -> ReadFailure {
         };
     }
     match error {
+        error if crate::retry::is_preflight_busy(error) => ReadFailure::Transport,
         // The HTTP transport reads the whole body before the JSON-RPC layer
         // sees it. It reports a body that is not JSON as `Malformed` and an
         // oversized body as `TooLarge`. Both indicate unusable answers.
@@ -926,6 +926,201 @@ pub(super) mod log_capture {
 mod tests {
     #![allow(clippy::unwrap_used, reason = "test assertions")]
     use super::*;
+
+    async fn busy_witness(
+        busy: u64,
+        divergent: bool,
+        refusal: bool,
+    ) -> (Result<CrossCheckOutcome, WalletError>, usize) {
+        use stellar_baselib::{
+            account::{Account, AccountBehavior},
+            transaction::TransactionBehavior,
+            transaction_builder::{TransactionBuilder, TransactionBuilderBehavior},
+        };
+        use stellar_xdr::{
+            AccountId, InvokeContractArgs, Limits, PublicKey, ScAddress, ScSymbol, ScVal,
+            SorobanAddressCredentials, SorobanAuthorizationEntry, SorobanAuthorizedFunction,
+            SorobanAuthorizedInvocation, SorobanCredentials, Uint256, VecM, WriteXdr,
+        };
+        let account = |byte| {
+            ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+                [byte; 32],
+            ))))
+        };
+        let entry = SorobanAuthorizationEntry {
+            credentials: SorobanCredentials::Address(SorobanAddressCredentials {
+                address: account(7),
+                nonce: 1,
+                signature_expiration_ledger: 0,
+                signature: ScVal::Void,
+            }),
+            root_invocation: SorobanAuthorizedInvocation {
+                function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+                    contract_address: account(9),
+                    function_name: ScSymbol::try_from("transfer").unwrap(),
+                    args: VecM::default(),
+                }),
+                sub_invocations: VecM::default(),
+            },
+        };
+        let response = |entry: &SorobanAuthorizationEntry| {
+            serde_json::json!({
+                "latestLedger": 100, "minResourceFee": "100",
+                "results": [{"auth": [entry.to_xdr_base64(Limits::none()).unwrap()], "xdr": "AAAAAQ=="}]
+            })
+        };
+        let primary = serde_json::from_value(response(&entry)).unwrap();
+        let mut oracle_entry = entry.clone();
+        if divergent && let SorobanCredentials::Address(credentials) = &mut oracle_entry.credentials
+        {
+            credentials.address = account(8);
+        }
+        let mut oracle_answer = response(&oracle_entry);
+        if refusal {
+            oracle_answer["error"] = serde_json::json!("preflight queue full");
+        }
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::body_partial_json(
+            serde_json::json!({"method": "getNetwork"}),
+        ))
+        .respond_with(stellar_agent_test_support::EchoIdResponder::new(
+            stellar_agent_test_support::signed_envelope::get_network_result(
+                stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+            ),
+        ))
+        .mount(&server)
+        .await;
+        wiremock::Mock::given(wiremock::matchers::body_partial_json(
+            serde_json::json!({"method": "simulateTransaction"}),
+        ))
+        .respond_with(stellar_agent_test_support::EchoIdResponder::new(response(
+            &entry,
+        )))
+        .mount(&server)
+        .await;
+        wiremock::Mock::given(wiremock::matchers::body_partial_json(
+            serde_json::json!({"method": "simulateTransaction"}),
+        ))
+        .respond_with(stellar_agent_test_support::EchoIdResponder::new(
+            oracle_answer,
+        ))
+        .with_priority(2)
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+        wiremock::Mock::given(wiremock::matchers::body_partial_json(
+            serde_json::json!({"method": "simulateTransaction"}),
+        ))
+        .respond_with(|request: &wiremock::Request| {
+            let body: serde_json::Value = request.body_json().unwrap();
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0", "id": body["id"],
+                "error": {"code": -32004, "message": "preflight queue full"}
+            }))
+        })
+        .with_priority(1)
+        .up_to_n_times(busy)
+        .mount(&server)
+        .await;
+        let profile = Profile::builder_testnet("signer", "witness", "nonce", "witness")
+            .rpc_url(server.uri())
+            .oracle_provider_url(server.uri().parse::<url::Url>().unwrap())
+            .build();
+        let check = SorobanCrossCheck::prepare(
+            &profile,
+            &NetworkContext::from_profile(&profile),
+            CrossCheckValue::Unvalued,
+            "busy_witness",
+        )
+        .unwrap();
+        let source = stellar_strkey::ed25519::PublicKey([7; 32]).to_string();
+        let mut source = Account::new(&source, "0").unwrap();
+        let envelope = TransactionBuilder::new(
+            &mut source,
+            stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+            None,
+        )
+        .fee(100_u32)
+        .add_operation(stellar_xdr::Operation {
+            source_account: None,
+            body: stellar_xdr::OperationBody::Inflation,
+        })
+        .build_for_simulation()
+        .to_envelope()
+        .unwrap();
+        let result = check
+            .witness_with_timing(
+                SorobanWitnessInputs {
+                    envelope: &envelope,
+                    primary: &primary,
+                    expiration_ledger: 110,
+                    resource_fee_ceiling: 1000,
+                },
+                WitnessTiming {
+                    attempt_budget: Duration::from_secs(15),
+                    retry_backoff: Duration::ZERO,
+                },
+            )
+            .await;
+        (
+            result,
+            stellar_agent_test_support::rpc_request_count(&server, "simulateTransaction").await,
+        )
+    }
+
+    #[tokio::test]
+    async fn witness_retries_a_busy_oracle() {
+        let error = stellar_rpc_client::Error::JsonRpc(jsonrpsee_core::ClientError::Call(
+            serde_json::from_value(
+                serde_json::json!({"code": -32004, "message": "preflight queue full"}),
+            )
+            .unwrap(),
+        ));
+        assert_eq!(classify_read(&error), ReadFailure::Transport);
+        let (result, requests) = busy_witness(1, false, false).await;
+        assert!(
+            matches!(result, Ok(CrossCheckOutcome::Passed(_))),
+            "{result:?}"
+        );
+        assert_eq!(requests, 2);
+        let (result, requests) = busy_witness(3, false, false).await;
+        assert!(
+            matches!(
+                result,
+                Err(WalletError::Network(NetworkError::WitnessUnavailable {
+                    reason: Reason::Transport { attempts: 3, .. }
+                }))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(requests, 3);
+    }
+
+    #[tokio::test]
+    async fn busy_never_turns_divergence_into_agreement() {
+        let (result, requests) = busy_witness(1, true, false).await;
+        assert!(
+            matches!(
+                result,
+                Err(WalletError::Network(NetworkError::WitnessDivergence { .. }))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(requests, 2);
+    }
+
+    #[tokio::test]
+    async fn witness_stops_on_a_simulation_refusal() {
+        let (result, requests) = busy_witness(1, false, true).await;
+        assert!(
+            matches!(
+                result,
+                Err(WalletError::Network(NetworkError::WitnessDivergence { .. }))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(requests, 2);
+    }
     #[test]
     fn skipped_without_threshold_renders_its_own_line() {
         let view = CrossCheckOutcome::Skipped(CrossCheckSkip::NoThresholdForAsset).view();

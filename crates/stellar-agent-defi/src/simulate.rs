@@ -194,12 +194,13 @@ pub async fn simulate_invoke_returning_scval(
         reason: format!("RPC client construction failed: {e}"),
     })?;
 
-    let simulate_response = client
-        .simulate_transaction_envelope(&envelope, None)
-        .await
-        .map_err(|e| SimulateError::SimulateFailed {
-            reason: format!("simulate_transaction_envelope failed: {e}"),
-        })?;
+    let simulate_response = stellar_agent_network::retry::retry_preflight_busy(None, || {
+        client.simulate_transaction_envelope(&envelope, None)
+    })
+    .await
+    .map_err(|e| SimulateError::SimulateFailed {
+        reason: format!("simulate_transaction_envelope failed: {e}"),
+    })?;
 
     // Check for a contract-level error in the response.
     if let Some(err_msg) = &simulate_response.error {
@@ -364,6 +365,46 @@ mod tests {
 
     // XDR-base64 for ScVal::Void (SCV_VOID discriminant 1 in xdr-27; Bool=0, Void=1).
     const SCVAL_VOID_B64: &str = "AAAAAQ==";
+
+    #[tokio::test]
+    async fn unbudgeted_simulate_retries_busy() {
+        for busy in [1, 4] {
+            let (server, url) =
+                mock_simulate_server(simulate_success_response_json(SCVAL_VOID_B64)).await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(|request: &wiremock::Request| {
+                    let body: serde_json::Value = request.body_json().unwrap();
+                    wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "jsonrpc": "2.0", "id": body["id"],
+                        "error": {"code": -32004, "message": "preflight queue full"}
+                    }))
+                })
+                .with_priority(1)
+                .up_to_n_times(busy)
+                .mount(&server)
+                .await;
+            let result = simulate_invoke_returning_scval(
+                TEST_CONTRACT,
+                "balance",
+                vec![],
+                &url,
+                TEST_PASSPHRASE,
+            )
+            .await;
+            if busy == 1 {
+                assert!(matches!(result, Ok(ScVal::Void)), "{result:?}");
+            } else {
+                assert!(
+                    matches!(result, Err(SimulateError::SimulateFailed { .. })),
+                    "{result:?}"
+                );
+            }
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                if busy == 1 { 2 } else { 4 }
+            );
+        }
+    }
 
     // XDR-base64 for ScVal::I128(hi=0, lo=100_000_000).
     const SCVAL_I128_B64: &str = "AAAACgAAAAAAAAAAAAAAAAX14QA=";

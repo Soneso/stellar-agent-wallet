@@ -3081,10 +3081,11 @@ impl ContextRuleManager {
         let sim_envelope = tx_for_simulate
             .to_envelope()
             .map_err(|e| auth_payload_err(format!("to_envelope failed: {e:?}")))?;
-        let sim_response = server
-            .simulate_transaction_envelope(&sim_envelope, None)
-            .await
-            .map_err(|e| auth_payload_err(format!("simulate_transaction_envelope failed: {e}")))?;
+        let sim_response = stellar_agent_network::retry::retry_preflight_busy(None, || {
+            server.simulate_transaction_envelope(&sim_envelope, None)
+        })
+        .await
+        .map_err(|e| auth_payload_err(format!("simulate_transaction_envelope failed: {e}")))?;
 
         if let Some(sim_error) = &sim_response.error {
             return Err(read_only_refusal(
@@ -12084,7 +12085,91 @@ pub(crate) mod event_reason_tests {
         .unwrap()
     }
 
-    /// A mock endpoint answering every simulation with `simulate`.
+    /// Paused time advances when a busy retry enters its sleep.
+    pub(crate) async fn drive_busy_paused<F: std::future::Future>(future: F) -> F::Output {
+        use tracing::instrument::WithSubscriber;
+        let capture = stellar_agent_test_support::CaptureWriter::new();
+        let _inert = stellar_agent_test_support::inert_dispatcher();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let future = future.with_subscriber(subscriber);
+        tokio::pin!(future);
+        tokio::time::pause();
+        let mut sleeps = 0;
+        let result = loop {
+            tokio::select! {
+                biased;
+                result = &mut future => break result,
+                () = tokio::task::yield_now() => {}
+            }
+            let observed = capture
+                .captured_str()
+                .matches("waiting to retry busy simulation")
+                .count();
+            if observed > sleeps {
+                tokio::time::advance(Duration::from_secs(1)).await;
+                sleeps = observed;
+            }
+        };
+        tokio::time::resume();
+        result
+    }
+
+    /// The next `count` simulation requests receive a busy reply.
+    pub(crate) async fn busy_replies(server: &wiremock::MockServer, count: u64) {
+        wiremock::Mock::given(wiremock::matchers::body_partial_json(serde_json::json!({
+            "method": "simulateTransaction"
+        })))
+        .respond_with(|request: &wiremock::Request| {
+            let body: serde_json::Value = request.body_json().unwrap();
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0", "id": body["id"],
+                "error": {"code": -32004, "message": "preflight queue full"}
+            }))
+        })
+        .with_priority(1)
+        .up_to_n_times(count)
+        .mount(server)
+        .await;
+    }
+
+    /// A successful read returns a count of seven.
+    pub(crate) fn successful_read_result() -> serde_json::Value {
+        serde_json::json!({
+            "latestLedger": 100, "minResourceFee": "100",
+            "results": [{"auth": [], "xdr": ScVal::U32(7).to_xdr_base64(Limits::none()).unwrap()}]
+        })
+    }
+
+    #[tokio::test]
+    async fn read_only_simulate_retries_busy() {
+        let source = stellar_strkey::ed25519::PublicKey([7; 32]).to_string();
+        for busy in [1, 4] {
+            let server = read_only_server(&source, successful_read_result()).await;
+            busy_replies(&server, busy).await;
+            let result = manager_at(server.uri())
+                .get_rules_count(address(SMART_ACCOUNT), &source)
+                .await;
+            if busy == 1 {
+                assert!(matches!(result, Ok(7)), "{result:?}");
+            } else {
+                assert!(
+                    matches!(result, Err(SaError::AuthEntryConstructionFailed { stage: "auth_payload", ref redacted_reason }) if redacted_reason.starts_with("simulate_transaction_envelope failed: ")),
+                    "{result:?}"
+                );
+            }
+            assert_eq!(
+                stellar_agent_test_support::rpc_request_count(&server, "simulateTransaction").await,
+                if busy == 1 { 2 } else { 4 }
+            );
+        }
+    }
+
+    /// A mock endpoint answers every simulation with `simulate`.
     pub(crate) async fn read_only_server(
         source: &str,
         simulate: serde_json::Value,

@@ -2325,6 +2325,411 @@ async fn a_failed_simulation_request_carries_a_phase_prefix_and_no_credentials()
     }
 }
 
+async fn busy_resimulation_server(busy: usize, passphrase: &str) -> MockServer {
+    struct BusyResimulation {
+        busy: usize,
+        requests: AtomicUsize,
+        inner: PaymentRpc,
+    }
+    impl Respond for BusyResimulation {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let body: serde_json::Value = request.body_json().unwrap();
+            if body["method"] == "getLatestLedger" {
+                return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0", "id": body["id"],
+                    "result": {"id": "0".repeat(64), "protocolVersion": 29, "sequence": LATEST_LEDGER}
+                }));
+            }
+            if body["method"] == "getLedgerEntries" {
+                let payer = account_strkey(PAYER_SEED);
+                return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0", "id": body["id"],
+                    "result": {
+                        "latestLedger": LATEST_LEDGER,
+                        "entries": [{
+                            "key": stellar_agent_test_support::xdr_fixtures::account_ledger_key_xdr(&payer),
+                            "xdr": stellar_agent_test_support::xdr_fixtures::account_entry_xdr(&payer, 1_000_000_000, 0),
+                            "lastModifiedLedgerSeq": LATEST_LEDGER
+                        }]
+                    }
+                }));
+            }
+            if body["method"] == "simulateTransaction" {
+                let n = self.requests.fetch_add(1, Ordering::SeqCst);
+                if n > 0 && n <= self.busy {
+                    return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "jsonrpc": "2.0", "id": body["id"],
+                        "error": {"code": -32004, "message": "preflight queue full"}
+                    }));
+                }
+            }
+            self.inner.respond(request)
+        }
+    }
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(BusyResimulation {
+            busy,
+            requests: AtomicUsize::new(0),
+            inner: PaymentRpc {
+                network: MethodAnswer::Result(network_result(passphrase)),
+                health: MethodAnswer::Result(health_result("healthy", LATEST_LEDGER)),
+                first: answer(&[honest_entry()]),
+                resimulation: Box::new(|_| answer(&[])),
+                simulate_delay: Duration::ZERO,
+                network_requests: AtomicUsize::new(0),
+                health_requests: AtomicUsize::new(0),
+                received_signed: Arc::new(Mutex::new(Vec::new())),
+            },
+        })
+        .mount(&server)
+        .await;
+    server
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn busy_resimulation_transmits_once() {
+    for busy in [1, 4] {
+        #[cfg(feature = "mainnet-write")]
+        busy_mainnet_resimulation(busy).await;
+        let server = busy_resimulation_server(busy, TESTNET_PASSPHRASE).await;
+        let client = StellarRpcClient::new(&server.uri()).unwrap();
+        let signer = CountingSigner::new();
+        let gates = AtomicUsize::new(0);
+        let result = create_payment(
+            &requirements(),
+            &signer,
+            &client,
+            &SorobanCrossCheck::NotRequired,
+            TESTNET_PASSPHRASE,
+            tokio::time::Instant::now() + GENEROUS_DEADLINE,
+            |_| {
+                gates.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
+        if busy == 1 {
+            assert!(result.is_ok(), "{result:?}");
+        } else {
+            assert!(
+                matches!(result, Err(X402Error::RpcSimulateFailed { ref detail }) if detail.starts_with("re-simulation request failed: ")),
+                "{result:?}"
+            );
+        }
+        assert_eq!(gates.load(Ordering::SeqCst), 1);
+        assert_eq!(signer.address_auth_digests.lock().unwrap().len(), 1);
+        assert_eq!(
+            rpc_request_count(&server, "simulateTransaction").await,
+            if busy == 1 { 3 } else { 5 }
+        );
+    }
+}
+
+#[cfg(feature = "mainnet-write")]
+async fn busy_mainnet_resimulation(busy: usize) {
+    use base64::Engine as _;
+    use stellar_agent_core::approval::{
+        PendingApproval,
+        mainnet_fixtures::{ENABLEMENT_NONCE, ENDPOINT_HOST, MainnetConsentFixture},
+        witness::{ApprovalExpectation, ApprovedKind, verify_approval},
+    };
+    use stellar_agent_core::profile::{
+        name::{ProfileNameSource, ResolvedProfileName},
+        schema::{default_policy_window_state_path_for, signer_identity_entry_ref},
+        signer_identity::SignerIdentityRecord,
+    };
+    use stellar_agent_network::keyring::{
+        EnrolledRole, enrolled_signer, lazy_signer_from_keyring, rotate_keyring_secret_32,
+        write_keyring_string,
+    };
+    use stellar_agent_network::mainnet::{
+        MainnetConsumer, audit_readiness::audit_readiness, authority::MainnetAuthority,
+    };
+    use stellar_agent_network::policy_state::{
+        AttemptAuthorization, AttemptRequest, BusinessId, ExposureIdentity, IntentSlot,
+        OpenOutcome, OpenRequest, OperationKind, OperationRecorder, OperationTool,
+        PersistedWindowStore, X402Intent,
+    };
+    use stellar_agent_x402::exact::{
+        OperationHooks, X402MainnetProofs, create_payment_authorized, intent_digest, payment_root,
+    };
+
+    let server = busy_resimulation_server(busy, MAINNET_PASSPHRASE).await;
+    let oracle = busy_resimulation_server(0, MAINNET_PASSPHRASE).await;
+    let payer = account_strkey(PAYER_SEED);
+    let fixture = MainnetConsentFixture::with_profile(&format!("busy-x402-{busy}"), |profile| {
+        profile.mcp_signer_default.account.clone_from(&payer);
+        profile.oracle_provider_url = Some("https://oracle.example.invalid".parse().unwrap());
+        let providers = profile.providers.get_or_insert_with(Default::default);
+        providers.primary = Some(
+            stellar_agent_core::profile::schema::PrimaryProviderRecord::new(
+                "primary",
+                ENDPOINT_HOST,
+            ),
+        );
+        providers.oracle = Some(stellar_agent_core::profile::schema::ProviderRecord::new(
+            "oracle",
+            "oracle.example.invalid",
+            true,
+        ));
+    });
+    let profile = fixture.profile();
+    let profiles = fixture.home().join("profiles");
+    let requirements = PaymentRequirements {
+        network: stellar_agent_x402::constants::X402_STELLAR_PUBNET.to_owned(),
+        ..requirements()
+    };
+    let body = fixture
+        .policy_body(
+            fixture.sequence() + 1,
+            &[&stellar_agent_test_support::webauthn::fixture_authenticator()],
+        )
+        .replace("stellar_pay", "stellar_x402_create_payment")
+        .replace("\"native\"", &format!("\"{ASSET}\""))
+        .replace("max_stroops = \"100\"", "max_stroops = \"10000000\"")
+        .replace("max_stroops = \"200\"", "max_stroops = \"20000000\"")
+        .replace(
+            stellar_agent_core::approval::mainnet_fixtures::ALLOWED_DESTINATION,
+            &requirements.pay_to,
+        )
+        .replace(
+            "native = \"10000000000\"",
+            &format!("\"{ASSET}\" = \"10000000000\""),
+        );
+    fixture.write_signed(&body);
+    let owner = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
+    let window_path = default_policy_window_state_path_for(fixture.name());
+    let policy = stellar_agent_core::policy::v1::verified::load_verified_policy(
+        &stellar_agent_core::policy::v1::verified::PolicyLoad {
+            path: &fixture.policy_path(),
+            profile,
+            profile_name: fixture.name(),
+            owner_pubkey: &owner.verifying_key().to_bytes(),
+            owner_source: stellar_agent_core::policy::v1::verified::OwnerKeySource::Keyring,
+            window_path: &window_path,
+        },
+        stellar_agent_core::policy::v1::PolicyStateStore::new(),
+        stellar_agent_core::policy::v1::verified::PinMode::Advance,
+    )
+    .unwrap();
+    let public_key = ed25519_dalek::SigningKey::from_bytes(&PAYER_SEED)
+        .verifying_key()
+        .to_bytes();
+    write_keyring_string(
+        &profile.mcp_signer_default,
+        &stellar_strkey::Unredacted(&stellar_strkey::ed25519::PrivateKey(PAYER_SEED)).to_string(),
+    )
+    .unwrap();
+    write_keyring_string(
+        &signer_identity_entry_ref(&profile.mcp_signer_default),
+        &SignerIdentityRecord::signed_for_test(public_key, fixture.name(), profile, &owner)
+            .render()
+            .unwrap(),
+    )
+    .unwrap();
+    let signer = enrolled_signer(
+        fixture.name(),
+        &profiles,
+        profile,
+        EnrolledRole::Agent,
+        &public_key,
+        &policy.owner(),
+    )
+    .unwrap();
+    let signing_handle = lazy_signer_from_keyring(signer.seed_entry(), &payer).unwrap();
+    let enablement = stellar_agent_core::mainnet::enablement::verify_enablement(
+        &policy,
+        fixture.name(),
+        ProfileNameSource::Flag,
+        profile,
+        &profiles,
+        &|_| Ok(ENABLEMENT_NONCE.to_owned()),
+    )
+    .unwrap();
+    let context = NetworkContext::mainnet_write(
+        profile,
+        &ResolvedProfileName::from_flag(fixture.name()),
+        &profiles,
+        stellar_agent_network::MainnetEndpointFlags::default(),
+    )
+    .unwrap()
+    .with_test_transport_routes(&[
+        (ENDPOINT_HOST, &server.uri()),
+        ("oracle.example.invalid", &oracle.uri()),
+    ]);
+    let root = payment_root(&requirements, &payer).unwrap();
+    let digest = intent_digest(&requirements, &payer).unwrap();
+    let entry = PendingApproval::new_x402_pending(
+        &Sha256::digest(MAINNET_PASSPHRASE.as_bytes()).into(),
+        &root,
+        None,
+        stellar_agent_core::approval::process_uid_for_attestation().unwrap(),
+        600_000,
+    )
+    .unwrap();
+    let (approvals, blob) = fixture.consent(&entry);
+    let blob = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(blob.unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let approval = verify_approval(
+        &approvals,
+        profile,
+        fixture.name(),
+        &entry.approval_nonce,
+        &blob,
+        &ApprovalExpectation {
+            kind: ApprovedKind::X402Payment,
+            subject: stellar_agent_core::approval::subject::approval_subject_x402(&digest),
+        },
+        &policy,
+        stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+    )
+    .unwrap();
+    let key = &profile.audit_log_hash_chain_key_id;
+    rotate_keyring_secret_32(&key.service, &key.account).unwrap();
+    let readiness = audit_readiness(profile, fixture.name()).unwrap();
+    let writer = Arc::clone(readiness.writer());
+    let store = PersistedWindowStore::at_path(window_path);
+    let OpenOutcome::New(operation) =
+        OperationRecorder::new(&store, profile, &mut *writer.lock().unwrap(), "busy-x402")
+            .open(&OpenRequest {
+                business_id: BusinessId::parse("busy-x402").unwrap(),
+                tool: OperationTool::X402CreatePayment,
+                kind: OperationKind::X402Payment,
+                intent: IntentSlot::X402 {
+                    intent_digest: digest,
+                    intent: X402Intent {
+                        network: requirements.network.clone(),
+                        asset: requirements.asset.clone(),
+                        payer,
+                        pay_to: requirements.pay_to.clone(),
+                        amount: requirements.amount.clone(),
+                    },
+                },
+                envelope_xdr: None,
+                prepared_decision: None,
+                rule_ttl_ms: Some(600_000),
+            })
+            .unwrap()
+    else {
+        panic!("the operation is new");
+    };
+    let gates = AtomicUsize::new(0);
+    let exposures = AtomicUsize::new(0);
+    let result = create_payment_authorized(
+        &requirements,
+        MainnetConsumer::X402Create,
+        X402MainnetProofs::new(
+            &context,
+            &policy,
+            &enablement,
+            &MainnetAuthority::Approval(&approval),
+            &signer,
+            &signing_handle,
+            readiness,
+            &store,
+        )
+        .with_operation(stellar_agent_network::operation_entry::next_attempt_link(
+            &operation,
+        )),
+        CrossCheckValue::Amount {
+            asset: &stellar_agent_core::asset_id::CanonicalAsset::Contract(ASSET.to_owned()),
+            base_units: i128::from(AMOUNT),
+        },
+        tokio::time::Instant::now() + GENEROUS_DEADLINE,
+        |_| {
+            gates.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        },
+        OperationHooks {
+            before_sign: Box::new(|_| {
+                let started = OperationRecorder::new(
+                    &store,
+                    profile,
+                    &mut *writer.lock().unwrap(),
+                    "busy-x402",
+                )
+                .begin_attempt(
+                    &operation,
+                    &AttemptRequest {
+                        envelope: None,
+                        authorization: AttemptAuthorization::Linked,
+                        send_by_ms: u64::MAX,
+                    },
+                )
+                .unwrap();
+                Ok(Some(stellar_agent_network::OperationAttempt {
+                    operation_id: operation.id(),
+                    attempt_index: started.attempt_index,
+                }))
+            }),
+            expose: Box::new(|transmit| {
+                exposures.fetch_add(1, Ordering::SeqCst);
+                let attempt = transmit.operation.unwrap();
+                OperationRecorder::new(&store, profile, &mut *writer.lock().unwrap(), "busy-x402")
+                    .expose(
+                        attempt.operation_id,
+                        attempt.attempt_index,
+                        &ExposureIdentity::X402 {
+                            authorization_id: transmit.authorization_id.unwrap(),
+                            auth_entry_sha256: transmit.signed_entries_sha256,
+                            signature_expiration_ledger: transmit.signature_expiration_ledger,
+                        },
+                        None,
+                    )
+                    .unwrap();
+                Ok(())
+            }),
+        },
+    )
+    .await
+    .map(|authorized| authorized.payment);
+    if busy == 1 {
+        assert!(result.is_ok(), "{result:?}");
+    } else {
+        assert!(
+            matches!(result, Err(X402Error::RpcSimulateFailed { ref detail }) if detail.starts_with("re-simulation request failed: ")),
+            "{result:?}"
+        );
+    }
+    assert_eq!(gates.load(Ordering::SeqCst), 1);
+    assert_eq!(exposures.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        rpc_request_count(&server, "simulateTransaction").await,
+        if busy == 1 { 3 } else { 5 }
+    );
+    let bytes = std::fs::read(store.path()).unwrap();
+    let state: serde_json::Value = serde_json::from_slice(&bytes[32..]).unwrap();
+    let consumed: Vec<_> = state["authorizations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|authorization| {
+            authorization["approval_nonce"] == entry.approval_nonce
+                && authorization["state"] == "used"
+        })
+        .collect();
+    assert_eq!(consumed.len(), 1, "{state}");
+    let records = state["operations"]["records"].as_array().unwrap();
+    assert_eq!(records.len(), 1);
+    let attempts = records[0]["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert!(attempts[0]["exposure"].is_object(), "{state}");
+    let audit = std::fs::read_to_string(fixture.audit_path()).unwrap();
+    let exposures = audit
+        .lines()
+        .filter(|line| {
+            let row: serde_json::Value = serde_json::from_str(line).unwrap();
+            row["step"] == "expose"
+        })
+        .count();
+    assert_eq!(exposures, 1, "{audit}");
+}
+
 /// A simulation answer's `error` string reaches the refusal detail of both
 /// phases scrubbed: the echoed URL as host and port, the control character
 /// and the quotes escaped, quoted, and cut at the bound.

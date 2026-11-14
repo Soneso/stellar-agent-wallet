@@ -219,12 +219,13 @@ pub async fn count_wallet_auth_entries(
         reason: format!("RPC client construction failed: {e}"),
     })?;
 
-    let simulate_response = client
-        .simulate_transaction_envelope(&envelope, None)
-        .await
-        .map_err(|e| AuthGuardError::SimulateFailed {
-            reason: format!("simulate_transaction_envelope failed: {e}"),
-        })?;
+    let simulate_response = stellar_agent_network::retry::retry_preflight_busy(None, || {
+        client.simulate_transaction_envelope(&envelope, None)
+    })
+    .await
+    .map_err(|e| AuthGuardError::SimulateFailed {
+        reason: format!("simulate_transaction_envelope failed: {e}"),
+    })?;
 
     if let Some(err_msg) = &simulate_response.error {
         return Err(AuthGuardError::SimulateFailed {
@@ -367,6 +368,80 @@ mod tests {
     }
 
     // ── Unit tests for the production counting + classification logic ─────────
+
+    #[tokio::test]
+    async fn auth_guard_simulate_retries_busy() {
+        use stellar_xdr::{Limits, WriteXdr};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for busy in [1, 4] {
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let requests = std::cell::Cell::new(0);
+            let serve = async {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut bytes = Vec::new();
+                    loop {
+                        let mut byte = [0];
+                        stream.read_exact(&mut byte).await.unwrap();
+                        bytes.push(byte[0]);
+                        if bytes.ends_with(b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let headers = String::from_utf8(bytes).unwrap();
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse().unwrap())
+                        })
+                        .unwrap();
+                    let mut body = vec![0; length];
+                    stream.read_exact(&mut body).await.unwrap();
+                    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(body["method"], "simulateTransaction");
+                    requests.set(requests.get() + 1);
+                    let answer = if requests.get() <= busy {
+                        serde_json::json!({"jsonrpc": "2.0", "id": body["id"],
+                            "error": {"code": -32004, "message": "preflight queue full"}})
+                    } else {
+                        serde_json::json!({"jsonrpc": "2.0", "id": body["id"], "result": {
+                            "latestLedger": 100, "minResourceFee": "100",
+                            "results": [{"xdr": ScVal::Void.to_xdr_base64(Limits::none()).unwrap(),
+                                "auth": [make_auth_entry_for(make_wallet_sc_addr())
+                                    .to_xdr_base64(Limits::none()).unwrap()]}]}})
+                    }
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        answer.len(),
+                        answer
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }
+            };
+            let result = tokio::select! {
+                result = count_wallet_auth_entries(TEST_WALLET, TEST_WALLET, &[], &url) => result,
+                () = serve => panic!("the endpoint stays available"),
+            };
+            if busy == 1 {
+                assert!(matches!(result, Ok(1)), "{result:?}");
+                assert_eq!(requests.get(), 2);
+            } else {
+                assert!(
+                    matches!(result, Err(AuthGuardError::SimulateFailed { ref reason })
+                    if reason.starts_with("simulate_transaction_envelope failed: ")),
+                    "{result:?}"
+                );
+                assert_eq!(requests.get(), 4);
+            }
+        }
+    }
 
     /// Exactly 1 wallet-credentialled entry → count = 1 (pass).
     #[test]

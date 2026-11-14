@@ -389,18 +389,19 @@ pub(crate) async fn submit_timelock_invoke_described(
             format!("{}: to_envelope failed: {e:?}", args.op_label),
         )
     })?;
-    let mut sim_response = server
-        .simulate_transaction_envelope(&sim_envelope, None)
-        .await
-        .map_err(|e| {
-            auth_err(
-                "auth_payload",
-                format!(
-                    "{}: simulate_transaction_envelope failed: {e}",
-                    args.op_label
-                ),
-            )
-        })?;
+    let mut sim_response = stellar_agent_network::retry::retry_preflight_busy(None, || {
+        server.simulate_transaction_envelope(&sim_envelope, None)
+    })
+    .await
+    .map_err(|e| {
+        auth_err(
+            "auth_payload",
+            format!(
+                "{}: simulate_transaction_envelope failed: {e}",
+                args.op_label
+            ),
+        )
+    })?;
 
     let decode_simulation = |sim_response: &stellar_rpc_client::SimulateTransactionResponse| {
         if let Some(err) = &sim_response.error {
@@ -469,14 +470,20 @@ pub(crate) async fn submit_timelock_invoke_described(
             pre_submit_budget,
             "simulate_recovery",
             "auth_payload",
-            server.simulate_transaction_envelope(&sim_envelope, None),
+            stellar_agent_network::retry::retry_preflight_busy(
+                Some(pre_submit_budget.deadline),
+                || server.simulate_transaction_envelope(&sim_envelope, None),
+            ),
         )
         .await?
-        .map_err(|e| {
-            auth_err(
+        .map_err(|e| match e {
+            stellar_agent_network::retry::BusyRetryError::Rpc(e) => auth_err(
                 "auth_payload",
                 format!("simulate_transaction_envelope failed: {e}"),
-            )
+            ),
+            stellar_agent_network::retry::BusyRetryError::Expired => {
+                pre_submit_budget.elapsed("simulate_recovery", "auth_payload")
+            }
         })?;
         validate_latest_ledger(sim_response.latest_ledger)?;
         decoded_simulation = decode_simulation(&sim_response);
@@ -743,17 +750,23 @@ pub(crate) async fn submit_timelock_invoke_described(
             pre_submit_budget,
             "simulate_resim",
             "auth_payload",
-            server.simulate_transaction_envelope(&resim_envelope, None),
+            stellar_agent_network::retry::retry_preflight_busy(
+                Some(pre_submit_budget.deadline),
+                || server.simulate_transaction_envelope(&resim_envelope, None),
+            ),
         )
         .await?
-        .map_err(|e| {
-            auth_err(
+        .map_err(|e| match e {
+            stellar_agent_network::retry::BusyRetryError::Rpc(e) => auth_err(
                 "auth_payload",
                 format!(
                     "{}: re-simulate simulate_transaction_envelope failed: {e}",
                     args.op_label
                 ),
-            )
+            ),
+            stellar_agent_network::retry::BusyRetryError::Expired => {
+                pre_submit_budget.elapsed("simulate_resim", "auth_payload")
+            }
         })?;
 
         if let Some(err) = &resim_response.error {
@@ -1426,6 +1439,7 @@ mod tests {
             /// The simulation, counted from 1, that refuses with the RPC
             /// 30.0.1 host error and a timelock event carrying 4004.
             refused_simulation: Option<usize>,
+            busy_simulations: Option<(usize, usize)>,
         }
 
         impl Chain {
@@ -1447,6 +1461,7 @@ mod tests {
                     schedule_predictions: None,
                     ledger_after_reads: None,
                     refused_simulation: None,
+                    busy_simulations: None,
                 }
             }
         }
@@ -1502,7 +1517,17 @@ mod tests {
                         result
                     }
                     "simulateTransaction" => {
-                        self.simulations.fetch_add(1, Ordering::SeqCst);
+                        let number = self.simulations.fetch_add(1, Ordering::SeqCst) + 1;
+                        if self
+                            .chain
+                            .busy_simulations
+                            .is_some_and(|(start, count)| (start..start + count).contains(&number))
+                        {
+                            return ResponseTemplate::new(200).set_body_json(json!({
+                                "jsonrpc": "2.0", "id": body["id"],
+                                "error": {"code": -32004, "message": "preflight queue full"}
+                            }));
+                        }
                         let TransactionEnvelope::Tx(tx) = TransactionEnvelope::from_xdr_base64(
                             body["params"]["transaction"].as_str().unwrap(),
                             Limits::none(),
@@ -1582,6 +1607,10 @@ mod tests {
                             }],
                         });
                         let number = self.simulations.load(Ordering::SeqCst);
+                        let number = number
+                            - self.chain.busy_simulations.map_or(0, |(start, count)| {
+                                if number >= start + count { count } else { 0 }
+                            });
                         if self.chain.refused_simulation == Some(number) {
                             use crate::managers::rules::event_reason_tests::{
                                 RPC30_ERROR, encode, error_topics,
@@ -2632,6 +2661,77 @@ mod tests {
                 assert_eq!(sends, 0);
             }
 
+            #[tokio::test]
+            #[serial_test::serial]
+            async fn timelock_simulates_retry_busy() {
+                stellar_agent_test_support::keyring_mock::install().unwrap();
+                for stage in ["initial", "recovery", "resim"] {
+                    for busy in [1, 4] {
+                        let start = if stage == "initial" { 1 } else { 2 };
+                        let primary = Endpoint::start(Chain {
+                            busy_simulations: Some((start, busy)),
+                            recovery_case: (stage == "recovery").then_some(RecoveryCase::Valid),
+                            ..Chain::at(LEDGER)
+                        })
+                        .await;
+                        let secondary = Endpoint::start(Chain::at(LEDGER)).await;
+                        let outcome = submit(&primary, &secondary.witness_uri()).await;
+                        if busy == 1 {
+                            assert!(outcome.result.is_ok(), "{stage}: {:?}", outcome.result);
+                            assert_eq!(
+                                primary.simulations.load(Ordering::SeqCst),
+                                if stage == "recovery" { 4 } else { 3 }
+                            );
+                        } else {
+                            assert!(
+                                matches!(outcome.result, Err(SaError::AuthEntryConstructionFailed { stage: "auth_payload", ref redacted_reason }) if redacted_reason.contains("simulate_transaction_envelope failed: ")),
+                                "{stage}: {:?}",
+                                outcome.result
+                            );
+                            assert_eq!(primary.simulations.load(Ordering::SeqCst), start + 3);
+                            assert_eq!(primary.sends().await, 0);
+                        }
+                    }
+                    if stage != "initial" {
+                        let primary = Endpoint::start(Chain {
+                            busy_simulations: Some((2, 1)),
+                            recovery_case: (stage == "recovery").then_some(RecoveryCase::Valid),
+                            recovery_delay: Some(Duration::from_secs(3)),
+                            resimulation_delay: Some(Duration::from_secs(3)),
+                            ..Chain::at(LEDGER)
+                        })
+                        .await;
+                        let secondary = Endpoint::start(Chain::at(LEDGER)).await;
+                        let signer = CountingSigner::new(SEED);
+                        let outcome = submit_through(
+                            &primary,
+                            &secondary.witness_uri(),
+                            &signer,
+                            &signer,
+                            Duration::from_secs(2),
+                        )
+                        .await;
+                        let budget = crate::managers::auth_entry::PreSubmitBudget {
+                            deadline: tokio::time::Instant::now(),
+                            total: Duration::from_secs(2),
+                        };
+                        let error = outcome.result.unwrap_err();
+                        assert_eq!(
+                            serde_json::to_value(error).unwrap(),
+                            serde_json::to_value(budget.elapsed(
+                                if stage == "recovery" {
+                                    "simulate_recovery"
+                                } else {
+                                    "simulate_resim"
+                                },
+                                "auth_payload"
+                            ))
+                            .unwrap()
+                        );
+                    }
+                }
+            }
+
             /// A counting signer whose envelope signature takes
             /// `envelope_delay` and whose authorization signature takes
             /// `auth_delay`, as a hardware device's can.
@@ -2738,6 +2838,242 @@ mod tests {
                 ledger_reads_at_admission: AtomicUsize,
                 subjects: Mutex<Vec<stellar_agent_network::SubjectKind>>,
                 admitted_plan: Mutex<Option<stellar_agent_network::SignedIntentPlan>>,
+            }
+
+            struct BusyAdmission {
+                inner: stellar_agent_network::NoValueAdmission,
+                admits: AtomicUsize,
+                cancels: AtomicUsize,
+            }
+
+            fn busy_admission_fixture() -> (
+                tempfile::TempDir,
+                stellar_agent_core::profile::schema::Profile,
+                stellar_agent_network::policy_state::PersistedWindowStore,
+                BusyAdmission,
+            ) {
+                use stellar_agent_core::policy::v1::criteria::state_store::{
+                    StateKey, WindowEntry, WindowLimit,
+                };
+                use stellar_agent_core::policy::v1::{CheckedSizing, SizingBasis};
+                let (dir, _) = super::super::no_value_fixture();
+                let profile = stellar_agent_core::profile::schema::Profile::builder_testnet_named(
+                    "intent",
+                    "timelock-fixture-owner",
+                    "account",
+                    "timelock-fixture-nonce",
+                    "account",
+                )
+                .build();
+                let store = stellar_agent_network::policy_state::PersistedWindowStore::at_path(
+                    dir.path().join("intent.window"),
+                );
+                let sizing = CheckedSizing::for_test(
+                    SizingBasis::NoValue,
+                    vec![WindowEntry::new(
+                        StateKey::new("intent", 1, "rate_limit", 60),
+                        stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+                        1,
+                        WindowLimit::Count {
+                            window: "1m".to_owned(),
+                            max_calls: 1,
+                        },
+                    )],
+                )
+                .unwrap();
+                let inner = stellar_agent_network::NoValueAdmission::with_store(
+                    profile.clone(),
+                    store.clone(),
+                    sizing,
+                )
+                .unwrap();
+                (
+                    dir,
+                    profile,
+                    store,
+                    BusyAdmission {
+                        inner,
+                        admits: 0.into(),
+                        cancels: 0.into(),
+                    },
+                )
+            }
+
+            #[async_trait]
+            impl stellar_agent_network::SubmissionRecorder for BusyAdmission {
+                async fn admit_signed_intent(
+                    &self,
+                    plan: &stellar_agent_network::SignedIntentPlan,
+                ) -> Result<stellar_agent_network::IntentProof, WalletError> {
+                    self.admits.fetch_add(1, Ordering::SeqCst);
+                    self.inner.admit(plan).await
+                }
+                async fn cancel_unexposed(
+                    &self,
+                    proof: stellar_agent_network::IntentProof,
+                ) -> Result<(), WalletError> {
+                    self.cancels.fetch_add(1, Ordering::SeqCst);
+                    self.inner.cancel_unexposed(proof).await
+                }
+                async fn pre_send_bound(
+                    &self,
+                    _: &stellar_agent_network::SubmissionIntent,
+                    _: &stellar_agent_network::IntentBinding<'_>,
+                ) -> Result<(), WalletError> {
+                    Ok(())
+                }
+                async fn pre_send(
+                    &self,
+                    _: &stellar_agent_network::SubmissionIntent,
+                ) -> Result<(), WalletError> {
+                    Ok(())
+                }
+                async fn outcome(
+                    &self,
+                    _: &stellar_agent_network::SubmissionIntent,
+                    _: &stellar_agent_network::SubmissionOutcome,
+                ) {
+                }
+            }
+
+            #[tokio::test]
+            #[serial_test::serial]
+            async fn busy_signed_resimulation_takes_each_step_once() {
+                stellar_agent_test_support::keyring_mock::install().unwrap();
+                for busy in [2, 4] {
+                    let (_dir, _profile, _store, recorder) = busy_admission_fixture();
+                    let primary = Endpoint::start(Chain {
+                        busy_simulations: Some((2, busy)),
+                        ..Chain::at(LEDGER)
+                    })
+                    .await;
+                    let secondary = Endpoint::start(Chain::at(LEDGER)).await;
+                    let signer = super::AuthAndSourceSigner {
+                        auth: CountingSigner::new(SEED),
+                        source: CountingSigner::new(SEED),
+                    };
+                    let result = submit_timelock_invoke_with_g_key_auth(TimelockSubmitArgs {
+                        schedule_identity: None,
+                        host_function: HostFunction::InvokeContract(schedule()),
+                        signer: &signer,
+                        primary_rpc_url: &primary.uri(),
+                        secondary_rpc_url: &secondary.witness_uri(),
+                        network_passphrase: TESTNET_PASSPHRASE,
+                        timeout: Duration::from_secs(30),
+                        op_label: "schedule",
+                        admission: stellar_agent_network::SigningAdmission::Recorded(&recorder),
+                    })
+                    .await;
+                    assert_eq!(recorder.admits.load(Ordering::SeqCst), 1);
+                    assert_eq!(signer.auth.sign_calls(), 1);
+                    assert_eq!(
+                        primary.simulations.load(Ordering::SeqCst),
+                        if busy == 2 { 4 } else { 5 }
+                    );
+                    if busy == 2 {
+                        assert!(result.is_ok(), "{result:?}");
+                        assert_eq!(signer.source.sign_calls(), 1);
+                        assert_eq!(recorder.cancels.load(Ordering::SeqCst), 0);
+                    } else {
+                        assert!(
+                            matches!(result, Err(SaError::AuthEntryConstructionFailed { stage: "auth_payload", ref redacted_reason }) if redacted_reason.starts_with("schedule: re-simulate simulate_transaction_envelope failed: ")),
+                            "{result:?}"
+                        );
+                        assert_eq!(signer.source.sign_calls(), 0);
+                        assert_eq!(primary.sends().await, 0);
+                        assert_eq!(recorder.cancels.load(Ordering::SeqCst), 0);
+                    }
+                }
+            }
+
+            #[tokio::test]
+            #[serial_test::serial]
+            async fn dropped_retry_leaves_no_state() {
+                use tracing::instrument::WithSubscriber;
+                stellar_agent_test_support::keyring_mock::install().unwrap();
+                let _inert = stellar_agent_test_support::inert_dispatcher();
+                tokio::time::pause();
+                let mut states = Vec::new();
+                for busy in [false, true] {
+                    let (dir, _profile, _store, recorder) = busy_admission_fixture();
+                    let primary = Endpoint::start(Chain {
+                        busy_simulations: busy.then_some((2, 1)),
+                        resimulation_delay: Some(Duration::from_secs(30)),
+                        ..Chain::at(LEDGER)
+                    })
+                    .await;
+                    let secondary = Endpoint::start(Chain::at(LEDGER)).await;
+                    let signer = super::AuthAndSourceSigner {
+                        auth: CountingSigner::new(SEED),
+                        source: CountingSigner::new(SEED),
+                    };
+                    let capture = stellar_agent_test_support::CaptureWriter::new();
+                    let subscriber = tracing_subscriber::fmt()
+                        .with_writer(capture.clone())
+                        .without_time()
+                        .with_ansi(false)
+                        .with_max_level(tracing::Level::DEBUG)
+                        .finish();
+                    let primary_url = primary.uri();
+                    let secondary_url = secondary.witness_uri();
+                    let path = dir.path().join("intent.window");
+                    let before = {
+                        let future = submit_timelock_invoke_with_g_key_auth(TimelockSubmitArgs {
+                            schedule_identity: None,
+                            host_function: HostFunction::InvokeContract(schedule()),
+                            signer: &signer,
+                            primary_rpc_url: &primary_url,
+                            secondary_rpc_url: &secondary_url,
+                            network_passphrase: TESTNET_PASSPHRASE,
+                            timeout: Duration::from_secs(60),
+                            op_label: "schedule",
+                            admission: stellar_agent_network::SigningAdmission::Recorded(&recorder),
+                        })
+                        .with_subscriber(subscriber);
+                        tokio::pin!(future);
+                        loop {
+                            tokio::select! {
+                                biased;
+                                result = &mut future => panic!("submission must remain pending: {result:?}"),
+                                () = tokio::task::yield_now() => {}
+                            }
+                            if primary.simulations.load(Ordering::SeqCst) >= 2
+                                && (!busy
+                                    || primary.simulations.load(Ordering::SeqCst) > 2
+                                    || capture
+                                        .captured_str()
+                                        .contains("waiting to retry busy simulation"))
+                            {
+                                break std::fs::read(&path).unwrap();
+                            }
+                        }
+                    };
+                    assert_eq!(std::fs::read(&path).unwrap(), before);
+                    assert_eq!(recorder.admits.load(Ordering::SeqCst), 1);
+                    assert_eq!(recorder.cancels.load(Ordering::SeqCst), 0);
+                    assert_eq!(signer.auth.sign_calls(), 1);
+                    assert_eq!(signer.source.sign_calls(), 0);
+                    assert_eq!(primary.simulations.load(Ordering::SeqCst), 2);
+                    assert_eq!(primary.sends().await, 0);
+                    let profile =
+                        stellar_agent_core::profile::schema::Profile::builder_testnet_named(
+                            "intent",
+                            "timelock-fixture-owner",
+                            "account",
+                            "timelock-fixture-nonce",
+                            "account",
+                        )
+                        .build();
+                    let store =
+                        stellar_agent_network::policy_state::PersistedWindowStore::at_path(path);
+                    let views = store.signed_intents("intent", &profile).unwrap();
+                    assert_eq!(views.len(), 1);
+                    let mut state = serde_json::to_value(&views[0]).unwrap();
+                    state["intent_id"] = serde_json::Value::Null;
+                    state["admitted_at_ms"] = serde_json::Value::Null;
+                    states.push(state);
+                }
+                assert_eq!(states[0], states[1]);
             }
 
             #[async_trait]
