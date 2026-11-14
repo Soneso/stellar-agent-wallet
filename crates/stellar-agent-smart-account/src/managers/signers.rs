@@ -14270,3 +14270,96 @@ pub(crate) mod tests {
         );
     }
 }
+
+/// Size bounds of the futures on the migration submit path in a debug build.
+///
+/// Each bound is the future's size with each simulation awaited directly,
+/// plus 512 bytes. A debug build keeps the whole future on a 2 MiB stack.
+#[cfg(all(test, debug_assertions))]
+mod future_size_tests {
+    #![allow(clippy::expect_used, reason = "test-only")]
+
+    use super::*;
+    use crate::managers::migration::MigrationPlan;
+    use stellar_xdr::{ContractId, Hash};
+
+    /// `MigrationPlan::submit` takes 37808 bytes with direct simulations.
+    const MIGRATION_SUBMIT_BOUND: usize = 37_808 + 512;
+    /// `submit::submit_signed_invoke` takes 35040 bytes with direct simulations.
+    const SIGNED_INVOKE_BOUND: usize = 35_040 + 512;
+
+    fn manager(uri: &str) -> (SignersManager, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audit_log_path = dir.path().join("audit.jsonl");
+        let audit_writer = Arc::new(Mutex::new(
+            AuditWriter::open(audit_log_path.clone(), None).expect("audit writer"),
+        ));
+        let manager = SignersManager::new(SignersManagerConfig::new(
+            uri.to_owned(),
+            uri.to_owned(),
+            audit_writer,
+            audit_log_path,
+            "Test SDF Network ; September 2015".to_owned(),
+            "test-profile".to_owned(),
+            Duration::from_secs(5),
+            "stellar:testnet".to_owned(),
+        ))
+        .expect("manager");
+        (manager, dir)
+    }
+
+    /// The busy retry adds a fixed amount to each future on the path.
+    #[test]
+    fn migration_submit_futures_stay_within_their_bounds() {
+        let (manager, _dir) = manager("http://127.0.0.1:9");
+        let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new([7; 32]);
+        let account = ScAddress::Contract(ContractId(Hash([1; 32])));
+        let plan = MigrationPlan {
+            smart_account: account.clone(),
+            from_hash: [1; 32],
+            to_hash: [2; 32],
+            to_verifier_addr: account.clone(),
+            affected_rules: vec![],
+            destination_audit_status: crate::verifier_allowlist::VerifierAuditStatus::Unaudited,
+            request_id: "r".to_owned(),
+            warnings: vec![],
+            rules_skipped_count: 0,
+            audit_log_missing: vec![],
+        };
+        let submit = plan.submit(&signer, &manager, "r");
+        let submit_size = std::mem::size_of_val(&submit);
+        drop(submit);
+        assert!(
+            submit_size <= MIGRATION_SUBMIT_BOUND,
+            "the migration submit future takes {submit_size} bytes, over {MIGRATION_SUBMIT_BOUND}"
+        );
+
+        let args = crate::submit::SubmitInvokeArgs::builder()
+            .admission(stellar_agent_network::SigningAdmission::NoValue(
+                crate::signing::intent_test_helpers::no_value_admission(),
+            ))
+            .target_contract("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM")
+            .auth_rule_ids(&[])
+            .host_function(stellar_xdr::HostFunction::InvokeContract(
+                stellar_xdr::InvokeContractArgs {
+                    contract_address: account.clone(),
+                    function_name: stellar_xdr::ScSymbol::try_from("fn").expect("symbol"),
+                    args: VecM::default(),
+                },
+            ))
+            .signer(&signer)
+            .primary_rpc_url("http://127.0.0.1:9")
+            .network_passphrase("Test SDF Network ; September 2015")
+            .chain_id("stellar:testnet")
+            .timeout(Duration::from_secs(10))
+            .op_label("test_op")
+            .build();
+        let invoke = crate::submit::submit_signed_invoke(args);
+        let invoke_size = std::mem::size_of_val(&invoke);
+        drop(invoke);
+        assert!(
+            invoke_size <= SIGNED_INVOKE_BOUND,
+            "the signed invoke future takes {invoke_size} bytes, over {SIGNED_INVOKE_BOUND}"
+        );
+    }
+}

@@ -1,0 +1,1 @@
+- Keep each busy simulation request on the heap, so smart-account submissions fit a 2 MiB stack in debug builds.

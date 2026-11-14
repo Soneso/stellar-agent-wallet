@@ -138,7 +138,9 @@ where
         if Instant::now() >= deadline {
             return Err(BusyRetryError::Expired);
         }
-        let error = match tokio::time::timeout_at(deadline, op()).await {
+        // The heap holds the request future, so each call site's future
+        // grows by a fixed amount and not by the request's size.
+        let error = match tokio::time::timeout_at(deadline, Box::pin(op())).await {
             Ok(Ok(value)) => return Ok(value),
             Ok(Err(error)) => error,
             Err(_) => return Err(BusyRetryError::Expired),

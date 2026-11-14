@@ -4371,6 +4371,45 @@ mod tests {
             assert!(start.elapsed() < Duration::from_millis(500));
         }
 
+        /// A signed invoke with one busy simulation completes on a thread with
+        /// a 2 MiB stack and a current-thread runtime.
+        #[test]
+        #[serial_test::serial]
+        fn a_busy_signed_invoke_completes_on_a_two_mib_stack() {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
+            let (outcome, requests) = std::thread::Builder::new()
+                .stack_size(2 * 1024 * 1024)
+                .spawn(|| {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(async {
+                            let primary = endpoint(LEDGER).start().await;
+                            let secondary = endpoint(LEDGER).start().await;
+                            let relay = busy_relay(primary.uri(), 1, 1, Duration::ZERO).await;
+                            let result = submit_busy_path(
+                                &relay.uri(),
+                                &second_loopback_host(&secondary.uri()),
+                                false,
+                                Duration::from_secs(30),
+                            )
+                            .await;
+                            let requests = stellar_agent_test_support::rpc_request_count(
+                                &relay,
+                                "simulateTransaction",
+                            )
+                            .await;
+                            (result.map(|_| ()).map_err(|e| format!("{e:?}")), requests)
+                        })
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+            assert!(outcome.is_ok(), "{outcome:?}");
+            assert_eq!(requests, 3);
+        }
+
         /// A counting signer that keeps every authorization digest it signs,
         /// smart-account and classic, and whose envelope signature takes
         /// `envelope_delay` when one is set, as a hardware device's can.
