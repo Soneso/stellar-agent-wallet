@@ -318,10 +318,14 @@ async fn presence_until_done(
             expires_at.saturating_sub(now),
         ))
         .ok_or(WalletError::Approval(ApprovalFailure::PresenceUnavailable))?;
+    #[cfg(test)]
+    expiry_trace::arm(deadline);
     let result = tokio::select! {
         result = handle.await_presence(deadline) => result,
         _ = interrupt => Err(WalletError::Approval(ApprovalFailure::PresenceCanceled)),
     };
+    #[cfg(test)]
+    expiry_trace::decide(&result);
     let stopped = handle.shutdown().await;
     let closed = handoff
         .map(crate::common::private_open::PrivateOpen::close)
@@ -330,6 +334,37 @@ async fn presence_until_done(
     stopped?;
     closed?;
     result
+}
+
+#[cfg(test)]
+mod expiry_trace {
+    use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        static ARMED: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+        static DECIDED: Cell<Option<(tokio::time::Instant, &'static str)>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn reset() {
+        ARMED.set(None);
+        DECIDED.set(None);
+    }
+    pub(super) fn arm(deadline: std::time::Instant) {
+        ARMED.set(Some(deadline));
+    }
+    pub(super) fn armed() -> Option<std::time::Instant> {
+        ARMED.get()
+    }
+    pub(super) fn decide(result: &Result<VerifiedMainnetPresence, WalletError>) {
+        DECIDED.set(Some((
+            tokio::time::Instant::now(),
+            result.as_ref().map_or_else(|e| e.code(), |_| "ok"),
+        )));
+    }
+    pub(super) fn decided() -> Option<(tokio::time::Instant, &'static str)> {
+        DECIDED.get()
+    }
 }
 
 #[cfg(test)]
@@ -914,37 +949,71 @@ mod tests {
         .unwrap()
     }
 
-    async fn expire_ceremony(
+    async fn expire_at_armed_deadline(
         ceremony: impl std::future::Future<Output = Result<VerifiedMainnetPresence, WalletError>>,
         expires_at: u64,
     ) -> Result<VerifiedMainnetPresence, WalletError> {
         use std::{future::poll_fn, task::Poll, time::Duration};
+        use stellar_agent_core::timefmt::now_unix_ms;
+        use stellar_agent_test_support::timing::{let_io_run, wait_until};
+        use tokio::time::Instant;
 
+        expiry_trace::reset();
+        tokio::time::pause();
+        let _clock = ClockHold::new();
         let mut ceremony = std::pin::pin!(ceremony);
+        let w0 = now_unix_ms().unwrap();
+        let i0 = std::time::Instant::now();
         assert!(
             poll_fn(|cx| Poll::Ready(ceremony.as_mut().poll(cx)))
                 .await
                 .is_pending()
         );
-        // The first poll arms the deadline from the entry's wall-clock expiry.
-        // Holding Tokio time after that conversion controls the wait during I/O.
-        tokio::time::pause();
-        let _clock = ClockHold::new();
-        let remaining = Duration::from_millis(
-            expires_at
-                .checked_sub(stellar_agent_core::timefmt::now_unix_ms().unwrap())
-                .unwrap(),
+        let i1 = std::time::Instant::now();
+        let w1 = now_unix_ms().unwrap();
+        let armed = expiry_trace::armed().expect("the presence deadline is armed");
+        assert!(
+            armed >= i0 + Duration::from_millis(expires_at - w1) - Duration::from_millis(1),
+            "the armed deadline is not shortened"
         );
-        let margin = Duration::from_millis(250);
-        tokio::time::advance(remaining.checked_sub(margin).unwrap()).await;
+        assert!(
+            armed <= i1 + Duration::from_millis(expires_at - w0) + Duration::from_millis(1),
+            "the armed deadline is not extended"
+        );
+        let before = Instant::from_std(armed) - Duration::from_millis(1);
+        tokio::time::advance(before.duration_since(Instant::now())).await;
+        let_io_run(Duration::from_millis(20)).await;
         assert!(
             poll_fn(|cx| Poll::Ready(ceremony.as_mut().poll(cx)))
                 .await
-                .is_pending(),
-            "the ceremony stays pending before the entry deadline"
+                .is_pending()
         );
-        tokio::time::advance(margin + Duration::from_secs(1)).await;
-        let result = drive_call(ceremony, |_| async {}).await;
+        assert_eq!(
+            expiry_trace::decided(),
+            None,
+            "presence is pending before the armed tick"
+        );
+        let at = Instant::from_std(armed) + Duration::from_nanos(999_999);
+        tokio::time::advance(at.duration_since(Instant::now())).await;
+        let polled = poll_fn(|cx| Poll::Ready(ceremony.as_mut().poll(cx))).await;
+        wait_until("presence is decided at the armed tick", || {
+            expiry_trace::decided().is_some()
+        })
+        .await;
+        assert_eq!(
+            expiry_trace::decided(),
+            Some((at, "approval.presence_expired"))
+        );
+        let result = drive_call(
+            async {
+                match polled {
+                    Poll::Ready(result) => result,
+                    Poll::Pending => ceremony.await,
+                }
+            },
+            |_| async {},
+        )
+        .await;
         tokio::time::resume();
         result
     }
@@ -998,7 +1067,7 @@ mod tests {
             let result = if cancel {
                 drive_call(ceremony, |_| async {}).await
             } else {
-                expire_ceremony(ceremony, entry.expires_at_unix_ms).await
+                expire_at_armed_deadline(ceremony, entry.expires_at_unix_ms).await
             }
             .unwrap_err();
             assert_eq!(
@@ -1046,7 +1115,7 @@ mod tests {
         );
         let result = drive_call(ceremony, |_| browser).await;
         assert_eq!(result.unwrap_err().code(), "approval.presence_canceled");
-        crate::commands::approve::credential::tests::operator_expiry_and_cancellation().await;
+        crate::commands::approve::credential::tests::operator_mismatch_and_cancellation().await;
         // The expiry case runs last: advancing Tokio time leaves its clock
         // ahead of later wall-clock deadlines.
         ending(false).await;
@@ -1204,7 +1273,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let ended = expire_ceremony(
+        let ended = expire_at_armed_deadline(
             presence_until_done(
                 handle,
                 OpenMode::Private,

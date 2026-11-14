@@ -1487,6 +1487,92 @@ pub fn lose_send_answers_on_this_thread(count: usize) {
     LOST_SEND_ANSWERS.with(|lost| lost.set(count));
 }
 
+/// Observes confirmation boundaries on the current test thread.
+#[cfg(any(test, feature = "test-helpers"))]
+#[doc(hidden)]
+pub mod confirmation_trace {
+    use std::{
+        cell::RefCell,
+        future::{Future, poll_fn},
+        task::{Poll, Waker},
+    };
+    use tokio::time::Instant;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Branch {
+        BeforeRequest,
+        CutInFlight,
+        AnswerAtOrAfterDeadline,
+    }
+    #[derive(Clone, Debug, Default)]
+    pub struct Snapshot {
+        pub armed: Option<Instant>,
+        pub requests: usize,
+        pub sleeps: Vec<(Instant, Instant)>,
+        pub decided: Option<(Instant, Branch)>,
+        pub answer_held: bool,
+    }
+    #[derive(Default)]
+    struct Trace {
+        snapshot: Snapshot,
+        hold: bool,
+        waker: Option<Waker>,
+    }
+    thread_local! { static TRACE: RefCell<Trace> = RefCell::new(Trace::default()); }
+    pub fn reset() {
+        TRACE.with(|t| *t.borrow_mut() = Trace::default());
+    }
+    pub fn snapshot() -> Snapshot {
+        TRACE.with(|t| t.borrow().snapshot.clone())
+    }
+    pub(super) fn arm(deadline: Instant) {
+        TRACE.with(|t| t.borrow_mut().snapshot.armed = Some(deadline));
+    }
+    pub(super) fn request() {
+        TRACE.with(|t| t.borrow_mut().snapshot.requests += 1);
+    }
+    pub(super) fn sleep(at: Instant, until: Instant) {
+        TRACE.with(|t| t.borrow_mut().snapshot.sleeps.push((at, until)));
+    }
+    pub(super) fn decide(branch: Branch) {
+        TRACE.with(|t| t.borrow_mut().snapshot.decided = Some((Instant::now(), branch)));
+    }
+    pub struct Release;
+    impl Release {
+        pub fn release(self) {
+            let waker = TRACE.with(|t| {
+                let mut t = t.borrow_mut();
+                t.hold = false;
+                t.waker.take()
+            });
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }
+    }
+    pub fn hold_answers() -> Release {
+        TRACE.with(|t| t.borrow_mut().hold = true);
+        Release
+    }
+    pub(super) async fn answer<F: Future>(answer: F) -> F::Output {
+        let result = answer.await;
+        poll_fn(|cx| {
+            TRACE.with(|t| {
+                let mut t = t.borrow_mut();
+                if t.hold {
+                    t.snapshot.answer_held = true;
+                    t.waker = Some(cx.waker().clone());
+                    Poll::Pending
+                } else {
+                    Poll::Ready(())
+                }
+            })
+        })
+        .await;
+        result
+    }
+}
+
 /// The send's answer, or a transport timeout in its place while answers on
 /// this thread are to be lost under `test-hooks`.
 #[allow(
@@ -1556,20 +1642,32 @@ where
     P: FnMut() -> F,
     F: std::future::Future<Output = Result<TransactionRecord, stellar_rpc_client::Error>>,
 {
+    #[cfg(any(test, feature = "test-helpers"))]
+    confirmation_trace::arm(send_deadline);
     let redacted = redact_tx_hash(&intent.tx_hash);
     loop {
         // A sleep that reached the deadline ends the loop here, before another
         // request starts.
         if tokio::time::Instant::now() >= send_deadline {
+            #[cfg(any(test, feature = "test-helpers"))]
+            confirmation_trace::decide(confirmation_trace::Branch::BeforeRequest);
             return Err(record_timeout(recorder, intent, timeout_secs).await);
         }
         // A request the endpoint holds open is cut at the deadline rather than
         // left to the transport's own 60 s bound.
+        #[cfg(any(test, feature = "test-helpers"))]
+        confirmation_trace::request();
+        #[cfg(any(test, feature = "test-helpers"))]
+        let mut poll = || confirmation_trace::answer(poll());
         let Ok(poll_result) = tokio::time::timeout_at(send_deadline, poll()).await else {
+            #[cfg(any(test, feature = "test-helpers"))]
+            confirmation_trace::decide(confirmation_trace::Branch::CutInFlight);
             return Err(record_timeout(recorder, intent, timeout_secs).await);
         };
         // An answer that completed at or after the deadline is not read.
         if tokio::time::Instant::now() >= send_deadline {
+            #[cfg(any(test, feature = "test-helpers"))]
+            confirmation_trace::decide(confirmation_trace::Branch::AnswerAtOrAfterDeadline);
             return Err(record_timeout(recorder, intent, timeout_secs).await);
         }
 
@@ -1824,6 +1922,11 @@ async fn oracle_failed_record(
 /// A poll interval never carries a submission past its deadline: the loop
 /// that sleeps here checks the deadline before its next request.
 pub(crate) async fn sleep_before_next_poll(interval: Duration, deadline: tokio::time::Instant) {
+    #[cfg(any(test, feature = "test-helpers"))]
+    confirmation_trace::sleep(
+        tokio::time::Instant::now(),
+        deadline.min(tokio::time::Instant::now() + interval),
+    );
     tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + interval)).await;
 }
 

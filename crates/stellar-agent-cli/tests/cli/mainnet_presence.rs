@@ -376,6 +376,8 @@ mod signed {
     };
 
     const PROCESS_WAIT_BUDGET: Duration = Duration::from_secs(600);
+    const CHILD_EXPIRY: Duration = Duration::from_secs(30);
+    const EXIT_BOUND: Duration = Duration::from_secs(10);
 
     struct Home {
         dir: tempfile::TempDir,
@@ -484,7 +486,8 @@ mod signed {
             let mut entry = store.get(&self.nonce).unwrap().clone();
             store.remove(&self.nonce).unwrap();
             // This child-process case waits for the entry's wall-clock expiry.
-            let expiry = stellar_agent_core::timefmt::now_unix_ms().unwrap() + 20_000;
+            let expiry = stellar_agent_core::timefmt::now_unix_ms().unwrap()
+                + u64::try_from(CHILD_EXPIRY.as_millis()).unwrap();
             entry.expires_at_unix_ms = expiry;
             store
                 .insert(entry, stellar_agent_core::timefmt::now_unix_ms().unwrap())
@@ -584,6 +587,32 @@ mod signed {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
     }
+    fn observe_exit(child: &mut OwnedChild, expiry: u64) -> u64 {
+        let ready_wall = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+        assert!(
+            ready_wall < expiry,
+            "exit observation starts before the stored expiry"
+        );
+        let limit = expiry + u64::try_from(EXIT_BOUND.as_millis()).unwrap();
+        loop {
+            let exited = child.try_wait().unwrap().is_some();
+            let wall = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+            if exited {
+                assert!(
+                    wall >= expiry,
+                    "the child does not exit before the stored expiry"
+                );
+                assert!(wall <= limit, "the child exits within the expiry bound");
+                return wall;
+            }
+            assert!(
+                wall <= limit,
+                "the child exits within the expiry bound (not exited)"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     async fn finish(child: impl Into<OwnedChild>) -> (i32, String, String) {
         finish_by(child, Instant::now() + PROCESS_WAIT_BUDGET).await
     }
@@ -883,7 +912,6 @@ mod signed {
         for action in ["consent", "cancel", "expiry", "interrupt"] {
             let home = Home::new();
             let expiry = (action == "expiry").then(|| home.expire_after_startup());
-            let completion_deadline = Instant::now() + Duration::from_secs(35);
             let mut child: OwnedChild = home.command(false).spawn().unwrap().into();
             ready(&mut child, &home).await;
             match action {
@@ -911,13 +939,10 @@ mod signed {
                 "interrupt" => send_interrupt(&child),
                 _ => {}
             }
-            let (code, out, err) = finish_by(child, completion_deadline).await;
             if let Some(expiry) = expiry {
-                assert!(
-                    stellar_agent_core::timefmt::now_unix_ms().unwrap() >= expiry,
-                    "the command runs until the entry deadline"
-                );
+                observe_exit(&mut child, expiry);
             }
+            let (code, out, err) = finish(child).await;
             if action == "consent" {
                 assert_eq!(code, 0, "{out} {err}");
             } else {

@@ -17,6 +17,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use rmcp::model::CallToolResult;
 use serde_json::{Value, json};
 use serial_test::serial;
+use std::time::Duration;
 use stellar_agent_core::approval::{
     PendingApprovalStore, TOOLSET_GRANT_DEFAULT_TTL_MS, ToolsetGrantStore,
     attestation::{compute_attestation_v4, envelope_sha256},
@@ -26,14 +27,15 @@ use stellar_agent_core::policy::v1::criteria::state_store::{PolicyStateStore, St
 use stellar_agent_core::policy::v1::{canonical::canonical_bytes, signature::digest};
 use stellar_agent_core::profile::receipt::{ReceiptStatus, ReceiptStore};
 use stellar_agent_core::profile::schema::{PolicyEngineKind, Profile};
-use stellar_agent_core::timefmt::now_unix_ms;
+use stellar_agent_core::timefmt::{MockClock, now_unix_ms};
 use stellar_agent_mcp::server::{
     StellarPayCommitArgs, StellarToolsetInvokeArgs, StellarTransactionStatusArgs, WalletServer,
 };
 use stellar_agent_network::policy_state::PersistedWindowStore;
+use stellar_agent_network::submit::confirmation_trace::{self, Branch};
 use stellar_agent_test_support::{
     keyring_mock,
-    timing::{ClockHold, drive_call, wait_until},
+    timing::{ClockHold, drive_call, let_io_run, wait_until},
     xdr_fixtures::{account_entry_xdr_with_seq, account_ledger_key_xdr},
 };
 use tempfile::TempDir;
@@ -118,6 +120,7 @@ fn seed_key(service: &str, account: &str, bytes: &[u8]) {
 
 #[derive(Clone, Copy)]
 enum Outcome {
+    Held,
     Success,
     Timeout,
     Failed,
@@ -294,13 +297,16 @@ decision = "allow"
             if body["method"] == "getTransaction" {
                 observed_polls.fetch_add(1, Ordering::SeqCst);
                 let status = match *response_outcome.lock().unwrap() {
-                    Outcome::Success => { sequence.store(43, Ordering::SeqCst); "SUCCESS" }, Outcome::Timeout => "NOT_FOUND", Outcome::Failed => { sequence.store(43, Ordering::SeqCst); "FAILED" },
+                    Outcome::Success => { sequence.store(43, Ordering::SeqCst); "SUCCESS" }, Outcome::Timeout | Outcome::Held => "NOT_FOUND", Outcome::Failed => { sequence.store(43, Ordering::SeqCst); "FAILED" },
                 };
-                return ResponseTemplate::new(200).set_body_json(json!({
+                let response = ResponseTemplate::new(200).set_body_json(json!({
                     "jsonrpc": "2.0", "id": body["id"],
                     "result": { "status": status, "ledger": 1001, "latestLedger": 1002, "oldestLedger": 1,
                         "createdAt": (stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1000).to_string() }
                 }));
+                return if matches!(*response_outcome.lock().unwrap(), Outcome::Held) {
+                    response.set_delay(Duration::from_secs(3600))
+                } else { response };
             }
         let responder = crate::common::TimeoutRpc::new(vec![
             claim_entry(&response_source),
@@ -412,30 +418,91 @@ decision = "allow"
     }
 
     async fn commit_pay(&self, args: StellarPayCommitArgs) -> Value {
-        let expires = matches!(*self.outcomes.lock().unwrap(), Outcome::Timeout);
+        self.commit_pay_with_late_answer(args, false).await
+    }
+
+    async fn commit_pay_with_late_answer(&self, args: StellarPayCommitArgs, late: bool) -> Value {
+        let outcome = *self.outcomes.lock().unwrap();
+        let expires = late || matches!(outcome, Outcome::Timeout | Outcome::Held);
         let polls_before = self.polls.load(Ordering::SeqCst);
-        result_json(
+        confirmation_trace::reset();
+        let release = late.then(confirmation_trace::hold_answers);
+        let t0 = tokio::time::Instant::now();
+        let deadline = t0 + self.profile.submit_timeout();
+        let at = deadline + Duration::from_nanos(999_999);
+        let result = result_json(
             &drive_call(
                 self.server.call_stellar_pay_commit(args),
                 |probe| async move {
                     if expires {
-                        wait_until("the first confirmation poll", || {
-                            self.polls.load(Ordering::SeqCst) > polls_before
+                        wait_until("the confirmation deadline is armed", || {
+                            confirmation_trace::snapshot().armed.is_some()
                         })
                         .await;
-                        assert!(!probe.finished(), "the commit waits for confirmation");
-                        // Tokio rounds a timer deadline up to the next
-                        // millisecond, so the clock moves 1 ms past the timeout.
+                        assert_eq!(
+                            confirmation_trace::snapshot().armed,
+                            Some(deadline),
+                            "the configured submission deadline is armed"
+                        );
+                        wait_until("the confirmation phase barrier", || {
+                            let trace = confirmation_trace::snapshot();
+                            if late {
+                                trace.answer_held
+                            } else if matches!(outcome, Outcome::Held) {
+                                trace.requests == 1
+                                    && self.polls.load(Ordering::SeqCst) == polls_before + 1
+                            } else {
+                                trace
+                                    .sleeps
+                                    .last()
+                                    .is_some_and(|(_, until)| *until == deadline)
+                            }
+                        })
+                        .await;
                         tokio::time::advance(
-                            self.profile.submit_timeout() + std::time::Duration::from_millis(1),
+                            (deadline - Duration::from_millis(1))
+                                .duration_since(tokio::time::Instant::now()),
                         )
                         .await;
+                        let_io_run(Duration::from_millis(20)).await;
+                        assert!(
+                            !probe.finished(),
+                            "the commit is pending one tick before the deadline"
+                        );
+                        assert_eq!(confirmation_trace::snapshot().decided, None);
+                        if let Some(release) = release {
+                            release.release();
+                        }
+                        tokio::time::advance(at.duration_since(tokio::time::Instant::now())).await;
+                        wait_until("the commit ends at the deadline tick", || probe.finished())
+                            .await;
                     }
                 },
             )
             .await
             .unwrap(),
-        )
+        );
+        if expires {
+            let branch = if late {
+                Branch::AnswerAtOrAfterDeadline
+            } else if matches!(outcome, Outcome::Held) {
+                Branch::CutInFlight
+            } else {
+                Branch::BeforeRequest
+            };
+            assert_eq!(
+                confirmation_trace::snapshot().decided,
+                Some((at, branch)),
+                "the expected confirmation branch decides at the deadline tick"
+            );
+            assert_eq!(confirmation_trace::snapshot().requests, 1);
+            assert_eq!(
+                self.polls.load(Ordering::SeqCst),
+                polls_before + 1,
+                "only one confirmation poll"
+            );
+        }
+        result
     }
 
     fn window(&self) -> WindowSnapshot {
@@ -647,6 +714,120 @@ async fn approved_timeout_keeps_cap_until_transaction_status_settles() {
         )
         .is_empty()
     );
+    let details = &result["error"]["details"];
+    *h.outcomes.lock().unwrap() = Outcome::Success;
+    let status = result_json(
+        &h.server
+            .call_stellar_transaction_status(StellarTransactionStatusArgs {
+                chain_id: "stellar:testnet".to_owned(),
+                tx_hash: details["tx_hash"].as_str().unwrap().to_owned(),
+            })
+            .await
+            .unwrap(),
+    );
+    assert_eq!(status["ok"], true, "{status}");
+    assert_eq!(
+        h.window(),
+        WindowSnapshot {
+            amount: AMOUNT,
+            entries: 1,
+            pending: 1
+        }
+    );
+    let receipt = ReceiptStore::open(&h.name)
+        .unwrap()
+        .get(details["envelope_hash"].as_str().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.status, ReceiptStatus::Success);
+    h.assert_legs("value_action_pending", "payment", Some(AMOUNT));
+    let rows = crate::common::audit_rows(&h.profile);
+    assert!(crate::common::rows_of_kind(&rows, "value_action_submitted").is_empty());
+    let submitted = crate::common::rows_of_kind(&rows, "value_action_pending");
+    assert_eq!(submitted[0]["policy_decision"], "require_approval");
+    assert_eq!(
+        submitted[0]["approval_nonce"],
+        sim["data"]["approval"]["approval_nonce"]
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn approved_timeout_cuts_an_in_flight_confirmation_poll() {
+    let h = Harness::new("cap-approved-held", "require_approval", Outcome::Held).await;
+    let sim = h.simulate_pay(AMOUNT).await;
+    let result = h
+        .commit_pay(h.pay_args(&sim["data"], AMOUNT, Some(h.attest(&sim["data"]))))
+        .await;
+    assert_eq!(result["error"]["code"], "submission.tx_timeout", "{result}");
+    h.assert_send_reserved();
+    assert_eq!(
+        h.window(),
+        WindowSnapshot {
+            amount: AMOUNT,
+            entries: 1,
+            pending: 1
+        }
+    );
+    assert!(
+        crate::common::rows_of_kind(
+            &crate::common::audit_rows(&h.profile),
+            "value_action_submitted"
+        )
+        .is_empty()
+    );
+    let receipt = ReceiptStore::open(&h.name)
+        .unwrap()
+        .get(
+            result["error"]["details"]["envelope_hash"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.status, ReceiptStatus::Pending);
+    h.assert_legs("value_action_pending", "payment", Some(AMOUNT));
+}
+
+#[tokio::test]
+#[serial]
+async fn approved_confirmation_ready_after_the_deadline_is_a_timeout() {
+    let h = Harness::new("cap-approved-late", "require_approval", Outcome::Success).await;
+    let sim = h.simulate_pay(AMOUNT).await;
+    let result = h
+        .commit_pay_with_late_answer(
+            h.pay_args(&sim["data"], AMOUNT, Some(h.attest(&sim["data"]))),
+            true,
+        )
+        .await;
+    assert_eq!(result["error"]["code"], "submission.tx_timeout", "{result}");
+    h.assert_send_reserved();
+    assert_eq!(
+        h.window(),
+        WindowSnapshot {
+            amount: AMOUNT,
+            entries: 1,
+            pending: 1
+        }
+    );
+    assert!(
+        crate::common::rows_of_kind(
+            &crate::common::audit_rows(&h.profile),
+            "value_action_submitted"
+        )
+        .is_empty()
+    );
+    let receipt = ReceiptStore::open(&h.name)
+        .unwrap()
+        .get(
+            result["error"]["details"]["envelope_hash"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.status, ReceiptStatus::Pending);
+    h.assert_legs("value_action_pending", "payment", Some(AMOUNT));
     let details = &result["error"]["details"];
     *h.outcomes.lock().unwrap() = Outcome::Success;
     let status = result_json(
@@ -1194,113 +1375,164 @@ async fn allowed_submission_ignores_an_unverified_approval_nonce() {
 #[serial]
 async fn rule_ttl_bounds_toolset_queued_approval_at_commit() {
     const RULE_TTL_SECS: u64 = 600;
-    let mut h = Harness::with_approval_fields(
-        "cap-toolset-rule-ttl",
-        "require_approval",
-        Outcome::Success,
-        &format!("ttl_secs = {RULE_TTL_SECS}"),
-    )
-    .await;
-    let tools = tempfile::tempdir().unwrap();
-    stellar_agent_toolsets_install::write_toolset_for_test(
-        tools.path(),
-        "payment-toolset",
-        &["sign-payment"],
-        &[],
-        "2026-06-02T00:00:00Z",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        &crate::common::toolset_pin_key(),
-    )
-    .unwrap();
-    let grant_path = tools.path().join("grants.toml");
-    let now = now_unix_ms().unwrap();
-    let grant = build_attested_grant(
-        "payment-toolset".to_owned(),
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
-        "1.0.0".to_owned(),
-        "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
-        "sign-payment".to_owned(),
-        DEST.to_owned(),
-        "XLM".to_owned(),
-        1,
-        100_000_000,
-        process_uid_for_attestation().unwrap(),
-        now,
-        TOOLSET_GRANT_DEFAULT_TTL_MS,
-        &ATTESTATION_KEY,
-        &stellar_agent_core::approval::AttestationBinding::new(&h.name, "stellar:testnet"),
-    )
-    .unwrap();
-    ToolsetGrantStore::open(grant_path.clone(), now)
-        .unwrap()
-        .insert(grant)
+    const AMOUNT: i128 = 20_000_000;
+    for (n, (age_ms, admitted)) in [
+        (599_999, true),
+        (600_000, false),
+        (900_000, false),
+        (60_000_000, false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut h = Harness::with_approval_fields(
+            &format!("cap-toolset-rule-ttl-{n}"),
+            "require_approval",
+            Outcome::Success,
+            &format!("ttl_secs = {RULE_TTL_SECS}"),
+        )
+        .await;
+        let tools = tempfile::tempdir().unwrap();
+        stellar_agent_toolsets_install::write_toolset_for_test(
+            tools.path(),
+            "payment-toolset",
+            &["sign-payment"],
+            &[],
+            "2026-06-02T00:00:00Z",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &crate::common::toolset_pin_key(),
+        )
         .unwrap();
-    h.server.set_toolsets_root_for_test(tools.path().to_owned());
-    h.server
-        .set_toolset_pin_key_for_test(crate::common::toolset_pin_key());
-    h.server.set_grant_store_path_for_test(grant_path);
-    let sim = h.simulate_pay(AMOUNT).await;
-    let rule_nonce = sim["data"]["approval"]["approval_nonce"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let args = h.pay_args(&sim["data"], AMOUNT, None);
-    let invoke = |params| StellarToolsetInvokeArgs {
-        toolset: "payment-toolset".to_owned(),
-        action: "stellar_pay_commit".to_owned(),
-        chain_id: Some("stellar:testnet".to_owned()),
-        args: params,
-    };
-    let prompt = result_json(
-        &h.server
-            .call_stellar_toolset_invoke(invoke(pay_json(&args)))
-            .await
-            .unwrap(),
-    );
-    assert_eq!(
-        prompt["error"]["code"], "policy.approval_required",
-        "{prompt}"
-    );
-    let nonce = {
-        let mut store =
-            PendingApprovalStore::open(h.approval_dir.path().join(format!("{}.toml", h.name)))
-                .unwrap();
-        let queued: Vec<_> = store
-            .snapshot(now_unix_ms().unwrap())
-            .into_iter()
-            .filter(|entry| entry.approval_nonce != rule_nonce)
-            .collect();
-        assert_eq!(queued.len(), 1, "toolset queues per-action approval");
-        assert!(
-            !queued[0].expired,
-            "the toolset entry carries its own expiry"
-        );
-        let nonce = queued[0].approval_nonce.clone();
+        let grant_path = tools.path().join("grants.toml");
         let now = now_unix_ms().unwrap();
-        let mut entry = store.get(&nonce).unwrap().clone();
-        entry.created_at_unix_ms = now - 2 * RULE_TTL_SECS * 1_000;
-        assert!(!entry.is_expired(now), "the stored expiry remains live");
-        assert!(store.remove(&nonce).unwrap());
-        store.insert(entry, now).unwrap();
-        nonce
-    };
-    let approval = h.attest_nonce(&nonce, &args.envelope_xdr);
-    let result = result_json(
-        &h.server
-            .call_stellar_toolset_invoke(invoke(pay_json(&h.pay_args(
-                &sim["data"],
-                AMOUNT,
-                Some(approval),
-            ))))
-            .await
-            .unwrap(),
-    );
-    assert_eq!(result["error"], prompt["error"], "{result}");
-    let rows = crate::common::audit_rows(&h.profile);
-    assert!(
-        crate::common::rows_of_kind(&rows, "value_action_pending").is_empty(),
-        "{rows:?}"
-    );
+        let grant = build_attested_grant(
+            "payment-toolset".to_owned(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "1.0.0".to_owned(),
+            "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+            "sign-payment".to_owned(),
+            DEST.to_owned(),
+            "XLM".to_owned(),
+            1,
+            100_000_000,
+            process_uid_for_attestation().unwrap(),
+            now,
+            TOOLSET_GRANT_DEFAULT_TTL_MS,
+            &ATTESTATION_KEY,
+            &stellar_agent_core::approval::AttestationBinding::new(&h.name, "stellar:testnet"),
+        )
+        .unwrap();
+        ToolsetGrantStore::open(grant_path.clone(), now)
+            .unwrap()
+            .insert(grant)
+            .unwrap();
+        h.server.set_toolsets_root_for_test(tools.path().to_owned());
+        h.server
+            .set_toolset_pin_key_for_test(crate::common::toolset_pin_key());
+        h.server.set_grant_store_path_for_test(grant_path);
+        let sim = h.simulate_pay(AMOUNT).await;
+        let rule_nonce = sim["data"]["approval"]["approval_nonce"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let args = h.pay_args(&sim["data"], AMOUNT, None);
+        let invoke = |params| StellarToolsetInvokeArgs {
+            toolset: "payment-toolset".to_owned(),
+            action: "stellar_pay_commit".to_owned(),
+            chain_id: Some("stellar:testnet".to_owned()),
+            args: params,
+        };
+        let prompt = result_json(
+            &h.server
+                .call_stellar_toolset_invoke(invoke(pay_json(&args)))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            prompt["error"]["code"], "policy.approval_required",
+            "{prompt}"
+        );
+        let now0 = now_unix_ms().unwrap();
+        let nonce = {
+            let mut store =
+                PendingApprovalStore::open(h.approval_dir.path().join(format!("{}.toml", h.name)))
+                    .unwrap();
+            let queued: Vec<_> = store
+                .snapshot(now_unix_ms().unwrap())
+                .into_iter()
+                .filter(|entry| entry.approval_nonce != rule_nonce)
+                .collect();
+            assert_eq!(queued.len(), 1, "toolset queues per-action approval");
+            assert!(
+                !queued[0].expired,
+                "the toolset entry carries its own expiry"
+            );
+            let nonce = queued[0].approval_nonce.clone();
+            let mut entry = store.get(&nonce).unwrap().clone();
+            entry.created_at_unix_ms = now0 - age_ms;
+            assert!(!entry.is_expired(now0), "the stored expiry remains live");
+            assert!(store.remove(&nonce).unwrap());
+            store.insert(entry, now0).unwrap();
+            nonce
+        };
+        let approval = h.attest_nonce(&nonce, &args.envelope_xdr);
+        h.server
+            .set_clock_for_test(Arc::new(MockClock::new(move || Ok(now0))));
+        for repeated in [false, true] {
+            let result = result_json(
+                &drive_call(
+                    h.server
+                        .call_stellar_toolset_invoke(invoke(pay_json(&h.pay_args(
+                            &sim["data"],
+                            AMOUNT,
+                            Some(approval.clone()),
+                        )))),
+                    |_| async {},
+                )
+                .await
+                .unwrap(),
+            );
+            let rows = crate::common::audit_rows(&h.profile);
+            if admitted {
+                if repeated {
+                    assert_eq!(
+                        result["error"]["code"], "policy.approval_consumed",
+                        "{result}"
+                    );
+                } else {
+                    assert_eq!(result["ok"], true, "age {age_ms}: {result}");
+                }
+                assert_eq!(h.sends.lock().unwrap().len(), 1);
+                h.assert_legs("value_action_pending", "payment", Some(AMOUNT));
+                let pending = crate::common::rows_of_kind(&rows, "value_action_pending");
+                assert_eq!(pending.len(), 1);
+                assert_eq!(pending[0]["policy_decision"], "require_approval");
+                assert_eq!(pending[0]["approval_nonce"], nonce);
+                assert_eq!(
+                    crate::common::rows_of_kind(&rows, "value_action_submitted").len(),
+                    0
+                );
+            } else {
+                assert_eq!(result["error"], prompt["error"], "age {age_ms}: {result}");
+                assert!(h.sends.lock().unwrap().is_empty());
+                assert!(
+                    crate::common::rows_of_kind(&rows, "value_action_pending").is_empty(),
+                    "{rows:?}"
+                );
+            }
+            let store =
+                PendingApprovalStore::open(h.approval_dir.path().join(format!("{}.toml", h.name)))
+                    .unwrap();
+            assert_eq!(
+                matches!(
+                    store.get(&nonce).expect("the approval remains stored").kind,
+                    stellar_agent_core::approval::ApprovalKind::Consumed { .. }
+                ),
+                admitted,
+                "age {age_ms}, repeated {repeated}: only an admitted approval is consumed"
+            );
+        }
+    }
 }
 
 #[tokio::test]
