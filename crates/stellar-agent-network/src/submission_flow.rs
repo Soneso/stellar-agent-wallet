@@ -380,6 +380,31 @@ pub fn finish_reconciliation(
                 "recovery: checked receipt repair refused after sequence recovery; completed work remains committed"
             )
         }
+        ReconcilePass::RecoveryFailed {
+            error: error @ crate::policy_state::RecoveryError::Context { source, detail },
+            ..
+        } if detail.starts_with("selected sequences: ")
+            || matches!(
+                source.as_ref(),
+                crate::policy_state::RecoveryError::Context { .. }
+            ) =>
+        {
+            tracing::warn!(
+                profile = %profile_name,
+                code = error.code(),
+                error = %error,
+                "recovery: the stage refused; durable progress appears in the detail"
+            )
+        }
+        ReconcilePass::RecoveryFailed {
+            error: error @ crate::policy_state::RecoveryError::Context { .. },
+            ..
+        } => tracing::warn!(
+            profile = %profile_name,
+            code = error.code(),
+            error = %error,
+            "recovery: the stage refused; every sequence stays held"
+        ),
         ReconcilePass::RecoveryFailed { error, .. }
             if !matches!(error, crate::policy_state::RecoveryError::NeedsEvidence(_)) =>
         {
@@ -539,16 +564,15 @@ async fn reconcile_stages(
         recovery::repair_committed_receipts(window, profile, receipts, &writer, None)
     });
     match (sequences, repaired) {
-        (Err(error), _)
-            if matches!(
-                error,
-                crate::policy_state::RecoveryError::Store(_)
-                    | crate::policy_state::RecoveryError::EndpointIdentity(_)
-            ) =>
+        (Err(error), repaired)
+            if !matches!(error, crate::policy_state::RecoveryError::NeedsEvidence(_)) =>
         {
             ReconcilePass::RecoveryFailed {
                 legacy: report.clone(),
-                error,
+                error: match repaired {
+                    Err(refused) => error.with_context(refused.to_string()),
+                    Ok(()) => error,
+                },
             }
         }
         (sequences, Err(refused)) => {
@@ -686,6 +710,19 @@ pub enum StatusFailure {
     ChainQueryFailed(NetworkError),
 }
 
+/// Logs the refusal without inferring release state from the failed call.
+pub(crate) fn warn_status_recovery_refusal(
+    profile_name: &str,
+    error: &crate::policy_state::RecoveryError,
+) {
+    tracing::warn!(
+        profile = %profile_name,
+        code = error.code(),
+        error = %error,
+        "transaction status: recovery refused; completed work remains committed"
+    );
+}
+
 /// Reconciles one transaction and reads its resulting receipt and reservation.
 /// Mainnet recovery and accounting delivery use the caller's audit writer.
 ///
@@ -784,12 +821,7 @@ pub async fn transaction_status(
                 sequences = "refused";
                 // The status answer stands; the drain below runs as on the
                 // refused reconciliation path.
-                tracing::warn!(
-                    profile = %profile_name,
-                    code = error.code(),
-                    error = %error,
-                    "transaction status: recovery refused; unresolved sequences stay held"
-                );
+                warn_status_recovery_refusal(profile_name, &error);
             }
         }
     }
