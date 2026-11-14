@@ -1522,7 +1522,7 @@ pub struct OpenAuthorization {
 // Transitions
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn pin_refusal(error: PinError) -> WindowStoreError {
+pub(super) fn pin_refusal(error: PinError) -> WindowStoreError {
     match error {
         PinError::InstallationKeyCoordinate => WindowStoreError::InstallationKeyCoordinate,
         PinError::Absent => refused(MainnetPrecondition::PolicyPinAbsent),
