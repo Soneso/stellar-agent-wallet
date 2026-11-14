@@ -6259,7 +6259,7 @@ mod tests {
             assert_eq!(auth.expires_at_ms(), expected, "{ttl_ms}");
             assert_eq!(auth.entries(), holds.as_slice(), "{ttl_ms}");
             let wire = f.wire();
-            assert_eq!(wire["version"], 10);
+            assert_eq!(wire["version"], 12);
             let record = wire["authorizations"]
                 .as_array()
                 .unwrap()

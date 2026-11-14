@@ -2192,6 +2192,38 @@ pub enum ValidationError {
         open: usize,
     },
 
+    /// Total-budget accounting cannot read the policy pin. The window may be
+    /// empty.
+    ///
+    /// # Wire code
+    ///
+    /// `"policy.total_epoch_unavailable"`.
+    #[error("total-budget accounting requires a readable policy pin ({detail})")]
+    TotalEpochUnavailable {
+        /// Why the pin cannot be read.
+        detail: String,
+    },
+
+    /// A total-budget debit names a policy other than the pinned one.
+    ///
+    /// # Wire code
+    ///
+    /// `"policy.total_epoch_stale"`.
+    #[error("the total-budget debit was sized under a policy other than the pinned one")]
+    TotalEpochStale,
+
+    /// The policy pinned when an earlier build's spending window was loaded
+    /// admits no further total-budget debit.
+    ///
+    /// # Wire code
+    ///
+    /// `"policy.total_epoch_retired"`.
+    #[error(
+        "the spending window cannot account for total-budget debits recorded by an earlier \
+         build; sign and install a new policy"
+    )]
+    TotalEpochRetired,
+
     /// The reset refuses while approvals remain inside their waiting windows.
     ///
     /// # Wire code
@@ -2475,6 +2507,9 @@ impl ValidationError {
             Self::OperationBusinessIdConflict => "operation.business_id_conflict",
             Self::OperationBusinessIdMismatch => "operation.business_id_mismatch",
             Self::ResetOperationsOpen { .. } => "reset.operations_open",
+            Self::TotalEpochUnavailable { .. } => "policy.total_epoch_unavailable",
+            Self::TotalEpochStale => "policy.total_epoch_stale",
+            Self::TotalEpochRetired => "policy.total_epoch_retired",
             Self::ResetApprovalsPending { .. } => "reset.approvals_pending",
             Self::AuditAppendFailed { .. } => "audit.append_failed",
         }
@@ -4667,6 +4702,17 @@ mod tests {
                 "reset.operations_open",
             ),
             (
+                ValidationError::TotalEpochUnavailable {
+                    detail: "absent".to_owned(),
+                },
+                "policy.total_epoch_unavailable",
+            ),
+            (ValidationError::TotalEpochStale, "policy.total_epoch_stale"),
+            (
+                ValidationError::TotalEpochRetired,
+                "policy.total_epoch_retired",
+            ),
+            (
                 ValidationError::ResetApprovalsPending { pending: 2 },
                 "reset.approvals_pending",
             ),
@@ -5003,6 +5049,13 @@ mod tests {
                 ValidationError::ResetOperationsOpen { open } => {
                     ValidationError::ResetOperationsOpen { open: *open }
                 }
+                ValidationError::TotalEpochUnavailable { detail } => {
+                    ValidationError::TotalEpochUnavailable {
+                        detail: detail.clone(),
+                    }
+                }
+                ValidationError::TotalEpochStale => ValidationError::TotalEpochStale,
+                ValidationError::TotalEpochRetired => ValidationError::TotalEpochRetired,
                 ValidationError::ResetApprovalsPending { pending } => {
                     ValidationError::ResetApprovalsPending { pending: *pending }
                 }
@@ -5905,6 +5958,24 @@ mod tests {
             (
                 ValidationError::ResetOperationsOpen { open: 1 }.into(),
                 "reset.operations_open",
+                ErrorCategory::Validation,
+            ),
+            (
+                ValidationError::TotalEpochUnavailable {
+                    detail: "absent".to_owned(),
+                }
+                .into(),
+                "policy.total_epoch_unavailable",
+                ErrorCategory::Validation,
+            ),
+            (
+                ValidationError::TotalEpochStale.into(),
+                "policy.total_epoch_stale",
+                ErrorCategory::Validation,
+            ),
+            (
+                ValidationError::TotalEpochRetired.into(),
+                "policy.total_epoch_retired",
                 ErrorCategory::Validation,
             ),
             (

@@ -1045,14 +1045,21 @@ fn redact_reference(value: &str) -> String {
     format!("{}...{}", &value[..8], &value[value.len() - 8..])
 }
 
-/// Retains a typed policy refusal across the service's MPP error boundary.
+/// Retains a typed policy refusal, a denial or a total-budget epoch refusal,
+/// across the service's MPP error boundary.
 fn accounting_error(
     error: stellar_agent_network::policy_state::WindowStoreError,
     refusal: &Mutex<Option<WalletError>>,
 ) -> stellar_agent_mpp::BeforeSignError {
-    if let stellar_agent_network::policy_state::WindowStoreError::PolicyDenied { reason } = error {
+    let typed = match error {
+        stellar_agent_network::policy_state::WindowStoreError::PolicyDenied { reason } => {
+            Some(WalletError::PolicyDenied { reason })
+        }
+        other => other.total_epoch_error().map(WalletError::Validation),
+    };
+    if let Some(typed) = typed {
         if let Ok(mut slot) = refusal.lock() {
-            *slot = Some(WalletError::PolicyDenied { reason });
+            *slot = Some(typed);
         }
         stellar_agent_mpp::BeforeSignError::PolicyRefused(state_error())
     } else {
@@ -1350,6 +1357,40 @@ mod tests {
             stellar_agent_mpp::BeforeSignError::Accounting(_)
         ));
         assert!(refusal.lock().expect("refusal lock").is_none());
+    }
+
+    #[test]
+    fn accounting_epoch_refusal_preserves_its_code() {
+        use stellar_agent_network::policy_state::WindowStoreError;
+        for (error, code) in [
+            (
+                WindowStoreError::TotalEpochUnavailable {
+                    detail: "pin unreadable".to_owned(),
+                },
+                "policy.total_epoch_unavailable",
+            ),
+            (
+                WindowStoreError::TotalEpochStale,
+                "policy.total_epoch_stale",
+            ),
+            (
+                WindowStoreError::TotalEpochRetired,
+                "policy.total_epoch_retired",
+            ),
+        ] {
+            let refusal = Mutex::new(None);
+            let classified = accounting_error(error, &refusal);
+            assert!(matches!(
+                classified,
+                stellar_agent_mpp::BeforeSignError::PolicyRefused(_)
+            ));
+            let error = refusal
+                .lock()
+                .expect("refusal lock")
+                .take()
+                .expect("typed epoch refusal");
+            assert_eq!(error.code(), code);
+        }
     }
 
     #[derive(Parser)]

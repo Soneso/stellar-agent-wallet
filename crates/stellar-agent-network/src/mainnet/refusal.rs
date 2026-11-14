@@ -5,7 +5,8 @@
 //! Every refusal reaches an agent as `network.mainnet_authorization_refused`
 //! with a generic text; the precondition is for the operator's log and for
 //! tests. A build without mainnet writes reports
-//! `network.mainnet_write_forbidden` instead.
+//! `network.mainnet_write_forbidden` instead. A total-budget epoch refusal
+//! keeps its own `policy.total_epoch_*` code, because its remedy differs.
 
 use stellar_agent_core::error::{NetworkError, WalletError};
 
@@ -389,6 +390,68 @@ pub enum MainnetAuthorizationError {
     /// A precondition does not hold.
     #[error("mainnet authorization refused: {0}")]
     Refused(MainnetPrecondition),
+    /// The durable total-budget accounting refuses the authorization's holds.
+    #[error("{0}")]
+    TotalEpoch(TotalEpochRefusal),
+}
+
+/// A refusal of the durable total-budget accounting, kept apart from the
+/// generic refusal because each names its own remedy.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum TotalEpochRefusal {
+    /// The policy pin cannot be read.
+    #[error("total-budget accounting requires a readable policy pin ({detail})")]
+    Unavailable {
+        /// Why the pin cannot be read.
+        detail: String,
+    },
+    /// A debit was sized under a policy other than the pinned one.
+    #[error("the total-budget debit was sized under a policy other than the pinned one")]
+    Stale,
+    /// A debit names the digest that an earlier build's state retired.
+    #[error("total-budget debits under this policy need a new signed policy")]
+    Retired,
+}
+
+impl TotalEpochRefusal {
+    /// The refusal a window-store error names, when it is an epoch refusal.
+    #[cfg(feature = "mainnet-write")]
+    #[must_use]
+    pub(crate) fn from_store(error: &crate::policy_state::WindowStoreError) -> Option<Self> {
+        use crate::policy_state::WindowStoreError;
+        match error {
+            WindowStoreError::TotalEpochUnavailable { detail } => Some(Self::Unavailable {
+                detail: detail.clone(),
+            }),
+            WindowStoreError::TotalEpochStale => Some(Self::Stale),
+            WindowStoreError::TotalEpochRetired => Some(Self::Retired),
+            _ => None,
+        }
+    }
+
+    /// The validation error the agent receives.
+    #[must_use]
+    pub fn validation_error(&self) -> stellar_agent_core::error::ValidationError {
+        use stellar_agent_core::error::ValidationError;
+        match self {
+            Self::Unavailable { detail } => ValidationError::TotalEpochUnavailable {
+                detail: detail.clone(),
+            },
+            Self::Stale => ValidationError::TotalEpochStale,
+            Self::Retired => ValidationError::TotalEpochRetired,
+        }
+    }
+
+    /// The stable wire code, one of `policy.total_epoch_*`.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Unavailable { .. } => "policy.total_epoch_unavailable",
+            Self::Stale => "policy.total_epoch_stale",
+            Self::Retired => "policy.total_epoch_retired",
+        }
+    }
 }
 
 impl MainnetAuthorizationError {
@@ -406,7 +469,8 @@ impl MainnetAuthorizationError {
 impl From<MainnetAuthorizationError> for WalletError {
     /// The agent-facing error: the policy's `policy.deny.*` code for a
     /// denial, `network.mainnet_write_forbidden` for a build without mainnet
-    /// writes, and `network.mainnet_authorization_refused` for every refused
+    /// writes, `policy.total_epoch_*` for a total-budget epoch refusal, and
+    /// `network.mainnet_authorization_refused` for every refused
     /// precondition. The precondition does not cross into the error: the
     /// caller logs it.
     fn from(error: MainnetAuthorizationError) -> Self {
@@ -418,6 +482,7 @@ impl From<MainnetAuthorizationError> for WalletError {
             MainnetAuthorizationError::Refused(_) => {
                 WalletError::Network(NetworkError::MainnetAuthorizationRefused)
             }
+            MainnetAuthorizationError::TotalEpoch(refusal) => refusal.validation_error().into(),
         }
     }
 }
@@ -461,6 +526,9 @@ impl From<MainnetAuthorizationError> for AuthorizedPathError {
             MainnetAuthorizationError::FeatureDisabled => {
                 Self::Wallet(WalletError::Network(NetworkError::MainnetWriteForbidden))
             }
+            MainnetAuthorizationError::TotalEpoch(refusal) => {
+                Self::Wallet(refusal.validation_error().into())
+            }
         }
     }
 }
@@ -486,6 +554,34 @@ pub(crate) fn require(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The three epoch refusals of a mint keep their own codes through the
+    /// mint adapter, the wallet conversion, and the authorized path.
+    #[cfg(feature = "mainnet-write")]
+    #[test]
+    fn a_mint_epoch_refusal_keeps_its_code() {
+        use crate::policy_state::WindowStoreError;
+        for (error, code) in [
+            (
+                WindowStoreError::TotalEpochUnavailable {
+                    detail: "pin unreadable".to_owned(),
+                },
+                "policy.total_epoch_unavailable",
+            ),
+            (
+                WindowStoreError::TotalEpochStale,
+                "policy.total_epoch_stale",
+            ),
+            (
+                WindowStoreError::TotalEpochRetired,
+                "policy.total_epoch_retired",
+            ),
+        ] {
+            let refused = super::super::mint::store_error(error);
+            assert_eq!(WalletError::from(refused.clone()).code(), code);
+            assert_eq!(refused.report("mint").code(), code);
+        }
+    }
 
     /// Every precondition, through an exhaustive match so a new variant fails
     /// to compile here until it is listed.

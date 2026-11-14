@@ -61,8 +61,8 @@ use super::operations::{
 };
 use super::store::{
     PersistedWindowStore, RecordStatus, WIRE_VERSION_LEDGER, WireBucket, WireFile, WireRecord,
-    admit, file_holds_id, find_or_insert_bucket, generation_entry_ref, i128_decimal_str, now_ms,
-    prune_stale,
+    admit, check_total_shape, file_holds_id, find_or_insert_bucket, generation_entry_ref,
+    i128_decimal_str, is_total_entry, is_total_hold, now_ms, prune_stale,
 };
 use crate::mainnet::digest::{BindingFacts, bindings_digest};
 use crate::mainnet::digest::{content_digest, entries_digest};
@@ -700,6 +700,10 @@ pub(super) struct WireAuthorizationHold {
     pub(super) ts_ms: u64,
     #[serde(with = "i128_decimal_str")]
     pub(super) amount: i128,
+    /// The policy digest a total-budget hold counts against. Only a hold of
+    /// a total bucket carries one.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_hex32")]
+    pub(super) epoch: Option<[u8; 32]>,
 }
 
 /// Validates the authorization history of one snapshot.
@@ -909,6 +913,8 @@ fn sweep(wire: &mut WireFile, now_ms: u64, commit: CommitId, scope: SweepScope) 
                         chain_scope: Some(super::store::ChainScope::for_chain(auth.chain)),
                         ts_ms: spent_ms,
                         amount: hold.amount,
+                        epoch: hold.epoch,
+                        authorization_id: hold.epoch.map(|_| auth.id),
                         ..WireRecord::confirmed_defaults()
                     },
                 );
@@ -995,6 +1001,110 @@ pub(super) fn reset_survivors(wire: &WireFile, now_ms: u64) -> Vec<WireAuthoriza
             Some(kept)
         })
         .collect()
+}
+
+/// Releases the total-budget debits of authorization `auth_id`, whose
+/// transaction a checked recovery decision proves failed or never included.
+///
+/// Every counted total row the authorization wrote becomes `proved_unspent`
+/// and keeps its amount for audit. An authorization that still holds is
+/// settled as expired at `now_ms`: its total holds become `proved_unspent`
+/// rows, and its other holds become confirmed spend dated at the claim, as an
+/// expiry retains them. Rows and holds of every other authorization stay. A
+/// repeated call changes nothing.
+pub(super) fn release_total_debits(wire: &mut WireFile, auth_id: AuthorizationId, now_ms: u64) {
+    let holding = wire
+        .authorizations
+        .iter()
+        .find(|auth| auth.id == auth_id && auth.state.holds())
+        .map(|auth| (auth.chain, auth.claimed_ms.unwrap_or(auth.minted_ms)));
+    if let Some((chain, spent_ms)) = holding
+        && wire
+            .holds
+            .iter()
+            .any(|hold| hold.authorization_id == auth_id && is_total_hold(hold))
+    {
+        let holds: Vec<WireAuthorizationHold> = wire
+            .holds
+            .iter()
+            .filter(|hold| hold.authorization_id == auth_id)
+            .cloned()
+            .collect();
+        for hold in &holds {
+            let total = is_total_hold(hold);
+            retain_hold(
+                &mut wire.entries,
+                hold,
+                WireRecord {
+                    chain_scope: Some(super::store::ChainScope::for_chain(chain)),
+                    ts_ms: spent_ms,
+                    amount: hold.amount,
+                    status: if total {
+                        RecordStatus::ProvedUnspent
+                    } else {
+                        RecordStatus::Confirmed
+                    },
+                    epoch: hold.epoch,
+                    authorization_id: hold.epoch.map(|_| auth_id),
+                    ..WireRecord::confirmed_defaults()
+                },
+            );
+        }
+        wire.holds.retain(|hold| hold.authorization_id != auth_id);
+        if let Some(auth) = wire
+            .authorizations
+            .iter_mut()
+            .find(|auth| auth.id == auth_id)
+        {
+            auth.state = AuthorizationState::Expired;
+            auth.settled_ms = Some(now_ms);
+        }
+    }
+    for bucket in wire
+        .entries
+        .iter_mut()
+        .filter(|bucket| super::store::is_total_budget_bucket(bucket))
+    {
+        for record in &mut bucket.records {
+            if record.authorization_id == Some(auth_id) {
+                record.status = RecordStatus::ProvedUnspent;
+            }
+        }
+    }
+}
+
+/// Converts each total-budget hold of `original` into the reset successor's
+/// `entries` once. A hold of a claimed authorization, or of one a committed
+/// exposure names, becomes counted spend dated at the claim, or at the mint
+/// when no claim is recorded. An unclaimed, unexposed hold is released. The
+/// conversion reads the holds of `original`, so an authorization the reset
+/// drops still keeps its counted spend.
+pub(super) fn retain_total_holds_on_reset(original: &WireFile, entries: &mut Vec<WireBucket>) {
+    let exposed = operations::exposed_authorizations(original);
+    for hold in original.holds.iter().filter(|hold| is_total_hold(hold)) {
+        let Some(auth) = original
+            .authorizations
+            .iter()
+            .find(|auth| auth.id == hold.authorization_id)
+        else {
+            continue;
+        };
+        if auth.claimed_ms.is_none() && !exposed.contains(&auth.id) {
+            continue;
+        }
+        retain_hold(
+            entries,
+            hold,
+            WireRecord {
+                chain_scope: Some(super::store::ChainScope::for_chain(auth.chain)),
+                ts_ms: auth.claimed_ms.unwrap_or(auth.minted_ms),
+                amount: hold.amount,
+                epoch: hold.epoch,
+                authorization_id: hold.epoch.map(|_| auth.id),
+                ..WireRecord::confirmed_defaults()
+            },
+        );
+    }
 }
 
 /// Whether `auth` is open or claimed and inside its lifetime at `now_ms`.
@@ -1688,6 +1798,8 @@ fn apply_consumption(
                         .saturating_mul(1000)
                         .saturating_add(hold.window_secs.saturating_mul(1000))
                 }),
+                epoch: hold.epoch,
+                authorization_id: hold.epoch.map(|_| id),
                 ..WireRecord::confirmed_defaults()
             },
             // Retained authorized spend: confirmed at the moment the store
@@ -1695,6 +1807,8 @@ fn apply_consumption(
             _ => WireRecord {
                 ts_ms: now,
                 amount: hold.amount,
+                epoch: hold.epoch,
+                authorization_id: hold.epoch.map(|_| id),
                 ..WireRecord::confirmed_defaults()
             },
         };
@@ -1737,6 +1851,16 @@ pub(super) fn mint_into(
     options: MintOptions,
 ) -> Result<MintedRecord, WindowStoreError> {
     use MainnetPrecondition as P;
+    // Both public mint entries ran `check_total_shape` before their lock.
+    // The mint's prechecks compared `policy_digest` with the pin under the
+    // lock, so a total hold binds to the pin through it.
+    if request
+        .holds
+        .iter()
+        .any(|entry| is_total_entry(entry) && entry.epoch() != Some(request.policy_digest))
+    {
+        return Err(WindowStoreError::TotalEpochStale);
+    }
     let domain = request.binding.domain();
     let content = request.binding.content_digest();
     check(
@@ -1821,6 +1945,11 @@ pub(super) fn mint_into(
                     window_secs: entry_key.window_secs(),
                     ts_ms: entry.timestamp_ms(),
                     amount: entry.amount(),
+                    epoch: if is_total_entry(entry) {
+                        entry.epoch()
+                    } else {
+                        None
+                    },
                 });
             }
             Some(id)
@@ -1955,6 +2084,8 @@ impl PersistedWindowStore {
         profile: &Profile,
         request: &MintRequest,
     ) -> Result<MintedRecord, WindowStoreError> {
+        // A malformed entry refuses before the lock, the key, and any read.
+        check_total_shape(&request.holds)?;
         let lock = self.ledger_lock(profile)?;
         let now = now_ms()?;
         let expires = self.mint_prechecks(&lock, profile, request, now)?;
@@ -1966,7 +2097,7 @@ impl PersistedWindowStore {
         if let Some(hook) = MINT_AFTER_READ.with_borrow_mut(Option::take) {
             hook();
         }
-        let mut wire = original.clone();
+        let mut wire = self.retired_successor(&lock, profile, &original)?;
         sweep_expired(&mut wire, now);
         let minted = mint_into(
             &mut wire,
@@ -2103,7 +2234,7 @@ impl PersistedWindowStore {
         check(as_read.state == AuthorizationState::Open, P::NotOpen)?;
         check(as_read.minted_ms <= now, P::NotYetValid)?;
         check(now < as_read.expires_ms, P::Expired)?;
-        let mut wire = original.clone();
+        let mut wire = self.retired_successor(&lock, profile, &original)?;
         sweep_expired(&mut wire, now);
         let auth = wire
             .authorizations
@@ -2156,6 +2287,42 @@ impl PersistedWindowStore {
         receipts.pop().ok_or_else(|| WindowStoreError::Invalid {
             detail: "a consumption returned no receipt".to_owned(),
         })
+    }
+
+    /// Consumes one authorization for the recorder about to send a
+    /// transaction's bytes, as [`Self::consume_authorization`] does, or with
+    /// `exposure` as [`Self::consume_authorization_exposing`] does.
+    ///
+    /// A transaction binding also returns the capability of the reservation
+    /// its holds became, named by the binding's envelope hash. Only the
+    /// recorder that holds it before the bytes leave can release that
+    /// reservation's total-budget debits.
+    ///
+    /// # Errors
+    ///
+    /// The errors of the two consumptions.
+    pub(crate) fn consume_authorization_unsent(
+        &self,
+        profile: &Profile,
+        id: AuthorizationId,
+        expect: &ConsumeExpect,
+        binding: &ConsumptionBinding,
+        exposure: Option<super::operations::ConsumptionExposure<'_>>,
+    ) -> Result<(ConsumeReceipt, Option<super::store::UnsentReservation>), WindowStoreError> {
+        let mut receipts =
+            self.consume_batch(profile, &[(id, expect.clone(), binding.clone())], exposure)?;
+        let receipt = receipts.pop().ok_or_else(|| WindowStoreError::Invalid {
+            detail: "a consumption returned no receipt".to_owned(),
+        })?;
+        let unsent = match binding {
+            ConsumptionBinding::Transaction(submission) => {
+                Some(super::store::UnsentReservation::of_reservation(
+                    stellar_agent_core::hex::encode(&submission.envelope_hash),
+                ))
+            }
+            _ => None,
+        };
+        Ok((receipt, unsent))
     }
 
     /// Consumes one authorization and commits the exposure of the operation
@@ -2241,7 +2408,7 @@ impl PersistedWindowStore {
         let (key, _mint) = self.load_or_mint_key(profile)?;
         let gen_entry = generation_entry_ref(profile);
         let original = self.read_verified(profile, &key, &gen_entry)?;
-        let mut wire = original.clone();
+        let mut wire = self.retired_successor(&lock, profile, &original)?;
         sweep_expired(&mut wire, now);
         let scope = PinScope::for_profile(self.path(), profile);
         let mut receipts = Vec::with_capacity(batch.len());
@@ -2329,7 +2496,7 @@ impl PersistedWindowStore {
         let (key, _mint) = self.load_or_mint_key(profile)?;
         let gen_entry = generation_entry_ref(profile);
         let original = self.read_verified(profile, &key, &gen_entry)?;
-        let mut wire = original.clone();
+        let mut wire = self.retired_successor(&lock, profile, &original)?;
         let swept = sweep_expired(&mut wire, now);
         let auth = wire
             .authorizations
@@ -2876,10 +3043,13 @@ mod tests {
         let l = Ledger::new();
         let request = l.request(tx(1), vec![hold(70)]);
         let minted = l.mint(&request).unwrap();
-        assert_eq!(l.wire().version, super::super::store::WIRE_VERSION_CHAIN);
+        assert_eq!(
+            l.wire().version,
+            super::super::store::WIRE_VERSION_TOTAL_EPOCH
+        );
         l.claim(&request, &minted).unwrap();
         let wire = l.wire();
-        assert_eq!(wire.version, super::super::store::WIRE_VERSION_CLAIM);
+        assert_eq!(wire.version, super::super::store::WIRE_VERSION_TOTAL_EPOCH);
         let reopened = PersistedWindowStore::at_path(l.store.path().to_path_buf());
         let read = reopened.read_for_inspection(&l.profile).unwrap().unwrap();
         assert_eq!(read.authorizations, wire.authorizations);
@@ -3266,7 +3436,7 @@ mod tests {
         assert_eq!(reservation.profile(), l.name());
 
         let wire = l.wire();
-        assert_eq!(wire.version, 5);
+        assert_eq!(wire.version, 12);
         let record = l.record(minted.id);
         assert_eq!(record.state, AuthorizationState::Open);
         assert_eq!(record.domain, AuthorizationDomain::Transaction);
@@ -3461,7 +3631,7 @@ mod tests {
                     .unwrap();
             }
             let wire = l.store.read_for_inspection(&l.profile).unwrap().unwrap();
-            assert_eq!(wire.version, 5);
+            assert_eq!(wire.version, 12);
             let body = serde_json::to_value(&wire).unwrap();
             assert!(body.get("approvals").is_none());
             assert_eq!(
@@ -4571,7 +4741,7 @@ mod tests {
         let minted = l.mint(&request).unwrap();
         l.consume(&request, &minted, &consumption_of(&request.binding))
             .unwrap();
-        assert_eq!(l.wire().version, 5, "settled history retains its scope");
+        assert_eq!(l.wire().version, 12, "settled history retains its scope");
 
         l.clock.set(T0 + RETENTION_MS);
         l.store.record_and_persist(&l.profile, &[hold(1)]).unwrap();
@@ -4589,7 +4759,7 @@ mod tests {
         let wire = l.wire();
         assert!(wire.authorizations.is_empty());
         assert_eq!(
-            wire.version, 5,
+            wire.version, 12,
             "pruning retains authenticated network scope"
         );
         let body: serde_json::Value = serde_json::from_slice(&l.bytes()[32..]).unwrap();
@@ -5044,6 +5214,7 @@ mod tests {
             window_secs: 86_400,
             ts_ms: 0,
             amount: 1,
+            epoch: None,
         }
     }
 
@@ -6654,8 +6825,8 @@ mod tests {
         }
     }
 
-    /// The file is written as version 10 exactly when a record carries a
-    /// policy authority, and a lower version carrying one refuses the read.
+    /// Every successor is written as version 12, with or without a policy
+    /// authority, and a version below 10 carrying one refuses the read.
     #[test]
     #[serial]
     fn version_ten_only_with_policy_authority() {
@@ -6663,11 +6834,15 @@ mod tests {
         let approval = l.request(tx(1), vec![hold(5)]);
         l.mint(&approval).unwrap();
         let version = l.wire().version;
-        assert!(version < WIRE_VERSION_POLICY_AUTHORITY, "{version}");
+        assert_eq!(
+            version,
+            super::super::store::WIRE_VERSION_TOTAL_EPOCH,
+            "{version}"
+        );
         let policy = under_policy(l.request(tx(2), vec![hold(5)]), T0 + APPROVAL_MS);
         let minted = l.mint(&policy).unwrap();
         let wire = l.wire();
-        assert_eq!(wire.version, WIRE_VERSION_POLICY_AUTHORITY);
+        assert_eq!(wire.version, super::super::store::WIRE_VERSION_TOTAL_EPOCH);
         let record = l.record(minted.id);
         assert_eq!(record.approval_nonce, None);
         assert_eq!(record.approval_expires_ms, None);
@@ -7134,7 +7309,7 @@ mod tests {
     }
 
     /// A record minted without amounts keeps them absent: its bytes hold no
-    /// amount field, round-trip unchanged and select no newer version.
+    /// amount field and round-trip unchanged.
     #[test]
     #[serial]
     fn legacy_authorization_without_amounts_keeps_its_bytes() {
@@ -7148,7 +7323,10 @@ mod tests {
         assert!(!bytes.contains("native_reservation"), "{bytes}");
         let back: WireAuthorization = serde_json::from_str(&bytes).unwrap();
         assert_eq!(serde_json::to_string(&back).unwrap(), bytes);
-        assert!(l.wire().version < WIRE_VERSION_POLICY_AUTHORITY);
+        assert_eq!(
+            l.wire().version,
+            super::super::store::WIRE_VERSION_TOTAL_EPOCH
+        );
         assert_eq!(
             super::super::operations::native_reserved(&l.wire(), None),
             0
@@ -7554,5 +7732,1021 @@ mod tests {
             .find(|auth| auth.id == minted.id)
             .unwrap();
         assert_eq!(stored.operation, Some(link));
+    }
+
+    /// Total-budget accounting on the mainnet authorization path: the gate
+    /// of an engine hydrated from the window file, and the durable admission
+    /// `resolve::tx` runs after it, each checked on its own.
+    mod total_budget {
+        use super::super::super::store::{retire_earlier_build, total_in_file};
+        use super::*;
+        use ed25519_dalek::{Signer as _, SigningKey};
+        use stellar_agent_core::policy::v1::PolicyEngineV1;
+        use stellar_agent_core::policy::v1::canonical::canonical_bytes;
+        use stellar_agent_core::policy::v1::criteria::state_store::set_query_time_for_test;
+        use stellar_agent_core::policy::v1::loader::load_signed_policy_text;
+        use stellar_agent_core::policy::v1::signature::digest;
+        use stellar_agent_core::policy::v1::value::{ActionKind, ValueClass, ValueLeg};
+        use stellar_agent_core::policy::{
+            Decision, DenyReason, McpToolRegistration, PolicyEngine as _, ToolDescriptor,
+            ToolValueKind,
+        };
+
+        const DEST: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
+        /// Past every horizon the store knows: retention, the exposure
+        /// horizon, and the authorization and approval lifetimes.
+        const LATE: u64 = T0 + RETENTION_MS + 30 * 86_400_000;
+        /// The fixture's pinned digest, which `Ledger::request` names.
+        const P7: [u8; 32] = [7; 32];
+
+        fn owner() -> SigningKey {
+            SigningKey::from_bytes(&[11; 32])
+        }
+
+        struct Policy {
+            text: String,
+            digest: [u8; 32],
+            sequence: i64,
+        }
+
+        /// A signed v2 policy with a native `total_budget` of 10.
+        fn policy(sequence: i64) -> Policy {
+            let body = format!(
+                "version = 2\nscope = \"profile:ledger\"\nsequence = {sequence}\n\n\
+                 [[rules]]\nmatch = {{ tool = \"stellar_pay\", chain = \"*\" }}\n\
+                 criteria = [{{ kind = \"total_budget\", asset = \"native\", max_stroops = 10 }}]\n\
+                 decision = \"allow\"\n"
+            );
+            let d = digest(&canonical_bytes(&body).unwrap());
+            let key = owner();
+            let text = format!(
+                "{body}\n[signature]\nowner_id = \"{}\"\nsig = \"{}\"\n",
+                stellar_strkey::ed25519::PublicKey(key.verifying_key().to_bytes()),
+                stellar_agent_core::hex::encode(&key.sign(&d).to_bytes())
+            );
+            Policy {
+                text,
+                digest: d,
+                sequence,
+            }
+        }
+
+        fn pay_tool() -> ToolDescriptor {
+            ToolDescriptor::from_registration(&McpToolRegistration {
+                name: "stellar_pay",
+                destructive_hint: true,
+                read_only_hint: false,
+                chain_id_required: true,
+                value_kind: ToolValueKind::MovesValue,
+            })
+        }
+
+        fn payment(amount: i128) -> ValueClass {
+            ValueClass::single(ValueLeg {
+                kind: ActionKind::Payment,
+                amount: Some(amount),
+                asset: Some("native".to_owned()),
+                destination: Some(DEST.to_owned()),
+            })
+        }
+
+        /// The engine a CLI process builds, or an MCP dispatch refreshes:
+        /// the window file hydrated into a fresh in-memory store.
+        fn hydrated(l: &Ledger, store: &PersistedWindowStore, p: &Policy) -> PolicyEngineV1 {
+            let memory = PolicyStateStore::new();
+            store.load_into("ledger", &l.profile, &memory).unwrap();
+            let document = load_signed_policy_text(
+                &p.text,
+                "ledger",
+                &owner().verifying_key().to_bytes(),
+                &l.profile.network_passphrase,
+            )
+            .unwrap();
+            PolicyEngineV1::new_with_store(document, "ledger".to_owned(), memory)
+                .with_policy_digest_for_test(p.digest)
+        }
+
+        fn gate(engine: &PolicyEngineV1, l: &Ledger, amount: i128, now: u64) -> Decision {
+            let _q = set_query_time_for_test(now);
+            engine
+                .evaluate_with_value_full(
+                    &pay_tool(),
+                    &serde_json::Value::Null,
+                    &l.profile,
+                    payment(amount),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    now,
+                )
+                .unwrap()
+                .decision
+        }
+
+        fn gate_denies(decision: &Decision) -> bool {
+            matches!(
+                decision,
+                Decision::Deny(DenyReason::TotalBudgetExhausted { .. })
+            )
+        }
+
+        fn durable_denies<T>(result: &Result<T, WindowStoreError>) -> bool {
+            matches!(
+                result,
+                Err(WindowStoreError::PolicyDenied { reason })
+                    if matches!(**reason, DenyReason::TotalBudgetExhausted { .. })
+            )
+        }
+
+        /// The engine's sized holds for `amount`, minted under `p` at `now`
+        /// for `binding`.
+        fn admit_holds(
+            l: &Ledger,
+            store: &PersistedWindowStore,
+            engine: &PolicyEngineV1,
+            p: &Policy,
+            binding: DomainBinding,
+            amount: i128,
+            now: u64,
+        ) -> (MintRequest, Result<MintedRecord, WindowStoreError>) {
+            let holds = engine
+                .size_window_entries(&pay_tool(), &l.profile, &payment(amount), now)
+                .unwrap();
+            assert_eq!(holds.len(), 1, "one total hold");
+            assert_eq!(holds[0].epoch(), Some(p.digest));
+            let mut request = l.request(binding, holds);
+            request.policy_sequence = p.sequence;
+            request.policy_digest = p.digest;
+            *request.authority.approval_expiry_mut() = now + APPROVAL_MS;
+            let minted = store.mint_authorization(&l.profile, &request);
+            (request, minted)
+        }
+
+        /// Both layers at `now` for `amount`, through a fresh hydration.
+        fn both(l: &Ledger, p: &Policy, n: u8, amount: i128, now: u64) -> (Decision, bool) {
+            l.clock.set(now);
+            let engine = hydrated(l, &l.store, p);
+            let decision = gate(&engine, l, amount, now);
+            let (_, minted) = admit_holds(l, &l.store, &engine, p, tx(n), amount, now);
+            assert!(
+                minted.is_ok() || durable_denies(&minted),
+                "unexpected {minted:?}"
+            );
+            (decision, minted.is_ok())
+        }
+
+        fn assert_denied((decision, admitted): (Decision, bool), label: &str) {
+            assert!(gate_denies(&decision), "{label}: gate {decision:?}");
+            assert!(!admitted, "{label}: the durable admission admits");
+        }
+
+        fn assert_admitted((decision, admitted): (Decision, bool), label: &str) {
+            assert_eq!(decision, Decision::Allow, "{label}: gate");
+            assert!(admitted, "{label}: the durable admission refuses");
+        }
+
+        /// Pays 6 under `p`: gate, mint, consume, confirm, and record.
+        fn first_payment(l: &Ledger, p: &Policy) -> PolicyEngineV1 {
+            let engine = hydrated(l, &l.store, p);
+            assert_eq!(gate(&engine, l, 6, T0), Decision::Allow);
+            let (request, minted) = admit_holds(l, &l.store, &engine, p, tx(1), 6, T0);
+            let minted = minted.unwrap();
+            l.clock.set(T0 + 50);
+            l.consume(&request, &minted, &consumption_of(&request.binding))
+                .unwrap();
+            l.clock.set(T0 + 100);
+            let envelope = stellar_agent_core::hex::encode(&[(1_u8 ^ 0x80) ^ 0x5a; 32]);
+            l.store
+                .confirm(&l.profile, &envelope, Some(1_800_000_000))
+                .unwrap();
+            let _q = set_query_time_for_test(T0 + 100);
+            engine
+                .record_confirmed_checked(&pay_tool(), &l.profile, &payment(6))
+                .unwrap();
+            engine
+        }
+
+        /// A total entry of `amount` under `epoch` against a limit of 10.
+        fn total(amount: i128, epoch: [u8; 32]) -> WindowEntry {
+            total_in("total:native", amount, epoch)
+        }
+
+        fn total_in(bucket: &str, amount: i128, epoch: [u8; 32]) -> WindowEntry {
+            WindowEntry::new(
+                StateKey::new("ledger", 1, bucket, 0),
+                T0,
+                amount,
+                WindowLimit::Total {
+                    asset: "native".to_owned(),
+                    max_stroops: 10,
+                },
+            )
+            .with_epoch(Some(epoch))
+        }
+
+        /// The total an ordinary writer admits against at `now`: the file
+        /// after the sweep that writer commits before it counts.
+        fn sum(l: &Ledger, epoch: [u8; 32], now: u64) -> i128 {
+            let mut wire = l.wire();
+            sweep_expired(&mut wire, now);
+            total_in_file(&wire, &StateKey::new("ledger", 1, "total:native", 0), epoch)
+                .unwrap()
+                .0
+        }
+
+        // ── probes on the mainnet route ──────────────────────────────────
+
+        #[test]
+        #[serial]
+        fn total_survives_the_mcp_refresh() {
+            let l = Ledger::new();
+            let p = policy(7);
+            l.pin(p.sequence, p.digest);
+            let engine = first_payment(&l, &p);
+            l.clock.set(LATE);
+            engine.state_store().clear().unwrap();
+            l.store
+                .load_into("ledger", &l.profile, engine.state_store())
+                .unwrap();
+            assert_eq!(
+                gate(&engine, &l, 6, LATE),
+                Decision::Deny(DenyReason::TotalBudgetExhausted {
+                    asset: "native".to_owned(),
+                    max_stroops: 10,
+                    remaining_stroops: 4,
+                })
+            );
+            let (_, minted) = admit_holds(&l, &l.store, &engine, &p, tx(4), 6, LATE);
+            assert!(durable_denies(&minted), "{minted:?}");
+        }
+
+        #[test]
+        #[serial]
+        fn total_survives_a_reopen_past_every_horizon() {
+            let l = Ledger::new();
+            let p = policy(7);
+            l.pin(p.sequence, p.digest);
+            drop(first_payment(&l, &p));
+            for (n, now) in [(2_u8, T0 + 1_000), (3, T0 + 300_001), (4, LATE)] {
+                l.clock.set(now);
+                let reopened = PersistedWindowStore::at_path(l.store.path().to_owned());
+                let engine = hydrated(&l, &reopened, &p);
+                let decision = gate(&engine, &l, 6, now);
+                let (_, minted) = admit_holds(&l, &reopened, &engine, &p, tx(n), 6, now);
+                assert!(gate_denies(&decision), "{now}: {decision:?}");
+                assert!(durable_denies(&minted), "{now}: {minted:?}");
+            }
+        }
+
+        #[test]
+        #[serial]
+        fn a_new_epoch_starts_at_zero() {
+            let l = Ledger::new();
+            let first = policy(7);
+            l.pin(first.sequence, first.digest);
+            drop(first_payment(&l, &first));
+            let resigned = policy(8);
+            assert_ne!(resigned.digest, first.digest);
+            l.pin(resigned.sequence, resigned.digest);
+            assert_denied(both(&l, &resigned, 2, 11, T0 + 1_000), "11 under D2");
+            assert_admitted(both(&l, &resigned, 3, 10, T0 + 1_000), "10 under D2");
+        }
+
+        #[test]
+        #[serial]
+        fn an_expired_signed_claim_stays_counted() {
+            let l = Ledger::new();
+            let p = policy(7);
+            l.pin(p.sequence, p.digest);
+            let engine = hydrated(&l, &l.store, &p);
+            let (request, minted) = admit_holds(&l, &l.store, &engine, &p, tx(1), 6, T0);
+            let minted = minted.unwrap();
+            l.clock.set(T0 + 7);
+            l.claim(&request, &minted).unwrap();
+            assert_denied(
+                both(&l, &p, 2, 6, minted.expires_at_ms + 1),
+                "expired claim",
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn an_unresolved_send_stays_counted() {
+            let l = Ledger::new();
+            let p = policy(7);
+            l.pin(p.sequence, p.digest);
+            let engine = hydrated(&l, &l.store, &p);
+            let (request, minted) = admit_holds(&l, &l.store, &engine, &p, tx(1), 6, T0);
+            let minted = minted.unwrap();
+            l.clock.set(T0 + 50);
+            l.consume(&request, &minted, &consumption_of(&request.binding))
+                .unwrap();
+            assert_denied(both(&l, &p, 2, 6, T0 + 1_000), "within maxTime");
+            assert_denied(both(&l, &p, 3, 6, T0 + 300_001), "past maxTime");
+            let reservation = l.store.pending_reservations(&l.profile).unwrap().remove(0);
+            l.clock.set(T0 + 300_002);
+            l.store
+                .expire_accounting(&l.profile, None, &reservation, T0 + 300_002)
+                .unwrap()
+                .unwrap();
+            assert_denied(both(&l, &p, 4, 6, T0 + 300_003), "after accounting expiry");
+        }
+
+        #[test]
+        #[serial]
+        fn an_unused_hold_releases() {
+            let l = Ledger::new();
+            let p = policy(7);
+            l.pin(p.sequence, p.digest);
+            let engine = hydrated(&l, &l.store, &p);
+            admit_holds(&l, &l.store, &engine, &p, tx(1), 6, T0)
+                .1
+                .unwrap();
+            assert_denied(both(&l, &p, 2, 6, T0 + 1_000), "while open");
+            assert_admitted(both(&l, &p, 3, 6, T0 + TTL_MS + 1), "after the TTL");
+        }
+
+        #[test]
+        #[serial]
+        fn concurrent_admissions_admit_one() {
+            let l = Ledger::new();
+            let p = policy(7);
+            l.pin(p.sequence, p.digest);
+            let engines = [hydrated(&l, &l.store, &p), hydrated(&l, &l.store, &p)];
+            assert_eq!(gate(&engines[0], &l, 6, T0), Decision::Allow);
+            assert_eq!(gate(&engines[1], &l, 6, T0), Decision::Allow);
+            let path = l.store.path().to_owned();
+            let barrier = std::sync::Barrier::new(2);
+            let requests: Vec<MintRequest> = [(1_u8, &engines[0]), (2_u8, &engines[1])]
+                .into_iter()
+                .map(|(n, engine)| {
+                    let holds = engine
+                        .size_window_entries(&pay_tool(), &l.profile, &payment(6), T0)
+                        .unwrap();
+                    let mut request = l.request(tx(n), holds);
+                    request.policy_sequence = p.sequence;
+                    request.policy_digest = p.digest;
+                    request
+                })
+                .collect();
+            let profile = l.profile.clone();
+            let results: Vec<_> = std::thread::scope(|scope| {
+                let handles: Vec<_> = requests
+                    .iter()
+                    .map(|request| {
+                        let path = path.clone();
+                        let barrier = &barrier;
+                        let profile = &profile;
+                        scope.spawn(move || {
+                            let store = PersistedWindowStore::at_path(path);
+                            barrier.wait();
+                            store.mint_authorization(profile, request).map(|_| ())
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            let admitted = results.iter().filter(|r| r.is_ok()).count();
+            assert!(
+                admitted <= 1,
+                "both admissions of 6 against 10: {results:?}"
+            );
+            if admitted == 1 {
+                assert_denied(both(&l, &p, 3, 6, T0 + 10), "the retry");
+            }
+        }
+
+        // ── durable admission ────────────────────────────────────────────
+
+        /// Mints a Soroban total hold of 6 under `p` and consumes it into
+        /// retained spend.
+        fn retained_spend(l: &Ledger, p: &Policy) {
+            let engine = hydrated(l, &l.store, p);
+            let (request, minted) = admit_holds(l, &l.store, &engine, p, soroban(1), 6, T0);
+            let minted = minted.unwrap();
+            l.consume(&request, &minted, &consumption_of(&request.binding))
+                .unwrap();
+            let rows: Vec<_> = l
+                .wire()
+                .entries
+                .iter()
+                .filter(|bucket| bucket.bucket == "total:native")
+                .flat_map(|bucket| bucket.records.clone())
+                .collect();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].status, RecordStatus::Confirmed);
+            assert_eq!(rows[0].epoch, Some(p.digest));
+        }
+
+        #[test]
+        #[serial]
+        fn total_rows_survive_successful_pruning() {
+            let l = Ledger::new();
+            let p = policy(7);
+            l.pin(p.sequence, p.digest);
+            retained_spend(&l, &p);
+            l.clock.set(LATE);
+            let late = WindowEntry::new(hold(1).key().clone(), LATE, 1, hold(1).limit().clone());
+            l.store.record_and_persist(&l.profile, &[late]).unwrap();
+            assert_eq!(sum(&l, p.digest, LATE), 6, "the total row remains");
+            assert_denied(both(&l, &p, 2, 6, LATE), "after pruning");
+        }
+
+        #[test]
+        #[serial]
+        fn an_x402_consume_stays_counted() {
+            let l = Ledger::new();
+            let p = policy(7);
+            l.pin(p.sequence, p.digest);
+            retained_spend(&l, &p);
+            l.clock.set(LATE);
+            let late = WindowEntry::new(hold(1).key().clone(), LATE, 1, hold(1).limit().clone());
+            l.store.record_and_persist(&l.profile, &[late]).unwrap();
+            assert_denied(both(&l, &p, 2, 6, LATE), "after a later write");
+        }
+
+        #[test]
+        #[serial]
+        fn assets_are_isolated_within_one_digest() {
+            let l = Ledger::new();
+            l.mint(&l.request(tx(1), vec![total(6, P7)])).unwrap();
+            let other = format!("total:{DEST}");
+            l.mint(&l.request(tx(2), vec![total_in(&other, 10, P7)]))
+                .unwrap();
+        }
+
+        #[test]
+        #[serial]
+        fn open_holds_stay_in_their_epoch() {
+            let l = Ledger::new();
+            l.mint(&l.request(tx(1), vec![total(6, P7)])).unwrap();
+            l.pin(8, [8; 32]);
+            let mut request = l.request(tx(2), vec![total(10, [8; 32])]);
+            request.policy_sequence = 8;
+            request.policy_digest = [8; 32];
+            l.mint(&request).unwrap();
+        }
+
+        #[test]
+        #[serial]
+        fn an_invalidated_hold_releases() {
+            let l = Ledger::new();
+            let minted = l.mint(&l.request(tx(1), vec![total(6, P7)])).unwrap();
+            assert!(
+                l.store
+                    .invalidate_authorization(&l.profile, minted.id, "cancel")
+                    .unwrap()
+            );
+            l.mint(&l.request(tx(2), vec![total(10, P7)])).unwrap();
+        }
+
+        #[test]
+        #[serial]
+        fn a_mint_binds_the_hold_epoch() {
+            let l = Ledger::new();
+            let before = l.store.path().exists();
+            assert!(matches!(
+                l.mint(&l.request(tx(1), vec![total(6, [8; 32])])),
+                Err(WindowStoreError::TotalEpochStale)
+            ));
+            assert!(matches!(
+                l.mint(&l.request(tx(2), vec![total(-1, P7)])),
+                Err(WindowStoreError::Invalid { detail }) if detail == "a total-budget debit is negative"
+            ));
+            assert_eq!(l.store.path().exists(), before);
+        }
+
+        #[test]
+        #[serial]
+        fn equality_at_the_limit_passes() {
+            let l = Ledger::new();
+            let p = policy(7);
+            l.pin(p.sequence, p.digest);
+            assert_admitted(both(&l, &p, 1, 6, T0), "6 of 10");
+            assert_admitted(both(&l, &p, 2, 4, T0 + 1), "10 of 10");
+            assert_denied(both(&l, &p, 3, 1, T0 + 2), "11 of 10");
+        }
+
+        // ── reset ────────────────────────────────────────────────────────
+
+        #[test]
+        #[serial]
+        fn reset_retains_a_claim_its_survivors_omit() {
+            let l = Ledger::new();
+            let request = l.request(tx(1), vec![total(6, P7)]);
+            let minted = l.mint(&request).unwrap();
+            l.clock.set(T0 + 7);
+            l.claim(&request, &minted).unwrap();
+            let after = T0 + APPROVAL_MS + 1;
+            l.clock.set(after);
+            l.reset(after).unwrap();
+            let wire = l.wire();
+            assert!(wire.authorizations.iter().all(|auth| auth.id != minted.id));
+            let rows: Vec<_> = wire
+                .entries
+                .iter()
+                .filter(|bucket| bucket.bucket == "total:native")
+                .flat_map(|bucket| bucket.records.clone())
+                .collect();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                (rows[0].status, rows[0].amount, rows[0].epoch),
+                (RecordStatus::Confirmed, 6, Some(P7))
+            );
+            assert_eq!(rows[0].authorization_id, Some(minted.id));
+            assert_eq!(rows[0].ts_ms, T0 + 7);
+        }
+
+        #[test]
+        #[serial]
+        fn reset_converts_each_hold_once() {
+            let l = Ledger::new();
+            for (n, amount) in [(1_u8, 3), (2, 4)] {
+                let request = l.request(tx(n), vec![total(amount, P7)]);
+                let minted = l.mint(&request).unwrap();
+                l.claim(&request, &minted).unwrap();
+            }
+            let after = T0 + TTL_MS + 1;
+            l.clock.set(after);
+            l.reset(after).unwrap();
+            l.store
+                .reset(
+                    &l.profile,
+                    &l.name(),
+                    after + 1,
+                    "repair",
+                    "second-reset",
+                    |row| Ok::<_, ()>(signed_by(11, row)),
+                    |_, _| Ok(()),
+                )
+                .unwrap();
+            assert_eq!(sum(&l, P7, after + 1), 7);
+            assert!(l.wire().holds.is_empty());
+        }
+
+        // ── retirement and hydration on the mainnet route ────────────────
+
+        /// Rewrites the committed file through `change`, sealing it unchecked.
+        fn reseal(l: &Ledger, change: impl FnOnce(&mut WireFile)) {
+            let mut wire = l.wire();
+            change(&mut wire);
+            l.store.seal_unchecked_for_test(&l.profile, &wire);
+        }
+
+        #[test]
+        #[serial]
+        fn earlier_build_content_is_not_relabelled() {
+            let l = Ledger::new();
+            l.mint(&l.request(tx(1), vec![total(6, P7)])).unwrap();
+            let consumed = l.request(tx(2), vec![total(3, P7)]);
+            let minted = l.mint(&consumed).unwrap();
+            l.consume(&consumed, &minted, &consumption_of(&consumed.binding))
+                .unwrap();
+            reseal(&l, |wire| {
+                wire.version = super::super::super::store::WIRE_VERSION_OPERATIONS;
+                for record in wire.entries.iter_mut().flat_map(|b| &mut b.records) {
+                    record.epoch = None;
+                    record.authorization_id = None;
+                }
+                for hold in &mut wire.holds {
+                    hold.epoch = None;
+                }
+            });
+            l.pin(8, [8; 32]);
+            let mut successor = l.wire();
+            assert!(retire_earlier_build(&mut successor, Some([8; 32])).unwrap());
+            assert_eq!(successor.retired_total_epoch, Some([8; 32]));
+            assert_eq!(
+                successor.version,
+                super::super::super::store::WIRE_VERSION_TOTAL_EPOCH
+            );
+            assert!(successor.holds.iter().all(|hold| hold.epoch.is_none()));
+            assert!(
+                successor
+                    .entries
+                    .iter()
+                    .flat_map(|bucket| &bucket.records)
+                    .all(|record| record.epoch.is_none() && record.authorization_id.is_none())
+            );
+            l.store
+                .load_into("ledger", &l.profile, &PolicyStateStore::new())
+                .unwrap();
+            let committed = l.wire();
+            assert_eq!(committed.retired_total_epoch, Some([8; 32]));
+            assert!(committed.holds.iter().all(|hold| hold.epoch.is_none()));
+        }
+
+        #[test]
+        #[serial]
+        fn retirement_refuses_a_total_mint() {
+            let l = Ledger::new();
+            l.mint(&l.request(tx(1), vec![hold(5)])).unwrap();
+            reseal(&l, |wire| {
+                wire.version = super::super::super::store::WIRE_VERSION_OPERATIONS;
+            });
+            l.store
+                .load_into("ledger", &l.profile, &PolicyStateStore::new())
+                .unwrap();
+            assert_eq!(l.wire().retired_total_epoch, Some(P7));
+            let error = l.mint(&l.request(tx(2), vec![total(1, P7)])).unwrap_err();
+            assert!(matches!(error, WindowStoreError::TotalEpochRetired));
+            assert_eq!(
+                error.operation_error().unwrap().code(),
+                "policy.total_epoch_retired"
+            );
+            #[cfg(feature = "mainnet-write")]
+            assert_eq!(
+                stellar_agent_core::error::WalletError::from(crate::mainnet::mint::store_error(
+                    error
+                ))
+                .code(),
+                "policy.total_epoch_retired",
+                "the mainnet mint keeps the retired code"
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn hydration_and_admission_agree_on_the_sum() {
+            let l = Ledger::new();
+            let now = T0 + 1_000;
+            // An open hold, a claimed hold, and two unclaimed holds that
+            // expire at `now + 1`.
+            l.mint(&l.request(tx(1), vec![total(1, P7)])).unwrap();
+            let claimed = l.request(tx(2), vec![total(2, P7)]);
+            let minted = l.mint(&claimed).unwrap();
+            l.claim(&claimed, &minted).unwrap();
+            for n in [3_u8, 4] {
+                let mut request = l.request(tx(n), vec![total(1, P7)]);
+                request.authorization_ttl_ms = now + 1 - T0;
+                l.mint(&request).unwrap();
+            }
+            reseal(&l, |wire| {
+                let key = StateKey::new("", 1, "total:native", 0);
+                let bucket = find_or_insert_bucket(&mut wire.entries, &key);
+                for (status, epoch) in [
+                    (RecordStatus::Confirmed, P7),
+                    (RecordStatus::Pending, P7),
+                    (RecordStatus::Exposure, P7),
+                    (RecordStatus::AccountingExpired, P7),
+                    (RecordStatus::OperatorCleared, P7),
+                    (RecordStatus::ProvedUnspent, P7),
+                    (RecordStatus::Confirmed, [8; 32]),
+                ] {
+                    bucket.records.push(WireRecord {
+                        chain_scope: wire.chain_scope,
+                        ts_ms: T0,
+                        amount: 1,
+                        status,
+                        epoch: Some(epoch),
+                        id: "ef".repeat(32),
+                        ..WireRecord::confirmed_defaults()
+                    });
+                }
+            });
+            for at in [now, now + 1] {
+                l.clock.set(at);
+                let memory = PolicyStateStore::new();
+                l.store.load_into("ledger", &l.profile, &memory).unwrap();
+                for epoch in [P7, [8; 32]] {
+                    let key = StateKey::new("ledger", 1, "total:native", 0);
+                    assert_eq!(
+                        memory.query_epoch(&key, epoch).unwrap().0,
+                        sum(&l, epoch, at),
+                        "{at}"
+                    );
+                }
+            }
+            assert_eq!(sum(&l, P7, now), 2 + 1 + 1 + 1 + 5);
+            assert_eq!(sum(&l, P7, now + 1), 2 + 1 + 5);
+        }
+
+        #[test]
+        #[serial]
+        fn hydration_samples_one_clock() {
+            let l = Ledger::new();
+            for n in [1_u8, 2] {
+                l.mint(&l.request(tx(n), vec![total(1, P7)])).unwrap();
+            }
+            let expiry = T0 + TTL_MS;
+            l.clock.set(expiry);
+            super::super::super::store::CLOCK_READS.set(0);
+            let memory = PolicyStateStore::new();
+            l.store.load_into("ledger", &l.profile, &memory).unwrap();
+            assert_eq!(super::super::super::store::CLOCK_READS.get(), 1);
+            let key = StateKey::new("ledger", 1, "total:native", 0);
+            assert_eq!(memory.query_epoch(&key, P7).unwrap().0, 0);
+            assert_eq!(sum(&l, P7, expiry), 0);
+        }
+
+        // ── one asset under its classic and its asset-contract spelling ──
+
+        /// A signed v2 policy: `stellar_pay` under a native total of 10 and
+        /// `stellar_create_account` under a total of 10 in the native asset
+        /// contract of the profile's network.
+        fn two_spelling_policy(l: &Ledger) -> (Policy, String) {
+            let native_sac = stellar_agent_core::asset_id::CanonicalAsset::Native
+                .sac_contract_id(&l.profile.network_passphrase)
+                .unwrap();
+            let body = format!(
+                "version = 2\nscope = \"profile:ledger\"\nsequence = 9\n\n\
+                 [[rules]]\nmatch = {{ tool = \"stellar_pay\", chain = \"*\" }}\n\
+                 criteria = [{{ kind = \"total_budget\", asset = \"native\", max_stroops = 10 }}]\n\
+                 decision = \"allow\"\n\n\
+                 [[rules]]\nmatch = {{ tool = \"stellar_create_account\", chain = \"*\" }}\n\
+                 criteria = [{{ kind = \"total_budget\", asset = \"{native_sac}\", max_stroops = 10 }}]\n\
+                 decision = \"allow\"\n"
+            );
+            let d = digest(&canonical_bytes(&body).unwrap());
+            let key = owner();
+            let text = format!(
+                "{body}\n[signature]\nowner_id = \"{}\"\nsig = \"{}\"\n",
+                stellar_strkey::ed25519::PublicKey(key.verifying_key().to_bytes()),
+                stellar_agent_core::hex::encode(&key.sign(&d).to_bytes())
+            );
+            (
+                Policy {
+                    text,
+                    digest: d,
+                    sequence: 9,
+                },
+                native_sac,
+            )
+        }
+
+        fn creation_tool() -> ToolDescriptor {
+            ToolDescriptor::from_registration(&McpToolRegistration {
+                name: "stellar_create_account",
+                destructive_hint: true,
+                read_only_hint: false,
+                chain_id_required: true,
+                value_kind: ToolValueKind::MovesValue,
+            })
+        }
+
+        fn creation(amount: i128) -> ValueClass {
+            ValueClass::single(ValueLeg {
+                kind: ActionKind::AccountCreation,
+                amount: Some(amount),
+                asset: Some("native".to_owned()),
+                destination: Some(DEST.to_owned()),
+            })
+        }
+
+        /// Both layers for one call of `tool` with `value` at `now`, through
+        /// a fresh hydration of `store`.
+        fn spend(
+            l: &Ledger,
+            store: &PersistedWindowStore,
+            p: &Policy,
+            tool: &ToolDescriptor,
+            value: &ValueClass,
+            n: u8,
+            now: u64,
+        ) -> (Decision, Result<MintedRecord, WindowStoreError>) {
+            let engine = hydrated(l, store, p);
+            let _q = set_query_time_for_test(now);
+            let decision = engine
+                .evaluate_with_value_full(
+                    tool,
+                    &serde_json::Value::Null,
+                    &l.profile,
+                    value.clone(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    now,
+                )
+                .unwrap()
+                .decision;
+            let holds = engine
+                .size_window_entries(tool, &l.profile, value, now)
+                .unwrap();
+            let mut request = l.request(tx(n), holds);
+            request.policy_sequence = p.sequence;
+            request.policy_digest = p.digest;
+            (decision, store.mint_authorization(&l.profile, &request))
+        }
+
+        #[test]
+        #[serial]
+        fn equivalent_asset_spellings_share_one_total() {
+            let l = Ledger::new();
+            let (p, _) = two_spelling_policy(&l);
+            l.pin(p.sequence, p.digest);
+            let (decision, minted) = spend(&l, &l.store, &p, &pay_tool(), &payment(6), 1, T0);
+            assert_eq!(decision, Decision::Allow);
+            minted.unwrap();
+            for reopen in [false, true] {
+                let store = if reopen {
+                    PersistedWindowStore::at_path(l.store.path().to_owned())
+                } else {
+                    l.store.clone()
+                };
+                let (decision, minted) =
+                    spend(&l, &store, &p, &creation_tool(), &creation(6), 2, T0 + 1);
+                assert!(
+                    gate_denies(&decision),
+                    "reopen {reopen}: one asset is allocated 6 + 6 at the gate"
+                );
+                assert!(
+                    durable_denies(&minted),
+                    "reopen {reopen}: one asset is allocated 6 + 6: {minted:?}"
+                );
+            }
+        }
+
+        /// A stored total row under either spelling of one asset, the bucket
+        /// name taken from the policy text, counts in the one bucket that
+        /// both spellings name.
+        #[test]
+        #[serial]
+        fn stored_rows_of_either_spelling_count_together() {
+            let (_, native_sac) = two_spelling_policy(&Ledger::new());
+            for stored in ["native".to_owned(), native_sac] {
+                let l = Ledger::new();
+                let (p, _) = two_spelling_policy(&l);
+                l.pin(p.sequence, p.digest);
+                l.store.record_and_persist(&l.profile, &[hold(1)]).unwrap();
+                reseal(&l, |wire| {
+                    let key = StateKey::new("", 1, &format!("total:{stored}"), 0);
+                    find_or_insert_bucket(&mut wire.entries, &key)
+                        .records
+                        .push(WireRecord {
+                            ts_ms: T0,
+                            amount: 6,
+                            epoch: Some(p.digest),
+                            ..WireRecord::confirmed_defaults()
+                        });
+                });
+                for reopen in [false, true] {
+                    let store = if reopen {
+                        PersistedWindowStore::at_path(l.store.path().to_owned())
+                    } else {
+                        l.store.clone()
+                    };
+                    for (n, tool, value) in [
+                        (1, pay_tool(), payment(6)),
+                        (2, creation_tool(), creation(6)),
+                    ] {
+                        let (decision, minted) = spend(&l, &store, &p, &tool, &value, n, T0 + 1);
+                        assert!(
+                            gate_denies(&decision),
+                            "stored under {stored}, reopen {reopen}, {}: gate {decision:?}",
+                            tool.name
+                        );
+                        assert!(
+                            durable_denies(&minted),
+                            "stored under {stored}, reopen {reopen}, {}: {minted:?}",
+                            tool.name
+                        );
+                    }
+                }
+                let (decision, minted) =
+                    spend(&l, &l.store, &p, &creation_tool(), &creation(4), 3, T0 + 2);
+                assert_eq!(decision, Decision::Allow, "equality under {stored}");
+                minted.unwrap();
+            }
+        }
+
+        // ── the shape refusal precedes key creation ──────────────────────
+
+        fn key_present(l: &Ledger) -> bool {
+            let id = &l.profile.policy_window_state_key_id;
+            keyring_core::Entry::new(&id.service, &id.account)
+                .unwrap()
+                .get_password()
+                .is_ok()
+        }
+
+        /// Malformed entries, each beside another defect a later check
+        /// refuses: the shape refusal wins, and no key, file, or counter is
+        /// created.
+        #[test]
+        #[serial]
+        fn a_malformed_mint_creates_no_key() {
+            let windowed_total = WindowEntry::new(
+                StateKey::new("ledger", 1, "native", 86_400),
+                T0,
+                6,
+                WindowLimit::Total {
+                    asset: "native".to_owned(),
+                    max_stroops: 10,
+                },
+            )
+            .with_epoch(Some(P7));
+            let unepoched = WindowEntry::new(
+                StateKey::new("ledger", 1, "total:native", 0),
+                T0,
+                6,
+                WindowLimit::Total {
+                    asset: "native".to_owned(),
+                    max_stroops: 10,
+                },
+            );
+            for (entry, expected) in [
+                (
+                    windowed_total,
+                    "a total-budget entry's limit and key disagree",
+                ),
+                (unepoched, "a total-budget entry needs its epoch"),
+            ] {
+                for defect in ["none", "malformed pin", "future timestamp"] {
+                    let l = Ledger::new();
+                    let mut entry = entry.clone();
+                    if defect == "malformed pin" {
+                        let entry_ref =
+                            PinScope::for_profile(l.store.path(), &l.profile).pin_entry_ref();
+                        keyring_core::Entry::new(&entry_ref.service, &entry_ref.account)
+                            .unwrap()
+                            .set_password("unreadable")
+                            .unwrap();
+                    }
+                    if defect == "future timestamp" {
+                        entry = WindowEntry::new(
+                            entry.key().clone(),
+                            T0 + 3_600_000,
+                            entry.amount(),
+                            entry.limit().clone(),
+                        )
+                        .with_epoch(entry.epoch());
+                    }
+                    assert!(!key_present(&l));
+                    let result = l.mint(&l.request(tx(1), vec![entry]));
+                    assert!(
+                        matches!(&result, Err(WindowStoreError::Invalid { detail }) if detail == expected),
+                        "{defect}: {result:?}"
+                    );
+                    assert!(
+                        !key_present(&l),
+                        "{defect}: shape refusal mints the state key"
+                    );
+                    assert!(!l.store.path().exists(), "{defect}");
+                    assert!(
+                        get_raw_generation(&l).is_none(),
+                        "{defect}: the counter is written"
+                    );
+                }
+            }
+        }
+
+        fn get_raw_generation(l: &Ledger) -> Option<String> {
+            let entry_ref = generation_entry_ref(&l.profile);
+            keyring_core::Entry::new(&entry_ref.service, &entry_ref.account)
+                .unwrap()
+                .get_password()
+                .ok()
+        }
+
+        // ── shape checks of the mint ─────────────────────────────────────
+
+        #[test]
+        #[serial]
+        fn a_mint_refuses_a_total_limit_on_a_windowed_key() {
+            let l = Ledger::new();
+            let entry = WindowEntry::new(
+                StateKey::new("ledger", 1, "native", 86_400),
+                T0,
+                6,
+                WindowLimit::Total {
+                    asset: "native".to_owned(),
+                    max_stroops: 10,
+                },
+            )
+            .with_epoch(Some(P7));
+            assert!(matches!(
+                l.mint(&l.request(tx(1), vec![entry])),
+                Err(WindowStoreError::Invalid { detail })
+                    if detail == "a total-budget entry's limit and key disagree"
+            ));
+            assert!(!l.store.path().exists());
+        }
+
+        #[test]
+        #[serial]
+        fn a_mint_refuses_an_amount_limit_on_a_total_key() {
+            let l = Ledger::new();
+            let entry = WindowEntry::new(
+                StateKey::new("ledger", 1, "total:native", 0),
+                T0,
+                6,
+                WindowLimit::Amount {
+                    asset: "native".to_owned(),
+                    window: "1d".to_owned(),
+                    max_stroops: 10,
+                },
+            )
+            .with_epoch(Some(P7));
+            assert!(matches!(
+                l.mint(&l.request(tx(1), vec![entry])),
+                Err(WindowStoreError::Invalid { detail })
+                    if detail == "a total-budget entry's limit and key disagree"
+            ));
+            assert!(!l.store.path().exists());
+        }
     }
 }

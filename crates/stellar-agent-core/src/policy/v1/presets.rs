@@ -51,7 +51,7 @@
 //! assert_eq!(plan(&derived).recommended_balance_xlm, "6");
 //! ```
 
-use super::asset_equivalence::assets_equivalent;
+use super::asset_equivalence::{assets_equivalent, total_budget_identity};
 use super::criteria::counterparty_allowlist::destination_form;
 use super::criteria::per_period_cap::Window;
 use super::mainnet_minimum::{
@@ -2016,8 +2016,9 @@ const CLASS_CONDITION_KINDS: [&str; 1] = ["home_domain_resolved"];
 
 /// A counter key as the evaluation builds it: the bucket and the window
 /// (`total` for the total budget). `per_period_cap` keys the identifier as
-/// written, with the native aliases normalized; `total_budget` keys
-/// `total:<identifier>`; an unlisted budget keys `unlisted:<identifier>`;
+/// written, with the native aliases normalized; `total_budget` keys the
+/// identity every spelling of its asset shares
+/// ([`total_budget_identity`]); an unlisted budget keys `unlisted:<identifier>`;
 /// every `rate_limit` shares the `rate_limit` bucket of its window.
 type CounterKey = (String, &'static str);
 
@@ -2694,8 +2695,9 @@ fn tool_view(
     }
     for c in rule.of_kind("total_budget").filter(|c| same(c)) {
         if let Some(limit) = stroops_of(c.get("max_stroops")) {
+            let asset = c.get("asset").and_then(Value::as_str).unwrap_or_default();
             write(CapView {
-                key: (identifier(c), TOTAL),
+                key: (total_budget_identity(asset, passphrase), TOTAL),
                 secs: None,
                 limit,
                 writers: 1,
@@ -3299,7 +3301,9 @@ pub fn summarize(
         "Rate limits count every tool in one shared bucket per window.".to_owned(),
         "A payment beyond an exhausted cap, total budget, or unlisted budget is denied."
             .to_owned(),
-        "A new policy signature starts a new total_budget allocation.".to_owned(),
+        "Signing the same policy body again keeps its total_budget allocation; a different \
+         digest starts another."
+            .to_owned(),
     ];
     let floor_free: Vec<&str> = x402_floors
         .iter()
@@ -5910,7 +5914,8 @@ mod tests {
         let summary = summary_of(&policy_body(PROFILE, &derived("api-day", false, true)));
         for note in [
             "Rate limits count every tool in one shared bucket per window.",
-            "A new policy signature starts a new total_budget allocation.",
+            "Signing the same policy body again keeps its total_budget allocation; a different \
+             digest starts another.",
             "Caps use rolling windows: 1d covers the last 86,400 seconds and 1w the last 604,800 seconds.",
             "A payment beyond an exhausted cap, total budget, or unlisted budget is denied.",
         ] {
@@ -8075,13 +8080,13 @@ mod tests {
             (
                 114,
                 BoundCounts {
-                    evaluations: 1_010_390,
-                    checked: 1_580,
+                    evaluations: 995_188,
+                    checked: 1_556,
                     staged: 86,
                 },
-                202,
-                0,
-                176
+                178,
+                24,
+                200
             ),
             "bound property size"
         );

@@ -475,10 +475,14 @@ fn reset_refusal(name: &str, error: WindowStoreError) -> ResetRefusal {
 
 /// Maps a store failure of the reset to its agent-facing error.
 ///
-/// A store written by a newer build and the mainnet refusals carry their own
-/// validation codes; every other store failure is a wallet defect.
+/// A store written by a newer build, the mainnet refusals, and the
+/// total-budget epoch refusals carry their own validation codes; every other
+/// store failure is a wallet defect.
 fn store_refusal(name: &str, error: WindowStoreError) -> WalletError {
-    if let Some(refusal) = error.chain_validation_error() {
+    if let Some(refusal) = error
+        .chain_validation_error()
+        .or_else(|| error.total_epoch_error())
+    {
         return WalletError::Validation(refusal);
     }
     match error {
@@ -1002,6 +1006,40 @@ mod tests {
             assert!(matches!(error, WalletError::Validation(_)));
             assert!(!error.to_string().contains("reset-window-state"));
         }
+    }
+
+    /// The code a reset refusal of `error` reports.
+    fn reset_code(error: WindowStoreError) -> &'static str {
+        match reset_refusal("acme", error) {
+            ResetRefusal::Wallet(error) => error.code(),
+            _ => panic!("expected a wallet refusal"),
+        }
+    }
+
+    #[test]
+    fn a_reset_without_a_readable_pin_keeps_its_epoch_code() {
+        assert_eq!(
+            reset_code(WindowStoreError::TotalEpochUnavailable {
+                detail: "no policy pin is recorded".to_owned(),
+            }),
+            "policy.total_epoch_unavailable"
+        );
+    }
+
+    #[test]
+    fn a_reset_under_a_stale_epoch_keeps_its_code() {
+        assert_eq!(
+            reset_code(WindowStoreError::TotalEpochStale),
+            "policy.total_epoch_stale"
+        );
+    }
+
+    #[test]
+    fn a_reset_under_a_retired_epoch_keeps_its_code() {
+        assert_eq!(
+            reset_code(WindowStoreError::TotalEpochRetired),
+            "policy.total_epoch_retired"
+        );
     }
 
     #[test]

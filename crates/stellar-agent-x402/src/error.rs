@@ -241,7 +241,9 @@ impl X402Error {
     /// surface. [`X402Error::EndpointIdentity`] and [`X402Error::CrossCheck`]
     /// return the code of the wallet error they carry, such as
     /// `network.endpoint_network_mismatch` or `simulation.divergence`, the code
-    /// every other signing path answers for the same refusal.
+    /// every other signing path answers for the same refusal. A total-budget
+    /// epoch refusal of the mainnet authorization keeps its
+    /// `policy.total_epoch_*` code.
     #[must_use]
     pub fn wire_code(&self) -> &'static str {
         match self {
@@ -251,6 +253,9 @@ impl X402Error {
                 }
                 stellar_agent_network::mainnet::MainnetAuthorizationError::FeatureDisabled => {
                     "network.mainnet_write_forbidden"
+                }
+                stellar_agent_network::mainnet::MainnetAuthorizationError::TotalEpoch(refusal) => {
+                    refusal.code()
                 }
                 _ => "network.mainnet_authorization_refused",
             },
@@ -472,6 +477,25 @@ mod tests {
         let d = err.to_string();
         assert!(d.contains("transaction build failed"));
         assert!(d.contains("xdr overflow"));
+    }
+
+    #[test]
+    fn a_total_epoch_refusal_carries_its_own_wire_code() {
+        use stellar_agent_network::mainnet::{MainnetAuthorizationError, TotalEpochRefusal};
+        for (refusal, code) in [
+            (
+                TotalEpochRefusal::Unavailable {
+                    detail: "pin unreadable".to_owned(),
+                },
+                "policy.total_epoch_unavailable",
+            ),
+            (TotalEpochRefusal::Stale, "policy.total_epoch_stale"),
+            (TotalEpochRefusal::Retired, "policy.total_epoch_retired"),
+        ] {
+            let err =
+                X402Error::MainnetAuthorization(MainnetAuthorizationError::TotalEpoch(refusal));
+            assert_eq!(err.wire_code(), code);
+        }
     }
 
     #[test]

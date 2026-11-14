@@ -1020,7 +1020,7 @@ impl SubmissionRecorder for WalletSubmissionRecorder<'_> {
             SubmissionOutcome::Success { ledger, created_at } => {
                 self.end_sent_attempt(intent);
                 self.finalize_receipt(intent, ReceiptStatus::Success, Some(*ledger));
-                self.settle_window(intent, WindowSettlement::Confirm(*created_at));
+                self.settle_window(intent, WindowSettlement::Confirm(*created_at), None);
                 self.record_floor(intent).await;
                 self.tombstone_approval(intent);
             }
@@ -1042,12 +1042,21 @@ impl SubmissionRecorder for WalletSubmissionRecorder<'_> {
                 // approval stays unspent. The window records are released,
                 // converted mainnet holds included, the pending row is closed
                 // with `code`, and the receipt that holds the sequence is
-                // removed. A used mainnet authorization stays used.
-                self.end_unsent_attempt(code);
-                self.close_unsent_records(intent, UnwoundAfter::Reservation, code);
-                self.remove_receipt(intent, ReceiptStore::abandon_unsent);
+                // removed. A used mainnet authorization stays used. This
+                // report holds no pre-send proof, so total-budget debits stay.
+                self.report_not_sent(intent, code);
             }
         }
+    }
+}
+
+impl WalletSubmissionRecorder<'_> {
+    /// The public report that no attempt carried `intent`'s bytes, under the
+    /// refusal `code`. It releases windowed records only.
+    fn report_not_sent(&self, intent: &SubmissionIntent, code: &str) {
+        self.end_unsent_attempt(code);
+        self.close_unsent_records(intent, UnwoundAfter::Reservation, code, None);
+        self.remove_receipt(intent, ReceiptStore::abandon_unsent);
     }
 }
 
@@ -1088,6 +1097,9 @@ impl WalletSubmissionRecorder<'_> {
             }
         };
 
+        // The proof that this call's reservation has not been sent. It is a
+        // local of this call: only this call's unwind below can use it.
+        let mut unsent = None;
         if self.window_entries.is_empty() {
             // The receipt gate recorded a new receipt, so no other receipt
             // carries this hash. An older stateful policy can still have a
@@ -1104,11 +1116,17 @@ impl WalletSubmissionRecorder<'_> {
                     &self.reservation(intent),
                     id,
                 ),
-                None => self.window.record_pending(
-                    self.profile,
-                    &self.window_entries,
-                    &self.reservation(intent),
-                ),
+                None => self
+                    .window
+                    .record_pending_unsent(
+                        self.profile,
+                        &self.window_entries,
+                        &self.reservation(intent),
+                    )
+                    .map(|(outcome, proof)| {
+                        unsent = Some(proof);
+                        outcome
+                    }),
             };
             if let Err(e) = recorded {
                 // A duplicate found under the lock is a resend of bytes another
@@ -1130,7 +1148,7 @@ impl WalletSubmissionRecorder<'_> {
             // this submission's, and a pending row the anchor does not cover is
             // closed out with them.
             if let AnchorAfterRow::Behind(refusal) = anchor {
-                self.unwind(intent, UnwoundAfter::Reservation, refusal.code());
+                self.unwind_releasing(intent, UnwoundAfter::Reservation, refusal.code(), unsent);
                 return Err(refusal);
             }
         }
@@ -1141,9 +1159,11 @@ impl WalletSubmissionRecorder<'_> {
         // failure stopped.
         if let Err(e) = self.mark_submitted(&intent.envelope_hash) {
             let refusal = receipt_store_refusal(&e);
-            self.unwind(intent, UnwoundAfter::Reservation, refusal.code());
+            self.unwind_releasing(intent, UnwoundAfter::Reservation, refusal.code(), unsent);
             return Err(refusal);
         }
+        // The bytes may leave from here on, so the proof ends here.
+        drop(unsent);
 
         Ok(())
     }
@@ -1169,11 +1189,15 @@ fn signing_reservation_refusal(
 /// under the wire code the gate reports for the same reason and carrying the
 /// same typed reason. A window that already holds these bytes is a
 /// resubmission, reported as `submission.tx_already_submitted` with the
-/// transaction to reconcile. Every other refusal is a record the wallet could
-/// not write, which is what `submission.record_unavailable` names. All of
-/// them refuse the send.
+/// transaction to reconcile. A total-budget epoch refusal keeps its
+/// `policy.total_epoch_*` code. Every other refusal is a record the wallet
+/// could not write, which is what `submission.record_unavailable` names. All
+/// of them refuse the send.
 fn reservation_refusal(error: WindowStoreError, intent: &SubmissionIntent) -> WalletError {
-    if let Some(error) = error.chain_validation_error() {
+    if let Some(error) = error
+        .chain_validation_error()
+        .or_else(|| error.total_epoch_error())
+    {
         return WalletError::Validation(error);
     }
     match error {
@@ -1542,12 +1566,12 @@ impl WalletSubmissionRecorder<'_> {
                         return Err(AuthorizedPathError::Wallet(error));
                     }
                 };
-                self.window.consume_authorization_exposing(
+                self.window.consume_authorization_unsent(
                     self.profile,
                     authorization_id,
                     &expect,
                     &binding,
-                    ConsumptionExposure {
+                    Some(ConsumptionExposure {
                         operation_id: attempt.operation_id,
                         attempt_index: attempt.attempt_index,
                         identity: ExposureIdentity::Classic {
@@ -1562,39 +1586,52 @@ impl WalletSubmissionRecorder<'_> {
                         submission_ledger: Some(intent.submission_ledger),
                         audit: &mut *guard,
                         request_id: &self.request_id,
-                    },
+                    }),
                 )
             }
-            None => {
-                self.window
-                    .consume_authorization(self.profile, authorization_id, &expect, &binding)
+            None => self.window.consume_authorization_unsent(
+                self.profile,
+                authorization_id,
+                &expect,
+                &binding,
+                None,
+            ),
+        };
+        // The proof that the consumed reservation has not been sent is a
+        // local of this call: only this call's unwind below can use it.
+        let unsent = match consumed {
+            Ok((_, unsent)) => unsent,
+            Err(e) => {
+                // A duplicate found under the lock is a resend of bytes
+                // another submission reserved: its pending row names the
+                // same envelope hash and stays open for that submission's
+                // settlement. A prior consumption without a reservation
+                // closes this resend's own row: the guarded lookup found no
+                // retained original row still owed.
+                let reached = match e {
+                    WindowStoreError::DuplicateReservation => UnwoundAfter::Receipt,
+                    _ => UnwoundAfter::PendingRow,
+                };
+                let refusal = consumption_refusal(e, intent);
+                self.unwind(intent, reached, refusal.code());
+                return Err(match refusal {
+                    ConsumptionRefusal::Precondition(precondition) => {
+                        AuthorizedPathError::Refused(precondition)
+                    }
+                    ConsumptionRefusal::Error(error) => AuthorizedPathError::Wallet(error),
+                });
             }
         };
-        if let Err(e) = consumed {
-            // A duplicate found under the lock is a resend of bytes another
-            // submission reserved: its pending row names the same envelope
-            // hash and stays open for that submission's settlement. A prior
-            // consumption without a reservation closes this resend's own row:
-            // the guarded lookup found no retained original row still owed.
-            let reached = match e {
-                WindowStoreError::DuplicateReservation => UnwoundAfter::Receipt,
-                _ => UnwoundAfter::PendingRow,
-            };
-            let refusal = consumption_refusal(e, intent);
-            self.unwind(intent, reached, refusal.code());
-            return Err(match refusal {
-                ConsumptionRefusal::Precondition(precondition) => {
-                    AuthorizedPathError::Refused(precondition)
-                }
-                ConsumptionRefusal::Error(error) => AuthorizedPathError::Wallet(error),
-            });
-        }
 
         if let Err(e) = self.mark_submitted(&intent.envelope_hash) {
             let refusal = receipt_store_refusal(&e);
-            self.unwind(intent, UnwoundAfter::Reservation, refusal.code());
+            self.unwind_releasing(intent, UnwoundAfter::Reservation, refusal.code(), unsent);
             return Err(refusal.into());
         }
+        // The bytes may leave from here on, so the proof ends here.
+        drop(unsent);
+        #[cfg(feature = "test-hooks")]
+        after_receipt_mark(self, intent);
         Ok(AuthorizationConsumed::new(
             envelope_hash,
             content_digest,
@@ -1694,16 +1731,35 @@ impl WalletSubmissionRecorder<'_> {
     /// again, so no caller holds it here, and it is a plain append: it lands
     /// during an anchor outage too.
     fn unwind(&self, intent: &SubmissionIntent, reached: UnwoundAfter, code: &str) {
+        self.unwind_releasing(intent, reached, code, None);
+    }
+
+    /// [`Self::unwind`] for the call that holds `unsent`, the proof that its
+    /// reservation's bytes never left. Only that call's own pre-send unwind
+    /// has the proof, which releases the reservation's total-budget debits.
+    fn unwind_releasing(
+        &self,
+        intent: &SubmissionIntent,
+        reached: UnwoundAfter,
+        code: &str,
+        unsent: Option<crate::policy_state::UnsentReservation>,
+    ) {
         self.end_unsent_attempt(code);
-        self.close_unsent_records(intent, reached, code);
+        self.close_unsent_records(intent, reached, code, unsent);
         self.remove_receipt(intent, ReceiptStore::abandon_pre_submit);
     }
 
     /// The release and the closing row of [`Self::unwind`], for the stages
     /// `reached` names.
-    fn close_unsent_records(&self, intent: &SubmissionIntent, reached: UnwoundAfter, code: &str) {
+    fn close_unsent_records(
+        &self,
+        intent: &SubmissionIntent,
+        reached: UnwoundAfter,
+        code: &str,
+        unsent: Option<crate::policy_state::UnsentReservation>,
+    ) {
         if reached == UnwoundAfter::Reservation {
-            self.settle_window(intent, WindowSettlement::Release);
+            self.settle_window(intent, WindowSettlement::Release, unsent);
         }
         if matches!(
             reached,
@@ -1769,23 +1825,35 @@ impl WalletSubmissionRecorder<'_> {
         ));
     }
 
-    fn settle_window(&self, intent: &SubmissionIntent, settlement: WindowSettlement) {
+    /// Settles the window records of `intent`. A release with `unsent`, the
+    /// proof of the call that reserved them, also releases their
+    /// total-budget debits; every other release keeps those debits.
+    fn settle_window(
+        &self,
+        intent: &SubmissionIntent,
+        settlement: WindowSettlement,
+        unsent: Option<crate::policy_state::UnsentReservation>,
+    ) {
         if self.window_entries.is_empty() {
             return;
         }
+        let unsent = unsent.filter(|unsent| unsent.id() == intent.envelope_hash);
         let result = match settlement {
             WindowSettlement::Confirm(created_at) => {
                 self.window
                     .confirm(self.profile, &intent.envelope_hash, created_at)
             }
-            WindowSettlement::Release => self
-                .window
-                .pre_exposure_cancellation(self.profile, &intent.envelope_hash)
-                .and_then(|decision| {
-                    self.window
-                        .apply_accounting_decision(self.profile, decision)
-                        .map(|_| ())
-                }),
+            WindowSettlement::Release => match unsent {
+                Some(unsent) => self.window.release_unsent(self.profile, unsent),
+                None => self
+                    .window
+                    .pre_exposure_cancellation(self.profile, &intent.envelope_hash)
+                    .and_then(|decision| {
+                        self.window
+                            .apply_accounting_decision(self.profile, decision)
+                            .map(|_| ())
+                    }),
+            },
         };
         if let Err(e) = result {
             tracing::warn!(
@@ -1797,6 +1865,34 @@ impl WalletSubmissionRecorder<'_> {
                  until reconciliation"
             );
         }
+    }
+}
+
+/// A callback the authorized submission runs right after its receipt is
+/// marked submitted and its pre-send proof has ended, so a test can report on
+/// the same recorder before the call returns.
+///
+/// Only compiled when the `test-hooks` Cargo feature is enabled. Never include
+/// `test-hooks` in production or release builds.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub type AfterReceiptMarkHook = std::sync::Arc<
+    dyn for<'r, 'p> Fn(&'r WalletSubmissionRecorder<'p>, &SubmissionIntent) + Send + Sync,
+>;
+
+/// The installed [`AfterReceiptMarkHook`], if any.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub static AFTER_RECEIPT_MARK_HOOK: Mutex<Option<AfterReceiptMarkHook>> = Mutex::new(None);
+
+#[cfg(feature = "test-hooks")]
+fn after_receipt_mark(recorder: &WalletSubmissionRecorder<'_>, intent: &SubmissionIntent) {
+    let hook = AFTER_RECEIPT_MARK_HOOK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(hook) = hook {
+        hook(recorder, intent);
     }
 }
 
@@ -2434,7 +2530,7 @@ mod tests {
             assert!(records[0]["observed_at_ms"].is_u64());
             assert_eq!(records[0]["signed_intent"], exposure_c.intent_id().unwrap());
         }
-        recorder.settle_window(&intent, WindowSettlement::Release);
+        recorder.settle_window(&intent, WindowSettlement::Release, None);
         assert!(window.pending_reservations(&profile).unwrap().is_empty());
         assert_eq!(
             window.signed_intents("intent", &profile).unwrap()[0].status,
@@ -4510,6 +4606,125 @@ mod tests {
             );
         }
 
+        /// A total-budget entry of `amount` under the fixture's pinned policy.
+        fn total_hold_of(
+            fx: &LedgerFixture,
+            amount: i128,
+        ) -> stellar_agent_core::policy::v1::criteria::state_store::WindowEntry {
+            use stellar_agent_core::policy::v1::criteria::state_store::{
+                StateKey, WindowEntry, WindowLimit,
+            };
+            WindowEntry::new(
+                StateKey::new(&fx.name, 1, "total:native", 0),
+                fx.now,
+                amount,
+                WindowLimit::Total {
+                    asset: "native".to_owned(),
+                    max_stroops: 10,
+                },
+            )
+            .with_epoch(Some(fixtures::POLICY_DIGEST))
+        }
+
+        /// A total-budget hold of 6 under the fixture's pinned policy.
+        fn total_holds(
+            fx: &LedgerFixture,
+        ) -> Vec<stellar_agent_core::policy::v1::criteria::state_store::WindowEntry> {
+            vec![total_hold_of(fx, 6)]
+        }
+
+        /// The receipt is marked submitted; inside that window a public
+        /// not-sent report runs on the same recorder; the sender proceeds.
+        /// Nothing is released, and a second admission of 10 refuses.
+        #[cfg(feature = "test-hooks")]
+        #[tokio::test]
+        #[serial]
+        async fn a_public_not_sent_report_after_the_receipt_mark_releases_nothing() {
+            let fx = LedgerFixture::new("consume-mark-race", NOW);
+            let sub = submission();
+            let holds = total_holds(&fx);
+            let (_, authorization) = grant(&fx, &sub, &holds, "approval-1");
+            let recorder = fx.recorder(holds, Some(Arc::clone(&fx.writer)));
+            *AFTER_RECEIPT_MARK_HOOK.lock().unwrap() = Some(Arc::new(
+                |recorder: &WalletSubmissionRecorder<'_>, intent: &SubmissionIntent| {
+                    recorder.report_not_sent(intent, "network.rpc_timeout");
+                },
+            ));
+            let sent = recorder
+                .pre_send_authorized(&sub.intent, MainnetSubmitGrant::Tx(authorization))
+                .await;
+            *AFTER_RECEIPT_MARK_HOOK.lock().unwrap() = None;
+            sent.expect("the sender proceeds to send");
+            assert_eq!(
+                reservations(&fx),
+                1,
+                "a public report after the receipt mark released the debit"
+            );
+            let again = fx
+                .window
+                .record_authorized(&fx.profile, &[total_hold_of(&fx, 10)]);
+            assert!(
+                matches!(again, Err(WindowStoreError::PolicyDenied { .. })),
+                "another 10 admitted: {again:?}"
+            );
+        }
+
+        /// A consumed grant whose receipt cannot be marked submitted sent no
+        /// byte, so its unwind releases the total debit of that attempt.
+        #[cfg(feature = "test-hooks")]
+        #[tokio::test]
+        #[serial]
+        async fn a_failed_mark_submitted_releases_the_total_debit() {
+            let fx = LedgerFixture::new("consume-mark-total", NOW);
+            let sub = submission();
+            let holds = total_holds(&fx);
+            let (id, authorization) = grant(&fx, &sub, &holds, "approval-1");
+
+            let result = {
+                let _fail = Toggle::set(&FAIL_MARK_SUBMITTED);
+                fx.recorder(holds, Some(Arc::clone(&fx.writer)))
+                    .consume_for_submission(&sub.intent, MainnetSubmitGrant::Tx(authorization))
+            };
+
+            assert_eq!(
+                wallet_refusal(result).code(),
+                "submission.record_unavailable"
+            );
+            assert!(!fx.is_open(id), "the record stays used");
+            assert_eq!(
+                reservations(&fx),
+                0,
+                "bytes never leave but the authorized debit stays charged"
+            );
+            assert!(receipt(&fx, &sub.intent).is_none());
+        }
+
+        /// A consumed grant whose submission is reported unsent after
+        /// `pre_send_authorized` returned keeps its total debit.
+        #[tokio::test]
+        #[serial]
+        async fn a_reported_non_send_keeps_the_authorized_total_debit() {
+            let fx = LedgerFixture::new("consume-not-sent-total", NOW);
+            let sub = submission();
+            let holds = total_holds(&fx);
+            let (_, authorization) = grant(&fx, &sub, &holds, "approval-1");
+            let recorder = fx.recorder(holds, Some(Arc::clone(&fx.writer)));
+            recorder
+                .pre_send_authorized(&sub.intent, MainnetSubmitGrant::Tx(authorization))
+                .await
+                .unwrap();
+            recorder
+                .outcome(
+                    &sub.intent,
+                    &SubmissionOutcome::NotSent {
+                        code: "network.rpc_timeout".to_owned(),
+                        error: "send-by passed".to_owned(),
+                    },
+                )
+                .await;
+            assert_eq!(reservations(&fx), 1, "a reported non-send keeps the total");
+        }
+
         /// A receipt for the same source and sequence refuses the claim,
         /// before anything of this submission is written or consumed.
         #[tokio::test]
@@ -4594,6 +4809,106 @@ mod tests {
                 fx.audit_kinds(),
                 ["value_action_pending", "value_action_failed"]
             );
+        }
+
+        /// A total-budget reservation whose pre-send step refuses after the
+        /// reservation is written is released through its writer's
+        /// capability. Once `pre_send` returns, a not-sent report keeps the
+        /// total charged.
+        #[tokio::test]
+        #[serial]
+        async fn the_unsent_capability_releases_the_total_only_before_the_send() {
+            use stellar_agent_core::policy::v1::criteria::state_store::{
+                StateKey, WindowEntry, WindowLimit,
+            };
+            let digest = [0x5a; 32];
+            let total = |fx: &LedgerFixture| {
+                vec![
+                    WindowEntry::new(
+                        StateKey::new(&fx.name, 1, "total:native", 0),
+                        fx.now,
+                        6,
+                        WindowLimit::Total {
+                            asset: "native".to_owned(),
+                            max_stroops: 10,
+                        },
+                    )
+                    .with_epoch(Some(digest)),
+                ]
+            };
+            let sub = submission();
+
+            let fx = LedgerFixture::new("unsent-total", NOW);
+            fx.repin(digest);
+            fx.anchors.fail_next_writes(64);
+            let error = fx
+                .recorder(total(&fx), Some(Arc::clone(&fx.writer)))
+                .pre_send(&sub.intent)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), "submission.record_unavailable");
+            assert_eq!(reservations(&fx), 0, "the unsent total is released");
+
+            let fx = LedgerFixture::new("sent-total", NOW);
+            fx.repin(digest);
+            let recorder = fx.recorder(total(&fx), Some(Arc::clone(&fx.writer)));
+            recorder.pre_send(&sub.intent).await.unwrap();
+            recorder
+                .outcome(
+                    &sub.intent,
+                    &SubmissionOutcome::NotSent {
+                        code: "network.rpc_timeout".to_owned(),
+                        error: "send-by passed".to_owned(),
+                    },
+                )
+                .await;
+            assert_eq!(reservations(&fx), 1, "a reported non-send keeps the total");
+        }
+
+        /// A reservation sized under a policy other than the pinned one
+        /// refuses the send under `policy.total_epoch_stale`, and a retired
+        /// or unreadable epoch keeps its own code through the same adapter.
+        #[tokio::test]
+        #[serial]
+        async fn a_reservation_epoch_refusal_keeps_its_code() {
+            use stellar_agent_core::policy::v1::criteria::state_store::{
+                StateKey, WindowEntry, WindowLimit,
+            };
+            let fx = LedgerFixture::new("stale-total", NOW);
+            let stale = vec![
+                WindowEntry::new(
+                    StateKey::new(&fx.name, 1, "total:native", 0),
+                    fx.now,
+                    6,
+                    WindowLimit::Total {
+                        asset: "native".to_owned(),
+                        max_stroops: 10,
+                    },
+                )
+                .with_epoch(Some([0x5b; 32])),
+            ];
+            let sub = submission();
+            let error = fx
+                .recorder(stale, Some(Arc::clone(&fx.writer)))
+                .pre_send(&sub.intent)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), "policy.total_epoch_stale");
+            assert_eq!(reservations(&fx), 0);
+            for (error, code) in [
+                (
+                    WindowStoreError::TotalEpochRetired,
+                    "policy.total_epoch_retired",
+                ),
+                (
+                    WindowStoreError::TotalEpochUnavailable {
+                        detail: "pin unreadable".to_owned(),
+                    },
+                    "policy.total_epoch_unavailable",
+                ),
+            ] {
+                assert_eq!(reservation_refusal(error, &sub.intent).code(), code);
+            }
         }
 
         /// A pending row that cannot be appended, behind an outbox row that

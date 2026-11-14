@@ -249,19 +249,27 @@ pub(crate) fn prepare_authorized_recorder<'a>(
             record.profile,
             &stellar_agent_core::policy::v1::PolicyStateStore::new(),
         )
-        .map_err(|error| {
-            if let Some(refusal) = error.chain_validation_error() {
-                return WalletError::Validation(refusal);
-            }
-            WalletError::Submission(SubmissionError::RecordUnavailable {
-                detail: format!("the submission window store could not be opened: {error}"),
-            })
-        })?;
+        .map_err(|error| window_open_error(&error))?;
     Ok(PreparedRecorder {
         record,
         approval,
         receipts,
         window,
+    })
+}
+
+/// The refusal of a window store that cannot be hydrated: a chain or
+/// total-budget epoch refusal keeps its own code, and every other failure is
+/// `submission.record_unavailable`.
+fn window_open_error(error: &stellar_agent_network::policy_state::WindowStoreError) -> WalletError {
+    if let Some(refusal) = error
+        .chain_validation_error()
+        .or_else(|| error.total_epoch_error())
+    {
+        return WalletError::Validation(refusal);
+    }
+    WalletError::Submission(SubmissionError::RecordUnavailable {
+        detail: format!("the submission window store could not be opened: {error}"),
     })
 }
 
@@ -744,6 +752,33 @@ mod tests {
     use stellar_agent_network::policy_state::{DeliveryReport, ReconcileReport};
     use stellar_agent_network::submission_flow::{ReconcilePass, finish_reconciliation};
     use stellar_agent_network::{envelope_hash_hex, submission_flow::submission_details};
+
+    #[test]
+    fn a_window_epoch_refusal_keeps_its_code() {
+        use stellar_agent_network::policy_state::WindowStoreError;
+        for (error, code) in [
+            (
+                WindowStoreError::TotalEpochUnavailable {
+                    detail: "pin unreadable".to_owned(),
+                },
+                "policy.total_epoch_unavailable",
+            ),
+            (
+                WindowStoreError::TotalEpochStale,
+                "policy.total_epoch_stale",
+            ),
+            (
+                WindowStoreError::TotalEpochRetired,
+                "policy.total_epoch_retired",
+            ),
+            (
+                WindowStoreError::GenerationMismatch,
+                "submission.record_unavailable",
+            ),
+        ] {
+            assert_eq!(window_open_error(&error).code(), code);
+        }
+    }
 
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]

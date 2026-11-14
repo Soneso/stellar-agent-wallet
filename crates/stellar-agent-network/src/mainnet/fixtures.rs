@@ -68,7 +68,7 @@ pub(crate) const SEQUENCE: i64 = 42;
 
 /// The policy the fixtures pin and bind.
 const POLICY_SEQUENCE: i64 = 7;
-const POLICY_DIGEST: [u8; 32] = [0x71; 32];
+pub(crate) const POLICY_DIGEST: [u8; 32] = [0x71; 32];
 const POLICY_OWNER: [u8; 32] = [0x01; 32];
 
 /// The authorization lifetime and approval window, in milliseconds.

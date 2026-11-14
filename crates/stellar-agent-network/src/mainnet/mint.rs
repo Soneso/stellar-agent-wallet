@@ -9,6 +9,9 @@ use crate::policy_state::{MintRequest, MintedRecord, WindowStoreError};
 use stellar_agent_core::mainnet::enablement::EnablementRecord;
 
 pub(crate) fn store_error(error: WindowStoreError) -> MainnetAuthorizationError {
+    if let Some(refusal) = super::TotalEpochRefusal::from_store(&error) {
+        return MainnetAuthorizationError::TotalEpoch(refusal);
+    }
     match error {
         WindowStoreError::AuthorizationRefused { precondition } => {
             MainnetAuthorizationError::Refused(precondition)

@@ -55,7 +55,7 @@ State-changing (writes the profile file; no network, no keyring). Creates and pe
 - `--asset <USDC|XLM>`: asset of the caps (default `USDC`).
 - `--tolerated-loss <AMOUNT>` and `--typical-payment <AMOUNT>`: the XLM amounts the caps derive from. USDC presets carry their own amounts and refuse these flags.
 - `--unlisted-budget <yes|no>`: whether the payment tools pay recipients outside the list from one shared budget. Api presets only; they ask when the flag is absent.
-- `--total-budget <yes|no>`: whether a total budget bounds spending until the next policy signature (default `yes`).
+- `--total-budget <yes|no>`: whether a total budget bounds spending under the signed policy's digest (default `yes`). Signing the same policy body again keeps the allocation; a different digest starts another.
 - `--output <FORMAT>`: format of the stderr preview, `json` (default) or `table`. The stdout envelope stays JSON.
 
 The seven preset flags apply to `--network mainnet --engine v1` only. Elsewhere, any of them refuses with `validation.usage_error` and the message `<flags>: these flags apply only to --network mainnet --engine v1`, naming the given flags but never their values. Nothing is written.
@@ -68,7 +68,7 @@ At a terminal, where stdin and stderr are both terminals, `init` asks for each m
 
 - `Tolerated loss in XLM: ` and `Typical payment in XLM: ` for an XLM preset without the amount flags.
 - `Allow payments to unlisted recipients up to <U> <asset> per rolling day, shared by all payment tools, at most <P/2> <asset> per payment? [yes/no]: ` for an api preset without `--unlisted-budget`. Only `yes` or `no` is accepted, in any case.
-- `Limit total spending to <L> <asset> until the next policy signature? A new signature starts a new allocation. [Y/n]: ` without `--total-budget`. An empty answer, `y`, or `yes` means yes; `n` or `no` means no.
+- `Limit total spending to <L> <asset> for this policy? Signing the same policy body again keeps the allocation; a different digest starts another. [Y/n]: ` without `--total-budget`. An empty answer, `y`, or `yes` means yes; `n` or `no` means no.
 
 Without a terminal, the total budget is chosen, and a missing XLM amount or a missing api answer refuses with `profile.preset_input_required`. The message names the flag that supplies the answer.
 

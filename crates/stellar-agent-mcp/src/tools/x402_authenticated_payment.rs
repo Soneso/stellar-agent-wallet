@@ -1462,7 +1462,8 @@ impl WalletServer {
 /// A refused authorization of the intent, the submission or the release is
 /// `network.mainnet_authorization_refused` with a text that says the payload
 /// was withheld and names no precondition. A policy denial keeps the reason's
-/// `policy.deny.*` code, `FeatureDisabled` maps to the signing refusal
+/// `policy.deny.*` code, a total-budget epoch refusal keeps its
+/// `policy.total_epoch_*` code, `FeatureDisabled` maps to the signing refusal
 /// `network.mainnet_write_forbidden`, an endpoint identity or cross-check
 /// refusal keeps its own code, and every other failure is
 /// `x402.payment_build_failed`.
@@ -1484,9 +1485,9 @@ fn mainnet_payment_error(
     use stellar_agent_x402::X402Error;
     match error {
         X402Error::MuxedContractProtocolUnsupported { .. } => x402_error_to_tool_result(error),
-        X402Error::MainnetAuthorization(MainnetAuthorizationError::PolicyDenied(_)) => {
-            crate::tools::x402_create_payment::mainnet_x402_error(error, withheld, transmitted)
-        }
+        X402Error::MainnetAuthorization(
+            MainnetAuthorizationError::PolicyDenied(_) | MainnetAuthorizationError::TotalEpoch(_),
+        ) => crate::tools::x402_create_payment::mainnet_x402_error(error, withheld, transmitted),
         X402Error::MainnetAuthorization(MainnetAuthorizationError::FeatureDisabled) => {
             crate::tools::common::x402_mainnet_signing_forbidden_result()
         }
@@ -2306,6 +2307,35 @@ mod tests {
             crate::tools::common::assert_business_envelope(&other).0,
             "x402.payment_build_failed"
         );
+    }
+
+    /// A total-budget epoch refusal of the ledger authorization keeps its
+    /// own code on the authenticated payment tool.
+    #[cfg(feature = "mainnet-write")]
+    #[test]
+    fn a_ledger_epoch_refusal_keeps_its_payment_code() {
+        use stellar_agent_network::mainnet::{MainnetAuthorizationError, TotalEpochRefusal};
+        use stellar_agent_x402::X402Error;
+        for (refusal, code) in [
+            (
+                TotalEpochRefusal::Unavailable {
+                    detail: "pin unreadable".to_owned(),
+                },
+                "policy.total_epoch_unavailable",
+            ),
+            (TotalEpochRefusal::Stale, "policy.total_epoch_stale"),
+            (TotalEpochRefusal::Retired, "policy.total_epoch_retired"),
+        ] {
+            let result = mainnet_payment_error(
+                &X402Error::MainnetAuthorization(MainnetAuthorizationError::TotalEpoch(refusal)),
+                "after intent authorization",
+                None,
+            );
+            assert_eq!(
+                crate::tools::common::assert_business_envelope(&result).0,
+                code
+            );
+        }
     }
 
     /// After the transmit gate the refusal, denial, build-failure and
