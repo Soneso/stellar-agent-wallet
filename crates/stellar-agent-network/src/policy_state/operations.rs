@@ -66,6 +66,7 @@ use super::ledger::{
     AuthorizationState, ConsumptionBinding, DomainBinding, MintAuthority, MintOptions, MintRequest,
     MintedRecord, WireAuthorization,
 };
+use super::notices::{CommittedBatch, CommittedTransition};
 use super::recovery::{CheckedRecoveryDecision, DecidedTransition};
 use super::recovery_run::{RawRecoveryRun, RecoveryRunSnapshot};
 use super::store::{
@@ -1813,16 +1814,22 @@ fn release_unsent_attempt(
 // Section access, adoption and expiry
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn records(wire: &WireFile) -> &[WireOperation] {
+pub(super) fn records(wire: &WireFile) -> &[WireOperation] {
     wire.operations
         .as_ref()
         .map_or(&[], |section| section.records.as_slice())
 }
 
-fn tombstones(wire: &WireFile) -> &[WireTombstone] {
+pub(super) fn tombstones(wire: &WireFile) -> &[WireTombstone] {
     wire.operations
         .as_ref()
         .map_or(&[], |section| section.tombstones.as_slice())
+}
+
+/// Whether an entry closed at `closed_at_ms`, or still open, belongs to the
+/// selection since `ts_ms`. The boundary is inclusive.
+pub(super) fn retained_since(closed_at_ms: Option<u64>, ts_ms: u64) -> bool {
+    closed_at_ms.is_none_or(|closed| closed >= ts_ms)
 }
 
 fn section_mut(wire: &mut WireFile) -> &mut OperationsSection {
@@ -1962,15 +1969,19 @@ pub(super) fn check_mint_link(
     Ok(())
 }
 
-/// Collects the audit rows one commit appends, before the window write.
+/// Collects the audit rows one commit appends, before the window write, and
+/// the state edges those rows name.
 pub(super) struct AuditBatch<'a> {
     request_id: &'a str,
     chain_id: &'static str,
     commit: CommitId,
     entries: Vec<AuditEntry>,
+    committed: CommittedBatch,
 }
 
 impl AuditBatch<'_> {
+    /// Appends the transition row of `record` for `step`. A step that names
+    /// a state also records that edge; the `expose` step names none.
     fn transition(
         &mut self,
         record: &WireOperation,
@@ -1978,6 +1989,16 @@ impl AuditBatch<'_> {
         from: Option<OperationState>,
         step: &str,
     ) {
+        if let Some(state) = OperationState::ALL
+            .into_iter()
+            .find(|state| state.wire_name() == step)
+        {
+            self.committed.push(CommittedTransition::from_record(
+                record,
+                attempt_index,
+                state,
+            ));
+        }
         self.entries.push(AuditEntry::new_operation_transition(
             record.tool.wire_name(),
             self.chain_id,
@@ -2207,6 +2228,7 @@ impl WindowSection for Operations {
             chain_id: "",
             commit: CommitId::random(),
             entries: Vec::new(),
+            committed: CommittedBatch::default(),
         };
         super::ledger::sweep_expired_with(&mut expired, now_ms, audit.commit);
         expire_records(&mut expired, now_ms, &mut audit)?;
@@ -3016,11 +3038,15 @@ impl OperationAudit for stellar_agent_core::audit_log::AuditWriter {
 /// failure returns `audit.append_failed` and commits nothing. A caller that
 /// holds an audit writer acquired it before calling, because the writer
 /// lock precedes the window lock.
+///
+/// The recorder keeps the state edges of every successful commit until
+/// [`Self::take_committed`] moves them out.
 pub struct OperationRecorder<'a> {
     store: &'a PersistedWindowStore,
     profile: &'a Profile,
     audit: &'a mut dyn OperationAudit,
     request_id: String,
+    committed: CommittedBatch,
 }
 
 impl std::fmt::Debug for OperationRecorder<'_> {
@@ -4309,6 +4335,7 @@ pub(super) fn expose_in_consumption(
             chain_id: profile.chain_id.caip2_str(),
             commit: CommitId::random(),
             entries: Vec::new(),
+            committed: CommittedBatch::default(),
         },
         changed: false,
     };
@@ -4354,6 +4381,7 @@ impl<'a> OperationRecorder<'a> {
             profile,
             audit,
             request_id: request_id.into(),
+            committed: CommittedBatch::default(),
         }
     }
 
@@ -4419,7 +4447,7 @@ impl<'a> OperationRecorder<'a> {
         let gen_entry = generation_entry_ref(profile);
         let original = store.read_verified(profile, &key, &gen_entry)?;
         let successor = store.retired_successor(lock, profile, &original)?;
-        let (value, next, entries) = {
+        let (value, next, entries, committed) = {
             let mut session = Session {
                 profile,
                 now,
@@ -4432,12 +4460,13 @@ impl<'a> OperationRecorder<'a> {
                     chain_id: profile.chain_id.caip2_str(),
                     commit: CommitId::random(),
                     entries: Vec::new(),
+                    committed: CommittedBatch::default(),
                 },
                 changed: false,
             };
             let value = step(&mut session)?;
             let next = session.changed.then_some(session.wire);
-            (value, next, session.audit.entries)
+            (value, next, session.audit.entries, session.audit.committed)
         };
         if let Some(mut next) = next {
             // Maintenance completes before the audit rows, so a refused fold
@@ -4449,8 +4478,16 @@ impl<'a> OperationRecorder<'a> {
                     .map_err(|detail| WindowStoreError::AuditAppendFailed { detail })?;
             }
             store.commit_generation(&key, &gen_entry, original, next)?;
+            // Only edges whose commit returned success reach the recorder.
+            self.committed.append(committed);
         }
         Ok(value)
+    }
+
+    /// Moves out the transitions this recorder's steps committed since the
+    /// last call, in commit order, and leaves its batch empty.
+    pub fn take_committed(&mut self) -> CommittedBatch {
+        std::mem::take(&mut self.committed)
     }
 
     /// Opens or looks up the record `request.business_id` names.
@@ -5218,7 +5255,7 @@ impl<'a> OperationStatus<'a> {
     /// The verified window, pruned in memory on the store clock. A read
     /// applies only lifecycle pruning: it promotes and folds nothing, so it
     /// keeps every proof and never refuses on maintenance.
-    fn read(&self) -> Result<Option<WireFile>, WindowStoreError> {
+    pub(super) fn read(&self) -> Result<Option<WireFile>, WindowStoreError> {
         let Some(mut wire) = self.store.read_for_inspection(self.profile)? else {
             return Ok(None);
         };
@@ -5607,13 +5644,13 @@ impl<'a> OperationStatus<'a> {
         };
         let mut views: Vec<OperationView> = records(&wire)
             .iter()
-            .filter(|record| record.closed_at_ms.is_none_or(|closed| closed >= ts_ms))
+            .filter(|record| retained_since(record.closed_at_ms, ts_ms))
             .map(OperationView::of_record)
             .collect();
         views.extend(
             tombstones(&wire)
                 .iter()
-                .filter(|tombstone| tombstone.closed_at_ms >= ts_ms)
+                .filter(|tombstone| retained_since(Some(tombstone.closed_at_ms), ts_ms))
                 .map(OperationView::of_tombstone),
         );
         Ok(views)
@@ -5926,9 +5963,9 @@ pub(crate) mod tests {
     use crate::mainnet::clock::{TestClockGuard, set_now_ms_for_test};
     use crate::mainnet::digest::BindingFacts;
     use crate::mainnet::types::{AuthorizationDomain, MainnetConsumer};
-    use crate::policy_state::ChainScope;
     use crate::policy_state::ledger::{ClaimExpect, DomainBinding, PolicyAuthorityBinding};
     use crate::policy_state::store::{RETENTION_MS, ResetConsent, ResetError};
+    use crate::policy_state::{ChainScope, WatchClass, WatchedOperation};
 
     #[test]
     #[serial]
@@ -6243,7 +6280,7 @@ pub(crate) mod tests {
             }
         }
 
-        fn policy(&self) -> MintAuthority {
+        pub(crate) fn policy(&self) -> MintAuthority {
             MintAuthority::Policy(PolicyAuthorityBinding {
                 policy_digest: [7; 32],
                 policy_sequence: 7,
@@ -6254,7 +6291,7 @@ pub(crate) mod tests {
             })
         }
 
-        fn mint_request(
+        pub(crate) fn mint_request(
             &self,
             binding: DomainBinding,
             authority: MintAuthority,
@@ -8944,8 +8981,8 @@ pub(crate) mod tests {
         let handle = fx.open_new(&request("order-1", canonical(1)));
         let before = fs::read(fx.store.path()).unwrap();
         fx.sink.fail = true;
-        let error = fx
-            .recorder()
+        let mut recorder = fx.recorder();
+        let error = recorder
             .transition(
                 handle.id(),
                 None,
@@ -8954,6 +8991,7 @@ pub(crate) mod tests {
             )
             .unwrap_err();
         assert_eq!(code(&error), "audit.append_failed");
+        assert!(recorder.take_committed().is_empty());
         let mint = fx.mint_request(tx(1), fx.policy(), vec![]);
         assert!(matches!(
             fx.begin_mint(&handle, &mint),
@@ -8962,6 +9000,474 @@ pub(crate) mod tests {
         assert_eq!(fs::read(fx.store.path()).unwrap(), before);
         assert_eq!(fx.record(handle.id()).state, OperationState::Prepared);
         assert!(fx.wire().authorizations.is_empty());
+    }
+
+    /// The state, attempt and history time of each transition `batch` holds.
+    fn edges(batch: CommittedBatch) -> Vec<(OperationState, Option<u32>, u64)> {
+        batch
+            .into_iter()
+            .map(|edge| (edge.state(), edge.attempt_index(), edge.at_ms()))
+            .collect()
+    }
+
+    /// Runs `step` on a fresh recorder and returns its result with the
+    /// edges the recorder committed.
+    fn drained<T>(
+        fx: &mut Fx,
+        step: impl FnOnce(&mut OperationRecorder<'_>) -> T,
+    ) -> (T, Vec<(OperationState, Option<u32>, u64)>) {
+        let mut recorder = fx.recorder();
+        let value = step(&mut recorder);
+        (value, edges(recorder.take_committed()))
+    }
+
+    /// The attempt request of `handle`'s next attempt under a mint of `mint`.
+    fn mint_attempt(handle: &OperationHandle, mint: &MintRequest) -> AttemptRequest {
+        AttemptRequest {
+            envelope: (!handle.kind().is_x402()).then(|| AttemptEnvelope {
+                xdr: "AAAAENVELOPE".to_owned(),
+                unsigned_envelope_sha256: handle.unsigned_envelope_sha256().unwrap_or([0xee; 32]),
+            }),
+            authorization: AttemptAuthorization::Mint(Box::new(mint.clone())),
+            send_by_ms: u64::MAX,
+        }
+    }
+
+    /// Every state-naming audit row of a successful commit yields one edge
+    /// with its own history time and audit attempt; `begin` yields two and
+    /// an exposure, pure evidence or an approval link none. An evidence
+    /// write's incidental adoption yields its own edge. The sites cover
+    /// creation, the approval wait, both adoptions, `begin`, the checked
+    /// transitions, both decision outcomes and non-inclusion, both expiry
+    /// paths and the x402 obligation expiry.
+    #[test]
+    #[serial]
+    fn committed_batch_holds_every_state_edge() {
+        use OperationState as S;
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let mut fx = Fx::new();
+        let mut seen = Vec::new();
+        let mut check = |actual: Vec<(S, Option<u32>, u64)>,
+                         expected: Vec<(S, Option<u32>, u64)>| {
+            assert_eq!(actual, expected);
+            seen.extend(actual.into_iter().map(|(state, _, _)| state));
+        };
+
+        let (opened, committed) = drained(&mut fx, |r| r.open(&request("order-1", canonical(1))));
+        let OpenOutcome::New(handle) = opened.unwrap() else {
+            panic!("expected a new record")
+        };
+        check(committed, vec![(S::Prepared, None, T0)]);
+        fx.clock.set(T0 + 1);
+        let (waited, committed) = drained(&mut fx, |r| {
+            r.run(None, |session| {
+                session.await_approval(handle.id(), [9; 32], [1; 32])
+            })
+        });
+        waited.unwrap();
+        check(committed, vec![(S::AwaitingApproval, None, T0 + 1)]);
+        fx.clock.set(T0 + 2);
+        let mint = fx.mint_request(tx(1), fx.policy(), vec![]);
+        let (started, committed) = drained(&mut fx, |r| {
+            r.begin_attempt(&handle, &mint_attempt(&handle, &mint))
+        });
+        let started = started.unwrap();
+        check(
+            committed,
+            vec![(S::Authorized, None, T0 + 2), (S::Sending, Some(1), T0 + 2)],
+        );
+        fx.claim(&mint, started.minted.as_ref().unwrap());
+        fx.clock.set(T0 + 3);
+        let (exposed, committed) = drained(&mut fx, |r| {
+            r.expose(handle.id(), 1, &classic_exposure(1), Some(10))
+        });
+        exposed.unwrap();
+        check(committed, vec![]);
+        fx.clock.set(T0 + 4);
+        let (unknown, committed) = drained(&mut fx, |r| {
+            r.transition(
+                handle.id(),
+                Some(1),
+                S::SentOutcomeUnknown,
+                &TransitionEvidence::default(),
+            )
+        });
+        unknown.unwrap();
+        check(committed, vec![(S::SentOutcomeUnknown, Some(1), T0 + 4)]);
+        let (released, committed) = drained(&mut fx, |r| {
+            r.record_evidence(
+                handle.id(),
+                1,
+                &EvidenceInput {
+                    sequence_released: Some(SequenceReleaseInput {
+                        primary_ledger: 300,
+                        witness_ledger: 300,
+                        min_close_time_ms: T0,
+                    }),
+                    ..EvidenceInput::default()
+                },
+            )
+        });
+        released.unwrap();
+        check(committed, vec![]);
+        let attempt = OperationStatus::new(&fx.store, &fx.profile)
+            .outcome_snapshot(Some(&[1 ^ 0x80; 32]))
+            .unwrap()
+            .pop()
+            .unwrap();
+        fx.clock.set(T0 + 5);
+        let (decided, committed) = drained(&mut fx, |r| {
+            r.commit_decision(&decide(&attempt, DecidedTransition::NotIncluded(proof())))
+        });
+        let decision_commit = decided.unwrap();
+        check(committed, vec![(S::NotIncluded, Some(1), T0 + 5)]);
+        let (projected, committed) = drained(&mut fx, |r| {
+            r.acknowledge_projection(handle.id(), 1, decision_commit)
+        });
+        projected.unwrap();
+        check(committed, vec![]);
+        fx.clock.set(T0 + 6);
+        let successor = fx.mint_request(tx(2), fx.policy(), vec![]);
+        let (started, committed) = drained(&mut fx, |r| {
+            r.begin_attempt(&handle, &mint_attempt(&handle, &successor))
+        });
+        started.unwrap();
+        check(committed, vec![(S::Sending, Some(2), T0 + 6)]);
+
+        fx.clock.set(T0 + 7);
+        let (handle, attempt) = decided_attempt(&mut fx, 3);
+        let (decided, committed) = drained(&mut fx, |r| {
+            r.commit_decision(&decide(
+                &attempt,
+                DecidedTransition::Succeeded(agreed(3, "SUCCESS")),
+            ))
+        });
+        decided.unwrap();
+        check(committed, vec![(S::Succeeded, Some(1), T0 + 7)]);
+        assert_eq!(fx.record(handle.id()).state, S::Succeeded);
+        let (_, attempt) = decided_attempt(&mut fx, 4);
+        let (decided, committed) = drained(&mut fx, |r| {
+            r.commit_decision(&decide(
+                &attempt,
+                DecidedTransition::Failed {
+                    outcome: agreed(4, "FAILED"),
+                    fee_charged: 100,
+                },
+            ))
+        });
+        decided.unwrap();
+        check(committed, vec![(S::Failed, Some(1), T0 + 7)]);
+
+        fx.clock.set(T0 + 8);
+        let handle = unknown_named(&mut fx, 5);
+        let (cleared, committed) = drained(&mut fx, |r| {
+            r.transition(
+                handle.id(),
+                Some(1),
+                S::Cancelled,
+                &TransitionEvidence {
+                    clear: Some(ClearForm::Untimed),
+                    ..TransitionEvidence::default()
+                },
+            )
+        });
+        cleared.unwrap();
+        check(committed, vec![(S::Cancelled, Some(1), T0 + 8)]);
+        let handle = fx.open_new(&request("order-6", canonical(6)));
+        exposed_attempt(&mut fx, &handle, 6, &classic_exposure(6), vec![]);
+        fx.clock.set(T0 + 9);
+        let (paid, committed) = drained(&mut fx, |r| {
+            r.transition(
+                handle.id(),
+                Some(1),
+                S::PayloadReleased,
+                &TransitionEvidence::default(),
+            )
+        });
+        paid.unwrap();
+        check(committed, vec![(S::PayloadReleased, Some(1), T0 + 9)]);
+        let handle = fx.open_new(&request("order-8", canonical(8)));
+        let mint = fx.mint_request(tx(8), fx.policy(), vec![]);
+        fx.begin_mint(&handle, &mint).unwrap();
+        fx.clock.set(T0 + 10);
+        let (unsent, committed) = drained(&mut fx, |r| {
+            r.transition(
+                handle.id(),
+                Some(1),
+                S::NotSent,
+                &TransitionEvidence::default(),
+            )
+        });
+        unsent.unwrap();
+        check(committed, vec![(S::NotSent, Some(1), T0 + 10)]);
+        let handle = x402_exposed(&mut fx, 7, S::SentOutcomeUnknown);
+        fx.clock.set(T0 + 11);
+        let (obliged, committed) = drained(&mut fx, |r| {
+            r.release_obligation(
+                handle.id(),
+                1,
+                WindowObservation {
+                    ledger: 501,
+                    close_time_floor_ms: T0,
+                    observed_at_ms: T0 + 11,
+                },
+                false,
+            )
+        });
+        obliged.unwrap();
+        check(committed, vec![(S::Expired, Some(1), T0 + 11)]);
+        let handle = fx.open_new(&request("order-10", canonical(10)));
+        let linked = linked_mint(&fx, &handle, tx(10), fx.policy(), 1);
+        fx.store.mint_authorization(&fx.profile, &linked).unwrap();
+        fx.clock.set(T0 + 12);
+        let business_id = BusinessId::parse("order-10").unwrap();
+        let (found, committed) = drained(&mut fx, |r| r.lookup(&business_id));
+        found.unwrap();
+        check(committed, vec![(S::Authorized, None, T0 + 12)]);
+        let mut waiting = request("order-11", canonical(11));
+        waiting.rule_ttl_ms = Some(1);
+        fx.open_new(&waiting);
+        fx.clock.set(T0 + 14);
+        let (ended, committed) = drained(&mut fx, |r| r.expire_due(T0 + 14));
+        ended.unwrap();
+        check(committed, vec![(S::Expired, None, T0 + 14)]);
+        drop(fx);
+
+        // An authorization that expired while linked adopts through the
+        // sweep, as in `sweep_adopts_waiting_operation_before_restart`.
+        let mut fx = Fx::new();
+        let mut open = request("order-1", canonical(1));
+        open.rule_ttl_ms = Some(300_000);
+        let handle = fx.open_new(&open);
+        fx.clock.set(T0 + 299_000);
+        let linked = linked_mint(&fx, &handle, tx(1), fx.policy(), 1);
+        fx.store.mint_authorization(&fx.profile, &linked).unwrap();
+        let swept_at = T0 + 299_000 + TTL_MS + 1;
+        fx.clock.set(swept_at);
+        let (ended, committed) = drained(&mut fx, |r| r.expire_due(swept_at));
+        ended.unwrap();
+        check(committed, vec![(S::Authorized, None, swept_at)]);
+        drop(fx);
+
+        // A link-only write adds no edge. An evidence write whose sweep
+        // adopts a waiting record yields exactly that adoption's edge.
+        let mut fx = Fx::new();
+        let waiting = fx.open_new(&request("order-1", canonical(1)));
+        step(&mut fx, &waiting, None, S::AwaitingApproval);
+        let (linked, committed) = drained(&mut fx, |r| r.link_approval(waiting.id(), [9; 32]));
+        linked.unwrap();
+        check(committed, vec![]);
+        assert_eq!(fx.record(waiting.id()).approval_record_id, Some([9; 32]));
+        let handle = unknown_named(&mut fx, 2);
+        let adoptable = fx.open_new(&request("order-3", canonical(3)));
+        let linked = linked_mint(&fx, &adoptable, tx(3), fx.policy(), 1);
+        fx.store.mint_authorization(&fx.profile, &linked).unwrap();
+        fx.clock.set(T0 + 20);
+        let (evidenced, committed) = drained(&mut fx, |r| {
+            r.record_evidence(
+                handle.id(),
+                1,
+                &EvidenceInput {
+                    rows: vec![outcome_row(2, 10)],
+                    ..EvidenceInput::default()
+                },
+            )
+        });
+        assert!(evidenced.unwrap().is_some());
+        check(committed, vec![(S::Authorized, None, T0 + 20)]);
+
+        let mut states: Vec<S> = seen;
+        states.sort_by_key(|state| S::ALL.iter().position(|all| all == state));
+        states.dedup();
+        assert_eq!(states, S::ALL);
+    }
+
+    /// A refused edge, a replay, an observation, an append failure and a
+    /// generation commit that returns an error publish nothing, also when
+    /// the commit is durable. A failed optional compaction still returns
+    /// success and publishes its edge.
+    #[test]
+    #[serial]
+    fn committed_batch_is_empty_without_a_commit() {
+        use super::super::store::{
+            COMMIT_FAULT_AFTER_COUNTER, COMMIT_FAULT_AFTER_PREPARED, COMMIT_FAULT_COMPACTION,
+            arm_accounting_fault,
+        };
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let expire = |r: &mut OperationRecorder<'_>, id: OperationId| {
+            r.transition(
+                id,
+                None,
+                OperationState::Expired,
+                &TransitionEvidence::default(),
+            )
+        };
+        for (seam, durable) in [
+            (COMMIT_FAULT_AFTER_PREPARED, false),
+            (COMMIT_FAULT_AFTER_COUNTER, true),
+        ] {
+            let mut fx = Fx::new();
+            let handle = fx.open_new(&request("order-1", canonical(1)));
+            let armed = arm_accounting_fault(seam);
+            let (result, committed) = drained(&mut fx, |r| expire(r, handle.id()));
+            drop(armed);
+            assert!(result.is_err(), "seam {seam}");
+            assert_eq!(committed, vec![], "seam {seam}");
+            let reopened = PersistedWindowStore::at_path(fx.store.path().to_owned());
+            let wire = reopened.read_for_inspection(&fx.profile).unwrap().unwrap();
+            let state = records(&wire)
+                .iter()
+                .find(|record| record.id == handle.id())
+                .unwrap()
+                .state;
+            let expected = if durable {
+                OperationState::Expired
+            } else {
+                OperationState::Prepared
+            };
+            assert_eq!(state, expected, "seam {seam}");
+        }
+
+        let mut fx = Fx::new();
+        let handle = fx.open_new(&request("order-1", canonical(1)));
+        let (refused, committed) = drained(&mut fx, |r| {
+            r.transition(
+                handle.id(),
+                None,
+                OperationState::Succeeded,
+                &TransitionEvidence::default(),
+            )
+        });
+        assert!(refused.is_err());
+        assert_eq!(committed, vec![]);
+        let (observed, committed) = drained(&mut fx, |r| {
+            r.record_observation(WindowObservation {
+                ledger: 10,
+                close_time_floor_ms: T0,
+                observed_at_ms: T0,
+            })
+        });
+        observed.unwrap();
+        assert_eq!(committed, vec![]);
+        let armed = arm_accounting_fault(COMMIT_FAULT_COMPACTION);
+        let (result, committed) = drained(&mut fx, |r| expire(r, handle.id()));
+        drop(armed);
+        result.unwrap();
+        assert_eq!(committed, vec![(OperationState::Expired, None, T0)]);
+        let (replayed, committed) = drained(&mut fx, |r| expire(r, handle.id()));
+        replayed.unwrap();
+        assert_eq!(committed, vec![]);
+    }
+
+    /// An expiry a lookup commits stays in the recorder's batch when the
+    /// recorder's next step refuses.
+    #[test]
+    #[serial]
+    fn committed_batch_keeps_changes_before_a_later_error() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let mut fx = Fx::new();
+        let mut open = request("order-1", canonical(1));
+        open.rule_ttl_ms = Some(1_000);
+        let handle = fx.open_new(&open);
+        fx.clock.set(T0 + 1_000);
+        let mint = fx.mint_request(tx(1), fx.policy(), vec![]);
+        let business_id = BusinessId::parse("order-1").unwrap();
+        let mut recorder = fx.recorder();
+        assert!(matches!(
+            recorder.lookup(&business_id).unwrap(),
+            Some(LookupOutcome::Replay(view)) if view.state == OperationState::Expired
+        ));
+        assert!(
+            recorder
+                .begin_attempt(&handle, &mint_attempt(&handle, &mint))
+                .is_err()
+        );
+        assert_eq!(
+            edges(recorder.take_committed()),
+            vec![(OperationState::Expired, None, T0 + 1_000)]
+        );
+    }
+
+    /// Each drain moves the accumulated edges out once, with the record's
+    /// identity, business id and approval link.
+    #[test]
+    #[serial]
+    fn recorder_drains_once() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let mut fx = Fx::new();
+        let mut recorder = fx.recorder();
+        let OpenOutcome::New(first) = recorder.open(&request("order-1", canonical(1))).unwrap()
+        else {
+            panic!("expected a new record")
+        };
+        let OpenOutcome::New(second) = recorder.open(&request("order-2", canonical(2))).unwrap()
+        else {
+            panic!("expected a new record")
+        };
+        let batch = recorder.take_committed();
+        assert_eq!(batch.len(), 2);
+        assert!(recorder.take_committed().is_empty());
+        let ids: Vec<_> = batch
+            .into_iter()
+            .map(|edge| {
+                (
+                    edge.operation_id(),
+                    edge.business_id().as_str().to_owned(),
+                    edge.approval_record_id(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                (first.id(), "order-1".to_owned(), None),
+                (second.id(), "order-2".to_owned(), None)
+            ]
+        );
+    }
+
+    /// A transition another recorder commits reaches this recorder's
+    /// verified reads, never its batch.
+    #[test]
+    #[serial]
+    fn external_commits_add_no_notice() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let mut fx = Fx::new();
+        let (handle, attempt) = decided_attempt(&mut fx, 1);
+        let external = PersistedWindowStore::at_path(fx.store.path().to_owned());
+        let mut external_rows = Sink::default();
+        OperationRecorder::new(&external, &fx.profile, &mut external_rows, "cli")
+            .commit_decision(&decide(
+                &attempt,
+                DecidedTransition::Succeeded(agreed(1, "SUCCESS")),
+            ))
+            .unwrap();
+        let business_id = BusinessId::parse("order-1").unwrap();
+        let (found, committed) = drained(&mut fx, |r| r.lookup(&business_id));
+        assert!(matches!(
+            found.unwrap(),
+            Some(LookupOutcome::Replay(view)) if view.state == OperationState::Succeeded
+        ));
+        assert_eq!(committed, vec![]);
+        assert_eq!(
+            OperationStatus::new(&fx.store, &fx.profile)
+                .watch_classes(T0)
+                .unwrap(),
+            vec![WatchedOperation {
+                operation_id: handle.id(),
+                class: WatchClass::Settled,
+            }]
+        );
     }
 
     #[test]

@@ -21,9 +21,9 @@ use crate::fees::ClassicFeeChoice;
 use crate::mainnet::MainnetAuthorizationError;
 use crate::policy_state::{
     AttemptAuthorization, AttemptEnvelope, AttemptRequest, BusinessId, CommitBinding, CommitTarget,
-    IntentSlot, LookupOutcome, OpenOutcome, OpenRequest, OperationHandle, OperationKind,
-    OperationLink, OperationRecorder, OperationState, OperationStatus, OperationView,
-    PersistedWindowStore, SlotKind, WindowStoreError,
+    CommittedBatch, IntentSlot, LookupOutcome, OpenOutcome, OpenRequest, OperationHandle,
+    OperationKind, OperationLink, OperationRecorder, OperationState, OperationStatus,
+    OperationView, PersistedWindowStore, SlotKind, WindowStoreError,
 };
 use crate::submission_record::{AuditWriterHandle, OperationAttempt};
 
@@ -593,6 +593,32 @@ pub fn begin_classic_attempt(
     handle: &OperationHandle,
     unsigned_envelope_b64: &str,
 ) -> Result<OperationAttempt, WalletError> {
+    begin_classic_attempt_committed(
+        store,
+        profile,
+        writer,
+        request_id,
+        handle,
+        unsigned_envelope_b64,
+        &mut CommittedBatch::default(),
+    )
+}
+
+/// [`begin_classic_attempt`], appending the transitions it commits to
+/// `committed`. An error adds no entries; it does not establish rollback.
+///
+/// # Errors
+///
+/// The errors of [`begin_classic_attempt`].
+pub fn begin_classic_attempt_committed(
+    store: &PersistedWindowStore,
+    profile: &Profile,
+    writer: &AuditWriterHandle,
+    request_id: &str,
+    handle: &OperationHandle,
+    unsigned_envelope_b64: &str,
+    committed: &mut CommittedBatch,
+) -> Result<OperationAttempt, WalletError> {
     let send_by_ms = attempt_send_by_ms(envelope_max_time(unsigned_envelope_b64)?);
     let mut guard = writer.lock().map_err(|_| {
         WalletError::Submission(SubmissionError::RecordUnavailable {
@@ -600,19 +626,20 @@ pub fn begin_classic_attempt(
                 .to_owned(),
         })
     })?;
-    let started = OperationRecorder::new(store, profile, &mut *guard, request_id)
-        .begin_attempt(
-            handle,
-            &AttemptRequest {
-                envelope: Some(AttemptEnvelope {
-                    xdr: unsigned_envelope_b64.to_owned(),
-                    unsigned_envelope_sha256: unsigned_envelope_sha256(unsigned_envelope_b64),
-                }),
-                authorization: AttemptAuthorization::Linked,
-                send_by_ms,
-            },
-        )
-        .map_err(operation_refusal)?;
+    let mut recorder = OperationRecorder::new(store, profile, &mut *guard, request_id);
+    let started = recorder.begin_attempt(
+        handle,
+        &AttemptRequest {
+            envelope: Some(AttemptEnvelope {
+                xdr: unsigned_envelope_b64.to_owned(),
+                unsigned_envelope_sha256: unsigned_envelope_sha256(unsigned_envelope_b64),
+            }),
+            authorization: AttemptAuthorization::Linked,
+            send_by_ms,
+        },
+    );
+    committed.append(recorder.take_committed());
+    let started = started.map_err(operation_refusal)?;
     Ok(OperationAttempt {
         operation_id: handle.id(),
         attempt_index: started.attempt_index,
@@ -1367,5 +1394,194 @@ pub(crate) mod tests {
     fn attempt_send_by_keeps_the_send_margin() {
         assert_eq!(attempt_send_by_ms(1_000), 970_000);
         assert_eq!(attempt_send_by_ms(0), u64::MAX);
+    }
+
+    /// The operation-store fixture with a keyed audit writer, an envelope
+    /// record of `order-1` and an open policy authorization linked to its
+    /// first attempt. It uses no `mainnet-write` fixture, so the adapter
+    /// batch tests also run without that feature.
+    pub(crate) struct StoreLinked {
+        pub(crate) fx: crate::policy_state::operations::tests::Fx,
+        pub(crate) writer: AuditWriterHandle,
+        pub(crate) handle: OperationHandle,
+        pub(crate) unsigned: String,
+        _anchors: std::sync::Arc<stellar_agent_core::audit_log::tip_anchor::InMemoryTipAnchorStore>,
+    }
+
+    impl StoreLinked {
+        pub(crate) fn new() -> Self {
+            use stellar_agent_core::audit_log::AuditWriter;
+            use stellar_agent_core::audit_log::tip_anchor::{
+                InMemoryTipAnchorStore, KeyedAuditAccess, TipAnchorStore,
+            };
+            use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
+            use stellar_agent_test_support::signed_envelope::SignedTestEnvelope;
+
+            let mut fx = crate::policy_state::operations::tests::Fx::new();
+            let anchors = std::sync::Arc::new(InMemoryTipAnchorStore::new());
+            let writer = AuditWriter::open(
+                fx.profile.audit_log_path.clone(),
+                Some(KeyedAuditAccess::new(
+                    zeroize::Zeroizing::new([0x5c; 32]),
+                    std::sync::Arc::clone(&anchors) as std::sync::Arc<dyn TipAnchorStore>,
+                )),
+            )
+            .unwrap();
+            let unsigned = SignedTestEnvelope::builder([3; 32])
+                .network_passphrase(MAINNET_PASSPHRASE)
+                .time_bounds(0, crate::mainnet::clock::now_ms().unwrap() / 1000 + 120)
+                .sequence(101)
+                .unsigned()
+                .build()
+                .envelope_xdr()
+                .to_owned();
+            let opened = fx
+                .recorder()
+                .open(&OpenRequest {
+                    business_id: BusinessId::parse("order-1").unwrap(),
+                    tool: crate::policy_state::OperationTool::CliPay,
+                    kind: OperationKind::Pay,
+                    intent: IntentSlot::Envelope {
+                        unsigned_envelope_sha256: unsigned_envelope_sha256(&unsigned),
+                        intent_digest: [7; 32],
+                        max_time: envelope_max_time(&unsigned).unwrap(),
+                    },
+                    envelope_xdr: Some(unsigned.clone()),
+                    prepared_decision: None,
+                    rule_ttl_ms: None,
+                })
+                .unwrap();
+            let OpenOutcome::New(handle) = opened else {
+                panic!("a new business id opens a record: {opened:?}")
+            };
+            let mut linked = fx.mint_request(
+                crate::policy_state::ledger::DomainBinding::Transaction {
+                    unsigned_envelope_sha256: unsigned_envelope_sha256(&unsigned),
+                    tx_hash: [0x81; 32],
+                    source: SOURCE.to_owned(),
+                    sequence: 101,
+                },
+                fx.policy(),
+                vec![],
+            );
+            linked.operation = Some(next_attempt_link(&handle));
+            fx.store.mint_authorization(&fx.profile, &linked).unwrap();
+            Self {
+                fx,
+                writer: std::sync::Arc::new(std::sync::Mutex::new(writer)),
+                handle,
+                unsigned,
+                _anchors: anchors,
+            }
+        }
+
+        /// Begins the record's next attempt, appending its edges to
+        /// `committed`.
+        pub(crate) fn begin(
+            &self,
+            committed: &mut CommittedBatch,
+        ) -> Result<OperationAttempt, WalletError> {
+            begin_classic_attempt_committed(
+                &self.fx.store,
+                &self.fx.profile,
+                &self.writer,
+                "request",
+                &self.handle,
+                &self.unsigned,
+                committed,
+            )
+        }
+    }
+
+    /// The operation, state and attempt of each edge `committed` holds.
+    pub(crate) fn batch_edges(
+        committed: &CommittedBatch,
+    ) -> Vec<(OperationId, OperationState, Option<u32>)> {
+        committed
+            .clone()
+            .into_iter()
+            .map(|edge| (edge.operation_id(), edge.state(), edge.attempt_index()))
+            .collect()
+    }
+
+    /// Without `mainnet-write` the committed attempt entry appends the
+    /// adoption and `Sending` edges it commits; a refused second entry
+    /// adds none and keeps the batch's earlier edges.
+    #[test]
+    #[serial_test::serial]
+    fn attempt_wrapper_batches_without_the_mainnet_feature() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let linked = StoreLinked::new();
+        let mut committed = CommittedBatch::default();
+        let attempt = linked.begin(&mut committed).unwrap();
+        let started = vec![
+            (linked.handle.id(), OperationState::Authorized, None),
+            (
+                linked.handle.id(),
+                OperationState::Sending,
+                Some(attempt.attempt_index),
+            ),
+        ];
+        assert_eq!(batch_edges(&committed), started);
+        let refused = linked.begin(&mut committed).unwrap_err();
+        assert_eq!(refused.code(), "operation.attempt_open");
+        assert_eq!(batch_edges(&committed), started);
+    }
+
+    #[cfg(feature = "mainnet-write")]
+    mod committed {
+        use serial_test::serial;
+
+        use super::*;
+        use crate::mainnet::fixtures::{self, LedgerFixture};
+
+        /// The committed attempt entry appends the adoption and `Sending`
+        /// edges it commits; a refused second entry commits nothing and
+        /// keeps the batch's earlier edges.
+        #[test]
+        #[serial]
+        fn attempt_wrappers_preserve_commits_on_success_and_refusal() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let fx = LedgerFixture::new("attempt-committed", 1_800_000_000_000);
+            let unsigned = fixtures::unsigned_envelope();
+            let binding = fixtures::tx_binding(unsigned.envelope_xdr(), unsigned.tx_hash_hex());
+            let (handle, _authorization) = fx.linked_record(binding, &[], "order-1");
+            let mut committed = CommittedBatch::default();
+            let begin = |committed: &mut CommittedBatch| {
+                begin_classic_attempt_committed(
+                    &fx.window,
+                    &fx.profile,
+                    &fx.writer,
+                    "request",
+                    &handle,
+                    unsigned.envelope_xdr(),
+                    committed,
+                )
+            };
+            let attempt = begin(&mut committed).unwrap();
+            let edges = |committed: &CommittedBatch| -> Vec<_> {
+                committed
+                    .clone()
+                    .into_iter()
+                    .map(|edge| (edge.operation_id(), edge.state(), edge.attempt_index()))
+                    .collect()
+            };
+            let started = vec![
+                (handle.id(), OperationState::Authorized, None),
+                (
+                    handle.id(),
+                    OperationState::Sending,
+                    Some(attempt.attempt_index),
+                ),
+            ];
+            assert_eq!(edges(&committed), started);
+            let refused = begin(&mut committed).unwrap_err();
+            assert_eq!(refused.code(), "operation.attempt_open");
+            assert_eq!(edges(&committed), started);
+        }
     }
 }
