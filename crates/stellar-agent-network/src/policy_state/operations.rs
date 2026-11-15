@@ -1719,6 +1719,19 @@ pub(super) fn projection_owed(wire: &WireFile) -> Vec<AuthorizationId> {
         .collect()
 }
 
+/// Every authorization whose retained attempt holds a checked recovery
+/// decision of success. Its total debits are final charges.
+pub(super) fn checked_successes(wire: &WireFile) -> Vec<AuthorizationId> {
+    records(wire)
+        .iter()
+        .flat_map(|record| &record.attempts)
+        .filter(|attempt| {
+            attempt.decision.is_some() && attempt.outcome == Some(OperationState::Succeeded)
+        })
+        .map(|attempt| attempt.authorization_id)
+        .collect()
+}
+
 /// Every retained operation that has not ended. A writer without an
 /// operation audit leaves the authorizations they link untouched.
 pub(super) fn live_operations(wire: &WireFile) -> Vec<OperationId> {
@@ -2420,7 +2433,9 @@ fn prune_section(wire: &mut WireFile, now_ms: u64) {
     });
 
     // A record whose committed decision still owes its receipt projection
-    // stays until that acknowledgement, whatever its age.
+    // stays until that acknowledgement, whatever its age. A checked success
+    // stays while a total debit of its attempt awaits the final marker, since
+    // the success is the evidence for that marker.
     let eligible = |wire: &WireFile, record: &WireOperation| {
         record.state.is_terminal()
             && !record.attempts.iter().any(|attempt| {
@@ -2428,6 +2443,9 @@ fn prune_section(wire: &mut WireFile, now_ms: u64) {
                     .decision
                     .as_ref()
                     .is_some_and(|decision| !decision.projected)
+                    || (attempt.decision.is_some()
+                        && attempt.outcome == Some(OperationState::Succeeded)
+                        && super::store::total_awaits_final(wire, attempt.authorization_id))
             })
             && !wire.authorizations.iter().any(|auth| {
                 auth.operation
@@ -3062,8 +3080,7 @@ impl Session<'_> {
     fn settle(&mut self) -> Result<(), WindowStoreError> {
         self.sweep_and_adopt()?;
         self.expire(self.now)?;
-        prune_stale(&mut self.wire, self.now);
-        Ok(())
+        prune_stale(&mut self.wire, self.now)
     }
 
     /// The record or tombstone `business_id` names, with its slot kind and
@@ -3984,6 +4001,9 @@ impl Session<'_> {
         ) {
             super::ledger::release_total_debits(&mut self.wire, auth_id, now);
         }
+        // A checked success keeps this attempt's total debits charged. The
+        // decision stored above is the evidence the commit's pruning reads to
+        // mark them final, including holds a later sweep converts.
         let row = match outcome {
             Some(outcome) => ReleaseRow {
                 class: ReleaseClass::Settled,
@@ -4388,12 +4408,14 @@ impl<'a> OperationRecorder<'a> {
             (value, next, session.audit.entries)
         };
         if let Some(mut next) = next {
+            // Maintenance completes before the audit rows, so a refused fold
+            // appends no row for a step that commits nothing.
+            prune_stale(&mut next, now)?;
             for entry in entries {
                 self.audit
                     .append(entry)
                     .map_err(|detail| WindowStoreError::AuditAppendFailed { detail })?;
             }
-            prune_stale(&mut next, now);
             store.commit_generation(&key, &gen_entry, original, next)?;
         }
         Ok(value)
@@ -4736,7 +4758,7 @@ impl<'a> OperationRecorder<'a> {
         slot_kind: SlotKind,
     ) -> Result<bool, WindowStoreError> {
         self.run(None, |session| {
-            prune_stale(&mut session.wire, session.now);
+            prune_stale(&mut session.wire, session.now)?;
             let Some(tombstone) = session.wire.operations.as_mut().and_then(|section| {
                 section
                     .tombstones
@@ -5131,12 +5153,14 @@ impl<'a> OperationStatus<'a> {
         Self { store, profile }
     }
 
-    /// The verified window, pruned in memory on the store clock.
+    /// The verified window, pruned in memory on the store clock. A read
+    /// applies only lifecycle pruning: it promotes and folds nothing, so it
+    /// keeps every proof and never refuses on maintenance.
     fn read(&self) -> Result<Option<WireFile>, WindowStoreError> {
         let Some(mut wire) = self.store.read_for_inspection(self.profile)? else {
             return Ok(None);
         };
-        prune_stale(&mut wire, now_ms()?);
+        super::store::prune_lifecycle(&mut wire, now_ms()?);
         Ok(Some(wire))
     }
 
@@ -13349,6 +13373,439 @@ pub(crate) mod tests {
             fx.store
                 .record_authorized(&fx.profile, &[total(6)])
                 .unwrap();
+        }
+
+        // ── final charges ────────────────────────────────────────────────
+
+        fn succeeded() -> DecidedTransition {
+            DecidedTransition::Succeeded(agreed(1, "SUCCESS"))
+        }
+
+        /// A checked success marks its own total row of 6 final beside an
+        /// unrelated pending 3: the use stays 9, and the window rows keep
+        /// their exact amounts.
+        #[test]
+        #[serial]
+        fn a_checked_success_marks_only_its_own_rows_final() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let mut fx = Fx::new();
+            let (handle, _) = decided_attempt(&mut fx, 1);
+            let auth_id = fx.record(handle.id()).attempts[0].authorization_id;
+            push_total_row(&fx, &envelope_id(1), auth_id, 6);
+            let other = AuthorizationId::from_bytes([0x77; 32]);
+            push_total_row(&fx, &"ee".repeat(32), other, 3);
+            let attempt = snapshot(&fx, 1);
+            fx.recorder()
+                .commit_decision(&decide(&attempt, succeeded()))
+                .unwrap();
+            let mut rows = total_rows(&fx);
+            rows.sort_by_key(|row| row.2);
+            assert_eq!(
+                rows,
+                vec![
+                    (Some(other), RecordStatus::Pending, 3),
+                    (Some(auth_id), RecordStatus::FinalTotal, 6),
+                ]
+            );
+            assert_eq!(sum(&fx), 9);
+            assert_eq!(hydrated(&fx), 9);
+            let mut window: Vec<_> = bucket_rows(&fx, 1)
+                .into_iter()
+                .filter(|row| row.0 != "total:native")
+                .map(|row| (row.0, row.1, row.2))
+                .collect();
+            window.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(
+                window,
+                vec![
+                    ("native".to_owned(), RecordStatus::Confirmed, 25),
+                    ("usdc".to_owned(), RecordStatus::Confirmed, 40),
+                ]
+            );
+        }
+
+        /// A checked success finalizes a consumed row, a row whose accounting
+        /// expired, and a held claim the decision's own sweep converts.
+        /// A success decided while the claim still holds keeps the hold
+        /// charged; the later conversion becomes final.
+        #[test]
+        #[serial]
+        fn a_checked_success_finalizes_every_shape() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            for shape in ["consumed", "expired", "converted", "held"] {
+                let mut fx = Fx::new();
+                let stored = if shape == "converted" { "held" } else { shape };
+                let (_, _, auth_id) = decided_total_attempt(&mut fx, 1, stored);
+                let attempt = snapshot(&fx, 1);
+                let expires = fx.auth(auth_id).expires_ms;
+                if shape == "converted" {
+                    fx.clock.set(expires);
+                }
+                fx.recorder()
+                    .commit_decision(&decide(&attempt, succeeded()))
+                    .unwrap();
+                if shape == "held" {
+                    assert!(total_rows(&fx).is_empty(), "{shape}");
+                    assert_eq!(sum(&fx), 6, "{shape}");
+                    fx.clock.set(expires);
+                    fx.prune_now();
+                }
+                assert_eq!(
+                    total_rows(&fx),
+                    vec![(Some(auth_id), RecordStatus::FinalTotal, 6)],
+                    "{shape}"
+                );
+                assert!(fx.wire().holds.is_empty(), "{shape}");
+                assert_eq!(sum(&fx), 6, "{shape}");
+                assert_eq!(hydrated(&fx), 6, "{shape}");
+            }
+        }
+
+        /// At operation capacity, projected released rows are collected and
+        /// an anonymous final 2 folds. A success whose projection is owed
+        /// keeps its final row of 6. A new operation opens, 2 more admit,
+        /// and 1 refuses.
+        #[test]
+        #[serial]
+        fn capacity_reclaims_history_and_folds_final_charges() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let mut fx = Fx::new();
+            projected_failure(&mut fx);
+            let (_, attempt, owed) = decided_total_attempt(&mut fx, 3, "consumed");
+            fx.recorder()
+                .commit_decision(&decide(
+                    &attempt,
+                    DecidedTransition::Succeeded(agreed(3, "SUCCESS")),
+                ))
+                .unwrap();
+            fx.store
+                .record_authorized(&fx.profile, &[total(2)])
+                .unwrap();
+            fx.rewrite(|wire| {
+                let bucket = super::super::super::store::find_or_insert_bucket(
+                    &mut wire.entries,
+                    &total_key(),
+                );
+                let released = bucket
+                    .records
+                    .iter()
+                    .find(|record| record.status == RecordStatus::ProvedUnspent)
+                    .unwrap()
+                    .clone();
+                let mut n = 0_u32;
+                while serialized_len(&*wire) <= FILE_THRESHOLD {
+                    let bucket = super::super::super::store::find_or_insert_bucket(
+                        &mut wire.entries,
+                        &total_key(),
+                    );
+                    for _ in 0..500 {
+                        n += 1;
+                        let mut copy = released.clone();
+                        copy.id = format!("{n:064x}");
+                        bucket.records.push(copy);
+                    }
+                }
+            });
+            fx.clock.set(past_retention());
+            let opened = fx.recorder().open(&request("order-2", canonical(2)));
+            assert!(
+                matches!(opened, Ok(OpenOutcome::New(_))),
+                "history strands the payer: {opened:?}"
+            );
+            assert_eq!(
+                total_rows(&fx),
+                vec![(Some(owed), RecordStatus::FinalTotal, 6)]
+            );
+            let sums: Vec<_> = fx
+                .wire()
+                .total_sums
+                .iter()
+                .map(|sum| (sum.bucket.clone(), sum.epoch, sum.amount))
+                .collect();
+            assert_eq!(sums, vec![("total:native".to_owned(), P7, 2)]);
+            assert_eq!(sum(&fx), 8);
+            fx.store
+                .record_authorized(&fx.profile, &[total(2)])
+                .unwrap();
+            assert!(matches!(
+                fx.store.record_authorized(&fx.profile, &[total(1)]),
+                Err(WindowStoreError::PolicyDenied { .. })
+            ));
+        }
+
+        /// A settled sum at `i128::MAX` beside an old final 1 cannot fold.
+        /// The read-only status and recovery views still report the
+        /// unrelated attempt and its proof. A checked success then refuses
+        /// with the typed detail, appends no audit row, and writes nothing.
+        #[test]
+        #[serial]
+        fn a_refused_fold_keeps_reads_and_appends_nothing() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let mut fx = Fx::new();
+            let (handle, decided, _) = decided_total_attempt(&mut fx, 1, "consumed");
+            fx.rewrite(|wire| {
+                wire.total_sums
+                    .push(super::super::super::store::WireTotalSum {
+                        scope_specificity: 1,
+                        bucket: "total:native".to_owned(),
+                        epoch: P7,
+                        amount: i128::MAX,
+                        settled_until_ms: T0,
+                    });
+                super::super::super::store::find_or_insert_bucket(&mut wire.entries, &total_key())
+                    .records
+                    .push(super::super::super::store::WireRecord {
+                        ts_ms: T0,
+                        amount: 1,
+                        epoch: Some(P7),
+                        status: RecordStatus::FinalTotal,
+                        ..super::super::super::store::WireRecord::confirmed_defaults()
+                    });
+            });
+            fx.clock.set(past_retention());
+            let status = OperationStatus::new(&fx.store, &fx.profile);
+            let view = status
+                .view(&BusinessId::parse("order-1").unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(view.state, OperationState::SentOutcomeUnknown);
+            let attempt = snapshot(&fx, 1);
+            assert_eq!(
+                (
+                    attempt.operation_id,
+                    &attempt.exposure,
+                    attempt.sequence_released
+                ),
+                (decided.operation_id, &decided.exposure, true)
+            );
+            assert_eq!(attempt.generation, decided.generation + 1);
+            let gen_entry = generation_entry_ref(&fx.profile);
+            let counter = || {
+                keyring_core::Entry::new(&gen_entry.service, &gen_entry.account)
+                    .unwrap()
+                    .get_password()
+                    .ok()
+            };
+            let before = (fs::read(fx.store.path()).unwrap(), counter());
+            let rows = fx.sink.entries.len();
+            let result = fx
+                .recorder()
+                .commit_decision(&decide(&attempt, succeeded()));
+            assert!(
+                matches!(&result, Err(WindowStoreError::Invalid { detail })
+                    if detail == "a total-budget sum overflows"),
+                "{result:?}"
+            );
+            assert_eq!(fx.sink.entries.len(), rows, "a refused fold appends a row");
+            assert_eq!((fs::read(fx.store.path()).unwrap(), counter()), before);
+            assert_eq!(
+                fx.record(handle.id()).state,
+                OperationState::SentOutcomeUnknown
+            );
+        }
+
+        /// A checked success whose claim still holds a total of 6 stays when
+        /// the terminal-record cap fills. Its hold converts into a final row;
+        /// then the record leaves under the cap, and the row folds into 6.
+        #[test]
+        #[serial]
+        fn the_terminal_cap_keeps_a_success_until_its_hold_is_final() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let mut fx = Fx::new();
+            let (handle, attempt, auth_id) = decided_total_attempt(&mut fx, 1, "held");
+            let commit = fx
+                .recorder()
+                .commit_decision(&decide(&attempt, succeeded()))
+                .unwrap();
+            fx.recorder()
+                .acknowledge_projection(handle.id(), 1, commit)
+                .unwrap();
+            // A later expired record, cloned under fresh identities, fills
+            // the cap; the success is the oldest terminal record.
+            fx.clock.set(fx.now() + 1);
+            let filler = fx.open_new(&request("filler", canonical(9)));
+            fx.recorder()
+                .transition(
+                    filler.id(),
+                    None,
+                    OperationState::Expired,
+                    &TransitionEvidence::default(),
+                )
+                .unwrap();
+            let fill = |fx: &Fx, first: usize, count: usize| {
+                fx.rewrite(|wire| {
+                    let section = wire.operations.as_mut().unwrap();
+                    let template = section
+                        .records
+                        .iter()
+                        .find(|record| record.id == filler.id())
+                        .unwrap()
+                        .clone();
+                    for n in first..first + count {
+                        let mut extra = template.clone();
+                        extra.id = OperationId::random();
+                        extra.business_id = BusinessId::parse(&format!("fill-{n}")).unwrap();
+                        section.records.push(extra);
+                    }
+                });
+            };
+            let kept = |fx: &Fx| records(&fx.wire()).iter().any(|r| r.id == handle.id());
+            fill(&fx, 0, TERMINAL_RECORDS_MAX - 1);
+            let terminal = |fx: &Fx| {
+                records(&fx.wire())
+                    .iter()
+                    .filter(|record| record.state.is_terminal())
+                    .count()
+            };
+            assert_eq!(terminal(&fx), TERMINAL_RECORDS_MAX + 1);
+            fx.prune_now();
+            assert_eq!(terminal(&fx), TERMINAL_RECORDS_MAX);
+            assert!(
+                kept(&fx),
+                "the cap removes the success before its hold is final"
+            );
+            assert!(total_rows(&fx).is_empty());
+            assert_eq!(sum(&fx), 6);
+            let expires = fx.auth(auth_id).expires_ms;
+            fx.clock.set(expires);
+            fx.prune_now();
+            assert_eq!(
+                total_rows(&fx),
+                vec![(Some(auth_id), RecordStatus::FinalTotal, 6)]
+            );
+            fill(&fx, TERMINAL_RECORDS_MAX, 1);
+            fx.prune_now();
+            assert!(!kept(&fx), "a final success stays above the cap");
+            assert_eq!(
+                total_rows(&fx),
+                vec![(Some(auth_id), RecordStatus::FinalTotal, 6)]
+            );
+            fx.clock.set(past_retention());
+            fx.prune_now();
+            assert!(total_rows(&fx).is_empty());
+            let sums: Vec<_> = fx
+                .wire()
+                .total_sums
+                .iter()
+                .map(|sum| (sum.epoch, sum.amount))
+                .collect();
+            assert_eq!(sums, vec![(P7, 6)]);
+            assert_eq!(sum(&fx), 6);
+        }
+
+        /// A checked success with an acknowledged projection leaves a claimed
+        /// total hold of 6. A later consumption turns the hold into a pending
+        /// row, which becomes final while the success is retained. Past the
+        /// cap and the age limit the row folds into 6 and the record leaves.
+        #[test]
+        #[serial]
+        fn a_late_consumption_after_a_checked_success_becomes_final() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let mut fx = Fx::new();
+            let handle = fx.open_new(&request("order-1", canonical(1)));
+            let mint = fx.mint_request(tx(1), fx.policy(), vec![total(6)]);
+            let started = fx.begin_mint(&handle, &mint).unwrap();
+            let minted = started.minted.as_ref().unwrap();
+            fx.claim(&mint, minted);
+            let envelope: [u8; 32] = Sha256::digest(envelope_text(1)).into();
+            let exposure = ExposureIdentity::Classic {
+                envelope_sha256: envelope,
+                tx_hash: [1 ^ 0x80; 32],
+                sequence: 101,
+                max_time: T0 / 1_000 + 60,
+                receipt: envelope_id(1),
+            };
+            fx.recorder()
+                .expose(handle.id(), started.attempt_index, &exposure, Some(10))
+                .unwrap();
+            fx.recorder()
+                .transition(
+                    handle.id(),
+                    Some(started.attempt_index),
+                    OperationState::SentOutcomeUnknown,
+                    &TransitionEvidence::default(),
+                )
+                .unwrap();
+            fx.recorder()
+                .record_evidence(
+                    handle.id(),
+                    started.attempt_index,
+                    &EvidenceInput {
+                        sequence_released: Some(SequenceReleaseInput {
+                            primary_ledger: 90,
+                            witness_ledger: 90,
+                            min_close_time_ms: T0,
+                        }),
+                        ..EvidenceInput::default()
+                    },
+                )
+                .unwrap();
+            let auth_id = started.authorization_id;
+            let decision = decide(&snapshot(&fx, 1), succeeded());
+            let commit = fx.recorder().commit_decision(&decision).unwrap();
+            fx.recorder()
+                .acknowledge_projection(handle.id(), 1, commit)
+                .unwrap();
+            assert!(fx.auth(auth_id).state.holds(), "the claim still holds");
+            assert!(total_rows(&fx).is_empty());
+            consume_as(&fx, &mint, minted, 1, envelope);
+            assert!(fx.wire().holds.is_empty());
+            assert_eq!(
+                total_rows(&fx),
+                vec![(Some(auth_id), RecordStatus::FinalTotal, 6)]
+            );
+            let kept = |fx: &Fx| records(&fx.wire()).iter().any(|r| r.id == handle.id());
+            assert!(kept(&fx));
+            assert_eq!(sum(&fx), 6);
+            fx.clock.set(fx.now() + 1);
+            let filler = fx.open_new(&request("filler", canonical(9)));
+            fx.recorder()
+                .transition(
+                    filler.id(),
+                    None,
+                    OperationState::Expired,
+                    &TransitionEvidence::default(),
+                )
+                .unwrap();
+            fx.rewrite(|wire| {
+                let section = wire.operations.as_mut().unwrap();
+                let template = section
+                    .records
+                    .iter()
+                    .find(|record| record.id == filler.id())
+                    .unwrap()
+                    .clone();
+                for n in 0..TERMINAL_RECORDS_MAX {
+                    let mut extra = template.clone();
+                    extra.id = OperationId::random();
+                    extra.business_id = BusinessId::parse(&format!("fill-{n}")).unwrap();
+                    section.records.push(extra);
+                }
+            });
+            fx.clock.set(past_retention() + TERMINAL_RETENTION_MS);
+            fx.prune_now();
+            assert!(!kept(&fx), "a final success stays past the cap and the age");
+            assert!(total_rows(&fx).is_empty());
+            let sums: Vec<_> = fx
+                .wire()
+                .total_sums
+                .iter()
+                .map(|sum| (sum.epoch, sum.amount))
+                .collect();
+            assert_eq!(sums, vec![(P7, 6)]);
+            assert_eq!(sum(&fx), 6);
         }
 
         /// The clock moves back before any reuse: the hold still counts.

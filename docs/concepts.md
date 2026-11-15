@@ -239,7 +239,12 @@ against one allocation. The allocation persists across restarts, state
 refreshes, clock changes, and owner resets. A signed, sent, or confirmed debit
 stays counted. An operator clear keeps it counted. A checked failure or
 non-inclusion releases that attempt's debit and keeps its fee charged. An
-x402 or MPP debit stays counted for the life of the signed policy. An exhausted allocation refuses with
+x402 or MPP debit stays counted for the life of the signed policy.
+A final charge is a debit no supported release changes: authorized x402 or MPP
+spend, and a classic payment with a checked success. One week after its date it
+folds into one settled sum for its policy digest, scope, and asset. The sum
+keeps the full amount through restarts, resets, and policy changes. A debit
+whose outcome is unresolved stays an individual record. An exhausted allocation refuses with
 `policy.deny.total_budget_exhausted`, which names the maximum and the
 remaining amount. The criterion requires `decision = "allow"`.
 An exhausted allocation or unlisted budget denies the payment; neither

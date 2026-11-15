@@ -1534,13 +1534,14 @@ pub struct ToolLimits {
     pub period_caps: Vec<PeriodCap>,
     /// Every rate limit of the rule, shortest window first.
     pub rate_caps: Vec<RateCap>,
-    /// The non-renewing total until the next signature.
+    /// The non-renewing total of the signed policy digest. The same digest
+    /// keeps its charge; a new sequence changes the body digest.
     pub total_budget: Option<String>,
     /// The amount above which a payment requests approval.
     pub approval_above: Option<String>,
     /// At most what this tool alone pays without approval in each window of
-    /// the asset, and in `total` until the next signature, to the recipients
-    /// of `largest_payment`. When it pays one, it is also at most what it
+    /// the asset, and in `total` under the signed policy digest, to the
+    /// recipients of `largest_payment`. When it pays one, it is also at most what it
     /// pays every recipient together. Only payments the evaluation allows
     /// count; a payment that requests approval never does. `0` when no such
     /// recipient is paid with `allow`, `null` for no bound.
@@ -1595,7 +1596,8 @@ pub struct RateCap {
 /// At most what one tool can pay without approval in one window.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PeriodBound {
-    /// A rolling window, or `total` for the time until the next signature.
+    /// A rolling window, or `total` for the allocation of the signed policy
+    /// digest.
     pub window: String,
     /// At most this amount; `null` for no bound.
     pub amount: Option<String>,
@@ -1641,7 +1643,8 @@ pub struct Counter {
 /// every tool together.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AssetBound {
-    /// A rolling window, or `total` for the time until the next signature.
+    /// A rolling window, or `total` for the allocation of the signed policy
+    /// digest.
     pub window: String,
     /// At most this amount; `null` when some tool pays without a bound;
     /// `per_tool` when the tools' bounds differ within one counter or their
@@ -1680,7 +1683,8 @@ pub struct AssetLimits {
     pub unlisted_largest_payment: Agreed<String>,
     /// Every window any tool caps, shortest first.
     pub period_caps: Vec<AgreedPeriodCap>,
-    /// The non-renewing total until the next signature.
+    /// The non-renewing total of the signed policy digest. The same digest
+    /// keeps its charge; a new sequence changes the body digest.
     pub total_budget: Agreed<String>,
     /// The amount above which a payment requests approval.
     pub approval_above: Agreed<String>,
@@ -2234,7 +2238,7 @@ impl ToolView {
     }
 
     /// At most what one counter admits in a window of `window` seconds
-    /// (`None` for the time until the next signature).
+    /// (`None` for the allocation of the signed policy digest).
     ///
     /// An amount counter written `m` times per payment admits a total `S`
     /// with `m·S_before + a ≤ L` for its last payment `a ≤ amax`, so `S` is at

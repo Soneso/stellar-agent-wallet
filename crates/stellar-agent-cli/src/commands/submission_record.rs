@@ -1496,6 +1496,30 @@ mod tests {
         assert!(rendered.details.is_none());
     }
 
+    /// A total-budget overflow the recorder reports keeps its code, and a
+    /// multibyte diagnostic renders intact.
+    #[test]
+    fn a_total_overflow_keeps_its_code_and_text() {
+        let err = record_unavailable(
+            "the spending-window reservation could not be written: Invalid { detail: \"a \
+             total-budget sum overflows\" } profil \u{e9}t\u{e9} \u{20ac}",
+        );
+        let envelope = error_envelope(&err, SIGNED_XDR, "pay");
+        let rendered = envelope.error.as_ref().unwrap();
+        assert_eq!(rendered.code, "submission.record_unavailable");
+        assert!(
+            rendered.message.contains("a total-budget sum overflows"),
+            "{}",
+            rendered.message
+        );
+        assert!(
+            rendered.message.contains("\u{e9}t\u{e9} \u{20ac}"),
+            "{}",
+            rendered.message
+        );
+        assert!(rendered.details.is_none());
+    }
+
     /// Only verified approval authority contributes a tombstone.
     #[cfg(feature = "mainnet-write")]
     #[tokio::test(flavor = "current_thread")]

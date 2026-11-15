@@ -1,0 +1,1 @@
+- Final total-budget charges fold into per-policy sums after one week. Their full amount remains charged through restart and reset.
