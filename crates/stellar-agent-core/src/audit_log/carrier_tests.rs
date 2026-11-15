@@ -91,6 +91,392 @@ fn concurrent_admission_has_one_winner() {
     }
 }
 
+#[test]
+#[serial_test::serial]
+fn concurrent_admission_retains_both_identities() {
+    use crate::audit_log::consent_evidence::{RecordState, tests::delivered};
+    use std::sync::mpsc;
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let (_dir, path, store) = evidence_fixture();
+    let batch = crate::audit_log::outbox::OutboxBatch::read_locked(&path, store.as_ref()).unwrap();
+    batch
+        .commit_evidence_change(&path, store.as_ref(), &[0x42; 32], false, |image, _| {
+            image.records = (0..10)
+                .map(|n| crate::audit_log::consent_evidence::EvidenceRecord {
+                    digest: [0; 32],
+                    generation: 0,
+                    sequence: 0,
+                    state: RecordState::Reserved,
+                    ..delivered(n)
+                })
+                .collect();
+            Ok(())
+        })
+        .unwrap();
+    drop(batch);
+    let before = store.outbox_item_writes().len();
+    let (loaded_tx, loaded_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    test_seam::on_evidence_loaded(&path, move || {
+        loaded_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    let worker = |identity, done: mpsc::Sender<()>| {
+        let outbox = AuditOutbox::for_log_keyed(&path, store.clone(), Zeroizing::new([0x42; 32]));
+        std::thread::spawn(move || {
+            let result = outbox.reserve_evidence(identity, 9_000, 0);
+            let _ = done.send(());
+            result
+        })
+    };
+    let a = worker([254; 32], done_tx.clone());
+    loaded_rx.recv().unwrap();
+    let contended = release_tx.clone();
+    test_seam::on_contended(&outbox_lock_path(&path), move || {
+        let _ = contended.send(());
+    });
+    let watched = store.clone();
+    test_seam::on_evidence_loaded(&path, move || {
+        if watched.outbox_item_writes().len() == before {
+            let _ = release_tx.send(());
+            done_rx.recv().unwrap();
+        }
+    });
+    let b = worker([255; 32], done_tx);
+    let results = [a.join().unwrap(), b.join().unwrap()];
+    assert!(
+        results.iter().all(Result::is_ok),
+        "both admissions below capacity succeed: {results:?}"
+    );
+    let writer = AuditWriter::open(path, Some(access(&store))).unwrap();
+    let identities: Vec<[u8; 32]> = writer
+        .outbox_evidence()
+        .unwrap()
+        .unwrap()
+        .records()
+        .iter()
+        .map(|record| record.identity)
+        .collect();
+    let mut expected: Vec<[u8; 32]> = (0..10).map(|n| delivered(n).identity).collect();
+    expected.extend([[254; 32], [255; 32]]);
+    assert_eq!(
+        identities, expected,
+        "no admission loses another's identity"
+    );
+}
+
+/// A log with initialized consent evidence and no writer open.
+fn evidence_fixture() -> (tempfile::TempDir, PathBuf, Arc<InMemoryTipAnchorStore>) {
+    let (dir, path, store) = fixture();
+    let mut writer = AuditWriter::open(path.clone(), Some(access(&store))).unwrap();
+    writer.initialize_consent_evidence().unwrap();
+    drop(writer);
+    (dir, path, store)
+}
+
+/// Seals `records` under the fixture key in the store's scope.
+fn evidence_slot(
+    store: &InMemoryTipAnchorStore,
+    generation: u64,
+    predecessor: [u8; 32],
+    records: Vec<crate::audit_log::consent_evidence::EvidenceRecord>,
+) -> Vec<u8> {
+    crate::audit_log::consent_evidence::EvidenceImage {
+        scope: store.outbox_evidence_scope().unwrap(),
+        generation,
+        floor_ms: 0,
+        predecessor,
+        records,
+    }
+    .seal(&[0x42; 32])
+}
+
+fn evidence_slots(path: &Path) -> [Option<Vec<u8>>; 2] {
+    crate::audit_log::consent_evidence::slot_paths(path)
+        .map(|slot| crate::audit_log::consent_evidence::read_slot(&slot).unwrap())
+}
+
+/// The stage, both owners, the record, and both slots of a binding.
+type BindingState = (
+    Option<Vec<u8>>,
+    Option<String>,
+    Option<String>,
+    Option<CarrierRecord>,
+    [Option<Vec<u8>>; 2],
+);
+
+fn binding_state(path: &Path, store: &InMemoryTipAnchorStore) -> BindingState {
+    (
+        fs::read(carriers::generation_path(path, 2)).ok(),
+        store.load_outbox_owner_state(1).unwrap(),
+        store.load_outbox_owner_state(2).unwrap(),
+        store.load_carrier_record().unwrap(),
+        evidence_slots(path),
+    )
+}
+
+/// Fresh and resumed bindings refuse source evidence that does not
+/// authenticate before anything is staged, stored, or installed.
+#[test]
+#[serial_test::serial]
+fn binding_requires_selected_image() {
+    use crate::audit_log::consent_evidence::{slot_paths, tests::delivered};
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    for resumed in [false, true] {
+        for reason in ["missing image", "tag", "scope", "owner rollback"] {
+            let (_dir, path, store) = evidence_fixture();
+            if resumed {
+                let mut binding =
+                    AuditWriter::open_for_carrier_binding(path.clone(), access(&store)).unwrap();
+                assert!(binding.bind_carriers_with_fault(4).is_err());
+            }
+            match reason {
+                "missing image" => {
+                    for slot in slot_paths(&path) {
+                        fs::remove_file(slot).unwrap();
+                    }
+                }
+                "tag" => {
+                    for slot in slot_paths(&path) {
+                        let mut bytes = fs::read(&slot).unwrap();
+                        bytes[130] ^= 1;
+                        fs::write(&slot, bytes).unwrap();
+                    }
+                }
+                "scope" => store.set_evidence_scope([0x77; 32]),
+                _ => {
+                    for (slot, n) in slot_paths(&path).iter().zip([3, 4]) {
+                        fs::write(slot, evidence_slot(&store, 5, [0; 32], vec![delivered(n)]))
+                            .unwrap();
+                    }
+                }
+            }
+            let before = binding_state(&path, &store);
+            let result = AuditWriter::open_for_carrier_binding(path.clone(), access(&store))
+                .and_then(|mut binding| binding.bind_carriers());
+            assert!(
+                matches!(
+                    &result,
+                    Err(WriterError::OutboxEvidenceUnusable { reason: refused }) if *refused == reason
+                ),
+                "resumed {resumed}: {reason}: {result:?}"
+            );
+            assert_eq!(
+                binding_state(&path, &store),
+                before,
+                "resumed {resumed}: {reason}"
+            );
+        }
+    }
+}
+
+/// Every binding boundary converges on the newest authenticated source
+/// image, which the binding commits to the source owner before staging.
+#[test]
+#[serial_test::serial]
+fn binding_reselects_source_through_every_boundary() {
+    use crate::audit_log::consent_evidence::{self, tests::delivered};
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    for gap in [false, true] {
+        for boundary in 1..=6 {
+            let (_dir, path, store) = evidence_fixture();
+            let current = evidence_slots(&path)[0].clone().unwrap();
+            let newer = evidence_slot(
+                &store,
+                if gap { 5 } else { 2 },
+                consent_evidence::head(&current),
+                vec![delivered(7)],
+            );
+            fs::write(&consent_evidence::slot_paths(&path)[1], &newer).unwrap();
+            let mut binding =
+                AuditWriter::open_for_carrier_binding(path.clone(), access(&store)).unwrap();
+            assert_eq!(
+                owner_json(&store, 1)["e"]["g"],
+                1,
+                "the read-only preflight commits nothing"
+            );
+            if boundary == 6 {
+                binding.binding_fail_after_retire = true;
+            }
+            let result = if boundary == 6 {
+                binding.bind_carriers()
+            } else {
+                binding.bind_carriers_with_fault(boundary)
+            };
+            assert!(result.is_err(), "gap {gap} boundary {boundary}");
+            drop(binding);
+            if matches!(boundary, 2 | 3 | 4 | 6) {
+                assert!(
+                    matches!(
+                        crate::audit_log::outbox::locked_owner_evidence(
+                            &path,
+                            store.as_ref(),
+                            Some(&[0x42; 32])
+                        ),
+                        Err(WriterError::CarrierRecoveryRequired { .. })
+                    ),
+                    "gap {gap} boundary {boundary}: ordinary reads wait for the binding"
+                );
+            }
+            if boundary != 5 {
+                let resumed = AuditWriter::open_for_carrier_binding(path.clone(), access(&store))
+                    .and_then(|mut binding| binding.bind_carriers());
+                assert!(
+                    resumed.is_ok(),
+                    "gap {gap} boundary {boundary}: the binding resumes: {resumed:?}"
+                );
+            }
+            let head = crate::hex::encode(&consent_evidence::head(&newer));
+            for generation in [1, 2] {
+                assert_eq!(
+                    owner_json(&store, generation)["e"]["head"],
+                    head,
+                    "gap {gap} boundary {boundary}: owner {generation} commits the newest image"
+                );
+            }
+            let writer = AuditWriter::open(path.clone(), Some(access(&store))).unwrap();
+            assert_eq!(
+                writer.outbox_evidence().unwrap().unwrap().records(),
+                &[delivered(7)],
+                "gap {gap} boundary {boundary}"
+            );
+        }
+    }
+
+    // A source image that appears after the record switch is committed while
+    // the stage still retires the source; the captured watch then reports
+    // the changed source owner.
+    for boundary in [4, 6] {
+        let (_dir, path, store) = evidence_fixture();
+        let mut binding =
+            AuditWriter::open_for_carrier_binding(path.clone(), access(&store)).unwrap();
+        binding.binding_fail_after_retire = boundary == 6;
+        let result = if boundary == 6 {
+            binding.bind_carriers()
+        } else {
+            binding.bind_carriers_with_fault(4)
+        };
+        assert!(result.is_err(), "boundary {boundary}");
+        drop(binding);
+        let current = evidence_slots(&path)[0].clone().unwrap();
+        let newer = evidence_slot(
+            &store,
+            2,
+            consent_evidence::head(&current),
+            vec![delivered(8)],
+        );
+        fs::write(&consent_evidence::slot_paths(&path)[1], &newer).unwrap();
+        let resumed = AuditWriter::open_for_carrier_binding(path.clone(), access(&store))
+            .and_then(|mut binding| binding.bind_carriers());
+        assert!(
+            resumed.is_ok(),
+            "boundary {boundary}: a switched binding commits its source image: {resumed:?}"
+        );
+        let head = crate::hex::encode(&consent_evidence::head(&newer));
+        for generation in [1, 2] {
+            assert_eq!(
+                owner_json(&store, generation)["e"]["head"],
+                head,
+                "boundary {boundary}: owner {generation}"
+            );
+        }
+        assert!(
+            matches!(
+                AuditWriter::open(path.clone(), Some(access(&store))),
+                Err(WriterError::RetiredOutboxChanged { generation: 1 })
+            ),
+            "boundary {boundary}"
+        );
+    }
+}
+
+/// A binding carries the complete selected owner; the successor's later
+/// changes leave the retired owner, which stays under its watch.
+#[test]
+#[serial_test::serial]
+fn binding_preserves_root_and_active_selection() {
+    use crate::audit_log::consent_evidence::RecordState;
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let (_dir, path, store) = fixture();
+    let outbox = AuditOutbox::for_log_keyed(&path, store.clone(), Zeroizing::new([0x42; 32]));
+    let mut writer = AuditWriter::open(path.clone(), Some(access(&store))).unwrap();
+    outbox.append_queued(&row("pinned")).unwrap();
+    assert_eq!(writer.drain_outbox().unwrap(), 1);
+    writer.initialize_consent_evidence().unwrap();
+    let bind = |identity: [u8; 32], id: &str| {
+        let reservation = outbox.reserve_evidence(identity, 9_000, 0).unwrap();
+        outbox
+            .clone()
+            .with_evidence_reservation(reservation)
+            .append_queued(&row(id))
+            .unwrap()
+    };
+    outbox.reserve_evidence([1; 32], 9_000, 0).unwrap();
+    bind([2; 32], "delivered");
+    assert_eq!(writer.drain_outbox().unwrap(), 1);
+    bind([3; 32], "queued");
+    assert_eq!(outbox.advance_evidence_floor(40).unwrap(), 40);
+    let source = writer.outbox_evidence().unwrap().unwrap();
+    let states: Vec<RecordState> = source.records().iter().map(|record| record.state).collect();
+    for state in [
+        RecordState::Reserved,
+        RecordState::Queued,
+        RecordState::Delivered,
+        RecordState::LegacyPin,
+    ] {
+        assert!(states.contains(&state), "{state:?}");
+    }
+    let raw = owner_value(&store, 1);
+    drop(writer);
+    AuditWriter::open_for_carrier_binding(path.clone(), access(&store))
+        .unwrap()
+        .bind_carriers()
+        .unwrap();
+    assert_eq!(
+        owner_value(&store, 2),
+        raw,
+        "the successor holds the complete source owner"
+    );
+    let writer = AuditWriter::open(path.clone(), Some(access(&store))).unwrap();
+    let carried = writer.outbox_evidence().unwrap().unwrap();
+    assert_eq!(carried.time_floor_ms(), 40);
+    assert_eq!(carried.records().len(), source.records().len());
+    outbox.release_evidence([1; 32]).unwrap();
+    assert!(
+        !writer
+            .outbox_evidence()
+            .unwrap()
+            .unwrap()
+            .records()
+            .iter()
+            .any(|record| record.identity == [1; 32])
+    );
+    assert_eq!(
+        owner_value(&store, 1),
+        raw,
+        "active changes leave the retired owner"
+    );
+    drop(writer);
+    let mut changed = owner_json(&store, 1);
+    changed["e"]["g"] = serde_json::json!(changed["e"]["g"].as_u64().unwrap() + 1);
+    store
+        .store_outbox_owner_state(1, &changed.to_string())
+        .unwrap();
+    assert!(matches!(
+        crate::audit_log::outbox::check_outbox_commitment(&path, store.as_ref()),
+        Err(WriterError::RetiredOutboxChanged { generation: 1 })
+    ));
+}
+
 fn access(store: &Arc<InMemoryTipAnchorStore>) -> KeyedAuditAccess {
     KeyedAuditAccess::new(Zeroizing::new([0x42; 32]), store.clone())
 }
@@ -382,9 +768,17 @@ fn a_binding_stages_a_fenced_line_and_the_successor_re_signs_it() {
 /// Authenticating a different stage never substitutes it for the selected
 /// source.
 #[test]
+#[serial_test::serial]
 fn owner_stage_rejects_valid_but_different_bytes() {
-    for prefix in [false, true] {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    for (evidence, prefix) in [(true, false), (true, true), (false, false), (false, true)] {
         let (_dir, path, store) = owned_fixture(false);
+        if evidence {
+            let mut writer = AuditWriter::open(path.clone(), Some(access(&store))).unwrap();
+            writer.initialize_consent_evidence().unwrap();
+        }
         for id in ["one", "two"] {
             queue_owned(&path, &store, id, 0);
         }
@@ -417,8 +811,10 @@ fn owner_stage_rejects_valid_but_different_bytes() {
         assert_eq!(
             fs::read(outbox_path(&path)).unwrap(),
             source,
-            "stage equals the selected source"
+            "evidence {evidence}, prefix {prefix}: stage equals the selected source"
         );
+        assert_eq!(owner_value(&store, 2), owner_value(&store, 1));
+        assert_eq!(owner_json(&store, 2).get("e").is_some(), evidence);
     }
 }
 
@@ -2233,6 +2629,52 @@ fn a_retired_write_during_binding_is_not_adopted() {
         outbox.append(&row("B")),
         Err(WriterError::RetiredOutboxChanged { generation: 1 })
     ));
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn an_interrupted_binding_preserves_a_holder_delivery_source_on_orphan_evidence() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let (_dir, path, store) = fixture();
+    let entry = row("R");
+    AuditOutbox::for_log(&path, store.clone())
+        .append(&entry)
+        .unwrap();
+    let batch = OutboxBatch::read_locked(&path, store.as_ref()).unwrap();
+    replace(&outbox_lock_path(&path));
+    let mut binding = AuditWriter::open_for_carrier_binding(path.clone(), access(&store)).unwrap();
+    assert!(binding.bind_carriers_with_fault(4).is_err());
+    binding.append_checked(entry).unwrap();
+    drop(binding);
+    store
+        .store_outbox_state(1, &OutboxState::default())
+        .unwrap();
+    drop(batch);
+    fs::write(
+        &crate::audit_log::consent_evidence::slot_paths(&path)[0],
+        b"orphan",
+    )
+    .unwrap();
+    let before = fs::read(outbox_path(&path)).unwrap();
+    let result = AuditWriter::open_for_carrier_binding(path.clone(), access(&store))
+        .and_then(|mut binding| binding.bind_carriers());
+    assert!(
+        matches!(
+            result,
+            Err(WriterError::OutboxEvidenceUnusable {
+                reason: "evidence image without owner"
+            })
+        ),
+        "{result:?}"
+    );
+    assert_eq!(
+        fs::read(outbox_path(&path)).unwrap(),
+        before,
+        "orphan evidence refuses before the legacy source is cleared"
+    );
 }
 
 #[cfg(unix)]

@@ -1471,13 +1471,14 @@ impl AuditWriter {
                 .load_carrier_record()?
                 .map_or(0, |record| record.generation);
             if !carriers::generation_path(&path, generation).try_exists()? {
-                super::outbox::OutboxBatch::read_for_recovery(
+                let batch = super::outbox::OutboxBatch::read_for_recovery(
                     &path,
                     store.as_ref(),
                     generation,
                     outbox,
-                )?
-                .binding_selection(store.as_ref(), hmac_key.as_deref())?;
+                )?;
+                batch.binding_selection(store.as_ref(), hmac_key.as_deref())?;
+                batch.binding_evidence(&path, store.as_ref(), hmac_key.as_deref(), false)?;
             }
         }
 
@@ -2081,7 +2082,9 @@ impl AuditWriter {
     /// log without a record) the binding:
     ///
     /// 1. checks that the outbox holds its committed prefix followed only by
-    ///    tagged rows authenticated at their lines;
+    ///    tagged rows authenticated at their lines, and that the evidence image
+    ///    of G authenticates under the stored key, committing a newer image to
+    ///    the owner of G first;
     /// 2. writes those lines to `<log>.outbox.g<G+1>`, syncs it and its
     ///    directory, and stores the commitment of G+1 over them;
     /// 3. appends an `audit_carriers_bound` row;
@@ -2114,6 +2117,9 @@ impl AuditWriter {
     ///   from does not hold its committed prefix. Nothing is changed.
     /// - [`WriterError::CarrierIdentityUnavailable`] when a held carrier
     ///   cannot be identified.
+    /// - [`WriterError::OutboxEvidenceUnusable`] and
+    ///   [`WriterError::KeyedLogNeedsKey`] when the source evidence does not
+    ///   authenticate. Nothing is staged or stored.
     /// - Every error of the append, and [`WriterError::TipAnchorStore`] and
     ///   [`WriterError::Io`] for the store and the files.
     pub fn bind_carriers(&mut self) -> Result<carriers::CarrierBindingReport, WriterError> {
@@ -2174,12 +2180,8 @@ impl AuditWriter {
             // acquisition, which refuses until a changed retired commitment is
             // acknowledged.
             let staged = carriers::generation_path(&self.path, record.generation);
-            let selected = self.binding_source(
-                store.as_ref(),
-                retired.generation,
-                Some(retired),
-                &held.outbox,
-            )?;
+            let selected =
+                self.binding_source(store.as_ref(), retired.generation, Some(retired), &held)?;
             let carried_rows = (fs::read(&staged)? == selected.bytes
                 && selected.matches_stored(store.as_ref(), record.generation)?)
             .then_some(selected.rows);
@@ -2243,7 +2245,7 @@ impl AuditWriter {
         retired: Option<RetiredOutbox>,
         stop_after: Option<u8>,
     ) -> Result<carriers::CarrierBindingReport, WriterError> {
-        let selected = self.binding_source(store, from, retired.as_ref(), &held.outbox)?;
+        let selected = self.binding_source(store, from, retired.as_ref(), held)?;
         let carried_rows = selected.rows;
         #[cfg(test)]
         if let Some(hook) = self.binding_after_snapshot.take() {
@@ -2304,12 +2306,15 @@ impl AuditWriter {
     /// Selects a binding's source from its retired name when that file exists.
     /// An interrupted binding recognizes a completed legacy delivery by the
     /// same zero commitment and complete log tail that the drain checks.
+    /// The source's evidence image is authenticated with its queue. A newer
+    /// image is committed to the source owner, and the selection is then read
+    /// again, so the staged owner and the watch carry the committed root.
     fn binding_source(
         &self,
         store: &dyn TipAnchorStore,
         from: u64,
         retired: Option<&RetiredOutbox>,
-        held: &Arc<AuditWriterLock>,
+        held: &BindingCarriers,
     ) -> Result<super::outbox::BindingSelection, WriterError> {
         let retired_file = retired
             .and_then(|retired| retired.file.as_deref())
@@ -2318,17 +2323,25 @@ impl AuditWriter {
             Some(file) if file.try_exists()? => file,
             _ => super::outbox::outbox_path(&self.path),
         };
-        let batch = super::outbox::OutboxBatch::read_file_for_recovery(&source, store, from, held)?;
+        let batch =
+            super::outbox::OutboxBatch::read_file_for_recovery(&source, store, from, &held.outbox)?;
         if retired.is_some()
             && batch.owner_plan(store, self.hmac_key.as_deref())?.is_none()
             && let Some(delivered) = batch.uncommitted_entries(self.hmac_key.as_deref())
             && self.active_file_ends_with(&delivered)?
         {
+            // A refused evidence image leaves the source queue in place.
+            batch.binding_evidence(&self.path, store, self.hmac_key.as_deref(), false)?;
             // Persist recognition before a binding row changes the log tail.
             batch.clear()?;
             return Ok(super::outbox::BindingSelection::empty_legacy());
         }
-        batch.binding_selection(store, self.hmac_key.as_deref())
+        let key = self.hmac_key.as_deref();
+        let selected = batch.binding_selection(store, key)?;
+        if batch.binding_evidence(&self.path, store, key, true)? {
+            return batch.binding_selection(store, key);
+        }
+        Ok(selected)
     }
 
     /// Moves the outbox of generation `from` to the retired name the stored
@@ -2613,6 +2626,8 @@ impl AuditWriter {
     /// closed-prefix rows from delivery.
     /// Recoverable publication and a lone fence show no active loss.
     /// Hard owner refusals apply before the caller revokes permissions.
+    /// An evidence-dependent query authenticates the owner's evidence image
+    /// first and can commit a newer authenticated image to the owner.
     ///
     /// # Errors
     ///
@@ -2682,8 +2697,10 @@ impl AuditWriter {
     /// requires the anchor. It then resets nonzero v1 state, stores owner
     /// evidence, and publishes the generation line.
     /// A changed retired watch resets last, preserving carrier identities.
-    /// A watch-only loss leaves the active queue and its protected items
-    /// unchanged. A retry before the owner item is stored repeats selected
+    /// A watch-only loss leaves the active queue unchanged. An
+    /// evidence-dependent acknowledgement can commit a newer authenticated
+    /// evidence image, as [`AuditWriter::outbox_loss`] does. The other
+    /// protected items stay unchanged. A retry before the owner item is stored repeats selected
     /// rows with their request IDs.
     ///
     /// # Errors
@@ -7159,8 +7176,9 @@ pub enum WriterError {
     /// `scope`, `head`, `owner rollback`, `evidence image without owner`,
     /// `queue not drained`, `evidence-generation overflow`, `expiry overflow`,
     /// `expired reservation`, `conflicting reservation`, `unresolved pin`,
-    /// `reservation scope or expiry`, `missing reservation`, and
-    /// `queued row still present`. It never
+    /// `reservation scope or expiry`, `missing reservation`,
+    /// `queued row still present`, `missing migration pin`,
+    /// `evidence not initialized`, and `owner recommit required`. It never
     /// carries file contents. Recovery is in
     /// `docs/maintainers/audit-log-recovery.md`.
     #[error(
