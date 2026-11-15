@@ -49,7 +49,7 @@
 //!
 //! An ordinary keyed append writes `{"k":"row","g":G,"s":S,"r":0,"body":B,"tag":"T"}`.
 //! Queued consent uses `r=1` and returns an [`OutboxRowRef`] after durability succeeds.
-//! The owner drain retains delivery evidence for those consent rows.
+//! The owner drain retains delivery evidence for reserved consent rows.
 //! The body is the entry's canonical JSON. The tag is lowercase hex HMAC-SHA256
 //! over `stellar-agent-outbox-row:v2`, big-endian u64 generation and sequence,
 //! one evidence byte, and the exact body bytes, without separators or newline.
@@ -57,7 +57,7 @@
 //! untagged lines included. With one, G is its generation and S is the row's
 //! position after it. Both are assigned under the outbox lock.
 //!
-//! A keyed append neither reads nor writes a keyring commitment or owner
+//! An unreserved keyed append neither reads nor writes a keyring commitment or owner
 //! state. Under the outbox lock it reads an existing file, checks the carrier
 //! generation, authenticates a first generation line and checks the quota.
 //! It then measures and encodes its row. A generation line that does not
@@ -66,6 +66,9 @@
 //! the directory, and checks the carrier generation again. The directory
 //! sync makes the file's name durable before the row is acknowledged, also
 //! after a publication whose own directory sync failed.
+//! A reservation-bearing append commits its exact Queued reference before
+//! the first queue write. A failed write retains that slot for retry.
+//! Appenders cannot mark evidence Delivered.
 //!
 //! An unkeyed append writes the serialized entry. The v1 commitment covers every
 //! line's bytes in file order, and its stored representation stays v1.
@@ -74,9 +77,9 @@
 //! therefore refuses the append with the file unchanged. After its row is
 //! written and synced, it stores the new count and chain head.
 //!
-//! Every append follows one rule. A refusal before the first write changes
-//! nothing: the checks, the row's measure and its encoding all run first. The
-//! first write creates a missing file or drops a torn tail, a final segment
+//! Admission, row measurement, and encoding precede every write.
+//! Reserved appends then commit Queued evidence under the same carrier.
+//! The first queue write creates a missing file or drops a torn tail, a final segment
 //! with no terminating newline. Such a segment is an append that never
 //! returned `Ok`, so the file is truncated back to just after the last
 //! newline and synced. A failure after a write truncates the file back to its
@@ -239,16 +242,23 @@
 
 //! # Owner and generation codecs
 //!
-//! The owner value records a queue generation, a closed batch, a legacy-state
+//! Version 1 records a queue generation, a closed batch, a legacy-state
 //! digest, and at most 15 requested row digests, oldest first.
-//! Recent evidence includes only rows whose evidence flag is one.
+//! These recent digests migrate to pins when evidence initializes.
+//! Version 2 commits the complete lifetime evidence image through its head.
+//! Only anchored delivery creates Delivered records in that image.
+//! Unreserved compatibility rows consume no evidence slot.
+//! Reservations and unresolved pins count toward the 4,096-slot admission cap.
+//! Explicit lifecycle notifications and the persistent floor govern reclamation.
+//! Every admitted approval retains evidence throughout its permitted uses.
 //! The legacy digest hashes the exact v1 commitment value at cutover.
 //! Batch commitments hash ordered binary row digests. A row digest hashes the
 //! row's bytes without its tag and newline. An untagged row of a cutover
 //! prefix hashes as a row of generation zero at its line with evidence zero.
 //! Owner accounts follow carrier generations, independently of the queue
-//! generation inside the value. Only writers holding the writer and outbox
-//! carriers write owner state. Locked verification may read owner state
+//! generation inside the value. Writers hold both writer and outbox carriers
+//! for delivery. Appenders hold the outbox carrier for reservation, Queued
+//! binding, and authenticated lifecycle changes. Locked verification reads owner state
 //! without the writer sidecar and writes nothing.
 //!
 //! A generation header is `{"k":"gen","g":G,"tag":"T"}` followed by a newline.
@@ -267,11 +277,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
-use super::consent_evidence::{self, EvidenceImage, EvidenceRecord, OutboxEvidence, Selected};
+use super::consent_evidence::{
+    self, EvidenceImage, EvidenceRecord, EvidenceReservation, MAX_EVIDENCE_ENTRIES, OutboxEvidence,
+    RecordState, Selected,
+};
 use super::entry::AuditEntry;
 use super::lock::{AuditWriterLock, BoundCarrierLock, Carrier};
 use super::schema::EventKind;
 use super::writer::{WriterError, basename_lossy_path as basename, sidecar_path};
+use crate::error::{ApprovalFailure, WalletError};
 
 /// Commitment to the complete lines queued in one outbox.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1355,10 +1369,12 @@ fn wait_for_outbox(
 /// Every append takes the outbox lock for its own duration.
 #[derive(Clone)]
 pub struct AuditOutbox {
+    log_path: PathBuf,
     path: PathBuf,
     lock_path: PathBuf,
     state: Arc<dyn TipAnchorStore>,
     key: Option<Zeroizing<[u8; 32]>>,
+    reservation: Option<EvidenceReservation>,
 }
 
 impl std::fmt::Debug for AuditOutbox {
@@ -1382,10 +1398,12 @@ impl AuditOutbox {
     #[must_use]
     pub fn for_log(log_path: &Path, state: Arc<dyn TipAnchorStore>) -> Self {
         Self {
+            log_path: log_path.to_path_buf(),
             path: outbox_path(log_path),
             lock_path: outbox_lock_path(log_path),
             state,
             key: None,
+            reservation: None,
         }
     }
 
@@ -1415,6 +1433,148 @@ impl AuditOutbox {
     #[must_use]
     pub fn is_keyed(&self) -> bool {
         self.key.is_some()
+    }
+
+    /// Reserves capacity before ceremony, including consent with a direct sink.
+    /// Supply authenticated approval identity, immutable expiry, and verified time.
+    /// Use [`EvidenceReservation::deadline`] for the conservative retention deadline.
+    /// Finish the policy-window transaction before calling this method.
+    ///
+    /// # Errors
+    /// Refuses unkeyed, uninitialized, expired, conflicting, or unusable evidence.
+    /// Full capacity returns `approval.evidence_capacity`; storage errors retain their codes.
+    pub fn reserve_evidence(
+        &self,
+        identity: [u8; 32],
+        expires_at_ms: u64,
+        now_ms: u64,
+    ) -> Result<EvidenceReservation, WalletError> {
+        let mut capacity = false;
+        let result = (|| {
+            let (batch, key) = self.evidence_batch()?;
+            batch.commit_evidence_change(
+                &self.log_path,
+                self.state.as_ref(),
+                &key,
+                false,
+                |image, _| {
+                    if expires_at_ms <= image.floor_ms.max(now_ms) {
+                        return Err(evidence_unusable("expired reservation"));
+                    }
+                    image.advance_floor(now_ms);
+                    if let Some(record) = image
+                        .records
+                        .iter()
+                        .find(|record| record.identity == identity)
+                    {
+                        if record.expires_at_ms != expires_at_ms
+                            || record.state == RecordState::LegacyPin
+                        {
+                            return Err(evidence_unusable("conflicting reservation"));
+                        }
+                    } else if image.records.len() >= MAX_EVIDENCE_ENTRIES {
+                        capacity = true;
+                    } else {
+                        image.records.push(EvidenceRecord {
+                            identity,
+                            expires_at_ms,
+                            digest: [0; 32],
+                            generation: 0,
+                            sequence: 0,
+                            state: RecordState::Reserved,
+                        });
+                        image.records.sort_by_key(|record| record.identity);
+                    }
+                    Ok(())
+                },
+            )
+        })();
+        let loaded =
+            result.map_err(|error| super::writer::audit_writer_refusal("outbox", &error))?;
+        if capacity {
+            return Err(WalletError::Approval(ApprovalFailure::EvidenceCapacity));
+        }
+        Ok(EvidenceReservation::new(
+            loaded.image.scope,
+            identity,
+            expires_at_ms,
+        ))
+    }
+
+    /// Carries this reservation into a reference-returning queued append.
+    #[must_use]
+    pub fn with_evidence_reservation(mut self, reservation: EvidenceReservation) -> Self {
+        self.reservation = Some(reservation);
+        self
+    }
+
+    /// Releases evidence after authenticated revocation or final operation termination.
+    /// First consumption and a missing approval record do not authorize release.
+    /// Call outside the policy-window lock; retry an interrupted release safely.
+    ///
+    /// # Errors
+    /// Returns carrier, evidence, key, and storage refusals. Migration pins cannot be released.
+    pub fn release_evidence(&self, identity: [u8; 32]) -> Result<(), WriterError> {
+        let (batch, key) = self.evidence_batch()?;
+        batch.commit_evidence_change(
+            &self.log_path,
+            self.state.as_ref(),
+            &key,
+            false,
+            |image, _| {
+                if image.records.iter().any(|record| {
+                    record.identity == identity && record.state == RecordState::LegacyPin
+                }) {
+                    return Err(evidence_unusable("unresolved pin"));
+                }
+                image.records.retain(|record| record.identity != identity);
+                Ok(())
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Advances the persistent floor and removes expired records, retaining migration pins.
+    /// Authorization uses and mints refresh `max(wall_clock, evidence_floor)`.
+    ///
+    /// # Errors
+    /// Returns carrier, evidence, key, and storage refusals.
+    pub fn advance_evidence_floor(&self, now_ms: u64) -> Result<u64, WriterError> {
+        let (batch, key) = self.evidence_batch()?;
+        let loaded = batch.commit_evidence_change(
+            &self.log_path,
+            self.state.as_ref(),
+            &key,
+            false,
+            |image, _| {
+                image.advance_floor(now_ms);
+                Ok(())
+            },
+        )?;
+        Ok(loaded.image.floor_ms)
+    }
+
+    /// Reads the authenticated floor, recommitting a newer image before returning it.
+    /// Missing or version 1 ownership returns zero only when neither slot exists.
+    ///
+    /// # Errors
+    /// Returns carrier, evidence, key, and storage refusals, including a rotation fence.
+    pub fn evidence_time_floor(&self) -> Result<u64, WriterError> {
+        let (batch, key) = self.evidence_batch()?;
+        Ok(
+            read_owner_evidence(&self.log_path, self.state.as_ref(), &batch, Some(&key))?
+                .map_or(0, |evidence| evidence.time_floor_ms()),
+        )
+    }
+
+    fn evidence_batch(&self) -> Result<(OutboxBatch, Zeroizing<[u8; 32]>), WriterError> {
+        let held = self.key.as_ref().ok_or_else(queued_key_required)?;
+        let batch = OutboxBatch::read_locked(&self.log_path, self.state.as_ref())?;
+        let key = match first_generation(&parse_lines(&batch.bytes).lines)? {
+            Some((g, tag)) => self.generation_key(held, g, &tag)?,
+            None => held.clone(),
+        };
+        Ok((batch, key))
     }
 
     /// Appends `entry` as one line and syncs it, under the outbox lock.
@@ -1526,7 +1686,7 @@ impl AuditOutbox {
             file,
             extent: Extent::of(&bytes),
             coordinates: Coordinates::Committed(OutboxState::over(&lines)),
-            lock,
+            lock: Arc::new(lock),
         })
     }
 
@@ -1567,7 +1727,7 @@ impl AuditOutbox {
                 g,
                 s: rows as u64 + 1,
             },
-            lock,
+            lock: Arc::new(lock),
         })
     }
 
@@ -1614,7 +1774,7 @@ pub(crate) struct PreparedOutboxAppend<'a> {
     /// The outbox lock, held until the append returns; its generation selects
     /// the commitment an unkeyed append stores and is checked again after a
     /// keyed append's sync.
-    lock: BoundCarrierLock,
+    lock: Arc<BoundCarrierLock>,
 }
 
 /// The length of the outbox as preparation read it, and the length up to
@@ -1686,6 +1846,55 @@ impl PreparedOutboxAppend<'_> {
         .map_err(WriterError::Serialise)?;
         line.push(b'\n');
         let outbox = self.outbox;
+        if let (Some(reservation), Some(reference), Coordinates::Keyed { key, .. }) =
+            (&outbox.reservation, &reference, &self.coordinates)
+        {
+            let (scope, identity, expires_at_ms) = reservation.facts();
+            let batch =
+                OutboxBatch::read_retained(&outbox.log_path, outbox.state.as_ref(), &self.lock)?;
+            batch.commit_evidence_change(
+                &outbox.log_path,
+                outbox.state.as_ref(),
+                key,
+                false,
+                |image, _| {
+                    if scope != image.scope || expires_at_ms <= image.floor_ms {
+                        return Err(evidence_unusable("reservation scope or expiry"));
+                    }
+                    let record = image
+                        .records
+                        .iter_mut()
+                        .find(|record| record.identity == identity)
+                        .ok_or_else(|| evidence_unusable("missing reservation"))?;
+                    if record.expires_at_ms != expires_at_ms {
+                        return Err(evidence_unusable("conflicting reservation"));
+                    }
+                    if record.state == RecordState::Delivered && record.digest == reference.digest {
+                        return Ok(());
+                    }
+                    if record.state == RecordState::Queued
+                        && record.digest != reference.digest
+                        && parse_lines(&batch.bytes)
+                            .lines
+                            .iter()
+                            .filter_map(|line| tagged_layout(line))
+                            .any(|row| {
+                                layout_digest(row.g, row.s, row.r, row.body) == record.digest
+                            })
+                    {
+                        return Err(evidence_unusable("queued row still present"));
+                    }
+                    if !matches!(record.state, RecordState::Reserved | RecordState::Queued) {
+                        return Err(evidence_unusable("conflicting reservation"));
+                    }
+                    record.state = RecordState::Queued;
+                    record.digest = reference.digest;
+                    record.generation = reference.generation;
+                    record.sequence = reference.sequence;
+                    Ok(())
+                },
+            )?;
+        }
         let (mut file, created) = match self.file.take() {
             Some(file) => (file, false),
             None => {
@@ -2331,8 +2540,17 @@ impl OutboxBatch {
         store: &dyn TipAnchorStore,
         key: Option<&[u8; 32]>,
     ) -> Result<Option<OwnerDelivery>, WriterError> {
+        self.owner_plan_loaded(self.owner(store)?, key)
+    }
+
+    /// Plans under the carrier using the owner returned by fence recovery.
+    pub(crate) fn owner_plan_loaded(
+        &self,
+        owner: Option<OutboxOwnerState>,
+        key: Option<&[u8; 32]>,
+    ) -> Result<Option<OwnerDelivery>, WriterError> {
         let lines = parse_lines(&self.bytes).lines;
-        match self.owner(store)? {
+        match owner {
             None if lines.iter().any(|line| is_tagged(line)) => self.cutover(&lines, key).map(Some),
             None => Ok(None),
             Some(owner) => self
@@ -2394,7 +2612,7 @@ impl OutboxBatch {
             entries,
             owner: Some(owner),
             zero_legacy: true,
-            consent: rows.iter().any(|(r, _)| *r == 1),
+            selected: rows,
         })
     }
 
@@ -2512,11 +2730,7 @@ impl OutboxBatch {
             found_rows: digests.len() as u64,
         });
         let changes = !entries.is_empty() || loss.is_some();
-        let consent = digests
-            .get(delivered..)
-            .unwrap_or_default()
-            .iter()
-            .any(|(r, _)| *r == 1);
+        let selected = digests.get(delivered..).unwrap_or_default().to_vec();
         if changes {
             if !recovery {
                 owner.g = advance_generation(owner.g)?;
@@ -2529,7 +2743,7 @@ impl OutboxBatch {
                 publish: (changes || recovery).then_some(owner.g),
                 owner: changes.then_some(owner),
                 zero_legacy: !clean,
-                consent,
+                selected,
             },
             loss,
             refusal,
@@ -2588,6 +2802,82 @@ impl OutboxBatch {
         self.owner(store)?
             .map(|owner| self.select_owner(&parse_lines(&self.bytes).lines, owner, check, true))
             .transpose()
+    }
+
+    /// Validates evidence before loss classification permits caller revocation.
+    pub(crate) fn prepare_delivery_evidence(
+        &self,
+        log_path: &Path,
+        store: &dyn TipAnchorStore,
+        key: Option<&[u8; 32]>,
+    ) -> Result<bool, WriterError> {
+        match key {
+            Some(key) => Ok(self
+                .evidence_for_change(log_path, store, key, false, true)?
+                .is_some()),
+            None => Ok(read_owner_evidence(log_path, store, self, key)?.is_some()),
+        }
+    }
+
+    /// Authenticates a loss plan before revocation or acknowledgement writes.
+    pub(crate) fn evidence_owner_selection(
+        &self,
+        log_path: &Path,
+        store: &dyn TipAnchorStore,
+        key: Option<&[u8; 32]>,
+    ) -> Result<Option<OwnerSelection>, WriterError> {
+        let selection = self.owner_selection(store, SuffixCheck::Keyed(key))?;
+        if selection.as_ref().is_some_and(|selection| {
+            selection.plan.has_consent()
+                || (selection.loss.is_some()
+                    && selection
+                        .plan
+                        .owner
+                        .as_ref()
+                        .is_some_and(|owner| owner.e.is_some()))
+        }) {
+            self.prepare_delivery_evidence(log_path, store, key)?;
+            return self.owner_selection(store, SuffixCheck::Keyed(key));
+        }
+        Ok(selection)
+    }
+
+    /// Commits matching queued records and the closed batch after anchoring.
+    pub(crate) fn commit_delivery(
+        &self,
+        log_path: &Path,
+        store: &dyn TipAnchorStore,
+        key: Option<&[u8; 32]>,
+        plan: &OwnerDelivery,
+    ) -> Result<(), WriterError> {
+        let Some(owner) = &plan.owner else {
+            return Ok(());
+        };
+        if plan.has_consent()
+            && owner.e.is_some()
+            && self.owner(store)?.is_some_and(|owner| owner.e.is_some())
+        {
+            let key = key.ok_or_else(queued_key_required)?;
+            self.commit_evidence_change(log_path, store, key, false, |image, current| {
+                for record in &mut image.records {
+                    if record.state == RecordState::Queued
+                        && plan
+                            .selected
+                            .iter()
+                            .any(|(r, digest)| *r == 1 && *digest == record.digest)
+                    {
+                        record.state = RecordState::Delivered;
+                    }
+                }
+                let evidence = current.e;
+                *current = owner.clone();
+                current.e = evidence;
+                Ok(())
+            })?;
+        } else {
+            store.store_outbox_owner_state(self.generation, &owner.to_keyring_value())?;
+        }
+        Ok(())
     }
 
     /// The generation line a key change publishes in place of a queue that
@@ -2748,7 +3038,7 @@ impl OwnerSelection {
                 publish: Some(owner.g),
                 owner: Some(owner),
                 zero_legacy: legacy_present,
-                consent: false,
+                selected: Vec::new(),
             },
             loss: Some(OutboxLoss {
                 expected_rows: expected as u64,
@@ -2850,8 +3140,8 @@ pub(crate) struct OwnerDelivery {
     pub(crate) zero_legacy: bool,
     /// The generation line to publish, or `None` when the queue stays.
     pub(crate) publish: Option<u64>,
-    /// Whether a newly selected row carries delivery evidence.
-    consent: bool,
+    /// Newly selected flags and full digests, excluding the closed prefix.
+    selected: Vec<(u8, [u8; 32])>,
 }
 
 impl OwnerDelivery {
@@ -2861,14 +3151,13 @@ impl OwnerDelivery {
             owner: None,
             zero_legacy: false,
             publish: Some(g),
-            consent: false,
+            selected: Vec::new(),
         }
     }
 
-    /// Whether newly selected consent rows would close under an owner that
-    /// commits no evidence.
-    pub(crate) fn consent_without_evidence_root(&self) -> bool {
-        self.consent && self.owner.as_ref().is_some_and(|owner| owner.e.is_none())
+    /// Whether newly selected rows require authenticated evidence selection.
+    pub(crate) fn has_consent(&self) -> bool {
+        self.selected.iter().any(|(r, _)| *r == 1)
     }
 
     /// The owner value to store, in its keyring form.
@@ -3207,7 +3496,7 @@ fn write_evidence_slot(path: &Path, bytes: &[u8]) -> Result<(), WriterError> {
     Ok(())
 }
 
-/// Checked before any mutation, including a recovered candidate's recommit.
+/// Checked before a successor write and before a mutation's recommit.
 fn next_evidence_generation(image: &EvidenceImage) -> Result<u64, WriterError> {
     image
         .generation
@@ -3270,7 +3559,7 @@ impl OutboxBatch {
         store: &dyn TipAnchorStore,
         key: &[u8; 32],
         fenced: bool,
-        transform: impl FnOnce(&mut EvidenceImage, &mut OutboxOwnerState),
+        transform: impl FnOnce(&mut EvidenceImage, &mut OutboxOwnerState) -> Result<(), WriterError>,
     ) -> Result<LoadedEvidence, WriterError> {
         let mut loaded = self
             .evidence_for_change(log_path, store, key, fenced, !fenced)?
@@ -3280,7 +3569,15 @@ impl OutboxBatch {
         }
         let generation = next_evidence_generation(&loaded.image)?;
         let predecessor = consent_evidence::head(&loaded.bytes);
-        transform(&mut loaded.image, &mut loaded.owner);
+        let original = (loaded.image.clone(), loaded.owner.clone());
+        transform(&mut loaded.image, &mut loaded.owner)?;
+        if !fenced && original.0 == loaded.image {
+            if original.1 != loaded.owner {
+                self.check_generation(store)?;
+                store_owner_confirmed(store, self.generation, &loaded.owner.to_keyring_value())?;
+            }
+            return Ok(loaded);
+        }
         loaded.image.generation = generation;
         loaded.image.predecessor = predecessor;
         loaded.bytes = loaded.image.seal(key);
@@ -3317,7 +3614,7 @@ impl OutboxBatch {
         if let Some(ref loaded) = selected
             && self.bytes != encode_generation_line(key, loaded.owner.g)
         {
-            return Err(evidence_unusable("queue not drained"));
+            return Err(tagged_refusal(1, "queue not drained before a key change"));
         }
         if let Some(owner) = target.owner_value() {
             self.check_generation(store)?;
@@ -3342,27 +3639,28 @@ impl OutboxBatch {
         store: &dyn TipAnchorStore,
         key: Option<&[u8; 32]>,
         required: bool,
-    ) -> Result<(), WriterError> {
-        let owner = match self.owner(store)? {
+    ) -> Result<Option<OutboxOwnerState>, WriterError> {
+        let current = self.owner(store)?;
+        let owner = match current {
             Some(owner) if owner.e.is_some() => owner,
             _ => {
                 if required && consent_evidence::any_slot_exists(log_path)? {
                     return Err(evidence_unusable("evidence image without owner"));
                 }
-                return Ok(());
+                return Ok(current);
             }
         };
         if self.bytes != encode_fence_line(owner.g) || self.state != OutboxState::default() {
             return if required {
                 Err(evidence_unusable("queue not drained"))
             } else {
-                Ok(())
+                Ok(Some(owner))
             };
         }
         let key = key.ok_or(WriterError::KeyedLogNeedsKey {
             evidence: "the owner state commits consent evidence",
         })?;
-        let loaded = self.commit_evidence_change(log_path, store, key, true, |_, _| {})?;
+        let loaded = self.commit_evidence_change(log_path, store, key, true, |_, _| Ok(()))?;
         let paths = consent_evidence::slot_paths(log_path);
         let other = 1 - loaded.index;
         if consent_evidence::read_slot(&paths[other])?.as_deref() != Some(loaded.bytes.as_slice()) {
@@ -3382,7 +3680,8 @@ impl OutboxBatch {
         }
         #[cfg(any(test, feature = "test-helpers"))]
         test_seam::check_stop(&self.path, test_seam::Stop::EvidenceCopiesSynced)?;
-        self.check_generation(store)
+        self.check_generation(store)?;
+        Ok(Some(loaded.owner))
     }
 }
 
@@ -4433,68 +4732,89 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn a_queued_reference_survives_completed_key_rotation() {
-        let (_dir, path, store, writer) = cut_over_fixture();
-        drop(writer);
-        let mut rotation = AuditWriter::open_for_key_rotation(
-            path.clone(),
-            Some(Zeroizing::new(ROW_KEY)),
-            store.clone(),
-            crate::audit_log::BindingHistory::NotRecorded,
-        )
-        .unwrap();
-        let (waiting, ready) = std::sync::mpsc::channel();
-        test_seam::on_contended(&outbox_lock_path(&path), move || waiting.send(()).unwrap());
-        let reference = std::thread::scope(|scope| {
-            let append = scope.spawn(|| keyed_outbox(&path, &store).append_queued(&row("rotated")));
-            ready.recv().unwrap();
-            store.set_reload(Ok(Some(ROW_KEY)));
-            rotation.fence_outbox_for_key_change().unwrap();
-            store.set_reload(Ok(Some(NEXT_KEY)));
-            rotation
-                .switch_entry_tag_key(Zeroizing::new(NEXT_KEY), "rotation")
-                .unwrap();
-            crate::audit_log::resign_chain_root_sidecars(&path, &NEXT_KEY).unwrap();
-            drop(rotation);
-            append.join().unwrap().unwrap()
-        });
-        let bytes = outbox_bytes(&path);
-        let lines = parse_lines(&bytes).lines;
-        let decoded = decode_tagged(lines[1], 2, SuffixCheck::Keyed(Some(&NEXT_KEY)), 1, 1);
-        assert!(
-            decoded.is_ok(),
-            "the queued row authenticates under the reloaded key"
-        );
-        let entry = decoded.unwrap().entry;
-        assert_eq!(entry.request_id, "rotated");
-        assert_eq!(
-            test_seam::delivered_row_digest(lines[1]).unwrap().1,
-            *reference.digest()
-        );
-        assert!(matches!(
-            AuditWriter::open(
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        for enforced in [false, true] {
+            let (_dir, path, store, writer) = if enforced {
+                initialized()
+            } else {
+                cut_over_fixture()
+            };
+            let outbox = keyed_outbox(&path, &store);
+            let outbox = if enforced {
+                let reservation = outbox.reserve_evidence([1; 32], 9_000, 0).unwrap();
+                outbox.with_evidence_reservation(reservation)
+            } else {
+                outbox
+            };
+            drop(writer);
+            let mut rotation = AuditWriter::open_for_key_rotation(
+                path.clone(),
+                Some(Zeroizing::new(ROW_KEY)),
+                store.clone(),
+                crate::audit_log::BindingHistory::NotRecorded,
+            )
+            .unwrap();
+            let (waiting, ready) = std::sync::mpsc::channel();
+            test_seam::on_contended(&outbox_lock_path(&path), move || waiting.send(()).unwrap());
+            let reference = std::thread::scope(|scope| {
+                let append = scope.spawn(|| outbox.append_queued(&row("rotated")));
+                ready.recv().unwrap();
+                store.set_reload(Ok(Some(ROW_KEY)));
+                rotation.fence_outbox_for_key_change().unwrap();
+                store.set_reload(Ok(Some(NEXT_KEY)));
+                rotation
+                    .switch_entry_tag_key(Zeroizing::new(NEXT_KEY), "rotation")
+                    .unwrap();
+                crate::audit_log::resign_chain_root_sidecars(&path, &NEXT_KEY).unwrap();
+                drop(rotation);
+                append.join().unwrap().unwrap()
+            });
+            let bytes = outbox_bytes(&path);
+            let lines = parse_lines(&bytes).lines;
+            let decoded = decode_tagged(lines[1], 2, SuffixCheck::Keyed(Some(&NEXT_KEY)), 1, 1);
+            assert!(
+                decoded.is_ok(),
+                "the queued row authenticates under the reloaded key"
+            );
+            let entry = decoded.unwrap().entry;
+            assert_eq!(entry.request_id, "rotated");
+            assert_eq!(
+                test_seam::delivered_row_digest(lines[1]).unwrap().1,
+                *reference.digest()
+            );
+            assert!(matches!(
+                AuditWriter::open(
+                    path.clone(),
+                    Some(KeyedAuditAccess::new(
+                        Zeroizing::new(ROW_KEY),
+                        store.clone(),
+                    ))
+                ),
+                Err(WriterError::AuditKeyReplaced)
+            ));
+            let mut writer = AuditWriter::open(
                 path.clone(),
                 Some(KeyedAuditAccess::new(
-                    Zeroizing::new(ROW_KEY),
+                    Zeroizing::new(NEXT_KEY),
                     store.clone(),
-                ))
-            ),
-            Err(WriterError::AuditKeyReplaced)
-        ));
-        let mut writer = AuditWriter::open(
-            path.clone(),
-            Some(KeyedAuditAccess::new(
-                Zeroizing::new(NEXT_KEY),
-                store.clone(),
-            )),
-        )
-        .unwrap();
-        assert_eq!(delivered(&path, "rotated"), 1);
-        assert_eq!(
-            owner_state(&store).unwrap().recent,
-            vec![*reference.digest()]
-        );
-        assert_eq!(writer.drain_outbox().unwrap(), 0);
+                )),
+            )
+            .unwrap();
+            assert_eq!(delivered(&path, "rotated"), 1);
+            if enforced {
+                assert!(evidence_snapshot(&writer).contains_delivered(&[1; 32], &reference));
+            } else {
+                assert_eq!(
+                    owner_state(&store).unwrap().recent,
+                    vec![*reference.digest()]
+                );
+            }
+            assert_eq!(writer.drain_outbox().unwrap(), 0);
+        }
     }
 
     fn replace_tagged_line(path: &Path, store: &Arc<InMemoryTipAnchorStore>, line: &[u8]) {
@@ -9053,6 +9373,906 @@ mod tests {
         }
     }
 
+    fn evidence_snapshot(writer: &AuditWriter) -> OutboxEvidence {
+        writer.outbox_evidence().unwrap().unwrap()
+    }
+
+    fn seed_records(path: &Path, store: &InMemoryTipAnchorStore, count: usize, expired: bool) {
+        let batch = OutboxBatch::read_locked(path, store).unwrap();
+        batch
+            .commit_evidence_change(path, store, &ROW_KEY, false, |image, _| {
+                image.records = (0..count)
+                    .map(|index| {
+                        let mut record = evidence_record(index as u32);
+                        record.state = RecordState::Reserved;
+                        record.digest = [0; 32];
+                        record.generation = 0;
+                        record.sequence = 0;
+                        if expired && index == 0 {
+                            record.expires_at_ms = 10;
+                        }
+                        record
+                    })
+                    .collect();
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn reserve_row(outbox: &AuditOutbox, identity: [u8; 32], name: &str) -> OutboxRowRef {
+        let reservation = outbox.reserve_evidence(identity, 9_000, 0).unwrap();
+        outbox
+            .clone()
+            .with_evidence_reservation(reservation)
+            .append_queued(&row(name))
+            .unwrap()
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn admission_refuses_the_4097th_identity() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let (_dir, path, store, writer) = initialized();
+        seed_records(&path, &store, MAX_EVIDENCE_ENTRIES, false);
+        let before = evidence_snapshot(&writer);
+        let outbox = keyed_outbox(&path, &store);
+        let error = outbox.reserve_evidence([255; 32], 10_000, 0).unwrap_err();
+        assert_eq!(error.code(), "approval.evidence_capacity");
+        assert_eq!(
+            error.to_string(),
+            "Consent evidence capacity is full; retry after an existing approval ends."
+        );
+        assert_eq!(
+            evidence_snapshot(&writer),
+            before,
+            "all admitted identities survive refusal"
+        );
+        assert_eq!(outbox_bytes(&path), header(1));
+        assert_eq!(
+            outbox
+                .reserve_evidence([255; 32], 10_000, 1)
+                .unwrap_err()
+                .code(),
+            "approval.evidence_capacity"
+        );
+        assert_eq!(evidence_snapshot(&writer).records(), before.records());
+        assert_eq!(evidence_snapshot(&writer).time_floor_ms(), 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn admission_is_idempotent_and_fact_bound() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let (_dir, path, store, writer) = initialized();
+        let outbox = keyed_outbox(&path, &store);
+        let reservation = outbox.reserve_evidence([1; 32], 100, 1).unwrap();
+        let before = (slots(&path), store.outbox_item_writes());
+        assert_eq!(
+            outbox.reserve_evidence([1; 32], 100, 1).unwrap(),
+            reservation
+        );
+        assert_eq!((slots(&path), store.outbox_item_writes()), before);
+        assert!(
+            outbox.reserve_evidence([1; 32], 101, 1).is_err(),
+            "conflicting expiry refuses"
+        );
+        assert!(outbox.reserve_evidence([2; 32], 1, 1).is_err());
+        assert_eq!(evidence_snapshot(&writer).records().len(), 1);
+        assert_eq!(
+            EvidenceReservation::deadline(100, u64::MAX).unwrap(),
+            900_100
+        );
+        assert_eq!(EvidenceReservation::deadline(100, 20).unwrap(), 120);
+        assert!(EvidenceReservation::deadline(u64::MAX, 1).is_err());
+        let plain = AuditOutbox::for_log(&path, store.clone());
+        assert!(plain.reserve_evidence([2; 32], 100, 1).is_err());
+        assert_eq!((slots(&path), store.outbox_item_writes()), before);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn queued_binding_precedes_row_write() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        for rollback_fails in [false, true] {
+            let (_dir, path, store, mut writer) = initialized();
+            let outbox = keyed_outbox(&path, &store);
+            let reservation = outbox.reserve_evidence([1; 32], 100, 0).unwrap();
+            let outbox = outbox.with_evidence_reservation(reservation);
+            let before = outbox_bytes(&path);
+            test_seam::arm_sync_failure(outbox.path(), test_seam::SyncStep::File);
+            if rollback_fails {
+                test_seam::arm_sync_failure(outbox.path(), test_seam::SyncStep::Rollback);
+            }
+            assert!(matches!(
+                outbox.append_queued(&row("failed")),
+                Err(WriterError::Io(_))
+            ));
+            let evidence = evidence_snapshot(&writer);
+            assert_eq!(
+                evidence.records()[0].state,
+                RecordState::Queued,
+                "Queued precedes the row write"
+            );
+            if rollback_fails {
+                assert_ne!(outbox_bytes(&path), before);
+                assert_eq!(writer.drain_outbox().unwrap(), 1);
+                assert_eq!(
+                    evidence_snapshot(&writer).records()[0].state,
+                    RecordState::Delivered
+                );
+            } else {
+                assert_eq!(outbox_bytes(&path), before);
+            }
+            assert_eq!(delivered(&path, "failed"), usize::from(rollback_fails));
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn queued_binding_rejects_retargeting() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let (_dir, path, store, mut writer) = initialized();
+        let outbox = keyed_outbox(&path, &store);
+        let reservation = outbox.reserve_evidence([1; 32], 100, 0).unwrap();
+        let outbox = outbox.with_evidence_reservation(reservation);
+        let first = outbox.append_queued(&row("first")).unwrap();
+        let before = (
+            outbox_bytes(&path),
+            slots(&path),
+            store.outbox_item_writes(),
+        );
+        assert!(
+            outbox.append_queued(&row("other")).is_err(),
+            "a drainable digest cannot be retargeted"
+        );
+        assert_eq!(
+            (
+                outbox_bytes(&path),
+                slots(&path),
+                store.outbox_item_writes()
+            ),
+            before
+        );
+        assert_eq!(
+            evidence_snapshot(&writer).records()[0].digest,
+            *first.digest()
+        );
+        assert_eq!(writer.drain_outbox().unwrap(), 1);
+        let queue = outbox_bytes(&path);
+        assert!(
+            outbox.append_queued(&row("again")).is_err(),
+            "a Delivered record cannot be retargeted"
+        );
+        assert_eq!(outbox_bytes(&path), queue);
+        let record = evidence_snapshot(&writer).records()[0].clone();
+        assert_eq!(
+            (record.state, record.digest),
+            (RecordState::Delivered, *first.digest()),
+            "Delivered stays at the first digest"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_refused_row_write_permits_a_retargeted_retry() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let (_dir, path, store, mut writer) = initialized();
+        let outbox = keyed_outbox(&path, &store);
+        let reservation = outbox.reserve_evidence([1; 32], 100, 0).unwrap();
+        let outbox = outbox.with_evidence_reservation(reservation);
+        test_seam::arm_sync_failure(outbox.path(), test_seam::SyncStep::File);
+        assert!(outbox.append_queued(&row("failed")).is_err());
+        let first = evidence_snapshot(&writer).records()[0].digest;
+        let reference = outbox
+            .append_queued(&row("retry"))
+            .expect("an absent row permits retargeting");
+        assert_ne!(first, *reference.digest());
+        assert_eq!(writer.drain_outbox().unwrap(), 1);
+        assert!(evidence_snapshot(&writer).contains_delivered(&[1; 32], &reference));
+        assert_eq!(delivered(&path, "failed"), 0);
+        assert_eq!(delivered(&path, "retry"), 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_full_file_reclaims_expired_entries_before_refusing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let (_dir, path, store, writer) = initialized();
+        seed_records(&path, &store, MAX_EVIDENCE_ENTRIES, true);
+        keyed_outbox(&path, &store)
+            .reserve_evidence([255; 32], 10_000, 10)
+            .expect("expiry GC precedes admission");
+        let evidence = evidence_snapshot(&writer);
+        assert_eq!(evidence.records().len(), MAX_EVIDENCE_ENTRIES);
+        assert!(
+            !evidence
+                .records()
+                .iter()
+                .any(|record| record.identity == evidence_record(0).identity)
+        );
+        assert_eq!(evidence.time_floor_ms(), 10);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reservation_refuses_another_scope() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let (_dir, path, store, writer) = initialized();
+        let outbox = keyed_outbox(&path, &store);
+        outbox.reserve_evidence([1; 32], 100, 0).unwrap();
+        let (_other_dir, other_path, other_store, mut other_writer) = keyed_fixture();
+        other_store.set_evidence_scope([99; 32]);
+        other_writer.initialize_consent_evidence().unwrap();
+        let reservation = keyed_outbox(&other_path, &other_store)
+            .reserve_evidence([1; 32], 100, 0)
+            .unwrap();
+        let before = (
+            slots(&path),
+            outbox_bytes(&path),
+            store.outbox_item_writes(),
+        );
+        assert!(
+            outbox
+                .with_evidence_reservation(reservation)
+                .append_queued(&row("foreign"))
+                .is_err(),
+            "a foreign scope refuses"
+        );
+        assert_eq!(
+            (
+                slots(&path),
+                outbox_bytes(&path),
+                store.outbox_item_writes()
+            ),
+            before
+        );
+        assert_eq!(
+            evidence_snapshot(&writer).records()[0].state,
+            RecordState::Reserved
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_drain_without_consent_rows_leaves_evidence_untouched() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let (_dir, path, store, mut writer) = initialized();
+        plant(&path, 0, b"broken");
+        plant(&path, 1, b"broken");
+        let before = (slots(&path), committed(&store));
+        keyed_outbox(&path, &store).append(&row("plain")).unwrap();
+        assert_eq!(
+            writer.drain_outbox().unwrap(),
+            1,
+            "ordinary rows need no evidence read"
+        );
+        assert_eq!((slots(&path), committed(&store)), before);
+        drop(writer);
+        let (_dir, path, store, mut rotation, old) = rotation_fixture(storage_sandbox.path());
+        rotation.fence_outbox_for_key_change().unwrap();
+        store.set_reload(Ok(Some(NEXT_KEY)));
+        drop(rotation);
+        let mut rotation = restart_rotation(&path, &store, NEXT_KEY);
+        assert_eq!(rotation.drain_outbox().unwrap(), 0);
+        assert_rotated(&path, &store, &old, 8, &NEXT_KEY);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rollback_deferred_drain_preserves_queued_consent() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let (_dir, path, store, mut writer) = initialized();
+        reserve_row(&keyed_outbox(&path, &store), [1; 32], "waiting");
+        keyed_outbox(&path, &store)
+            .append(&row("mixed-plain"))
+            .unwrap();
+        plant(&path, 0, &sealed(&store, 9, &[3]));
+        plant(&path, 1, &sealed(&store, 9, &[4]));
+        let before = (
+            slots(&path),
+            outbox_bytes(&path),
+            owner_state(&store),
+            store.outbox_item_writes(),
+        );
+        assert_eq!(
+            writer.drain_outbox().unwrap(),
+            0,
+            "rollback defers the batch"
+        );
+        assert_eq!(
+            (
+                slots(&path),
+                outbox_bytes(&path),
+                owner_state(&store),
+                store.outbox_item_writes()
+            ),
+            before
+        );
+        assert_eq!(delivered(&path, "waiting"), 0);
+        assert_eq!(delivered(&path, "mixed-plain"), 0);
+        assert_eq!(evidence_refusal(writer.outbox_evidence()), "owner rollback");
+        assert!(
+            writer.outbox_loss().is_err(),
+            "classification refuses before revocation"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn evidence_time_floor_is_write_free() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let (_dir, path, store, writer) = initialized();
+        let outbox = keyed_outbox(&path, &store);
+        assert_eq!(outbox.advance_evidence_floor(80).unwrap(), 80);
+        let before = (
+            slots(&path),
+            owner_state(&store),
+            store.outbox_item_writes(),
+        );
+        assert_eq!(outbox.evidence_time_floor().unwrap(), 80);
+        assert_eq!(
+            (
+                slots(&path),
+                owner_state(&store),
+                store.outbox_item_writes()
+            ),
+            before
+        );
+        let newer = sealed(&store, 9, &[9]);
+        plant(&path, 0, &newer);
+        assert_eq!(outbox.evidence_time_floor().unwrap(), 90);
+        assert_eq!(
+            committed(&store).unwrap().head,
+            consent_evidence::head(&newer)
+        );
+        drop(writer);
+        let (_dir, path, store, _writer) = keyed_fixture();
+        let outbox = keyed_outbox(&path, &store);
+        assert_eq!(outbox.evidence_time_floor().unwrap(), 0);
+        plant(&path, 0, b"orphan");
+        assert!(matches!(
+            outbox.evidence_time_floor(),
+            Err(WriterError::OutboxEvidenceUnusable {
+                reason: "evidence image without owner"
+            })
+        ));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn queued_is_not_delivered() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let (_dir, path, store, mut writer) = initialized();
+        let reference = reserve_row(&keyed_outbox(&path, &store), [1; 32], "queued");
+        assert!(
+            !evidence_snapshot(&writer).contains_delivered(&[1; 32], &reference),
+            "Queued is not Delivered"
+        );
+        assert_eq!(writer.drain_outbox().unwrap(), 1);
+        assert!(evidence_snapshot(&writer).contains_delivered(&[1; 32], &reference));
+        assert!(!evidence_snapshot(&writer).contains_delivered(&[2; 32], &reference));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn anchor_failure_commits_no_delivery() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let (_dir, path, store, mut writer) = initialized();
+        let reference = reserve_row(&keyed_outbox(&path, &store), [1; 32], "anchored");
+        let before = (slots(&path), owner_state(&store), outbox_bytes(&path));
+        store.fail_next_writes(3);
+        assert!(
+            matches!(writer.drain_outbox(), Err(WriterError::TipAnchorStore(_))),
+            "a failed anchor refuses delivery"
+        );
+        assert_eq!(
+            (slots(&path), owner_state(&store), outbox_bytes(&path)),
+            before
+        );
+        assert!(!evidence_snapshot(&writer).contains_delivered(&[1; 32], &reference));
+        assert_eq!(writer.drain_outbox().unwrap(), 1);
+        assert!(evidence_snapshot(&writer).contains_delivered(&[1; 32], &reference));
+        assert_eq!(delivered(&path, "anchored"), 2);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn unreserved_orphan_does_not_consume_capacity() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let (_dir, path, store, mut writer) = initialized();
+        keyed_outbox(&path, &store)
+            .append_queued(&row("orphan"))
+            .unwrap();
+        assert_eq!(writer.drain_outbox().unwrap(), 1);
+        assert!(
+            evidence_snapshot(&writer).records().is_empty(),
+            "unreserved rows create no record"
+        );
+        assert_eq!(delivered(&path, "orphan"), 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn old_live_evidence_survives_full_drains() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let (_dir, path, store, mut writer) = initialized();
+        let outbox = keyed_outbox(&path, &store);
+        let oldest = reserve_row(&outbox, evidence_record(0).identity, "oldest");
+        writer.drain_outbox().unwrap();
+        for batch in 0..4 {
+            for index in 0..MAX_OUTBOX_ROWS {
+                let n = 1 + batch * MAX_OUTBOX_ROWS + index;
+                reserve_row(
+                    &outbox,
+                    evidence_record(n as u32).identity,
+                    &format!("row-{n}"),
+                );
+            }
+            assert_eq!(writer.drain_outbox().unwrap(), MAX_OUTBOX_ROWS);
+            assert!(
+                evidence_snapshot(&writer)
+                    .contains_delivered(&evidence_record(0).identity, &oldest),
+                "the oldest live grant survives full drains"
+            );
+        }
+        assert_eq!(evidence_snapshot(&writer).records().len(), 257);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn publication_stops_preserve_delivery() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        use test_seam::Stop;
+        for stop in [
+            Stop::EvidenceOwnerStored,
+            Stop::OwnerStored,
+            Stop::ReplacementSynced,
+            Stop::Renamed,
+            Stop::DirectorySynced,
+        ] {
+            let (dir, path, store, mut writer) = initialized();
+            let outbox = keyed_outbox(&path, &store);
+            outbox.append(&row("plain")).unwrap();
+            let reference = reserve_in_process(dir.path(), &store, 1, "published");
+            let bytes = outbox_bytes(&path);
+            let digests: Vec<_> = parse_lines(&bytes).lines[1..]
+                .iter()
+                .map(|line| test_seam::delivered_row_digest(line).unwrap())
+                .collect();
+            test_seam::arm_stop(&outbox_path(&path), stop);
+            assert!(writer.drain_outbox().is_err());
+            let owner = owner_state(&store).unwrap();
+            let closed = owner.closed.as_ref().unwrap();
+            assert_eq!((owner.g, closed.g, closed.n), (2, 1, 2));
+            assert_eq!(
+                closed.batch,
+                batch_digest(&digests),
+                "closed includes every ordered digest"
+            );
+            assert!(evidence_snapshot(&writer).contains_delivered(&[1; 32], &reference));
+            let suffix = reserve_in_process(dir.path(), &store, 2, "suffix");
+            drop(writer);
+            let writer = reopen(&path, &store);
+            assert!(evidence_snapshot(&writer).contains_delivered(&[1; 32], &reference));
+            assert!(evidence_snapshot(&writer).contains_delivered(&[2; 32], &suffix));
+            assert_eq!(delivered(&path, "suffix"), 1);
+            assert_eq!(delivered(&path, "plain"), 1);
+            assert_eq!(
+                delivered(&path, "published"),
+                1,
+                "a committed prefix is not repeated: {stop:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn precommit_stops_allow_at_least_once_delivery() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        use test_seam::Stop;
+        for stop in [
+            Stop::BeforeAppends,
+            Stop::AfterAppend(1),
+            Stop::AnchorChecked,
+            Stop::EvidenceCandidateSynced,
+        ] {
+            let (_dir, path, store, mut writer) = initialized();
+            let reference = reserve_row(&keyed_outbox(&path, &store), [1; 32], "pending");
+            let root = committed(&store);
+            test_seam::arm_stop(&outbox_path(&path), stop);
+            assert!(writer.drain_outbox().is_err());
+            assert_eq!(committed(&store), root, "owner stays old before commit");
+            let evidence = evidence_snapshot(&writer);
+            assert_eq!(
+                evidence.contains_delivered(&[1; 32], &reference),
+                stop == Stop::EvidenceCandidateSynced,
+                "only a post-anchor durable candidate supplies recovered coverage"
+            );
+            drop(writer);
+            let writer = reopen(&path, &store);
+            assert!(evidence_snapshot(&writer).contains_delivered(&[1; 32], &reference));
+            assert_eq!(
+                delivered(&path, "pending"),
+                if stop == Stop::BeforeAppends { 1 } else { 2 }
+            );
+        }
+        let (_dir, path, store, mut writer) = initialized();
+        let reference = reserve_row(&keyed_outbox(&path, &store), [1; 32], "store-fault");
+        let root = committed(&store);
+        let queued = outbox_bytes(&path);
+        store.set_owner_failing(false, true);
+        assert!(matches!(
+            writer.drain_outbox(),
+            Err(WriterError::TipAnchorStore(_))
+        ));
+        assert_eq!(committed(&store), root);
+        assert_eq!(outbox_bytes(&path), queued);
+        assert!(slots(&path).iter().all(Option::is_some));
+        assert!(matches!(
+            writer.outbox_evidence(),
+            Err(WriterError::TipAnchorStore(_))
+        ));
+        store.set_owner_failing(false, false);
+        assert!(evidence_snapshot(&writer).contains_delivered(&[1; 32], &reference));
+        assert_eq!(writer.drain_outbox().unwrap(), 1);
+        assert_eq!(delivered(&path, "store-fault"), 2);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn release_follows_final_use() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let (_dir, path, store, mut writer) = initialized();
+        let outbox = keyed_outbox(&path, &store);
+        let reference = reserve_row(&outbox, [1; 32], "retryable");
+        writer.drain_outbox().unwrap();
+        outbox.reserve_evidence([2; 32], 9_000, 1).unwrap();
+        assert!(
+            evidence_snapshot(&writer).contains_delivered(&[1; 32], &reference),
+            "retryable consumed grants retain proof"
+        );
+        outbox.release_evidence([1; 32]).unwrap();
+        assert!(!evidence_snapshot(&writer).contains_delivered(&[1; 32], &reference));
+        let before = (slots(&path), store.outbox_item_writes());
+        outbox.release_evidence([1; 32]).unwrap();
+        assert_eq!((slots(&path), store.outbox_item_writes()), before);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn expiry_floor_prevents_clock_revival() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let (_dir, path, store, writer) = initialized();
+        let outbox = keyed_outbox(&path, &store);
+        outbox.reserve_evidence([1; 32], 100, 10).unwrap();
+        assert_eq!(outbox.advance_evidence_floor(99).unwrap(), 99);
+        assert_eq!(evidence_snapshot(&writer).records().len(), 1);
+        assert_eq!(outbox.advance_evidence_floor(100).unwrap(), 100);
+        assert!(evidence_snapshot(&writer).records().is_empty());
+        assert_eq!(
+            outbox.advance_evidence_floor(1).unwrap(),
+            100,
+            "the floor never decreases"
+        );
+        assert!(outbox.reserve_evidence([1; 32], 100, 1).is_err());
+        assert!(evidence_snapshot(&writer).records().is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn legacy_pins_survive_floor_advancement() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let (_dir, path, store, writer) = initialized();
+        let batch = OutboxBatch::read_locked(&path, store.as_ref()).unwrap();
+        let pin = EvidenceRecord::legacy_pin([7; 32]);
+        batch
+            .commit_evidence_change(&path, store.as_ref(), &ROW_KEY, false, |image, _| {
+                image.records.push(pin.clone());
+                Ok(())
+            })
+            .unwrap();
+        drop(batch);
+        let outbox = keyed_outbox(&path, &store);
+        assert_eq!(outbox.advance_evidence_floor(u64::MAX).unwrap(), u64::MAX);
+        assert_eq!(
+            evidence_snapshot(&writer).records(),
+            std::slice::from_ref(&pin),
+            "pins survive every clock"
+        );
+        assert!(outbox.release_evidence(pin.identity).is_err());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_full_file_still_queues_and_delivers_existing_grants() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let (_dir, path, store, mut writer) = initialized();
+        seed_records(&path, &store, MAX_EVIDENCE_ENTRIES, false);
+        let outbox = keyed_outbox(&path, &store);
+        let before = evidence_snapshot(&writer).records()[1..].to_vec();
+        let reference = reserve_row(&outbox, evidence_record(0).identity, "last");
+        assert_eq!(writer.drain_outbox().unwrap(), 1);
+        let evidence = evidence_snapshot(&writer);
+        assert!(evidence.contains_delivered(&evidence_record(0).identity, &reference));
+        assert_eq!(evidence.records().len(), MAX_EVIDENCE_ENTRIES);
+        assert_eq!(evidence.records()[1..], before);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_reserved_reference_waits_for_owner_commit() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let (_dir, path, store, mut writer) = initialized();
+        let outbox = keyed_outbox(&path, &store);
+        let reference = reserve_row(&outbox, [1; 32], "anchored");
+        let queued = evidence_snapshot(&writer);
+        assert_eq!(
+            queued.records()[0].state,
+            RecordState::Queued,
+            "an append binds Queued and never Delivered"
+        );
+        assert!(!queued.contains_delivered(&[1; 32], &reference));
+        let root = committed(&store).unwrap().head;
+        store.set_owner_failing(false, true);
+        let result = writer.drain_outbox();
+        assert!(
+            matches!(result, Err(WriterError::TipAnchorStore(_))),
+            "{result:?}"
+        );
+        store.set_owner_failing(false, false);
+        assert_eq!(
+            committed(&store).unwrap().head,
+            root,
+            "a failed owner store commits no delivery"
+        );
+        assert_eq!(writer.drain_outbox().unwrap(), 1);
+        assert!(evidence_snapshot(&writer).contains_delivered(&[1; 32], &reference));
+        assert_eq!(delivered(&path, "anchored"), 2);
+        assert_eq!(writer.drain_outbox().unwrap(), 0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn appender_evidence_apis_refuse_a_rotation_fence() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let (_dir, path, store, mut writer, _old) = rotation_fixture(storage_sandbox.path());
+        writer.fence_outbox_for_key_change().unwrap();
+        drop(writer);
+        store.set_reload(Ok(Some(ROW_KEY)));
+        let images = slots(&path);
+        let writes = owner_writes(&store);
+        let outbox = keyed_outbox(&path, &store);
+        let fence = tagged_refusal(1, "tagged record whose tag does not verify");
+        let refused = outbox.reserve_evidence([200; 32], 9_000, 0);
+        assert_eq!(
+            refused.map_err(|error| error.to_string()),
+            Err(super::super::writer::audit_writer_refusal("outbox", &fence).to_string()),
+            "a fence refuses admission"
+        );
+        for result in [
+            outbox.release_evidence(evidence_record(2).identity),
+            outbox.advance_evidence_floor(80).map(drop),
+            outbox.evidence_time_floor().map(drop),
+        ] {
+            assert_eq!(
+                result.map_err(|error| error.to_string()),
+                Err(fence.to_string())
+            );
+        }
+        assert_eq!(slots(&path), images);
+        assert_eq!(owner_writes(&store), writes);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn acknowledgement_covers_only_selected_rows() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let (_dir, path, store, mut writer) = initialized();
+        let outbox = keyed_outbox(&path, &store);
+        let retained = reserve_row(&outbox, [1; 32], "retained");
+        writer.drain_outbox().unwrap();
+        let selected = reserve_row(&outbox, [2; 32], "selected");
+        let discarded = reserve_row(&outbox, [3; 32], "discarded");
+        let bytes = outbox_bytes(&path);
+        let lines = parse_lines(&bytes).lines;
+        let mut damaged = [lines[0], lines[1]].join(&b'\n');
+        damaged.extend_from_slice(b"\n{\"k\":\"row\"}\n");
+        fs::write(outbox.path(), damaged).unwrap();
+        drop(writer);
+        let mut writer = AuditWriter::open_for_outbox_acknowledgement(
+            path.clone(),
+            Some(Zeroizing::new(ROW_KEY)),
+            store.clone(),
+            crate::audit_log::BindingHistory::NotRecorded,
+        )
+        .unwrap();
+        assert!(writer.outbox_loss().unwrap().is_some());
+        let report = writer
+            .acknowledge_outbox_loss("verified revocation", Default::default())
+            .unwrap();
+        assert_eq!((report.drained, report.discarded), (1, 1));
+        let evidence = evidence_snapshot(&writer);
+        assert!(evidence.contains_delivered(&[1; 32], &retained));
+        assert!(evidence.contains_delivered(&[2; 32], &selected));
+        assert!(
+            !evidence.contains_delivered(&[3; 32], &discarded),
+            "discarded rows receive no delivery evidence"
+        );
+        assert_eq!(evidence.records().len(), 3);
+        assert_eq!(delivered(&path, "selected"), 1);
+        assert_eq!(delivered(&path, "discarded"), 0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rotation_fence_recommits_newer_candidate() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let (_dir, path, store, mut writer, _old) = rotation_fixture(storage_sandbox.path());
+        let newer = sealed(&store, 9, &[2, 9]);
+        plant(&path, 1, &newer);
+        let writes = owner_writes(&store);
+        writer.fence_outbox_for_key_change().unwrap();
+        assert_eq!(
+            committed(&store).unwrap().head,
+            consent_evidence::head(&newer),
+            "fencing recommits the selected candidate"
+        );
+        assert_eq!(owner_writes(&store), writes + 1);
+        assert_eq!(slots(&path), [Some(newer.clone()), Some(newer.clone())]);
+        store.set_reload(Ok(Some(NEXT_KEY)));
+        writer
+            .switch_entry_tag_key(Zeroizing::new(NEXT_KEY), "rotation")
+            .unwrap();
+        assert_rotated(&path, &store, &newer, 10, &NEXT_KEY);
+        drop(writer);
+        let (_dir, path, _store, mut writer, _old) = rotation_fixture(storage_sandbox.path());
+        fs::write(outbox_path(&path), encode_generation_line(&NEXT_KEY, 1)).unwrap();
+        let error = writer.fence_outbox_for_key_change().unwrap_err();
+        assert!(matches!(
+            error,
+            WriterError::OutboxUnusable {
+                reason: "queue not drained before a key change",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rotation_uncertain_retag_owner_resolves_actual_commit() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        for outcome in 0..3 {
+            let (_dir, path, store, writer, old) = rotation_fixture(storage_sandbox.path());
+            drop(writer);
+            let uncertain = Arc::new(UncertainStore {
+                inner: store.clone(),
+                reread_fails: outcome == 2,
+                stored: std::sync::atomic::AtomicBool::new(false),
+            });
+            let mut writer = AuditWriter::open_for_key_rotation(
+                path.clone(),
+                Some(Zeroizing::new(ROW_KEY)),
+                uncertain,
+                crate::audit_log::BindingHistory::NotRecorded,
+            )
+            .unwrap();
+            writer.fence_outbox_for_key_change().unwrap();
+            store.set_owner_failing(false, outcome == 1);
+            store.set_reload(Ok(Some(NEXT_KEY)));
+            let result = writer.switch_entry_tag_key(Zeroizing::new(NEXT_KEY), "rotation");
+            if outcome == 0 {
+                assert!(
+                    result.is_ok(),
+                    "a persisted retag confirms an uncertain owner store: {result:?}"
+                );
+                assert_rotated(&path, &store, &old, 8, &NEXT_KEY);
+            } else {
+                assert!(
+                    matches!(result, Err(WriterError::TipAnchorStore(_))),
+                    "rejected or unreadable stores remain storage failures"
+                );
+                assert_eq!(outbox_bytes(&path), encode_fence_line(1));
+                assert_eq!(
+                    committed(&store).unwrap().g,
+                    if outcome == 1 { 7 } else { 8 }
+                );
+                assert_eq!(slots(&path)[0].as_ref(), Some(&old));
+            }
+            drop(writer);
+            store.set_owner_failing(false, false);
+            let _writer = restart_rotation(&path, &store, NEXT_KEY);
+            assert_rotated(&path, &store, &old, 8, &NEXT_KEY);
+        }
+    }
+
+    #[test]
+    fn evidence_protocol_documents_lifetime() {
+        const DOC: &str = include_str!("../../../../docs/maintainers/audit-log-recovery.md");
+        for sentence in [
+            "Every admitted approval retains its slot throughout every permitted use.",
+            "The 4,096 slots count Reserved, Queued, Delivered, and unresolved migration pins together.",
+            "Only an anchored writer marks a matching Queued record Delivered.",
+            "A read-only recommit is exempt from that overflow check.",
+        ] {
+            assert!(DOC.contains(sentence), "{sentence}");
+        }
+    }
+
     // Consent evidence storage.
 
     use crate::audit_log::consent_evidence::tests::delivered as evidence_record;
@@ -9609,7 +10829,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn ordinary_delivery_ignores_evidence_refusal() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (_dir, path, store, mut writer) = initialized();
         plant(&path, 0, &sealed(&store, 3, &[3]));
         plant(&path, 1, &sealed(&store, 3, &[4]));
@@ -9621,11 +10845,14 @@ mod tests {
         outbox.append(&row("plain")).unwrap();
         assert_eq!(writer.drain_outbox().unwrap(), 1);
         outbox.append_queued(&row("consent")).unwrap();
-        assert_eq!(writer.drain_outbox().unwrap(), 1);
+        let queued = outbox_bytes(&path);
+        assert_eq!(writer.drain_outbox().unwrap(), 0);
         writer.write_entry(own_row("after")).unwrap();
-        for id in ["allow", "plain", "consent", "after"] {
+        for id in ["allow", "plain", "after"] {
             assert_eq!(delivered(&path, id), 1, "{id}");
         }
+        assert_eq!(delivered(&path, "consent"), 0);
+        assert_eq!(outbox_bytes(&path), queued);
         assert_eq!(committed(&store), root);
         assert_eq!(evidence_refusal(writer.outbox_evidence()), "owner rollback");
     }
@@ -9671,9 +10898,22 @@ mod tests {
 
     fn change_evidence(path: &Path, store: &dyn TipAnchorStore) -> Result<(), WriterError> {
         let batch = OutboxBatch::read_locked(path, store)?;
-        batch
-            .commit_evidence_change(path, store, &ROW_KEY, false, |image, _| image.floor_ms += 1)?;
+        batch.commit_evidence_change(path, store, &ROW_KEY, false, |image, _| {
+            image.floor_ms += 1;
+            Ok(())
+        })?;
         Ok(())
+    }
+
+    fn reserve_existing(
+        path: &Path,
+        store: Arc<dyn TipAnchorStore>,
+    ) -> Result<EvidenceReservation, WalletError> {
+        AuditOutbox::for_log_keyed(path, store, Zeroizing::new(ROW_KEY)).reserve_evidence(
+            evidence_record(2).identity,
+            9_000,
+            74,
+        )
     }
 
     fn arm_evidence_fault(path: &Path, index: usize, fault: usize) {
@@ -9755,7 +10995,7 @@ mod tests {
             drop(writer);
             arm_evidence_fault(&path, 0, fault);
             arm_evidence_fault(&path, 1, fault);
-            assert!(change_evidence(&path, store.as_ref()).is_err());
+            assert!(reserve_existing(&path, store.clone()).is_err());
             assert_eq!(
                 slots(&path)[0].as_ref(),
                 Some(&old),
@@ -9782,6 +11022,7 @@ mod tests {
         let refused =
             batch.commit_evidence_change(&path, store.as_ref(), &ROW_KEY, false, |image, _| {
                 image.records.push(image.records[0].clone());
+                Ok(())
             });
         assert!(matches!(
             refused,
@@ -9797,6 +11038,7 @@ mod tests {
                 image.floor_ms = 74;
                 owner.g = 2;
                 owner.record_delivery(1, &[]);
+                Ok(())
             })
             .unwrap();
         assert_eq!(
@@ -9817,15 +11059,22 @@ mod tests {
         for reread_fails in [false, true] {
             let (_dir, path, store, writer, old) = rotation_fixture(storage_sandbox.path());
             drop(writer);
-            let uncertain = UncertainStore {
+            let uncertain = Arc::new(UncertainStore {
                 inner: store.clone(),
                 reread_fails,
                 stored: std::sync::atomic::AtomicBool::new(false),
-            };
-            let result = change_evidence(&path, &uncertain);
+            });
+            let result = reserve_existing(&path, uncertain);
             if reread_fails {
-                assert!(
-                    matches!(result, Err(WriterError::TipAnchorStore(ref error)) if error.to_string().contains("owner reread fault"))
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    super::super::writer::audit_writer_refusal(
+                        "outbox",
+                        &WriterError::TipAnchorStore(TipAnchorStoreError::new(
+                            "owner reread fault"
+                        ))
+                    )
+                    .to_string()
                 );
             } else {
                 assert!(
@@ -9847,10 +11096,15 @@ mod tests {
         let (_dir, path, store, writer, old) = rotation_fixture(storage_sandbox.path());
         drop(writer);
         store.set_owner_failing(false, true);
-        assert!(matches!(
-            change_evidence(&path, store.as_ref()),
-            Err(WriterError::TipAnchorStore(_))
-        ));
+        let error = reserve_existing(&path, store.clone()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            super::super::writer::audit_writer_refusal(
+                "outbox",
+                &WriterError::TipAnchorStore(TipAnchorStoreError::new("owner write fault"))
+            )
+            .to_string()
+        );
         assert_eq!(
             committed(&store).unwrap().head,
             consent_evidence::head(&old)
@@ -10491,13 +11745,19 @@ mod tests {
             record.generation += 1;
             watched.store_carrier_record(&record).unwrap();
         });
-        assert!(matches!(
-            change_evidence(&path, store.as_ref()),
-            Err(WriterError::CarrierGenerationChanged {
-                held: 1,
-                current: 2
-            })
-        ));
+        assert_eq!(
+            reserve_existing(&path, store.clone())
+                .unwrap_err()
+                .to_string(),
+            super::super::writer::audit_writer_refusal(
+                "outbox",
+                &WriterError::CarrierGenerationChanged {
+                    held: 1,
+                    current: 2
+                }
+            )
+            .to_string()
+        );
         assert_eq!(
             owner_writes(&store),
             before,
@@ -10555,6 +11815,81 @@ mod tests {
             ),
             before
         );
+    }
+
+    fn reserve_in_process(
+        root: &Path,
+        store: &InMemoryTipAnchorStore,
+        identity: u8,
+        request: &str,
+    ) -> OutboxRowRef {
+        fs::write(
+            root.join("owner-1"),
+            store.load_outbox_owner_state(1).unwrap().unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            root.join("carrier"),
+            serde_json::to_vec(&store.load_carrier_record().unwrap().unwrap()).unwrap(),
+        )
+        .unwrap();
+        fs::write(root.join("scope"), store.outbox_evidence_scope().unwrap()).unwrap();
+        let child_home = root.join("child-home");
+        stellar_agent_test_support::sandbox::mark_sandbox(&child_home).unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "audit_log::outbox::tests::reserved_append_process",
+            ])
+            .env("RESERVED_PROCESS_ROOT", root)
+            .env("RESERVED_PROCESS_ID", identity.to_string())
+            .env("RESERVED_PROCESS_REQUEST", request)
+            .env("STELLAR_AGENT_HOME", child_home)
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "child: {}; stderr: {}; stdout: {}",
+            child.status,
+            String::from_utf8_lossy(&child.stderr),
+            String::from_utf8_lossy(&child.stdout)
+        );
+        store
+            .store_outbox_owner_state(1, &fs::read_to_string(root.join("owner-1")).unwrap())
+            .unwrap();
+        serde_json::from_slice(&fs::read(root.join("reference")).unwrap()).unwrap()
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reserved_append_process() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let Ok(root) = std::env::var("RESERVED_PROCESS_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let identity: u8 = std::env::var("RESERVED_PROCESS_ID")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let request = std::env::var("RESERVED_PROCESS_REQUEST").unwrap();
+        let store = Arc::new(ProcessEvidenceStore {
+            root: root.clone(),
+            exit_after_store: false,
+        });
+        let outbox = AuditOutbox::for_log_keyed(
+            &root.join("audit/audit.jsonl"),
+            store,
+            Zeroizing::new(ROW_KEY),
+        );
+        let reference = reserve_row(&outbox, [identity; 32], &request);
+        fs::write(
+            root.join("reference"),
+            serde_json::to_vec(&reference).unwrap(),
+        )
+        .unwrap();
     }
 
     #[derive(Debug)]

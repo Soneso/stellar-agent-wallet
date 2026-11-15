@@ -1992,7 +1992,7 @@ impl AuditWriter {
             .ok_or(WriterError::TipAnchorUnavailable)?;
         self.check_carrier_guards(store.as_ref())?;
         let batch = self.read_outbox(store.as_ref())?;
-        batch.recover_evidence_fence(
+        let owner = batch.recover_evidence_fence(
             &self.path,
             store.as_ref(),
             self.hmac_key.as_deref(),
@@ -2005,18 +2005,31 @@ impl AuditWriter {
         // Every queue with a tagged line, and every queue under owner state,
         // drains through the owner protocol; only an untagged legacy queue
         // reaches the recognition and the commitment check below.
-        if let Some(plan) = batch.owner_plan(store.as_ref(), self.hmac_key.as_deref())? {
-            // Consent rows wait while evidence files exist beside an owner
-            // that commits none: that owner entry is older than the files.
-            if plan.consent_without_evidence_root()
-                && super::consent_evidence::any_slot_exists(&self.path)?
-            {
-                tracing::warn!(
-                    log = %basename_lossy_path(&self.path),
-                    "audit outbox: consent rows wait because evidence files exist without an \
-                     evidence owner; restore the current owner entry"
-                );
-                return Ok(0);
+        if let Some(mut plan) = batch.owner_plan_loaded(owner, self.hmac_key.as_deref())? {
+            if plan.has_consent() {
+                match batch.prepare_delivery_evidence(
+                    &self.path,
+                    store.as_ref(),
+                    self.hmac_key.as_deref(),
+                ) {
+                    Err(WriterError::OutboxEvidenceUnusable {
+                        reason: "owner rollback" | "evidence image without owner",
+                    }) => {
+                        tracing::warn!(
+                            "audit outbox: consent batch waits for authenticated evidence recovery"
+                        );
+                        return Ok(0);
+                    }
+                    Err(error) => return Err(error),
+                    Ok(true) => {
+                        if let Some(current) =
+                            batch.owner_plan(store.as_ref(), self.hmac_key.as_deref())?
+                        {
+                            plan = current;
+                        }
+                    }
+                    Ok(false) => {}
+                }
             }
             return self.deliver_owner_plan(batch, plan, store.as_ref(), false);
         }
@@ -2521,7 +2534,7 @@ impl AuditWriter {
     fn deliver_owner_plan(
         &mut self,
         batch: super::outbox::OutboxBatch,
-        plan: super::outbox::OwnerDelivery,
+        mut plan: super::outbox::OwnerDelivery,
         store: &dyn TipAnchorStore,
         acknowledgement: bool,
     ) -> Result<usize, WriterError> {
@@ -2533,7 +2546,7 @@ impl AuditWriter {
         let drained = plan.entries.len();
         #[cfg(any(test, feature = "test-helpers"))]
         let mut appended = 0;
-        for entry in plan.entries {
+        for entry in std::mem::take(&mut plan.entries) {
             self.append_checked(entry)?;
             #[cfg(any(test, feature = "test-helpers"))]
             {
@@ -2555,8 +2568,8 @@ impl AuditWriter {
         if plan.zero_legacy && acknowledgement {
             zero_legacy()?;
         }
-        if let Some(owner) = owner {
-            store.store_outbox_owner_state(batch.generation(), &owner)?;
+        if owner.is_some() {
+            batch.commit_delivery(&self.path, store, self.hmac_key.as_deref(), &plan)?;
             #[cfg(any(test, feature = "test-helpers"))]
             stop(super::outbox::test_seam::Stop::OwnerStored)?;
         }
@@ -2625,10 +2638,9 @@ impl AuditWriter {
             Some(record) => super::lock::retired_changed(store.as_ref(), &record)?,
             None => None,
         };
-        if let Some(selection) = batch.owner_selection(
-            store.as_ref(),
-            super::outbox::SuffixCheck::Keyed(self.hmac_key.as_deref()),
-        )? {
+        if let Some(selection) =
+            batch.evidence_owner_selection(&self.path, store.as_ref(), self.hmac_key.as_deref())?
+        {
             return Ok(selection
                 .loss
                 .or_else(|| retired.as_ref().map(super::lock::RetiredChange::loss)));
@@ -2713,10 +2725,8 @@ impl AuditWriter {
             Some(record) => super::lock::retired_changed(store.as_ref(), record)?,
             None => None,
         };
-        let selection = batch.owner_selection(
-            store.as_ref(),
-            super::outbox::SuffixCheck::Keyed(self.hmac_key.as_deref()),
-        )?;
+        let selection =
+            batch.evidence_owner_selection(&self.path, store.as_ref(), self.hmac_key.as_deref())?;
         let active_loss = selection.as_ref().map_or_else(
             || batch.loss(self.hmac_key.as_deref()),
             |selection| selection.loss,
@@ -7147,7 +7157,10 @@ pub enum WriterError {
     ///
     /// `reason` is one of `missing image`, `length`, `tag`, `layout`,
     /// `scope`, `head`, `owner rollback`, `evidence image without owner`,
-    /// `queue not drained`, and `evidence-generation overflow`. It never
+    /// `queue not drained`, `evidence-generation overflow`, `expiry overflow`,
+    /// `expired reservation`, `conflicting reservation`, `unresolved pin`,
+    /// `reservation scope or expiry`, `missing reservation`, and
+    /// `queued row still present`. It never
     /// carries file contents. Recovery is in
     /// `docs/maintainers/audit-log-recovery.md`.
     #[error(

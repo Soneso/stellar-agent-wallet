@@ -546,10 +546,37 @@ A missing or version 1 owner beside either evidence file refuses with `evidence 
 A drain under such an owner leaves queued consent rows in place, and rows without consent evidence still deliver.
 Every refusal uses `audit.outbox_evidence_unusable` with a fixed reason.
 Ordinary appends and payments that need no approval never read the evidence files.
-A drain reads them only while repairing an exact rotation fence.
+A drain reads them before selected consent rows and while repairing an exact rotation fence.
+An ordinary drain defers the entire selected batch on `owner rollback`, leaving its bytes and protected items unchanged.
+Unrelated payments without approval continue; explicit evidence queries and evidence-dependent loss classification retain the refusal.
+
+**Admission and lifetime.** Every admitted approval retains its slot throughout every permitted use.
+The 4,096 slots count Reserved, Queued, Delivered, and unresolved migration pins together.
+Admission refuses a new identity at capacity with `approval.evidence_capacity`; existing approvals remain usable within their signed limits.
+Capacity refusal requires no ceremony and evicts no live grant.
+The producer supplies authenticated `WireApproval.id`, immutable expiry, and verified clocks before presenting consent.
+Retention ends at checked waiting expiry plus the lesser of the rule duration and 900,000 milliseconds.
+This deadline retains evidence without extending signed authority.
+An identical identity and expiry retries idempotently; conflicting facts refuse.
+Appenders reserve slots and bind exact queue references under the active carrier before writing rows.
+A failed row write keeps Queued evidence; retargeting requires the old digest to be absent from the held queue.
+Only an anchored writer marks a matching Queued record Delivered.
+The closed batch hashes every ordered row independently of evidence membership.
+Unreserved compatibility rows audit without creating live evidence.
+
+**Lifecycle and clocks.** Release follows authenticated revocation or final operation termination, outside the policy-window lock.
+First consumption and a missing approval record do not authorize release; retryable consumed grants retain their proof.
+Explicit floor advancement removes records expiring at or below the persistent maximum clock, and migration pins never expire through clock collection.
+Admission can reclaim expired slots before refusing capacity.
+Every authorization use and mint uses the greater of wall time and the evidence floor, refreshed before a mint after collection.
+Recoverable storage and publication errors retry the existing grant without another ceremony.
+Production activation requires authenticated sink provenance, retained references, publication and lifecycle adapters, and a complete live-grant inventory.
+Unresolved pins and incomplete binding and verifier integration block activation; initialization remains explicit.
+Populations exceeding capacity require an authenticated migration before activation.
 
 **Evidence transactions.** The active outbox carrier covers the owner reload, authenticated selection, transformation, candidate sync, owner store, and outcome reread.
-The selected generation is checked before any mutation or recommit.
+The selected generation is checked before a successor write and before a mutation's recommit.
+A read-only recommit is exempt from that overflow check.
 Generation `u64::MAX` refuses with `evidence-generation overflow`, through `audit.outbox_evidence_unusable`, without writes.
 A read at that generation remains valid.
 The successor uses the other slot, generation plus one, and the selected head as its predecessor.
