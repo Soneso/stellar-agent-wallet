@@ -1925,12 +1925,10 @@ async fn oracle_failed_record(
 /// A poll interval never carries a submission past its deadline: the loop
 /// that sleeps here checks the deadline before its next request.
 pub(crate) async fn sleep_before_next_poll(interval: Duration, deadline: tokio::time::Instant) {
+    let until = deadline.min(tokio::time::Instant::now() + interval);
     #[cfg(any(test, feature = "test-helpers"))]
-    confirmation_trace::sleep(
-        tokio::time::Instant::now(),
-        deadline.min(tokio::time::Instant::now() + interval),
-    );
-    tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + interval)).await;
+    confirmation_trace::sleep(tokio::time::Instant::now(), until);
+    tokio::time::sleep_until(until).await;
 }
 
 /// Reports a timeout to `recorder` for a submission whose confirmation never

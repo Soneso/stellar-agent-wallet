@@ -373,6 +373,7 @@ struct Fixture {
     audit: Arc<Mutex<AuditWriter>>,
     registry: MulticallRegistry,
     signer: SpySigner,
+    multicall_timeout: Duration,
 }
 
 impl Fixture {
@@ -410,6 +411,8 @@ impl Fixture {
                 inner: stellar_agent_network::signing::test_doubles::CountingSigner::new(SEED),
                 hook: Mutex::new(None),
             },
+            // Accounting and cap checks cannot exhaust a year during a test run.
+            multicall_timeout: Duration::from_secs(365 * 24 * 60 * 60),
         }
     }
 
@@ -421,6 +424,7 @@ impl Fixture {
             audit,
             registry,
             signer,
+            multicall_timeout,
         } = self;
         drop((audit, registry, signer));
         let audit = Arc::new(Mutex::new(
@@ -444,6 +448,7 @@ impl Fixture {
                 inner: stellar_agent_network::signing::test_doubles::CountingSigner::new(SEED),
                 hook: Mutex::new(None),
             },
+            multicall_timeout,
         }
     }
 
@@ -599,7 +604,7 @@ impl Fixture {
                 policy_engine: engine,
                 profile: &self.profile,
                 audit_writer: Some(Arc::clone(&self.audit)),
-                timeout: Duration::from_secs(2),
+                timeout: self.multicall_timeout,
                 fee: ResolvedFeePerOp::default(),
                 chain_id,
                 request_id: "multicall-record",
@@ -835,12 +840,35 @@ async fn a_reservation_refused_at_admission_surfaces_as_the_gate_denial() {
     assert!(fixture.rows("value_action_submitted").is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 #[serial]
 async fn timed_out_multicall_reserves_sized_legs_and_denies_a_second_bundle() {
-    let fixture = Fixture::new();
+    use stellar_agent_network::submit::confirmation_trace;
+    use stellar_agent_test_support::timing::{ClockHold, drive_call, wait_until};
+
+    // Signing and real RPC I/O cannot consume the submission deadline.
+    let _hold = ClockHold::new();
+    let mut fixture = Fixture::new();
+    fixture.multicall_timeout = Duration::from_secs(2);
     let (server, sends, sent_hash) = rpc("NOT_FOUND").await;
-    let err = fixture.multicall(&server.uri()).await.unwrap_err();
+    confirmation_trace::reset();
+    let observed_sends = Arc::clone(&sends);
+    let err = drive_call(fixture.multicall(&server.uri()), |probe| async move {
+        wait_until(
+            "the mock records the send and confirmation is armed",
+            || {
+                probe.finished()
+                    || (observed_sends.load(Ordering::SeqCst) == 1
+                        && confirmation_trace::snapshot().armed.is_some())
+            },
+        )
+        .await;
+        if !probe.finished() {
+            tokio::time::advance(Duration::from_secs(2)).await;
+        }
+    })
+    .await
+    .unwrap_err();
     assert_eq!(err.wire_code(), "submission.tx_timeout", "{err:?}");
     let SaError::SubmissionUnresolved {
         tx_hash: Some(tx_hash),

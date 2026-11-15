@@ -719,6 +719,25 @@ pub(crate) mod tests {
     /// asserting that the server stopped and the redirect file and its
     /// directory are gone.
     async fn case(typing: Typing, timeout: Duration) -> (EnrollmentEnd, SoftwareRegistrar, String) {
+        if matches!(typing, Typing::Nothing) {
+            // The expiry case advances only its own runtime's clock.
+            return match std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(case_with_mode(
+                        typing,
+                        timeout,
+                        crate::common::mainnet_presence::OpenMode::Private,
+                    ))
+            })
+            .join()
+            {
+                Ok(result) => result,
+                Err(panic) => std::panic::resume_unwind(panic),
+            };
+        }
         case_with_mode(
             typing,
             timeout,
@@ -793,10 +812,8 @@ pub(crate) mod tests {
             std::future::pending(),
             read_code,
         );
-        let end = if matches!(typing, Typing::Nothing)
-            && mode == crate::common::mainnet_presence::OpenMode::Operator
-        {
-            expire_enrollment(ceremony, driver, "prompt").await
+        let end = if matches!(typing, Typing::Nothing) {
+            expire_enrollment(ceremony, driver, timeout, "prompt").await
         } else {
             let (end, ()) = tokio::time::timeout(Duration::from_secs(60), async {
                 tokio::join!(ceremony, driver)
@@ -935,10 +952,11 @@ pub(crate) mod tests {
     async fn expire_enrollment(
         ceremony: impl Future<Output = EnrollmentEnd>,
         driver: impl Future<Output = ()>,
+        lifetime: Duration,
         branch: &'static str,
     ) -> EnrollmentEnd {
         use std::{future::poll_fn, task::Poll};
-        use stellar_agent_test_support::timing::{ClockHold, drive_call, let_io_run, wait_until};
+        use stellar_agent_test_support::timing::{ClockHold, drive_call, wait_until};
         use tokio::time::Instant as RuntimeInstant;
 
         enroll_trace::reset();
@@ -954,11 +972,11 @@ pub(crate) mod tests {
         let i1 = Instant::now();
         let armed = enroll_trace::armed().expect("the enrollment deadline is armed");
         assert!(
-            armed >= i0 + Duration::from_millis(200),
+            armed >= i0 + lifetime,
             "the enrollment deadline is not shortened"
         );
         assert!(
-            armed <= i1 + Duration::from_millis(200),
+            armed <= i1 + lifetime,
             "the enrollment deadline is not extended"
         );
         if branch == "prompt" {
@@ -983,7 +1001,6 @@ pub(crate) mod tests {
         }
         let before = RuntimeInstant::from_std(armed) - Duration::from_millis(1);
         tokio::time::advance(before.duration_since(RuntimeInstant::now())).await;
-        let_io_run(Duration::from_millis(20)).await;
         assert!(
             poll_fn(|cx| Poll::Ready(ceremony.as_mut().poll(cx)))
                 .await
@@ -1017,12 +1034,12 @@ pub(crate) mod tests {
         end
     }
 
-    #[tokio::test]
+    #[test]
     #[serial_test::serial]
-    async fn operator_enrollment_expires_at_its_deadline() {
+    fn operator_enrollment_expires_at_its_deadline() {
         for registration in [false, true] {
             // Each std deadline starts on an unadvanced runtime.
-            std::thread::spawn(move || {
+            let handle = std::thread::spawn(move || {
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -1050,6 +1067,7 @@ pub(crate) mod tests {
                                     || async { panic!("no terminal prompt before registration") },
                                 ),
                                 async {},
+                                Duration::from_millis(200),
                                 "registration",
                             )
                             .await;
@@ -1061,9 +1079,10 @@ pub(crate) mod tests {
                             assert!(!enroll_trace::prompted());
                         }
                     });
-            })
-            .join()
-            .unwrap();
+            });
+            if let Err(panic) = handle.join() {
+                std::panic::resume_unwind(panic);
+            }
         }
     }
 
