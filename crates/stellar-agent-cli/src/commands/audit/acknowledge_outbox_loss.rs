@@ -366,7 +366,14 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn acknowledging_a_loss_revokes_a_decided_approval_with_a_refused_destination() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         keyring_mock::install().unwrap();
         let dir = tempfile::tempdir().unwrap();

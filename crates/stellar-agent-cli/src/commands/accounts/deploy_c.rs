@@ -1187,7 +1187,13 @@ mod tests {
     async fn deploy_c_dry_run_with_profile_opens_writer_but_emits_no_entries() {
         stellar_agent_test_support::keyring_mock::install().ok();
 
-        let dir = TempDir::new().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let profile = profile_with_audit_path(
             "deploy-c-audit-dry-run-test",
@@ -1226,7 +1232,13 @@ mod tests {
     async fn deploy_c_profile_writer_emits_sa_raw_invocation_on_rpc_failure() {
         stellar_agent_test_support::keyring_mock::install().ok();
 
-        let dir = TempDir::new().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let profile = profile_with_audit_path(
             "deploy-c-audit-failure-test",
@@ -1270,7 +1282,13 @@ mod tests {
     async fn deploy_c_loads_once_with_and_without_profile() {
         stellar_agent_test_support::keyring_mock::install().ok();
         let _env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
-        let dir = TempDir::new().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         for selected in [None, Some("load-once".to_owned())] {
             let name = selected.as_deref().unwrap_or("default");

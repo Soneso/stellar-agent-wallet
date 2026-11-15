@@ -68,7 +68,13 @@ fn write_policy(raw: &str) -> [u8; 32] {
 #[serial]
 fn noop_has_no_proofs_and_v1_is_verified() {
     keyring_mock::install().unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        dir.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home = StellarAgentHomeGuard::new(dir.path());
     let mut profile = profile(false);
     assert!(
@@ -113,7 +119,13 @@ fn unsigned_engine_selection_refuses_before_payment() {
     use stellar_agent_core::{policy::PolicyError, profile::schema::PolicyEngineKind};
     use stellar_agent_network::policy_engine::PolicyEngineBuildError;
     keyring_mock::install().unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        dir.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home = StellarAgentHomeGuard::new(dir.path());
     let mut profile = profile(false);
     let body = V1
@@ -176,7 +188,13 @@ fn unsigned_engine_selection_refuses_before_payment() {
 fn engine_selection_refuses_unreadable_owner_state() {
     for malformed in [false, true] {
         keyring_mock::install().unwrap();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = StellarAgentHomeGuard::new(dir.path());
         let mut profile = profile(false);
         profile.policy.engine = stellar_agent_core::profile::schema::PolicyEngineKind::Noop;
@@ -216,7 +234,13 @@ fn engine_selection_refuses_unreadable_owner_state() {
     }
     for failure in 0..3 {
         keyring_mock::install().unwrap();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = StellarAgentHomeGuard::new(dir.path());
         let mut profile = profile(false);
         profile.policy.engine = stellar_agent_core::profile::schema::PolicyEngineKind::Noop;
@@ -276,7 +300,13 @@ decision = "allow"
     noop_has_no_proofs_and_v1_is_verified();
     for mainnet in [false, true] {
         keyring_mock::install().unwrap();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = StellarAgentHomeGuard::new(dir.path());
         let mut profile = profile(mainnet);
         profile.policy.engine = stellar_agent_core::profile::schema::PolicyEngineKind::Noop;
@@ -352,7 +382,13 @@ decision = "allow"
 #[serial]
 fn mainnet_v1_and_v2_without_table_have_no_enablement() {
     keyring_mock::install().unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        dir.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home = StellarAgentHomeGuard::new(dir.path());
     let profile = profile(true);
     let mut doc = FULL.parse::<toml_edit::DocumentMut>().unwrap();
@@ -377,7 +413,13 @@ fn mainnet_v1_and_v2_without_table_have_no_enablement() {
 fn enabled_mainnet_verifies_and_bad_binding_refuses() {
     use sha2::Digest as _;
     keyring_mock::install().unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        dir.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home = StellarAgentHomeGuard::new(dir.path());
     let profile = profile(true);
     let profile_dir = default_profile_dir().unwrap();
@@ -445,7 +487,13 @@ fn a_stored_nonce_without_a_pin_refuses_and_writes_no_pin() {
     };
     use stellar_agent_network::policy_engine::PolicyEngineBuildError;
     keyring_mock::install().unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        dir.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home = StellarAgentHomeGuard::new(dir.path());
     let profile = profile(true);
     let profile_dir = default_profile_dir().unwrap();

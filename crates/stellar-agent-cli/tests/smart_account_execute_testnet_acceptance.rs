@@ -61,8 +61,10 @@
 #[path = "live/smart_account_fixtures.rs"]
 mod smart_account_fixtures;
 
+#[path = "cli/acceptance_storage.rs"]
+mod acceptance_storage;
+
 use std::path::Path;
-use std::process::Command;
 
 use smart_account_fixtures::{
     DEPLOY_TIMEOUT, TESTNET_FRIENDBOT_URL, TESTNET_PASSPHRASE, TESTNET_RPC_URL, XLM_SAC_TESTNET,
@@ -240,7 +242,7 @@ fn scval_b64(val: &ScVal) -> String {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Runs the `stellar-agent` release binary with `args`, `STELLAR_AGENT_HOME`
-/// and `HOME` under `home`, the headless keyring backend, and the given
+/// and `HOME` under `home`, the selected acceptance store, and the given
 /// environment variables set only on the child process. Returns
 /// `(exit_success, last_stdout_line_as_json, stdout, stderr)`.
 fn run_cli(
@@ -251,14 +253,11 @@ fn run_cli(
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
     stellar_agent_test_support::sandbox::mark_sandbox(&home.join("agent"))
         .expect("mark fixture directory");
-    let mut cmd = Command::new(bin_path);
-    cmd.args(cfg!(feature = "live-platform-keyring").then_some("--test-live-platform-keyring"));
+    let mut cmd = acceptance_storage::command(bin_path, &home.join("agent"), Some(HEADLESS_KEY));
     cmd.args(args)
         .env("STELLAR_AGENT_HOME", home.join("agent"))
         .env("HOME", home.join("home"))
-        .env_remove("STELLAR_AGENT_PROFILE")
-        .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
-        .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY);
+        .env_remove("STELLAR_AGENT_PROFILE");
     for (k, v) in envs {
         cmd.env(k, v);
     }

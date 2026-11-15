@@ -13,7 +13,6 @@
 )]
 
 use std::path::Path;
-use std::process::Command;
 
 use serde_json::{Value, json};
 use serial_test::serial;
@@ -55,8 +54,11 @@ fn write_profile(home: &Path, name: &str, primary: &str, oracle: &str) {
 /// Runs the binary with `args`, the secret of `signer` in
 /// `CROSS_CHECK_SIGNER` when given, and returns `(exit_code, stdout)`.
 fn run(home: &Path, args: &[&str], signer: Option<[u8; 32]>) -> (i32, String) {
-    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_stellar-agent"));
+    let mut command = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home,
+    )
+    .expect("isolated CLI child");
     command
         .args(args)
         .env("STELLAR_AGENT_HOME", home)
@@ -120,7 +122,7 @@ async fn pay_reports_the_cross_check_in_json_and_text() {
     let ledger = ClassicLedger::new(&[&source, DEST_G], &[]);
     let primary = ledger.serve().await;
     let oracle = ledger.serve().await;
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     write_profile(home.path(), "pay-witness", &primary.uri(), &oracle.uri());
 
     let (code, stdout) = run(
@@ -176,7 +178,7 @@ async fn pay_sign_reports_the_cross_check_in_text() {
     let ledger = ClassicLedger::new(&[&source, DEST_G], &[]);
     let primary = ledger.serve().await;
     let oracle = ledger.serve().await;
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     write_profile(
         home.path(),
         "pay-sign-witness",

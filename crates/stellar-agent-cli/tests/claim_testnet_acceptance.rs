@@ -48,8 +48,10 @@
     reason = "test-only; panics and unwraps are acceptable in testnet acceptance tests"
 )]
 
+#[path = "cli/acceptance_storage.rs"]
+mod acceptance_storage;
+
 use std::error::Error;
-use std::process::Command;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
@@ -180,6 +182,8 @@ async fn submit_testnet_signed_xdr(
 /// subprocess invocation and reaches ledger inclusion on testnet.
 #[tokio::test]
 async fn t3_cli_single_shot_happy_path() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("acceptance home");
     let (creator_g, creator_seed) = fresh_keypair();
     let (claimant_g, claimant_seed) = fresh_keypair();
     fund_via_friendbot(&creator_g).await;
@@ -225,8 +229,7 @@ async fn t3_cli_single_shot_happy_path() {
             .to_owned();
 
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
-    let output = Command::new(bin_path)
-        .args(cfg!(feature = "live-platform-keyring").then_some("--test-live-platform-keyring"))
+    let output = acceptance_storage::command(bin_path, storage_sandbox.path(), None)
         .args([
             "claim",
             &balance_id_hex72,

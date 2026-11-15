@@ -1097,7 +1097,6 @@ mod tests {
     use stellar_agent_core::policy::v1::verified::read_pin_without_creating;
     use stellar_agent_core::profile::schema::policy_pin_entry_ref;
     use stellar_agent_test_support::{StellarAgentHomeGuard, keyring_mock};
-    use tempfile::TempDir;
 
     use super::super::policy_authoring::{missing_pin_lock_detail, pin_read_failure};
     use super::super::sign_policy::tests::{
@@ -1192,8 +1191,8 @@ mod tests {
     }
 
     struct Fixture {
-        dir: TempDir,
         _home: StellarAgentHomeGuard,
+        dir: stellar_agent_test_support::sandbox::StateSandbox,
         profile: Profile,
         path: PathBuf,
         window: PathBuf,
@@ -1202,7 +1201,13 @@ mod tests {
     impl Fixture {
         fn with(profile: impl FnOnce() -> Profile, raw: &str, enroll: bool) -> Self {
             keyring_mock::install().unwrap();
-            let dir = TempDir::new().unwrap();
+            let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                dir.path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let home = StellarAgentHomeGuard::new(dir.path());
             let mut profile = profile();
             profile.audit_log_path = dir.path().join("audit.jsonl");

@@ -3464,7 +3464,14 @@ pub(crate) mod tests {
     #[serial_test::serial]
     async fn durable_transition_api_enforces_replay_receipt_and_outcome_rules() {
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
-        let directory = TempDir::new().expect("tempdir");
+        let directory = stellar_agent_test_support::sandbox::StateSandbox::new().expect("tempdir");
+        assert!(
+            directory
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(directory.path());
         let store = test_store(directory.path().join("state"), [7; 32]);
         let now = 1_700_000_000;

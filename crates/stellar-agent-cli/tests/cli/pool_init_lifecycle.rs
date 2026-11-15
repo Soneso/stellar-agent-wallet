@@ -12,7 +12,6 @@ use serial_test::serial;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    process::Command,
     sync::{Arc, Mutex},
 };
 use stellar_agent_core::profile::{
@@ -191,16 +190,19 @@ impl Respond for Rpc {
 }
 
 fn cli(home: &Path, args: &[&str]) -> (i32, Value) {
-    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
-    let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-        .args(args)
-        .env("STELLAR_AGENT_HOME", home)
-        .env_remove("STELLAR_AGENT_PROFILE")
-        .env_remove("STELLAR_AGENT_RPC_URL")
-        .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
-        .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY)
-        .output()
-        .unwrap();
+    let output = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home,
+    )
+    .expect("isolated CLI child")
+    .args(args)
+    .env("STELLAR_AGENT_HOME", home)
+    .env_remove("STELLAR_AGENT_PROFILE")
+    .env_remove("STELLAR_AGENT_RPC_URL")
+    .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+    .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY)
+    .output()
+    .unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
     let value = serde_json::from_str(
         stdout
@@ -329,12 +331,22 @@ fn clear_receipt(home: &Path, envelope_hash: &str) -> (i32, Value) {
     )
 }
 
-async fn fixture() -> (tempfile::TempDir, MockServer, Rpc) {
+async fn fixture() -> (
+    stellar_agent_test_support::sandbox::StateSandbox,
+    MockServer,
+    Rpc,
+) {
     fixture_with_fee(None).await
 }
 
-async fn fixture_with_fee(fee_per_op: Option<u32>) -> (tempfile::TempDir, MockServer, Rpc) {
-    let home = tempfile::tempdir().unwrap();
+async fn fixture_with_fee(
+    fee_per_op: Option<u32>,
+) -> (
+    stellar_agent_test_support::sandbox::StateSandbox,
+    MockServer,
+    Rpc,
+) {
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let server = MockServer::start().await;
     let state = Rpc(Arc::new(Mutex::new(State {
         home: home.path().to_owned(),

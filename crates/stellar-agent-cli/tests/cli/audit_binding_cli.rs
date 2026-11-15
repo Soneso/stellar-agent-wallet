@@ -11,7 +11,6 @@
 )]
 
 use std::path::Path;
-use std::process::Command;
 use std::sync::Arc;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -57,19 +56,22 @@ fn repointed_profile(home: &Path, name: &str, rpc_url: &str) -> std::path::PathB
 }
 
 fn run(home: &Path, args: &[&str]) -> (i32, serde_json::Value, String) {
-    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
-    let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-        .args(args)
-        .env("STELLAR_AGENT_HOME", home)
-        .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
-        .env(
-            "STELLAR_AGENT_HEADLESS_KEYRING_KEY",
-            URL_SAFE_NO_PAD.encode(HEADLESS_KEY),
-        )
-        .env_remove("STELLAR_AGENT_PROFILE")
-        .env_remove("STELLAR_AGENT_RPC_URL")
-        .output()
-        .unwrap();
+    let output = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home,
+    )
+    .expect("isolated CLI child")
+    .args(args)
+    .env("STELLAR_AGENT_HOME", home)
+    .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+    .env(
+        "STELLAR_AGENT_HEADLESS_KEYRING_KEY",
+        URL_SAFE_NO_PAD.encode(HEADLESS_KEY),
+    )
+    .env_remove("STELLAR_AGENT_PROFILE")
+    .env_remove("STELLAR_AGENT_RPC_URL")
+    .output()
+    .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let line = stdout
@@ -98,7 +100,7 @@ async fn silent_rpc() -> MockServer {
 #[tokio::test]
 #[serial]
 async fn a_signing_smart_account_verb_refuses_a_changed_binding_and_sends_nothing() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let rpc = silent_rpc().await;
     let name = "binding-sign";
     let repointed = repointed_profile(dir.path(), name, &rpc.uri());
@@ -138,7 +140,7 @@ async fn a_signing_smart_account_verb_refuses_a_changed_binding_and_sends_nothin
 #[tokio::test]
 #[serial]
 async fn a_read_only_smart_account_verb_refuses_a_changed_binding_and_creates_nothing() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let rpc = silent_rpc().await;
     let name = "binding-read";
     let repointed = repointed_profile(dir.path(), name, &rpc.uri());

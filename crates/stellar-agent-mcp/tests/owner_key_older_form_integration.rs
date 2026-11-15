@@ -32,7 +32,13 @@ fn owner(name: &str) -> Option<String> {
 #[test]
 #[serial_test::serial]
 fn an_engine_build_leaves_another_profiles_older_form_entry() {
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        home.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home = StellarAgentHomeGuard::new(home.path());
     keyring_mock::install().unwrap();
     let profile_dir = default_profile_dir().unwrap();

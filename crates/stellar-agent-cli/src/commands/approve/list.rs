@@ -468,7 +468,13 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn list_run_empty_store_yields_empty_pending_and_exit_0() {
-        let home = TempDir::new().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home_guard = StellarAgentHomeGuard::new(home.path());
         let dir = default_approval_dir().unwrap();
         assert_eq!(dir, home.path().join("approvals"));
@@ -488,7 +494,13 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn list_run_populated_store_reports_payment_and_rejected_entries() {
-        let home = TempDir::new().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home_guard = StellarAgentHomeGuard::new(home.path());
         let dir = default_approval_dir().unwrap();
         assert_eq!(dir, home.path().join("approvals"));
@@ -529,7 +541,13 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn list_run_excludes_expired_unless_include_expired() {
-        let home = TempDir::new().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home_guard = StellarAgentHomeGuard::new(home.path());
         let dir = default_approval_dir().unwrap();
         assert_eq!(dir, home.path().join("approvals"));
@@ -996,7 +1014,14 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn muxed_approval_shows_base_account() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         use stellar_agent_core::approval::view::ApprovalSummaryView;
         let key = [0xAE; 32];

@@ -8,10 +8,9 @@
 //!
 //! # Test isolation
 //!
-//! The shared server command sets `STELLAR_AGENT_HOME` to an empty scratch
-//! home, so the profile-less server falls back to the testnet default profile
-//! (as documented in `loader::load_default_or_testnet_fallback`) and never
-//! reaches the default state directory.
+//! Each child owns a marked home. Handshakes use the empty-home testnet
+//! fallback; balances uses a stored Noop profile and a local RPC responder.
+//! Both clean and poisoned parent environments exercise every scenario.
 //!
 //! Every test that spawns the server is `#[serial]`, like the tests in this
 //! target that override `STELLAR_AGENT_HOME` in this process.
@@ -21,8 +20,8 @@
 //! 1. `initialize` handshake → server returns capabilities including `tools`.
 //! 2. `notifications/initialized` → server processes without error.
 //! 3. `tools/list` → returns `stellar_balances` with the declared schema.
-//! 4. `tools/call stellar_balances` with a valid account → valid JSON envelope.
-//! 5. `tools/call <unknown>` → returns a tool-not-found / method-not-found error.
+//! 4. `tools/call stellar_balances` with an absent account → failed tool envelope.
+//! 5. Invalid account arguments and unknown tools → protocol invalid-params errors.
 //!
 //! # Policy-engine gate assertion
 //!
@@ -46,13 +45,114 @@ use crate::common::server_binary::server_command;
 // Helper: the binary under the shared child-process driver
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Spawns the binary with logging off under the shared driver. The driver
-/// sends JSON lines, waits a bounded time for each response by id, and kills
-/// the child on drop.
-fn spawn_server() -> ChildDriver {
-    let mut command = server_command();
-    command.env("STELLAR_AGENT_LOG", "off");
-    ChildDriver::spawn(command)
+/// Owns the marked home and optional local RPC until the child is stopped.
+struct ServerFixture {
+    driver: ChildDriver,
+    rpc: Option<wiremock::MockServer>,
+    _home: stellar_agent_test_support::sandbox::StateSandbox,
+    runtime: tokio::runtime::Runtime,
+}
+
+impl std::ops::Deref for ServerFixture {
+    type Target = ChildDriver;
+    fn deref(&self) -> &Self::Target {
+        &self.driver
+    }
+}
+
+impl std::ops::DerefMut for ServerFixture {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.driver
+    }
+}
+
+impl ServerFixture {
+    fn requests(&self) -> Vec<wiremock::Request> {
+        self.runtime
+            .block_on(self.rpc.as_ref().unwrap().received_requests())
+            .unwrap()
+    }
+}
+
+fn spawn_server(poisoned: bool, local_rpc: bool) -> ServerFixture {
+    use std::ffi::OsStr;
+    use stellar_agent_test_support::{env_guard::ScopedEnvVar, sandbox::StateSandbox};
+    let poison = [
+        ("STELLAR_AGENT_PROFILE", "poison-profile"),
+        ("STELLAR_AGENT_CHAIN_ID", "stellar:mainnet"),
+        ("STELLAR_AGENT_RPC_URL", "invalid-fixture-endpoint"),
+        ("STELLAR_AGENT_KEYRING_BACKEND", "poison-backend"),
+        ("STELLAR_AGENT_HEADLESS_KEYRING_KEY", "poison-key"),
+        (
+            "STELLAR_AGENT_TEST_LIVE_PLATFORM_KEYRING",
+            "real-platform-keyring",
+        ),
+    ];
+    let _environment: Vec<_> = poison
+        .iter()
+        .map(|(name, value)| ScopedEnvVar::new(name, poisoned.then_some(OsStr::new(value))))
+        .collect();
+    let home = StateSandbox::new().unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let rpc = local_rpc.then(|| {
+        runtime.block_on(async {
+            let rpc = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(
+                    stellar_agent_test_support::echo_id_responder::KeyedLedgerEntriesResponder::new(
+                    ),
+                )
+                .mount(&rpc)
+                .await;
+            std::fs::create_dir(home.path().join("profiles")).unwrap();
+            std::fs::write(
+                home.path().join("profiles/default.toml"),
+                stellar_agent_test_support::profile_fixtures::noop_profile_toml(
+                    "default",
+                    "stellar:testnet",
+                    &rpc.uri(),
+                ),
+            )
+            .unwrap();
+            rpc
+        })
+    });
+    let command = server_command(home.path());
+    let environment: std::collections::HashMap<_, _> = command.get_envs().collect();
+    assert_eq!(
+        environment.get(OsStr::new("STELLAR_AGENT_HOME")),
+        Some(&Some(home.path().as_os_str()))
+    );
+    assert_eq!(
+        environment.get(OsStr::new("STELLAR_AGENT_KEYRING_BACKEND")),
+        Some(&Some(OsStr::new("headless-env")))
+    );
+    assert_eq!(
+        environment.get(OsStr::new("STELLAR_AGENT_HEADLESS_KEYRING_KEY")),
+        Some(&Some(OsStr::new("invalid-fixture-key")))
+    );
+    for name in [
+        "STELLAR_AGENT_PROFILE",
+        "STELLAR_AGENT_CHAIN_ID",
+        "STELLAR_AGENT_RPC_URL",
+        "STELLAR_AGENT_TEST_LIVE_PLATFORM_KEYRING",
+    ] {
+        assert!(
+            !environment.contains_key(OsStr::new(name)),
+            "ambient wallet setting {name}"
+        );
+    }
+    assert_eq!(
+        command.get_args().count(),
+        0,
+        "ordinary server receives no live argument"
+    );
+    ServerFixture {
+        driver: ChildDriver::spawn(command),
+        rpc,
+        _home: home,
+        runtime,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -63,118 +163,139 @@ fn spawn_server() -> ChildDriver {
 #[test]
 #[serial]
 fn initialize_returns_capabilities() {
-    let mut driver = spawn_server();
+    for poisoned in [false, true] {
+        let mut driver = spawn_server(poisoned, false);
 
-    driver.send(&serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": { "name": "test-client", "version": "0.1.0" }
-        }
-    }));
+        driver.send(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "test-client", "version": "0.1.0" }
+            }
+        }));
 
-    let response = driver.response(1);
+        let response = driver.response(1);
 
-    // Response must have the expected fields.
-    assert_eq!(response["jsonrpc"], "2.0", "unexpected jsonrpc version");
-    assert_eq!(response["id"], 1, "unexpected response id");
-    let result = &response["result"];
-    assert!(
-        result["capabilities"]["tools"].is_object(),
-        "server must advertise tools capability: {response:?}"
-    );
+        // Response must have the expected fields.
+        assert_eq!(response["jsonrpc"], "2.0", "unexpected jsonrpc version");
+        assert_eq!(response["id"], 1, "unexpected response id");
+        let result = &response["result"];
+        assert!(
+            result["capabilities"]["tools"].is_object(),
+            "server must advertise tools capability: {response:?}"
+        );
+    }
 }
 
 /// 2. `notifications/initialized` → server processes without error.
 #[test]
 #[serial]
 fn notifications_initialized_processed() {
-    let mut driver = spawn_server();
+    for poisoned in [false, true] {
+        let mut driver = spawn_server(poisoned, false);
 
-    // First: do the handshake.
-    driver.send(&serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": { "name": "test-client", "version": "0.1.0" }
-        }
-    }));
-    let _init_response = driver.response(1);
+        // First: do the handshake.
+        driver.send(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "test-client", "version": "0.1.0" }
+            }
+        }));
+        let init_response = driver.response(1);
+        assert!(
+            init_response["result"]["capabilities"]["tools"].is_object(),
+            "{init_response}"
+        );
+        assert!(init_response.get("error").is_none(), "{init_response}");
 
-    // Notifications have no id and expect no response.
-    driver.send(&serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": "notifications/initialized"
-    }));
+        // Notifications have no id and expect no response.
+        driver.send(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }));
 
-    // Now send tools/list to check that the server is still responsive.
-    driver.send(&serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "tools/list",
-        "params": {}
-    }));
+        // Now send tools/list to check that the server is still responsive.
+        driver.send(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        }));
 
-    let list_response = driver.response(2);
-    assert_eq!(list_response["id"], 2, "unexpected tools/list response id");
+        let list_response = driver.response(2);
+        assert_eq!(list_response["id"], 2, "unexpected tools/list response id");
+        assert!(list_response.get("error").is_none(), "{list_response}");
+        assert!(
+            list_response["result"]["tools"].is_array(),
+            "{list_response}"
+        );
+    }
 }
 
 /// 3. `tools/list` → returns `stellar_balances` with chain_id and account_id args.
 #[test]
 #[serial]
 fn tools_list_includes_stellar_balances() {
-    let mut driver = spawn_server();
+    for poisoned in [false, true] {
+        let mut driver = spawn_server(poisoned, false);
 
-    driver.send(&serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": { "name": "test-client", "version": "0.1.0" }
-        }
-    }));
-    let _init_response = driver.response(1);
+        driver.send(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "test-client", "version": "0.1.0" }
+            }
+        }));
+        let init_response = driver.response(1);
+        assert!(
+            init_response["result"]["capabilities"]["tools"].is_object(),
+            "{init_response}"
+        );
+        assert!(init_response.get("error").is_none(), "{init_response}");
 
-    driver.send(&serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "tools/list",
-        "params": {}
-    }));
+        driver.send(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        }));
 
-    let list_response = driver.response(2);
+        let list_response = driver.response(2);
 
-    let tools = &list_response["result"]["tools"];
-    assert!(
-        tools.is_array(),
-        "tools must be an array: {list_response:?}"
-    );
+        let tools = &list_response["result"]["tools"];
+        assert!(
+            tools.is_array(),
+            "tools must be an array: {list_response:?}"
+        );
 
-    let tools_arr = tools.as_array().expect("array");
-    let stellar_balances = tools_arr.iter().find(|t| t["name"] == "stellar_balances");
-    assert!(
-        stellar_balances.is_some(),
-        "stellar_balances must appear in tools/list: {tools:?}"
-    );
+        let tools_arr = tools.as_array().expect("array");
+        let stellar_balances = tools_arr.iter().find(|t| t["name"] == "stellar_balances");
+        assert!(
+            stellar_balances.is_some(),
+            "stellar_balances must appear in tools/list: {tools:?}"
+        );
 
-    let sb = stellar_balances.expect("found above");
-    let schema = &sb["inputSchema"];
-    assert!(
-        schema["properties"]["chain_id"].is_object(),
-        "stellar_balances must declare chain_id in inputSchema: {sb:?}"
-    );
-    assert!(
-        schema["properties"]["account_id"].is_object(),
-        "stellar_balances must declare account_id in inputSchema: {sb:?}"
-    );
+        let sb = stellar_balances.expect("found above");
+        let schema = &sb["inputSchema"];
+        assert!(
+            schema["properties"]["chain_id"].is_object(),
+            "stellar_balances must declare chain_id in inputSchema: {sb:?}"
+        );
+        assert!(
+            schema["properties"]["account_id"].is_object(),
+            "stellar_balances must declare account_id in inputSchema: {sb:?}"
+        );
+    }
 }
 
 /// 4a. `tools/call stellar_balances` → unknown account returns error envelope,
@@ -182,125 +303,172 @@ fn tools_list_includes_stellar_balances() {
 #[test]
 #[serial]
 fn tools_call_stellar_balances_unknown_account_returns_tool_error() {
-    let mut driver = spawn_server();
+    for poisoned in [false, true] {
+        let mut driver = spawn_server(poisoned, true);
 
-    driver.send(&serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": { "name": "test-client", "version": "0.1.0" }
-        }
-    }));
-    let _init_response = driver.response(1);
-
-    // A valid G-strkey that is unlikely to exist on testnet.
-    // The server must route the call to the network layer and respond with a
-    // tool-level error (account not found) or a network-level error.
-    driver.send(&serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 3,
-        "method": "tools/call",
-        "params": {
-            "name": "stellar_balances",
-            "arguments": {
-                "chain_id": "stellar:testnet",
-                "account_id": "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN"
+        driver.send(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "test-client", "version": "0.1.0" }
             }
-        }
-    }));
+        }));
+        let init_response = driver.response(1);
+        assert!(
+            init_response["result"]["capabilities"]["tools"].is_object(),
+            "{init_response}"
+        );
+        assert!(init_response.get("error").is_none(), "{init_response}");
 
-    let response = driver.response(3);
-    // The server must return a response (either a tool error or a network error).
-    // The response id must match the request.
-    assert_eq!(
-        response["id"], 3,
-        "response id must match request id: {response:?}"
-    );
+        driver.send(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "stellar_balances",
+                "arguments": {
+                    "chain_id": "stellar:testnet",
+                    "account_id": stellar_strkey::ed25519::PublicKey([7; 32]).to_string().to_string()
+                }
+            }
+        }));
+
+        let response = driver.response(3);
+        assert_eq!(
+            response["id"], 3,
+            "response id must match request id: {response:?}"
+        );
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        let envelope: serde_json::Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(envelope["ok"], false, "{envelope}");
+        assert!(envelope.get("data").is_none(), "{envelope}");
+        assert_eq!(
+            envelope["error"]["code"], "network.account_not_found",
+            "{envelope}"
+        );
+        let requests = driver.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "the account query reaches the local responder"
+        );
+        let request: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(request["method"], "getLedgerEntries");
+        use stellar_xdr::WriteXdr as _;
+        let account_key = stellar_xdr::LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
+            account_id: stellar_xdr::AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+                stellar_xdr::Uint256([7; 32]),
+            )),
+        })
+        .to_xdr_base64(stellar_xdr::Limits::none())
+        .unwrap();
+        assert_eq!(request["params"]["keys"], serde_json::json!([account_key]));
+    }
 }
 
 /// 4b. `tools/call stellar_balances` with invalid strkey → invalid_params error.
 #[test]
 #[serial]
 fn tools_call_stellar_balances_invalid_strkey_returns_invalid_params() {
-    let mut driver = spawn_server();
+    for poisoned in [false, true] {
+        let mut driver = spawn_server(poisoned, true);
 
-    driver.send(&serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": { "name": "test-client", "version": "0.1.0" }
-        }
-    }));
-    let _init_response = driver.response(1);
-
-    driver.send(&serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 3,
-        "method": "tools/call",
-        "params": {
-            "name": "stellar_balances",
-            "arguments": {
-                "chain_id": "stellar:testnet",
-                "account_id": "not-a-valid-strkey"
+        driver.send(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "test-client", "version": "0.1.0" }
             }
-        }
-    }));
+        }));
+        let init_response = driver.response(1);
+        assert!(
+            init_response["result"]["capabilities"]["tools"].is_object(),
+            "{init_response}"
+        );
+        assert!(init_response.get("error").is_none(), "{init_response}");
 
-    let response = driver.response(3);
+        driver.send(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "stellar_balances",
+                "arguments": {
+                    "chain_id": "stellar:testnet",
+                    "account_id": "not-a-valid-strkey"
+                }
+            }
+        }));
 
-    // Invalid params should return an error at the JSON-RPC or tool level.
-    let has_error =
-        response.get("error").is_some() || response["result"]["isError"].as_bool() == Some(true);
-    assert!(
-        has_error,
-        "invalid strkey must produce an error response: {response:?}"
-    );
+        let response = driver.response(3);
+
+        assert_eq!(response["id"], 3);
+        assert!(response.get("result").is_none(), "{response}");
+        assert_eq!(response["error"]["code"], -32602, "{response}");
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("account_id"),
+            "{response}"
+        );
+        assert!(
+            driver.requests().is_empty(),
+            "invalid account reaches no RPC"
+        );
+    }
 }
 
-/// 5. `tools/call <unknown>` → protocol error or tool.unknown error.
+/// An unknown tool is a protocol invalid-params refusal after initialization.
 #[test]
 #[serial]
 fn tools_call_unknown_tool_returns_error() {
-    let mut driver = spawn_server();
+    for poisoned in [false, true] {
+        let mut driver = spawn_server(poisoned, false);
 
-    driver.send(&serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": { "name": "test-client", "version": "0.1.0" }
-        }
-    }));
-    let _init_response = driver.response(1);
+        driver.send(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "test-client", "version": "0.1.0" }
+            }
+        }));
+        let init_response = driver.response(1);
+        assert!(
+            init_response["result"]["capabilities"]["tools"].is_object(),
+            "{init_response}"
+        );
+        assert!(init_response.get("error").is_none(), "{init_response}");
 
-    driver.send(&serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 4,
-        "method": "tools/call",
-        "params": {
-            "name": "totally_unknown_tool",
-            "arguments": {}
-        }
-    }));
+        driver.send(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "totally_unknown_tool",
+                "arguments": {}
+            }
+        }));
 
-    let response = driver.response(4);
+        let response = driver.response(4);
 
-    // The response must have either an error field (protocol error) or
-    // is_error=true in the result (tool-level error).
-    let has_error =
-        response.get("error").is_some() || response["result"]["isError"].as_bool() == Some(true);
-    assert!(
-        has_error,
-        "unknown tool must produce an error response: {response:?}"
-    );
+        assert_eq!(response["id"], 4);
+        assert!(response.get("result").is_none(), "{response}");
+        assert_eq!(response["error"]["code"], -32602, "{response}");
+        assert_eq!(response["error"]["message"], "tool not found");
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -392,8 +392,8 @@ mod tests {
 
     // ── Helpers ────────────────────────────────────────────────────────────────
 
-    fn tmp_log(dir: &TempDir) -> PathBuf {
-        dir.path().join("audit.jsonl")
+    fn tmp_log(dir: impl AsRef<std::path::Path>) -> PathBuf {
+        dir.as_ref().join("audit.jsonl")
     }
 
     fn open_writer(path: PathBuf) -> Arc<Mutex<AuditWriter>> {
@@ -474,7 +474,13 @@ mod tests {
         use stellar_agent_core::profile::{loader, schema::Profile};
         use stellar_agent_test_support::StellarAgentHomeGuard;
 
-        let dir = TempDir::new().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = StellarAgentHomeGuard::new(dir.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let path = dir.path().join("custom-audit.jsonl");
@@ -527,7 +533,13 @@ mod tests {
         use stellar_agent_core::profile::{loader, schema::Profile};
         use stellar_agent_test_support::StellarAgentHomeGuard;
 
-        let dir = TempDir::new().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = StellarAgentHomeGuard::new(dir.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let path = dir.path().join("operator-audit.jsonl");
@@ -593,7 +605,13 @@ mod tests {
         use stellar_agent_test_support::StellarAgentHomeGuard;
 
         stellar_agent_test_support::keyring_mock::install().unwrap();
-        let dir = TempDir::new().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = StellarAgentHomeGuard::new(dir.path());
         let name = "advisory-binding";
         let path = dir.path().join("advisory-audit.jsonl");
@@ -668,7 +686,7 @@ mod tests {
 
     /// Persists a profile and one revoked pin, with an optional seeded audit key.
     fn startup_profile_with_finding(
-        dir: &TempDir,
+        dir: &std::path::Path,
         name: &str,
         keyed: bool,
     ) -> stellar_agent_core::profile::schema::Profile {
@@ -676,7 +694,7 @@ mod tests {
         use stellar_agent_core::profile::{loader, schema::Profile};
         use stellar_agent_network::keyring::{keyed_audit_access, rotate_keyring_secret_32};
 
-        let path = dir.path().join("audit.jsonl");
+        let path = dir.join("audit.jsonl");
         let profile = Profile::builder_testnet_named(name, "signer", "test", "nonce", "test")
             .audit_log_path(&path)
             .build();
@@ -710,11 +728,17 @@ mod tests {
         use stellar_agent_core::audit_log::BindingCheck;
         use stellar_agent_network::keyring::keyed_audit_access;
 
-        let dir = TempDir::new().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let name = "advisory-release-keyed";
-        let profile = startup_profile_with_finding(&dir, name, true);
+        let profile = startup_profile_with_finding(dir.path(), name, true);
         assert_eq!(
             run_profile_with_revoked_pin(name).triggered_rule_ids,
             vec![4]
@@ -741,11 +765,17 @@ mod tests {
             keyed_audit_access, load_hmac_key_32, rotate_keyring_secret_32,
         };
 
-        let dir = TempDir::new().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let name = "advisory-release-unkeyed";
-        let profile = startup_profile_with_finding(&dir, name, false);
+        let profile = startup_profile_with_finding(dir.path(), name, false);
         let coord = &profile.audit_log_hash_chain_key_id;
         assert!(load_hmac_key_32(coord).is_err());
         assert_eq!(
@@ -771,11 +801,17 @@ mod tests {
         use stellar_agent_core::profile::{loader, schema::Profile};
         use stellar_agent_network::keyring::load_hmac_key_32;
 
-        let dir = TempDir::new().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let name = "advisory-missing-key";
-        let path = tmp_log(&dir);
+        let path = tmp_log(dir.path());
         let profile = Profile::builder_testnet_named(name, "signer", "test", "nonce", "test")
             .audit_log_path(&path)
             .build();
@@ -973,7 +1009,13 @@ mod tests {
         use stellar_agent_core::profile::{loader, schema::Profile};
         use stellar_agent_test_support::StellarAgentHomeGuard;
 
-        let dir = TempDir::new().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = StellarAgentHomeGuard::new(dir.path());
         let profile =
             Profile::builder_testnet_named("owner", "signer", "test", "nonce", "test").build();

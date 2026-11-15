@@ -1511,7 +1511,13 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn run_with_no_pending_returns_exit_1() {
-        let home = TempDir::new().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home_guard = StellarAgentHomeGuard::new(home.path());
         assert_eq!(
             default_approval_dir().unwrap(),
@@ -1552,7 +1558,13 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn run_missing_id_arg_returns_exit_1() {
-        let home = TempDir::new().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home_guard = StellarAgentHomeGuard::new(home.path());
         keyring_mock::install().unwrap();
         let args = RunArgs {
@@ -1568,7 +1580,13 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn run_empty_id_arg_returns_exit_1() {
-        let home = TempDir::new().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home_guard = StellarAgentHomeGuard::new(home.path());
         keyring_mock::install().unwrap();
         let args = RunArgs {
@@ -1666,16 +1684,6 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn mainnet_browser_open_and_no_browser_refusal() {
-        struct KeepMock;
-        impl Drop for KeepMock {
-            fn drop(&mut self) {
-                stellar_agent_network::keyring::KEEP_REGISTERED_STORE
-                    .store(false, std::sync::atomic::Ordering::SeqCst);
-            }
-        }
-        stellar_agent_network::keyring::KEEP_REGISTERED_STORE
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        let _mock = KeepMock;
         let fixture = stellar_agent_core::approval::mainnet_fixtures::MainnetConsentFixture::new(
             "browser-refusal",
         );
@@ -1783,7 +1791,14 @@ mod tests {
     #[test]
     #[serial]
     fn approval_refuses_a_refused_destination_before_the_audit_sink() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();

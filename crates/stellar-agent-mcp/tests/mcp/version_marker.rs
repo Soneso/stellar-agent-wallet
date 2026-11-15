@@ -9,7 +9,8 @@ mod tests {
     use crate::common::server_binary::server_command;
 
     fn assert_version(flag: &str) {
-        let output = server_command()
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("sandbox");
+        let output = server_command(home.path())
             .arg(flag)
             .output()
             .expect("MCP binary runs");
@@ -44,7 +45,8 @@ mod tests {
 
     #[test]
     fn help_keeps_package_version_without_marker() {
-        let output = server_command()
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("sandbox");
+        let output = server_command(home.path())
             .arg("--help")
             .output()
             .expect("MCP binary runs");

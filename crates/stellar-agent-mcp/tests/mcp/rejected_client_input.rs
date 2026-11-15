@@ -323,7 +323,13 @@ async fn serve_on_send(
 #[tokio::test]
 #[serial_test::serial]
 async fn a_rejected_argument_stays_out_of_the_tool_result() {
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        home.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
     let cases = [
         (
@@ -359,7 +365,13 @@ async fn a_rejected_argument_stays_out_of_the_tool_result() {
 #[tokio::test]
 #[serial_test::serial]
 async fn an_unknown_route_name_is_not_interpolated() {
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        home.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
     let response = tool_response(&format!("{MARKER}_tool"), json!({})).await;
     assert_eq!(response["error"]["message"], "tool not found", "{response}");
@@ -369,8 +381,7 @@ async fn an_unknown_route_name_is_not_interpolated() {
 /// The binary's final startup log states the refusal without the payload.
 #[test]
 fn the_startup_log_holds_no_rejected_message() {
-    let home = tempfile::tempdir().unwrap();
-    stellar_agent_test_support::sandbox::mark_sandbox(home.path()).unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     std::fs::create_dir_all(home.path().join("profiles")).unwrap();
     std::fs::write(
         home.path().join("profiles").join("default.toml"),
@@ -381,7 +392,7 @@ fn the_startup_log_holds_no_rejected_message() {
         ),
     )
     .unwrap();
-    let mut child = crate::common::server_binary::server_command()
+    let mut child = crate::common::server_binary::server_command(home.path())
         .args(["--profile", "default"])
         .env("STELLAR_AGENT_HOME", home.path())
         .env("STELLAR_AGENT_LOG", "trace")

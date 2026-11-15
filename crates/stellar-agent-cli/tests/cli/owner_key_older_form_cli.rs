@@ -8,7 +8,6 @@
 )]
 
 use std::path::Path;
-use std::process::Command;
 use std::sync::Arc;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -48,7 +47,7 @@ fn stored(entry_ref: &KeyringEntryRef) -> Option<String> {
 #[test]
 #[serial_test::serial]
 fn an_engine_build_leaves_another_profiles_older_form_entry() {
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     install_store(home.path());
     let profiles = home.path().join("profiles");
 
@@ -73,28 +72,31 @@ fn an_engine_build_leaves_another_profiles_older_form_entry() {
     let other_owner = KeyringEntryRef::default_owner_key("owner-b");
     put(&other_owner, &URL_SAFE_NO_PAD.encode([0x62; 32]));
 
-    stellar_agent_test_support::sandbox::mark_sandbox(home.path()).expect("mark fixture directory");
-    let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-        .args([
-            "pay",
-            DESTINATION,
-            "1 XLM",
-            "--sign-only",
-            "AAAAAA==",
-            "--profile",
-            "owner-a",
-        ])
-        .env("STELLAR_AGENT_HOME", home.path())
-        .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
-        .env(
-            "STELLAR_AGENT_HEADLESS_KEYRING_KEY",
-            URL_SAFE_NO_PAD.encode(HEADLESS_KEY),
-        )
-        .env_remove("STELLAR_AGENT_PROFILE")
-        .env_remove("STELLAR_AGENT_RPC_URL")
-        .env_remove("STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE")
-        .output()
-        .unwrap();
+    let output = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home.path(),
+    )
+    .expect("isolated CLI child")
+    .args([
+        "pay",
+        DESTINATION,
+        "1 XLM",
+        "--sign-only",
+        "AAAAAA==",
+        "--profile",
+        "owner-a",
+    ])
+    .env("STELLAR_AGENT_HOME", home.path())
+    .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+    .env(
+        "STELLAR_AGENT_HEADLESS_KEYRING_KEY",
+        URL_SAFE_NO_PAD.encode(HEADLESS_KEY),
+    )
+    .env_remove("STELLAR_AGENT_PROFILE")
+    .env_remove("STELLAR_AGENT_RPC_URL")
+    .env_remove("STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE")
+    .output()
+    .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
 
@@ -107,28 +109,31 @@ fn an_engine_build_leaves_another_profiles_older_form_entry() {
         stored(&other_owner) == Some(URL_SAFE_NO_PAD.encode([0x62; 32])),
         "the sibling entry stays byte-identical"
     );
-    stellar_agent_test_support::sandbox::mark_sandbox(home.path()).expect("mark fixture directory");
-    let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-        .args([
-            "pay",
-            DESTINATION,
-            "1 XLM",
-            "--sign-only",
-            "AAAAAA==",
-            "--profile",
-            "owner-b",
-        ])
-        .env("STELLAR_AGENT_HOME", home.path())
-        .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
-        .env(
-            "STELLAR_AGENT_HEADLESS_KEYRING_KEY",
-            URL_SAFE_NO_PAD.encode(HEADLESS_KEY),
-        )
-        .env_remove("STELLAR_AGENT_PROFILE")
-        .env_remove("STELLAR_AGENT_RPC_URL")
-        .env_remove("STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE")
-        .output()
-        .unwrap();
+    let output = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home.path(),
+    )
+    .expect("isolated CLI child")
+    .args([
+        "pay",
+        DESTINATION,
+        "1 XLM",
+        "--sign-only",
+        "AAAAAA==",
+        "--profile",
+        "owner-b",
+    ])
+    .env("STELLAR_AGENT_HOME", home.path())
+    .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+    .env(
+        "STELLAR_AGENT_HEADLESS_KEYRING_KEY",
+        URL_SAFE_NO_PAD.encode(HEADLESS_KEY),
+    )
+    .env_remove("STELLAR_AGENT_PROFILE")
+    .env_remove("STELLAR_AGENT_RPC_URL")
+    .env_remove("STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE")
+    .output()
+    .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(output.status.code(), Some(1));
     assert!(stdout.contains("older base64 form"), "{stdout}");

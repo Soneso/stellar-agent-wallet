@@ -102,14 +102,20 @@ pub fn mark_sandbox(path: &Path) -> Result<(), SandboxError> {
 /// Returns an I/O error when the executable is unreadable or lacks isolation.
 pub fn require_isolated_executable(path: &Path) -> std::io::Result<()> {
     let bytes = std::fs::read(path)?;
-    let marker = b"STELLAR_AGENT_TEST_STORAGE_ISOLATED";
-    if bytes.windows(marker.len()).any(|window| window == marker) {
+    if isolated_executable(&bytes) {
         Ok(())
     } else {
         Err(std::io::Error::other(
             "Build the child with test-helpers and stellar-agent-core/test-helpers before running acceptance.",
         ))
     }
+}
+
+/// Reports whether executable bytes contain the storage isolation marker.
+#[must_use]
+pub fn isolated_executable(bytes: &[u8]) -> bool {
+    const MARKER: &[u8] = b"STELLAR_AGENT_TEST_STORAGE_ISOLATED";
+    bytes.windows(MARKER.len()).any(|window| window == MARKER)
 }
 
 /// A marked directory retained for the lifetime of its owner.
@@ -146,6 +152,37 @@ mod tests {
     )]
     use super::*;
     use crate::env_guard::StellarAgentHomeGuard;
+
+    #[test]
+    fn child_executable_requires_the_isolation_literal() {
+        assert!(isolated_executable(
+            b"prefix STELLAR_AGENT_TEST_STORAGE_ISOLATED suffix"
+        ));
+        assert!(!isolated_executable(b"production executable"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn state_sandbox_keeps_home_valid_until_guard_drop() {
+        let previous = std::env::var_os("STELLAR_AGENT_HOME");
+        let sandbox = StateSandbox::new().unwrap();
+        let path = sandbox.path().to_path_buf();
+        assert!(
+            path.join(MARKER).is_file(),
+            "the owner marks storage before any home guard"
+        );
+        assert_eq!(path, path.canonicalize().unwrap());
+        assert_eq!(std::env::var_os("STELLAR_AGENT_HOME"), previous);
+        {
+            let _home = StellarAgentHomeGuard::new(&path);
+            assert_eq!(std::env::var_os("STELLAR_AGENT_HOME").unwrap(), path);
+            assert!(path.join(MARKER).is_file());
+        }
+        assert_eq!(std::env::var_os("STELLAR_AGENT_HOME"), previous);
+        assert!(path.is_dir(), "restoration precedes directory deletion");
+        drop(sandbox);
+        assert!(!path.exists(), "the owner removes its directory on drop");
+    }
 
     fn refuse_temporary_root_in_child(temporary: &Path, test: &str) {
         const DESTINATION: &str = "STELLAR_AGENT_TEST_SANDBOX_DESTINATION";

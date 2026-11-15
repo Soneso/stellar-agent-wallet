@@ -42,7 +42,6 @@
 )]
 
 use std::path::Path;
-use std::process::Command;
 
 use serde_json::Value;
 use stellar_agent_test_support::profile_fixtures::noop_profile_toml;
@@ -112,8 +111,11 @@ impl Run {
 }
 
 fn run_cli(home: &Path, args: &[&str]) -> Run {
-    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_stellar-agent"));
+    let mut command = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home,
+    )
+    .expect("isolated CLI child");
     command
         .args(args)
         .env("STELLAR_AGENT_HOME", home)
@@ -141,15 +143,15 @@ fn write_profile(home: &Path, file_name: &str, owner_profile: &str) -> String {
 
 /// A home holding `i107-requested.toml` whose coordinates name `i107-other` —
 /// exactly what copying `i107-other.toml` to `i107-requested.toml` produces.
-fn mismatched_home() -> tempfile::TempDir {
-    let home = tempfile::tempdir().expect("temp home");
+fn mismatched_home() -> stellar_agent_test_support::sandbox::StateSandbox {
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     write_profile(home.path(), REQUESTED, OWNED_BY);
     home
 }
 
 /// A home holding a self-consistent `i107-requested.toml`.
-fn consistent_home() -> tempfile::TempDir {
-    let home = tempfile::tempdir().expect("temp home");
+fn consistent_home() -> stellar_agent_test_support::sandbox::StateSandbox {
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     write_profile(home.path(), REQUESTED, REQUESTED);
     home
 }
@@ -299,7 +301,7 @@ fn a_self_consistent_profile_is_not_refused() {
 /// operate under any requested name while its authority points elsewhere.
 #[test]
 fn a_service_without_the_prefix_refuses_instead_of_resolving_to_default() {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     let profiles = home.path().join("profiles");
     std::fs::create_dir_all(&profiles).expect("create profiles dir");
     let toml = noop_profile_toml(REQUESTED, "stellar:testnet", FIXTURE_RPC).replace(
@@ -351,7 +353,7 @@ fn a_service_without_the_prefix_refuses_instead_of_resolving_to_default() {
 /// gate they never chose.
 #[test]
 fn a_mismatched_default_profile_refuses_rather_than_synthesizing() {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     write_profile(home.path(), "default", OWNED_BY);
 
     let run = run_cli(
@@ -382,8 +384,11 @@ fn a_mismatched_default_profile_refuses_rather_than_synthesizing() {
 #[test]
 fn the_environment_selected_profile_is_reconciled_as_well() {
     let home = mismatched_home();
-    stellar_agent_test_support::sandbox::mark_sandbox(home.path()).expect("mark fixture directory");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_stellar-agent"));
+    let mut command = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home.path(),
+    )
+    .expect("isolated CLI child");
     command
         .args([
             "pay",
@@ -822,7 +827,7 @@ fn the_cli_and_the_mcp_server_agree_on_the_same_mismatched_file() {
         OWNER_KEY_SERVICE_PREFIX, ProfileStateLayout, profile_name_mismatch_refusal,
     };
 
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     write_profile(home.path(), "alice", "default");
 
     // Loaded through the profile loader — the same path both binaries take —
@@ -959,7 +964,7 @@ fn an_unloadable_profile_is_not_reported_as_an_internal_defect() {
     ];
 
     for (label, argv) in commands {
-        let home = tempfile::tempdir().expect("temp home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
         let run = run_cli(home.path(), argv);
         assert_eq!(
             run.code_field(),
@@ -978,7 +983,7 @@ fn an_unloadable_profile_is_not_reported_as_an_internal_defect() {
 /// parse.
 #[test]
 fn a_malformed_profile_reports_a_validation_code_and_keeps_its_cause() {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     let profiles = home.path().join("profiles");
     std::fs::create_dir_all(&profiles).expect("create profiles dir");
     std::fs::write(
@@ -1019,7 +1024,7 @@ fn a_malformed_profile_reports_a_validation_code_and_keeps_its_cause() {
 #[test]
 fn init_next_steps_put_audit_key_before_signer_enrollment_on_both_engines() {
     for engine in ["v1", "noop"] {
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let run = run_cli(
             home.path(),
             &[
@@ -1058,7 +1063,7 @@ fn init_next_steps_put_audit_key_before_signer_enrollment_on_both_engines() {
 #[test]
 fn a_seed_as_a_missing_profile_name_is_not_echoed_by_a_raw_code_verb() {
     let marker = stellar_agent_test_support::rejected_value::seed_marker();
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     let run = run_cli(
         home.path(),
         &[
@@ -1099,7 +1104,7 @@ fn a_seed_as_a_missing_profile_name_is_not_echoed_by_a_raw_code_verb() {
 fn a_seed_in_a_refused_profile_name_is_not_echoed_by_any_command_family() {
     let marker = stellar_agent_test_support::rejected_value::seed_marker();
     let refused = format!("{marker}/x");
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     let families: [&[&str]; 4] = [
         &["approve", "list", "--profile", &refused],
         &["credentials", "list", "--profile", &refused],

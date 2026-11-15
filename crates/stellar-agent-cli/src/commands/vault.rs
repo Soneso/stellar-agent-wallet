@@ -1131,7 +1131,13 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn run_deposit_refuses_mainnet_before_keyring_and_any_request() {
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         crate::common::render::take_rendered_for_test();
         let rpc = wiremock::MockServer::start().await;
@@ -1173,7 +1179,13 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn run_withdraw_refuses_mainnet_before_keyring_and_any_request() {
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         crate::common::render::take_rendered_for_test();
         let rpc = wiremock::MockServer::start().await;
@@ -1215,7 +1227,13 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn run_deposit_initialises_keyring_store_before_signer_resolution() {
-        let home = tempfile::tempdir().expect("home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         // The keyring initialiser must be invoked on the deposit path, after
         // the profile load and before the signer is resolved from the keyring.
@@ -1273,7 +1291,13 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn run_withdraw_initialises_keyring_store_before_signer_resolution() {
-        let home = tempfile::tempdir().expect("home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let profile_loaded = Arc::new(AtomicBool::new(false));
         let init_invoked = Arc::new(AtomicBool::new(false));
@@ -1518,7 +1542,13 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn run_deposit_refuses_after_ordered_trust_gate_when_audit_key_unminted() {
-        let home = tempfile::tempdir().expect("home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
 
@@ -1594,7 +1624,13 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn run_withdraw_refuses_after_ordered_trust_gate_when_audit_key_unminted() {
-        let home = tempfile::tempdir().expect("home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
 

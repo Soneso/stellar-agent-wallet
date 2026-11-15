@@ -2651,7 +2651,14 @@ pub(crate) mod tests {
     async fn mainnet_rejected_at_run_boundary_network_flag_without_profile_refuses() {
         let calls = std::rc::Rc::new(std::cell::Cell::new(0));
         let guard_rpc = wiremock::MockServer::start().await;
-        let guard_home = tempfile::tempdir().expect("home");
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let _guard_env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         let mut args = minimal_args();
@@ -2980,7 +2987,14 @@ pub(crate) mod tests {
         let _profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         // The load runs the key-scope check, which lists the profiles
         // directory; keep that read inside a temporary data root.
-        let home = tempfile::tempdir().expect("valid test fixture");
+        let home =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect("valid test fixture");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let args = minimal_args();
         let resolved = resolve_profile_name(args.profile.as_deref());
@@ -3039,7 +3053,14 @@ pub(crate) mod tests {
         let _profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         // The load runs the key-scope check, which lists the profiles
         // directory; keep that read inside a temporary data root.
-        let home = tempfile::tempdir().expect("valid test fixture");
+        let home =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect("valid test fixture");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let args = minimal_args();
         let resolved = resolve_profile_name(args.profile.as_deref());
@@ -3605,7 +3626,13 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn a_failure_after_the_preview_prints_one_envelope_with_the_preview_in_details() {
-        let home = tempfile::tempdir().expect("home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let _profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         let server = mount_claim_rpc(SOURCE_G).await;
@@ -3644,7 +3671,13 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn a_failure_before_the_preview_prints_one_envelope_without_a_preview() {
-        let home = tempfile::tempdir().expect("home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let _profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         let server = mount_claim_rpc(SOURCE_G).await;
@@ -3699,7 +3732,13 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn table_output_prints_the_preview_line_before_the_error_line() {
-        let home = tempfile::tempdir().expect("home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let _profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         let server = mount_claim_rpc(SOURCE_G).await;
@@ -3983,7 +4022,13 @@ pub(crate) mod tests {
     async fn an_invalid_claim_argument_refuses_ahead_of_a_client_the_url_cannot_build() {
         const NAME: &str = "claim-unbuildable-url";
         const URL: &str = "http://127.0.0.1:9/a b";
-        let dir = tempfile::TempDir::new().expect("tempdir");
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().expect("tempdir");
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let _profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");

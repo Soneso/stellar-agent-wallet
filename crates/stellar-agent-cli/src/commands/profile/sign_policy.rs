@@ -1047,7 +1047,13 @@ pub(super) mod tests {
     #[serial]
     async fn sign_policy_takes_the_guard() {
         keyring_mock::install().unwrap();
-        let dir = TempDir::new().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let profile = provisioning_profile();
         let (_, owner, _) = seed_material([11; 32]);
@@ -1066,7 +1072,13 @@ pub(super) mod tests {
     #[serial]
     async fn guard_spans_read_to_replace() {
         keyring_mock::install().unwrap();
-        let dir = TempDir::new().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let profile = provisioning_profile();
         let (_, owner, _) = seed_material([11; 32]);
@@ -1086,7 +1098,13 @@ pub(super) mod tests {
     #[serial]
     async fn guard_released_after_refusal() {
         keyring_mock::install().unwrap();
-        let dir = TempDir::new().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let profile = provisioning_profile();
         let (_, owner, _) = seed_material([11; 32]);
@@ -1101,7 +1119,13 @@ pub(super) mod tests {
     #[serial]
     async fn sign_policy_missing_directory_keeps_unreadable_code() {
         keyring_mock::install().unwrap();
-        let dir = TempDir::new().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let profile = provisioning_profile();
         let (_, owner, _) = seed_material([11; 32]);
@@ -1216,7 +1240,13 @@ pub(super) mod tests {
         use stellar_agent_core::profile::schema::PolicyEngineKind;
         use stellar_agent_mcp::server::WalletServer;
         keyring_mock::install().unwrap();
-        let home = TempDir::new().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let (secret, public, _) = seed_material([0x51; 32]);
         enroll_owner_pubkey(PROFILE_NAME, &public);
@@ -1360,7 +1390,13 @@ pub(super) mod tests {
         keyring_mock::install().expect("mock store");
         let (_s_strkey, pk, _owner_g) = seed_material([0x12u8; 32]);
         enroll_owner_pubkey(PROFILE_NAME, &pk);
-        let dir = TempDir::new().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let path = dir.path().join("policy.toml");
         std::fs::write(&path, policy_body(PROFILE_NAME)).unwrap();
@@ -1431,7 +1467,13 @@ pub(super) mod tests {
         let (s_strkey, pk, owner_g) = seed_material([0x11u8; 32]);
         enroll_owner_pubkey(PROFILE_NAME, &pk);
 
-        let dir = TempDir::new().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let path = dir.path().join("policy.toml");
         std::fs::write(&path, policy_body(PROFILE_NAME)).unwrap();
@@ -1476,7 +1518,13 @@ pub(super) mod tests {
         let (s_strkey, pk, _g) = seed_material([0x22u8; 32]);
         enroll_owner_pubkey(PROFILE_NAME, &pk);
 
-        let dir = TempDir::new().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let path = dir.path().join("policy.toml");
         std::fs::write(&path, policy_body(PROFILE_NAME)).unwrap();
@@ -1510,7 +1558,13 @@ pub(super) mod tests {
         // A DIFFERENT seed than the one enrolled.
         let (wrong_s, _wrong_pk, _wrong_g) = seed_material([0x55u8; 32]);
 
-        let dir = TempDir::new().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let path = dir.path().join("policy.toml");
         let body = policy_body(PROFILE_NAME);
@@ -1540,7 +1594,13 @@ pub(super) mod tests {
             .unwrap()
             .set_password(stored)
             .unwrap();
-        let dir = TempDir::new().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let path = dir.path().join("policy.toml");
         let body = policy_body(PROFILE_NAME);
@@ -1622,7 +1682,13 @@ pub(super) mod tests {
         let (s_strkey, pk, owner_g) = seed_material([0x11u8; 32]);
         enroll_owner_pubkey(PROFILE_NAME, &pk);
 
-        let dir = TempDir::new().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let path = dir.path().join("policy.toml");
         std::fs::write(&path, policy_body(PROFILE_NAME)).unwrap();
@@ -1667,11 +1733,23 @@ pub(super) mod tests {
     async fn sign_file_holding(
         tag: &str,
         body: &str,
-    ) -> (i32, serde_json::Value, String, [u8; 32], TempDir) {
+    ) -> (
+        i32,
+        serde_json::Value,
+        String,
+        [u8; 32],
+        stellar_agent_test_support::sandbox::StateSandbox,
+    ) {
         keyring_mock::install().expect("mock store");
         let (s_strkey, pk, _g) = seed_material([0x66u8; 32]);
         enroll_owner_pubkey(PROFILE_NAME, &pk);
-        let dir = TempDir::new().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let path = dir.path().join("policy.toml");
         std::fs::write(&path, body).unwrap();
@@ -1818,7 +1896,13 @@ pub(super) mod tests {
         keyring_mock::install().expect("mock store");
         // No owner key enrolled.
         let (s_strkey, _pk, _g) = seed_material([0x11u8; 32]);
-        let dir = TempDir::new().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let path = dir.path().join("policy.toml");
         std::fs::write(&path, policy_body(PROFILE_NAME)).unwrap();
@@ -1837,11 +1921,10 @@ pub(super) mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn nonexistent_profile_returns_exit_1() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let args = SignPolicyArgs {
             profile: Some("__nonexistent_sign_policy__".to_owned()),
             secret_env: "__UNSET_SIGN_POLICY_VAR__".to_owned(),
@@ -1850,6 +1933,10 @@ pub(super) mod tests {
         };
         let code = run(&args).await;
         assert_eq!(code, 1);
+        fixture.assert_refusal(
+            Some("validation.profile_not_found"),
+            &["the requested profile was not found"],
+        );
     }
 
     // ── render_with_signature (the replaced / previous_owner_id reporting) ─────
@@ -2197,11 +2284,23 @@ pub(super) mod tests {
     async fn sign_mainnet_file_holding(
         tag: &str,
         body: &str,
-    ) -> (i32, serde_json::Value, String, [u8; 32], TempDir) {
+    ) -> (
+        i32,
+        serde_json::Value,
+        String,
+        [u8; 32],
+        stellar_agent_test_support::sandbox::StateSandbox,
+    ) {
         keyring_mock::install().expect("mock store");
         let (s_strkey, pk, _g) = seed_material([0x66u8; 32]);
         enroll_owner_pubkey(PROFILE_NAME, &pk);
-        let dir = TempDir::new().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let path = dir.path().join("policy.toml");
         std::fs::write(&path, body).unwrap();
@@ -2276,7 +2375,13 @@ pub(super) mod tests {
     async fn rendered_sequence_fields_and_mainnet_warning_follow_the_signed_body() {
         use stellar_agent_core::policy::pin::PinState;
         keyring_mock::install().unwrap();
-        let dir = TempDir::new().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let (secret, pk, _) = seed_material([11; 32]);
         enroll_owner_pubkey(PROFILE_NAME, &pk);
@@ -2393,7 +2498,13 @@ pub(super) mod tests {
             },
         };
         keyring_mock::install().unwrap();
-        let dir = TempDir::new().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let (previous_secret, previous_public, _) = seed_material([41; 32]);
         let (new_secret, new_public, _) = seed_material([42; 32]);
@@ -2485,7 +2596,13 @@ pub(super) mod tests {
             },
         };
         keyring_mock::install().unwrap();
-        let dir = TempDir::new().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let (pinned_secret, pinned_public, _) = seed_material([43; 32]);
         let (enrolled_secret, enrolled_public, _) = seed_material([44; 32]);
@@ -2714,7 +2831,13 @@ pub(super) mod tests {
         for present_pin in [false, true] {
             for nonce in ["absent", "present", "unreadable"] {
                 keyring_mock::install().unwrap();
-                let dir = TempDir::new().unwrap();
+                let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+                assert!(
+                    dir.path()
+                        .join(stellar_agent_test_support::sandbox::MARKER)
+                        .is_file(),
+                    "owned wallet root is marked before the home guard"
+                );
                 let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
                 let profile = provisioning_profile();
                 let (_, owner, _) = seed_material([11; 32]);
@@ -2777,7 +2900,13 @@ pub(super) mod tests {
             for bound in [false, true] {
                 for previous in [false, true] {
                     keyring_mock::install().unwrap();
-                    let dir = TempDir::new().unwrap();
+                    let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+                    assert!(
+                        dir.path()
+                            .join(stellar_agent_test_support::sandbox::MARKER)
+                            .is_file(),
+                        "owned wallet root is marked before the home guard"
+                    );
                     let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
                     let profile = provisioning_profile();
                     let (_, owner, _) = seed_material([11; 32]);
@@ -2831,7 +2960,13 @@ pub(super) mod tests {
                     }),
                 )])
                 .unwrap();
-                let dir = TempDir::new().unwrap();
+                let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+                assert!(
+                    dir.path()
+                        .join(stellar_agent_test_support::sandbox::MARKER)
+                        .is_file(),
+                    "owned wallet root is marked before the home guard"
+                );
                 let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
                 let (_, owner, _) = seed_material([11; 32]);
                 enroll_owner_pubkey("operator", &owner);

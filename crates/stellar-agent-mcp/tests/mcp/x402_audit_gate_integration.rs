@@ -530,12 +530,12 @@ impl Tool {
 /// named after that account. A seed therefore belongs to one profile name in
 /// the whole test binary: the tests here use seeds no other suite uses.
 struct Fixture {
-    _home: tempfile::TempDir,
-    _home_guard: StellarAgentHomeGuard,
     profile: Profile,
     server: WalletServer,
     mock: MockServer,
     rpc: X402Rpc,
+    _home_guard: StellarAgentHomeGuard,
+    _home: stellar_agent_test_support::sandbox::StateSandbox,
 }
 
 async fn fixture(
@@ -569,7 +569,13 @@ async fn build_fixture(
     configure_profile: impl FnOnce(&mut Profile),
     install_keyring: impl FnOnce(&str),
 ) -> Fixture {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
+    assert!(
+        home.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let home_guard = StellarAgentHomeGuard::new(home.path());
     let payer = gstrkey_for_seed(seed);
     install_keyring(&payer);

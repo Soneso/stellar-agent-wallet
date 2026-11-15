@@ -122,14 +122,14 @@ impl Run {
 /// A temporary data root with one saved testnet profile whose endpoints are
 /// a connection counter.
 struct Fixture {
-    home: tempfile::TempDir,
+    home: stellar_agent_test_support::sandbox::StateSandbox,
     counter: ConnectionCounter,
     profile: Profile,
 }
 
 impl Fixture {
     fn new() -> Self {
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let counter = ConnectionCounter::start().unwrap();
         let rpc_url = counter.https_uri().replacen("https://", "http://", 1);
         let profile = Profile::builder_testnet_named(PROFILE, "s", "a", "n", "a")
@@ -257,8 +257,11 @@ impl Fixture {
 /// The binary in `home` with `args`, under the headless backend and with
 /// every overlay that selects another profile, endpoint or secret removed.
 fn command_in(home: &Path, args: &[&str]) -> Command {
-    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_stellar-agent"));
+    let mut command = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home,
+    )
+    .expect("isolated CLI child");
     command
         .args(args)
         .env("STELLAR_AGENT_HOME", home)

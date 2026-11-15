@@ -1071,7 +1071,14 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn witness_retries_a_busy_oracle() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let error = stellar_rpc_client::Error::JsonRpc(jsonrpsee_core::ClientError::Call(
             serde_json::from_value(
@@ -1102,7 +1109,14 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn busy_never_turns_divergence_into_agreement() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let (result, requests) = busy_witness(1, true, false).await;
         assert!(
@@ -1118,7 +1132,14 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn witness_stops_on_a_simulation_refusal() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let (result, requests) = busy_witness(1, false, true).await;
         assert!(

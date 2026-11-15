@@ -3145,12 +3145,13 @@ async fn dispatch_stored_endpoints_environment_child() {
 
     keyring_mock::install().unwrap();
     install_test_nonce_key(246);
-    let scratch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
-    std::fs::create_dir_all(&scratch).unwrap();
-    let dir = tempfile::Builder::new()
-        .prefix("dispatch-retention-")
-        .tempdir_in(scratch)
-        .unwrap();
+    let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        dir.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
     let stored_primary = MockServer::start().await;
     let stored_secondary = MockServer::start().await;
@@ -3418,7 +3419,14 @@ async fn pay_two_phase_per_period_cap_second_call_denied_by_persisted_window() {
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(210);
 
-    let home_dir = tempfile::TempDir::new().expect("tempdir");
+    let home_dir = stellar_agent_test_support::sandbox::StateSandbox::new().expect("tempdir");
+    assert!(
+        home_dir
+            .path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home_guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home_dir.path());
 
     let seed = [0x51_u8; 32];
@@ -4437,7 +4445,15 @@ async fn a_rebuilt_envelope_at_the_same_sequence_is_refused() {
 #[tokio::test]
 #[serial]
 async fn a_submission_that_cannot_be_recorded_sends_nothing() {
-    let data_root = tempfile::tempdir().expect("temporary data root");
+    let data_root =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("temporary data root");
+    assert!(
+        data_root
+            .path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home_guard = stellar_agent_test_support::StellarAgentHomeGuard::new(data_root.path());
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(233);
@@ -5110,7 +5126,14 @@ async fn pay_commit_refused_at_the_reservation_reports_the_gate_code_and_sends_n
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(211);
 
-    let home_dir = tempfile::TempDir::new().expect("tempdir");
+    let home_dir = stellar_agent_test_support::sandbox::StateSandbox::new().expect("tempdir");
+    assert!(
+        home_dir
+            .path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home_guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home_dir.path());
 
     let seed = [0x52_u8; 32];

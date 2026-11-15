@@ -225,6 +225,7 @@ fn read_pin_checked_refuses_missing_lock() {
     assert_eq!(
         fixture.listing(),
         vec![
+            std::path::PathBuf::from(stellar_agent_test_support::sandbox::MARKER),
             std::path::PathBuf::from("policy.toml"),
             "profiles".into(),
             "profiles/operator.toml".into()

@@ -5,14 +5,19 @@
 #[serial_test::serial]
 async fn rotation_and_refresh_use_the_same_explicit_reference() {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-    use std::process::Command;
     use std::sync::Arc;
     use std::time::Duration;
     use stellar_agent_core::profile::schema::{KeyringEntryRef, Profile};
     use stellar_agent_network::counterparty::CounterpartyResolver as _;
     use stellar_agent_network::counterparty::cache::StellarTomlResolver;
     use wiremock::{Mock, MockServer, ResponseTemplate};
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        home.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
     let backend_key = [0x4b; 32];
     keyring_core::set_default_store(Arc::new(
@@ -52,17 +57,21 @@ async fn rotation_and_refresh_use_the_same_explicit_reference() {
     let before =
         stellar_agent_network::keyring::load_hmac_key_32(&profile.counterparty_cache_key_id)
             .unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-        .args(["profile", "rotate-counterparty-key", name])
-        .env("STELLAR_AGENT_HOME", home.path())
-        .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
-        .env(
-            "STELLAR_AGENT_HEADLESS_KEYRING_KEY",
-            URL_SAFE_NO_PAD.encode(backend_key),
-        )
-        .env_remove("STELLAR_AGENT_PROFILE")
-        .output()
-        .unwrap();
+    let output = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home.path(),
+    )
+    .expect("isolated CLI child")
+    .args(["profile", "rotate-counterparty-key", name])
+    .env("STELLAR_AGENT_HOME", home.path())
+    .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+    .env(
+        "STELLAR_AGENT_HEADLESS_KEYRING_KEY",
+        URL_SAFE_NO_PAD.encode(backend_key),
+    )
+    .env_remove("STELLAR_AGENT_PROFILE")
+    .output()
+    .unwrap();
     assert!(
         output.status.success(),
         "{}",

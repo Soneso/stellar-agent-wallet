@@ -47,21 +47,25 @@ use stellar_xdr::{
 #[test]
 #[serial]
 fn mainnet_remote_refusal_precedes_invalid_or_unreadable_policy() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     mainnet_home(dir.path());
     let command = || {
-        let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-            .args([
-                "approve",
-                "serve",
-                "--profile",
-                NAME,
-                "--remote",
-                "--confirm-remote-exposure",
-            ])
-            .env("STELLAR_AGENT_HOME", dir.path())
-            .output()
-            .unwrap();
+        let output = stellar_agent_test_support::cli_child::cli_command(
+            env!("CARGO_BIN_EXE_stellar-agent"),
+            dir.path(),
+        )
+        .expect("isolated CLI child")
+        .args([
+            "approve",
+            "serve",
+            "--profile",
+            NAME,
+            "--remote",
+            "--confirm-remote-exposure",
+        ])
+        .env("STELLAR_AGENT_HOME", dir.path())
+        .output()
+        .unwrap();
         assert_eq!(output.status.code(), Some(1));
         let text = String::from_utf8(output.stdout).unwrap();
         let envelope: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -167,6 +171,11 @@ pub(crate) fn sign_presence_policy(home: &Path, name: &str, profile: &Profile) {
 /// keyring under `home`, its owner-signed presence policy, and one pending
 /// payment in its store. Returns the profile and the entry's nonce.
 fn mainnet_home(home: &std::path::Path) -> (Profile, String) {
+    assert!(
+        home.join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let signer = KeyringEntryRef::default_signer(NAME);
     let nonce_ref = KeyringEntryRef::default_nonce(NAME);
     let mut profile = Profile::builder_mainnet_named(
@@ -255,22 +264,26 @@ fn approve(
     extra: &[&str],
     typed: &str,
 ) -> (i32, serde_json::Value, String) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-        .args(["approve", "--id", nonce, "--profile", NAME])
-        .args(extra)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env("STELLAR_AGENT_HOME", home)
-        .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
-        .env(
-            "STELLAR_AGENT_HEADLESS_KEYRING_KEY",
-            URL_SAFE_NO_PAD.encode(PROTECTION_KEY),
-        )
-        .env(NO_BROWSER_ENV, "1")
-        .env_remove("STELLAR_AGENT_PROFILE")
-        .spawn()
-        .expect("approve binary runs");
+    let mut child = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home,
+    )
+    .expect("isolated CLI child")
+    .args(["approve", "--id", nonce, "--profile", NAME])
+    .args(extra)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .env("STELLAR_AGENT_HOME", home)
+    .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+    .env(
+        "STELLAR_AGENT_HEADLESS_KEYRING_KEY",
+        URL_SAFE_NO_PAD.encode(PROTECTION_KEY),
+    )
+    .env(NO_BROWSER_ENV, "1")
+    .env_remove("STELLAR_AGENT_PROFILE")
+    .spawn()
+    .expect("approve binary runs");
     // The binary may exit before it reads stdin; a closed pipe is not a
     // failure of this test.
     let _ = child.stdin.take().unwrap().write_all(typed.as_bytes());
@@ -290,7 +303,7 @@ fn approve(
 #[test]
 #[serial]
 fn mainnet_presence_stdin_cannot_supply_signed_authority() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let home = dir.path();
     let (profile, nonce) = mainnet_home(home);
     let pending = home.join("approvals").join(format!("{NAME}.toml"));
@@ -344,17 +357,21 @@ fn mainnet_presence_stdin_cannot_supply_signed_authority() {
 #[test]
 #[serial]
 fn mainnet_presence_inbox_refuses_remote_and_no_open() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     mainnet_home(dir.path());
     for (flag, code) in [
         ("--remote", "approval.mainnet_remote_unsupported"),
         ("--no-open", "approval.presence_browser_required"),
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-            .args(["approve", "serve", "--profile", NAME, flag])
-            .env("STELLAR_AGENT_HOME", dir.path())
-            .output()
-            .unwrap();
+        let output = stellar_agent_test_support::cli_child::cli_command(
+            env!("CARGO_BIN_EXE_stellar-agent"),
+            dir.path(),
+        )
+        .expect("isolated CLI child")
+        .args(["approve", "serve", "--profile", NAME, flag])
+        .env("STELLAR_AGENT_HOME", dir.path())
+        .output()
+        .unwrap();
         assert_eq!(output.status.code(), Some(1));
         let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(body["error"]["code"], code);
@@ -380,7 +397,7 @@ mod signed {
     const EXIT_BOUND: Duration = Duration::from_secs(10);
 
     struct Home {
-        dir: tempfile::TempDir,
+        dir: stellar_agent_test_support::sandbox::StateSandbox,
         nonce: String,
         address: std::cell::Cell<SocketAddr>,
         pin: [u8; 32],
@@ -388,7 +405,13 @@ mod signed {
 
     impl Home {
         fn new() -> Self {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                dir.path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let (mut profile, nonce) = mainnet_home(dir.path());
             let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
             let leaf = stellar_agent_approval_remote::signed_origin_test_leaf(SIGNED_RP_ID);
@@ -438,7 +461,11 @@ mod signed {
             }
         }
         fn command(&self, serve: bool) -> Command {
-            let mut command = Command::new(env!("CARGO_BIN_EXE_stellar-agent"));
+            let mut command = stellar_agent_test_support::cli_child::cli_command(
+                env!("CARGO_BIN_EXE_stellar-agent"),
+                self.dir.path(),
+            )
+            .expect("isolated CLI child");
             command.arg("approve");
             if serve {
                 command.arg("serve");

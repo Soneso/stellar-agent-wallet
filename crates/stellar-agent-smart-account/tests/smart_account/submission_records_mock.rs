@@ -43,7 +43,6 @@ use stellar_xdr::{
     ScVal, SorobanAddressCredentials, SorobanAuthorizationEntry, SorobanAuthorizedFunction,
     SorobanAuthorizedInvocation, SorobanCredentials, TransactionEnvelope, VecM, WriteXdr,
 };
-use tempfile::TempDir;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
@@ -367,8 +366,8 @@ impl stellar_agent_network::Signer for SpySigner {
 }
 
 struct Fixture {
-    _root: TempDir,
     _home: StellarAgentHomeGuard,
+    _root: stellar_agent_test_support::sandbox::StateSandbox,
     profile: Profile,
     audit: Arc<Mutex<AuditWriter>>,
     registry: MulticallRegistry,
@@ -379,12 +378,13 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         keyring_mock::install().unwrap();
-        let scratch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
-        std::fs::create_dir_all(&scratch).unwrap();
-        let root = tempfile::Builder::new()
-            .prefix("submission-records-")
-            .tempdir_in(scratch)
-            .unwrap();
+        let root = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            root.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let home = StellarAgentHomeGuard::new(root.path());
         let mut profile = Profile::builder_testnet("svc", PROFILE, "nonce", PROFILE)
             .with_profile_name(PROFILE)

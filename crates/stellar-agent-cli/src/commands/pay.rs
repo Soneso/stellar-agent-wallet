@@ -3127,7 +3127,14 @@ pub(crate) mod tests {
     async fn mainnet_rejected_at_run_boundary_network_flag_without_profile_refuses() {
         let calls = std::rc::Rc::new(std::cell::Cell::new(0));
         let guard_rpc = wiremock::MockServer::start().await;
-        let guard_home = tempfile::tempdir().expect("home");
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let _guard_env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         let args = PayArgs {
@@ -3841,22 +3848,24 @@ pub(crate) mod tests {
         );
     }
 
-    /// The `run()` path with `use_oz_relayer = true` returns exit code 1 and
-    /// does NOT perform any network call (non-routable RPC address ensures any
-    /// accidental call would fail with a connection error rather than silently
-    /// succeeding).  The refuse gate is wired before any stage dispatch.
-    #[tokio::test]
+    /// Relayer opt-in returns its specific refusal before contacting the endpoint.
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn relayer_opt_in_exits_nonzero_without_network_call() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let mut args = minimal_args();
         args.use_oz_relayer = true;
-        // Non-routable address: any accidental RPC call would produce a
-        // connection error, making an accidentally-passing test impossible.
-        args.rpc_url = Some("http://127.0.0.1:1".to_owned());
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.destination = stellar_strkey::ed25519::PublicKey([7; 32])
+            .to_string()
+            .to_string();
         let exit = run(&args).await;
         assert_eq!(exit, 1, "relayer opt-in must exit with code 1");
+        fixture.assert_refusal(
+            Some("validation.relayer_not_implemented"),
+            &["relayer submission is not implemented"],
+        );
     }
 
     /// The AGPL-3.0 disclosure constant contains the required claims that
@@ -6165,7 +6174,13 @@ pub(crate) mod tests {
             },
         };
         stellar_agent_test_support::keyring_mock::install().unwrap();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let profile = Profile::builder_testnet_named("operator", "s", "a", "n", "a").build();
         let owner = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);

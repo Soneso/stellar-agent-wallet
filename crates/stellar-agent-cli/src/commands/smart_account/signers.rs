@@ -3475,12 +3475,11 @@ mod tests {
 
     /// `batch-add` with zero signer flags is refused at runtime (client-side,
     /// before any RPC call).
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn batch_add_run_refuses_empty_batch() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
-        let args = BatchAddArgsHarness::parse_from([
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
+        let mut args = BatchAddArgsHarness::parse_from([
             "test",
             "--account",
             "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
@@ -3490,8 +3489,20 @@ mod tests {
             "__STELLAR_AGENT_SIGNERS_TEST_DUMMY_VAR",
         ])
         .args;
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
         let code = batch_add_run(&args).await;
         assert_eq!(code, 1, "an empty signer batch must be refused");
+        fixture.assert_refusal(
+            Some("validation.address_invalid"),
+            &[
+                "batch-add requires at least one",
+                "--signer-delegated",
+                "--signer-webauthn",
+                "--signer-ed25519",
+            ],
+        );
     }
 
     // ── signer_kind_label ─────────────────────────────────────────────────────
@@ -3746,7 +3757,13 @@ mod tests {
         use stellar_agent_core::profile::schema::Profile;
         use stellar_agent_test_support::{StellarAgentHomeGuard, keyring_mock};
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = StellarAgentHomeGuard::new(dir.path());
         keyring_mock::install().unwrap();
         let _secret = OverrideSecretGuard::new();
@@ -4271,62 +4288,69 @@ mod tests {
 
     /// `--signer-ed25519` with invalid hex is refused fail-closed before any
     /// network call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn signer_ed25519_rejects_invalid_hex() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
-        let args = add_args_ed25519(&"zz".repeat(32), Some(ED25519_TEST_VERIFIER.to_owned()));
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
+        let mut args = add_args_ed25519(&"zz".repeat(32), Some(ED25519_TEST_VERIFIER.to_owned()));
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
         let code = add_run(&args).await;
         assert_eq!(code, 1, "invalid hex must be refused");
+        fixture.assert_refusal(
+            Some("validation.address_invalid"),
+            &["--signer-ed25519 is not valid hex"],
+        );
     }
 
     /// `--signer-ed25519` that decodes to a non-32-byte length is refused
     /// fail-closed (never silently truncated or padded) before any network call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn signer_ed25519_rejects_wrong_length() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         // 62 hex chars → 31 bytes.
-        let args = add_args_ed25519(&"ab".repeat(31), Some(ED25519_TEST_VERIFIER.to_owned()));
+        let mut args = add_args_ed25519(&"ab".repeat(31), Some(ED25519_TEST_VERIFIER.to_owned()));
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
         let code = add_run(&args).await;
         assert_eq!(code, 1, "a 31-byte key must be refused");
+        fixture.assert_refusal(
+            Some("validation.address_invalid"),
+            &["exactly 32 bytes", "got 31 bytes"],
+        );
     }
 
     /// `--signer-ed25519` with no `--verifier` and no registered Ed25519 verifier
     /// for the network fails closed before any network call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn signer_ed25519_missing_verifier_and_registry_fails_closed() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
-        let dir = tempfile::tempdir().unwrap();
-        let registry_path = dir.path().join("networks.toml");
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
+        let registry_path = fixture.sandbox.path().join("missing-networks.toml");
+        let _registry = stellar_agent_test_support::env_guard::ScopedEnvVar::new(
+            stellar_agent_smart_account::verifiers::STELLAR_AGENT_NETWORKS_TOML_ENV,
+            Some(registry_path.as_os_str()),
+        );
 
-        // SAFETY: serialised by #[serial]; no concurrent env access.
-        #[allow(unsafe_code, reason = "test-only env override; #[serial] serialises")]
-        unsafe {
-            std::env::set_var(
-                stellar_agent_smart_account::verifiers::STELLAR_AGENT_NETWORKS_TOML_ENV,
-                &registry_path,
-            );
-        }
-
-        let args = add_args_ed25519(&"ab".repeat(32), None);
+        let mut args = add_args_ed25519(&"ab".repeat(32), None);
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
         let code = add_run(&args).await;
-
-        // SAFETY: same as set; serialised by #[serial].
-        #[allow(unsafe_code, reason = "test-only env cleanup; #[serial] serialises")]
-        unsafe {
-            std::env::remove_var(
-                stellar_agent_smart_account::verifiers::STELLAR_AGENT_NETWORKS_TOML_ENV,
-            );
-        }
 
         assert_eq!(
             code, 1,
             "missing verifier and empty registry must fail closed"
+        );
+        fixture.assert_refusal(
+            Some("validation.address_invalid"),
+            &[
+                "no Ed25519 verifier registered",
+                "smart-account deploy-ed25519-verifier",
+            ],
         );
     }
 }

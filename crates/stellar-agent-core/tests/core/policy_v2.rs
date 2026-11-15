@@ -973,7 +973,14 @@ fn pin_read_is_guarded_against_interleaving() {
 #[test]
 #[serial]
 fn advance_compares_the_pin_again_before_it_writes() {
-    let guard_home = tempfile::tempdir().unwrap();
+    let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        guard_home
+            .path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
     let (dir, profile, key) = fixture();
     let coordinate = policy_pin_entry_ref(&profile.policy_window_state_key_id);
@@ -1023,7 +1030,14 @@ fn advance_compares_the_pin_again_before_it_writes() {
 #[test]
 #[serial]
 fn a_writer_in_the_advance_gap_is_compared_before_the_write() {
-    let guard_home = tempfile::tempdir().unwrap();
+    let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        guard_home
+            .path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
     let (dir, profile, key) = fixture();
     let owner = key.verifying_key().to_bytes();

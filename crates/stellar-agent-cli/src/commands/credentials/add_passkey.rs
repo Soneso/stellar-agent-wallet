@@ -698,11 +698,12 @@ mod tests {
     /// manager sharing that store with its passkeys registry in `dir`, and
     /// the store.
     async fn start_test_registration(
-        dir: &tempfile::TempDir,
+        dir: impl AsRef<std::path::Path>,
         tag: &str,
     ) -> (BridgeHandle, CredentialsManager, SharedStore) {
+        let dir = dir.as_ref();
         let store = stellar_agent_core::approval::store::PendingApprovalStore::open(
-            dir.path().join(format!("{tag}.toml")),
+            dir.join(format!("{tag}.toml")),
         )
         .unwrap();
         let store = Arc::new(Mutex::new(store));
@@ -714,7 +715,7 @@ mod tests {
         .await
         .unwrap();
         let mgr = CredentialsManager::new(
-            dir.path().join(format!("{tag}-passkeys")),
+            dir.join(format!("{tag}-passkeys")),
             tag,
             "localhost",
             Some(Arc::clone(&store)),
@@ -1126,10 +1127,16 @@ mod tests {
         use stellar_agent_core::audit_log::AuditBinding;
 
         stellar_agent_test_support::keyring_mock::install().unwrap();
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let _tty = crate::common::tty::tests::test_tty(true, true);
-        let (bridge, _, _) = start_test_registration(&home, "audit-prerequisite").await;
+        let (bridge, _, _) = start_test_registration(home.path(), "audit-prerequisite").await;
         let mut profile = stellar_agent_core::profile::schema::Profile::builder_testnet_named(
             name,
             &format!("stellar-agent-signer-{name}"),
@@ -1258,7 +1265,13 @@ mod tests {
     #[serial_test::serial]
     async fn add_passkey_requires_a_terminal() {
         stellar_agent_test_support::keyring_mock::install().unwrap();
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let name = "passkey-tty";
         let mut profile = stellar_agent_core::profile::schema::Profile::builder_testnet_named(

@@ -257,17 +257,20 @@ mod tests {
         assert_eq!(format_system_time(t), "2026-04-30T12:34:56Z");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn list_nonexistent_profile_returns_exit_1() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let args = ListArgs {
             json: false,
             profile: Some("__nonexistent_list_cpty__".to_owned()),
         };
         let code = run(&args).await;
         assert_eq!(code, 1);
+        fixture.assert_refusal(
+            Some("validation.profile_not_found"),
+            &["the requested profile was not found"],
+        );
     }
 
     #[test]

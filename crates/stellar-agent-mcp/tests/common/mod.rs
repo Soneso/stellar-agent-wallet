@@ -279,8 +279,8 @@ pub fn polled_tx_hash(request: &wiremock::Request) -> String {
 /// receipt already holds. Every test that commits holds one of these, and
 /// `#[serial]` is what makes the process-wide override safe.
 pub struct IsolatedDataRoot {
-    _dir: tempfile::TempDir,
     _guard: stellar_agent_test_support::StellarAgentHomeGuard,
+    _dir: stellar_agent_test_support::sandbox::StateSandbox,
 }
 
 /// Installs a fresh data root for the lifetime of the returned guard.
@@ -294,7 +294,14 @@ pub struct IsolatedDataRoot {
     reason = "shared across integration-test binaries; unused in some"
 )]
 pub fn isolated_data_root() -> IsolatedDataRoot {
-    let dir = tempfile::tempdir().expect("temporary data root");
+    let dir =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("temporary data root");
+    assert!(
+        dir.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let guard = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
     IsolatedDataRoot {
         _dir: dir,

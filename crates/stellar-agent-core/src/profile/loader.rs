@@ -9109,7 +9109,13 @@ account = "a"
     #[test]
     #[serial_test::serial]
     fn the_direct_readers_report_position_only() {
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let dir = default_profile_dir().unwrap();
         std::fs::create_dir_all(&dir).unwrap();

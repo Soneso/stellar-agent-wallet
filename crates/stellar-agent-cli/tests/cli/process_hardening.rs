@@ -15,7 +15,7 @@
 )]
 
 use std::io::{Read as _, Write as _};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
@@ -129,7 +129,7 @@ fn testnet_pending_payment(home: &std::path::Path, name: &str) -> (String, [u8; 
 #[test]
 #[serial]
 fn a_same_user_process_cannot_read_the_cli_environment() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let home = dir.path();
     let name = "environ-probe";
     let (nonce, protection_key) = testnet_pending_payment(home, name);
@@ -141,23 +141,26 @@ fn a_same_user_process_cannot_read_the_cli_environment() {
          without CAP_SYS_PTRACE"
     );
 
-    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-        .args(["approve", "--id", &nonce, "--profile", name])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env("STELLAR_AGENT_HOME", home)
-        .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
-        .env(
-            "STELLAR_AGENT_HEADLESS_KEYRING_KEY",
-            URL_SAFE_NO_PAD.encode(protection_key),
-        )
-        .env(crate::mainnet_presence::NO_BROWSER_ENV, "1")
-        .env(PROBE_VAR, &marker)
-        .env_remove("STELLAR_AGENT_PROFILE")
-        .spawn()
-        .expect("the binary starts");
+    let mut child = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home,
+    )
+    .expect("isolated CLI child")
+    .args(["approve", "--id", &nonce, "--profile", name])
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .env("STELLAR_AGENT_HOME", home)
+    .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+    .env(
+        "STELLAR_AGENT_HEADLESS_KEYRING_KEY",
+        URL_SAFE_NO_PAD.encode(protection_key),
+    )
+    .env(crate::mainnet_presence::NO_BROWSER_ENV, "1")
+    .env(PROBE_VAR, &marker)
+    .env_remove("STELLAR_AGENT_PROFILE")
+    .spawn()
+    .expect("the binary starts");
     let pid = child.id();
 
     // The reader thread signals once the prompt is on stderr and returns

@@ -1724,7 +1724,13 @@ mod tests {
             store::PendingApprovalStore,
         };
         use stellar_agent_core::profile::schema::Profile;
-        let home = tempfile::tempdir()?;
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new()?;
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         stellar_agent_test_support::keyring_mock::install()?;
         let profile = Profile::builder_testnet_named(

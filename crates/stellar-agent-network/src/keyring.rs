@@ -234,17 +234,24 @@ pub fn init_platform_keyring_store() -> Result<(), WalletError> {
 
 #[cfg(not(any(test, feature = "test-helpers")))]
 fn init_production_store() -> Result<(), WalletError> {
-    #[cfg(feature = "test-hooks")]
-    if KEEP_REGISTERED_STORE.load(std::sync::atomic::Ordering::SeqCst)
-        && keyring_core::get_default_store().is_some()
-    {
-        return Ok(());
-    }
+    dispatch_production_store(
+        stellar_agent_headless_keyring::requested_backend().as_deref(),
+        stellar_agent_headless_keyring::init_headless_store,
+        construct_native_store,
+    )
+}
+
+#[cfg(any(test, not(feature = "test-helpers")))]
+fn dispatch_production_store(
+    backend: Option<&str>,
+    headless: impl FnOnce(&str) -> Result<(), stellar_agent_headless_keyring::HeadlessKeyringInitError>,
+    native: impl FnOnce() -> Result<(), WalletError>,
+) -> Result<(), WalletError> {
     // A headless backend that cannot be set up is a configuration fault the
     // operator fixes in the environment, so it reports the configuration
     // code, with the variable or condition at fault, and no keyring entry.
-    if let Some(backend) = stellar_agent_headless_keyring::requested_backend() {
-        return stellar_agent_headless_keyring::init_headless_store(&backend).map_err(|e| {
+    if let Some(backend) = backend {
+        return headless(backend).map_err(|e| {
             tracing::debug!(error = %e, "headless keyring store init failure");
             WalletError::Auth(AuthError::KeyringConfigInvalid {
                 detail: e.to_string(),
@@ -252,7 +259,7 @@ fn init_production_store() -> Result<(), WalletError> {
         });
     }
 
-    construct_native_store()
+    native()
 }
 
 #[cfg(any(
@@ -404,10 +411,16 @@ pub fn active_keyring_backend() -> KeyringBackend {
 ///
 /// The errors of [`init_platform_keyring_store`], when it runs.
 pub(crate) fn ensure_platform_keyring_store() -> Result<(), WalletError> {
+    ensure_store_with(init_platform_keyring_store)
+}
+
+fn ensure_store_with(
+    initialize: impl FnOnce() -> Result<(), WalletError>,
+) -> Result<(), WalletError> {
     if keyring_core::get_default_store().is_some() {
         return Ok(());
     }
-    init_platform_keyring_store()
+    initialize()
 }
 
 /// The diagnostic label of an RPC credential entry: `service/account`.
@@ -2246,22 +2259,6 @@ pub static PANIC_AFTER_LOAD: std::sync::atomic::AtomicBool =
 #[doc(hidden)]
 pub static DROP_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Toggle that makes [`init_platform_keyring_store`] keep a store that is
-/// already registered instead of registering the platform store.
-///
-/// A test that drives several command runners in one process installs the
-/// in-memory mock store, arms this, and every runner's own initialization
-/// then reaches the same entries. The mock store is not a headless store, so
-/// [`active_keyring_backend`] reports [`KeyringBackend::Platform`] and the
-/// mainnet backend check runs as it does against the platform keyring.
-///
-/// Only compiled when the `test-hooks` Cargo feature is enabled.  Never include
-/// `test-hooks` in production or release builds.
-#[cfg(feature = "test-hooks")]
-#[doc(hidden)]
-pub static KEEP_REGISTERED_STORE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2323,14 +2320,108 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn isolated_init_keeps_the_registered_store() {
+        let _backend = stellar_agent_test_support::env_guard::ScopedEnvVar::new(
+            "STELLAR_AGENT_KEYRING_BACKEND",
+            None,
+        );
         let _store = RestoreStore::new();
         keyring_mock::install().unwrap();
         let original = keyring_core::get_default_store().unwrap();
+        let entry = rpc_entry();
+        store_raw(&entry, "kept");
         assert!(init_platform_keyring_store().is_ok());
         assert!(Arc::ptr_eq(
             &original,
             &keyring_core::get_default_store().unwrap()
         ));
+        assert_eq!(read_rpc_credential(&entry).unwrap().as_str(), "kept");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn production_selector_dispatch_preserves_backend_contract() {
+        use std::ffi::OsString;
+        use stellar_agent_headless_keyring::HeadlessKeyringInitError;
+        use stellar_agent_test_support::env_guard::ScopedEnvVar;
+
+        let _restore = RestoreStore::new();
+        let mut selectors = vec![
+            None,
+            Some(OsString::new()),
+            Some(OsString::from("unknown")),
+            Some(OsString::from("headless-env")),
+            Some(OsString::from("headless-dpapi")),
+        ];
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            selectors.push(Some(OsString::from_vec(vec![0xff])));
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+            selectors.push(Some(OsString::from_wide(&[0xd800])));
+        }
+        for selector in selectors {
+            let _selector = ScopedEnvVar::new("STELLAR_AGENT_KEYRING_BACKEND", selector.as_deref());
+            let requested = stellar_agent_headless_keyring::requested_backend();
+            let expected = selector.as_deref().and_then(std::ffi::OsStr::to_str);
+            assert_eq!(requested.as_deref(), expected);
+            let mut native_calls = 0;
+            let mut headless_calls = Vec::new();
+            let result = dispatch_production_store(
+                requested.as_deref(),
+                |label| {
+                    headless_calls.push(label.to_owned());
+                    match label {
+                        "headless-env" | "headless-dpapi" => Ok(()),
+                        _ => stellar_agent_headless_keyring::init_headless_store(label),
+                    }
+                },
+                || {
+                    native_calls += 1;
+                    Ok(())
+                },
+            );
+            match expected {
+                None => {
+                    result.unwrap();
+                    assert_eq!(native_calls, 1);
+                    assert!(headless_calls.is_empty());
+                }
+                Some(label) => {
+                    assert_eq!(
+                        native_calls, 0,
+                        "Unicode selection never falls back to native"
+                    );
+                    assert_eq!(headless_calls, [label]);
+                    if matches!(label, "headless-env" | "headless-dpapi") {
+                        result.unwrap();
+                    } else {
+                        assert_eq!(result.unwrap_err().code(), "auth.keyring_config_invalid");
+                    }
+                }
+            }
+            assert!(keyring_core::get_default_store().is_none());
+        }
+
+        let mut native_calls = 0;
+        let error = dispatch_production_store(
+            Some("headless-env"),
+            |_| Err(HeadlessKeyringInitError::InvalidEnvKey("fixture refusal")),
+            || {
+                native_calls += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            native_calls, 0,
+            "headless failure never falls back to native"
+        );
+        assert_eq!(error.code(), "auth.keyring_config_invalid");
+        assert!(error.to_string().contains("fixture refusal"));
+        assert!(keyring_core::get_default_store().is_none());
     }
 
     struct RestoreStore(Option<Arc<keyring_core::CredentialStore>>);
@@ -4271,8 +4362,33 @@ mod tests {
         keyring_mock::install().unwrap();
         let entry = rpc_entry();
         store_raw(&entry, "kept");
+        let mut calls = 0;
+        ensure_store_with(|| {
+            calls += 1;
+            init_platform_keyring_store()
+        })
+        .unwrap();
+        assert_eq!(calls, 0, "a registered store needs no initialization");
         ensure_platform_keyring_store().unwrap();
         assert_eq!(read_rpc_credential(&entry).unwrap().as_str(), "kept");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ensure_platform_keyring_store_initializes_once_and_propagates_failure() {
+        let _restore = RestoreStore::new();
+        let mut calls = 0;
+        let error = ensure_store_with(|| {
+            calls += 1;
+            Err(platform_store_init_failure(
+                "fixture initialization refused",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(calls, 1, "an absent store needs exactly one initialization");
+        assert_eq!(error.code(), "auth.keyring_platform_error");
+        assert!(error.to_string().contains("fixture initialization refused"));
+        assert!(keyring_core::get_default_store().is_none());
     }
     #[test]
     #[serial_test::serial]
@@ -4311,7 +4427,13 @@ mod tests {
             KeyScopeKind, SharedRecovery, key_scope_findings_in_dir,
         };
         use stellar_agent_core::profile::loader::save_to_dir;
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let dir = home.path().join("profiles");
         std::fs::create_dir_all(&dir).unwrap();

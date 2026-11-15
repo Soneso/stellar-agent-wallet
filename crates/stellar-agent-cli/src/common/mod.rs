@@ -58,6 +58,8 @@ mod operation_replay_tests;
 pub(crate) mod private_open;
 pub mod profile_access;
 #[cfg(test)]
+pub(crate) mod refusal_fixture;
+#[cfg(test)]
 pub(crate) mod refusal_log_fixture;
 pub mod render;
 pub mod served_pages;

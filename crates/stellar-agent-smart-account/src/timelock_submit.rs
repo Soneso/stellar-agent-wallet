@@ -2692,7 +2692,14 @@ mod tests {
             #[tokio::test]
             #[serial_test::serial]
             async fn initial_timelock_refusal_uses_response_events() {
-                let guard_home = tempfile::tempdir().unwrap();
+                let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+                assert!(
+                    guard_home
+                        .path()
+                        .join(stellar_agent_test_support::sandbox::MARKER)
+                        .is_file(),
+                    "owned wallet root is marked before the home guard"
+                );
                 let _guard_home =
                     stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
                 let (failure, signs, sends) = refusal_at(1).await;
@@ -2706,7 +2713,14 @@ mod tests {
             #[tokio::test]
             #[serial_test::serial]
             async fn signed_timelock_refusal_uses_response_events() {
-                let guard_home = tempfile::tempdir().unwrap();
+                let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+                assert!(
+                    guard_home
+                        .path()
+                        .join(stellar_agent_test_support::sandbox::MARKER)
+                        .is_file(),
+                    "owned wallet root is marked before the home guard"
+                );
                 let _guard_home =
                     stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
                 let (failure, signs, sends) = refusal_at(2).await;
@@ -2718,7 +2732,14 @@ mod tests {
             #[tokio::test]
             #[serial_test::serial]
             async fn timelock_simulates_retry_busy() {
-                let guard_home = tempfile::tempdir().unwrap();
+                let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+                assert!(
+                    guard_home
+                        .path()
+                        .join(stellar_agent_test_support::sandbox::MARKER)
+                        .is_file(),
+                    "owned wallet root is marked before the home guard"
+                );
                 let _guard_home =
                     stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
                 stellar_agent_test_support::keyring_mock::install().unwrap();
@@ -2996,7 +3017,14 @@ mod tests {
             #[tokio::test]
             #[serial_test::serial]
             async fn busy_signed_resimulation_takes_each_step_once() {
-                let guard_home = tempfile::tempdir().unwrap();
+                let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+                assert!(
+                    guard_home
+                        .path()
+                        .join(stellar_agent_test_support::sandbox::MARKER)
+                        .is_file(),
+                    "owned wallet root is marked before the home guard"
+                );
                 let _guard_home =
                     stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
                 stellar_agent_test_support::keyring_mock::install().unwrap();
@@ -3049,7 +3077,14 @@ mod tests {
             #[tokio::test]
             #[serial_test::serial]
             async fn dropped_retry_leaves_no_state() {
-                let guard_home = tempfile::tempdir().unwrap();
+                let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+                assert!(
+                    guard_home
+                        .path()
+                        .join(stellar_agent_test_support::sandbox::MARKER)
+                        .is_file(),
+                    "owned wallet root is marked before the home guard"
+                );
                 let _guard_home =
                     stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
                 use tracing::instrument::WithSubscriber;

@@ -4393,49 +4393,18 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn default_audit_log_path_for_uses_platform_project_dir_shape() {
-        let temporary = tempfile::tempdir().unwrap();
-        let suffix = if cfg!(target_os = "macos") {
-            format!(
-                "Library/Application Support/{}",
-                stellar_agent_test_support::sandbox::MACOS_WALLET_SUFFIX.trim()
-            )
-        } else if cfg!(target_os = "windows") {
-            "Soneso/stellar-agent/data".to_owned()
-        } else {
-            "stellar-agent".to_owned()
-        };
-        let _home =
-            stellar_agent_test_support::StellarAgentHomeGuard::new(&temporary.path().join(suffix));
-        let path = default_audit_log_path_for("alice");
-        let rendered = path.to_string_lossy();
-
-        #[cfg(target_os = "linux")]
-        {
-            assert!(
-                rendered.contains("/stellar-agent/audit/alice.jsonl"),
-                "linux path should end under stellar-agent/audit: {rendered}"
-            );
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            assert!(
-                rendered.contains(&format!(
-                    "/Library/Application Support/{}/audit/alice.jsonl",
-                    stellar_agent_test_support::sandbox::MACOS_WALLET_SUFFIX.trim()
-                )),
-                "macOS path should use the documented Application Support suffix: {rendered}"
-            );
-        }
-
-        #[cfg(target_os = "windows")]
-        {
-            assert!(
-                rendered.ends_with(r"Soneso\stellar-agent\data\audit\alice.jsonl"),
-                "windows path should end under Soneso\\stellar-agent\\data\\audit: {rendered}"
-            );
-        }
+    fn default_audit_log_path_for_joins_marked_root() {
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            sandbox
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let path = default_audit_log_path_for("profile/fixture");
+        assert_eq!(path, sandbox.path().join("audit/profile_fixture.jsonl"));
     }
 
     #[test]
@@ -4673,7 +4642,13 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn stellar_agent_home_override_redirects_profile_and_policy_dirs() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().expect("tempdir");
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
 
         let profile_dir = default_profile_dir().expect("default_profile_dir must succeed");
@@ -4693,37 +4668,17 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn default_passkeys_dir_ends_with_passkeys_component() {
-        let temporary = tempfile::tempdir().unwrap();
-        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(
-            &temporary
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            sandbox
                 .path()
-                .join(stellar_agent_test_support::sandbox::WALLET_DIRECTORY_COMPONENT.trim()),
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
         );
-        let dir = default_passkeys_dir().expect("default_passkeys_dir must succeed on CI");
-        assert!(
-            dir.ends_with("passkeys"),
-            "default_passkeys_dir must end with 'passkeys' component: {dir:?}"
-        );
-
-        let rendered = dir.to_string_lossy();
-
-        #[cfg(target_os = "linux")]
-        assert!(
-            rendered.contains("/stellar-agent/passkeys"),
-            "linux path must contain stellar-agent/passkeys: {rendered}"
-        );
-
-        #[cfg(target_os = "macos")]
-        assert!(
-            rendered.contains("stellar-agent/passkeys"),
-            "macOS path must contain stellar-agent/passkeys: {rendered}"
-        );
-
-        #[cfg(target_os = "windows")]
-        assert!(
-            rendered.contains(r"stellar-agent\passkeys"),
-            "windows path must contain stellar-agent\\passkeys: {rendered}"
-        );
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let path = default_passkeys_dir().unwrap();
+        assert_eq!(path, sandbox.path().join("passkeys"));
     }
 
     /// `default_operator_approval_credentials_dir` returns a path ending with
@@ -4735,25 +4690,18 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn default_operator_approval_credentials_dir_ends_with_expected_component() {
-        let temporary = tempfile::tempdir().unwrap();
-        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(
-            &temporary
-                .path()
-                .join(stellar_agent_test_support::sandbox::WALLET_DIRECTORY_COMPONENT.trim()),
-        );
-        let dir = default_operator_approval_credentials_dir()
-            .expect("default_operator_approval_credentials_dir must succeed on CI");
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         assert!(
-            dir.ends_with("operator-approval-credentials"),
-            "must end with 'operator-approval-credentials' component: {dir:?}"
+            sandbox
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
         );
-
-        let passkeys_dir = default_passkeys_dir().expect("default_passkeys_dir must succeed on CI");
-        assert_ne!(
-            dir, passkeys_dir,
-            "operator-approval credential dir must be distinct from the smart-account \
-             passkeys dir"
-        );
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let path = default_operator_approval_credentials_dir().unwrap();
+        assert_eq!(path, sandbox.path().join("operator-approval-credentials"));
+        assert_ne!(path, default_passkeys_dir().unwrap());
     }
 
     // ── KeyringEntryRef helpers ───────────────────────────────────────────────
@@ -5449,87 +5397,67 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn default_profile_dir_ends_with_profiles() {
-        let temporary = tempfile::tempdir().unwrap();
-        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(
-            &temporary
-                .path()
-                .join(stellar_agent_test_support::sandbox::WALLET_DIRECTORY_COMPONENT.trim()),
-        );
-        let dir = default_profile_dir().expect("default_profile_dir must succeed on CI");
-        assert_eq!(
-            dir.file_name().unwrap(),
-            "profiles",
-            "default_profile_dir must end with 'profiles'; got: {dir:?}"
-        );
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         assert!(
-            dir.to_string_lossy().contains("stellar-agent"),
-            "default_profile_dir must be under stellar-agent directory; got: {dir:?}"
+            sandbox
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
         );
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let path = default_profile_dir().unwrap();
+        assert_eq!(path, sandbox.path().join("profiles"));
     }
 
     /// `#[serial]`: see `default_passkeys_dir_ends_with_passkeys_component`.
     #[test]
     #[serial_test::serial]
     fn default_policy_dir_ends_with_policies() {
-        let temporary = tempfile::tempdir().unwrap();
-        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(
-            &temporary
-                .path()
-                .join(stellar_agent_test_support::sandbox::WALLET_DIRECTORY_COMPONENT.trim()),
-        );
-        let dir = default_policy_dir().expect("default_policy_dir must succeed on CI");
-        assert_eq!(
-            dir.file_name().unwrap(),
-            "policies",
-            "default_policy_dir must end with 'policies'; got: {dir:?}"
-        );
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         assert!(
-            dir.to_string_lossy().contains("stellar-agent"),
-            "default_policy_dir must be under stellar-agent directory; got: {dir:?}"
+            sandbox
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
         );
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let path = default_policy_dir().unwrap();
+        assert_eq!(path, sandbox.path().join("policies"));
     }
 
     #[test]
     #[serial_test::serial]
     fn default_approval_dir_ends_with_approvals() {
-        let temporary = tempfile::tempdir().unwrap();
-        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(
-            &temporary
-                .path()
-                .join(stellar_agent_test_support::sandbox::WALLET_DIRECTORY_COMPONENT.trim()),
-        );
-        let dir = default_approval_dir().expect("default_approval_dir must succeed on CI");
-        assert_eq!(
-            dir.file_name().unwrap(),
-            "approvals",
-            "default_approval_dir must end with 'approvals'; got: {dir:?}"
-        );
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         assert!(
-            dir.to_string_lossy().contains("stellar-agent"),
-            "default_approval_dir must be under stellar-agent directory; got: {dir:?}"
+            sandbox
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
         );
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let path = default_approval_dir().unwrap();
+        assert_eq!(path, sandbox.path().join("approvals"));
     }
 
     /// `#[serial]`: see `default_passkeys_dir_ends_with_passkeys_component`.
     #[test]
     #[serial_test::serial]
     fn default_toolsets_dir_ends_with_toolsets() {
-        let temporary = tempfile::tempdir().unwrap();
-        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(
-            &temporary
-                .path()
-                .join(stellar_agent_test_support::sandbox::WALLET_DIRECTORY_COMPONENT.trim()),
-        );
-        let dir = default_toolsets_dir().expect("default_toolsets_dir must succeed on CI");
-        assert_eq!(
-            dir.file_name().unwrap(),
-            "toolsets",
-            "default_toolsets_dir must end with 'toolsets'; got: {dir:?}"
-        );
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         assert!(
-            dir.to_string_lossy().contains("stellar-agent"),
-            "default_toolsets_dir must be under stellar-agent directory; got: {dir:?}"
+            sandbox
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
         );
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let path = default_toolsets_dir().unwrap();
+        assert_eq!(path, sandbox.path().join("toolsets"));
     }
 
     // ── audit_log_file_stem: Windows-reserved names (COM / LPT variants) ─────

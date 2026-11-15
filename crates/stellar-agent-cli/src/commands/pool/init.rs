@@ -1148,11 +1148,17 @@ mod tests {
         rpc_url: &str,
         pending: Option<PoolInitialization>,
     ) -> (
-        tempfile::TempDir,
+        stellar_agent_test_support::sandbox::StateSandbox,
         stellar_agent_test_support::StellarAgentHomeGuard,
         stellar_agent_test_support::ProfileEnvVarGuard,
     ) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         let mut profile =
@@ -1242,7 +1248,13 @@ mod tests {
         let server = crate::test_rpc::ClassicRpc::testnet(&[&funder])
             .serve()
             .await;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let _env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         stellar_agent_test_support::keyring_mock::install().unwrap();
@@ -1481,7 +1493,13 @@ mod tests {
         }
 
         async fn exercise(case: Case) {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                dir.path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
             let _env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
             let name = format!("pool-witness-{case:?}").to_ascii_lowercase();
@@ -1854,7 +1872,13 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn policy_pin_coordinate_refuses_without_writing() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let _env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         let name = "pin-refusal";

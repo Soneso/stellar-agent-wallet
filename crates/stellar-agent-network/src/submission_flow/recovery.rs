@@ -412,14 +412,20 @@ pub(crate) mod tests {
         fx: Fx,
         receipts: ReceiptStore,
         writer: Arc<Mutex<AuditWriter>>,
-        home: tempfile::TempDir,
         _guard: StellarAgentHomeGuard,
+        home: stellar_agent_test_support::sandbox::StateSandbox,
     }
 
     impl Rig {
         fn new() -> Self {
             let fx = Fx::new();
-            let home = tempfile::tempdir().unwrap();
+            let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                home.path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let guard = StellarAgentHomeGuard::new(home.path());
             let receipts = crate::submission_flow::open_receipts("ops").unwrap();
             let writer = writer_at(&fx.profile.audit_log_path);
@@ -653,7 +659,14 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial]
     async fn recovery_dispatch_keeps_both_refusals() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut rig = Rig::new();
         unknown_due(&mut rig.fx, 1);
@@ -794,7 +807,14 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn recovery_repair_detail_bounds_17_refusals() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         assert_bounded_repair_detail(17);
     }
@@ -802,7 +822,14 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn recovery_repair_detail_bounds_40_refusals() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         assert_bounded_repair_detail(40);
     }
@@ -810,7 +837,14 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn recovery_poisoned_writer_reports_unknown_acknowledgement() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut rig = Rig::new();
         commit_checked(&mut rig.fx, 1, Checked::NotIncluded);
@@ -873,7 +907,14 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn recovery_receipt_projection_requires_committed_proof_and_repairs_after_restart() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut rig = Rig::new();
         let (_, success) = commit_checked(&mut rig.fx, 1, Checked::Succeeded);
@@ -950,7 +991,14 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn recovery_projection_write_failure_keeps_retry_refused() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut rig = Rig::new();
         let (handle, commit) = commit_checked(&mut rig.fx, 1, Checked::NotIncluded);
@@ -990,7 +1038,14 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn recovery_projection_ack_failure_replays_once() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut rig = Rig::new();
         let (_, commit) = commit_checked(&mut rig.fx, 1, Checked::NotIncluded);
@@ -1029,7 +1084,14 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn recovery_projection_names_only_its_attempt() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut rig = Rig::new();
         let (handle, predecessor) = commit_checked(&mut rig.fx, 1, Checked::NotIncluded);
@@ -1072,7 +1134,14 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn recovery_projection_second_pass_is_byte_identical() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut rig = Rig::new();
         for (n, checked) in [
@@ -1106,7 +1175,14 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial]
     async fn recovery_projection_tampered_window_refuses() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut rig = Rig::new();
         commit_checked(&mut rig.fx, 1, Checked::NotIncluded);
@@ -1141,7 +1217,14 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial]
     async fn recovery_projection_continues_after_missing_fact() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut rig = Rig::new();
         historical_without(&mut rig.fx, 1, Checked::NotIncluded, "submission_ledger");
@@ -1178,7 +1261,14 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn recovery_exact_projection_names_missing_fact() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         for (checked, field, refusal) in [
             (Checked::NotIncluded, "source", "recovery.retry_refused"),
@@ -1241,7 +1331,14 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn recovery_projection_failure_code_survives_truncation() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         use sha2::{Digest as _, Sha256};
         let mut rig = Rig::new();
@@ -1298,7 +1395,14 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn recovery_projection_maps_checked_outcomes() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut rig = Rig::new();
         for (n, checked) in [
@@ -1324,7 +1428,14 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn recovery_projection_preserves_operator_clear() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut rig = Rig::new();
         let (_, commit) = commit_checked(&mut rig.fx, 1, Checked::NotIncluded);
@@ -1367,7 +1478,14 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn recovery_projection_preserves_approval_consumption() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut rig = Rig::new();
         let (_, commit, nonce) = commit_approved(&mut rig.fx, 1, Checked::NotIncluded);
@@ -1478,7 +1596,14 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn recovery_projection_keeps_the_stored_muxed_destination() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut rig = Rig::new();
         let (m0, m17) = (muxed(0), muxed(17));
@@ -1571,7 +1696,14 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn recovery_projection_refuses_another_destination() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut rig = Rig::new();
         commit_checked(&mut rig.fx, 1, Checked::Succeeded);
@@ -1651,7 +1783,14 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn recovery_projection_after_accounting_expiry_keeps_decision_precedence() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         for (n, checked) in [
             (1, Checked::NotIncluded),
@@ -1694,7 +1833,14 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn recovery_projection_repairs_expiry_first() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         for (n, checked) in [
             (1, Checked::Succeeded),
@@ -1756,7 +1902,14 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn recovery_projection_reads_historical_consumption_ledger() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         for approval in [true, false] {
             let mut rig = Rig::new();
@@ -1824,7 +1977,14 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial]
     async fn recovery_status_logs_projection_refusal_and_returns_answer() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         use stellar_agent_test_support::log_capture::CaptureWriter;
         let mut rig = Rig::new();
@@ -1870,7 +2030,14 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial]
     async fn recovery_dispatch_reports_projection_refusal_after_sequence_recovery() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut rig = Rig::new();
         commit_checked(&mut rig.fx, 1, Checked::NotIncluded);
@@ -1932,7 +2099,14 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial]
     async fn recovery_repair_refusal_precedes_missing_sequence_evidence() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut rig = Rig::new();
         let (_, refused) =
@@ -1987,7 +2161,14 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial]
     async fn recovery_missing_sequence_evidence_precedes_completion() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         use crate::policy_state::recovery::{
             RecoveryEndpoint, RecoveryFailure, RecoveryMethod, RecoveryReason,
@@ -2021,7 +2202,14 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial]
     async fn recovery_partial_repair_renders_completed_work() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut rig = Rig::new();
         let (_, refused) =
@@ -2133,7 +2321,14 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial]
     async fn recovery_projection_skips_missing_inputs_and_stored_replay() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut rig = Rig::new();
         let (_, commit) = commit_checked(&mut rig.fx, 1, Checked::NotIncluded);
@@ -2180,7 +2375,14 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial]
     async fn recovery_status_rereads_projected_approval_nonce() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut rig = Rig::new();
         let (_, commit, nonce) = commit_approved(&mut rig.fx, 1, Checked::NotIncluded);
@@ -2235,7 +2437,14 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial]
     async fn recovery_exposure_persists_zero_entry_identity() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         use crate::mainnet::fixtures::{self, LedgerFixture, SEQUENCE, SIGNER_SEED};
         use crate::policy_state::operations::tests::{

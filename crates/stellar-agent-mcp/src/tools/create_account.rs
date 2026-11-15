@@ -1421,7 +1421,13 @@ mod tests {
     #[serial_test::serial(keyring)]
     #[serial_test::serial]
     async fn muxed_contract_create_stages_refuse_before_state() {
-        let home = tempfile::tempdir().expect("home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         stellar_agent_test_support::keyring_mock::install().expect("keyring");
         let server = WalletServer::new(

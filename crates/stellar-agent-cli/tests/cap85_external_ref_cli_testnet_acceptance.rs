@@ -45,8 +45,10 @@
     reason = "test-only; panics and diagnostic output are acceptable in testnet acceptance tests"
 )]
 
+#[path = "cli/acceptance_storage.rs"]
+mod acceptance_storage;
+
 use std::path::Path;
-use std::process::Command;
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -283,7 +285,7 @@ async fn invoke_beacon(
 }
 
 /// Runs the binary with `args`, `STELLAR_AGENT_HOME` and `HOME` under
-/// `home`, the headless keyring backend, and `envs`. Returns
+/// `home`, the selected acceptance store, and `envs`. Returns
 /// `(exit_code, last_stdout_line_as_json, stdout, stderr)`.
 fn run_cli(
     home: &Path,
@@ -293,17 +295,15 @@ fn run_cli(
 ) -> (i32, serde_json::Value, String, String) {
     stellar_agent_test_support::sandbox::mark_sandbox(&home.join("agent"))
         .expect("mark fixture directory");
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_stellar-agent"));
-    cmd.args(cfg!(feature = "live-platform-keyring").then_some("--test-live-platform-keyring"));
+    let mut cmd = acceptance_storage::command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        &home.join("agent"),
+        Some(keyring_key),
+    );
     cmd.args(args)
         .env("STELLAR_AGENT_HOME", home.join("agent"))
         .env("HOME", home.join("home"))
-        .env_remove("STELLAR_AGENT_PROFILE")
-        .env(
-            stellar_agent_headless_keyring::BACKEND_ENV_VAR,
-            "headless-env",
-        )
-        .env(stellar_agent_headless_keyring::ENV_KEY_VAR, keyring_key);
+        .env_remove("STELLAR_AGENT_PROFILE");
     for (k, v) in envs {
         cmd.env(k, v);
     }

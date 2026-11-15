@@ -98,7 +98,7 @@ fn normalize(text: &str) -> String {
 }
 
 async fn check(case: Case) {
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let rpc = endpoint(case == Case::Failure).await;
     let max_time = if case == Case::Released { 1 } else { 0 };
     fixture_with(home.path(), &rpc.uri(), 7, max_time);
@@ -119,15 +119,18 @@ async fn check(case: Case) {
             )
             .unwrap();
     }
-    stellar_agent_test_support::sandbox::mark_sandbox(home.path()).expect("mark fixture directory");
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-        .args(["tx", "status", TX_HASH, "--profile", PROFILE])
-        .env("STELLAR_AGENT_HOME", home.path())
-        .env_remove("STELLAR_AGENT_PROFILE")
-        .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
-        .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY)
-        .output()
-        .unwrap();
+    let output = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home.path(),
+    )
+    .expect("isolated CLI child")
+    .args(["tx", "status", TX_HASH, "--profile", PROFILE])
+    .env("STELLAR_AGENT_HOME", home.path())
+    .env_remove("STELLAR_AGENT_PROFILE")
+    .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+    .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY)
+    .output()
+    .unwrap();
     assert_eq!(output.status.code(), Some(i32::from(case == Case::Failure)));
     let mut actual =
         normalize(&String::from_utf8(output.stdout).unwrap()).replace(&rpc.uri(), "RPC_URL");

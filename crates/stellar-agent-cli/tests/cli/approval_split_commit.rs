@@ -7,7 +7,7 @@
     reason = "integration assertions"
 )]
 
-use std::{path::PathBuf, process::Command, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signer, SigningKey};
@@ -44,24 +44,28 @@ struct SplitPayment {
     nonce: String,
     attestation: String,
     _home_guard: StellarAgentHomeGuard,
-    home: tempfile::TempDir,
+    home: stellar_agent_test_support::sandbox::StateSandbox,
 }
 
 impl SplitPayment {
     /// Runs the real binary with `args` under the fixture home and keyring.
     fn cli(&self, args: &[&str]) -> std::process::Output {
-        Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-            .args(args)
-            .env("STELLAR_AGENT_HOME", self.home.path())
-            .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
-            .env(
-                "STELLAR_AGENT_HEADLESS_KEYRING_KEY",
-                URL_SAFE_NO_PAD.encode(self.protection_key),
-            )
-            .env_remove("STELLAR_AGENT_PROFILE")
-            .stdin(std::process::Stdio::null())
-            .output()
-            .unwrap()
+        stellar_agent_test_support::cli_child::cli_command(
+            env!("CARGO_BIN_EXE_stellar-agent"),
+            self.home.path(),
+        )
+        .expect("isolated CLI child")
+        .args(args)
+        .env("STELLAR_AGENT_HOME", self.home.path())
+        .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+        .env(
+            "STELLAR_AGENT_HEADLESS_KEYRING_KEY",
+            URL_SAFE_NO_PAD.encode(self.protection_key),
+        )
+        .env_remove("STELLAR_AGENT_PROFILE")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap()
     }
 
     /// The commit arguments of `sim` with the approval nonce and attestation.
@@ -93,7 +97,13 @@ impl SplitPayment {
 /// Prepares a payment that a `require_approval` rule of 617 s gates, and
 /// approves it through `approve --id <nonce> --profile <name> --yes`.
 async fn approved_split_payment(name: &'static str) -> SplitPayment {
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        home.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home_guard = StellarAgentHomeGuard::new(home.path());
     let protection_key = [7; 32];
     let keyring: Arc<keyring_core::CredentialStore> =
@@ -228,18 +238,22 @@ reason = "Operator review"
     let nonce = sim["data"]["approval"]["approval_nonce"]
         .as_str()
         .expect("paired commit creates an operator request");
-    let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-        .args(["approve", "--id", nonce, "--profile", name, "--yes"])
-        .env("STELLAR_AGENT_HOME", home.path())
-        .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
-        .env(
-            "STELLAR_AGENT_HEADLESS_KEYRING_KEY",
-            URL_SAFE_NO_PAD.encode(protection_key),
-        )
-        .env_remove("STELLAR_AGENT_PROFILE")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .unwrap();
+    let output = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home.path(),
+    )
+    .expect("isolated CLI child")
+    .args(["approve", "--id", nonce, "--profile", name, "--yes"])
+    .env("STELLAR_AGENT_HOME", home.path())
+    .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+    .env(
+        "STELLAR_AGENT_HEADLESS_KEYRING_KEY",
+        URL_SAFE_NO_PAD.encode(protection_key),
+    )
+    .env_remove("STELLAR_AGENT_PROFILE")
+    .stdin(std::process::Stdio::null())
+    .output()
+    .unwrap();
     assert!(
         output.status.success(),
         "stdout={} stderr={}",
@@ -394,7 +408,13 @@ async fn gc_include_consumed_keeps_receipt_replay_protection() {
 #[serial]
 fn approve_gc_default_keeps_consumed_rows_and_its_json() {
     const NAME: &str = "gc-default";
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        home.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home_guard = StellarAgentHomeGuard::new(home.path());
     let account = stellar_strkey::ed25519::PublicKey([0x31; 32])
         .to_string()
@@ -442,13 +462,17 @@ fn approve_gc_default_keeps_consumed_rows_and_its_json() {
         );
     }
     std::thread::sleep(std::time::Duration::from_millis(5));
-    let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-        .args(["approve", "gc", "--profile", NAME])
-        .env("STELLAR_AGENT_HOME", home.path())
-        .env_remove("STELLAR_AGENT_PROFILE")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .unwrap();
+    let output = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home.path(),
+    )
+    .expect("isolated CLI child")
+    .args(["approve", "gc", "--profile", NAME])
+    .env("STELLAR_AGENT_HOME", home.path())
+    .env_remove("STELLAR_AGENT_PROFILE")
+    .stdin(std::process::Stdio::null())
+    .output()
+    .unwrap();
     assert!(
         output.status.success(),
         "stdout={} stderr={}",

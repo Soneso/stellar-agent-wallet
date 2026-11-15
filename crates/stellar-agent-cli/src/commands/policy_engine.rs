@@ -1224,7 +1224,13 @@ mod tests {
     #[serial_test::serial]
     fn unsigned_engine_selection_refuses_before_payment() {
         stellar_agent_test_support::keyring_mock::install().unwrap();
-        let home = tempfile::TempDir::new().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let name = "engine-selection";
         let key = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
@@ -1272,7 +1278,13 @@ mod tests {
     #[serial_test::serial]
     fn engine_selection_refusal_preserves_typed_code() {
         stellar_agent_test_support::keyring_mock::install().unwrap();
-        let home = tempfile::TempDir::new().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let name = "typed-selection";
         let key = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
@@ -1503,7 +1515,13 @@ mod tests {
 
         const NAME: &str = "chain-parity";
         const SOURCE: &str = "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI";
-        let home = tempfile::tempdir().expect("isolated home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("isolated home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = StellarAgentHomeGuard::new(home.path());
         keyring_mock::install().expect("mock keyring");
         let rpc = MockServer::start().await;
@@ -2523,7 +2541,13 @@ decision = "allow"
     fn the_engine_builder_refuses_an_older_form_keyring_entry() {
         use base64::Engine as _;
         stellar_agent_test_support::keyring_mock::install().unwrap();
-        let home = tempfile::TempDir::new().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let name = "engine-rewrite";
         write_v1_profile_toml(home.path(), name);
         let _home_guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
@@ -2557,7 +2581,13 @@ decision = "allow"
     fn the_engine_builder_refuses_an_older_form_test_owner_file() {
         use base64::Engine as _;
         stellar_agent_test_support::keyring_mock::install().unwrap();
-        let home = tempfile::TempDir::new().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let name = "engine-file";
         write_v1_profile_toml(home.path(), name);
         let older_form = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x62_u8; 32]);
@@ -2600,7 +2630,13 @@ decision = "allow"
         use ed25519_dalek::SigningKey;
         use rand_core::OsRng;
 
-        let home = tempfile::TempDir::new().expect("tempdir");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("tempdir");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let name = "forged-hazard";
         write_v1_profile_toml(home.path(), name);
 
@@ -2661,7 +2697,7 @@ decision = "allow"
         profile: Profile,
         _home_guard: stellar_agent_test_support::StellarAgentHomeGuard,
         _pubkey_guard: TestEnvVarGuard,
-        _home: tempfile::TempDir,
+        _home: stellar_agent_test_support::sandbox::StateSandbox,
     }
 
     fn unvalued_recorder_fixture(name: &str, policy_body: &str) -> UnvaluedRecorderFixture {
@@ -2670,7 +2706,13 @@ decision = "allow"
 
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring store init");
 
-        let home = tempfile::TempDir::new().expect("tempdir");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("tempdir");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         write_v1_profile_toml(home.path(), name);
 
         let owner_sk = SigningKey::generate(&mut OsRng);
@@ -2843,7 +2885,13 @@ decision = "allow"
 
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring store init");
 
-        let home = tempfile::TempDir::new().expect("tempdir");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("tempdir");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let name = "cross-process-seam";
         write_v1_profile_toml(home.path(), name);
 
@@ -2954,9 +3002,9 @@ decision = "allow"
         profile: Profile,
         requested_store: std::path::PathBuf,
         derived_store: std::path::PathBuf,
-        _home: tempfile::TempDir,
         _home_guard: stellar_agent_test_support::StellarAgentHomeGuard,
         _pubkey_guard: TestEnvVarGuard,
+        _home: stellar_agent_test_support::sandbox::StateSandbox,
     }
 
     /// Builds the fixture: a v1 profile at `<home>/profiles/i114-requested.toml`
@@ -2986,7 +3034,13 @@ decision = "allow"
 
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring store init");
 
-        let home = tempfile::TempDir::new().expect("tempdir");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("tempdir");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         write_v1_profile_toml_owned_by(home.path(), I114_REQUESTED, I114_DERIVED);
 
         let owner_sk = SigningKey::generate(&mut OsRng);
@@ -3223,7 +3277,14 @@ decision = "allow"
             (true, 2, true),
         ] {
             stellar_agent_test_support::keyring_mock::install().unwrap();
-            let directory = tempfile::tempdir().unwrap();
+            let directory = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                directory
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(directory.path());
             let profile = if mainnet {
                 Profile::builder_mainnet_named(

@@ -307,7 +307,13 @@ async fn cli_and_mcp_authorization_fingerprint_and_preview_match() {
     };
 
     const PROFILE_NAME: &str = "mpp-preview-parity";
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
+    assert!(
+        home.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home_guard = StellarAgentHomeGuard::new(home.path());
     keyring_mock::install().expect("mock keyring");
     install_test_nonce_key(243);
@@ -464,7 +470,13 @@ fn row_count(path: &std::path::Path) -> usize {
 #[tokio::test]
 #[serial]
 async fn mpp_charge_commit_refuses_tip_anchor_mismatch_when_the_log_is_rolled_back() {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
+    assert!(
+        home.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home_guard = StellarAgentHomeGuard::new(home.path());
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(240);
@@ -596,7 +608,13 @@ async fn mpp_accounting_cap_refusal_withholds_the_credential() {
     use stellar_agent_core::policy::v1::criteria::state_store::{PolicyStateStore, StateKey};
     use stellar_agent_core::policy::v1::loader::{PolicyDocument, PolicyRule, RuleMatch, ScopeId};
     use stellar_agent_network::policy_state::PersistedWindowStore;
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        home.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home = StellarAgentHomeGuard::new(home.path());
     keyring_mock::install().unwrap();
     install_test_nonce_key(241);
@@ -678,7 +696,13 @@ async fn x402_accounting_cap_refusal_withholds_the_payment_signature() {
     use stellar_agent_mcp::server::X402CreatePaymentArgs;
     use stellar_agent_network::policy_state::PersistedWindowStore;
     const PROFILE: &str = "x402-admission";
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        home.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home = StellarAgentHomeGuard::new(home.path());
     keyring_mock::install().unwrap();
     install_test_nonce_key(242);
@@ -769,13 +793,13 @@ async fn x402_accounting_cap_refusal_withholds_the_payment_signature() {
 
 /// One MPP server over a mock RPC: the payer, the profile, and the server.
 struct MppFixture {
-    _home: tempfile::TempDir,
-    _home_guard: StellarAgentHomeGuard,
     _mock: MockServer,
     profile: Profile,
     server: WalletServer,
     signed_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     payer: String,
+    _home_guard: StellarAgentHomeGuard,
+    _home: stellar_agent_test_support::sandbox::StateSandbox,
 }
 
 /// Builds a server for `profile_name`. `seed_secret` decides whether the
@@ -791,7 +815,13 @@ async fn mpp_fixture(
     seed_secret: bool,
     configure: impl FnOnce(SponsoredSimulateResponder, &Profile) -> SponsoredSimulateResponder,
 ) -> MppFixture {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
+    assert!(
+        home.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let home_guard = StellarAgentHomeGuard::new(home.path());
     keyring_mock::install().expect("mock keyring");
     install_test_nonce_key(244);

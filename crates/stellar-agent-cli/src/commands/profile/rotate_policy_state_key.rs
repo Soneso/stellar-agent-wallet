@@ -370,17 +370,20 @@ mod tests {
     // Defensive #[serial] — see enroll_signer.rs for full rationale; the
     // test binary observes a flaky race during parallel execution that
     // clobbers sibling #[serial] keyring tests' mock store.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn rotate_policy_state_key_nonexistent_profile_returns_exit_1() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let args = RotatePolicyStateKeyArgs {
             name: Some("__nonexistent_rotate_policy_state_key__".to_owned()),
             profile: None,
         };
         let code = run(&args).await;
         assert_eq!(code, 1);
+        fixture.assert_refusal(
+            Some("validation.profile_not_found"),
+            &["the requested profile was not found"],
+        );
     }
 
     fn put_raw(entry_ref: &stellar_agent_core::profile::schema::KeyringEntryRef, value: &str) {
@@ -483,12 +486,18 @@ mod tests {
         .await;
     }
     fn rotation_fixture() -> (
-        tempfile::TempDir,
+        stellar_agent_test_support::sandbox::StateSandbox,
         stellar_agent_core::profile::schema::Profile,
         PersistedWindowStore,
     ) {
         stellar_agent_test_support::keyring_mock::install().unwrap();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let mut profile = stellar_agent_core::profile::schema::Profile::builder_testnet_named(
             "rotate-scope",
             "s",

@@ -512,7 +512,13 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn run_refuses_mainnet_before_keyring_and_any_request() {
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         crate::common::render::take_rendered_for_test();
         let rpc = wiremock::MockServer::start().await;
@@ -554,7 +560,13 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn run_initialises_keyring_store_before_signer_resolution() {
-        let home = tempfile::tempdir().expect("home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         // The keyring initialiser must be invoked on the run() path, after the
         // profile load and before the signer is resolved from the keyring.

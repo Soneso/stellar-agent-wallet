@@ -178,8 +178,8 @@ fn envelope_message(response: &Value) -> String {
 
 /// Everything one test holds for the lifetime of its server.
 struct Fixture {
-    root: tempfile::TempDir,
     _home: StellarAgentHomeGuard,
+    root: stellar_agent_test_support::sandbox::StateSandbox,
     rpc: wiremock::MockServer,
     signer_reads: Arc<AtomicUsize>,
     profile: Profile,
@@ -187,7 +187,13 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
-        let root = tempfile::tempdir().unwrap();
+        let root = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            root.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let home = StellarAgentHomeGuard::new(root.path());
         let rpc = wiremock::MockServer::start().await;
         let signer_reads = Arc::new(AtomicUsize::new(0));
@@ -831,13 +837,13 @@ fn install_headless_store(home: &Path) -> DefaultStoreGuard {
 /// the temporary home is removed.
 struct HeadlessHome {
     _store: DefaultStoreGuard,
-    home: tempfile::TempDir,
+    home: stellar_agent_test_support::sandbox::StateSandbox,
     profile: Profile,
 }
 
 impl HeadlessHome {
     fn new() -> Self {
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let store = install_headless_store(home.path());
         let profile =
             Profile::builder_testnet(SIGNER_SERVICE, SIGNER_ACCOUNT, "halt-e2e-nonce", "default")
@@ -869,8 +875,7 @@ impl HeadlessHome {
 
     /// The binary bound to this home and the headless keyring.
     fn command(&self) -> Command {
-        stellar_agent_test_support::sandbox::mark_sandbox(self.home.path()).unwrap();
-        let mut command = crate::common::server_binary::server_command();
+        let mut command = crate::common::server_binary::server_command(self.home.path());
         command
             .args(["--profile", PROFILE])
             .env("STELLAR_AGENT_HOME", self.home.path())

@@ -12,12 +12,10 @@
 //!
 //! # Fixture setup
 //!
-//! A fresh temp directory stands in for `STELLAR_AGENT_HOME` (only ever set on
-//! the CHILD processes' environments, never the test-process environment).
-//! The profile name is unique per test run
-//! (`profile-init-acceptance-<pid>-<unix_secs>-<n>`) so the OS keyring coordinate
-//! `enroll-signer` writes to (below) never collides with a concurrent or
-//! prior local run.
+//! Parent and child processes share one owned, marked `STELLAR_AGENT_HOME`
+//! and the explicitly selected acceptance store. The profile name is unique
+//! per run (`profile-init-acceptance-<pid>-<unix_secs>-<n>`) so its keyring
+//! coordinates remain distinct across concurrent runs.
 //!
 //! 1. A signer ed25519 keypair is generated in-process and Friendbot-funded
 //!    (an existing, funded source account; the classic `ChangeTrust`
@@ -36,7 +34,7 @@
 //! 4. `stellar-agent profile enroll-signer --profile <name> --secret-env
 //!    <VAR>` is spawned with the signer's `S...` seed set only on that
 //!    subprocess's environment. The production write path (`enroll_signer.rs`)
-//!    both writes the seed to the OS keyring AND rewrites the profile TOML's
+//!    writes the seed to the selected store and rewrites the profile TOML's
 //!    `mcp_signer_default.account` from the placeholder to the derived
 //!    G-strkey — the completeness fix under test.
 //! 5. Negative proof of the fail-closed audit-pre-flight gate: `stellar-agent
@@ -54,7 +52,7 @@
 //! 7. `stellar-agent trustline --profile <name> --from <signer_g> --asset
 //!    <code>:<issuer_g>` is spawned with NO secret-env flag, this time
 //!    against a real Friendbot-funded issuer: it resolves the signer purely
-//!    through the profile + OS keyring coordinate `enroll-signer` populated,
+//!    through the profile and store coordinate `enroll-signer` populated,
 //!    and now proceeds past the audit pre-flight. A cheap classic
 //!    `ChangeTrust` is used as the "tiny funded testnet signing operation".
 //! 8. The profile's (tempdir-scoped) audit log file is read back and asserted
@@ -65,12 +63,10 @@
 //! # Audit-log isolation
 //!
 //! An unset `audit_log_path` resolves to the per-profile
-//! `default_audit_log_path_for(name)` under the canonical data root — for a
-//! release-shaped subprocess that is still a real host location. Step 3
-//! above rewrites the persisted `audit_log_path` field to a path inside this
-//! test's own tempdir before any subprocess reads it, pinning the exact file
-//! the final row assertion reads and keeping every step hermetic regardless
-//! of how the subprocess binary resolves its data root.
+//! `default_audit_log_path_for(name)` under the shared marked home. Step 3
+//! rewrites the persisted `audit_log_path` field to pin the exact file read
+//! by the final row assertion. The fixture owns that home until every child
+//! and in-process store operation has finished.
 //!
 //! # Cleanup
 //!
@@ -79,15 +75,14 @@
 //! assertion failure, or early return) so a panicking assertion never leaks a
 //! keyring entry — belt-and-suspenders on top of the per-run unique profile
 //! name. The profile TOML and the redirected audit log both live inside the
-//! test's own `tempfile::TempDir`, which is removed on drop.
+//! test's own `StateSandbox`, which removes its directory on drop.
 //!
-//! # Platform keyring precondition
+//! # Storage route
 //!
-//! `enroll-signer` and `trustline` both register the platform keyring store
-//! before touching it, so this suite requires a functioning platform keyring
-//! (macOS Keychain in local dev; a headless Secret Service, provisioned by the
-//! CI workflow via gnome-keyring, in CI). Keyring init failure fails this
-//! test — it is not an infrastructure precondition to be skipped.
+//! The acceptance driver configures an encrypted headless store by default.
+//! Platform selection requires the live feature and its exact permit, with
+//! a functioning native store. Parent and children use the same selection.
+//! Store registration failure fails the test.
 //!
 //! Gated behind `testnet-acceptance`:
 //!
@@ -104,8 +99,10 @@
     reason = "test-only; panics and unwraps are acceptable in testnet acceptance tests"
 )]
 
+#[path = "cli/acceptance_storage.rs"]
+mod acceptance_storage;
+
 use std::path::Path;
-use std::process::Command;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
@@ -138,7 +135,7 @@ const PROOF_ASSET_CODE: &str = "ACCTPROOF";
 /// `profile-init-acceptance-<pid>-<unix_secs>-<n>`.
 ///
 /// The profile TOML lives inside the test's own fresh tempdir and so cannot
-/// collide across runs on its own, but the OS keyring coordinate
+/// collide across runs on its own, but the selected store coordinate
 /// `enroll-signer` writes to (`stellar-agent-signer-<profile>` /
 /// `<derived_g>`) is OS-global, not tempdir-scoped — the profile name must be
 /// unique per run so repeated local runs (or a concurrent CI matrix) never
@@ -184,7 +181,7 @@ async fn wait_until_account_queryable(client: &StellarRpcClient, g_strkey: &str)
 
 /// RAII guard that deletes every keyring entry this test mints, on drop
 /// (success, assertion panic, or early return alike), so a failed test run
-/// never leaks an entry into the OS keyring — belt-and-suspenders on top of
+/// never leaves an entry in the selected store, in addition to
 /// [`unique_profile_name`]'s per-run namespacing.
 ///
 /// Holds the signer coordinate `enroll-signer` writes AND the audit
@@ -225,8 +222,7 @@ impl Drop for KeyringCleanupGuard {
 fn run_profile_init(home: &Path, profile: &str) -> serde_json::Value {
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
     stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
-    let output = Command::new(bin_path)
-        .args(cfg!(feature = "live-platform-keyring").then_some("--test-live-platform-keyring"))
+    let output = acceptance_storage::command(bin_path, home, None)
         .args([
             "profile",
             "init",
@@ -261,8 +257,7 @@ fn run_profile_init(home: &Path, profile: &str) -> serde_json::Value {
 fn run_enroll_signer(home: &Path, profile: &str, s_strkey: &str) -> serde_json::Value {
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
     stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
-    let output = Command::new(bin_path)
-        .args(cfg!(feature = "live-platform-keyring").then_some("--test-live-platform-keyring"))
+    let output = acceptance_storage::command(bin_path, home, None)
         .args([
             "profile",
             "enroll-signer",
@@ -295,8 +290,7 @@ fn run_enroll_signer(home: &Path, profile: &str, s_strkey: &str) -> serde_json::
 fn run_rotate_audit_key(home: &Path, profile: &str) -> serde_json::Value {
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
     stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
-    let output = Command::new(bin_path)
-        .args(cfg!(feature = "live-platform-keyring").then_some("--test-live-platform-keyring"))
+    let output = acceptance_storage::command(bin_path, home, None)
         .args(["profile", "rotate-audit-key", profile])
         .env("STELLAR_AGENT_HOME", home)
         .output()
@@ -331,8 +325,7 @@ fn run_trustline(
 ) -> (i32, serde_json::Value) {
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
     stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
-    let output = Command::new(bin_path)
-        .args(cfg!(feature = "live-platform-keyring").then_some("--test-live-platform-keyring"))
+    let output = acceptance_storage::command(bin_path, home, None)
         .args([
             "trustline",
             "--profile",
@@ -376,29 +369,25 @@ fn run_trustline(
 #[tokio::test]
 #[serial_test::serial]
 async fn profile_init_then_enroll_signer_enables_a_real_signing_operation() {
-    let storage_sandbox =
-        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
-    let _storage_home =
-        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-    // `enroll-signer` and `trustline` both register the platform keyring
-    // store before touching it, so this suite needs a functioning platform
-    // keyring (macOS Keychain locally; a headless Secret Service, provisioned
-    // by the CI workflow, on Linux CI runners). The test process also needs
-    // it initialised directly for `KeyringCleanupGuard`'s cleanup delete.
-    #[cfg(feature = "live-platform-keyring")]
-    if std::env::var("STELLAR_AGENT_TEST_LIVE_PLATFORM_KEYRING").as_deref()
-        == Ok("real-platform-keyring")
-    {
-        use stellar_agent_network::keyring::live::{
-            LivePlatformKeyring, init_platform_keyring_store_live,
-        };
-        init_platform_keyring_store_live(LivePlatformKeyring::acknowledge_real_platform_keyring())
-            .expect("live acceptance platform store");
-    }
-    stellar_agent_network::init_platform_keyring_store()
-        .expect("platform keyring store must initialise on this host");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+    // Parent key reads and child key writes share this owned home and the
+    // explicitly selected acceptance backend. Native access needs its permit.
+    acceptance_storage::dispatch(stellar_agent_network::init_platform_keyring_store, || {
+        #[cfg(feature = "live-platform-keyring")]
+        {
+            use stellar_agent_network::keyring::live::{
+                LivePlatformKeyring, init_platform_keyring_store_live,
+            };
+            init_platform_keyring_store_live(
+                LivePlatformKeyring::acknowledge_real_platform_keyring(),
+            )
+        }
+        #[cfg(not(feature = "live-platform-keyring"))]
+        unreachable!("selection requires the native feature")
+    })
+    .expect("selected acceptance store");
 
-    let home = tempfile::TempDir::new().expect("tempdir");
     let profile_name = unique_profile_name();
 
     // ── Fixture: a funded testnet signer account ──────────────────────────────

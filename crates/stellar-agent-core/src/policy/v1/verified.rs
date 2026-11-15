@@ -830,7 +830,14 @@ mod tests {
     #[test]
     #[serial]
     fn loads_beside_a_reader_take_the_exclusive_lock_only_to_write() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let f = Fixture::new();
         f.seed_pin();

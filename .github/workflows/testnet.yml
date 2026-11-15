@@ -18,6 +18,14 @@ on:
           substring (empty runs the full leg)
         required: false
         default: ''
+      keyring:
+        description: Storage route for native-capable suites
+        type: choice
+        required: false
+        default: headless
+        options:
+          - headless
+          - platform
       mainnet_write:
         description: >-
           Run every suite against the build with mainnet-write on
@@ -84,14 +92,8 @@ jobs:
           # The testnet feature set builds a different dependency graph from
           # the offline jobs; keep it in its own cache.
           prefix-key: testnet
-      # pay_policy_v1_testnet_acceptance (stellar-agent-cli) registers the
-      # platform keyring store before its policy gate and requires a
-      # functioning Secret Service; the runner has no login session or
-      # keyring by default. gnome-keyring provides the Secret Service
-      # implementation; dbus provides `dbus-run-session`, which brackets the
-      # whole driver invocation in a private D-Bus session bus so the keyring
-      # daemon and every `cargo test` / `stellar-agent` child process it
-      # spawns land on the same bus scope.
+      # Platform selection requires a functioning Secret Service. The private
+      # D-Bus session keeps the store and all acceptance children on one bus.
       - name: Install gnome-keyring (Linux Secret Service for the CLI v1-policy suite)
         run: sudo apt-get -o Acquire::Retries=3 install -y gnome-keyring dbus
       # The MPP and SEP-43 released-SDK interop suites assert the frozen Node
@@ -109,6 +111,7 @@ jobs:
           SHARE: 1/2
           FILTER: ${{ inputs.filter }}
           MAINNET_WRITE: ${{ inputs.mainnet_write && 'on' || 'off' }}
+          STELLAR_AGENT_TEST_KEYRING: ${{ inputs.keyring || 'headless' }}
           STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL: ${{ vars.TESTNET_SECONDARY_RPC_URL }}
         run: |
           dbus-run-session -- bash -c '
@@ -159,14 +162,8 @@ jobs:
           # The testnet feature set builds a different dependency graph from
           # the offline jobs; keep it in its own cache.
           prefix-key: testnet
-      # pay_policy_v1_testnet_acceptance (stellar-agent-cli) registers the
-      # platform keyring store before its policy gate and requires a
-      # functioning Secret Service; the runner has no login session or
-      # keyring by default. gnome-keyring provides the Secret Service
-      # implementation; dbus provides `dbus-run-session`, which brackets the
-      # whole driver invocation in a private D-Bus session bus so the keyring
-      # daemon and every `cargo test` / `stellar-agent` child process it
-      # spawns land on the same bus scope.
+      # Platform selection requires a functioning Secret Service. The private
+      # D-Bus session keeps the store and all acceptance children on one bus.
       - name: Install gnome-keyring (Linux Secret Service for the CLI v1-policy suite)
         run: sudo apt-get -o Acquire::Retries=3 install -y gnome-keyring dbus
       # The MPP and SEP-43 released-SDK interop suites assert the frozen Node
@@ -184,6 +181,7 @@ jobs:
           SHARE: 2/2
           FILTER: ${{ inputs.filter }}
           MAINNET_WRITE: ${{ inputs.mainnet_write && 'on' || 'off' }}
+          STELLAR_AGENT_TEST_KEYRING: ${{ inputs.keyring || 'headless' }}
           STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL: ${{ vars.TESTNET_SECONDARY_RPC_URL }}
         run: |
           dbus-run-session -- bash -c '

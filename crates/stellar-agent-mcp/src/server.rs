@@ -2079,7 +2079,13 @@ mod tests {
     fn settlement_oracle_follows_the_profile_chain() {
         use stellar_agent_core::profile::schema::{PrimaryProviderRecord, ProviderRecord};
         stellar_agent_test_support::keyring_mock::install().unwrap();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let mainnet = Profile::builder_mainnet_named(
             "oracle-wrapper",
@@ -2303,7 +2309,14 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn muxed_destination_reads() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let key = stellar_strkey::ed25519::PublicKey::from_string(SOURCE_G)
             .unwrap()

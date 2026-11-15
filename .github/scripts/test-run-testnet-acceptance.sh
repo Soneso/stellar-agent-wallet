@@ -98,7 +98,9 @@ if grep -qE '^mainnet-write *=' crates/stellar-agent-pool/Cargo.toml; then
 fi
 expect_features() {
   local mainnet_write="$1" crate="$2" want="$3" got
-  got=$(MAINNET_WRITE="$mainnet_write" suite_features "$crate" testnet-acceptance)
+  local target=claim_testnet_acceptance
+  [ "$crate" != stellar-agent-pool ] || target=pool_testnet_init
+  got=$(MAINNET_WRITE="$mainnet_write" suite_features "$crate" testnet-acceptance "$target")
   if [ "$got" = "$want" ]; then
     pass "(c) MAINNET_WRITE=$mainnet_write $crate builds with $want"
   else
@@ -415,11 +417,11 @@ run_keyring_driver() {
     STELLAR_AGENT_TEST_KEYRING="$1" MAINNET_WRITE=off FILTER="$NO_MATCH" PACE=0 RETRY_COOLDOWN=0 \
     BROWSER_RETRY_COOLDOWN=0 bash "$DRIVER" 2>&1
 }
-for value in headless ''; do
+for value in unknown ''; do
   out=$(run_keyring_driver "$value")
   rc=$?
   if [ "$rc" -ne 0 ] \
-    && printf '%s\n' "$out" | grep -qF "STELLAR_AGENT_TEST_KEYRING must be platform or unset, not '$value'" \
+    && printf '%s\n' "$out" | grep -qF "STELLAR_AGENT_TEST_KEYRING must be headless, platform or unset, not '$value'" \
     && ! printf '%s\n' "$out" | grep -qE '^::group::|no suite matched'; then
     pass "(i) STELLAR_AGENT_TEST_KEYRING='$value' fails before the first suite (exit $rc)"
   else
@@ -436,6 +438,82 @@ else
   fail "(i) control: STELLAR_AGENT_TEST_KEYRING=platform: exit $rc, output:"
   printf '%s\n' "$out" >&2
 fi
+# Each registered suite has an independently reviewed storage label.
+expected_storage=$(cat <<'MATRIX'
+stellar-agent-sep10 sep10_round_trip_testnet_acceptance no-keyring
+stellar-agent-sep10 sep10_replay_adversarial no-keyring
+stellar-agent-sep43 sep43_sdk_v17_interop_testnet_acceptance no-keyring
+stellar-agent-sep48 sep48_preview_testnet_acceptance no-keyring
+stellar-agent-sep7 sep7_testnet_acceptance no-keyring
+stellar-agent-anchor anchor_testnet_acceptance no-keyring
+stellar-agent-x402-identity sep10_gate_testnet_acceptance no-keyring
+stellar-agent-network fee_bump_testnet no-keyring
+stellar-agent-network fee_bump_idempotent_testnet no-keyring
+stellar-agent-pool pool_testnet_init fixture
+stellar-agent-pool pool_concurrent_testnet fixture
+stellar-agent-pool load_testnet fixture
+stellar-agent-stablecoin trustline_testnet_acceptance no-keyring
+stellar-agent-x402 x402_exact_testnet_acceptance no-keyring
+stellar-agent-mpp sponsored_testnet_acceptance fixture
+stellar-agent-dex dex_swap_testnet_acceptance no-keyring
+stellar-agent-defindex defindex_vault_testnet_acceptance no-keyring
+stellar-agent-defindex defindex_deposit_submit_testnet_acceptance no-keyring
+stellar-agent-mcp pay_commit_testnet_acceptance fixture
+stellar-agent-mcp create_account_testnet_acceptance fixture
+stellar-agent-mcp trustline_classic_testnet_acceptance fixture
+stellar-agent-mcp policy_value_descriptor_testnet_acceptance fixture
+stellar-agent-mcp rule_create_commit_testnet_acceptance fixture
+stellar-agent-mcp sep43_sign_and_submit_transaction_testnet_acceptance fixture
+stellar-agent-mcp toolset_sign_payment_gated_testnet_acceptance fixture
+stellar-agent-mcp x402_create_payment_testnet_acceptance fixture
+stellar-agent-mcp x402_authenticated_payment_testnet_acceptance fixture
+stellar-agent-mcp claim_commit_testnet_acceptance fixture
+stellar-agent-mcp approve_serve_testnet_acceptance fixture
+stellar-agent-mcp dex_quote_wire_testnet_acceptance fixture
+stellar-agent-cli claim_testnet_acceptance native-capable
+stellar-agent-cli pay_policy_v1_testnet_acceptance native-capable
+stellar-agent-cli pay_timeout_reconcile_testnet_acceptance native-capable
+stellar-agent-cli cli_submit_only_network_binding_testnet_acceptance native-capable
+stellar-agent-cli profile_init_enroll_signer_testnet_acceptance native-capable
+stellar-agent-cli smart_account_execute_testnet_acceptance native-capable
+stellar-agent-cli smart_account_multicall_cli_testnet_acceptance fixture
+stellar-agent-cli cap85_external_ref_cli_testnet_acceptance native-capable
+stellar-agent-smart-account deploy_c_testnet_acceptance no-keyring
+stellar-agent-smart-account quorum_authorization_info_testnet_acceptance fixture
+stellar-agent-smart-account smart_account_caps_testnet_acceptance fixture
+stellar-agent-smart-account smart_account_signers_testnet_acceptance fixture
+stellar-agent-smart-account smart_account_rules_testnet_acceptance fixture
+stellar-agent-smart-account smart_account_rules_pinning_testnet_acceptance fixture
+stellar-agent-smart-account smart_account_list_rules_testnet_acceptance fixture
+stellar-agent-smart-account smart_account_policy_mutators_testnet_acceptance fixture
+stellar-agent-smart-account smart_account_session_rule_expiry_testnet_acceptance fixture
+stellar-agent-smart-account smart_account_session_rule_horizon_testnet_acceptance fixture
+stellar-agent-smart-account smart_account_sim_audit_testnet_acceptance fixture
+stellar-agent-smart-account smart_account_migrate_verifier_testnet_acceptance fixture
+stellar-agent-smart-account-acceptance cap85_external_ref_testnet_acceptance fixture
+stellar-agent-smart-account smart_account_multicall_testnet_acceptance fixture
+stellar-agent-smart-account smart_account_timelock_testnet_acceptance fixture
+stellar-agent-smart-account-acceptance smart_account_rules_webauthn_testnet_acceptance fixture
+stellar-agent-smart-account smart_account_delegation_testnet_acceptance fixture
+stellar-agent-smart-account-acceptance smart_account_policy_observability_testnet_acceptance fixture
+stellar-agent-smart-account-acceptance smart_account_ergonomics_testnet_acceptance fixture
+stellar-agent-approval-remote operator_enroll_browser_acceptance fixture
+stellar-agent-approval-remote mainnet_presence_browser_acceptance fixture
+stellar-agent-approval-remote remote_approval_browser_testnet_acceptance fixture
+stellar-agent-approval-remote rule_proposal_remote_browser_testnet_acceptance fixture
+MATRIX
+)
+while read -r crate target expected; do
+  actual=$(suite_storage "$crate" "$target")
+  if [ "$actual" = "$expected" ]; then pass "storage label $crate/$target $expected";
+  else fail "storage label $crate/$target: $actual, expected $expected"; fi
+done <<< "$expected_storage"
+if suite_features stellar-agent-cli testnet-acceptance unclassified_fixture >/dev/null 2>&1; then
+  fail "unclassified suite must refuse"
+else pass "unclassified suite refuses"; fi
+if (grep() { return 1; }; STELLAR_AGENT_TEST_KEYRING=platform suite_features stellar-agent-cli testnet-acceptance claim_testnet_acceptance) >/dev/null 2>&1; then
+  fail "native route without its feature must refuse"
+else pass "native route without its feature refuses"; fi
 # (j) Every suite receives a marked home below target/tmp/test-sandboxes;
 # the platform leg receives its permit and each declared live feature.
 cat > "$STUB/cargo" <<'STUB_EOF'
@@ -452,40 +530,59 @@ if [ "${STELLAR_AGENT_TEST_KEYRING-}" = platform ]; then
   if [ "${STELLAR_AGENT_TEST_LIVE_PLATFORM_KEYRING-}" != real-platform-keyring ]; then
     echo 'error: could not compile fixture: live permit missing'; exit 101
   fi
-  suite_crate=''
-  next_crate=0
+  suite_crate='' target='' next=''
   for arg in "$@"; do
-    if [ "$next_crate" = 1 ]; then suite_crate=$arg; next_crate=0; fi
-    [ "$arg" != -p ] || next_crate=1
+    case "$next" in crate) suite_crate=$arg ;; target) target=$arg ;; esac
+    next=''
+    case "$arg" in -p) next=crate ;; --test) next=target ;; esac
   done
-  if grep -qE '^live-platform-keyring *=' "$root/crates/$suite_crate/Cargo.toml"; then
-    case "$*" in
-      *live-platform-keyring*) ;;
-      *) echo 'error: could not compile fixture: live feature missing'; exit 101 ;;
-    esac
+  # Independent expected matrix: only these seven CLI targets are native.
+  want_native=0
+  case "$suite_crate/$target" in
+    stellar-agent-cli/claim_testnet_acceptance) want_native=1 ;;
+    stellar-agent-cli/pay_policy_v1_testnet_acceptance) want_native=1 ;;
+    stellar-agent-cli/pay_timeout_reconcile_testnet_acceptance) want_native=1 ;;
+    stellar-agent-cli/cli_submit_only_network_binding_testnet_acceptance) want_native=1 ;;
+    stellar-agent-cli/profile_init_enroll_signer_testnet_acceptance) want_native=1 ;;
+    stellar-agent-cli/smart_account_execute_testnet_acceptance) want_native=1 ;;
+    stellar-agent-cli/cap85_external_ref_cli_testnet_acceptance) want_native=1 ;;
+  esac
+  got_native=0
+  case "$*" in *live-platform-keyring*) got_native=1 ;; esac
+  if [ "$got_native" != "$want_native" ]; then
+    echo "error: could not compile fixture: native route mismatch $suite_crate/$target"; exit 101
   fi
 fi
 echo "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out"
 STUB_EOF
 for mainnet_write in off on; do
   for keyring in headless platform; do
+    for share in '' 1/2 2/2; do
     if [ "$keyring" = platform ]; then
       out=$(env -u STELLAR_AGENT_TEST_LIVE_PLATFORM_KEYRING PATH="$STUB:$PATH" \
-        STELLAR_AGENT_TEST_KEYRING=platform MAINNET_WRITE="$mainnet_write" FILTER='' SHARE='' \
+        STELLAR_AGENT_TEST_KEYRING=platform MAINNET_WRITE="$mainnet_write" FILTER='' SHARE="$share" \
         PACE=0 RETRY_COOLDOWN=0 BROWSER_RETRY_COOLDOWN=0 bash "$DRIVER" 2>&1)
     else
       out=$(env -u STELLAR_AGENT_TEST_KEYRING -u STELLAR_AGENT_TEST_LIVE_PLATFORM_KEYRING \
-        PATH="$STUB:$PATH" MAINNET_WRITE="$mainnet_write" FILTER='' SHARE='' \
+        PATH="$STUB:$PATH" STELLAR_AGENT_TEST_KEYRING=headless MAINNET_WRITE="$mainnet_write" FILTER='' SHARE="$share" \
         PACE=0 RETRY_COOLDOWN=0 BROWSER_RETRY_COOLDOWN=0 bash "$DRIVER" 2>&1)
     fi
     rc=$?
-    if [ "$rc" -eq 0 ]; then
-      pass "(j) every suite receives marked storage and the selected permit/features: $mainnet_write $keyring"
+    expected=61
+    case "$share" in 1/2) expected=31 ;; 2/2) expected=30 ;; esac
+    labels=$(printf '%s\n' "$out" | grep -c '^::group::.* \[storage=')
+    if [ "$rc" -eq 0 ] && [ "$labels" -eq "$expected" ]; then
+      pass "(j) every suite receives labelled storage and the selected permit/features: $mainnet_write $keyring ${share:-all}"
     else
       fail "(j) suite storage contract: $mainnet_write $keyring exit $rc: $out"
     fi
+    done
   done
 done
+selection_count=$(grep -cF "STELLAR_AGENT_TEST_KEYRING: \${{ inputs.keyring || 'headless' }}" .github/workflows/testnet.yml)
+if [ "$selection_count" -eq 2 ] && grep -q 'default: headless' .github/workflows/testnet.yml; then
+  pass 'workflow shares forward the same storage selection and default to headless'
+else fail 'workflow storage selection differs between shares or default'; fi
 rm -f "$STUB/sleep" "$STUB/sleeps" "$STUB/summary"
 rm -f "$STUB/cargo" "$STUB/args"
 rmdir "$STUB"

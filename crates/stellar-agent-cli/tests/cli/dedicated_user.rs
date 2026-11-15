@@ -72,7 +72,11 @@ fn fixture() -> MainnetConsentFixture {
 }
 
 fn command(fixture: &MainnetConsentFixture) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_stellar-agent"));
+    let mut command = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        fixture.home(),
+    )
+    .expect("isolated CLI child");
     command
         .env("STELLAR_AGENT_HOME", fixture.home())
         .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")

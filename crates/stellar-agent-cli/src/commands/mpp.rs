@@ -1161,7 +1161,13 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn muxed_contract_challenge_refuses_before_state() {
-        let home = tempfile::tempdir().expect("home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         stellar_agent_test_support::keyring_mock::install().expect("keyring");
         let input = stellar_agent_mpp::ChallengeInput::Mcp {
@@ -1762,8 +1768,8 @@ mod tests {
     }
 
     struct StageCase {
-        _home: TempDir,
         _guard: stellar_agent_test_support::StellarAgentHomeGuard,
+        _home: stellar_agent_test_support::sandbox::StateSandbox,
         _mock: wiremock::MockServer,
         profile: Profile,
         signed: Arc<std::sync::atomic::AtomicUsize>,
@@ -1775,12 +1781,13 @@ mod tests {
         seed_secret: bool,
         configure: impl FnOnce(&mut Simulate, &Path),
     ) -> StageCase {
-        let scratch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
-        std::fs::create_dir_all(&scratch).expect("scratch directory");
-        let home = tempfile::Builder::new()
-            .prefix("mpp-stage-")
-            .tempdir_in(scratch)
-            .expect("home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("test home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring");
         let payer = g_strkey(seed);

@@ -142,7 +142,7 @@ impl CliRun {
 
 /// A temporary data root with its own headless keyring.
 pub struct IsolatedHome {
-    dir: tempfile::TempDir,
+    dir: stellar_agent_test_support::sandbox::StateSandbox,
     key: Zeroizing<[u8; 32]>,
 }
 
@@ -153,7 +153,7 @@ impl IsolatedHome {
         let mut key = Zeroizing::new([0u8; 32]);
         OsRng.fill_bytes(key.as_mut());
         Self {
-            dir: tempfile::tempdir().unwrap(),
+            dir: stellar_agent_test_support::sandbox::StateSandbox::new().unwrap(),
             key,
         }
     }
@@ -237,9 +237,11 @@ impl IsolatedHome {
     /// The `stellar-agent` command with the isolated environment applied.
     #[must_use]
     pub fn command(&self, args: &[&str]) -> Command {
-        stellar_agent_test_support::sandbox::mark_sandbox(self.path())
-            .expect("mark fixture directory");
-        let mut command = Command::new(env!("CARGO_BIN_EXE_stellar-agent"));
+        let mut command = stellar_agent_test_support::cli_child::cli_command(
+            env!("CARGO_BIN_EXE_stellar-agent"),
+            self.path(),
+        )
+        .expect("isolated CLI child");
         command
             .args(args)
             .env("STELLAR_AGENT_HOME", self.path())

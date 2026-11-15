@@ -171,7 +171,14 @@ fn pay(
 #[test]
 #[serial]
 fn testnet_total_survives_hydration() {
-    let guard_home = tempfile::tempdir().unwrap();
+    let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        guard_home
+            .path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
     keyring_mock::install().unwrap();
     let clock = set_now_ms_for_test(T0);

@@ -44,7 +44,13 @@ where
     F: FnOnce(&Path) -> Fut,
     Fut: Future<Output = i32>,
 {
-    let home = tempfile::tempdir().expect("test home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("test home");
+    assert!(
+        home.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

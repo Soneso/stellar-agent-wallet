@@ -1351,7 +1351,14 @@ mod tests {
     #[serial_test::serial]
     async fn mainnet_flag_without_profile_reaches_no_endpoint() {
         let guard_rpc = wiremock::MockServer::start().await;
-        let guard_home = tempfile::tempdir().expect("home");
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let _guard_env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         let mut args = minimal_args();
@@ -1369,29 +1376,36 @@ mod tests {
     }
 
     /// An empty `--function` is refused client-side.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn empty_function_refused_client_side() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let mut args = minimal_args();
         args.function = String::new();
-        args.rpc_url = Some("http://127.0.0.1:1".to_owned());
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
         let code = run(&args).await;
         assert_eq!(code, 1, "empty function name must be refused");
+        fixture.assert_refusal(
+            Some("validation.address_invalid"),
+            &["--function must not be empty"],
+        );
     }
 
     /// A malformed `--arg` is refused client-side with the failing index named.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn malformed_arg_refused_with_index() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let mut args = minimal_args();
         args.arg = vec![VOID_ARG_B64.to_owned(), "not-valid-base64!!".to_owned()];
-        args.rpc_url = Some("http://127.0.0.1:1".to_owned());
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
         let code = run(&args).await;
         assert_eq!(code, 1, "malformed --arg must be refused");
+        fixture.assert_refusal(Some("validation.xdr_argument_malformed"), &["arg[1]"]);
     }
 
     // ── Typed refusal pins (validate_execute_inputs) ────────────────────────
@@ -1463,7 +1477,13 @@ mod tests {
     #[test]
     #[serial]
     fn validate_inputs_missing_verifier_fails_closed_naming_deploy_verb() {
-        let dir = tempfile::TempDir::new().expect("tempdir");
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().expect("tempdir");
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = StellarAgentHomeGuard::new(dir.path());
         let mut args = minimal_args();
         args.verifier = None;
@@ -1503,7 +1523,13 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn missing_verifier_refused_before_any_network_call() {
-        let dir = tempfile::TempDir::new().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard = StellarAgentHomeGuard::new(dir.path());
 
         let mut args = minimal_args();

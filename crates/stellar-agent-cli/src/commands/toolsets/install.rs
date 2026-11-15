@@ -458,7 +458,13 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn tfixture_key_touching_with_attestation_file_reports_attested() {
-        let home = TempDir::new().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         keyring_mock::install().unwrap();
         // Key-touching + valid --attestation-file → "attested".
@@ -514,7 +520,13 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn tfixture_key_touching_no_attestation_returns_error() {
-        let home = TempDir::new().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         keyring_mock::install().unwrap();
         // Key-touching + no attestation → AttestationRequired error.
@@ -563,7 +575,13 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn tfixture_key_touching_with_override_reports_overridden() {
-        let home = TempDir::new().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         keyring_mock::install().unwrap();
         // Key-touching + --override-attestation → "overridden".
@@ -610,7 +628,13 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn tfixture_non_key_touching_with_override_flag_reports_not_required() {
-        let home = TempDir::new().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         keyring_mock::install().unwrap();
         // Non-key-touching + --override-attestation → "not-required" (gate never fires).
@@ -656,7 +680,13 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn tfixture_attestation_file_with_untrusted_auditor_refused() {
-        let home = TempDir::new().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         keyring_mock::install().unwrap();
         // `--attestation-file` whose `auditor_pubkey` is NOT in the auditor
@@ -736,7 +766,13 @@ mod tests {
             atomic::{AtomicUsize, Ordering},
         };
 
-        let home = TempDir::new().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let coordinate = KeyringEntryRef::toolset_pin_key();
         let reads = Arc::new(AtomicUsize::new(0));
@@ -827,7 +863,13 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn held_pin_key_lock_reports_installation_lock() {
-        let home = TempDir::new().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         keyring_mock::install().unwrap();
         let publisher_sk = SigningKey::from_bytes(&PUBLISHER_SEED);

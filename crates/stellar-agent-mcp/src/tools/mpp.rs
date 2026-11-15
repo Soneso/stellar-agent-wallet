@@ -847,7 +847,13 @@ mod tests {
     #[serial_test::serial(keyring)]
     #[serial_test::serial]
     async fn muxed_contract_challenge_refuses_before_state() {
-        let home = tempfile::tempdir().expect("home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         stellar_agent_test_support::keyring_mock::install().expect("keyring");
         let input = stellar_agent_mpp::ChallengeInput::Mcp {
@@ -1232,7 +1238,13 @@ mod tests {
     #[serial_test::serial(keyring)]
     #[serial_test::serial]
     async fn every_id_lookup_reports_not_found_on_a_profile_with_no_mpp_state() {
-        let home = tempfile::tempdir().expect("temp home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home_guard = StellarAgentHomeGuard::new(home.path());
         keyring_mock::install().expect("mock keyring store");
         let server = first_run_server();
@@ -1302,7 +1314,13 @@ mod tests {
     #[serial_test::serial(keyring)]
     #[serial_test::serial]
     async fn an_unknown_id_on_a_minted_empty_store_reports_not_found() {
-        let home = tempfile::tempdir().expect("temp home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home_guard = StellarAgentHomeGuard::new(home.path());
         keyring_mock::install().expect("mock keyring store");
         stellar_agent_mpp::MppAuthorizationStore::open_for_prepare(
@@ -1368,7 +1386,13 @@ mod tests {
     #[serial_test::serial(keyring)]
     #[serial_test::serial]
     async fn a_state_file_without_its_key_still_refuses() {
-        let home = tempfile::tempdir().expect("temp home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home_guard = StellarAgentHomeGuard::new(home.path());
         keyring_mock::install().expect("mock keyring store");
         let path = state_path(home.path());

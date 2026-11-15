@@ -27,7 +27,6 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -132,21 +131,24 @@ fn write_profile(home: &Path, rpc_url: &str, oracle: bool) {
 /// Runs the binary in `home` with `args` and `--profile PROFILE`, and
 /// returns its exit code and the JSON envelope it printed.
 fn run(home: &Path, args: &[&str]) -> (i32, Value) {
-    stellar_agent_test_support::sandbox::mark_sandbox(home).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-        .args(args)
-        .args(["--profile", PROFILE])
-        .env("STELLAR_AGENT_HOME", home)
-        .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
-        .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY)
-        .env_remove("STELLAR_AGENT_PROFILE")
-        .env_remove("STELLAR_AGENT_CHAIN_ID")
-        .env_remove("STELLAR_AGENT_RPC_URL")
-        .env_remove("STELLAR_AGENT_SECONDARY_RPC_URL")
-        .env_remove("STELLAR_AGENT_ORACLE_PROVIDER_URL")
-        .env_remove("STELLAR_AGENT_MCP_SIGNER_DEFAULT")
-        .output()
-        .expect("stellar-agent binary must run");
+    let output = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home,
+    )
+    .expect("isolated CLI child")
+    .args(args)
+    .args(["--profile", PROFILE])
+    .env("STELLAR_AGENT_HOME", home)
+    .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+    .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY)
+    .env_remove("STELLAR_AGENT_PROFILE")
+    .env_remove("STELLAR_AGENT_CHAIN_ID")
+    .env_remove("STELLAR_AGENT_RPC_URL")
+    .env_remove("STELLAR_AGENT_SECONDARY_RPC_URL")
+    .env_remove("STELLAR_AGENT_ORACLE_PROVIDER_URL")
+    .env_remove("STELLAR_AGENT_MCP_SIGNER_DEFAULT")
+    .output()
+    .expect("stellar-agent binary must run");
     let stdout = String::from_utf8(output.stdout).expect("stdout must be UTF-8");
     let envelope = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
         panic!(
@@ -164,7 +166,7 @@ fn run(home: &Path, args: &[&str]) -> (i32, Value) {
 #[test]
 fn mainnet_oracle_required_refuses_every_write_verb_of_a_fresh_profile_without_an_oracle() {
     for (verb, args) in WRITE_VERBS {
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let endpoint = ConnectionCounter::start().expect("loopback connection counter");
         write_profile(home.path(), &endpoint.https_uri(), true);
         let (code, complete) = run(home.path(), args);
@@ -178,7 +180,7 @@ fn mainnet_oracle_required_refuses_every_write_verb_of_a_fresh_profile_without_a
             "`{verb}` with its oracle probes the primary endpoint"
         );
 
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let endpoint = ConnectionCounter::start().expect("loopback connection counter");
         write_profile(home.path(), &endpoint.https_uri(), false);
         let (code, removed) = run(home.path(), args);

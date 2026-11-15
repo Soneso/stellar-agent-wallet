@@ -23,7 +23,7 @@ const SEED: [u8; 32] = [0x63; 32];
 
 pub(super) struct Fixture {
     _home: StellarAgentHomeGuard,
-    pub dir: tempfile::TempDir,
+    pub dir: stellar_agent_test_support::sandbox::StateSandbox,
     pub profile: Profile,
     pub account: String,
     name: String,
@@ -31,7 +31,13 @@ pub(super) struct Fixture {
 
 impl Fixture {
     pub fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let home = StellarAgentHomeGuard::new(dir.path());
         let account = stellar_strkey::ed25519::PublicKey(
             ed25519_dalek::SigningKey::from_bytes(&SEED)

@@ -655,7 +655,14 @@ fn per_period_cap_document(tools: &[&str], window: &str, cap_stroops: i128) -> P
 async fn pay_v1_per_period_cap_second_payment_denied_by_persisted_window_on_testnet() {
     keyring_mock::install().expect("mock keyring store init");
 
-    let home_dir = tempfile::TempDir::new().expect("tempdir");
+    let home_dir = stellar_agent_test_support::sandbox::StateSandbox::new().expect("tempdir");
+    assert!(
+        home_dir
+            .path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home_guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home_dir.path());
 
     let (g_strkey, seed) = fresh_keypair();

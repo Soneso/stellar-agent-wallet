@@ -4519,7 +4519,14 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn recovery_progress_counts_only_matched_stored_releases() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let (mut fx, id, _) = unmatched_release_fixture();
         let attempts = OperationStatus::new(&fx.store, &fx.profile)
@@ -4552,7 +4559,14 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn recovery_stale_snapshot_cannot_replace_a_newer_commit() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut fx = Fx::new();
         let original = stored_attempt(&mut fx);
@@ -4613,7 +4627,14 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn recovery_interrupted_batch_keeps_the_latest_observation() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut fx = Fx::new();
         let attempt = stored_attempt(&mut fx);
@@ -4670,7 +4691,14 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn recovery_sequence_release_audited_without_new_rows() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut fx = Fx::new();
         let attempt = stored_attempt(&mut fx);
@@ -5977,7 +6005,14 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn recovery_status_labels_missing_sequence_evidence() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         use super::super::operations::tests::{Checked, historical_without};
         let mut fx = Fx::new();
@@ -6014,7 +6049,13 @@ mod tests {
             "oldestLedger":1, "latestLedgerCloseTime":(NOW/1000).to_string(), "oldestLedgerCloseTime":"1"})).await;
         let client = StellarRpcClient::new(&server.uri()).unwrap();
         let writer = crate::submission_flow::recovery::tests::writer_at(&fx.profile.audit_log_path);
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let (warnings, guard) = stellar_agent_test_support::WarningCapture::capture(None);
         let answer = crate::submission_flow::transaction_status(
@@ -6701,7 +6742,14 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn recovery_unmatched_stored_release_keeps_debit_when_target_unreadable() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let (fx, id, account) = unmatched_release_fixture();
         let attempts = OperationStatus::new(&fx.store, &fx.profile)
@@ -6776,7 +6824,14 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn recovery_unmatched_stored_release_reads_target_once_then_decides() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let (fx, id, account) = unmatched_release_fixture();
         let writer = crate::submission_flow::recovery::tests::writer_at(&fx.profile.audit_log_path);
@@ -7693,7 +7748,13 @@ mod tests {
         let primary_client = StellarRpcClient::new(&primary.uri()).unwrap();
         let oracle_client = StellarRpcClient::new(&oracle.uri()).unwrap();
         let (writer, _) = crate::mainnet::fixtures::keyed_writer(&fx.profile.audit_log_path);
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         // The requested transaction has a pending receipt.
         let receipts = crate::submission_flow::open_receipts("ops").unwrap();

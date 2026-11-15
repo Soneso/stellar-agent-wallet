@@ -21,7 +21,6 @@
 )]
 
 use std::path::Path;
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
@@ -142,17 +141,20 @@ fn run_cli(home: &Path, args: &[&str]) -> (i32, Value) {
 
 /// Runs the binary as [`run_cli`] does, with the variables `envs` set.
 fn run_cli_with(home: &Path, args: &[&str], envs: &[(&str, &str)]) -> (i32, Value) {
-    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
-    let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-        .args(args)
-        .envs(envs.iter().copied())
-        .env("STELLAR_AGENT_HOME", home)
-        .env_remove("STELLAR_AGENT_PROFILE")
-        .env_remove("STELLAR_AGENT_RPC_URL")
-        .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
-        .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY)
-        .output()
-        .expect("stellar-agent binary must run");
+    let output = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home,
+    )
+    .expect("isolated CLI child")
+    .args(args)
+    .envs(envs.iter().copied())
+    .env("STELLAR_AGENT_HOME", home)
+    .env_remove("STELLAR_AGENT_PROFILE")
+    .env_remove("STELLAR_AGENT_RPC_URL")
+    .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+    .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY)
+    .output()
+    .expect("stellar-agent binary must run");
     let stdout = String::from_utf8(output.stdout).expect("stdout must be UTF-8");
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let last = stdout
@@ -235,7 +237,7 @@ async fn pay_refuses_another_network_before_the_build_reads() {
         ),
     ] {
         let (server, _rpc) = start(FUTURENET_PASSPHRASE, &[&source, DEST_G]).await;
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let argv = pay_argv(SEED, &server.uri(), &extra);
         let (code, envelope) = run_cli(home.path(), &as_strs(&argv));
         assert_refused_before_any_read(&format!("pay {label}"), code, &envelope, &server).await;
@@ -252,7 +254,7 @@ async fn pay_sign_only_refuses_another_network_before_the_gate_reads() {
         &[envelope.source(), envelope.destination()],
     )
     .await;
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let argv = pay_argv(
         [0x32; 32],
         &server.uri(),
@@ -269,7 +271,7 @@ async fn pay_sign_only_refuses_another_network_before_the_gate_reads() {
 async fn pay_endpoint_refusal_precedes_a_missing_source_account() {
     const SEED: [u8; 32] = [0x33; 32];
     let (server, rpc) = start(TESTNET_PASSPHRASE, &[DEST_G]).await;
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let argv = pay_argv(SEED, &server.uri(), &["--build-only"]);
 
     let (code, envelope) = run_cli(home.path(), &as_strs(&argv));
@@ -350,6 +352,11 @@ fn reconciling_stages(profile: &str) -> Vec<(&'static str, Vec<String>)> {
 /// reservation for `source` old enough to reconcile in the profile's window
 /// file, under the keyring store the child processes read.
 fn v1_profile_with_due_reservation(home: &Path, name: &str, rpc_url: &str, source: &str) {
+    assert!(
+        home.join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     use stellar_agent_core::policy::v1::criteria::state_store::{
         StateKey, WindowEntry, WindowLimit,
     };
@@ -440,7 +447,7 @@ async fn the_endpoint_check_precedes_the_reconcile_lookup_of_a_due_reservation()
     let source = account_id_for_seed([0x34; 32]);
     for (label, argv) in reconciling_stages(NAME) {
         let (server, rpc) = start(TESTNET_PASSPHRASE, &[&source, DEST_G]).await;
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         v1_profile_with_due_reservation(home.path(), NAME, &server.uri(), &source);
         let mut argv = argv;
         argv.extend(["--rpc-url".to_owned(), server.uri()]);
@@ -472,7 +479,7 @@ fn pay_issued_amount_refuses_xlm_unit_before_rpc() {
     let source = account_id_for_seed([0x36; 32]);
     let descriptor = format!("TST:{DEST_G}");
     for stage in [Some("--build-only"), None] {
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let mut argv = vec![
             "pay",
             DEST_G,
@@ -514,7 +521,7 @@ async fn a_malformed_fee_follows_the_endpoint_check_and_the_reconcile() {
     const NAME: &str = "endpoint-v1-malformed-fee";
     let source = account_id_for_seed([0x36; 32]);
     let (server, rpc) = start(FUTURENET_PASSPHRASE, &[&source, DEST_G]).await;
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     v1_profile_with_due_reservation(home.path(), NAME, &server.uri(), &source);
     let uri = server.uri();
     let argv = [
@@ -589,7 +596,7 @@ async fn pay_identity_check_outlasts_a_short_timeout() {
         })
         .mount(&server)
         .await;
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let argv = pay_argv(
         SEED,
         &server.uri(),
@@ -639,11 +646,17 @@ fn timeout_flag_help_names_the_send_and_poll() {
     ] {
         let mut argv = verb.clone();
         argv.push("--help");
-        let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-            .args(&argv)
-            .env_remove("STELLAR_AGENT_PROFILE")
-            .output()
-            .expect("stellar-agent binary must run");
+        let child_sandbox =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect("sandbox");
+        let output = stellar_agent_test_support::cli_child::cli_command(
+            env!("CARGO_BIN_EXE_stellar-agent"),
+            child_sandbox.path(),
+        )
+        .expect("isolated CLI child")
+        .args(&argv)
+        .env_remove("STELLAR_AGENT_PROFILE")
+        .output()
+        .expect("stellar-agent binary must run");
         let help = String::from_utf8(output.stdout).expect("help is UTF-8");
         let flag = help
             .split_once("--timeout-seconds <SECONDS>")
@@ -671,7 +684,7 @@ async fn sponsored_creation_refuses_another_network_before_the_sponsor_read() {
     let sponsor = account_id_for_seed([0x35; 32]);
     for fee in ["100", "auto"] {
         let (server, _rpc) = start(FUTURENET_PASSPHRASE, &[&sponsor]).await;
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let (code, envelope) = run_cli(
             home.path(),
             &[

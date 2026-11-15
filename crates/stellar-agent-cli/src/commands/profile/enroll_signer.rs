@@ -1587,11 +1587,24 @@ mod tests {
     // during parallel execution clobbers a sibling `#[serial]` test's mock
     // store, surfacing as `Auth(KeyringNotFound)` for the sibling. Serialising
     // defensively eliminates the cross-test interference at trivial cost.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn enroll_nonexistent_profile_returns_exit_1() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        if let Some((stdout, _)) = crate::common::test_support::capture(
+            "commands::profile::enroll_signer::tests::enroll_nonexistent_profile_returns_exit_1",
+        ) {
+            let envelopes: Vec<serde_json::Value> = stdout
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect();
+            crate::common::refusal_fixture::assert_refusal_envelopes(
+                &envelopes,
+                Some("validation.profile_not_found"),
+                &["the requested profile was not found"],
+            );
+            return;
+        }
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let args = EnrollSignerArgs {
             profile: Some("__nonexistent_enroll_signer__".to_owned()),
             secret_env: Some("__UNSET_ENROLL_SIGNER_VAR__".to_owned()),
@@ -1601,6 +1614,7 @@ mod tests {
         };
         let code = run(&args).await;
         assert_eq!(code, 1);
+        assert_eq!(fixture.rpc.accepted().unwrap(), 0);
     }
 
     // ── identity record and repair ──────────────────────────────────────
@@ -1735,7 +1749,13 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn mainnet_enrollment_names_the_bind_signer_step() {
-        let home = tempfile::tempdir().expect("home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         keyring_mock::install().unwrap();
         let (secret, address) = seed_material([0x65; 32]);
@@ -1821,7 +1841,13 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn repair_does_not_upgrade_a_v1_record() {
-        let home = tempfile::tempdir().expect("home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let (secret, address) = seed_material([0x64; 32]);
         for (profile, remedy) in [

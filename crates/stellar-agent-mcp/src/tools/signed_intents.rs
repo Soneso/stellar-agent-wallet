@@ -94,7 +94,13 @@ mod tests {
     #[serial_test::serial]
     async fn intent_view_reads_without_writing_and_refuses_tampering() {
         stellar_agent_test_support::keyring_mock::install().unwrap();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let profile = stellar_agent_core::profile::schema::Profile::builder_testnet_named(
             "intent",

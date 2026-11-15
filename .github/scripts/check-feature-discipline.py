@@ -173,9 +173,16 @@ TESTNET_DRIVER = '.github/scripts/run-testnet-acceptance.sh'
 TESTNET_ACTIVATION_ALLOWANCE = tuple(
     ('testnet.yml', job, TESTNET_DRIVER) for job in ('acceptance-1', 'acceptance-2'))
 TESTNET_FEATURES_FUNCTION = '''suite_features() {
-  local crate="$1" feature="$2"
-  if [ "${STELLAR_AGENT_TEST_KEYRING-}" = platform ] && grep -qE '^live-platform-keyring *=' "crates/$crate/Cargo.toml"; then
-    feature="$feature,live-platform-keyring"
+  local crate="$1" feature="$2" target="$3" storage
+  storage=$(suite_storage "$crate" "$target") || return 1
+  if [ "$storage" = native-capable ]; then
+    if ! grep -qE '^live-platform-keyring *=' "crates/$crate/Cargo.toml"; then
+      echo "error: native suite $crate/$target lacks live-platform-keyring" >&2
+      return 1
+    fi
+    if [ "${STELLAR_AGENT_TEST_KEYRING-headless}" = platform ]; then
+      feature="$feature,live-platform-keyring"
+    fi
   fi
   if [ "$MAINNET_WRITE" = "on" ] && grep -qE '^mainnet-write *=' "crates/$crate/Cargo.toml"; then
     printf 'mainnet-write,%s\\n' "$feature"
@@ -183,7 +190,7 @@ TESTNET_FEATURES_FUNCTION = '''suite_features() {
     printf '%s\\n' "$feature"
   fi
 }'''
-TESTNET_FEATURES_ASSIGNMENT = 'features=$(suite_features "$crate" "$feature")'
+TESTNET_FEATURES_ASSIGNMENT = 'features=$(suite_features "$crate" "$feature" "$target") || return 3'
 # Before each MCP suite of CHILD_DRIVER_SUITES the driver builds the CLI and
 # MCP tests together with the suite's features, so the child executable
 # exists. The inventory reads this one reviewed command for those suites
@@ -1647,6 +1654,8 @@ class Checker:
             'crates/stellar-agent-cli/tests/profile_init_enroll_signer_testnet_acceptance.rs',
         }
         acceptance_children = acceptance | {
+            'crates/stellar-agent-cli/src/acceptance_storage.rs',
+            'crates/stellar-agent-cli/tests/cli/acceptance_storage.rs',
             'crates/stellar-agent-cli/tests/claim_testnet_acceptance.rs',
             'crates/stellar-agent-cli/tests/cap85_external_ref_cli_testnet_acceptance.rs',
             'crates/stellar-agent-cli/tests/smart_account_execute_testnet_acceptance.rs',
@@ -1683,6 +1692,14 @@ class Checker:
             for start, end, _ in strings:
                 bare[start:end] = ' ' * (end - start)
             bare = ''.join(bare)
+            helper_use = re.search(r'\b(?:acceptance_storage|acceptance_child_fixture)\b\s*(?:::|as\b|[;,}])', bare)
+            helper_path = any(
+                re.search(r'(?:^|[/\\])acceptance_storage\.rs$', literal)
+                and re.search(r'#\s*\[[^\]]*\bpath\s*=\s*$', bare[:start])
+                for start, _, literal in strings
+            )
+            if (helper_use or helper_path) and relative not in acceptance_children:
+                self.fail('D15', f'{relative}: acceptance helper outside acceptance')
             def body(name, kind='fn'):
                 match = re.search(r'\b' + kind + ' ' + name + r'\b[^;]*?\{', bare)
                 if not match:

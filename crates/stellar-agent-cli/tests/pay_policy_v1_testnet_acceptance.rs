@@ -10,11 +10,10 @@
 //!
 //! # Fixture setup
 //!
-//! A fresh temp directory stands in for `STELLAR_AGENT_HOME` (only ever set on
-//! the CHILD process's environment, never the test-process environment). The
-//! profile name is unique per test run (`pay-v1-acceptance-<pid>-<unix_secs>-<n>`)
-//! so the OS keyring coordinate it drives (below) never collides with a
-//! concurrent or prior local run.
+//! Parent and child processes share one owned, marked `STELLAR_AGENT_HOME`
+//! and the explicitly selected acceptance store. The profile name is unique
+//! per run (`pay-v1-acceptance-<pid>-<unix_secs>-<n>`) so its keyring coordinates
+//! remain distinct across concurrent runs.
 //!
 //! 1. An ed25519 owner keypair is generated in-process.
 //! 2. A signed V1 policy document — one `per_tx_cap` rule matching
@@ -30,7 +29,7 @@
 //!    `policy_owner_key_id.service = "stellar-agent-owner-<profile>"` (the
 //!    prefix `build_v1_policy_engine` strips to recover the profile name) is
 //!    written to `<home>/profiles/<profile>.toml`.
-//! 4. The owner **PUBLIC** key is enrolled into the REAL OS keyring by
+//! 4. The owner **PUBLIC** key is enrolled into the selected store by
 //!    spawning `stellar-agent profile enroll-owner-key --secret-env <VAR>
 //!    --expected-address <owner_g>` as its own subprocess (the owner seed is
 //!    set only on that subprocess's environment) — the production write path
@@ -66,22 +65,20 @@
 //!
 //! This suite covers the FULL production path for the owner coordinate:
 //! profile load -> `enroll-owner-key` keyring registration (subprocess) ->
-//! `pay`'s V1 gate reading the owner public key from that SAME OS keyring
+//! `pay`'s V1 gate reading the owner public key from that same store
 //! entry -> signature verification -> `per_tx_cap` evaluation -> (on allow)
 //! sign -> submit -> confirm. The window-state HMAC key and generation
-//! counter already round-trip the real keyring in this same suite (via
+//! counter also round-trip the selected store in this suite (via
 //! `PersistedWindowStore`, unconditionally, no test-only override exists for
 //! that coordinate); the owner coordinate now exercises the identical
 //! keyring backend end to end.
 //!
-//! # Platform keyring precondition
+//! # Storage route
 //!
-//! The v1 policy path registers the platform keyring store before the gate
-//! and refuses when registration fails, so this suite requires a functioning
-//! platform keyring (macOS Keychain in local dev; a headless Secret Service,
-//! provisioned by the CI workflow via gnome-keyring, in CI). Keyring init
-//! failure fails this test — it is not an infrastructure precondition to be
-//! skipped.
+//! The acceptance driver configures an encrypted headless store by default.
+//! Platform selection requires the live feature and its exact permit, with
+//! a functioning native store. Parent and children use the same selection.
+//! Store registration failure fails the test.
 //!
 //! Gated behind `testnet-acceptance`:
 //!
@@ -98,7 +95,9 @@
     reason = "test-only; panics and unwraps are acceptable in testnet acceptance tests"
 )]
 
-use std::process::Command;
+#[path = "cli/acceptance_storage.rs"]
+mod acceptance_storage;
+
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
@@ -236,8 +235,7 @@ fn write_profile_toml(home: &std::path::Path, profile: &str) {
 fn rotate_audit_key_via_cli(home: &std::path::Path, profile: &str) -> OwnerKeyringGuard {
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
     stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
-    let output = Command::new(bin_path)
-        .args(cfg!(feature = "live-platform-keyring").then_some("--test-live-platform-keyring"))
+    let output = acceptance_storage::command(bin_path, home, None)
         .args(["profile", "rotate-audit-key", profile])
         .env("STELLAR_AGENT_HOME", home)
         .output()
@@ -296,12 +294,12 @@ fn write_signed_policy_toml(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Owner-key enrollment (real keyring) + cleanup guard
+// Owner-key enrollment and entry lifetime
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// RAII guard that deletes the enrolled owner-key keyring entry on drop
 /// (success, assertion panic, or early return alike), so a failed test run
-/// never leaks an entry into the OS keyring — belt-and-suspenders on top of
+/// never leaves an entry in the selected store, in addition to
 /// [`unique_profile_name`]'s per-run namespacing.
 struct OwnerKeyringGuard {
     coord: stellar_agent_core::profile::schema::KeyringEntryRef,
@@ -320,7 +318,7 @@ impl Drop for OwnerKeyringGuard {
     }
 }
 
-/// Enrolls `owner_s_strkey`'s derived public key into the REAL OS keyring for
+/// Enrolls `owner_s_strkey`'s derived public key into the selected store for
 /// `profile`, by spawning `stellar-agent profile enroll-owner-key` as its own
 /// subprocess — the exact production write path `enroll_owner_key.rs` drives.
 ///
@@ -338,8 +336,7 @@ fn enroll_owner_key_via_cli(
 ) -> OwnerKeyringGuard {
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
     stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
-    let output = Command::new(bin_path)
-        .args(cfg!(feature = "live-platform-keyring").then_some("--test-live-platform-keyring"))
+    let output = acceptance_storage::command(bin_path, home, None)
         .args([
             "profile",
             "enroll-owner-key",
@@ -399,8 +396,7 @@ fn run_pay(
 ) -> (i32, serde_json::Value) {
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
     stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
-    let output = Command::new(bin_path)
-        .args(cfg!(feature = "live-platform-keyring").then_some("--test-live-platform-keyring"))
+    let output = acceptance_storage::command(bin_path, home, None)
         .args([
             "pay",
             destination_g,
@@ -452,31 +448,28 @@ fn run_pay(
 #[tokio::test]
 #[serial_test::serial]
 async fn pay_v1_per_tx_cap_denies_over_cap_and_submits_under_cap() {
-    let storage_sandbox =
-        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
-    let _storage_home =
-        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-    // The v1 policy path registers the platform keyring store before the gate
-    // and refuses when registration fails, so this suite needs a functioning
-    // platform keyring (macOS Keychain locally; a headless Secret Service,
-    // provisioned by the CI workflow, on Linux CI runners).
-    #[cfg(feature = "live-platform-keyring")]
-    if std::env::var("STELLAR_AGENT_TEST_LIVE_PLATFORM_KEYRING").as_deref()
-        == Ok("real-platform-keyring")
-    {
-        use stellar_agent_network::keyring::live::{
-            LivePlatformKeyring, init_platform_keyring_store_live,
-        };
-        init_platform_keyring_store_live(LivePlatformKeyring::acknowledge_real_platform_keyring())
-            .expect("live acceptance platform store");
-    }
-    stellar_agent_network::init_platform_keyring_store()
-        .expect("platform keyring store must initialise on this host");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+    // Parent key reads and child key writes share this owned home and the
+    // explicitly selected acceptance backend. Native access needs its permit.
+    acceptance_storage::dispatch(stellar_agent_network::init_platform_keyring_store, || {
+        #[cfg(feature = "live-platform-keyring")]
+        {
+            use stellar_agent_network::keyring::live::{
+                LivePlatformKeyring, init_platform_keyring_store_live,
+            };
+            init_platform_keyring_store_live(
+                LivePlatformKeyring::acknowledge_real_platform_keyring(),
+            )
+        }
+        #[cfg(not(feature = "live-platform-keyring"))]
+        unreachable!("selection requires the native feature")
+    })
+    .expect("selected acceptance store");
 
-    let home = tempfile::TempDir::new().expect("tempdir");
     let profile_name = unique_profile_name();
 
-    // ── Fixture: owner keypair, signed policy, profile, real-keyring enrollment ─
+    // Owner keypair, signed policy, profile and selected-store enrollment.
     let owner_signing_key = SigningKey::generate(&mut OsRng);
     let owner_pubkey = write_signed_policy_toml(home.path(), &profile_name, &owner_signing_key);
     write_profile_toml(home.path(), &profile_name);
@@ -490,7 +483,7 @@ async fn pay_v1_per_tx_cap_denies_over_cap_and_submits_under_cap() {
         .to_string()
         .as_str()
         .to_owned();
-    // Enroll the owner PUBLIC key through the REAL OS keyring via the
+    // Enroll the owner PUBLIC key through the selected store via the
     // production `enroll-owner-key` subprocess; `_owner_keyring_guard` deletes
     // the entry when it drops at the end of this function (every exit path).
     let _owner_keyring_guard =

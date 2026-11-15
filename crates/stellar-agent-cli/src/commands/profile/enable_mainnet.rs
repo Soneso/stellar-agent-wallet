@@ -1115,7 +1115,7 @@ mod tests {
     }
 
     struct Fixture {
-        dir: tempfile::TempDir,
+        dir: stellar_agent_test_support::sandbox::StateSandbox,
         profile: Profile,
         args: EnableMainnetArgs,
         owner: SigningKey,
@@ -1192,7 +1192,13 @@ mod tests {
         /// Saves `profile` and seeds the keyring and the policy of an
         /// installation ready for its first enablement.
         fn seeded(profile: Profile) -> Self {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                dir.path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             loader::save_to_dir("operator", &profile, &dir.path().join("profiles")).unwrap();
             let owner = SigningKey::from_bytes(&[11; 32]);
             put(
