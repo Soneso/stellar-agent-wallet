@@ -22,9 +22,11 @@ use super::operations::{
 use super::recovery_run::{
     RecoveryClass, RecoveryRole, RecoveryRunMethod, RecoveryRunPhase, RecoveryRunState,
     RecoveryRunView, RecoveryStage, RecoveryStop, RecoveryStopReason, WireRecoveryRun,
-    classify_recovery_stop, normalize_recovery_run, recovery_deadline, recovery_expiry,
-    recovery_exposure_digest, recovery_retry_time,
+    classify_recovery_stop, configuration_reopens, normalize_recovery_run,
+    recovery_configuration_digest, recovery_deadline, recovery_expiry, recovery_exposure_digest,
+    recovery_retry_time,
 };
+use super::recovery_scan::{self, RecoveryScan};
 use super::{PersistedWindowStore, WindowStoreError};
 use crate::operational::OperationalReport;
 use crate::{MainnetOracle, StellarRpcClient};
@@ -56,6 +58,12 @@ pub enum RecoveryReason {
     AccountUnavailable,
     /// The paired interval proof is unavailable.
     CoverageRequired,
+    /// An unread ledger is no longer retained.
+    HistoryLost,
+    /// The exposure has no authenticated starting ledger.
+    MissingProvenance,
+    /// Paired ledger close times differ.
+    Disagreement,
 }
 
 /// An endpoint role from the configured recovery pair.
@@ -130,23 +138,19 @@ fn rpc_failure(error: &stellar_rpc_client::Error) -> RecoveryReason {
     }
 }
 
-fn read_failure(error: &dyn std::any::Any) -> RecoveryReason {
+fn read_failure(error: &crate::client::RecoveryReadError) -> RecoveryReason {
     use crate::client::RecoveryReadError;
     use stellar_agent_core::error::{NetworkError, ProtocolError};
-    if let Some(error) = error.downcast_ref::<stellar_rpc_client::Error>() {
-        return rpc_failure(error);
-    }
-    match error.downcast_ref::<RecoveryReadError>() {
-        Some(RecoveryReadError::Rpc(error)) => rpc_failure(error),
-        Some(RecoveryReadError::Shape) => RecoveryReason::MissingField,
-        Some(RecoveryReadError::Validation(WalletError::Network(
-            NetworkError::AccountNotFound { .. },
-        ))) => RecoveryReason::CoverageRequired,
-        Some(RecoveryReadError::Validation(WalletError::Protocol(
-            ProtocolError::XdrCodecFailed { .. },
-        ))) => RecoveryReason::MissingField,
-        Some(RecoveryReadError::Validation(_)) => RecoveryReason::AccountUnavailable,
-        None => RecoveryReason::Transport,
+    match error {
+        RecoveryReadError::Rpc(error) => rpc_failure(error),
+        RecoveryReadError::Shape => RecoveryReason::MissingField,
+        RecoveryReadError::Validation(WalletError::Network(NetworkError::AccountNotFound {
+            ..
+        })) => RecoveryReason::CoverageRequired,
+        RecoveryReadError::Validation(WalletError::Protocol(ProtocolError::XdrCodecFailed {
+            ..
+        })) => RecoveryReason::MissingField,
+        RecoveryReadError::Validation(_) => RecoveryReason::AccountUnavailable,
     }
 }
 
@@ -320,7 +324,10 @@ impl Budget {
         let (used, capacity) = if shared {
             (&mut self.used.shared, SHARED_REQUESTS)
         } else {
-            (&mut self.used.attempt, self.attempt_limit)
+            (
+                &mut self.used.attempt,
+                self.attempt_limit.min(ATTEMPT_REQUESTS),
+            )
         };
         if *used >= capacity {
             self.failed(RecoveryReason::RequestBudget);
@@ -330,7 +337,7 @@ impl Budget {
         Ok(())
     }
 
-    async fn read<T, E: 'static>(
+    async fn read<T, E: Into<crate::client::RecoveryReadError>>(
         &mut self,
         shared: bool,
         request: impl Future<Output = Result<T, E>>,
@@ -342,7 +349,7 @@ impl Budget {
                 Err(ReadFailure::Deadline)
             }
             Ok(Err(error)) => {
-                let reason = read_failure(&error);
+                let reason = read_failure(&error.into());
                 self.failed(reason);
                 Err(ReadFailure::Failed(reason))
             }
@@ -640,9 +647,7 @@ async fn shared_observation(
 #[derive(Debug)]
 struct Scan {
     answer: LedgerAnswer,
-    cursor: u32,
     upper: Option<u32>,
-    incomplete: bool,
     entries: Vec<(u32, u64)>,
 }
 
@@ -652,43 +657,19 @@ fn scan_page(
     max_time: u64,
     requested: usize,
 ) -> Option<Scan> {
-    let start = cursor.max(page.oldest_ledger);
-    let mut next = start;
-    let mut last_close = 0;
-    let mut entries = Vec::new();
-    let mut boundary = None;
-    if page.ledgers.is_empty() || page.ledgers.len() > requested {
+    if requested != 1 {
         return None;
     }
-    for ledger in &page.ledgers {
-        let close = ledger.ledger_close_time.parse::<u64>().ok()?;
-        if ledger.sequence != next || close == 0 || close < last_close {
-            return None;
-        }
-        entries.push((ledger.sequence, close));
-        if max_time > 0 && close > max_time && boundary.is_none() {
-            boundary = Some((ledger.sequence, close));
-        }
-        next = next.checked_add(1)?;
-        last_close = close;
-    }
-    let last = *entries.last()?;
-    if page.latest_ledger < last.0
-        || (page.ledgers.len() < requested && last.0 != page.latest_ledger)
-    {
-        return None;
-    }
-    let deciding = boundary.unwrap_or(last);
+    let close = recovery_scan::ledger(page, cursor, cursor).ok()?;
+    cursor.checked_add(1)?;
     Some(Scan {
         answer: LedgerAnswer {
-            expiry_ledger: Some(deciding.0),
-            close_time: Some(deciding.1),
+            expiry_ledger: Some(cursor),
+            close_time: Some(close),
             latest_ledger: Some(page.latest_ledger),
         },
-        cursor: boundary.map_or(next, |entry| entry.0),
-        upper: boundary.map(|entry| entry.0),
-        incomplete: page.oldest_ledger > cursor,
-        entries,
+        upper: (max_time > 0 && close > max_time).then_some(cursor),
+        entries: vec![(cursor, close)],
     })
 }
 
@@ -738,18 +719,101 @@ async fn history(
         return Err(ReadFailure::Failed(retention));
     }
     let scan = scan_page(&page, target, max_time, PAGE_SIZE);
-    if scan.as_ref().is_some_and(|scan| {
-        scan.answer
-            .close_time
-            .is_some_and(|close| close.checked_mul(1_000).is_none())
-    }) {
-        budget.failed(RecoveryReason::MissingField);
-        return Ok(None);
-    }
     if scan.is_none() {
         budget.failed(RecoveryReason::MissingField);
     }
     Ok(scan)
+}
+
+async fn scan_history(
+    pair: &EndpointPair<'_>,
+    shared: [(&SharedObservation, u32); 2],
+    attempt: &RecoveryAttempt,
+    exposure: &str,
+    configuration: String,
+    progress: &mut Option<RecoveryScan>,
+    budget: &mut Budget,
+) {
+    budget.context(RecoveryEndpoint::Primary, RecoveryMethod::GetLedgers, None);
+    let Some(start) = attempt.pre_exposure_ledger else {
+        budget.failed(RecoveryReason::MissingProvenance);
+        return;
+    };
+    let (Some(release), Some(oracle), ExposureIdentity::Classic { max_time, .. }) = (
+        matched_sequence_release(attempt),
+        pair.oracle,
+        &attempt.exposure,
+    ) else {
+        return;
+    };
+    if start > release.primary_ledger {
+        budget.failed(RecoveryReason::MissingField);
+        return;
+    }
+    if progress
+        .as_ref()
+        .is_none_or(|scan| scan.configuration != configuration)
+    {
+        *progress = Some(RecoveryScan::new(configuration, exposure, start));
+    }
+    let Some(scan) = progress else {
+        return;
+    };
+    let mut tips =
+        shared.map(|(s, tip)| s.report.latest_ledger.max(tip).max(release.primary_ledger));
+    while scan.end.is_none() && scan.next_unread <= release.primary_ledger {
+        let mut closes = [0; 2];
+        for (index, client) in [pair.primary, oracle].into_iter().enumerate() {
+            budget.context(
+                if index == 0 {
+                    RecoveryEndpoint::Primary
+                } else {
+                    RecoveryEndpoint::Oracle
+                },
+                RecoveryMethod::GetLedgers,
+                Some(scan.next_unread),
+            );
+            if shared[index].0.oldest > scan.next_unread {
+                budget.failed(RecoveryReason::HistoryLost);
+                return;
+            }
+            let Ok(page) = budget
+                .read(
+                    false,
+                    client
+                        .inner
+                        .get_ledgers(LedgerStart::Ledger(scan.next_unread), Some(1), None),
+                )
+                .await
+            else {
+                return;
+            };
+            match recovery_scan::ledger(&page, scan.next_unread, tips[index]) {
+                Ok(close) => closes[index] = close,
+                Err(reason) => {
+                    budget.failed(match reason {
+                        RecoveryStopReason::HistoryLost => RecoveryReason::HistoryLost,
+                        RecoveryStopReason::Lagging => RecoveryReason::Lagging,
+                        _ => RecoveryReason::MissingField,
+                    });
+                    return;
+                }
+            }
+            tips[index] = page.latest_ledger;
+        }
+        if scan.next_unread == release.primary_ledger && closes[0] <= *max_time {
+            budget.failed(RecoveryReason::Disagreement);
+            return;
+        }
+        if let Err(reason) = scan.accept(closes, *max_time) {
+            budget.failed(if reason == RecoveryStopReason::Disagreement {
+                RecoveryReason::Disagreement
+            } else {
+                RecoveryReason::MissingField
+            });
+            return;
+        }
+    }
 }
 
 fn pending(attempt: &RecoveryAttempt, now_ms: u64, class: &str, detail: &str) -> EvidenceInput {
@@ -774,18 +838,6 @@ fn evaluate(
     let mut input = pending(attempt, now_ms, "evidence_pending", detail);
     let mut update = input.recovery.take().unwrap_or_default();
     update.history_incomplete |= attempt.pre_exposure_ledger.is_none();
-    for (scan, is_primary) in [(primary, true), (oracle, false)] {
-        if let Some(scan) = scan {
-            update.history_incomplete |= scan.incomplete;
-            if is_primary {
-                update.primary_cursor = Some(scan.cursor);
-                update.primary_upper = scan.upper.or(update.primary_upper);
-            } else {
-                update.witness_cursor = Some(scan.cursor);
-                update.witness_upper = scan.upper.or(update.witness_upper);
-            }
-        }
-    }
     let mut answers = [
         primary.map_or_default(|scan| scan.answer),
         oracle.map_or_default(|scan| scan.answer),
@@ -1635,6 +1687,9 @@ fn contextual_stop(
                 RecoveryReason::RequestBudget => R::RequestBudget,
                 RecoveryReason::AccountUnavailable => R::AccountUnavailable,
                 RecoveryReason::CoverageRequired => R::CoverageRequired,
+                RecoveryReason::HistoryLost => R::HistoryLost,
+                RecoveryReason::MissingProvenance => R::MissingProvenance,
+                RecoveryReason::Disagreement => R::Disagreement,
             };
             let stage = match f.method {
                 RecoveryMethod::GetNetwork => S::Identity,
@@ -1668,6 +1723,8 @@ fn contextual_stop(
     };
     let roles = if stage == S::Lease || reason == R::RecordUnusable {
         Vec::new()
+    } else if matches!(reason, R::Disagreement | R::MissingProvenance) {
+        vec![RecoveryRole::Primary, RecoveryRole::Oracle]
     } else {
         roles
     };
@@ -1805,6 +1862,15 @@ async fn collect_outcomes(
             budget.failed(RecoveryReason::Deadline);
             break;
         }
+        if budget.used.attempt >= ATTEMPT_REQUESTS {
+            budget.context(
+                RecoveryEndpoint::Primary,
+                RecoveryMethod::GetTransaction,
+                None,
+            );
+            budget.failed(RecoveryReason::RequestBudget);
+            break;
+        }
         if primary.stale() || oracle.stale() {
             budget.context(
                 if primary.stale() {
@@ -1829,11 +1895,19 @@ async fn collect_outcomes(
         };
         let started = super::store::now_ms()?;
         let view = run_view(attempt, started);
-        if !view.earliest_retry_ms.is_some_and(|due| started >= due) {
+        let configuration = recovery_configuration_digest(driver.profile);
+        if !view.earliest_retry_ms.is_some_and(|due| started >= due)
+            && !configuration_reopens(attempt.recovery_run.as_ref(), &configuration)
+        {
             continue;
         }
+        let saved_scan = attempt
+            .recovery_run
+            .as_ref()
+            .and_then(|r| r.record())
+            .and_then(|r| r.scan.clone());
         let mut run = WireRecoveryRun {
-            version: 1,
+            version: if saved_scan.is_some() { 2 } else { 1 },
             exposure: recovery_exposure_digest(
                 attempt.operation_id,
                 attempt.attempt_index,
@@ -1854,6 +1928,7 @@ async fn collect_outcomes(
                 })?,
             consecutive_stops: view.effective_stops,
             stop: None,
+            scan: saved_scan,
         };
         recovery_retry_time(run.run_deadline_ms, run.consecutive_stops)?;
         driver.write(
@@ -1939,16 +2014,6 @@ async fn collect_outcomes(
             && class == OutcomeClass::Absent
             && matched_sequence_release(&owned).is_none()
         {
-            seeded.recovery.primary_cursor.get_or_insert(
-                attempt
-                    .pre_exposure_ledger
-                    .unwrap_or(primary.report.latest_ledger),
-            );
-            seeded.recovery.witness_cursor.get_or_insert(
-                attempt
-                    .pre_exposure_ledger
-                    .unwrap_or(oracle.report.latest_ledger),
-            );
             let target = primary
                 .report
                 .latest_ledger
@@ -2071,6 +2136,22 @@ async fn collect_outcomes(
                 }
             }
         }
+        let mut scan_progress = run.scan.clone();
+        if !high_roles.is_empty() && matches!(&accounts, Some(Ok(_))) && budget.failure.is_none() {
+            budget.attempt_limit = ATTEMPT_REQUESTS;
+            let tips = [scans.0.as_ref(), scans.1.as_ref()]
+                .map(|scan| scan.and_then(|s| s.answer.latest_ledger).unwrap_or(0));
+            scan_history(
+                pair,
+                [(&primary, tips[0]), (&oracle, tips[1])],
+                &owned,
+                &run.exposure,
+                configuration,
+                &mut scan_progress,
+                &mut budget,
+            )
+            .await;
+        }
         let mut evaluation = evaluate_outcome(
             &seeded,
             read_all.then_some(answers),
@@ -2125,6 +2206,15 @@ async fn collect_outcomes(
             evaluation.decision = None;
         }
         let fresh = driver.fresh(&owned, &run)?;
+        run.scan = scan_progress;
+        run.version = if run.scan.is_some() { 2 } else { 1 };
+        if budget
+            .failure
+            .is_some_and(|f| f.reason == RecoveryReason::HistoryLost)
+            && let Some(recovery) = &mut evaluation.input.recovery
+        {
+            recovery.history_incomplete = true;
+        }
         let decision = evaluation
             .decision
             .clone()
@@ -2263,7 +2353,10 @@ pub async fn recover_outcomes(
     let runnable: Vec<_> = attempts
         .iter()
         .filter(|a| {
-            run_view(a, now_ms)
+            configuration_reopens(
+                a.recovery_run.as_ref(),
+                &recovery_configuration_digest(profile),
+            ) || run_view(a, now_ms)
                 .earliest_retry_ms
                 .is_some_and(|due| now_ms >= due)
         })
@@ -3984,80 +4077,6 @@ mod tests {
     }
 
     #[test]
-    fn recovery_scan_continues_until_boundary() {
-        for boundary in [199, 200, 201] {
-            let mut first = page(1, 200, 201, 10);
-            for ledger in &mut first.ledgers {
-                if ledger.sequence >= boundary {
-                    ledger.ledger_close_time = "11".to_owned();
-                }
-            }
-            let scan = scan_page(&first, 1, 10, 200).unwrap();
-            if boundary <= 200 {
-                assert_eq!(scan.upper, Some(boundary));
-            } else {
-                assert_eq!(scan.upper, None);
-                assert_eq!(scan.cursor, 201);
-                let next = scan_page(&page(201, 1, 201, 11), scan.cursor, 10, 1).unwrap();
-                assert_eq!(next.upper, Some(201));
-            }
-        }
-    }
-
-    #[test]
-    fn recovery_history_page_malformed_keeps_cursor() {
-        let mut attempt = attempt(10);
-        attempt.recovery.primary_cursor = Some(1);
-        attempt.recovery.disagreements = 9;
-        for defect in 0..7 {
-            let mut page = page(1, 3, 3, 11);
-            match defect {
-                0 => page.ledgers[1].sequence = 3,
-                1 => page.ledgers[1].sequence = 1,
-                2 => page.ledgers.swap(0, 1),
-                3 => page.ledgers[0].ledger_close_time = "0".to_owned(),
-                4 => page.ledgers[0].ledger_close_time.clear(),
-                5 => page.latest_ledger = 4,
-                _ => page.ledgers[2].ledger_close_time = "10".to_owned(),
-            }
-            assert!(scan_page(&page, 1, 10, 200).is_none());
-            let input = evaluate(&attempt, None, None, NOW, "malformed_history").unwrap();
-            let recovery = input.recovery.unwrap();
-            assert_eq!(recovery.primary_cursor, Some(1));
-            assert_eq!(recovery.disagreements, 9);
-        }
-    }
-
-    #[test]
-    fn recovery_pruning_never_proves_expiry() {
-        for close in [9, 10] {
-            for oldest in [2, 10, 20] {
-                let mut page = page(oldest, 1, oldest, close);
-                page.oldest_ledger = oldest;
-                let scan = scan_page(&page, 1, 10, 200).unwrap();
-                assert!(scan.incomplete);
-                assert!(scan.upper.is_none());
-                let input =
-                    evaluate(&attempt(10), Some(&scan), Some(&scan), NOW, "pending").unwrap();
-                assert!(input.sequence_released.is_none());
-                assert!(input.recovery.unwrap().history_incomplete);
-            }
-        }
-    }
-
-    #[test]
-    fn recovery_no_provenance_uses_the_first_observed_upper_bound() {
-        let mut attempt = attempt(10);
-        attempt.pre_exposure_ledger = None;
-        let scan = deciding(70, 11, 10);
-        let input = evaluate(&attempt, Some(&scan), Some(&scan), NOW, "pending").unwrap();
-        let recovery = input.recovery.unwrap();
-        assert!(recovery.history_incomplete);
-        assert_eq!(recovery.primary_upper, Some(70));
-        assert_eq!(input.sequence_released.unwrap().primary_ledger, 70);
-    }
-
-    #[test]
     fn recovery_ledger_answer_canonical_vectors() {
         let answers = [
             LedgerAnswer {
@@ -4120,6 +4139,7 @@ mod tests {
                     automatic_runs: 1,
                     consecutive_stops: 0,
                     stop: None,
+                    scan: None,
                 };
                 recorder.write_recovery_run(attempt, &release_input(attempt), &run, None)
             })
@@ -4600,6 +4620,7 @@ mod tests {
             automatic_runs: 1,
             consecutive_stops: 0,
             stop: None,
+            scan: None,
         };
         let w1 = EvidenceInput {
             observation: Some(latest),
@@ -4770,17 +4791,35 @@ mod tests {
     async fn recovery_pass_respects_call_budget_and_deadline() {
         let mut budget = Budget::new();
         for _ in 0..4 {
-            budget.read(true, async { Ok::<_, ()>(()) }).await.unwrap();
+            budget
+                .read(true, async {
+                    Ok::<_, crate::client::RecoveryReadError>(())
+                })
+                .await
+                .unwrap();
         }
         assert_eq!(
-            budget.read(true, async { Ok::<_, ()>(()) }).await,
+            budget
+                .read(true, async {
+                    Ok::<_, crate::client::RecoveryReadError>(())
+                })
+                .await,
             Err(ReadFailure::Pending)
         );
         for _ in 0..24 {
-            budget.read(false, async { Ok::<_, ()>(()) }).await.unwrap();
+            budget
+                .read(false, async {
+                    Ok::<_, crate::client::RecoveryReadError>(())
+                })
+                .await
+                .unwrap();
         }
         assert_eq!(
-            budget.read(false, async { Ok::<_, ()>(()) }).await,
+            budget
+                .read(false, async {
+                    Ok::<_, crate::client::RecoveryReadError>(())
+                })
+                .await,
             Err(ReadFailure::Pending)
         );
         assert_eq!(
@@ -4795,12 +4834,14 @@ mod tests {
         budget
             .read(true, async {
                 tokio::time::sleep(Duration::from_secs(13)).await;
-                Ok::<_, ()>(())
+                Ok::<_, crate::client::RecoveryReadError>(())
             })
             .await
             .unwrap();
         assert_eq!(
-            budget.read::<(), ()>(false, std::future::pending()).await,
+            budget
+                .read::<(), crate::client::RecoveryReadError>(false, std::future::pending())
+                .await,
             Err(ReadFailure::Deadline)
         );
         assert_eq!(start.elapsed(), PASS_DURATION);
@@ -7152,7 +7193,9 @@ mod tests {
             budget.context(RecoveryEndpoint::Oracle, method, Some(7));
             let start = Instant::now();
             assert_eq!(
-                budget.read::<(), ()>(false, std::future::pending()).await,
+                budget
+                    .read::<(), crate::client::RecoveryReadError>(false, std::future::pending())
+                    .await,
                 Err(ReadFailure::Deadline)
             );
             assert_eq!(Instant::now() - start, Duration::from_secs(20));
@@ -7167,7 +7210,11 @@ mod tests {
                 }
             );
             assert_eq!(
-                budget.read(false, async { Ok::<_, ()>(()) }).await,
+                budget
+                    .read(false, async {
+                        Ok::<_, crate::client::RecoveryReadError>(())
+                    })
+                    .await,
                 Err(ReadFailure::Deadline)
             );
             assert_eq!(budget.used.attempt, 1);

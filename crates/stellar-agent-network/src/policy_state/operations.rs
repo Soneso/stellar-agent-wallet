@@ -5226,20 +5226,6 @@ impl<'a> OperationStatus<'a> {
         Ok(Some(wire))
     }
 
-    /// Reads the four oldest exposed classic attempts with unknown
-    /// outcomes for the outcome stage, attempts with a recorded sequence
-    /// release included. A transaction hash selects only its matching
-    /// attempt, released or not.
-    ///
-    /// # Errors
-    /// Returns every integrity, keyring and I/O error of the verified window read.
-    pub fn outcome_snapshot(
-        &self,
-        tx_hash: Option<&[u8; 32]>,
-    ) -> Result<Vec<RecoveryAttempt>, WindowStoreError> {
-        self.unknown_attempts(tx_hash)
-    }
-
     /// Filters authenticated scheduling views before the driver's oldest-four limit.
     pub(super) fn runnable_snapshot(
         &self,
@@ -5283,7 +5269,12 @@ impl<'a> OperationStatus<'a> {
                     attempt.decision.is_some(),
                     now,
                 );
-                if view.earliest_retry_ms.is_some_and(|due| now >= due) {
+                if view.earliest_retry_ms.is_some_and(|due| now >= due)
+                    || super::recovery_run::configuration_reopens(
+                        run.as_ref(),
+                        &super::recovery_run::recovery_configuration_digest(self.profile),
+                    )
+                {
                     candidates.push((
                         attempt.started_at_ms,
                         record.id.to_hex(),
@@ -5329,7 +5320,14 @@ impl<'a> OperationStatus<'a> {
             .collect())
     }
 
-    fn unknown_attempts(
+    /// Reads the four oldest exposed classic attempts with unknown
+    /// outcomes for the outcome stage, attempts with a recorded sequence
+    /// release included. A transaction hash selects only its matching
+    /// attempt, released or not.
+    ///
+    /// # Errors
+    /// Returns every integrity, keyring and I/O error of the verified window read.
+    pub fn outcome_snapshot(
         &self,
         tx_hash: Option<&[u8; 32]>,
     ) -> Result<Vec<RecoveryAttempt>, WindowStoreError> {

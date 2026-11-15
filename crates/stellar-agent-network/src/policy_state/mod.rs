@@ -208,6 +208,7 @@ pub mod lock;
 pub mod operations;
 pub mod recovery;
 mod recovery_run;
+mod recovery_scan;
 mod reset_consent;
 pub mod store;
 

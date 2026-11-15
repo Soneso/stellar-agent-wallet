@@ -20,6 +20,8 @@ use wiremock::{Mock, MockServer};
 
 const NOW: u64 = 1_800_000_000_000;
 
+mod scan_tests;
+
 type WriteHook = Box<dyn FnMut(u8)>;
 thread_local! {
     static WRITE_HOOK: std::cell::RefCell<Option<WriteHook>> = const { std::cell::RefCell::new(None) };
@@ -1045,7 +1047,7 @@ async fn driver_account_coverage_and_high_sequence() {
             60,
             101,
             RecoveryStopReason::CoverageRequired,
-            RecoveryClass::Explicit,
+            RecoveryClass::Automatic,
         ),
         (
             55,
@@ -1105,7 +1107,7 @@ async fn driver_account_coverage_and_high_sequence() {
             report.requests,
             RecoveryRequests {
                 shared: 4,
-                attempt: 4
+                attempt: if sequence == 101 { 6 } else { 4 }
             }
         );
     }
@@ -1341,7 +1343,7 @@ async fn driver_hash_shape_refuses_without_release() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let _storage_home =
         stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-    for defect in 0..7 {
+    for defect in 0..8 {
         let fx = Fixture::new(1, NOW / 1000 - 10);
         let pair = fx.pair([60, 60], NOW, 0).await;
         let mut bad = absence(60, NOW);
@@ -1356,7 +1358,8 @@ async fn driver_hash_shape_refuses_without_release() {
             }
             4 => bad["oldestLedger"] = json!(0),
             5 => bad["oldestLedger"] = json!(61),
-            _ => bad["latestLedger"] = json!(59),
+            6 => bad["latestLedger"] = json!(59),
+            _ => bad = json!([]),
         }
         override_answer(&pair[0], "getTransaction", bad).await;
         let report = fx.run(&pair).await.unwrap();
