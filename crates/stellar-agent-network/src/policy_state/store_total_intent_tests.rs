@@ -248,6 +248,7 @@ fn intent_total_linked_rows_never_own_the_charge() {
             Err(WindowStoreError::DuplicateReservation)
         ));
         assert_eq!(f.sum(D1), 6);
+        assert_eq!(f.store.total_usage(&f.profile, D1).unwrap(), native_usage(6));
         assert_eq!(f.hydrated(D1), 6);
         if mixed {
             let memory = PolicyStateStore::new();
@@ -266,6 +267,7 @@ fn intent_total_linked_rows_never_own_the_charge() {
         f.clock.set(T + 1001 + RETENTION_MS);
         f.authorized(&[f.windowed(1)]).unwrap();
         assert_eq!(f.sum(D1), 6);
+        assert_eq!(f.store.total_usage(&f.profile, D1).unwrap(), native_usage(6));
         assert_eq!(f.hydrated(D1), 6);
         assert!(f.wire().signed_intents.is_empty());
         assert_eq!(f.wire().total_sums[0].amount, 6);
@@ -757,6 +759,57 @@ fn intent_total_replay_checks_pin_and_retirement() {
         Some("policy.total_epoch_retired")
     );
     assert_eq!(f.sum(D1), 6);
+}
+
+/// Binding a final envelope refuses total legs sized under a digest that is
+/// no longer pinned, writes nothing, and leaves the intent unbound. The same
+/// legs bind once the pin names their digest again.
+#[test]
+#[serial]
+fn intent_total_bind_checks_the_pin() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let f = fx("intent-bind-pin");
+    f.pin(D1);
+    let legs = [f.total(6, D1)];
+    let (plan, envelope) = intent_fixture_plan(1, 60);
+    let plan = plan.with_legs(&legs);
+    let exposure = f
+        .store
+        .admit_signed_intent(&f.profile, &plan)
+        .unwrap()
+        .expose();
+    let id = exposure.intent_id().unwrap();
+    let facts =
+        crate::BindFacts::from_envelope(&envelope, Caip2::Testnet.network_passphrase()).unwrap();
+    let record = |f: &Fx| {
+        f.wire()
+            .signed_intents
+            .into_iter()
+            .find(|record| record.intent_id == id)
+            .unwrap()
+    };
+
+    f.pin(D2);
+    let before = f.state();
+    assert!(matches!(
+        f.store.bind_signed_intent(&f.profile, id, &facts, &legs),
+        Err(WindowStoreError::TotalEpochStale)
+    ));
+    assert_eq!(f.state(), before, "a refused binding writes nothing");
+    let unbound = record(&f);
+    assert_ne!(unbound.status, SignedIntentStatus::Bound);
+    assert_eq!(unbound.bound_envelope_hash, None);
+    assert_eq!(f.sum(D1), 6);
+
+    f.pin(D1);
+    f.store
+        .bind_signed_intent(&f.profile, id, &facts, &legs)
+        .unwrap();
+    let bound = record(&f);
+    assert_eq!(bound.status, SignedIntentStatus::Bound);
+    assert_eq!(bound.bound_envelope_hash, Some(facts.envelope_hash.clone()));
 }
 
 fn corrupt_total_intent(case: &str) {

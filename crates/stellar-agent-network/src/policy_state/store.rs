@@ -3578,9 +3578,10 @@ impl PersistedWindowStore {
             return Err(WindowStoreError::AccountingAuditOwed);
         }
         let original = wire.clone();
-        // The successor keeps every total row and sum of the retired working
-        // copy and converts each total hold once, before the sweep below
-        // settles any. Finality is marked first, while its evidence remains.
+        // Reset collects closed intents, then keeps every unlinked total row
+        // and sum of the retired working copy. It retains each claimed or
+        // exposed total hold once, before the sweep below settles any.
+        // Finality is marked before the capture, while its evidence remains.
         wire = self.retired_successor(lock, profile, &original)?;
         prune_closed_intents(&mut wire, crate::policy_state::store::now_ms()?)?;
         promote_final_totals(&mut wire);
@@ -7146,11 +7147,11 @@ pub(super) fn total_in_file(
             continue;
         }
         for record in &bucket.records {
-            // Any negative row of the bucket, whatever its epoch, leaves
-            // its sum undefined: the bucket refuses admissions.
             if record.signed_intent.is_some() {
                 continue;
             }
+            // Any negative unlinked row of the bucket, whatever its epoch,
+            // leaves its sum undefined: the bucket refuses admissions.
             u128::try_from(record.amount).map_err(|_| WindowStoreError::Invalid {
                 detail: "a total-budget record is negative".to_owned(),
             })?;

@@ -177,11 +177,12 @@ fn usage_rows_join_scope_and_floor() {
 }
 
 /// `--check` reports committed use only for trusted current state. A pin
-/// with no store reports zero; committed rows report their use; an earlier
-/// build's history, a retired digest, and a missing pin report `null` with a
-/// code; corrupt bytes fail the check. No case
-/// creates or changes a file, a keyring value, or the counter, and the exit
-/// code follows `valid`.
+/// with no store reports zero; committed rows report their use, and an
+/// issued asset keeps its own bucket; an earlier build's history, a retired
+/// digest, and a missing pin report `null` with a code; corrupt bytes fail the
+/// check. A pinned body without a bound reports `[]` on healthy state and
+/// fails the check with `null` on corrupt bytes. No case creates or changes a
+/// file, a keyring value, or the counter, and the exit code follows `valid`.
 #[test]
 #[serial]
 fn check_reports_usage_only_for_trusted_current_state() {
@@ -207,13 +208,36 @@ fn check_reports_usage_only_for_trusted_current_state() {
     assert_eq!(usage_check(&output), ("passed".to_owned(), None));
 
     let contract = format!("total:{}", native_contract());
+    let issuer = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
+    let classic = format!("total:USDC:{issuer}");
+    let issued_contract = stellar_agent_core::asset_id::CanonicalAsset::Classic {
+        code: "USDC".to_owned(),
+        issuer: issuer.to_owned(),
+    }
+    .sac_contract_id(stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE)
+    .unwrap();
+    let issued = format!("total:{issued_contract}");
     let rows = [
         (1, "total:native", 4, Some(digest)),
         (1, contract.as_str(), 2, Some(digest)),
         (9, "total:native", 9, Some(digest)),
         (1, "total:native", 5, Some([7; 32])),
+        (1, classic.as_str(), 3, Some(digest)),
     ];
     seal_total_rows(&store, &fixture.profile, TOTAL_INTENTS_VERSION, None, &rows);
+    let usage = |scope_specificity: u8, bucket: &str, used_stroops: i128| TotalUsage {
+        scope_specificity,
+        bucket: bucket.to_owned(),
+        used_stroops,
+    };
+    assert_eq!(
+        store.total_usage(&fixture.profile, digest).unwrap(),
+        [
+            usage(1, &issued, 3),
+            usage(1, "total:native", 6),
+            usage(9, "total:native", 9),
+        ]
+    );
     let output = checked("committed rows");
     assert_eq!(output["valid"], true, "{output}");
     assert_eq!(output["total_budget_usage"], usage_of(["6", "6"], ["4", "14"]));
@@ -245,6 +269,33 @@ fn check_reports_usage_only_for_trusted_current_state() {
     let sealed = std::fs::read(&fixture.window).unwrap();
     std::fs::write(&fixture.window, b"{").unwrap();
     let output = checked("corrupt state");
+    assert_eq!(output["valid"], false, "{output}");
+    assert_eq!(check_of(&output, "verified_policy").0, "passed");
+    assert!(output["total_budget_usage"].is_null(), "{output}");
+    assert_eq!(
+        usage_check(&output),
+        (
+            "failed".to_owned(),
+            Some("policy.window_state_unverifiable".to_owned())
+        )
+    );
+
+    std::fs::write(&fixture.window, &sealed).unwrap();
+    let raw = std::fs::read_to_string(fixture.path()).unwrap();
+    let mut document = raw.parse::<toml_edit::DocumentMut>().unwrap();
+    let rules = document["rules"].as_array_of_tables_mut().unwrap();
+    assert_eq!(rules.len(), 3, "rule 0 and the two total rules");
+    rules.remove(2);
+    rules.remove(1);
+    std::fs::write(fixture.path(), document.to_string()).unwrap();
+    fixture.sign_rewritten_and_verify(3);
+    let output = checked("no bound");
+    assert_eq!(output["valid"], true, "{output}");
+    assert_eq!(output["total_budget_usage"], serde_json::json!([]));
+    assert_eq!(usage_check(&output), ("passed".to_owned(), None));
+
+    std::fs::write(&fixture.window, b"{").unwrap();
+    let output = checked("no bound, corrupt state");
     assert_eq!(output["valid"], false, "{output}");
     assert_eq!(check_of(&output, "verified_policy").0, "passed");
     assert!(output["total_budget_usage"].is_null(), "{output}");

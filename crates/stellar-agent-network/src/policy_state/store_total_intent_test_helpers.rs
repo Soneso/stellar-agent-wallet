@@ -130,7 +130,7 @@ pub async fn recorder_refusal(case: &str) -> stellar_agent_core::WalletError {
         )
         .with_epoch(Some([0xd1; 32])),
     ];
-    let (plan, envelope) = crate::signed_intent::test_helpers::intent_fixture_plan(1, 60);
+    let (plan, _) = crate::signed_intent::test_helpers::intent_fixture_plan(1, 60);
     let plan = plan.with_legs(&entries);
     let receipts = ReceiptStore::open_at(dir.path(), "intent-adapter").unwrap();
     let recorder = WalletSubmissionRecorder::new(
@@ -214,7 +214,6 @@ pub async fn recorder_refusal(case: &str) -> stellar_agent_core::WalletError {
         }
         _ => panic!("unknown refusal fixture"),
     }
-    let _ = envelope;
     recorder.admit_signed_intent(&plan).await.err().unwrap()
 }
 
