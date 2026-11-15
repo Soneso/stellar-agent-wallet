@@ -13,7 +13,10 @@ use stellar_agent_core::approval::{
     presence::MainnetPresenceReceipt,
     subject::{SubjectKind, length_prefixed},
     verify_attestation,
-    witness::{ApprovalWitness, ApprovedKind},
+    witness::{
+        ApprovalConsentFacts, ApprovalDisposition, ApprovalFacts, ApprovalPayloadFacts,
+        ApprovalRecordFacts, ApprovalWitness, ApprovedKind,
+    },
 };
 use stellar_agent_core::audit_log::OutboxRowRef;
 use stellar_agent_core::policy::state_lock::WindowStoreLock;
@@ -91,6 +94,13 @@ pub struct ConsentPayload {
     /// The retained queued consent reference for delivery enforcement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outbox_row: Option<OutboxRowRef>,
+    /// The original consent challenge subject, required for intent payloads.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "super::ledger::opt_hex32"
+    )]
+    pub challenge_subject: Option<[u8; 32]>,
 }
 
 impl std::fmt::Debug for ConsentPayload {
@@ -359,6 +369,8 @@ impl WindowSection for Approvals {
                     && (payload.process_uid.is_empty()
                         || payload.process_uid.len() > PROCESS_UID_MAX
                         || payload.receipt.digest() != Some(consent.receipt_sha256)
+                        || payload.challenge_subject.is_some()
+                            != (record.subject_kind == SubjectKind::IntentDigest)
                         || payload.receipt.verified_at_unix_ms() != consent.consent_at_ms)
                 {
                     return Err(invalid("an approval has inconsistent consent payload"));
@@ -605,12 +617,19 @@ impl<'a> ApprovalRecorder<'a> {
             }
             let at = payload.receipt.verified_at_unix_ms();
             check_consent_time(record, at)?;
-            verify_payload(profile, record, payload)?;
+            let mut payload = payload.clone();
+            if record.subject_kind == SubjectKind::IntentDigest {
+                payload.challenge_subject =
+                    Some(witness.challenge_subject().ok_or_else(|| {
+                        unexpected("the intent witness lacks its challenge subject")
+                    })?);
+            }
+            verify_payload(profile, record, &payload)?;
             record.consent = Some(Consent {
                 consent_at_ms: at,
                 execution_expires_at_ms: execution_expiry(at, record.rule_ttl_ms)?,
                 receipt_sha256: digest,
-                payload: Some(payload.clone()),
+                payload: Some(payload),
             });
             if serialized_len(record) > APPROVAL_RECORD_MAX {
                 return Err(invalid("the approval record exceeds its allowance"));
@@ -766,6 +785,53 @@ impl<'a> ApprovalStatus<'a> {
     pub fn find_by_nonce(&self, nonce: &str) -> Result<Option<ApprovalView>, WindowStoreError> {
         self.find(|r| r.nonce == nonce)
     }
+
+    /// Projects authenticated durable proof facts without writing or opening the inbox.
+    /// Released payloads remain absent; consent clocks and receipt digests survive.
+    ///
+    /// # Errors
+    ///
+    /// Returns integrity, clock, keyring and I/O errors from inspection.
+    pub fn facts_by_nonce(&self, nonce: &str) -> Result<Option<ApprovalFacts>, WindowStoreError> {
+        Ok(self.find_by_nonce(nonce)?.map(|view| {
+            let record = view.record;
+            ApprovalFacts::new(
+                profile_name_for_approval(self.profile),
+                self.profile.chain_id,
+                ApprovalRecordFacts {
+                    id: record.id,
+                    operation_id: *record.operation_id.as_bytes(),
+                    nonce: record.nonce,
+                    disposition: match record.state {
+                        ApprovalState::Pending => ApprovalDisposition::Pending,
+                        ApprovalState::Consumed => ApprovalDisposition::Consumed,
+                        ApprovalState::Revoked => ApprovalDisposition::Revoked,
+                    },
+                    consumed_at_ms: record.consumed_at_ms,
+                    revoked_at_ms: record.revoked_at_ms,
+                    kind: record.kind,
+                    subject_kind: record.subject_kind,
+                    subject: record.subject,
+                    intent_digest: record.intent_digest,
+                    created_at_ms: record.created_at_ms,
+                    expires_at_ms: record.waiting_expires_at_ms,
+                    rule_ttl_ms: record.rule_ttl_ms,
+                    consent: record.consent.map(|consent| ApprovalConsentFacts {
+                        consent_at_ms: consent.consent_at_ms,
+                        execution_expires_at_ms: consent.execution_expires_at_ms,
+                        receipt_sha256: consent.receipt_sha256,
+                        payload: consent.payload.map(|payload| ApprovalPayloadFacts {
+                            attestation: payload.attestation,
+                            receipt: payload.receipt,
+                            process_uid: payload.process_uid,
+                            challenge_subject: payload.challenge_subject,
+                            outbox_row: payload.outbox_row,
+                        }),
+                    }),
+                },
+            )
+        }))
+    }
 }
 
 /// Consumes on the caller's successor image; its mint commits this change.
@@ -805,6 +871,9 @@ pub(super) fn consume(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod durable_tests;
 
 #[cfg(test)]
 pub(in crate::policy_state) mod tests {
@@ -923,6 +992,7 @@ pub(in crate::policy_state) mod tests {
                 receipt,
                 process_uid: entry.process_uid.clone(),
                 outbox_row: None,
+                challenge_subject: None,
             },
         )
     }
@@ -1362,6 +1432,7 @@ pub(in crate::policy_state) mod tests {
             receipt: receipt.clone(),
             process_uid: entry.process_uid.clone(),
             outbox_row: None,
+            challenge_subject: None,
         };
         assert!(
             ApprovalRecorder::new(&store, fixture.profile(), &mut rows, "request")
@@ -1375,6 +1446,7 @@ pub(in crate::policy_state) mod tests {
             receipt: receipt.clone(),
             process_uid: entry.process_uid.clone(),
             outbox_row: None,
+            challenge_subject: None,
         };
         let view = ApprovalRecorder::new(&store, fixture.profile(), &mut rows, "request")
             .record_consent(id, &witness, &payload)
@@ -1386,7 +1458,16 @@ pub(in crate::policy_state) mod tests {
             consent.execution_expires_at_ms,
             witness.execution_expires_at_ms()
         );
-        assert_eq!(consent.payload, Some(payload));
+        let challenge = stellar_agent_core::approval::presence::mainnet_consent_subject(
+            &entry,
+            &fixture.binding(),
+        )
+        .unwrap();
+        assert_ne!(challenge, digest);
+        assert_eq!(witness.challenge_subject(), Some(challenge));
+        let mut retained = payload;
+        retained.challenge_subject = Some(challenge);
+        assert_eq!(consent.payload, Some(retained));
     }
 
     #[test]
@@ -1717,6 +1798,45 @@ pub(in crate::policy_state) mod tests {
         let round_trip: ConsentPayload =
             serde_json::from_slice(&serde_json::to_vec(&fx.payload).unwrap()).unwrap();
         assert_eq!(round_trip, fx.payload);
+        let mut intent = fx.payload.clone();
+        intent.challenge_subject = Some([0x34; 32]);
+        let expected_intent = format!(
+            "{},\"challenge_subject\":\"{}\"}}",
+            serde_json::to_string(&fx.payload)
+                .unwrap()
+                .strip_suffix('}')
+                .unwrap(),
+            "34".repeat(32)
+        );
+        assert_eq!(serde_json::to_string(&intent).unwrap(), expected_intent);
+        assert_eq!(
+            serde_json::from_str::<ConsentPayload>(&expected_intent).unwrap(),
+            intent
+        );
+        let mut wire = fx.wire();
+        for (kind, subject, valid) in [
+            (SubjectKind::EnvelopeText, None, true),
+            (SubjectKind::EnvelopeText, Some([0x34; 32]), false),
+            (SubjectKind::IntentDigest, None, false),
+            (SubjectKind::IntentDigest, Some([0x34; 32]), true),
+        ] {
+            // Storage validation is isolated from the separately tested HMAC check.
+            let record = &mut wire.approvals.as_mut().unwrap().records[0];
+            record.subject_kind = kind;
+            record
+                .consent
+                .as_mut()
+                .unwrap()
+                .payload
+                .as_mut()
+                .unwrap()
+                .challenge_subject = subject;
+            assert_eq!(
+                Approvals::validate(&wire).is_ok(),
+                valid,
+                "challenge presence {kind:?} {subject:?}"
+            );
+        }
         let mut malformed = serde_json::to_value(&fx.payload).unwrap();
         malformed["outbox_row"]["digest"] = "sha256:AB".into();
         assert!(serde_json::from_value::<ConsentPayload>(malformed).is_err());

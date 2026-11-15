@@ -73,8 +73,9 @@
 //!
 //! A witness keeps the signed pending times, which its fact digest covers.
 //! It also reports the consent time, the receipt's verified time, and the
-//! exclusive execution expiry. An envelope witness has the signed expiry as
-//! its execution expiry and requires the pending lifetime to be live.
+//! exclusive execution expiry. An inbox envelope witness reports the signed
+//! expiry. Durable envelope verification also applies the retained consent's
+//! execution bound. Both require the signed lifetime to be live.
 //!
 //! An intent witness requires `created <= consent < waiting expiry` and
 //! `consent <= now < consent + min(900 s, governing TTL)`. It applies no
@@ -94,6 +95,7 @@
 //! and the window-state lock is released before assertion verification.
 
 use super::attest::{decode_sha256_hex, load_attestation_key};
+mod durable;
 use super::attestation::{AttestationBinding, AttestationScope, verify_attestation};
 use super::intent::ClassicIntent;
 use super::presence::MAINNET_CHAIN_ID;
@@ -108,6 +110,11 @@ use crate::policy::Decision;
 use crate::profile::caip2::Caip2;
 use crate::profile::owner_key::OwnerKeyContext;
 use crate::profile::schema::Profile;
+pub(crate) use durable::inbox_kind;
+pub use durable::{
+    ApprovalConsentFacts, ApprovalDisposition, ApprovalFacts, ApprovalPayloadFacts,
+    ApprovalRecordFacts, verify_durable_approval, verify_durable_intent_approval,
+};
 
 /// The approval kinds a mainnet proof accepts, each a classic transaction
 /// whose subject is [`approval_subject_classic`] of the record's envelope.
@@ -312,6 +319,7 @@ pub struct ApprovalWitness {
     subject_kind: SubjectKind,
     consent_at_ms: u64,
     execution_expires_at_ms: u64,
+    challenge_subject: Option<[u8; 32]>,
 }
 
 /// The longest execution window after consent, in milliseconds. An intent
@@ -386,6 +394,13 @@ impl ApprovalWitness {
         self.subject_kind
     }
 
+    /// The original consent challenge subject, retained for `record_consent`.
+    /// Envelope witnesses have no separate challenge subject.
+    #[must_use]
+    pub fn challenge_subject(&self) -> Option<[u8; 32]> {
+        self.challenge_subject
+    }
+
     /// When the operator consented, in Unix milliseconds: the verified time
     /// of the presence receipt the attestation binds.
     #[must_use]
@@ -393,8 +408,9 @@ impl ApprovalWitness {
         self.consent_at_ms
     }
 
-    /// The exclusive execution boundary, in Unix milliseconds. An envelope
-    /// witness reports its signed expiry. An intent witness reports the
+    /// The exclusive execution boundary, in Unix milliseconds. An inbox envelope
+    /// witness reports its signed expiry. Durable witnesses also retain the
+    /// consent execution bound. An intent witness reports the
     /// consent time plus the shorter of [`APPROVAL_EXECUTION_MAX_MS`] and the
     /// governing lifetime.
     #[must_use]
@@ -630,6 +646,7 @@ pub(crate) fn verify_approval_with(
         subject_kind: SubjectKind::EnvelopeText,
         consent_at_ms: receipt.verified_at_unix_ms(),
         execution_expires_at_ms: record.expires_at_unix_ms,
+        challenge_subject: None,
     })
 }
 
@@ -806,6 +823,7 @@ pub(crate) fn verify_intent_approval_with(
         subject_kind: SubjectKind::IntentDigest,
         consent_at_ms,
         execution_expires_at_ms,
+        challenge_subject: Some(super::presence::mainnet_consent_subject(record, &binding)?),
     })
 }
 
