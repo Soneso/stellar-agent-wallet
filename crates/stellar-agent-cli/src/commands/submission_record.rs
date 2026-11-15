@@ -300,7 +300,7 @@ pub(crate) fn prepare_mainnet_recorder<'a>(
                     ))
                 })?,
                 profile_name: profile_name.clone(),
-                approval_nonce: approval.nonce().to_owned(),
+                approval_nonce: approval.witness().nonce().to_owned(),
             }),
             MainnetAuthority::Policy(_) => None,
         },
@@ -1618,7 +1618,7 @@ mod tests {
                 MainnetAuthority::Policy(_) => assert!(prepared.tombstone.is_none()),
                 MainnetAuthority::Approval(witness) => {
                     let tombstone = prepared.tombstone.unwrap();
-                    assert_eq!(tombstone.approval_nonce, witness.nonce());
+                    assert_eq!(tombstone.approval_nonce, witness.witness().nonce());
                     assert_eq!(tombstone.profile_name, name);
                     assert_eq!(
                         tombstone.store_dir.join(format!("{name}.toml")),

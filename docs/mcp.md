@@ -359,6 +359,24 @@ operator runs `stellar-agent approve --id <approval_nonce> --profile <name>` as
 the same local user as the server. The commit request then carries that nonce
 and the `approval_attestation` the approval returned.
 
+For payment approvals, `approval.summary` describes the exact retained envelope,
+including its destination, asset, amount, fee, and sequence. Its additive
+`memo_details` member is a tagged object: `{"kind":"none"}`, or a `kind` of
+`text`, `id`, `hash`, or `return` with a `value`. Text preserves UTF-8, IDs use
+decimal strings, and hash and return values are arrays of 32 bytes. The legacy
+`memo` member remains null, text, a numeric ID, or hexadecimal bytes.
+
+Approval creation and expiry retain the policy evaluation interval in Unix
+milliseconds. Paired payment decisions and retained mainnet operation deadlines
+can shorten that interval. Queueing delay never restarts it: a positive
+subsecond remainder remains usable, and an expired interval refuses before
+issuing a protocol nonce. Mainnet signing authority also ends at the earlier
+of the captured decision end and the operator witness expiry.
+
+A mainnet retry uses its retained envelope, including the original sequence.
+Repeated preparation can still create another approval request; this release
+does not deduplicate the approval queue or extend its retention period.
+
 ## Resources
 
 The server exposes three MCP resources. None contains a secret.

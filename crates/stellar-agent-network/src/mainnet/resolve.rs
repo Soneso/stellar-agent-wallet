@@ -812,6 +812,7 @@ mod enabled {
             authority.policy_sequence() == policy.sequence(),
             P::PolicySequence,
         )?;
+        require(authority.evaluated_at_ms() <= now, P::NotYetValid)?;
         require(now < authority.governing_until_ms(), P::Expired)
     }
 
@@ -819,7 +820,7 @@ mod enabled {
     fn mint_authority(authority: &MainnetAuthority<'_>) -> MintAuthority {
         match authority {
             MainnetAuthority::Approval(approval) => MintAuthority::Approval {
-                nonce: approval.nonce().to_owned(),
+                nonce: approval.witness().nonce().to_owned(),
                 expires_at_ms: approval.expires_at_ms(),
             },
             MainnetAuthority::Policy(policy) => MintAuthority::Policy(policy.binding()),
@@ -830,7 +831,7 @@ mod enabled {
     /// fact digest or the policy authority digest.
     fn authority_fact(authority: &MainnetAuthority<'_>) -> [u8; 32] {
         match authority {
-            MainnetAuthority::Approval(approval) => approval.fact_digest(),
+            MainnetAuthority::Approval(approval) => approval.witness().fact_digest(),
             MainnetAuthority::Policy(policy) => policy.binding().digest(),
         }
     }
@@ -912,7 +913,16 @@ mod enabled {
     ) -> Result<(), MainnetAuthorizationError> {
         match authority {
             MainnetAuthority::Approval(approval) => {
-                approval_checks(context, policy, approval, subject, kind, evaluation, now)?;
+                approval_checks(
+                    context,
+                    policy,
+                    approval.witness(),
+                    subject,
+                    kind,
+                    evaluation,
+                    now,
+                )?;
+                check_policy_authority(context, policy, &approval.bound, now)?;
             }
             MainnetAuthority::Policy(authority) => {
                 check_policy_authority(context, policy, authority, now)?;
@@ -1389,6 +1399,8 @@ mod enabled {
             .map_err(|_| refused(P::IntentShape))?;
         match req.authority {
             MainnetAuthority::Approval(approval) => {
+                let bound = &approval.bound;
+                let approval = approval.witness();
                 require(
                     approval.profile() == req.context.profile_name(),
                     P::ApprovalProfileMismatch,
@@ -1414,6 +1426,12 @@ mod enabled {
                 )?;
                 require(approval.created_at_ms() <= now, P::NotYetValid)?;
                 require(now < approval.expires_at_ms(), P::ApprovalExpired)?;
+                check_policy_authority(req.context, req.policy, bound, now)?;
+                require(
+                    matches!(bound.scope(), AuthorityScope::X402Authenticated { home_domain, .. }
+                        if *home_domain == req.message.domain.home_domain),
+                    P::AuthorityScopeMismatch,
+                )?;
             }
             MainnetAuthority::Policy(authority) => {
                 check_policy_authority(req.context, req.policy, authority, now)?;
@@ -1745,7 +1763,7 @@ mod tests {
         });
         let approval = f.approval(&envelope, f.now, 600_000);
         let before = f.wire();
-        let authority = MainnetAuthority::Approval(&approval);
+        let authority = f.approval_authority(&approval);
         let mut req = request(&f, &context, &client, &authority);
         req.unsigned_envelope_xdr = &envelope;
         let signer =
@@ -1815,7 +1833,7 @@ mod tests {
             &f,
             &context,
             &client,
-            &MainnetAuthority::Approval(&approval),
+            &f.approval_authority(&approval),
         ))
         .await
         .unwrap();
@@ -1866,7 +1884,7 @@ mod tests {
         let f = ResolverFixture::new();
         let approval = f.approval(&f.envelope, f.now, 600_000);
         let client = f.context.primary_client().unwrap();
-        let authority = MainnetAuthority::Approval(&approval);
+        let authority = f.approval_authority(&approval);
         let req = request(&f, &f.context, &client, &authority);
         let guard = super::super::clock::set_clock_error_for_test();
         assert!(matches!(
@@ -2014,7 +2032,7 @@ mod tests {
             .unwrap();
         }
         let before = f.wire();
-        let authority = MainnetAuthority::Approval(&approval);
+        let authority = f.approval_authority(&approval);
         let mut req = request(&f, &context, &client, &authority);
         req.unsigned_envelope_xdr = &envelope;
         assert_refused(resolve_tx_sign(req).await, expected, &f, &before);
@@ -2107,7 +2125,7 @@ mod tests {
             }
         }
         let before = f.wire();
-        let authority = MainnetAuthority::Approval(&approval);
+        let authority = f.approval_authority(&approval);
         let mut req = request(&f, &context, &client, &authority);
         req.probe_deadline = Duration::from_millis(20);
         assert_refused(resolve_tx_sign(req).await, expected, &f, &before);
@@ -2146,7 +2164,7 @@ mod tests {
         let approval = f.approval(&f.envelope, f.now, 600_000);
         let client = f.context.primary_client().unwrap();
         let before = f.wire();
-        let authority = MainnetAuthority::Approval(&approval);
+        let authority = f.approval_authority(&approval);
         let mut req = request(&f, &f.context, &client, &authority);
         req.consumer = MainnetConsumer::X402Create;
         assert_refused(resolve_tx_sign(req).await, P::ConsumerMismatch, &f, &before);
@@ -2165,7 +2183,7 @@ mod tests {
                 &f,
                 &context,
                 &client,
-                &MainnetAuthority::Approval(&approval),
+                &f.approval_authority(&approval),
             ))
             .await,
             expected,
@@ -2204,7 +2222,7 @@ mod tests {
                 &f,
                 &context,
                 &client,
-                &MainnetAuthority::Approval(&approval),
+                &f.approval_authority(&approval),
             ))
             .await,
             P::NotYetValid,
@@ -2236,7 +2254,7 @@ mod tests {
                 &f,
                 &context,
                 &client,
-                &MainnetAuthority::Approval(&approval),
+                &f.approval_authority(&approval),
             ))
             .await,
             P::ApprovalExpired,
@@ -2364,7 +2382,7 @@ mod tests {
             context,
             &client,
             &intent,
-            &MainnetAuthority::Approval(&approval),
+            &f.approval_authority(&approval),
         ))
         .await
         .unwrap()
@@ -2531,7 +2549,7 @@ mod tests {
                     &context,
                     &client,
                     &intent,
-                    &MainnetAuthority::Approval(&approval),
+                    &f.approval_authority(&approval),
                 ))
                 .await
                 .unwrap_err();
@@ -2606,7 +2624,7 @@ mod tests {
                 &context,
                 &client,
                 &intent,
-                &MainnetAuthority::Approval(&approval),
+                &f.approval_authority(&approval),
             ))
             .await,
             expected,
@@ -2960,7 +2978,7 @@ mod tests {
         )
         .await;
         let before = f.wire();
-        let authority = MainnetAuthority::Approval(&approval);
+        let authority = f.approval_authority(&approval);
         let mut req = request(&f, &context, &client, &authority);
         req.witness = Some(&witness);
         let result = resolve_tx_sign(req).await;
@@ -3012,7 +3030,7 @@ mod tests {
         let witness = witness_for(&f, &context, &f.envelope, "oracle.example.invalid").await;
         assert_eq!(witness.authority(), "https://oracle.example.invalid");
         let approval = f.approval(&f.envelope, f.now, 600_000);
-        let authority = MainnetAuthority::Approval(&approval);
+        let authority = f.approval_authority(&approval);
         let mut req = request(&f, &context, &client, &authority);
         req.witness = Some(&witness);
         resolve_tx_sign(req).await.unwrap();
@@ -3057,7 +3075,7 @@ mod tests {
                 &f,
                 &context,
                 &client,
-                &MainnetAuthority::Approval(&approval),
+                &f.approval_authority(&approval),
             ))
             .await,
             expected,
@@ -3088,7 +3106,7 @@ mod tests {
             &f,
             &context,
             &client,
-            &MainnetAuthority::Approval(&approval),
+            &f.approval_authority(&approval),
         ))
         .await
         .unwrap();
@@ -3118,7 +3136,7 @@ mod tests {
         let client = context.primary_client().unwrap();
         let envelope = changed_envelope(&f, |tx| tx.tx.fee = 157);
         let approval = f.approval(&envelope, f.now, 600_000);
-        let authority = MainnetAuthority::Approval(&approval);
+        let authority = f.approval_authority(&approval);
         let mut req = request(&f, &context, &client, &authority);
         req.unsigned_envelope_xdr = &envelope;
         let auth = resolve_tx_sign(req).await.unwrap();
@@ -3168,7 +3186,7 @@ mod tests {
             &f,
             &context,
             &client,
-            &MainnetAuthority::Approval(&approval),
+            &f.approval_authority(&approval),
         ))
         .await;
         let Err(MainnetAuthorizationError::PolicyDenied(reason)) = result else {
@@ -3194,7 +3212,7 @@ mod tests {
             &f,
             &context,
             &client,
-            &MainnetAuthority::Approval(&approval),
+            &f.approval_authority(&approval),
         ))
         .await;
         let Err(MainnetAuthorizationError::PolicyDenied(reason)) = result else {
@@ -3222,7 +3240,7 @@ mod tests {
             &f,
             &context,
             &client,
-            &MainnetAuthority::Approval(&approval),
+            &f.approval_authority(&approval),
         ))
         .await
         .unwrap();
@@ -3231,7 +3249,7 @@ mod tests {
         });
         let approval = f.approval(&other, f.now, 600_000);
         let before = f.wire();
-        let authority = MainnetAuthority::Approval(&approval);
+        let authority = f.approval_authority(&approval);
         let mut req = request(&f, &context, &client, &authority);
         req.unsigned_envelope_xdr = &other;
         let result = resolve_tx_sign(req).await;
@@ -3253,7 +3271,7 @@ mod tests {
             &f,
             &context,
             &client,
-            &MainnetAuthority::Approval(&first),
+            &f.approval_authority(&first),
         ))
         .await
         .unwrap();
@@ -3264,7 +3282,7 @@ mod tests {
                 &f,
                 &context,
                 &client,
-                &MainnetAuthority::Approval(&second),
+                &f.approval_authority(&second),
             ))
             .await,
             P::DuplicateOpen,
@@ -3296,7 +3314,7 @@ mod tests {
                 &f,
                 &context,
                 &client,
-                &MainnetAuthority::Approval(&approval),
+                &f.approval_authority(&approval),
             ))
             .await,
             expected,
@@ -3384,7 +3402,7 @@ mod tests {
             &f.policy.owner(),
         )
         .unwrap();
-        let authority = MainnetAuthority::Approval(&approval);
+        let authority = f.approval_authority(&approval);
         let mut req = request(&f, &context, &client, &authority);
         if case == "signer_role" {
             req.signer = &signer;
@@ -3469,7 +3487,7 @@ mod tests {
         );
         let subject = stellar_agent_core::approval::subject::approval_subject_classic(&f.envelope);
         let audit = f.audit();
-        let authority = MainnetAuthority::Approval(&approval);
+        let authority = f.approval_authority(&approval);
         let check = |kind| {
             enabled::final_checks(
                 &f.context,
@@ -3503,7 +3521,7 @@ mod tests {
         let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
         let client = context.primary_client().unwrap();
         let approval = f.approval(&f.envelope, f.now, 600_000);
-        let authority = MainnetAuthority::Approval(&approval);
+        let authority = f.approval_authority(&approval);
         let mut req = request(&f, &context, &client, &authority);
         f.clock
             .set(f.now - MAINNET_AUDIT_READINESS_TTL_SECONDS * 1000);
@@ -3868,7 +3886,7 @@ mod tests {
         )
         .unwrap();
         let before = f.wire();
-        let authority = MainnetAuthority::Approval(&approval);
+        let authority = f.approval_authority(&approval);
         let mut req = request(&f, &f.context, &client, &authority);
         req.policy = &policy;
         assert_refused(resolve_tx_sign(req).await, expected, &f, &before);
@@ -3926,7 +3944,7 @@ mod tests {
                 "http://127.0.0.1:1",
             )
             .unwrap();
-            let authority = MainnetAuthority::Approval(&approval);
+            let authority = f.approval_authority(&approval);
             let mut req = request(&f, &f.context, &client, &authority);
             req.enablement = &enablement;
             assert_refused(resolve_tx_sign(req).await, P::ProfileMismatch, &f, &before);
@@ -3934,7 +3952,7 @@ mod tests {
             let server = f.server().await;
             let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
             let client = context.primary_client().unwrap();
-            let authority = MainnetAuthority::Approval(&approval);
+            let authority = f.approval_authority(&approval);
             let mut req = request(&f, &context, &client, &authority);
             req.enablement = &enablement;
             assert_refused(
@@ -3979,7 +3997,7 @@ mod tests {
                 &f,
                 &context,
                 &client,
-                &MainnetAuthority::Approval(&approval),
+                &f.approval_authority(&approval),
             ))
             .await,
             P::PolicyEvaluationFailed,
@@ -4025,7 +4043,7 @@ mod tests {
         });
         let approval = f.approval(&envelope, f.now, 600_000);
         let before = f.wire();
-        let authority = MainnetAuthority::Approval(&approval);
+        let authority = f.approval_authority(&approval);
         let mut req = request(&f, &context, &client, &authority);
         req.unsigned_envelope_xdr = &envelope;
         assert_refused(resolve_tx_sign(req).await, P::WitnessRequired, &f, &before);
@@ -4053,7 +4071,7 @@ mod tests {
                 &context,
                 &client,
                 &intent(&root),
-                &MainnetAuthority::Approval(&approval),
+                &f.approval_authority(&approval),
             ))
             .await,
             P::WitnessThresholdMissing,
@@ -4120,7 +4138,7 @@ mod tests {
                 &f,
                 &context,
                 &client,
-                &MainnetAuthority::Approval(&approval),
+                &f.approval_authority(&approval),
             ))
             .await,
             P::ApprovalPolicyMismatch,
@@ -4147,7 +4165,7 @@ mod tests {
             });
             let approval = f.approval(&envelope, f.now, 600_000);
             let before = f.wire();
-            let authority = MainnetAuthority::Approval(&approval);
+            let authority = f.approval_authority(&approval);
             let mut req = request(&f, &context, &client, &authority);
             req.unsigned_envelope_xdr = &envelope;
             let result = resolve_tx_sign(req).await;
@@ -4169,7 +4187,7 @@ mod tests {
         let client = context.primary_client().unwrap();
         let approval = f.approval(&f.envelope, f.now, 600_000);
         let before = f.wire();
-        let authority = MainnetAuthority::Approval(&approval);
+        let authority = f.approval_authority(&approval);
         let req = request(&f, &context, &client, &authority);
         std::fs::set_permissions(
             f.window_path().parent().unwrap(),
@@ -4223,7 +4241,7 @@ mod tests {
         )
         .unwrap();
         let before = f.wire();
-        let authority = MainnetAuthority::Approval(&approval);
+        let authority = f.approval_authority(&approval);
         let mut req = request(&f, &context, &client, &authority);
         req.signer = &signer;
         assert_refused(
@@ -4268,7 +4286,7 @@ mod tests {
                 &context,
                 &client,
                 &intent,
-                &MainnetAuthority::Approval(&approval),
+                &f.approval_authority(&approval),
             ))
             .await,
             P::NotYetValid,
@@ -4294,7 +4312,7 @@ mod tests {
                 &f,
                 &context,
                 &client,
-                &MainnetAuthority::Approval(&approval),
+                &f.approval_authority(&approval),
             ))
             .await
             .unwrap();
@@ -4380,7 +4398,7 @@ mod tests {
                 stellar_agent_core::approval::subject::approval_subject_classic(&envelope),
             );
             let before = f.wire();
-            let authority = MainnetAuthority::Approval(&second);
+            let authority = f.approval_authority(&second);
             let mut req = request(&f, &context, &client, &authority);
             req.unsigned_envelope_xdr = &envelope;
             assert_refused(
@@ -4433,7 +4451,7 @@ mod tests {
             f.clock.set(f.now + 600_000);
         }
         let intent = intent(&root);
-        let authority = MainnetAuthority::Approval(&approval);
+        let authority = f.approval_authority(&approval);
         let mut req = intent_request(&f, &context, &client, &intent, &authority);
         if let Some(policy) = &another {
             req.policy = policy;
@@ -4575,7 +4593,7 @@ mod tests {
             panic!("bound witness required")
         };
         let payment = intent(&root);
-        let authority = MainnetAuthority::Approval(&approval);
+        let authority = f.approval_authority(&approval);
         let mut req = intent_request(&f, &context, &client, &payment, &authority);
         req.witness = if case == "missing" {
             None
@@ -4989,7 +5007,7 @@ mod tests {
             let auth = resolve_message_sign(f.message_request(
                 &intent,
                 &message,
-                &MainnetAuthority::Approval(&approval),
+                &f.approval_authority(&approval),
             ))
             .unwrap();
             let wire = f.wire();
@@ -5096,7 +5114,7 @@ mod tests {
             )
             .unwrap()
         });
-        let authority = MainnetAuthority::Approval(&approval);
+        let authority = f.approval_authority(&approval);
         let mut req = f.message_request(&intent, &message, &authority);
         match case {
             "consumer" => req.consumer = MainnetConsumer::X402Create,
@@ -5251,7 +5269,7 @@ mod tests {
                        audit: AuditReadiness| {
             let mut intent = x402_intent(&root, MainnetConsumer::X402Authenticated);
             intent.network_id = network_id;
-            let authority = MainnetAuthority::Approval(approval);
+            let authority = f.approval_authority(approval);
             let mut req = f.message_request(&intent, &message, &authority);
             req.consumer = consumer;
             req.policy = policy;
@@ -5343,7 +5361,7 @@ mod tests {
         let approval = f.attested(&entry, ApprovedKind::X402Payment, subject);
         f.clock.set(created - 8 * 24 * 60 * 60 * 1000);
         let message = message_facts([1; 32], EPHEMERAL);
-        let authority = MainnetAuthority::Approval(&approval);
+        let authority = f.approval_authority(&approval);
         let req = f.message_request(&intent, &message, &authority);
         let before = f.wire();
         assert_refused(resolve_message_sign(req), P::NotYetValid, &f, &before);
@@ -5362,7 +5380,7 @@ mod tests {
         let intent = x402_intent(&root, MainnetConsumer::X402Authenticated);
         let message = message_facts([1; 32], EPHEMERAL);
         let approval = f.x402_approval(&root, Some(MESSAGE_HOME_DOMAIN), f.now);
-        let authority = MainnetAuthority::Approval(&approval);
+        let authority = f.approval_authority(&approval);
         let req = f.message_request(&intent, &message, &authority);
         let before = f.wire();
         let guard = super::super::clock::set_clock_error_for_test();
@@ -5384,18 +5402,14 @@ mod tests {
         let first = message_facts([1; 32], EPHEMERAL);
         let other = message_facts([2; 32], EPHEMERAL);
         let approval = f.x402_approval(&root, Some(MESSAGE_HOME_DOMAIN), f.now);
-        resolve_message_sign(f.message_request(
-            &intent,
-            &first,
-            &MainnetAuthority::Approval(&approval),
-        ))
-        .unwrap();
+        resolve_message_sign(f.message_request(&intent, &first, &f.approval_authority(&approval)))
+            .unwrap();
         let before = f.wire();
         assert_refused(
             resolve_message_sign(f.message_request(
                 &intent,
                 &other,
-                &MainnetAuthority::Approval(&approval),
+                &f.approval_authority(&approval),
             )),
             P::ApprovalNonceReused,
             &f,
@@ -5403,11 +5417,7 @@ mod tests {
         );
         let fresh = f.x402_approval(&root, Some(MESSAGE_HOME_DOMAIN), f.now);
         assert_refused(
-            resolve_message_sign(f.message_request(
-                &intent,
-                &first,
-                &MainnetAuthority::Approval(&fresh),
-            )),
+            resolve_message_sign(f.message_request(&intent, &first, &f.approval_authority(&fresh))),
             P::DuplicateOpen,
             &f,
             &before,
@@ -5421,11 +5431,7 @@ mod tests {
         value["sequence"] = serde_json::json!(8);
         entry.set_password(&value.to_string()).unwrap();
         assert_refused(
-            resolve_message_sign(f.message_request(
-                &intent,
-                &other,
-                &MainnetAuthority::Approval(&fresh),
-            )),
+            resolve_message_sign(f.message_request(&intent, &other, &f.approval_authority(&fresh))),
             P::PolicyPinMismatch,
             &f,
             &before,
@@ -5446,7 +5452,7 @@ mod tests {
             let auth = resolve_message_sign(f.message_request(
                 &intent,
                 &message,
-                &MainnetAuthority::Approval(&approval),
+                &f.approval_authority(&approval),
             ))
             .unwrap();
             let id = auth.id();
@@ -5492,7 +5498,7 @@ mod tests {
             let auth = resolve_message_sign(f.message_request(
                 &intent,
                 &message,
-                &MainnetAuthority::Approval(&approval),
+                &f.approval_authority(&approval),
             ))
             .unwrap();
             if case == "anchor_lag" {
@@ -5554,7 +5560,7 @@ mod tests {
         let auth = resolve_message_sign(f.message_request(
             &intent,
             &message,
-            &MainnetAuthority::Approval(&approval),
+            &f.approval_authority(&approval),
         ))
         .unwrap();
         let facts = RecomputedFacts {
@@ -5633,7 +5639,7 @@ mod tests {
         let auth = resolve_message_sign(f.message_request(
             &intent,
             &message,
-            &MainnetAuthority::Approval(&approval),
+            &f.approval_authority(&approval),
         ))
         .unwrap();
         f.anchor_failure
@@ -5705,8 +5711,8 @@ mod tests {
             MainnetConsumer::X402Authenticated
         };
         let intent = x402_intent(&root, consumer);
-        let authority = MainnetAuthority::Approval(&approval);
-        let plain_authority = MainnetAuthority::Approval(&plain);
+        let authority = f.approval_authority(&approval);
+        let plain_authority = f.approval_authority(&plain);
         let mut req = SorobanIntentRequest {
             context: &context,
             intent: &intent,
@@ -6013,7 +6019,7 @@ mod tests {
         let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
         let client = context.primary_client().unwrap();
         let approval = f.approval(&f.envelope, f.now, 600_000);
-        let authority = MainnetAuthority::Approval(&approval);
+        let authority = f.approval_authority(&approval);
         let req = request(&f, &context, &client, &authority);
         let before = f.wire();
         let broken = super::super::clock::set_clock_error_for_test();
@@ -6078,7 +6084,7 @@ mod tests {
             &f,
             &context,
             &client,
-            &MainnetAuthority::Approval(&approval),
+            &f.approval_authority(&approval),
         ))
         .await;
         let Err(MainnetAuthorizationError::PolicyDenied(reason)) = result else {
@@ -6129,6 +6135,7 @@ mod tests {
         let subject = stellar_agent_core::approval::subject::approval_subject_classic(&f.envelope);
         let audit = f.audit();
         let governing = f.now + 60_000;
+        let witness = f.approval(&f.envelope, f.now, 600_000);
         let check = |authority: &MainnetAuthority<'_>, now| {
             enabled::final_checks(
                 &f.context,
@@ -6146,6 +6153,14 @@ mod tests {
         check(&authority, governing - 1).unwrap();
         assert_eq!(
             check(&authority, governing),
+            Err(MainnetAuthorizationError::Refused(P::Expired))
+        );
+        let mut captured = f.captured_decision();
+        captured.bound_governing_ttl(60_000);
+        let approved = MainnetAuthority::from_decision(&captured, Some(&witness)).unwrap();
+        check(&approved, governing - 1).unwrap();
+        assert_eq!(
+            check(&approved, governing),
             Err(MainnetAuthorizationError::Refused(P::Expired))
         );
         let digest = f.policy.digest();
@@ -6204,6 +6219,27 @@ mod tests {
                 check(&other, f.now),
                 Err(MainnetAuthorizationError::Refused(expected))
             );
+            // Deliberately stale provenance exercises the approval branch too.
+            let MainnetAuthority::Policy(bound) = other else {
+                unreachable!()
+            };
+            let stale = MainnetDecision::for_test(
+                stellar_agent_core::policy::Decision::Allow,
+                None,
+                bound.policy_digest(),
+                bound.policy_sequence(),
+                bound.rule_index(),
+                bound.profile(),
+                bound.chain_id(),
+                bound.evaluated_at_ms(),
+                60_000,
+                bound.scope().clone(),
+            );
+            let approved = MainnetAuthority::from_decision(&stale, Some(&witness)).unwrap();
+            assert_eq!(
+                check(&approved, f.now),
+                Err(MainnetAuthorizationError::Refused(expected))
+            );
         }
 
         let server = f.server().await;
@@ -6238,7 +6274,7 @@ mod tests {
             &f,
             &context,
             &client,
-            &MainnetAuthority::Approval(&approval),
+            &f.approval_authority(&approval),
         ))
         .await
         .unwrap();
@@ -6281,6 +6317,203 @@ mod tests {
                 InvalidationStage::PreSendRefused,
             )
             .unwrap();
+        }
+    }
+
+    /// Both authorities keep a captured end through delay, durable reopen and header checks.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn captured_authority_ends_survive_resolution_and_reopen() {
+        use stellar_agent_core::mainnet::decision::{
+            EvaluationScope, MainnetEvaluationRequest, evaluate_mainnet,
+        };
+        use stellar_agent_core::policy::{McpToolRegistration, ToolDescriptor, ToolValueKind};
+        for consumer in [MainnetConsumer::CliPay, MainnetConsumer::McpPay] {
+            let policy_tool = classic_consumer_tools(consumer).unwrap().policy_tool;
+            let f =
+                ResolverFixture::configured(|_| {}, |raw| raw.replace("stellar_pay", policy_tool));
+            let server = f.server().await;
+            let endpoint = stellar_agent_core::mainnet::enablement::normalize_endpoint_host(
+                f.context.authority(),
+            )
+            .unwrap();
+            let context = f.context_with_routes(&[(&endpoint, &server.uri())]);
+            let client = context.primary_client().unwrap();
+            let mut descriptor = ToolDescriptor::from_registration(&McpToolRegistration {
+                name: policy_tool,
+                destructive_hint: true,
+                read_only_hint: false,
+                chain_id_required: true,
+                value_kind: ToolValueKind::MovesValue,
+            });
+            descriptor.chain_id = context.chain().caip2_str().to_owned();
+            let args = stellar_agent_core::envelope_decode::decode_authoritative_args(
+                &f.envelope,
+                "stellar_pay_commit",
+            )
+            .unwrap();
+            let mut decision = evaluate_mainnet(
+                &f.policy,
+                EvaluationScope::Classic,
+                f.now,
+                MainnetEvaluationRequest {
+                    chain_id: context.chain().caip2_str(),
+                    tool: &descriptor,
+                    args: &args,
+                    profile: &f.profile,
+                    value: None,
+                    account_view: None,
+                    identity_view: None,
+                    counterparty_cache: None,
+                    sep10_sessions: None,
+                    sep45_sessions: None,
+                },
+            )
+            .unwrap();
+            decision.bound_governing_ttl(30_001);
+            let end = f.now + 30_001;
+            let witness = f.approval(&f.envelope, f.now, 600_000);
+            let mut holds = None;
+            for approved in [false, true] {
+                f.clock.set(f.now + 1_234);
+                let authority =
+                    MainnetAuthority::from_decision(&decision, approved.then_some(&witness))
+                        .unwrap();
+                let mut req = request(&f, &context, &client, &authority);
+                req.consumer = consumer;
+                let mut auth = resolve_tx_sign(req).await.unwrap();
+                if let Some(ref expected) = holds {
+                    assert_eq!(auth.entries(), expected);
+                } else {
+                    holds = Some(auth.entries().to_vec());
+                }
+                assert!(!auth.entries().is_empty());
+                let reopened = crate::policy_state::PersistedWindowStore::at_path(
+                    f.window.path().to_path_buf(),
+                );
+                let records = reopened
+                    .open_authorizations(&f.profile, f.now + 1_234)
+                    .unwrap();
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].expires_at_ms, end);
+                assert_eq!(auth.expires_at_ms(), end);
+                let wire = f.wire();
+                let record = wire["authorizations"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|r| r["id"] == serde_json::to_value(auth.id()).unwrap())
+                    .unwrap();
+                assert_eq!(record["expires_ms"], end);
+                if approved {
+                    assert_eq!(record["approval_expires_ms"], end);
+                }
+                auth.check_not_expired(end - 1).unwrap();
+                assert_eq!(
+                    auth.check_not_expired(end),
+                    Err(MainnetAuthorizationError::Refused(P::Expired))
+                );
+                auth.0.header.expires_at_ms = end + 1;
+                assert_eq!(
+                    auth.check_not_expired(end - 1),
+                    Err(MainnetAuthorizationError::Refused(P::LifetimeInvalid))
+                );
+                invalidate_unconsumed(
+                    &f.window,
+                    &context,
+                    auth.id(),
+                    InvalidationStage::PreSendRefused,
+                )
+                .unwrap();
+                f.clock.set(end);
+                assert_eq!(
+                    resolve_tx_sign({
+                        let mut req = request(&f, &context, &client, &authority);
+                        req.consumer = consumer;
+                        req
+                    })
+                    .await
+                    .unwrap_err(),
+                    MainnetAuthorizationError::Refused(P::Expired)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn captured_approval_end_bounds_intent() {
+        captured_end_for_shared_domain(false).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn captured_approval_end_bounds_message() {
+        captured_end_for_shared_domain(true).await;
+    }
+
+    async fn captured_end_for_shared_domain(message_domain: bool) {
+        let f = if message_domain {
+            x402_fixture()
+        } else {
+            soroban_fixture()
+        };
+        let mut decision = f.captured_decision();
+        decision.bound_governing_ttl(30_001);
+        let root = if message_domain {
+            x402_root(&f)
+        } else {
+            root(&f)
+        };
+        let witness = intent_approval(&f, &root, message_domain.then_some(MESSAGE_HOME_DOMAIN));
+        let authority = MainnetAuthority::from_decision(&decision, Some(&witness)).unwrap();
+        let end = f.now + 30_001;
+        f.clock.set(f.now + 1_234);
+        let (id, expiry) = if message_domain {
+            let intent = x402_intent(&root, MainnetConsumer::X402Authenticated);
+            let message = message_facts([1; 32], EPHEMERAL);
+            let auth =
+                resolve_message_sign(f.message_request(&intent, &message, &authority)).unwrap();
+            assert_eq!(auth.signer_role(), super::super::SignerRole::Sep10Ephemeral);
+            (auth.id(), auth.expires_at_ms())
+        } else {
+            let server = f.server().await;
+            let endpoint = stellar_agent_core::mainnet::enablement::normalize_endpoint_host(
+                f.context.authority(),
+            )
+            .unwrap();
+            let context = f.context_with_routes(&[(&endpoint, &server.uri())]);
+            let client = context.primary_client().unwrap();
+            let intent = intent(&root);
+            let auth =
+                resolve_soroban_intent(intent_request(&f, &context, &client, &intent, &authority))
+                    .await
+                    .unwrap();
+            assert!(!auth.entries().is_empty());
+            (auth.id(), auth.expires_at_ms())
+        };
+        let reopened =
+            crate::policy_state::PersistedWindowStore::at_path(f.window.path().to_path_buf());
+        let records = reopened
+            .open_authorizations(&f.profile, f.now + 1_234)
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].expires_at_ms, end);
+        assert_eq!(expiry, end);
+        let wire = f.wire();
+        let record = &wire["authorizations"][0];
+        assert_eq!(record["id"], serde_json::to_value(id).unwrap());
+        assert_eq!(record["approval_expires_ms"], end);
+        assert!(record.get("parent").is_none());
+        if message_domain {
+            assert!(wire["holds"].as_array().is_none_or(Vec::is_empty));
+            f.clock.set(end);
+            let intent = x402_intent(&root, MainnetConsumer::X402Authenticated);
+            let message = message_facts([1; 32], EPHEMERAL);
+            assert_eq!(
+                resolve_message_sign(f.message_request(&intent, &message, &authority)).unwrap_err(),
+                MainnetAuthorizationError::Refused(P::Expired)
+            );
         }
     }
 }

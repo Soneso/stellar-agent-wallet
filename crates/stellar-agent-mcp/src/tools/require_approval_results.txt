@@ -13,6 +13,9 @@ Some(false)
         "amount_stroops": "10",
         "asset": "XLM",
         "memo": null,
+        "memo_details": {
+          "kind": "none"
+        },
         "simulated_fee_stroops": "100",
         "simulated_seq_num": 2,
         "to": "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL"
