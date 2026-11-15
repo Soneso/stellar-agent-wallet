@@ -2961,6 +2961,53 @@ fn x402_approval_notes(views: &[ToolView], asset: &str, mainnet: bool) -> Vec<St
     notes
 }
 
+/// One signed total-budget bound: an exact allocation of one asset and the
+/// rules whose `total_budget` criteria state it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TotalBound {
+    /// The scope specificity of the bound's bucket.
+    pub scope_specificity: u8,
+    /// The asset's total-budget identity on the network.
+    pub asset: String,
+    /// The signed allocation in stroops.
+    pub max_stroops: i128,
+    /// The index of every rule that states this bound, ascending.
+    pub rule_indexes: Vec<usize>,
+}
+
+/// Every distinct signed total-budget bound of `body`, in the order of first
+/// appearance. Equal allocations of one asset share a bound; different
+/// allocations stay separate. Reads the raw criteria and their exact stroop
+/// amounts, never a display cap.
+///
+/// `None` when a `total_budget` criterion has no readable asset or amount.
+#[must_use]
+pub fn total_bounds(body: &DocumentMut, network_passphrase: &str) -> Option<Vec<TotalBound>> {
+    let mut bounds: Vec<TotalBound> = Vec::new();
+    for (index, rule) in read_rules(body).iter().enumerate() {
+        for criterion in rule.of_kind("total_budget") {
+            let asset = criterion.get("asset").and_then(Value::as_str)?;
+            let asset = total_budget_identity(asset, network_passphrase);
+            let max_stroops = stroops_of(criterion.get("max_stroops"))?;
+            match bounds
+                .iter_mut()
+                .find(|bound| bound.asset == asset && bound.max_stroops == max_stroops)
+            {
+                Some(bound) if bound.rule_indexes.contains(&index) => {}
+                Some(bound) => bound.rule_indexes.push(index),
+                None => bounds.push(TotalBound {
+                    scope_specificity:
+                        super::criteria::total_budget::TOTAL_BUDGET_SCOPE_SPECIFICITY,
+                    asset,
+                    max_stroops,
+                    rule_indexes: vec![index],
+                }),
+            }
+        }
+    }
+    Some(bounds)
+}
+
 /// Summarizes the spending bounds of a policy body.
 ///
 /// Reads only `body`. For each tool the first matching rule counts, as in
@@ -8422,6 +8469,64 @@ mod tests {
                 "{name} unlisted={unlisted_budget}"
             );
         }
+    }
+
+    /// Every distinct signed total bound keeps its exact stroops and its
+    /// rules. Equivalent spellings of one asset share a bound only at an
+    /// equal maximum; a repeated criterion lists its rule once.
+    #[test]
+    fn total_bounds_keep_exact_separate_maxima() {
+        let sac = CanonicalAsset::Native
+            .sac_contract_id(MAINNET_PASSPHRASE)
+            .unwrap();
+        let rule = |criteria: &str| {
+            format!(
+                "[[rules]]\nmatch = {{ tool = \"stellar_pay\", chain = \"stellar:mainnet\" }}\n\
+                 criteria = [{criteria}]\ndecision = \"allow\"\n"
+            )
+        };
+        let body = [
+            "version = 2\nscope = \"profile:agent\"\nsequence = 1\n".to_owned(),
+            rule(r#"{ kind = "total_budget", asset = "native", max_stroops = "10" }"#),
+            rule(&format!(
+                r#"{{ kind = "total_budget", asset = "{sac}", max_stroops = 20 }}"#
+            )),
+            rule(
+                r#"{ kind = "total_budget", asset = "XLM", max_stroops = 10 }, { kind = "total_budget", asset = "native", max_stroops = "10" }"#,
+            ),
+            rule(r#"{ kind = "per_tx_cap", asset = "native", max_stroops = "5" }"#),
+            rule(
+                r#"{ kind = "total_budget", asset = "native", max_stroops = "123456789012345678901" }"#,
+            ),
+        ]
+        .concat();
+        let bound = |max_stroops: i128, rule_indexes: Vec<usize>| TotalBound {
+            scope_specificity: 1,
+            asset: "native".to_owned(),
+            max_stroops,
+            rule_indexes,
+        };
+        assert_eq!(
+            total_bounds(&doc(&body), MAINNET_PASSPHRASE),
+            Some(vec![
+                bound(10, vec![0, 2]),
+                bound(20, vec![1]),
+                bound(123_456_789_012_345_678_901, vec![4]),
+            ])
+        );
+        let unreadable = format!(
+            "{}{}",
+            "version = 2\nscope = \"profile:agent\"\nsequence = 1\n",
+            rule(r#"{ kind = "total_budget", asset = "native", max_stroops = "ten" }"#)
+        );
+        assert_eq!(total_bounds(&doc(&unreadable), MAINNET_PASSPHRASE), None);
+        assert_eq!(
+            total_bounds(
+                &doc(&rule(r#"{ kind = "rate_limit" }"#)),
+                MAINNET_PASSPHRASE
+            ),
+            Some(Vec::new())
+        );
     }
 
     include!("presets_recipient_tests.rs");

@@ -7189,6 +7189,147 @@ pub(super) fn total_in_file(
     Ok((sum, count))
 }
 
+/// The committed use of one total-budget allocation in one epoch.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TotalUsage {
+    /// The scope specificity of the counted bucket.
+    pub scope_specificity: u8,
+    /// The canonical bucket: `total:` and the asset's total-budget identity.
+    pub bucket: String,
+    /// The exact persisted use in stroops.
+    pub used_stroops: i128,
+}
+
+/// Why [`PersistedWindowStore::total_usage`] reports no use.
+#[derive(Debug, thiserror::Error)]
+pub enum TotalUsageError {
+    /// The authenticated window-state read failed.
+    #[error("{0}")]
+    State(WindowStoreError),
+    /// The policy pin or its lock cannot be read, or no pin is recorded.
+    #[error("{0}")]
+    Policy(stellar_agent_core::policy::PolicyError),
+    /// The authenticated state holds no trustworthy use for the epoch.
+    #[error("{0}")]
+    Unavailable(WindowStoreError),
+}
+
+impl TotalUsageError {
+    /// The stable code of the failure: the epoch, chain, pin, and lock codes,
+    /// and `policy.window_state_unverifiable` for every other state failure.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        let store = match self {
+            Self::Policy(error) => return error.wire_code(),
+            Self::State(error) | Self::Unavailable(error) => error,
+        };
+        if let Some(error) = store
+            .total_epoch_error()
+            .or_else(|| store.chain_validation_error())
+        {
+            return error.code();
+        }
+        match store {
+            WindowStoreError::WriterLocked => "policy.state_lock_busy",
+            _ => "policy.window_state_unverifiable",
+        }
+    }
+}
+
+impl PersistedWindowStore {
+    /// The committed total-budget use of `epoch`, one item per scope and
+    /// canonical bucket, sorted. Every persisted hold, row, settled sum, and
+    /// retained intent leg counts once, as durable admission counts it.
+    ///
+    /// The read holds the existing shared window lock across the pin and the
+    /// authenticated state. It sweeps, prunes, retires, and writes nothing,
+    /// and creates no file, directory, lock, key, or counter. An absent store
+    /// under a pin naming `epoch` has no use.
+    ///
+    /// # Errors
+    ///
+    /// [`TotalUsageError::Policy`] for an unreadable pin or lock and for an
+    /// absent pin or lock file. [`TotalUsageError::State`] when the
+    /// authenticated read fails. [`TotalUsageError::Unavailable`] when the pin
+    /// names another digest, an earlier build wrote the history, `epoch` is
+    /// retired, or a bucket holds a negative row or overflows.
+    pub fn total_usage(
+        &self,
+        profile: &Profile,
+        epoch: [u8; 32],
+    ) -> Result<Vec<TotalUsage>, TotalUsageError> {
+        use stellar_agent_core::policy::{PolicyError, v1::verified::with_pin_without_creating};
+        with_pin_without_creating(&self.path, profile, |state| match state {
+            PinState::Present(pin) if pin.digest() == epoch => {
+                self.total_usage_read(profile, epoch)
+            }
+            PinState::Present(_) => Err(TotalUsageError::Unavailable(
+                WindowStoreError::TotalEpochStale,
+            )),
+            PinState::Absent => Err(TotalUsageError::Policy(PolicyError::PinAbsent)),
+        })
+        .map_err(TotalUsageError::Policy)?
+    }
+
+    fn total_usage_read(
+        &self,
+        profile: &Profile,
+        epoch: [u8; 32],
+    ) -> Result<Vec<TotalUsage>, TotalUsageError> {
+        let Some(wire) = self
+            .read_for_inspection(profile)
+            .map_err(TotalUsageError::State)?
+        else {
+            return Ok(Vec::new());
+        };
+        if earlier_build(&wire) || wire.retired_total_epoch == Some(epoch) {
+            return Err(TotalUsageError::Unavailable(
+                WindowStoreError::TotalEpochRetired,
+            ));
+        }
+        let rows = wire
+            .entries
+            .iter()
+            .filter(|entry| is_total_budget_bucket(entry))
+            .map(|entry| (entry.scope_specificity, &entry.bucket));
+        let holds = wire
+            .holds
+            .iter()
+            .filter(|hold| is_total_hold(hold))
+            .map(|hold| (hold.scope_specificity, &hold.bucket));
+        let sums = wire
+            .total_sums
+            .iter()
+            .map(|sum| (sum.scope_specificity, &sum.bucket));
+        let legs = wire
+            .signed_intents
+            .iter()
+            .flat_map(|intent| &intent.legs)
+            .filter(|leg| leg.epoch.is_some())
+            .map(|leg| (leg.scope_specificity, &leg.bucket));
+        let mut keys: Vec<(u8, String)> = rows
+            .chain(holds)
+            .chain(sums)
+            .chain(legs)
+            .map(|(scope, bucket)| (scope, canonical_total_bucket(bucket, &wire)))
+            .collect();
+        keys.sort();
+        keys.dedup();
+        keys.into_iter()
+            .map(|(scope_specificity, bucket)| {
+                let key = StateKey::new("", scope_specificity, &bucket, 0);
+                let (used_stroops, _) =
+                    total_in_file(&wire, &key, epoch).map_err(TotalUsageError::Unavailable)?;
+                Ok(TotalUsage {
+                    scope_specificity,
+                    bucket,
+                    used_stroops,
+                })
+            })
+            .collect()
+    }
+}
+
 /// The digest the policy pin of `profile`'s store at `path` names, read
 /// under `lock`, or `None` when no pin is recorded.
 ///
@@ -22039,6 +22180,7 @@ mod tests {
         }
 
         include!("store_total_intent_tests.rs");
+        include!("store_total_usage_tests.rs");
 
         // ── writer shape checks ──────────────────────────────────────────
 

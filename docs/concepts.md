@@ -255,6 +255,9 @@ whose outcome is unresolved stays an individual record. An exhausted allocation 
 remaining amount. The criterion requires `decision = "allow"`.
 An exhausted allocation or unlisted budget denies the payment; neither
 requests an approval.
+`profile enable-mainnet --check` reports each signed bound's committed use
+and remaining amount in exact stroops, without changing wallet state. The
+report is `null` when the use is unknown, and never zero for unknown history.
 A confirmed `smart-account multicall` bundle counts each of its transfers
 against the allocation and against an unlisted budget.
 Under either criterion, a bundle with a call the wallet does not recognize as
