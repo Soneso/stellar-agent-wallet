@@ -495,7 +495,7 @@ async fn a_claim_rerun_after_its_balance_left_replays_the_stored_claim() {
     );
     assert_eq!(fixture.ceremonies().len(), before.ceremonies);
     assert_eq!(fixture.sent_envelopes().await.len(), before.sent);
-    assert_only_recovery_state_changes(
+    assert_no_recovery_state_before_eligibility(
         &operations(&fixture),
         &before.operations,
         &fresh,
@@ -504,26 +504,40 @@ async fn a_claim_rerun_after_its_balance_left_replays_the_stored_claim() {
 }
 
 /// A run under the fresh id `fresh` refuses after the reconciliation pass.
-/// That pass evaluates the stored attempt, which waits in
-/// `sent_outcome_unknown` with no sequence release.
+/// The stored attempt waits in `sent_outcome_unknown` before its recovery
+/// eligibility at `(max_time + 6) * 1000`, later than the pass window
+/// `pass_ms`, so the pass reserves nothing and writes no recovery state.
 ///
-/// No record or tombstone opens and the record count stays. The whole
-/// operations object keeps its earlier value apart from the stored attempt's
-/// recovery state, which is its first. The fixture's ledger pages hold no
-/// entries, so the state is `evidence_pending` with detail
-/// `malformed_history`. Both cursors stay at the attempt's lower bound,
-/// ledger 2000, and the pass time falls inside `pass_ms`.
-fn assert_only_recovery_state_changes(
+/// No record or tombstone opens, the record count stays, and the whole
+/// operations object keeps its earlier value.
+fn assert_no_recovery_state_before_eligibility(
     after: &Value,
     before: &Value,
     fresh: &str,
     pass_ms: std::ops::RangeInclusive<u64>,
 ) {
-    assert_only_stored_recovery_changes(after, before, fresh, pass_ms, 2000);
+    let count = |operations: &Value| operations["records"].as_array().map(Vec::len);
+    assert_eq!(count(after), count(before), "the record count stays");
+    for section in ["records", "tombstones"] {
+        assert!(
+            after[section]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .all(|entry| entry["business_id"] != fresh),
+            "nothing opens under {fresh} in {section}"
+        );
+    }
+    let max_time =
+        before["records"][0]["attempts"][0]["exposure"]["identity"]["classic"]["max_time"]
+            .as_u64()
+            .unwrap();
+    assert!((max_time + 6) * 1_000 > *pass_ms.end(), "{max_time}");
+    assert_eq!(after, before, "a pass before eligibility writes nothing");
 }
 
-/// The check of [`assert_only_recovery_state_changes`] with the attempt's
-/// lower bound `cursor`.
+/// The check that only the stored attempt's first recovery state changes,
+/// with the attempt's lower bound `cursor`.
 fn assert_only_stored_recovery_changes(
     after: &Value,
     before: &Value,
@@ -664,14 +678,17 @@ fn expiring_balance(expired: &Arc<AtomicBool>) -> ClassicRpc {
 /// A claim rerun under the business id of its run of unknown outcome prints the
 /// stored claim once the claimant predicate expired. The lookup precedes the
 /// balance read and the predicate check, whose answer changed once the claim
-/// ran. A claim under an unknown id keeps the predicate refusal.
+/// ran. A claim under an unknown id keeps the predicate refusal. Its dispatch
+/// runs once the stored attempt is due, so the recovery driver reserves one
+/// automatic run for it and stores a stop with an automatic retry time.
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial]
 async fn claim_replays_its_business_id_after_the_predicate_expires() {
     let expired = Arc::new(AtomicBool::new(false));
+    let endpoints = [expiring_balance(&expired), expiring_balance(&expired)];
     let fixture = Spec::new("replay-expired-claim")
-        .primary(expiring_balance(&expired))
-        .oracle(expiring_balance(&expired))
+        .primary(endpoints[0].clone())
+        .oracle(endpoints[1].clone())
         .build()
         .await;
     let id = fresh_business_id();
@@ -701,12 +718,28 @@ async fn claim_replays_its_business_id_after_the_predicate_expires() {
     );
     assert_eq!(Effects::of(&fixture).await, before);
 
+    // The stored attempt is due at (max_time + 6) * 1000. Health reads,
+    // which recovery checks against the moved clock, report a close at that
+    // clock; ledger pages, which the readiness check holds against the host
+    // clock, keep the host clock.
+    let max_time = stored["attempts"][0]["exposure"]["identity"]["classic"]["max_time"]
+        .as_u64()
+        .unwrap();
+    let due_ms = (max_time + 6) * 1_000;
+    let system_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let _clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(due_ms + 1_000);
+    for endpoint in &endpoints {
+        endpoint.close_health_ahead(due_ms / 1_000 + 1 - system_secs);
+    }
     let fresh = fresh_business_id();
-    let pass_from = stellar_agent_network::mainnet::clock::now_ms().unwrap();
+    let mark = fixture.primary_methods().await.len();
     let other = Verb::Claim
         .run(&fixture, Some(&fresh), Intent::Default, false)
         .await;
-    let pass_to = stellar_agent_network::mainnet::clock::now_ms().unwrap();
+    let sent = fixture.primary_methods().await[mark..].to_vec();
     assert_eq!(other.code, 1, "{}", other.envelope);
     assert_eq!(
         other.error_code(),
@@ -715,12 +748,27 @@ async fn claim_replays_its_business_id_after_the_predicate_expires() {
         other.envelope
     );
     assert_eq!(fixture.ceremonies().len(), before.ceremonies);
-    assert_only_recovery_state_changes(
-        &operations(&fixture),
-        &before.operations,
-        &fresh,
-        pass_from..=pass_to,
+    let after = operations(&fixture);
+    let count = |operations: &Value| operations["records"].as_array().map(Vec::len);
+    assert_eq!(
+        count(&after),
+        count(&before.operations),
+        "the record count stays"
     );
+    assert!(
+        after["records"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .all(|entry| entry["business_id"] != fresh.as_str()),
+        "nothing opens under {fresh}"
+    );
+    // Dispatch reached the driver: one automatic run and its stop.
+    let run = &record(&fixture, &id)["attempts"][0]["recovery_run"];
+    assert_eq!(run["automatic_runs"], 1, "{run} after {sent:?}");
+    assert_eq!(run["phase"], "stopped", "{run}");
+    assert_eq!(run["stop"]["class"], "automatic", "{run}");
+    assert!(run["stop"]["earliest_retry_ms"].as_u64().is_some(), "{run}");
 }
 
 /// The exit code a replay of the stored record `stored` returns.

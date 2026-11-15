@@ -8012,6 +8012,10 @@ pub(crate) mod tests {
             /// How many ledgers the `getLatestLedger` answer trails ledger
             /// 100, the ledger of the double's other answers.
             pub latest_ledger_behind: AtomicU32,
+            /// How many seconds after the request the latest ledger closed in
+            /// the `getHealth` answers, for a test clock ahead of the system
+            /// clock; `getLedgers` keeps the system clock.
+            pub health_lead_secs: std::sync::atomic::AtomicU64,
             /// Ledger entries that replace the fixture's.
             pub entries: std::sync::Mutex<Option<Vec<serde_json::Value>>>,
             /// Runs before each answer with the request method.
@@ -8313,7 +8317,8 @@ pub(crate) mod tests {
                     "getHealth" => answer(
                         serde_json::json!({"status":"healthy", "latestLedger":100, "oldestLedger":1,
                             "ledgerRetentionWindow":100, "oldestLedgerCloseTime":1,
-                            "latestLedgerCloseTime":stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1000}),
+                            "latestLedgerCloseTime":stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1000
+                                + self.control.health_lead_secs.load(Ordering::SeqCst)}),
                     ),
                     "getLedgers" => answer(serde_json::json!({
                         "latestLedger":100, "oldestLedger":1,

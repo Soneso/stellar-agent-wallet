@@ -49,11 +49,14 @@ pub(super) fn configure_budget(budget: &mut Budget) {
     }
 }
 
+/// The seam after the write's audit append, before its prepared image.
+const AUDIT_APPENDED: u8 = 0xA1;
+
 pub(super) fn before_write(
     input: &EvidenceInput,
     run: &WireRecoveryRun,
     decision: bool,
-) -> Option<impl Drop> {
+) -> Option<Box<dyn std::any::Any>> {
     let stage = if decision {
         4
     } else if run.phase == RecoveryRunPhase::Stopped {
@@ -69,10 +72,21 @@ pub(super) fn before_write(
         }
     });
     let (wanted, seam) = WRITE_FAULT.get();
-    (stage == wanted).then(|| {
+    (stage == wanted).then(|| -> Box<dyn std::any::Any> {
         WRITE_FAULT.set((0, 0));
-        super::super::store::arm_accounting_fault(seam)
+        if seam == AUDIT_APPENDED {
+            Box::new(super::super::store::fail_store_writes())
+        } else {
+            Box::new(super::super::store::arm_accounting_fault(seam))
+        }
     })
+}
+
+/// Arms the store `seam` fault at the driver write of `stage` (1 reservation,
+/// 2 release, 3 stop, 4 decision) until the guard drops.
+pub(super) fn arm_write_fault(stage: u8, seam: u8) -> impl Drop {
+    WRITE_FAULT.set((stage, seam));
+    Hook
 }
 
 struct Hook;
@@ -853,6 +867,85 @@ commit_seam_test!(
 commit_seam_test!(driver_seam_decision_counter, 4, COMMIT_FAULT_AFTER_COUNTER);
 commit_seam_test!(driver_seam_decision_compaction, 4, COMMIT_FAULT_COMPACTION);
 
+/// The reservation, release and decision writes each refuse after their audit
+/// append and before their prepared image: the prior generation and run stay
+/// byte-identical, and the refusal keeps the root code and verified progress.
+#[tokio::test]
+#[serial]
+async fn driver_audit_append_seam_keeps_prior_generation() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    for stage in [1, 2, 4] {
+        let fx = Fixture::new(1, NOW / 1000 - 10);
+        let pair = fx.pair([60, 60], NOW, 0).await;
+        let store = fx.fx.store.path().to_owned();
+        let audit = fx.fx.profile.audit_log_path.clone();
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let slot = std::rc::Rc::clone(&seen);
+        WRITE_HOOK.with_borrow_mut(|hook| {
+            *hook = Some(Box::new(move |at| {
+                if at == stage {
+                    let lines =
+                        std::fs::read_to_string(&audit).map_or(0, |log| log.lines().count());
+                    *slot.borrow_mut() = Some((std::fs::read(&store).unwrap(), lines));
+                }
+            }));
+        });
+        WRITE_FAULT.set((stage, AUDIT_APPENDED));
+        let hook = Hook;
+        let result = fx.run(&pair).await;
+        drop(hook);
+        let (before, lines) = seen.borrow_mut().take().unwrap();
+        assert_eq!(
+            std::fs::read(fx.fx.store.path()).unwrap(),
+            before,
+            "stage {stage}"
+        );
+        let appended = std::fs::read_to_string(&fx.fx.profile.audit_log_path)
+            .unwrap()
+            .lines()
+            .count();
+        assert!(appended >= lines, "stage {stage}");
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.code(),
+            "submission.record_unavailable",
+            "stage {stage}"
+        );
+        let RecoveryError::Context { source, detail } = error else {
+            panic!("verified context required")
+        };
+        assert!(matches!(
+            *source,
+            RecoveryError::Store(WindowStoreError::Io {
+                kind: std::io::ErrorKind::StorageFull
+            })
+        ));
+        let released = usize::from(stage == 4);
+        assert_eq!(
+            detail,
+            format!(
+                "selected sequences: {released} released, {} held, 0 unavailable",
+                1 - released
+            ),
+            "stage {stage}"
+        );
+        let record = fx.fx.record(fx.ids[0]);
+        assert!(record.attempts[0].decision.is_none(), "stage {stage}");
+        assert_eq!(
+            OperationStatus::new(&fx.fx.store, &fx.fx.profile)
+                .native_reserved_stroops(None)
+                .unwrap(),
+            125
+        );
+        if stage == 1 {
+            assert!(record.attempts[0].recovery_run.is_none());
+            assert_eq!(rpc_request_count(&pair[0], "getTransaction").await, 0);
+        }
+    }
+}
+
 async fn commit_seams(stages: &[u8], seams: &[u8]) {
     use super::super::store::{COMMIT_FAULT_AFTER_PREPARED, COMMIT_FAULT_COMPACTION};
     for &stage in stages {
@@ -1589,12 +1682,77 @@ async fn driver_process_child() {
     let success = result.is_ok();
     if let Err(error) = result {
         assert_eq!(error.code(), "submission.record_unavailable");
-        assert!(error.to_string().contains("recovery snapshot is stale"));
+        assert!(
+            losing_refusal(&error).is_some(),
+            "the loser refuses safely: {error:?}"
+        );
     }
     assert_eq!(
         proxy(&address, &json!({"op":"done","success":success})),
         true
     );
+}
+
+/// The safe refusal of a driver that loses the reservation race, named by
+/// its rule: the stale-snapshot refusal of the exact run comparison, or the
+/// window-lock refusal. Both carry the verified progress in `Context`.
+fn losing_refusal(error: &RecoveryError) -> Option<&'static str> {
+    let RecoveryError::Context { source, .. } = error else {
+        return None;
+    };
+    match source.as_ref() {
+        RecoveryError::Store(WindowStoreError::Invalid { detail })
+            if detail == "recovery snapshot is stale" =>
+        {
+            Some("stale")
+        }
+        RecoveryError::Store(WindowStoreError::WriterLocked) => Some("locked"),
+        _ => None,
+    }
+}
+
+/// A reservation that cannot take the window lock returns the lock refusal
+/// with verified progress, sends no attempt request and writes nothing.
+#[tokio::test]
+#[serial]
+async fn driver_reservation_refuses_while_the_window_lock_is_held() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let fx = Fixture::new(1, NOW / 1000 - 10);
+    let pair = fx.pair([60, 60], NOW, 0).await;
+    let held = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let slot = std::rc::Rc::clone(&held);
+    let path = fx.fx.store.path().to_owned();
+    let key = fx.fx.profile.policy_window_state_key_id.clone();
+    WRITE_HOOK.with_borrow_mut(|hook| {
+        *hook = Some(Box::new(move |stage| {
+            if stage == 1 && slot.borrow().is_none() {
+                *slot.borrow_mut() = Some(WindowStoreLock::acquire_for(&path, &key).unwrap());
+            }
+        }));
+    });
+    let before = std::fs::read(fx.fx.store.path()).unwrap();
+    let hook = Hook;
+    let result = fx.run(&pair).await;
+    drop(hook);
+    assert!(held.borrow_mut().take().is_some(), "the hook held the lock");
+    let error = result.unwrap_err();
+    assert_eq!(losing_refusal(&error), Some("locked"), "{error:?}");
+    assert_eq!(error.code(), "submission.record_unavailable");
+    let RecoveryError::Context { detail, .. } = &error else {
+        unreachable!()
+    };
+    assert_eq!(
+        detail,
+        "selected sequences: 0 released, 1 held, 0 unavailable"
+    );
+    assert_eq!(std::fs::read(fx.fx.store.path()).unwrap(), before);
+    for server in &pair {
+        for name in ["getTransaction", "getLedgers", "getLedgerEntries"] {
+            assert_eq!(rpc_request_count(server, name).await, 0, "{name}");
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2178,7 +2336,6 @@ async fn driver_prefix_quality_is_ephemeral_and_unavailable_is_unknown() {
 #[tokio::test]
 async fn driver_rpc_timeout_keeps_its_exact_cause() {
     let mut budget = Budget::new();
-    budget.driver = true;
     budget.context(
         RecoveryEndpoint::Oracle,
         RecoveryMethod::GetTransaction,

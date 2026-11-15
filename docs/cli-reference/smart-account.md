@@ -953,7 +953,7 @@ Collection conserves the charge in settled sums, and linked submission bookkeepi
 Window state with total-bearing intents requires a build supporting version 16.
 Ordinary payments continue within the remaining signed allocation; reset does not replenish it.
 Different authority requires `profile sign-policy --profile <profile> --secret-env OWNER_SEED`.
-Checked outcome recovery has no CLI or MCP entry point; `tx status` does not release unknown total charges.
+Checked outcome recovery on CLI and MCP dispatch and status settles classic attempts only; no CLI or MCP path, including `tx status`, releases exposed signed intents' totals of unknown outcome without proof of non-use.
 
 A schedule charge closes when both endpoints, above every authorization expiration, report its operation done or unset.
 

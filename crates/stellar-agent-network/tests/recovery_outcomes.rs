@@ -431,7 +431,7 @@ async fn recovery_decisions_of_one_pass_bind_fresh_generations() {
 /// the pass at the deadline and durably stops the spent reservation.
 #[tokio::test]
 #[serial]
-async fn recovery_pass_ends_at_its_deadline_and_leaves_the_interrupted_attempt() {
+async fn recovery_pass_ends_at_its_deadline_and_durably_stops_the_reserved_attempt() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let _storage_home =
         stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
