@@ -361,9 +361,7 @@ use std::marker::PhantomData;
 #[cfg(feature = "mainnet-write")]
 use stellar_agent_core::profile::caip2::Caip2;
 
-use super::refusal::MainnetAuthorizationError;
-#[cfg(feature = "mainnet-write")]
-use super::refusal::{MainnetPrecondition as P, require};
+use super::refusal::{MainnetAuthorizationError, MainnetPrecondition as P, require};
 use super::types::{
     AuthorizationDomain, AuthorizationId, MainnetConsumer, MessageDomain, RecomputedFacts,
     SignerRole,
@@ -669,8 +667,7 @@ impl Header {
             self.expires_at_ms <= self.authority.expires_at_ms(),
             P::LifetimeInvalid,
         )?;
-        require(self.issued_at_ms <= now_ms, P::NotYetValid)?;
-        require(now_ms < self.expires_at_ms, P::Expired)
+        check_validity(self.issued_at_ms, self.expires_at_ms, now_ms)
     }
 
     fn endpoint(&self) -> Option<(&str, u64)> {
@@ -797,6 +794,17 @@ pub(crate) struct FeeBumpInner<R: FeeBumpRole> {
 #[cfg(not(feature = "mainnet-write"))]
 pub(crate) struct MessageSignInner {
     never: Never,
+}
+
+/// Requires `issued_at_ms <= now_ms < expires_at_ms`: an authorization is
+/// valid from its issue time, and its expiry itself is expired.
+pub(crate) fn check_validity(
+    issued_at_ms: u64,
+    expires_at_ms: u64,
+    now_ms: u64,
+) -> Result<(), MainnetAuthorizationError> {
+    require(issued_at_ms <= now_ms, P::NotYetValid)?;
+    require(now_ms < expires_at_ms, P::Expired)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1092,6 +1100,18 @@ impl MainnetTxSignAuthorization {
         #[cfg(feature = "mainnet-write")]
         {
             &self.0.entries
+        }
+        #[cfg(not(feature = "mainnet-write"))]
+        {
+            match self.0.never {}
+        }
+    }
+
+    /// When the authorization was issued, in Unix milliseconds.
+    pub(crate) fn issued_at_ms(&self) -> u64 {
+        #[cfg(feature = "mainnet-write")]
+        {
+            self.0.header.issued_at_ms
         }
         #[cfg(not(feature = "mainnet-write"))]
         {

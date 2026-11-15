@@ -15,6 +15,20 @@ use super::{
     TxSigningPayload, WebAuthnAssertion,
 };
 
+/// The precondition labels of the mainnet refusals `capture` recorded, in
+/// emission order.
+#[cfg(test)]
+pub(crate) fn refused_preconditions(
+    capture: &stellar_agent_test_support::WarningCapture,
+) -> Vec<String> {
+    capture
+        .seen()
+        .iter()
+        .filter_map(|warning| warning.get("precondition"))
+        .map(|label| label.trim_matches('"').to_owned())
+        .collect()
+}
+
 /// Wraps a software key and counts each call of each [`Signer`] method.
 /// Clones share their key and counters.
 #[derive(Clone)]
@@ -27,6 +41,8 @@ pub struct CountingSigner {
     advance_clock: Option<Arc<crate::mainnet::clock::TestClockGuard>>,
     #[cfg(all(feature = "mainnet-write", any(test, feature = "test-hooks")))]
     advance_to: u64,
+    #[cfg(all(feature = "mainnet-write", any(test, feature = "test-hooks")))]
+    advance_before_signing: bool,
     public_keys: Arc<AtomicUsize>,
     signs: Arc<AtomicUsize>,
 }
@@ -45,6 +61,8 @@ impl CountingSigner {
             advance_clock: None,
             #[cfg(all(feature = "mainnet-write", any(test, feature = "test-hooks")))]
             advance_to: 0,
+            #[cfg(all(feature = "mainnet-write", any(test, feature = "test-hooks")))]
+            advance_before_signing: false,
             public_keys: Arc::new(AtomicUsize::new(0)),
             signs: Arc::new(AtomicUsize::new(0)),
         }
@@ -80,6 +98,20 @@ impl CountingSigner {
         }
     }
 
+    /// A signer that advances the shared test clock when it is asked for a
+    /// transaction signature, before its key checks the payload and signs.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the test clock is unavailable.
+    #[cfg(all(feature = "mainnet-write", any(test, feature = "test-hooks")))]
+    pub fn advancing_clock_before_signing_to(seed: [u8; 32], ms: u64) -> Self {
+        Self {
+            advance_before_signing: true,
+            ..Self::advancing_clock_to(seed, ms)
+        }
+    }
+
     /// The key's public key bytes, read without counting.
     #[cfg(feature = "mainnet-write")]
     pub fn key_bytes(&self) -> [u8; 32] {
@@ -101,12 +133,20 @@ impl CountingSigner {
         self.public_key_calls() + self.sign_calls()
     }
 
+    /// Advances the test clock when this signer advances it at `before_signing`.
+    #[cfg(all(feature = "mainnet-write", any(test, feature = "test-hooks")))]
+    fn advance_clock(&self, before_signing: bool) {
+        if let Some(clock) = &self.advance_clock
+            && self.advance_before_signing == before_signing
+        {
+            clock.set(self.advance_to);
+        }
+    }
+
     fn finish(&self, signature: Result<[u8; 64], WalletError>) -> Result<[u8; 64], WalletError> {
         self.signs.fetch_add(1, Ordering::SeqCst);
         #[cfg(all(feature = "mainnet-write", any(test, feature = "test-hooks")))]
-        if let Some(clock) = &self.advance_clock {
-            clock.set(self.advance_to);
-        }
+        self.advance_clock(false);
         signature.map(|mut bytes| {
             if self.corrupt {
                 bytes[0] ^= 0x01;
@@ -119,6 +159,8 @@ impl CountingSigner {
 #[async_trait]
 impl Signer for CountingSigner {
     async fn sign_tx_payload(&self, payload: &TxSigningPayload) -> Result<[u8; 64], WalletError> {
+        #[cfg(all(feature = "mainnet-write", any(test, feature = "test-hooks")))]
+        self.advance_clock(true);
         self.finish(self.key.sign_tx_payload(payload).await)
     }
 

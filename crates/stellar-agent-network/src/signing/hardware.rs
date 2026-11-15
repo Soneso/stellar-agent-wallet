@@ -355,10 +355,12 @@ impl Signer for HardwareSigningKey {
     ///
     /// The errors of the device's hash-signing command: user refusal, device
     /// not found, wrong app, timeout, blind signing disabled, or an
-    /// unexpected response. A mainnet binding to another key returns
-    /// `network.mainnet_authorization_refused`.
+    /// unexpected response. A mainnet binding to another key, or an
+    /// authorization that is not valid after the device returns its key,
+    /// returns `network.mainnet_authorization_refused`.
     async fn sign_tx_payload(&self, payload: &TxSigningPayload) -> Result<[u8; 64], WalletError> {
         payload.check_mainnet_binding(self).await?;
+        payload.check_mainnet_interval()?;
         self.sign_hash(payload.as_bytes(), "transaction").await
     }
 
@@ -603,6 +605,8 @@ mod tests {
         /// Queue of pre-scripted raw answer bytes (data + retcode).
         answers: Mutex<VecDeque<Vec<u8>>>,
         commands: Arc<Mutex<Vec<APDUCommand<Vec<u8>>>>>,
+        /// Runs on every exchange, while the device answers.
+        on_exchange: Option<Box<dyn Fn() + Send + Sync>>,
     }
 
     impl MockExchange {
@@ -611,6 +615,7 @@ mod tests {
             Self {
                 answers: Mutex::new(VecDeque::new()),
                 commands: Arc::new(Mutex::new(Vec::new())),
+                on_exchange: None,
             }
         }
 
@@ -674,6 +679,9 @@ mod tests {
                 p2: command.p2,
                 data: command.data.to_vec(),
             });
+            if let Some(hook) = &self.on_exchange {
+                hook();
+            }
             let mut queue = self
                 .answers
                 .lock()
@@ -1153,6 +1161,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn transaction_mainnet_binding_refuses_another_key() {
         let own_key = [7; 32];
         let mock = MockExchange::with_success(own_key.to_vec());
@@ -1186,6 +1195,57 @@ mod tests {
             }
             let key = key_with_mock(mock);
             assert_eq!(key.sign_tx_payload(&payload).await.unwrap(), [0x5a; 64]);
+        }
+    }
+
+    /// The device signs a mainnet transaction payload only while its
+    /// authorization is valid on the mainnet clock after the device returned
+    /// its key. A clock that leaves the interval during that exchange sends
+    /// no signing command.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn transaction_signing_rechecks_the_authorization_after_the_key_exchange() {
+        let own_key = [7; 32];
+        let payload = TxSigningPayload::bound_between_for_test([0x3c; 32], own_key, 1_000, 2_000);
+        let clock = Arc::new(crate::mainnet::clock::set_now_ms_for_test(1_500));
+        for (answered_at_ms, refusal) in [
+            (999, Some("not_yet_valid")),
+            (2_000, Some("expired")),
+            (1_999, None),
+        ] {
+            let mut mock = MockExchange::empty();
+            for mut answer in [own_key.to_vec(), vec![0x5a; 64]] {
+                answer.extend_from_slice(&[0x90, 0x00]);
+                mock.answers.lock().unwrap().push_back(answer);
+            }
+            let device_clock = Arc::clone(&clock);
+            mock.on_exchange = Some(Box::new(move || device_clock.set(answered_at_ms)));
+            let commands = Arc::clone(&mock.commands);
+            let key = key_with_mock(mock);
+            let (warnings, _guard) =
+                stellar_agent_test_support::WarningCapture::capture(Some("stellar_agent_network"));
+            let result = key.sign_tx_payload(&payload).await;
+            let sign_commands = commands
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|command| command.ins == 0x08)
+                .count();
+            if let Some(label) = refusal {
+                assert_eq!(
+                    result.err().map(|error| error.code()),
+                    Some("network.mainnet_authorization_refused"),
+                    "answered at {answered_at_ms}"
+                );
+                assert_eq!(
+                    crate::signing::test_doubles::refused_preconditions(&warnings),
+                    [label]
+                );
+                assert_eq!(sign_commands, 0, "answered at {answered_at_ms}");
+            } else {
+                assert_eq!(result.unwrap(), [0x5a; 64]);
+                assert_eq!(sign_commands, 1);
+            }
         }
     }
 

@@ -1297,6 +1297,48 @@ mod tests {
             f.assert_claimed_holds(auth.id(), 70);
         }
 
+        /// The authorization's end reached after the claim and before the key
+        /// signs refuses at the signer: the payload carries the authorization's
+        /// interval, the key checks it immediately before signing, and the
+        /// claim keeps its spend counted.
+        #[tokio::test]
+        #[serial]
+        async fn a_classic_authorization_expiring_before_the_signature_signs_nothing() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let f = fixtures::LedgerFixture::new("expiring-classic", NOW);
+            let (envelope, auth) = ledger_authorization(&f);
+            let signer = CountingSigner::advancing_clock_before_signing_to(
+                SIGNER_SEED,
+                auth.expires_at_ms(),
+            );
+            let (warnings, _guard) =
+                stellar_agent_test_support::WarningCapture::capture(Some("stellar_agent_network"));
+            let result = authorized_signature(
+                envelope.envelope_xdr(),
+                &signer,
+                MAINNET,
+                MainnetConsumer::CliPay,
+                &auth,
+            )
+            .await;
+            assert!(
+                matches!(
+                    &result,
+                    Err(AuthorizedPathError::Wallet(error))
+                        if error.code() == "network.mainnet_authorization_refused"
+                ),
+                "{result:?}"
+            );
+            assert_eq!(
+                crate::signing::test_doubles::refused_preconditions(&warnings),
+                ["expired"]
+            );
+            assert_eq!(signer.sign_calls(), 1);
+            f.assert_claimed_holds(auth.id(), 70);
+        }
+
         /// The valid case signs once, and the attached signature verifies
         /// under the transaction's mainnet payload.
         #[tokio::test]
