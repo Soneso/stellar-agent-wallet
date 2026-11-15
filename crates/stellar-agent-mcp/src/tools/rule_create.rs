@@ -1823,6 +1823,33 @@ mod tests {
     )]
     use super::*;
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn intent_total_recorder_codes_reach_mcp_adapter() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        for (case, code) in [
+            ("unavailable", "policy.total_epoch_unavailable"),
+            ("stale", "policy.total_epoch_stale"),
+            ("retired", "policy.total_epoch_retired"),
+            ("exhausted", "policy.deny.total_budget_exhausted"),
+            ("binding", "submission.intent_binding_mismatch"),
+            ("invalid", "submission.intent_record_unavailable"),
+        ] {
+            let error = stellar_agent_network::policy_state::store::total_intent_test_helpers::recorder_refusal(case).await;
+            for mapped in
+                stellar_agent_smart_account::signing::intent_test_helpers::total_intent_error_routes(
+                    &error,
+                )
+            {
+                let result = sa_error_result(&mapped);
+                let (actual, _, _) = crate::tools::common::assert_business_envelope(&result);
+                assert_eq!(actual, code, "{case}");
+            }
+        }
+    }
+
     /// The rule-create view carries both hash lists in full: two hashes that
     /// share their first eight bytes stay distinct, and no `_first8` field
     /// appears.

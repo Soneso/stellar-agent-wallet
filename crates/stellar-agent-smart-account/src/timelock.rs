@@ -476,12 +476,25 @@ fn keeps_its_wire_code(e: &SaError) -> bool {
     matches!(
         e,
         SaError::MainnetWriteForbidden
+            | SaError::TotalEpochUnavailable { .. }
+            | SaError::TotalEpochStale
+            | SaError::TotalEpochRetired
             | SaError::PolicyDenied { .. }
             | SaError::IntentRecordUnavailable { .. }
             | SaError::IntentBindingMismatch { .. }
             | SaError::LedgerWitnessUnavailable { .. }
             | SaError::LedgerWitnessMismatch { .. }
     )
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+pub(crate) fn total_intent_error_routes(error: &stellar_agent_core::WalletError) -> Vec<SaError> {
+    let mapped = || crate::submit::map_admission_error(error, "intent-total");
+    vec![
+        schedule_submit_error(mapped(), "検証-é"),
+        cancel_submit_error(mapped(), "検証-é"),
+        execute_submit_error(mapped(), "検証-é"),
+    ]
 }
 
 /// Maps a failure of the `schedule` submission into the schedule error surface.

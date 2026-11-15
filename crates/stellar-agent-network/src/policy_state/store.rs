@@ -267,7 +267,7 @@ pub(super) const WIRE_VERSION_LEDGER: u32 = 4;
 /// A file written by a newer build carries records this one cannot account
 /// for, so it is refused rather than read with the fields it happens to
 /// recognise.
-pub(super) const WIRE_VERSION_MAX: u32 = WIRE_VERSION_TOTAL_SUMS;
+pub(super) const WIRE_VERSION_MAX: u32 = WIRE_VERSION_TOTAL_INTENTS;
 
 /// Wire version binding the accounting network on every snapshot.
 #[cfg_attr(
@@ -318,9 +318,20 @@ pub(crate) const WIRE_VERSION_DESTINATION: u32 = WIRE_VERSION_RECOVERY_RUN + 1;
 /// Wire version carrying final total-budget charges and their settled sums.
 pub(crate) const WIRE_VERSION_TOTAL_SUMS: u32 = WIRE_VERSION_DESTINATION + 1;
 
+/// Wire version carrying epoch-bearing total-budget intent legs.
+pub(crate) const WIRE_VERSION_TOTAL_INTENTS: u32 = 16;
+
 /// Selects the format required by stored fields and retains each committed floor.
 fn select_wire_version(wire: &WireFile, committed: Option<u32>) -> u32 {
-    if committed.is_some_and(|version| version >= WIRE_VERSION_TOTAL_SUMS)
+    if committed.is_some_and(|version| version >= WIRE_VERSION_TOTAL_INTENTS)
+        || wire
+            .signed_intents
+            .iter()
+            .flat_map(|intent| &intent.legs)
+            .any(IntentLeg::is_total)
+    {
+        WIRE_VERSION_TOTAL_INTENTS
+    } else if committed.is_some_and(|version| version >= WIRE_VERSION_TOTAL_SUMS)
         || !wire.total_sums.is_empty()
         || wire
             .entries
@@ -1145,7 +1156,7 @@ pub(super) struct WireTotalSum {
     pub(super) epoch: [u8; 32],
     #[serde(with = "i128_decimal_str")]
     pub(super) amount: i128,
-    /// The latest timestamp of a row folded into the sum.
+    /// The latest folded row timestamp or authenticated intent closure time.
     pub(super) settled_until_ms: u64,
 }
 
@@ -1165,6 +1176,7 @@ pub(super) struct WireTotalSum {
 /// carries recovery runs at version 13. [`WIRE_VERSION_DESTINATION`] carries
 /// payment destination provenance at version 14. [`WIRE_VERSION_TOTAL_SUMS`]
 /// carries final total-budget charges and their settled sums at version 15.
+/// [`WIRE_VERSION_TOTAL_INTENTS`] carries epoch-bearing intent legs at version 16.
 /// Optional fields
 /// preserve the serialized shape of legacy snapshots for integrity checks;
 /// missing network provenance refuses at the authenticated read boundary.
@@ -1325,6 +1337,12 @@ pub(super) struct IntentLeg {
     ts_ms: u64,
     #[serde(with = "i128_decimal_str")]
     amount: i128,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "super::ledger::opt_hex32"
+    )]
+    epoch: Option<[u8; 32]>,
 }
 
 impl IntentLeg {
@@ -1335,14 +1353,20 @@ impl IntentLeg {
             window_secs: entry.key().window_secs(),
             ts_ms: entry.timestamp_ms(),
             amount: entry.amount(),
+            epoch: entry.epoch(),
         }
     }
-    fn identity(&self) -> (u8, &str, u64, i128) {
+    fn is_total(&self) -> bool {
+        self.window_secs == 0 && self.bucket.starts_with("total:")
+    }
+
+    fn identity(&self, scope: ChainScope) -> (u8, String, u64, i128, Option<[u8; 32]>) {
         (
             self.scope_specificity,
-            &self.bucket,
+            canonical_bucket_in(&self.bucket, Some(scope)),
             self.window_secs,
             self.amount,
+            self.epoch,
         )
     }
 }
@@ -1427,15 +1451,20 @@ impl SignedIntentRecord {
         }
     }
     fn same_legs(&self, entries: &[WindowEntry]) -> bool {
-        let mut stored: Vec<_> = self.legs.iter().map(IntentLeg::identity).collect();
+        let mut stored: Vec<_> = self
+            .legs
+            .iter()
+            .map(|leg| leg.identity(self.chain_scope))
+            .collect();
         let mut requested: Vec<_> = entries
             .iter()
             .map(|entry| {
                 (
                     entry.key().scope_specificity(),
-                    entry.key().bucket(),
+                    canonical_bucket_in(entry.key().bucket(), Some(self.chain_scope)),
                     entry.key().window_secs(),
                     entry.amount(),
+                    entry.epoch(),
                 )
             })
             .collect();
@@ -1981,6 +2010,16 @@ impl PersistedWindowStore {
         }
         for intent in &wire.signed_intents {
             for leg in &intent.legs {
+                if let Some(epoch) = leg.epoch {
+                    let key = StateKey::new(
+                        profile_name,
+                        leg.scope_specificity,
+                        &canonical_total_bucket(&leg.bucket, &wire),
+                        0,
+                    );
+                    in_memory(dest.append_epoch(&key, leg.ts_ms, leg.amount, epoch))?;
+                    continue;
+                }
                 let key = StateKey::new(
                     profile_name,
                     leg.scope_specificity,
@@ -2023,6 +2062,7 @@ impl PersistedWindowStore {
                     if let Some(epoch) = record.epoch
                         && record.status != RecordStatus::ProvedUnspent
                         && record.amount >= 0
+                        && record.signed_intent.is_none()
                     {
                         in_memory(dest.append_epoch(&key, record.ts_ms, record.amount, epoch))?;
                     }
@@ -2371,11 +2411,6 @@ impl PersistedWindowStore {
         plan: &crate::SignedIntentPlan,
     ) -> Result<crate::IntentProof, WindowStoreError> {
         check_total_shape(plan.legs())?;
-        if plan.legs().iter().any(is_total_entry) {
-            return Err(intent_invalid(
-                "a signed intent cannot carry a total-budget leg",
-            ));
-        }
         plan.chain_scope().require_profile(profile)?;
         self.ensure_parent_dir()?;
         let lock = WindowStoreLock::acquire_for_with_retry(
@@ -2390,6 +2425,9 @@ impl PersistedWindowStore {
         let gen_entry = generation_entry_ref(profile);
         let original = self.read_verified(profile, &key, &gen_entry)?;
         let base = self.retired_successor(&lock, profile, &original)?;
+        if plan.legs().iter().any(is_total_entry) {
+            bind_total_entries(plan.legs(), total_pin(&lock, &self.path, profile)?)?;
+        }
         if original.chain_scope != Some(plan.chain_scope()) {
             return Err(WindowStoreError::ChainMismatch);
         }
@@ -2401,6 +2439,8 @@ impl PersistedWindowStore {
             let mut progress = base.clone();
             let progress_changed = reduce_intent_progress(&mut progress, witness, now, false)?;
             let mut proposed = progress.clone();
+            ledger::sweep_expired(&mut proposed, now);
+            prune_stale(&mut proposed, now)?;
             let result = install_intent_admission(&mut proposed, plan, now);
             if witness.is_some_and(|capability| !self.capability_is_current(profile, capability)) {
                 witness = None;
@@ -2664,6 +2704,7 @@ impl PersistedWindowStore {
         facts: &crate::BindFacts,
         legs: &[WindowEntry],
     ) -> Result<(), WindowStoreError> {
+        check_total_shape(legs)?;
         self.ensure_parent_dir()?;
         let lock = WindowStoreLock::acquire_for_with_retry(
             &self.path,
@@ -2673,6 +2714,9 @@ impl PersistedWindowStore {
         let gen_entry = generation_entry_ref(profile);
         let original = self.read_verified(profile, &key, &gen_entry)?;
         let mut wire = self.retired_successor(&lock, profile, &original)?;
+        if legs.iter().any(is_total_entry) {
+            bind_total_entries(legs, total_pin(&lock, &self.path, profile)?)?;
+        }
         let record = wire
             .signed_intents
             .iter_mut()
@@ -2723,11 +2767,6 @@ impl PersistedWindowStore {
     ) -> Result<MintOutcome, WindowStoreError> {
         check_total_shape(new_entries)?;
         let totals = new_entries.iter().any(is_total_entry);
-        if totals && signed_intent.is_some() {
-            return Err(WindowStoreError::Invalid {
-                detail: "a signed intent cannot carry a total-budget leg".to_owned(),
-            });
-        }
         self.ensure_parent_dir()?;
         #[cfg(test)]
         if let Some(hook) = DESTINATION_BEFORE_LOCK.with(|slot| slot.borrow_mut().take()) {
@@ -3542,18 +3581,24 @@ impl PersistedWindowStore {
         // The successor keeps every total row and sum of the retired working
         // copy and converts each total hold once, before the sweep below
         // settles any. Finality is marked first, while its evidence remains.
-        let mut retired = self.retired_successor(lock, profile, &original)?;
-        promote_final_totals(&mut retired);
-        let retained_sums = retired.total_sums.clone();
-        let mut retained_totals: Vec<WireBucket> = retired
+        wire = self.retired_successor(lock, profile, &original)?;
+        prune_closed_intents(&mut wire, crate::policy_state::store::now_ms()?)?;
+        promote_final_totals(&mut wire);
+        let retained_sums = wire.total_sums.clone();
+        let mut retained_totals: Vec<WireBucket> = wire
             .entries
             .iter()
             .filter(|bucket| is_total_budget_bucket(bucket))
             .cloned()
             .collect();
-        ledger::retain_total_holds_on_reset(&retired, &mut retained_totals);
-        let retired_total_epoch = retired.retired_total_epoch;
-        prune_closed_intents(&mut wire, crate::policy_state::store::now_ms()?)?;
+        for bucket in &mut retained_totals {
+            bucket
+                .records
+                .retain(|record| record.signed_intent.is_none());
+        }
+        retained_totals.retain(|bucket| !bucket.records.is_empty());
+        ledger::retain_total_holds_on_reset(&wire, &mut retained_totals);
+        let retired_total_epoch = wire.retired_total_epoch;
         if !wire.signed_intents.is_empty() {
             return Err(WindowStoreError::SignedIntentLive {
                 explanation: intent_reset_explanations(
@@ -4932,6 +4977,7 @@ fn authenticated_scope(wire: &WireFile) -> Result<ChainScope, WindowStoreError> 
 /// Final total-budget charges and settled sums select
 /// [`WIRE_VERSION_TOTAL_SUMS`] (15). Builds capped at 12 refuse version 13;
 /// builds capped at 13 refuse version 14; builds capped at 14 refuse 15.
+/// Total-budget intent legs require version 16, which readers capped at 15 refuse.
 fn check_snapshot(wire: &WireFile) -> Result<(), WindowStoreError> {
     let max_version = WIRE_VERSION_MAX;
     #[cfg(test)]
@@ -5105,6 +5151,9 @@ fn intent_invalid(detail: &'static str) -> WindowStoreError {
 fn admitted_duration(legs: &[IntentLeg]) -> Result<u64, WindowStoreError> {
     use stellar_agent_core::policy::v1::criteria::per_period_cap::MAX_SUPPORTED_WINDOW_SECS;
     legs.iter().try_fold(0, |maximum, leg| {
+        if leg.is_total() {
+            return Ok(maximum);
+        }
         let duration = leg
             .window_secs
             .checked_mul(1000)
@@ -5117,10 +5166,28 @@ fn admitted_duration(legs: &[IntentLeg]) -> Result<u64, WindowStoreError> {
 }
 
 fn prune_closed_intents(wire: &mut WireFile, now: u64) -> Result<bool, WindowStoreError> {
+    let mut sums = wire.total_sums.clone();
     for intent in &wire.signed_intents {
         if let Some(t) = intent.expiry_observed_at_ms {
-            t.checked_add(RETENTION_MS)
+            let boundary = t
+                .checked_add(RETENTION_MS)
                 .ok_or_else(|| intent_invalid("signed intent horizon overflows"))?;
+            if now > boundary {
+                for leg in intent.legs.iter().filter(|leg| leg.is_total()) {
+                    let epoch = leg.epoch.ok_or_else(|| {
+                        intent_invalid("a total-budget intent leg needs its epoch")
+                    })?;
+                    add_total_sum(
+                        &mut sums,
+                        wire.chain_scope,
+                        leg.scope_specificity,
+                        canonical_total_bucket(&leg.bucket, wire),
+                        epoch,
+                        leg.amount,
+                        t,
+                    )?;
+                }
+            }
         }
     }
     let before = wire.signed_intents.len();
@@ -5129,6 +5196,7 @@ fn prune_closed_intents(wire: &mut WireFile, now: u64) -> Result<bool, WindowSto
             .expiry_observed_at_ms
             .is_none_or(|t| now <= t + RETENTION_MS)
     });
+    wire.total_sums = sums;
     Ok(before != wire.signed_intents.len())
 }
 
@@ -5215,10 +5283,17 @@ fn install_intent_admission(
                 entry.amount(),
                 entry.limit().clone(),
             )
+            .with_epoch(entry.epoch())
         })
         .collect();
     let frozen = plan.with_legs(&entries);
     let id = frozen.facts.intent_id();
+    if entries
+        .iter()
+        .any(|entry| is_total_entry(entry) && entry.epoch() == wire.retired_total_epoch)
+    {
+        return Err(WindowStoreError::TotalEpochRetired);
+    }
     if let Some(record) = wire
         .signed_intents
         .iter_mut()
@@ -5293,6 +5368,22 @@ fn validate_signed_intents(wire: &WireFile) -> Result<(), WindowStoreError> {
         return Err(intent_invalid("signed intent state requires version 9"));
     }
     for (index, intent) in wire.signed_intents.iter().enumerate() {
+        for leg in &intent.legs {
+            if leg.is_total() {
+                if wire.version < WIRE_VERSION_TOTAL_INTENTS {
+                    return Err(intent_invalid(
+                        "a total-budget intent requires wire version 16",
+                    ));
+                }
+                if leg.epoch.is_none() {
+                    return Err(intent_invalid("a total-budget intent leg needs its epoch"));
+                }
+            } else if leg.epoch.is_some() || leg.bucket.starts_with("total:") {
+                return Err(intent_invalid(
+                    "a non-total intent leg cannot carry an epoch or total bucket",
+                ));
+            }
+        }
         let facts = intent.facts();
         if intent.envelope_max_ledger == Some(0) {
             return Err(intent_invalid("signed intent envelope bound is invalid"));
@@ -5316,10 +5407,11 @@ fn validate_signed_intents(wire: &WireFile) -> Result<(), WindowStoreError> {
             || intent.generation == 0
             || intent.generation > wire.generation
             || intent.legs.is_empty()
-            || intent
-                .legs
-                .iter()
-                .any(|leg| leg.amount <= 0 || leg.ts_ms != intent.admitted_at_ms)
+            || intent.legs.iter().any(|leg| {
+                leg.amount < 0
+                    || (leg.amount == 0 && !leg.is_total())
+                    || leg.ts_ms != intent.admitted_at_ms
+            })
         {
             return Err(invalid());
         }
@@ -5585,6 +5677,7 @@ fn check_intent_json(value: &serde_json::Value) -> Result<(), WindowStoreError> 
 ///
 /// [`WindowStoreError::Invalid`] when a settled sum would overflow.
 pub(super) fn prune_stale(wire: &mut WireFile, now_ms: u64) -> Result<(), WindowStoreError> {
+    prune_closed_intents(wire, now_ms)?;
     promote_final_totals(wire);
     fold_final_totals(wire, now_ms)?;
     prune_lifecycle(wire, now_ms);
@@ -5652,10 +5745,11 @@ pub(super) fn total_awaits_final(wire: &WireFile, auth_id: AuthorizationId) -> b
 
 /// Whether `record` still counts and carries no final marker.
 fn counted_unfinal(record: &WireRecord) -> bool {
-    !matches!(
-        record.status,
-        RecordStatus::FinalTotal | RecordStatus::ProvedUnspent
-    )
+    record.signed_intent.is_none()
+        && !matches!(
+            record.status,
+            RecordStatus::FinalTotal | RecordStatus::ProvedUnspent
+        )
 }
 
 /// Folds each final total row strictly older than retention into the sum of
@@ -5674,6 +5768,7 @@ fn fold_final_totals(wire: &mut WireFile, now_ms: u64) -> Result<(), WindowStore
     let owed = operations::projection_owed(wire);
     let folds = |record: &WireRecord| {
         record.status == RecordStatus::FinalTotal
+            && record.signed_intent.is_none()
             && record.ts_ms < cutoff
             && record.amount >= 0
             && record.epoch.is_some()
@@ -5687,29 +5782,15 @@ fn fold_final_totals(wire: &mut WireFile, now_ms: u64) -> Result<(), WindowStore
             let Some(epoch) = record.epoch else {
                 continue;
             };
-            let index = sums.iter().position(|sum| {
-                sum.scope_specificity == bucket.scope_specificity
-                    && sum.epoch == epoch
-                    && canonical_total_bucket(&sum.bucket, wire) == canonical
-            });
-            let index = index.unwrap_or_else(|| {
-                sums.push(WireTotalSum {
-                    scope_specificity: bucket.scope_specificity,
-                    bucket: canonical.clone(),
-                    epoch,
-                    amount: 0,
-                    settled_until_ms: 0,
-                });
-                sums.len() - 1
-            });
-            let sum = &mut sums[index];
-            sum.amount =
-                sum.amount
-                    .checked_add(record.amount)
-                    .ok_or_else(|| WindowStoreError::Invalid {
-                        detail: "a total-budget sum overflows".to_owned(),
-                    })?;
-            sum.settled_until_ms = sum.settled_until_ms.max(record.ts_ms);
+            add_total_sum(
+                &mut sums,
+                wire.chain_scope,
+                bucket.scope_specificity,
+                canonical.clone(),
+                epoch,
+                record.amount,
+                record.ts_ms,
+            )?;
             folded = true;
         }
     }
@@ -5723,6 +5804,40 @@ fn fold_final_totals(wire: &mut WireFile, now_ms: u64) -> Result<(), WindowStore
         }
         wire.total_sums = sums;
     }
+    Ok(())
+}
+
+/// Adds one final charge to its canonical sum with checked arithmetic.
+fn add_total_sum(
+    sums: &mut Vec<WireTotalSum>,
+    chain_scope: Option<ChainScope>,
+    scope_specificity: u8,
+    bucket: String,
+    epoch: [u8; 32],
+    amount: i128,
+    timestamp: u64,
+) -> Result<(), WindowStoreError> {
+    let index = sums.iter().position(|sum| {
+        sum.scope_specificity == scope_specificity
+            && sum.epoch == epoch
+            && canonical_bucket_in(&sum.bucket, chain_scope) == bucket
+    });
+    let index = index.unwrap_or_else(|| {
+        sums.push(WireTotalSum {
+            scope_specificity,
+            bucket,
+            epoch,
+            amount: 0,
+            settled_until_ms: 0,
+        });
+        sums.len() - 1
+    });
+    let sum = &mut sums[index];
+    sum.amount = sum
+        .amount
+        .checked_add(amount)
+        .ok_or_else(|| intent_invalid("a total-budget sum overflows"))?;
+    sum.settled_until_ms = sum.settled_until_ms.max(timestamp);
     Ok(())
 }
 
@@ -5741,7 +5856,9 @@ pub(super) fn prune_lifecycle(wire: &mut WireFile, now_ms: u64) {
         bucket.records.retain(|r| {
             let final_release = r.status == RecordStatus::ProvedUnspent
                 && !r.authorization_id.is_some_and(|id| owed.contains(&id));
-            (total && !final_release) || r.ts_ms >= cutoff || is_exposure(r)
+            (total && r.signed_intent.is_none() && !final_release)
+                || r.ts_ms >= cutoff
+                || is_exposure(r)
         });
     }
     wire.entries.retain(|b| !b.records.is_empty());
@@ -6953,6 +7070,9 @@ pub(super) fn check_total_shape(entries: &[WindowEntry]) -> Result<(), WindowSto
                 detail: "a total-budget entry needs its epoch".to_owned(),
             });
         }
+        if !total && entry.epoch().is_some() {
+            return Err(intent_invalid("a non-total entry cannot carry an epoch"));
+        }
         if total && entry.amount() < 0 {
             return Err(WindowStoreError::Invalid {
                 detail: "a total-budget debit is negative".to_owned(),
@@ -6992,8 +7112,9 @@ pub(super) fn total_hold_counts(
 }
 
 /// The total-budget use of `epoch` under `key` in `wire`: every counted row,
-/// every hold, and the settled sum of that scope, asset, and epoch, whatever
-/// its age. The count is a diagnostic of representation entries.
+/// every hold, retained intent leg, and settled sum of that scope, asset,
+/// and epoch, whatever its age. Linked receipt rows carry no additional total.
+/// The count is a diagnostic of representation entries.
 ///
 /// A hold counts until a committed transition removes it from the file. The
 /// writers sweep expired authorizations into the successor before they admit,
@@ -7027,6 +7148,9 @@ pub(super) fn total_in_file(
         for record in &bucket.records {
             // Any negative row of the bucket, whatever its epoch, leaves
             // its sum undefined: the bucket refuses admissions.
+            if record.signed_intent.is_some() {
+                continue;
+            }
             u128::try_from(record.amount).map_err(|_| WindowStoreError::Invalid {
                 detail: "a total-budget record is negative".to_owned(),
             })?;
@@ -7053,6 +7177,14 @@ pub(super) fn total_in_file(
         }
         sum = sum.checked_add(settled.amount).ok_or_else(overflow)?;
         count = count.saturating_add(1);
+    }
+    for leg in wire.signed_intents.iter().flat_map(|intent| &intent.legs) {
+        if same_bucket(leg.scope_specificity, &leg.bucket, leg.window_secs)
+            && leg.epoch == Some(epoch)
+        {
+            sum = sum.checked_add(leg.amount).ok_or_else(overflow)?;
+            count = count.saturating_add(1);
+        }
     }
     Ok((sum, count))
 }
@@ -20026,7 +20158,10 @@ mod tests {
                     .unwrap();
                 }
                 "commit" => {
-                    store.record_authorized(&profile, &[total(6)]).unwrap();
+                    store.record_authorized(&profile, &[total(3)]).unwrap();
+                    let _proof = store
+                        .admit_signed_intent(&profile, &total_plan(88, &[total(3)]))
+                        .unwrap();
                 }
                 "fold" => {
                     store.record_authorized(&profile, &[total(6)]).unwrap();
@@ -20071,6 +20206,9 @@ mod tests {
         #[test]
         #[serial]
         fn a_stale_second_process_cannot_overshoot() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let guard_home = tempfile::tempdir().unwrap();
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
@@ -20786,17 +20924,31 @@ mod tests {
             };
             sealed.version = WIRE_VERSION_TOTAL_SUMS;
             sealed.total_sums.push(sum.clone());
+            total_intent_test_helpers::append_closed_intent(&mut sealed, [3; 32], 2, 100_000);
             f.seal(&sealed);
-            let _clock = crate::mainnet::clock::set_now_ms_for_test(100_000);
+            let _clock = crate::mainnet::clock::set_now_ms_for_test(100_001 + RETENTION_MS);
             enrolled_reset_owner(&f, 0xa1);
             authorized_reset(&f, "preserve-total", |_, _| Ok(())).unwrap();
             let committed = f.store.read_for_inspection(&f.profile).unwrap().unwrap();
-            assert_eq!(committed.version, WIRE_VERSION_TOTAL_SUMS);
+            assert_eq!(committed.version, WIRE_VERSION_TOTAL_INTENTS);
             assert_eq!(
                 serde_json::to_value(&committed.entries).unwrap(),
                 serde_json::to_value(vec![total]).unwrap()
             );
-            assert_eq!(committed.total_sums, vec![sum]);
+            assert_eq!(
+                committed.total_sums,
+                vec![
+                    sum,
+                    WireTotalSum {
+                        scope_specificity: 1,
+                        bucket: "total:native".into(),
+                        epoch: [3; 32],
+                        amount: 2,
+                        settled_until_ms: 100_000,
+                    }
+                ]
+            );
+            assert!(committed.signed_intents.is_empty());
             let key = StateKey::new("reset-snapshot", 1, "total:native", 0);
             assert_eq!(total_in_file(&committed, &key, D1).unwrap().0, 9);
             assert_eq!(committed.retired_total_epoch, Some(D2));
@@ -20844,6 +20996,9 @@ mod tests {
         #[test]
         #[serial]
         fn reset_survives_every_commit_fault() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let guard_home = tempfile::tempdir().unwrap();
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
@@ -20853,6 +21008,15 @@ mod tests {
                 COMMIT_FAULT_COMPACTION,
             ] {
                 let (f, _) = total_reset_fixture();
+                let mut sealed = f.store.read_for_inspection(&f.profile).unwrap().unwrap();
+                let sum = WireTotalSum {
+                    settled_until_ms: 1,
+                    ..settled("total:native", D1, 3)
+                };
+                sealed.version = WIRE_VERSION_TOTAL_SUMS;
+                sealed.total_sums.push(sum.clone());
+                let generation = sealed.generation;
+                f.seal(&sealed);
                 let _clock = crate::mainnet::clock::set_now_ms_for_test(100_000);
                 enrolled_reset_owner(&f, 0xa1);
                 let fault = arm_accounting_fault(seam);
@@ -20861,11 +21025,27 @@ mod tests {
                 assert_eq!(result.is_ok(), seam == COMMIT_FAULT_COMPACTION, "{seam}");
                 let reread = f.store.read_for_inspection(&f.profile).unwrap().unwrap();
                 let key = StateKey::new("reset-snapshot", 1, "total:native", 0);
-                assert_eq!(total_in_file(&reread, &key, D1).unwrap().0, 6, "{seam}");
+                assert_eq!(reread.total_sums, vec![sum], "{seam}");
+                assert_eq!(
+                    reread
+                        .entries
+                        .iter()
+                        .filter(|b| is_total_budget_bucket(b))
+                        .flat_map(|b| &b.records)
+                        .map(|r| r.amount)
+                        .collect::<Vec<_>>(),
+                    vec![6]
+                );
+                assert_eq!(reread.retired_total_epoch, Some(D2));
+                assert_eq!(
+                    reread.generation,
+                    generation + u64::from(seam != COMMIT_FAULT_AFTER_PREPARED)
+                );
+                assert_eq!(total_in_file(&reread, &key, D1).unwrap().0, 9, "{seam}");
                 pin_reset(&f, D1);
                 let denied = f
                     .store
-                    .record_authorized(&f.profile, &[reset_total(D1, 5)])
+                    .record_authorized(&f.profile, &[reset_total(D1, 2)])
                     .map(drop);
                 assert!(exhausted(&denied), "{seam}: {denied:?}");
             }
@@ -21156,7 +21336,7 @@ mod tests {
                 stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             assert_eq!(WIRE_VERSION_TOTAL_EPOCH, 12);
             assert_eq!(WIRE_VERSION_TOTAL_SUMS, WIRE_VERSION_DESTINATION + 1);
-            assert_eq!(WIRE_VERSION_MAX, WIRE_VERSION_TOTAL_SUMS);
+            assert_eq!(WIRE_VERSION_MAX, WIRE_VERSION_TOTAL_INTENTS);
             let f = fx("total-sums-version");
             let mut marked = version_twelve();
             f.push_final(&mut marked, 1, "total:native", 1, D1);
@@ -21833,22 +22013,32 @@ mod tests {
 
         #[test]
         #[serial]
-        fn a_signed_intent_refuses_a_total_leg() {
-            let guard_home = tempfile::tempdir().unwrap();
-            let _guard_home =
-                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        fn a_signed_intent_admits_and_exhausts_a_total_leg() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let f = fx("total-intent");
             f.pin(D1);
-            let result = f
+            let _proof = f
                 .store
                 .admit_signed_intent(&f.profile, &intent_with(&[f.total(6, D1)]))
-                .map(drop);
-            assert_eq!(
-                detail(result),
-                "a signed intent cannot carry a total-budget leg"
+                .unwrap();
+            assert_eq!(f.sum(D1), 6);
+            assert_eq!(f.hydrated(D1), 6);
+            let second = crate::signed_intent::test_helpers::with_legs(
+                &intent_fixture_plan(2, 60).0,
+                &[f.total(6, D1)],
             );
-            assert!(!f.store.path.exists());
+            assert!(exhausted(
+                &f.store.admit_signed_intent(&f.profile, &second).map(drop)
+            ));
+            let second = second.with_legs(&[f.total(4, D1)]);
+            let _proof = f.store.admit_signed_intent(&f.profile, &second).unwrap();
+            assert_eq!(f.sum(D1), 10);
+            assert_eq!(f.hydrated(D1), 10);
         }
+
+        include!("store_total_intent_tests.rs");
 
         // ── writer shape checks ──────────────────────────────────────────
 
@@ -22701,3 +22891,8 @@ mod tests {
         }
     }
 }
+
+/// Shared recorder fixtures for intent-total adapter tests.
+#[cfg(any(test, feature = "test-helpers"))]
+#[path = "store_total_intent_test_helpers.rs"]
+pub mod total_intent_test_helpers;

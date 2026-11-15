@@ -909,6 +909,37 @@ mod tests {
     use stellar_agent_core::profile::name::ProfileNameSource;
 
     use super::*;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn intent_total_recorder_codes_reach_cli_adapters() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new()
+            .expect("the adapter fixture creates a marked sandbox");
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        for (case, code) in [
+            ("unavailable", "policy.total_epoch_unavailable"),
+            ("stale", "policy.total_epoch_stale"),
+            ("retired", "policy.total_epoch_retired"),
+            ("exhausted", "policy.deny.total_budget_exhausted"),
+            ("binding", "submission.intent_binding_mismatch"),
+            ("invalid", "submission.intent_record_unavailable"),
+        ] {
+            let error = stellar_agent_network::policy_state::store::total_intent_test_helpers::recorder_refusal(case).await;
+            for mapped in
+                stellar_agent_smart_account::signing::intent_test_helpers::total_intent_error_routes(
+                    &error,
+                )
+            {
+                assert_eq!(wrap_sa_error(&mapped).code(), code, "plain/{case}");
+                assert_eq!(
+                    build_sa_error_envelope(&mapped).code(),
+                    code,
+                    "redacted/{case}"
+                );
+            }
+        }
+    }
     use crate::common::signer_ceremony::test_fixtures::{
         EnrolledPin, assert_enrolled_outcome, enrolled_mainnet_profile,
     };

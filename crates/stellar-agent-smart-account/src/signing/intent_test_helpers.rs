@@ -9,6 +9,17 @@ use stellar_agent_core::policy::{
 use stellar_agent_core::profile::{caip2::TESTNET_PASSPHRASE, schema::Profile};
 use stellar_agent_network::{IntentSubject, NoValueAdmission, SignedIntentPlan, SignerDescriptor};
 
+/// Passes a recorder refusal through admission, submission, and all timelock adapters.
+#[must_use]
+pub fn total_intent_error_routes(error: &stellar_agent_core::WalletError) -> Vec<crate::SaError> {
+    let mut errors = vec![
+        crate::submit::map_admission_error(error, "intent-total"),
+        crate::submit::map_submit_error(error, "intent-total", ""),
+    ];
+    errors.extend(crate::timelock::total_intent_error_routes(error));
+    errors
+}
+
 fn shared_admission() -> &'static (tempfile::TempDir, Arc<NoValueAdmission>) {
     static ADMISSION: OnceLock<(tempfile::TempDir, Arc<NoValueAdmission>)> = OnceLock::new();
     ADMISSION.get_or_init(|| {

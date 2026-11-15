@@ -2096,6 +2096,19 @@ pub(crate) fn map_submit_error(
     use stellar_agent_core::error::{NetworkError, SubmissionError, WalletError};
 
     match error {
+        WalletError::Validation(stellar_agent_core::ValidationError::TotalEpochUnavailable {
+            detail,
+        }) => {
+            return SaError::TotalEpochUnavailable {
+                detail: detail.clone(),
+            };
+        }
+        WalletError::Validation(stellar_agent_core::ValidationError::TotalEpochStale) => {
+            return SaError::TotalEpochStale;
+        }
+        WalletError::Validation(stellar_agent_core::ValidationError::TotalEpochRetired) => {
+            return SaError::TotalEpochRetired;
+        }
         WalletError::Submission(SubmissionError::IntentRecordUnavailable { class }) => {
             return SaError::IntentRecordUnavailable { class };
         }

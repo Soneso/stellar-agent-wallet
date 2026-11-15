@@ -298,6 +298,21 @@ pub enum PostSubmitVerificationKind {
               variant size is intentional diagnostic richness"
 )]
 pub enum SaError {
+    /// The pinned total-budget epoch cannot be authenticated.
+    #[error("Total-budget policy state is unavailable: {detail}")]
+    #[serde(rename = "policy.total_epoch_unavailable")]
+    TotalEpochUnavailable {
+        /// The state refusal detail.
+        detail: String,
+    },
+    /// The evaluated policy no longer matches the pin.
+    #[error("The total-budget policy epoch is stale. Reload the pinned policy.")]
+    #[serde(rename = "policy.total_epoch_stale")]
+    TotalEpochStale,
+    /// Earlier state has no trustworthy history for this allocation.
+    #[error("The total-budget policy epoch is retired. Different signed authority is required.")]
+    #[serde(rename = "policy.total_epoch_retired")]
+    TotalEpochRetired,
     /// Intent accounting cannot establish a durable charge.
     #[error(
         "Smart-account intent recording is unavailable ({class}). Existing exposed charges remain."
@@ -3017,6 +3032,9 @@ impl SaError {
     #[must_use]
     pub fn wire_code(&self) -> &'static str {
         match self {
+            Self::TotalEpochUnavailable { .. } => "policy.total_epoch_unavailable",
+            Self::TotalEpochStale => "policy.total_epoch_stale",
+            Self::TotalEpochRetired => "policy.total_epoch_retired",
             Self::IntentRecordUnavailable { .. } => "submission.intent_record_unavailable",
             Self::IntentBindingMismatch { .. } => "submission.intent_binding_mismatch",
             Self::ThresholdUnreachable { .. } => "sa.threshold_unreachable",
