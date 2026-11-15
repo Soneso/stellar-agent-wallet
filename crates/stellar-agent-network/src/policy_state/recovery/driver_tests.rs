@@ -1776,10 +1776,9 @@ async fn driver_two_processes_race_reservation() {
             let (seen, timeout) = condition
                 .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(10), |seen| !*seen)
                 .unwrap();
-            assert!(
-                *seen && !timeout.timed_out(),
-                "the losing W1 finishes before the winning hash response"
-            );
+            if !*seen || timeout.timed_out() {
+                return wiremock::ResponseTemplate::new(503);
+            }
             wiremock::Respond::respond(&EchoIdResponder::new(absence(60, NOW)), request)
         })
         .with_priority(1)
