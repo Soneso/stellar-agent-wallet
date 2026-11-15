@@ -5127,6 +5127,55 @@ mod tests {
             }
         }
 
+        /// A charge of `i128::MAX` under a limit of `i128::MAX` leaves no
+        /// room: a reservation of 1 overflows the total. The send refuses as
+        /// `submission.record_unavailable` with the typed detail, reserves
+        /// nothing, and the rendered envelope keeps the code.
+        #[tokio::test]
+        #[serial]
+        async fn a_total_overflow_refuses_as_record_unavailable() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            use stellar_agent_core::policy::v1::criteria::state_store::{
+                StateKey, WindowEntry, WindowLimit,
+            };
+            let fx = LedgerFixture::new("overflow-total", NOW);
+            let total = |amount: i128| {
+                WindowEntry::new(
+                    StateKey::new(&fx.name, 1, "total:native", 0),
+                    fx.now,
+                    amount,
+                    WindowLimit::Total {
+                        asset: "native".to_owned(),
+                        max_stroops: i128::MAX,
+                    },
+                )
+                .with_epoch(Some(fixtures::POLICY_DIGEST))
+            };
+            fx.window
+                .record_authorized(&fx.profile, &[total(i128::MAX)])
+                .unwrap();
+            let sub = submission();
+            let error = fx
+                .recorder(vec![total(1)], Some(Arc::clone(&fx.writer)))
+                .pre_send(&sub.intent)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), "submission.record_unavailable");
+            assert!(
+                error.message().contains("a total-budget sum overflows"),
+                "{error:?}"
+            );
+            assert_eq!(reservations(&fx), 0);
+            let envelope =
+                crate::submission_flow::submission_error_envelope(&error, "AAAA", "tx status");
+            assert_eq!(
+                envelope.error.as_ref().unwrap().code,
+                "submission.record_unavailable"
+            );
+        }
+
         /// A pending row that cannot be appended, behind an outbox row that
         /// does not parse, refuses before the consumption: no row exists, and
         /// the record stays open.

@@ -614,7 +614,8 @@ where
             .parse::<DocumentMut>()
             .is_ok_and(|document| has_total_budget(&document))
         {
-            warnings.push("The new signature starts a new total_budget allocation.".to_owned());
+            warnings
+                .push("The changed policy digest starts a new total_budget allocation.".to_owned());
         }
         let data = AddCounterpartyData {
             profile: start.profile_name.clone(),
@@ -2948,8 +2949,27 @@ mod tests {
         outcome.succeeded();
         assert_eq!(
             outcome.data()["warnings"],
-            serde_json::json!(["The new signature starts a new total_budget allocation."])
+            serde_json::json!(["The changed policy digest starts a new total_budget allocation."])
         );
+        assert_eq!(outcome.data()["signed"], true);
+        assert_eq!(outcome.data()["sequence"], 2);
+        assert_eq!(outcome.data()["digest"], to_hex(&fixture.digest()));
+    }
+
+    /// A draft carries no signed digest, so it names no new allocation.
+    #[tokio::test]
+    #[serial]
+    async fn draft_with_total_budget_warns_nothing() {
+        let raw = body().replace(
+            "allowlist = [] }]",
+            "allowlist = [] }, { kind = \"total_budget\", asset = \"native\", max_stroops = \
+             \"200000000\" }]",
+        );
+        let fixture = Fixture::draft(&raw);
+        let outcome = drive(&args(&account(7)), Seams::new(&fixture)).await;
+        outcome.succeeded();
+        assert_eq!(outcome.data()["signed"], false);
+        assert_eq!(outcome.data()["warnings"], serde_json::json!([]));
     }
 
     #[tokio::test]

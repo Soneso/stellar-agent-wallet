@@ -780,7 +780,9 @@ impl PolicyStateStore {
     /// their age.
     ///
     /// Entries of another epoch, entries without an epoch, and entries under
-    /// any other key never count, so a re-signed policy starts at zero.
+    /// any other key never count. The allocation follows the signed body
+    /// digest: another digest starts at zero, and the same digest keeps its
+    /// charge. Assigning a new sequence changes the body digest.
     ///
     /// # Errors
     /// Returns [`StateStoreError::LockPoisoned`] if the mutex is poisoned, and

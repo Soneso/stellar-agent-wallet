@@ -1118,6 +1118,22 @@ pub(super) fn retain_total_holds_on_reset(original: &WireFile, entries: &mut Vec
     }
 }
 
+/// Every retained authorization a consumption without a transaction used.
+/// Its counted total rows are retained authorized spend.
+pub(super) fn retained_spend(wire: &WireFile) -> Vec<AuthorizationId> {
+    wire.authorizations
+        .iter()
+        .filter(|auth| {
+            auth.state == AuthorizationState::Used
+                && auth
+                    .consumption
+                    .as_ref()
+                    .is_some_and(|binding| !matches!(binding, ConsumptionBinding::Transaction(_)))
+        })
+        .map(|auth| auth.id)
+        .collect()
+}
+
 /// Whether `auth` is open or claimed and inside its lifetime at `now_ms`.
 pub(super) fn effective(auth: &WireAuthorization, now_ms: u64) -> bool {
     auth.state.holds() && auth.minted_ms <= now_ms && now_ms < auth.expires_ms
@@ -1820,12 +1836,18 @@ fn apply_consumption(
                 ..WireRecord::confirmed_defaults()
             },
             // Retained authorized spend: confirmed at the moment the store
-            // released it, as an authorized external settlement is.
+            // released it, as an authorized external settlement is. No
+            // supported release returns it, so its total charge is final.
             _ => WireRecord {
                 ts_ms: now,
                 amount: hold.amount,
                 epoch: hold.epoch,
                 authorization_id: hold.epoch.map(|_| id),
+                status: if hold.epoch.is_some() {
+                    RecordStatus::FinalTotal
+                } else {
+                    RecordStatus::Confirmed
+                },
                 ..WireRecord::confirmed_defaults()
             },
         };
@@ -2124,7 +2146,7 @@ impl PersistedWindowStore {
             expires,
             MintOptions::default(),
         )?;
-        prune_stale(&mut wire, now);
+        prune_stale(&mut wire, now)?;
         self.commit_generation(&key, &gen_entry, original, wire)?;
         drop(lock);
         Ok(minted)
@@ -2471,10 +2493,16 @@ impl PersistedWindowStore {
                 consumed_at_ms: now,
             });
         }
+        // Maintenance completes before any audit row, so a refused fold
+        // appends nothing.
+        let rows = match &exposure {
+            Some(exposure) => super::operations::expose_in_consumption(
+                &mut wire, profile, &original, now, exposure,
+            )?,
+            None => Vec::new(),
+        };
+        prune_stale(&mut wire, now)?;
         if let Some(exposure) = exposure {
-            let rows = super::operations::expose_in_consumption(
-                &mut wire, profile, &original, now, &exposure,
-            )?;
             for row in rows {
                 exposure
                     .audit
@@ -2482,7 +2510,6 @@ impl PersistedWindowStore {
                     .map_err(|detail| WindowStoreError::AuditAppendFailed { detail })?;
             }
         }
-        prune_stale(&mut wire, now);
         self.commit_generation(&key, &gen_entry, original, wire)?;
         drop(lock);
         Ok(receipts)
@@ -2532,7 +2559,7 @@ impl PersistedWindowStore {
             wire.holds.retain(|hold| hold.authorization_id != id);
         }
         if invalidated || swept {
-            prune_stale(&mut wire, now);
+            prune_stale(&mut wire, now)?;
             self.commit_generation(&key, &gen_entry, original, wire)?;
         }
         drop(lock);
@@ -8441,7 +8468,7 @@ mod tests {
                 .flat_map(|bucket| bucket.records.clone())
                 .collect();
             assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].status, RecordStatus::Confirmed);
+            assert_eq!(rows[0].status, RecordStatus::FinalTotal);
             assert_eq!(rows[0].epoch, Some(p.digest));
         }
 
@@ -8476,6 +8503,44 @@ mod tests {
             let late = WindowEntry::new(hold(1).key().clone(), LATE, 1, hold(1).limit().clone());
             l.store.record_and_persist(&l.profile, &[late]).unwrap();
             assert_denied(both(&l, &p, 2, 6, LATE), "after a later write");
+        }
+
+        /// Authorized spend of 2 and a retained Soroban consumption of 4 are
+        /// final charges; a transaction consumption of 3 stays pending.
+        #[test]
+        #[serial]
+        fn each_writer_marks_only_its_final_charges() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let l = Ledger::new();
+            l.store
+                .record_authorized(&l.profile, &[total(2, P7)])
+                .unwrap();
+            for (binding, amount) in [(soroban(1), 4), (tx(2), 3)] {
+                let request = l.request(binding, vec![total(amount, P7)]);
+                let minted = l.mint(&request).unwrap();
+                l.consume(&request, &minted, &consumption_of(&request.binding))
+                    .unwrap();
+            }
+            let mut rows: Vec<_> = l
+                .wire()
+                .entries
+                .iter()
+                .filter(|bucket| bucket.bucket == "total:native")
+                .flat_map(|bucket| &bucket.records)
+                .map(|record| (record.amount, record.status))
+                .collect();
+            rows.sort_by_key(|row| row.0);
+            assert_eq!(
+                rows,
+                vec![
+                    (2, RecordStatus::FinalTotal),
+                    (3, RecordStatus::Pending),
+                    (4, RecordStatus::FinalTotal),
+                ]
+            );
+            assert_eq!(sum(&l, P7, T0), 9);
         }
 
         #[test]

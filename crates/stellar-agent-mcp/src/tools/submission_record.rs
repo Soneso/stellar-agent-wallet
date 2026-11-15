@@ -1320,6 +1320,24 @@ mod tests {
         assert_eq!(code, "submission.record_unavailable");
     }
 
+    /// A total-budget overflow the recorder reports keeps its code, and a
+    /// multibyte diagnostic renders intact.
+    #[test]
+    fn a_total_overflow_keeps_its_code_and_text() {
+        let detail = "the spending-window reservation could not be written: Invalid { \
+                      detail: \"a total-budget sum overflows\" } profil \u{e9}t\u{e9} \u{20ac}";
+        let err = WalletError::Submission(SubmissionError::RecordUnavailable {
+            detail: detail.to_owned(),
+        });
+        let (code, message) = rendered(&submission_error_result(&err, SIGNED_XDR));
+        assert_eq!(code, "submission.record_unavailable");
+        assert!(
+            message.contains("a total-budget sum overflows"),
+            "{message}"
+        );
+        assert!(message.contains("\u{e9}t\u{e9} \u{20ac}"), "{message}");
+    }
+
     /// A timeout carries the window it ran out of.
     #[test]
     fn a_defi_timeout_carries_its_timeout_seconds() {
