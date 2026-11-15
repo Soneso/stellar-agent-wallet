@@ -9978,10 +9978,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(evidence.time_floor_ms(), 74);
-        assert_eq!(
-            test_seam::take_syncs(&candidate),
-            vec![test_seam::SyncStep::File, test_seam::SyncStep::Directory]
-        );
+        let expected: &[test_seam::SyncStep] = if cfg!(unix) {
+            &[test_seam::SyncStep::File, test_seam::SyncStep::Directory]
+        } else {
+            &[test_seam::SyncStep::File]
+        };
+        assert_eq!(test_seam::take_syncs(&candidate), expected);
         assert_eq!(committed(&store).unwrap().g, 8);
     }
 
@@ -10065,10 +10067,12 @@ mod tests {
             [Some(old.clone()), Some(old)],
             "both old images precede key replacement"
         );
-        assert_eq!(
-            test_seam::take_syncs(&inactive),
-            vec![test_seam::SyncStep::File, test_seam::SyncStep::Directory]
-        );
+        let expected: &[test_seam::SyncStep] = if cfg!(unix) {
+            &[test_seam::SyncStep::File, test_seam::SyncStep::Directory]
+        } else {
+            &[test_seam::SyncStep::File]
+        };
+        assert_eq!(test_seam::take_syncs(&inactive), expected);
         assert_eq!(outbox_bytes(&path), encode_fence_line(1));
         let images = slots(&path);
         let writes = owner_writes(&store);
@@ -10312,10 +10316,15 @@ mod tests {
             test_seam::record_syncs(&slot);
         }
         let _resumed = restart_rotation(&path, &store, NEXT_KEY);
+        let expected: &[test_seam::SyncStep] = if cfg!(unix) {
+            &[test_seam::SyncStep::File, test_seam::SyncStep::Directory]
+        } else {
+            &[test_seam::SyncStep::File]
+        };
         for slot in consent_evidence::slot_paths(&path) {
             assert_eq!(
                 test_seam::take_syncs(&slot),
-                vec![test_seam::SyncStep::File, test_seam::SyncStep::Directory],
+                expected,
                 "each complete copy is synced before the queue reopens"
             );
         }
@@ -10603,6 +10612,7 @@ mod tests {
                 .unwrap();
             count.write_all(b"1").unwrap();
             count.sync_all().unwrap();
+            #[cfg(unix)]
             File::open(&self.root).unwrap().sync_all().unwrap();
             if self.exit_after_store {
                 std::process::exit(0);
@@ -10741,9 +10751,21 @@ mod tests {
         let mut b_output = BufReader::new(b.stdout.take().unwrap());
         wait_for(&mut b_output, "contended");
         a.stdin.take().unwrap().write_all(b"1").unwrap();
-        assert!(a.wait().unwrap().success());
+        let a = a.wait_with_output().unwrap();
+        assert!(
+            a.status.success(),
+            "child a: {}; stderr: {}",
+            a.status,
+            String::from_utf8_lossy(&a.stderr)
+        );
         wait_for(&mut b_output, "returned newest evidence");
-        assert!(b.wait().unwrap().success());
+        let b = b.wait_with_output().unwrap();
+        assert!(
+            b.status.success(),
+            "child b: {}; stderr: {}",
+            b.status,
+            String::from_utf8_lossy(&b.stderr)
+        );
         assert_eq!(
             fs::read(root.join("stores")).unwrap(),
             b"1",
@@ -10762,7 +10784,8 @@ mod tests {
         let restarted = spawn("restart").wait_with_output().unwrap();
         assert!(
             restarted.status.success(),
-            "{}",
+            "child restart: {}; stderr: {}",
+            restarted.status,
             String::from_utf8_lossy(&restarted.stderr)
         );
         assert!(String::from_utf8_lossy(&restarted.stdout).contains("returned newest evidence"));
