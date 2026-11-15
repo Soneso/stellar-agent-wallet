@@ -1,8 +1,10 @@
-//! The exclusive lock over a toolsets directory.
+//! The exclusive and shared locks over a toolsets directory.
 //!
 //! Install and uninstall change a toolset's directory and its pin record.
 //! Each runs under one exclusive advisory lock on
 //! `<toolsets_root>/.toolsets.lock`, so processes never interleave those steps.
+//! A reader that must see one installation unchanged holds a shared lock on
+//! the same file, which excludes the exclusive lock.
 //! The CLI holds a separate installation-wide lock while reading or minting
 //! the pin key. The lock order is the toolsets-root lock first, then the
 //! installation pin-key lock.
@@ -87,6 +89,74 @@ pub fn lock_toolsets(toolsets_root: &Path) -> Result<ToolsetsLock, ToolsetInstal
         _file: file,
         root: toolsets_root.to_path_buf(),
     })
+}
+
+/// A shared advisory lock over one toolsets directory, released when dropped.
+///
+/// Shared locks coexist; while one lives, [`lock_toolsets`] cannot take the
+/// exclusive lock, so no install, forced reinstall, or uninstall changes the
+/// root. This guard cannot stand in for a [`ToolsetsLock`].
+pub struct ToolsetsReadLock {
+    /// The guard releases the lock before closing the file handle.
+    _file: HeldFileLock,
+}
+
+impl std::fmt::Debug for ToolsetsReadLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolsetsReadLock").finish_non_exhaustive()
+    }
+}
+
+/// Takes the shared lock of an existing `toolsets_root` without blocking,
+/// creating the lock file when absent. The root itself is never created.
+///
+/// Returns `Ok(None)` when `toolsets_root` does not exist.
+///
+/// # Errors
+///
+/// - [`ToolsetInstallError::Busy`]: the exclusive lock is held.
+/// - [`ToolsetInstallError::Io`]: the lock file cannot be opened or locked.
+pub fn lock_toolsets_shared(
+    toolsets_root: &Path,
+) -> Result<Option<ToolsetsReadLock>, ToolsetInstallError> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    shared_lock(toolsets_root, &options)
+}
+
+/// Takes the shared lock of `toolsets_root` without blocking, opening only
+/// an existing lock file. Creates nothing.
+///
+/// Returns `Ok(None)` when the root or its lock file does not exist.
+///
+/// # Errors
+///
+/// As [`lock_toolsets_shared`].
+pub fn lock_existing_toolsets_shared(
+    toolsets_root: &Path,
+) -> Result<Option<ToolsetsReadLock>, ToolsetInstallError> {
+    shared_lock(toolsets_root, OpenOptions::new().read(true))
+}
+
+fn shared_lock(
+    toolsets_root: &Path,
+    options: &OpenOptions,
+) -> Result<Option<ToolsetsReadLock>, ToolsetInstallError> {
+    let file = match options.open(toolsets_root.join(TOOLSETS_LOCK_FILE_NAME)) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(ToolsetInstallError::from_io(e)),
+    };
+    match HeldFileLock::try_lock_shared(file) {
+        Ok(guard) => Ok(Some(ToolsetsReadLock { _file: guard })),
+        Err(std::fs::TryLockError::WouldBlock) => Err(ToolsetInstallError::Busy),
+        Err(std::fs::TryLockError::Error(e)) => Err(ToolsetInstallError::from_io(e)),
+    }
 }
 
 /// An exclusive installation pin-key lock, held until dropped.
@@ -191,6 +261,43 @@ mod tests {
 
         drop(held);
         lock_toolsets(&root).expect("the lock is free once the first guard drops");
+    }
+
+    #[test]
+    fn shared_locks_coexist_and_exclude_the_exclusive_lock() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("toolsets");
+        drop(lock_toolsets(&root).unwrap());
+        let first = lock_existing_toolsets_shared(&root).unwrap().unwrap();
+        let second = lock_toolsets_shared(&root).unwrap().unwrap();
+        let err = lock_toolsets(&root).unwrap_err();
+        assert!(matches!(err, ToolsetInstallError::Busy), "{err:?}");
+        drop(first);
+        let err = lock_toolsets(&root).unwrap_err();
+        assert!(matches!(err, ToolsetInstallError::Busy), "{err:?}");
+        drop(second);
+        let exclusive = lock_toolsets(&root).expect("free once every shared guard drops");
+        for shared in [lock_toolsets_shared, lock_existing_toolsets_shared] {
+            let err = shared(&root).unwrap_err();
+            assert!(matches!(err, ToolsetInstallError::Busy), "{err:?}");
+        }
+        drop(exclusive);
+    }
+
+    #[test]
+    fn shared_locks_never_create_the_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("toolsets");
+        assert!(lock_toolsets_shared(&root).unwrap().is_none());
+        assert!(lock_existing_toolsets_shared(&root).unwrap().is_none());
+        assert!(!root.exists(), "no shared lock creates the root");
+
+        std::fs::create_dir(&root).unwrap();
+        assert!(lock_existing_toolsets_shared(&root).unwrap().is_none());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        drop(lock_toolsets_shared(&root).unwrap().unwrap());
+        assert!(root.join(TOOLSETS_LOCK_FILE_NAME).is_file());
+        assert!(lock_existing_toolsets_shared(&root).unwrap().is_some());
     }
 
     #[test]

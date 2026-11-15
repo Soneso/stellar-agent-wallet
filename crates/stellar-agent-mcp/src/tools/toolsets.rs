@@ -310,8 +310,11 @@ impl WalletServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         use stellar_agent_toolsets_runtime::{ToolsetRuntimeError, matrix};
 
-        let toolset_name = stellar_agent_toolsets::sanitise_display(&args.toolset, 64);
-        let action = stellar_agent_toolsets::sanitise_display(&args.action, 128);
+        // Routing, policy, and halt decisions use the names exactly as sent:
+        // display sanitization can map distinct inputs to one name. Text
+        // rendered from them is sanitized where it is produced.
+        let toolset_name = args.toolset.clone();
+        let action = args.action.clone();
 
         // Halt check for the routed tool, repeated from the server's entry
         // check: the action names the tool whose handler runs in this
@@ -818,7 +821,7 @@ impl WalletServer {
                 ))
             }
 
-            Ok(GatedResolveOutcome::Resolved { tool_name }) => {
+            Ok(GatedResolveOutcome::Resolved { tool_name, .. }) => {
                 // Gate passed (current grant found).
                 // Force per-action PaymentSimulated approval UNCONDITIONALLY,
                 // overriding DispatchOutcome::Allow.
@@ -1101,7 +1104,7 @@ impl WalletServer {
                     Some(payload),
                 ))
             }
-            Ok(GatedResolveOutcome::Resolved { tool_name }) => {
+            Ok(GatedResolveOutcome::Resolved { tool_name, .. }) => {
                 self.route_to_gated_commit_rule_create(tool_name, toolset_args)
                     .await
             }

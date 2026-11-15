@@ -111,7 +111,8 @@ pub use error::ToolsetInstallError;
 pub use hash::sha256_hex_of;
 pub use lock::{
     InstallationPinKeyLock, TOOLSET_PIN_KEY_LOCK_FILE_NAME, TOOLSETS_LOCK_FILE_NAME, ToolsetsLock,
-    lock_installation_pin_key, lock_toolsets,
+    ToolsetsReadLock, lock_existing_toolsets_shared, lock_installation_pin_key, lock_toolsets,
+    lock_toolsets_shared,
 };
 pub use pin::{PinKey, ToolsetPinRecord, read_pin};
 #[cfg(any(test, feature = "test-helpers"))]

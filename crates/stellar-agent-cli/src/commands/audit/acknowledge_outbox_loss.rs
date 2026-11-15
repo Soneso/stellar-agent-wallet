@@ -956,6 +956,47 @@ mod tests {
         assert!(!dir.path().join("approvals.toml").exists());
     }
 
+    /// A held grant reader refuses the acknowledgement before any decided
+    /// approval or grant is revoked and before the acknowledgement row.
+    #[test]
+    #[serial_test::serial]
+    fn a_held_grant_reader_refuses_before_any_revocation() {
+        use stellar_agent_core::approval::toolset_grant::ToolsetGrantReader;
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (args, profile) = fixture(dir.path());
+        let permissions = Permissions::seed(dir.path());
+        queue_and_lose(&profile);
+        let approvals = std::fs::read(&permissions.approvals_path).unwrap();
+        let grants = std::fs::read(&permissions.grants_path).unwrap();
+        let reader = ToolsetGrantReader::open_existing(&permissions.grants_path)
+            .unwrap()
+            .unwrap();
+
+        let error = permissions.acknowledge(&args, &profile).unwrap_err();
+        assert_eq!(error.code(), "approval.writer_locked", "{error}");
+        assert_eq!(
+            std::fs::read(&permissions.approvals_path).unwrap(),
+            approvals
+        );
+        assert_eq!(std::fs::read(&permissions.grants_path).unwrap(), grants);
+        assert_eq!(log_kinds(&profile), ["audit_entry_tags_started"]);
+        drop(reader);
+        permissions.assert_untouched();
+
+        let result = permissions.acknowledge(&args, &profile).unwrap();
+        assert_eq!(
+            (
+                result.report.revoked_approvals,
+                result.report.revoked_grants
+            ),
+            (1, 1)
+        );
+    }
+
     #[test]
     fn the_verb_requires_a_reason() {
         for args in [

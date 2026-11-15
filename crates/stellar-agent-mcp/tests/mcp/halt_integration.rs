@@ -407,6 +407,40 @@ async fn read_only_tools_and_the_profile_resource_answer_while_halted() {
         "a read-only toolset action is not halted: {response}"
     );
 
+    // A decorated read-only action names no tool: it is refused as unknown,
+    // both at the server's entry and inside the dispatcher, before any
+    // policy evaluation.
+    let decorated = "\x1b[0mstellar_balances";
+    let response = client
+        .call(
+            "stellar_toolset_invoke",
+            json!({ "toolset": "absent-toolset", "action": decorated, "args": {} }),
+        )
+        .await;
+    assert_eq!(
+        envelope_code(&response).as_deref(),
+        Some(halt::HALTED_CODE),
+        "a decorated action is halted at the entry: {response}"
+    );
+    let capture = crate::common::policy_mock::CapturingPolicyEngine::new();
+    let mut direct = WalletServer::new(fixture.profile.clone()).unwrap();
+    direct.set_policy_engine_for_test(Arc::new(capture.clone()));
+    let result = direct
+        .call_stellar_toolset_invoke(stellar_agent_mcp::server::StellarToolsetInvokeArgs {
+            toolset: "absent-toolset".to_owned(),
+            action: decorated.to_owned(),
+            chain_id: None,
+            args: json!({}),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::common::assert_business_envelope(&result).0,
+        halt::HALTED_CODE,
+        "a decorated action is halted inside the dispatcher"
+    );
+    assert!(capture.arguments_for("stellar_toolset_invoke").is_empty());
+
     let response = client
         .request(
             "resources/read",

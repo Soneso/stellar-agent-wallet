@@ -175,8 +175,8 @@ const ROUTED_HALT_CHECK_TOOL: &str = "stellar_toolset_invoke";
 /// The name of the tool whose descriptor decides the halt check of a call of
 /// `tool` with `arguments`.
 ///
-/// For [`ROUTED_HALT_CHECK_TOOL`] with a string `action` this is that action,
-/// sanitized as the dispatcher sanitizes it before it routes; a name with no
+/// For [`ROUTED_HALT_CHECK_TOOL`] with a string `action` this is that action
+/// exactly as sent, the name the dispatcher routes by; a name with no
 /// descriptor is refused like any unknown tool. Every other call, a
 /// dispatcher call without a string `action` included, is decided by `tool`
 /// itself.
@@ -189,7 +189,7 @@ fn halt_checked_tool_name<'a>(
             .and_then(|arguments| arguments.get("action"))
             .and_then(serde_json::Value::as_str)
     {
-        return std::borrow::Cow::Owned(stellar_agent_toolsets::sanitise_display(action, 128));
+        return std::borrow::Cow::Owned(action.to_owned());
     }
     std::borrow::Cow::Borrowed(tool)
 }
@@ -1239,7 +1239,7 @@ impl WalletServer {
             .err()
             .map(|error| {
                 tracing::warn!(
-                    tool = %tool_name,
+                    tool = %stellar_agent_toolsets::sanitise_display(tool_name, 128),
                     code = error.code(),
                     "stellar-agent-mcp: tool call refused: the profile is halted"
                 );
@@ -1961,6 +1961,38 @@ mod tests {
     use stellar_agent_core::profile::schema::{MINIMUM_FLOOR, Profile};
 
     use super::*;
+
+    #[test]
+    fn the_halt_selector_uses_the_routed_action_as_sent() {
+        let arguments = |action: Value| {
+            let Value::Object(map) = serde_json::json!({ "toolset": "t", "action": action }) else {
+                unreachable!()
+            };
+            map
+        };
+        for action in [
+            "stellar_balances",
+            "\x1b[0mstellar_balances",
+            "stellar_balances\x1b[0m",
+            "\x1b]0;t\x07stellar_pay_commit",
+            "STELLAR_BALANCES",
+        ] {
+            let selected = halt_checked_tool_name(
+                ROUTED_HALT_CHECK_TOOL,
+                Some(&arguments(Value::String(action.to_owned()))),
+            );
+            assert_eq!(selected, action);
+        }
+        assert_eq!(
+            halt_checked_tool_name(ROUTED_HALT_CHECK_TOOL, Some(&arguments(Value::Null))),
+            ROUTED_HALT_CHECK_TOOL
+        );
+        assert_eq!(
+            halt_checked_tool_name("stellar_pay_commit", Some(&arguments(Value::from("x")))),
+            "stellar_pay_commit"
+        );
+        assert!(halt_check_applies(None), "an unknown name is halted");
+    }
 
     #[test]
     #[cfg(feature = "mainnet-write")]

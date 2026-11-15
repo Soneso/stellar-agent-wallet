@@ -1312,7 +1312,17 @@ what this dispatcher routes. It does not narrow the native tools this server
 registers, the caller chooses the `toolset` argument, and the server binds no
 session to a toolset; the operator policy and the approvals bound native and
 routed calls alike. A record that does not verify refuses with
-`toolset.pin_unverifiable`.
+`toolset.pin_unverifiable`. The `toolset` and `action` arguments are compared
+exactly as sent, at the halt check and in routing; a decorated or altered name
+names no tool. A gated call that meets an install or grant change in progress
+answers an internal error whose message is `toolset.enforcement_error:`
+followed by the nested `toolset.coordination_busy` diagnostic. The runtime
+library's grant recheck, which no MCP tool calls, returns its refusals as
+library results: `toolset.grant_invocation_mismatch`,
+`toolset.coordination_busy`, `toolset.coordination_unavailable`,
+`toolset.grant_changed`, `toolset.grant_expired`, and
+`toolset.io_error: clock_unavailable` for a clock failure. See
+[Grant and installation locks](./toolsets.md#grant-and-installation-locks).
 
 ## Output and exit behavior
 

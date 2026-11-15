@@ -500,6 +500,8 @@ async fn dangerous_key_tojson_rejected_gated() {
     .expect("build_attested_grant");
     let mut store = ToolsetGrantStore::open(grant_store_path.clone(), now_ms).expect("open grants");
     store.insert(grant).expect("insert grant");
+    // A grant writer holds the grant lock until it drops.
+    drop(store);
 
     let server = build_allow_server_with_overrides(
         &toolsets_root,
@@ -595,6 +597,8 @@ async fn dangerous_key_chain_id_injected_gated_still_caught() {
     .expect("build_attested_grant");
     let mut store = ToolsetGrantStore::open(grant_store_path.clone(), now_ms).expect("open grants");
     store.insert(grant).expect("insert grant");
+    // A grant writer holds the grant lock until it drops.
+    drop(store);
 
     let server = build_allow_server_with_overrides(
         &toolsets_root,
