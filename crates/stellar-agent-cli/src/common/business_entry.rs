@@ -12,6 +12,7 @@ use std::io::Write;
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::{InternalError, WalletError};
 use stellar_agent_core::profile::Profile;
+use stellar_agent_core::profile::receipt::PaymentDestinations;
 use stellar_agent_network::MainnetWriteContext;
 use stellar_agent_network::fees::ClassicFeeChoice;
 use stellar_agent_network::operation_entry::{
@@ -244,6 +245,21 @@ pub(crate) fn replay_line(view: &OperationView) -> String {
             line.push_str(&crate::common::render::sanitize_for_table(code));
         }
     }
+    match &view.destinations {
+        PaymentDestinations::None => {}
+        PaymentDestinations::Single(destination) => {
+            line.push_str("  destination ");
+            line.push_str(&crate::common::render::sanitize_for_table(destination));
+        }
+        PaymentDestinations::PerOperation(entries) => {
+            for entry in entries {
+                line.push_str(&format!("  destination[{}] ", entry.operation));
+                line.push_str(&crate::common::render::sanitize_for_table(
+                    &entry.destination,
+                ));
+            }
+        }
+    }
     line.push_str("  next ");
     line.push_str(operation_entry::replay_next(view));
     line
@@ -300,4 +316,128 @@ pub(crate) fn write_replay(out: &mut dyn Write, format: OutputFormat, view: &Ope
 #[cfg(all(test, feature = "mainnet-write"))]
 pub(crate) fn fresh_business_id() -> String {
     format!("test-{}", uuid::Uuid::new_v4())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, reason = "test assertions")]
+
+    use super::*;
+    use stellar_agent_core::profile::receipt::OperationDestination;
+    use stellar_agent_network::policy_state::{OperationId, OperationResult, SlotKind};
+
+    const G: &str = "GADQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOZPI";
+    const M_MAX: &str = "MADQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQP77777777777754MA";
+
+    fn view(destinations: PaymentDestinations, compacted: bool) -> OperationView {
+        OperationView {
+            operation_id: OperationId::from_bytes([0x5a; 16]),
+            business_id: BusinessId::parse("order-7").unwrap(),
+            state: OperationState::SentOutcomeUnknown,
+            tool: None,
+            kind: Some(OperationKind::Pay),
+            slot_kind: SlotKind::Envelope,
+            intent_digest: [1; 32],
+            attempts: 1,
+            result: Some(OperationResult::default()),
+            created_at_ms: None,
+            closed_at_ms: None,
+            waiting_expires_at_ms: None,
+            execution_expires_at_ms: None,
+            compacted,
+            history_incomplete: false,
+            destinations,
+        }
+    }
+
+    fn written(format: OutputFormat, view: &OperationView) -> String {
+        let mut out = Vec::new();
+        let _ = write_replay(&mut out, format, view);
+        String::from_utf8(out).unwrap()
+    }
+
+    fn json_data(view: &OperationView) -> serde_json::Value {
+        let parsed: serde_json::Value =
+            serde_json::from_str(&written(OutputFormat::Json, view)).unwrap();
+        parsed["data"].clone()
+    }
+
+    /// A pay replay carries the complete destination on the JSON and table
+    /// outputs, a differing list as `destinations` and one indexed table
+    /// entry per operation, and a tombstone carries neither.
+    #[test]
+    fn a_pay_replay_carries_its_destination() {
+        let single = view(PaymentDestinations::Single(M_MAX.to_owned()), false);
+        let data = json_data(&single);
+        assert_eq!(data["destination"], M_MAX, "{data}");
+        assert!(data.get("destinations").is_none(), "{data}");
+        assert_eq!(
+            written(OutputFormat::Table, &single),
+            format!(
+                "Operation replayed: business_id order-7  state sent_outcome_unknown  \
+                 destination {M_MAX}  next wait\n"
+            )
+        );
+
+        let listed = view(
+            PaymentDestinations::PerOperation(vec![
+                OperationDestination {
+                    operation: 0,
+                    destination: G.to_owned(),
+                },
+                OperationDestination {
+                    operation: 2,
+                    destination: M_MAX.to_owned(),
+                },
+            ]),
+            false,
+        );
+        let data = json_data(&listed);
+        assert_eq!(
+            data["destinations"],
+            serde_json::json!([
+                { "operation": 0, "destination": G },
+                { "operation": 2, "destination": M_MAX },
+            ]),
+            "{data}"
+        );
+        assert!(data.get("destination").is_none(), "{data}");
+        assert_eq!(
+            written(OutputFormat::Table, &listed),
+            format!(
+                "Operation replayed: business_id order-7  state sent_outcome_unknown  \
+                 destination[0] {G}  destination[2] {M_MAX}  next wait\n"
+            )
+        );
+
+        let tombstone = view(PaymentDestinations::None, true);
+        let data = json_data(&tombstone);
+        assert!(data.get("destination").is_none(), "{data}");
+        assert!(data.get("destinations").is_none(), "{data}");
+        assert_eq!(
+            written(OutputFormat::Table, &tombstone),
+            "Operation replayed: business_id order-7  state sent_outcome_unknown  next none\n"
+        );
+    }
+
+    /// A stored destination with control and multibyte text renders through
+    /// the table sanitizer.
+    #[test]
+    fn a_pay_replay_carries_its_destination_escaped() {
+        let hostile = view(
+            PaymentDestinations::Single("M\u{1b}[31mé\u{7}".to_owned()),
+            false,
+        );
+        let line = written(OutputFormat::Table, &hostile);
+        assert!(!line.contains('\u{1b}'), "{line:?}");
+        assert!(!line.contains('\u{7}'), "{line:?}");
+        assert_eq!(
+            line,
+            format!(
+                "Operation replayed: business_id order-7  state sent_outcome_unknown  \
+                 destination {}  next wait\n",
+                crate::common::render::sanitize_for_table("M\u{1b}[31mé\u{7}")
+            )
+        );
+    }
 }

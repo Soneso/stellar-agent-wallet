@@ -13,6 +13,7 @@ use stellar_agent_core::approval::{
 };
 use stellar_agent_core::error::{InternalError, SubmissionError, ValidationError, WalletError};
 use stellar_agent_core::mainnet::verified_policy::VerifiedPolicy;
+use stellar_agent_core::profile::receipt::{DestinationFields, PaymentDestinations};
 use stellar_agent_core::profile::schema::Profile;
 use stellar_xdr::{Limits, Memo, ReadXdr as _, TransactionEnvelope};
 
@@ -314,6 +315,34 @@ pub fn envelope_facts(unsigned_envelope_b64: &str) -> Result<EnvelopeFacts, Wall
     })
 }
 
+/// The destinations a result shows for `envelope`. One destination shared by
+/// every payment operation gives `Single`, differing destinations give the
+/// whole list, and an envelope without a payment operation gives `None`.
+#[must_use]
+pub fn result_destinations(envelope: &TransactionEnvelope) -> PaymentDestinations {
+    let entries = crate::submit::payment_operation_destinations(envelope);
+    match entries.first() {
+        None => PaymentDestinations::None,
+        Some(first)
+            if entries
+                .iter()
+                .all(|entry| entry.destination == first.destination) =>
+        {
+            PaymentDestinations::Single(first.destination.clone())
+        }
+        Some(_) => PaymentDestinations::PerOperation(entries),
+    }
+}
+
+/// The [`result_destinations`] of base64 envelope XDR; `None` for bytes that
+/// do not decode.
+#[must_use]
+pub fn envelope_result_destinations(envelope_b64: &str) -> PaymentDestinations {
+    decode_envelope(envelope_b64).map_or(PaymentDestinations::None, |envelope| {
+        result_destinations(&envelope)
+    })
+}
+
 fn decode_envelope(unsigned_envelope_b64: &str) -> Result<TransactionEnvelope, WalletError> {
     TransactionEnvelope::from_xdr_base64(unsigned_envelope_b64, Limits::none())
         .map_err(|error| unexpected_envelope(&format!("it does not decode: {error}")))
@@ -609,11 +638,12 @@ pub fn replay_next(view: &OperationView) -> &'static str {
 
 /// The answer a call under a retained business id receives in place of new
 /// work: `{status: "replayed", business_id, operation: {id, state, tx_hash,
-/// ledger, error_code}, next}`.
+/// ledger, error_code}, next}`. A payment record also carries `destination`
+/// or `destinations`; a tombstone carries neither.
 #[must_use]
 pub fn replay_json(view: &OperationView) -> Value {
     let result = view.result.as_ref();
-    json!({
+    let mut replay = json!({
         "status": "replayed",
         "business_id": view.business_id.as_str(),
         "operation": {
@@ -626,7 +656,16 @@ pub fn replay_json(view: &OperationView) -> Value {
             "error_code": result.and_then(|result| result.error_code.clone()),
         },
         "next": replay_next(view),
-    })
+    });
+    if view.destinations != PaymentDestinations::None
+        && let (Value::Object(replay), Ok(Value::Object(fields))) = (
+            &mut replay,
+            serde_json::to_value(DestinationFields(view.destinations.clone())),
+        )
+    {
+        replay.extend(fields);
+    }
+    replay
 }
 
 /// The business id a value call enters with.
@@ -1149,6 +1188,7 @@ pub(crate) mod tests {
             execution_expires_at_ms: None,
             compacted,
             history_incomplete: false,
+            destinations: PaymentDestinations::None,
         }
     }
 
@@ -1193,6 +1233,134 @@ pub(crate) mod tests {
                 "next": "wait",
             })
         );
+    }
+
+    /// Every result shape of `result_destinations` and its literal members.
+    #[test]
+    fn result_destinations_follow_the_payment_operations() {
+        use crate::submit::destination_tests::{envelope_for_destinations, payment};
+        use stellar_agent_core::profile::receipt::OperationDestination;
+        use stellar_xdr::{
+            Asset, FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionExt,
+            FeeBumpTransactionInnerTx, ManageDataOp, MuxedAccount, Operation, OperationBody,
+            PathPaymentStrictReceiveOp, PathPaymentStrictSendOp, Uint256, WriteXdr as _,
+        };
+        const G: &str = "GADQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOZPI";
+        const G_OTHER: &str = "GAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEARIHQ";
+        const M_MAX: &str = "MADQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQP77777777777754MA";
+        let account = |text: &str| {
+            stellar_agent_core::payment_accounts::PaymentAccount::parse(text)
+                .unwrap()
+                .to_muxed_account()
+        };
+        let manage_data = Operation {
+            source_account: None,
+            body: OperationBody::ManageData(ManageDataOp {
+                data_name: "k".as_bytes().to_vec().try_into().unwrap(),
+                data_value: None,
+            }),
+        };
+        let strict_receive = Operation {
+            source_account: None,
+            body: OperationBody::PathPaymentStrictReceive(PathPaymentStrictReceiveOp {
+                send_asset: Asset::Native,
+                send_max: 10,
+                destination: account(G),
+                dest_asset: Asset::Native,
+                dest_amount: 5,
+                path: Default::default(),
+            }),
+        };
+        let strict_send = Operation {
+            source_account: None,
+            body: OperationBody::PathPaymentStrictSend(PathPaymentStrictSendOp {
+                send_asset: Asset::Native,
+                send_amount: 10,
+                destination: account(M_MAX),
+                dest_asset: Asset::Native,
+                dest_min: 5,
+                path: Default::default(),
+            }),
+        };
+        let entry = |operation: u32, destination: &str| OperationDestination {
+            operation,
+            destination: destination.to_owned(),
+        };
+        let wire = |value: &PaymentDestinations| {
+            serde_json::to_value(DestinationFields(value.clone())).unwrap()
+        };
+
+        let none = result_destinations(&envelope_for_destinations(vec![manage_data.clone()]));
+        assert_eq!(none, PaymentDestinations::None);
+        assert_eq!(wire(&none), json!({}));
+
+        let single_g = result_destinations(&envelope_for_destinations(vec![payment(G)]));
+        assert_eq!(single_g, PaymentDestinations::Single(G.to_owned()));
+        assert_eq!(wire(&single_g), json!({ "destination": G }));
+
+        let shared = result_destinations(&envelope_for_destinations(vec![
+            payment(M_MAX),
+            payment(M_MAX),
+        ]));
+        assert_eq!(shared, PaymentDestinations::Single(M_MAX.to_owned()));
+        assert_eq!(wire(&shared), json!({ "destination": M_MAX }));
+
+        let mixed = envelope_for_destinations(vec![payment(G), manage_data, payment(M_MAX)]);
+        let listed = result_destinations(&mixed);
+        assert_eq!(
+            listed,
+            PaymentDestinations::PerOperation(vec![entry(0, G), entry(2, M_MAX)])
+        );
+        assert_eq!(
+            wire(&listed),
+            json!({ "destinations": [
+                { "operation": 0, "destination": G },
+                { "operation": 2, "destination": M_MAX },
+            ] })
+        );
+
+        let two_g = result_destinations(&envelope_for_destinations(vec![
+            payment(G),
+            payment(G_OTHER),
+        ]));
+        assert_eq!(
+            wire(&two_g),
+            json!({ "destinations": [
+                { "operation": 0, "destination": G },
+                { "operation": 1, "destination": G_OTHER },
+            ] })
+        );
+
+        let paths = result_destinations(&envelope_for_destinations(vec![
+            strict_receive,
+            strict_send,
+        ]));
+        assert_eq!(
+            paths,
+            PaymentDestinations::PerOperation(vec![entry(0, G), entry(1, M_MAX)])
+        );
+
+        let TransactionEnvelope::Tx(inner) = mixed.clone() else {
+            panic!("expected a v1 envelope")
+        };
+        let fee_bump = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+            tx: FeeBumpTransaction {
+                fee_source: MuxedAccount::Ed25519(Uint256([9; 32])),
+                fee: 1_000,
+                inner_tx: FeeBumpTransactionInnerTx::Tx(inner),
+                ext: FeeBumpTransactionExt::V0,
+            },
+            signatures: Default::default(),
+        });
+        assert_eq!(result_destinations(&fee_bump), listed);
+
+        let text = mixed.to_xdr_base64(Limits::none()).unwrap();
+        assert_eq!(envelope_result_destinations(&text), listed);
+        assert_eq!(
+            envelope_result_destinations("not an envelope"),
+            PaymentDestinations::None
+        );
+        assert_eq!(envelope_result_destinations(""), PaymentDestinations::None);
     }
 
     #[test]

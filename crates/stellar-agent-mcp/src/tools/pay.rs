@@ -798,13 +798,19 @@ impl WalletServer {
 
         // ── Dispatch gate (with policy views) ─────────────────────────────────
         // The source AccountView feeds the `minimum_reserve` criterion; the
-        // destination's on-chain `home_domain` feeds `home_domain_resolved`. The
-        // destination fetch is non-fatal: a not-yet-created destination has no
-        // home_domain, so `identity_view` is simply `None`. An M destination
-        // reads its G base account.
-        let dest_view = fetch_account(&client, destination.base_account(), &[])
-            .await
-            .ok();
+        // destination's on-chain `home_domain` feeds `home_domain_resolved`. A
+        // not-yet-created destination has no home_domain, so `identity_view`
+        // is `None`. Any other read error refuses with its own code before the
+        // gate, so no nonce, approval, hold, or send exists. A retained record
+        // that the mainnet lookup above settled stays settled. An M
+        // destination reads its G base account.
+        let dest_view = match fetch_account(&client, destination.base_account(), &[]).await {
+            Ok(view) => Some(view),
+            Err(stellar_agent_core::WalletError::Network(
+                stellar_agent_core::error::NetworkError::AccountNotFound { .. },
+            )) => None,
+            Err(err) => return Ok(ledger_err_result(&err)),
+        };
         let source_adapter = crate::policy_adapter::AccountViewAdapter::new(&account_view);
         let dest_adapter = dest_view
             .as_ref()
@@ -1662,6 +1668,8 @@ impl WalletServer {
                     .clone()
                     .or_else(|| overridden_gate_effects.clone()),
             };
+        #[cfg(any(test, feature = "test-helpers"))]
+        let gate_value_effects = sized_effects_hook::take().or(gate_value_effects);
         // A payment leg with a destination records the SHA-256 of the
         // complete destination and its redaction, never the clear text.
         let audit_legs = gate_value_effects
@@ -1945,6 +1953,18 @@ impl WalletServer {
                     "cross_check": cross_check.view(),
                     "ledger": ledger,
                 });
+                // The sent envelope equals the one rebuilt from the validated
+                // arguments, so its destination is the payment's complete one.
+                if let (Some(view), Ok(serde_json::Value::Object(fields))) = (
+                    view.as_object_mut(),
+                    serde_json::to_value(stellar_agent_core::profile::receipt::DestinationFields(
+                        stellar_agent_network::operation_entry::envelope_result_destinations(
+                            &args.envelope_xdr,
+                        ),
+                    )),
+                ) {
+                    view.extend(fields);
+                }
                 crate::tools::business_entry::echo_business_id(&mut view, business_id.as_ref());
                 let envelope = stellar_agent_core::envelope::Envelope::ok(view);
                 let json_out = envelope
@@ -2236,6 +2256,27 @@ impl WalletServer {
     }
 }
 
+/// A test seam that replaces the gate-sized effects one commit records,
+/// after the policy gate and before the audit leg constructor.
+#[cfg(any(test, feature = "test-helpers"))]
+mod sized_effects_hook {
+    use std::sync::{Mutex, PoisonError};
+    use stellar_agent_core::policy::v1::ValueEffects;
+
+    static NEXT: Mutex<Option<ValueEffects>> = Mutex::new(None);
+
+    /// Sets the effects the next commit records.
+    #[cfg(all(test, feature = "mainnet-write"))]
+    pub(super) fn set(effects: ValueEffects) {
+        *NEXT.lock().unwrap_or_else(PoisonError::into_inner) = Some(effects);
+    }
+
+    /// Takes the effects a test set, once.
+    pub(super) fn take() -> Option<ValueEffects> {
+        NEXT.lock().unwrap_or_else(PoisonError::into_inner).take()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -2245,6 +2286,46 @@ mod tests {
 
     use super::*;
     use stellar_xdr::{Hash, StringM};
+
+    /// A commit whose gate-sized leg carries a lowercase destination refuses
+    /// `validation.address_invalid` before the nonce, the hold, and the send,
+    /// and writes no audit row. The same commit then succeeds, so its nonce
+    /// stayed unconsumed.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[allow(clippy::unwrap_used, reason = "test assertions")]
+    async fn a_malformed_payment_leg_refuses_before_exposure() {
+        use crate::tools::common::tests::mainnet::{ClassicRun, Tool, authorizations};
+        let run = ClassicRun::allowed(Tool::Pay).await;
+        let destination = run.args["destination"].as_str().unwrap().to_lowercase();
+        sized_effects_hook::set(stellar_agent_core::policy::v1::ValueEffects::single(
+            stellar_agent_core::policy::v1::ValueLeg {
+                kind: stellar_agent_core::policy::v1::ActionKind::Payment,
+                amount: Some(11),
+                asset: Some("native".to_owned()),
+                destination: Some(destination),
+            },
+        ));
+        let refused = run.commit().await;
+        assert_eq!(
+            refused["error"]["code"], "validation.address_invalid",
+            "{refused}"
+        );
+        assert!(run.control.sent().is_empty(), "no send");
+        assert!(
+            authorizations(&run.f).is_empty(),
+            "no authorization or hold"
+        );
+        let log = std::fs::read_to_string(&run.f.server.profile.audit_log_path).unwrap_or_default();
+        assert!(!log.contains("value_action_pending"), "no row: {log}");
+        let committed = run.commit().await;
+        assert_eq!(
+            committed["ok"], true,
+            "the nonce stayed usable: {committed}"
+        );
+        assert_eq!(run.control.sent().len(), 1);
+    }
 
     #[tokio::test]
     #[serial_test::serial(keyring)]

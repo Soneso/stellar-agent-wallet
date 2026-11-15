@@ -1136,7 +1136,6 @@ pub fn render_summary_html(view: &PendingApprovalView) -> String {
             package_version,
             package_shasum_short,
             capability,
-            destination_redacted,
             destination,
             destination_base,
             asset,
@@ -1161,14 +1160,7 @@ pub fn render_summary_html(view: &PendingApprovalView) -> String {
             ));
             format!(
                 "{}{}{}",
-                address_block(
-                    "Destination",
-                    if destination_base.is_some() {
-                        destination
-                    } else {
-                        destination_redacted
-                    }
-                ),
+                address_block("Destination", destination),
                 base_account_block(destination_base.as_deref()),
                 facts(&rows)
             )
@@ -3725,5 +3717,94 @@ mod tests {
         assert!(html.contains(&"d".repeat(12)));
         assert!(!html.contains(&"d".repeat(13)));
         assert!(html.contains(&"a".repeat(32)));
+    }
+
+    const CONSENT_G: &str = "GDK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LCRG";
+    const CONSENT_MMAX: &str =
+        "MDK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5L7777777777774ZMO";
+
+    fn gate_to(destination: &str) -> PendingApproval {
+        PendingApproval::new_toolset_first_invoke_gate_pending(
+            "pay-tools".to_owned(),
+            "a".repeat(32),
+            "1.0.0".to_owned(),
+            "d".repeat(64),
+            "sign-payment".to_owned(),
+            destination.to_owned(),
+            "XLM".to_owned(),
+            0,
+            10,
+            process_uid_for_attestation().unwrap(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap()
+    }
+
+    /// The page shows the complete G and maximum-ID M destination of a
+    /// toolset grant, with a base row for M only.
+    #[test]
+    fn toolset_consent_shows_the_complete_destination() {
+        let html = render_summary_html(&view_of(gate_to(CONSENT_G)));
+        assert!(
+            html.contains(&format!(
+                "Destination</div>\n      <div class=\"addr\">{CONSENT_G}</div>"
+            )),
+            "{html}"
+        );
+        assert!(!html.contains("GDK5L...5LCRG"), "{html}");
+        assert!(!html.contains("Base account"), "{html}");
+        let html = render_summary_html(&view_of(gate_to(CONSENT_MMAX)));
+        assert!(
+            html.contains(&format!(
+                "Destination</div>\n      <div class=\"addr\">{CONSENT_MMAX}</div>"
+            )),
+            "{html}"
+        );
+        assert!(
+            html.contains(&format!(
+                "Base account</div>\n      <div class=\"addr\">{CONSENT_G}</div>"
+            )),
+            "{html}"
+        );
+    }
+
+    /// The page of a payment to the maximum-ID M shows the complete address
+    /// and its base row.
+    #[test]
+    fn payment_consent_shows_the_complete_destination() {
+        let html = render_summary_html(&view_of(fixtures::payment_pending(
+            SOURCE_G,
+            CONSENT_MMAX,
+            "XLM",
+            2_500_000,
+            None,
+            100,
+            42,
+            process_uid_for_attestation().unwrap(),
+            DEFAULT_TTL_MS,
+        )));
+        assert!(html.contains(CONSENT_MMAX), "{html}");
+        assert!(
+            html.contains(&format!(
+                "Base account</div>\n      <div class=\"addr\">{CONSENT_G}</div>"
+            )),
+            "{html}"
+        );
+    }
+
+    /// A destination with markup, control, and multibyte text renders
+    /// escaped through `address_block`.
+    #[test]
+    fn malformed_consent_terms_render_escaped() {
+        let mut view = view_of(gate_to(CONSENT_MMAX));
+        if let ApprovalSummaryView::ToolsetFirstInvokeGate { destination, .. } = &mut view.summary {
+            "M<b>\u{e9}\u{202e}".clone_into(destination);
+        }
+        let html = render_summary_html(&view);
+        assert!(html.contains("M&lt;b&gt;\u{e9}"), "{html}");
+        assert!(
+            !html.contains("<b>") && !html.contains('\u{202e}'),
+            "{html}"
+        );
     }
 }

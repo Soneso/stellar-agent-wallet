@@ -71,13 +71,15 @@ test("toolset gate row names the version, the shasum prefix and the install iden
   const view = { kind_name: "ToolsetFirstInvokeGate", summary: {
     kind: "toolset_first_invoke_gate", toolset_name: "pay-toolset", package_version: "1.2.0",
     package_shasum_short: "0123456789ab", install_id: "fedcba9876543210fedcba9876543210",
-    capability: "sign-payment", destination_redacted: "GAAAA...AAAAA", asset: "XLM",
+    capability: "sign-payment", destination_redacted: "GAAAA...AAAAA",
+    destination: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF", asset: "XLM",
     amount_min_stroops: "1", amount_max_stroops: "10000000",
   }};
   const row = renderedRow(view);
   assert.equal(row.headline, "Toolset capability request");
   assert.equal(row.meta, "pay-toolset 1.2.0 · sha256 0123456789ab · " +
-    "install fedcba9876543210fedcba9876543210 · requests sign-payment · to GAAAA...AAAAA");
+    "install fedcba9876543210fedcba9876543210 · requests sign-payment · " +
+    "to GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF");
   assert.deepEqual(row.metaClasses, ["ap-meta", "toolset-gate"]);
 });
 
@@ -139,6 +141,42 @@ test("toolset inbox keeps the full muxed destination", () => {
     assert.equal(resolved(row.classes, "text-overflow"), "clip");
     assert.equal(resolved(row.classes, "white-space"), "normal");
   }
+});
+
+const MUX_MAX = "MDK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5L7777777777774ZMO";
+
+function toolsetView(destination, destinationBase) {
+  return { kind_name: "ToolsetFirstInvokeGate", summary: {
+    kind: "toolset_first_invoke_gate", toolset_name: "pay-toolset", package_version: "1.2.0",
+    package_shasum_short: "0123456789ab", install_id: "fedcba9876543210fedcba9876543210",
+    capability: "sign-payment", destination_redacted: destination.slice(0, 5) + "..." +
+      destination.slice(-5), destination, destination_base: destinationBase, asset: "XLM",
+    amount_min_stroops: "1", amount_max_stroops: "10000000",
+  }};
+}
+
+test("toolset_consent_shows_the_complete_destination", () => {
+  const plain = renderedMain(toolsetView(MUX_BASE, null));
+  assert.equal(plain.length, 1, "a G destination has no base row");
+  assert.ok(plain[0].text.endsWith(" · to " + MUX_BASE), plain[0].text);
+  assert.ok(!plain[0].text.includes("GDK5L..."), plain[0].text);
+  const muxed = renderedMain(toolsetView(MUX_MAX, MUX_BASE));
+  assert.ok(muxed[0].text.endsWith(" · to " + MUX_MAX), muxed[0].text);
+  assert.deepEqual(muxed[1], { text: "base account " + MUX_BASE, classes: ["ap-meta", "muxed"] });
+});
+
+test("payment_consent_shows_the_complete_destination", () => {
+  const rows = renderedMain({ summary: { kind: "payment", to: MUX_MAX, to_base: MUX_BASE,
+    amount_stroops: "10000000", asset: "XLM", memo: { kind: "none" } } });
+  assert.equal(rows[0].text, "to " + MUX_MAX + " · memo none");
+  assert.deepEqual(rows[1], { text: "base account " + MUX_BASE, classes: ["ap-meta", "muxed"] });
+});
+
+test("malformed_consent_terms_render_escaped", () => {
+  const hostile = "<b>é‮\u0007</b>";
+  const rows = renderedMain(toolsetView(hostile, null));
+  assert.ok(rows[0].text.endsWith(" · to " + hostile), "the text is a text node, never markup");
+  assert.ok(rows.every((row) => row.classes.every((name) => !name.includes("<"))));
 });
 
 test("payment inbox does not clip a muxed address", () => {

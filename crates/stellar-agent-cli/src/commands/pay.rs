@@ -185,6 +185,7 @@ use crate::common::signer_ceremony::{
     resolve_software_signer_from_env,
 };
 use crate::common::{ResolvedProfileName, resolve_profile_name};
+use stellar_agent_core::profile::receipt::{DestinationFields, PaymentDestinations};
 use stellar_agent_network::policy_state::{OperationKind, OperationTool};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -236,6 +237,12 @@ pub struct PayResult {
 
     /// The stage that produced this result.
     pub stage: String,
+
+    /// The complete destinations of the envelope's payment operations:
+    /// `destination` when they share one, `destinations` when they differ,
+    /// and neither without a payment operation.
+    #[serde(flatten)]
+    pub destinations: DestinationFields,
 
     /// Selected per-operation fee in stroops.
     ///
@@ -649,6 +656,7 @@ where
                 return 1;
             }
             let result = PayResult {
+                destinations: result_fields(&built.envelope_xdr),
                 envelope_xdr: built.envelope_xdr,
                 tx_hash: None,
                 ledger: None,
@@ -747,6 +755,7 @@ where
     match sign_envelope(context, args, unsigned_xdr, profile, &resolved.name).await {
         Ok(signed_xdr) => {
             let result = PayResult {
+                destinations: result_fields(&signed_xdr),
                 envelope_xdr: signed_xdr,
                 tx_hash: None,
                 ledger: None,
@@ -922,6 +931,7 @@ where
     {
         Ok((signed_xdr, sub_result)) => {
             let result = PayResult {
+                destinations: result_fields(&signed_xdr),
                 envelope_xdr: signed_xdr,
                 tx_hash: Some(sub_result.tx_hash.clone()),
                 ledger: Some(sub_result.ledger),
@@ -1574,6 +1584,7 @@ where
     {
         Ok((xdr, sub_result)) => {
             let result = PayResult {
+                destinations: result_fields(&xdr),
                 envelope_xdr: xdr,
                 tx_hash: Some(sub_result.tx_hash.clone()),
                 ledger: Some(sub_result.ledger),
@@ -2204,6 +2215,9 @@ fn print_success(envelope: &Envelope<PayResult>, format: OutputFormat) {
                         }
                     }
                 }
+                for line in destination_lines(&result.destinations) {
+                    println!("{line}");
+                }
                 if let Some(business_id) = &result.business_id {
                     println!("business_id {business_id}");
                 }
@@ -2211,6 +2225,33 @@ fn print_success(envelope: &Envelope<PayResult>, format: OutputFormat) {
         }
         // Json and all unknown formats: delegate to shared render_json.
         _ => render_json(envelope),
+    }
+}
+
+/// The result members of the payment operations `envelope_xdr` holds.
+fn result_fields(envelope_xdr: &str) -> DestinationFields {
+    DestinationFields(
+        stellar_agent_network::operation_entry::envelope_result_destinations(envelope_xdr),
+    )
+}
+
+/// The table lines of a result's destinations, escaped for the terminal.
+fn destination_lines(destinations: &DestinationFields) -> Vec<String> {
+    match &destinations.0 {
+        PaymentDestinations::None => Vec::new(),
+        PaymentDestinations::Single(destination) => {
+            vec![format!("Destination: {}", sanitize_for_table(destination))]
+        }
+        PaymentDestinations::PerOperation(entries) => entries
+            .iter()
+            .map(|entry| {
+                format!(
+                    "Destination (operation {}): {}",
+                    entry.operation,
+                    sanitize_for_table(&entry.destination)
+                )
+            })
+            .collect(),
     }
 }
 
@@ -2531,6 +2572,7 @@ where
     {
         Ok(submitted) => {
             let result = PayResult {
+                destinations: result_fields(&submitted.signed_xdr),
                 envelope_xdr: submitted.signed_xdr,
                 tx_hash: Some(submitted.result.tx_hash.clone()),
                 ledger: Some(submitted.result.ledger),
@@ -3343,6 +3385,7 @@ pub(crate) mod tests {
         assert_eq!(tx_fee_from_envelope_xdr(&built.envelope_xdr), 250);
 
         let result = PayResult {
+            destinations: DestinationFields::default(),
             envelope_xdr: built.envelope_xdr,
             tx_hash: None,
             ledger: None,
@@ -3365,6 +3408,7 @@ pub(crate) mod tests {
         // field-omitted JSON would fail with "missing field
         // `selected_fee_per_op_stroops`".
         let result = PayResult {
+            destinations: DestinationFields::default(),
             envelope_xdr: "AAAA".to_owned(),
             tx_hash: None,
             ledger: None,
@@ -3387,6 +3431,7 @@ pub(crate) mod tests {
     #[test]
     fn pay_result_cross_check_field_shape() {
         let mut result = PayResult {
+            destinations: DestinationFields::default(),
             envelope_xdr: "AAAA".to_owned(),
             tx_hash: Some("ab".repeat(32)),
             ledger: Some(7),
@@ -6404,6 +6449,88 @@ pub(crate) mod tests {
             }
         }
 
+        /// The G base of `[7; 32]`, its M0, and its maximum-ID M address.
+        pub(super) const G7: &str = "GADQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOZPI";
+        pub(super) const M7_ZERO: &str =
+            "MADQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOAAAAAAAAAAAACMWM";
+        pub(super) const M7_MAX: &str =
+            "MADQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQP77777777777754MA";
+        /// Another G account, which a staged run names as its caller text.
+        pub(super) const G8: &str = "GAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEARIHQ";
+
+        /// Asserts a successful result whose single `destination` is
+        /// `destination`, with its table line.
+        pub(super) fn assert_result_destination(envelope: &serde_json::Value, destination: &str) {
+            let data = &envelope["data"];
+            assert_eq!(data["destination"], destination, "{envelope}");
+            assert!(data.get("destinations").is_none(), "{envelope}");
+            let result: PayResult = serde_json::from_value(data.clone()).unwrap();
+            assert_eq!(
+                destination_lines(&result.destinations),
+                [format!("Destination: {destination}")]
+            );
+        }
+
+        /// Build, sign, submit, and full results carry the complete G, M0,
+        /// and maximum-ID destination decoded from the envelope each stage
+        /// outputs, signs, or sends. The staged runs name another account as
+        /// their caller destination; the results carry the envelope's.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn pay_results_carry_the_complete_destination() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let signer = EnvSigner::new([0x5B; 32], "PAY_RESULT_DESTINATION_SK");
+            let once = witness_profile_once(&signer, &audit).await;
+            for (index, destination) in [G7, M7_ZERO, M7_MAX].into_iter().enumerate() {
+                let (primary, oracle) = endpoints(&signer, Some(G7)).await;
+                let profile = witnessing(&once, &primary, &oracle, &audit);
+                let mut build = to(&signer, &primary, destination, false);
+                build.build_only = true;
+                build.secret_env = None;
+                let built = run_stage(&build, &profile).await;
+                assert_eq!(built.code, 0, "{destination}: {}", built.envelope);
+                assert_eq!(built.envelope["data"]["stage"], "build");
+                assert_result_destination(&built.envelope, destination);
+                let unsigned = built.envelope["data"]["envelope_xdr"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+
+                let (primary, oracle) = endpoints(&signer, Some(G7)).await;
+                let profile = witnessing(&once, &primary, &oracle, &audit);
+                let mut full = to(&signer, &primary, destination, false);
+                full.amount = format!("{} XLM", 2001 + index);
+                let full = run_stage(&full, &profile).await;
+                assert_passed(&full, destination);
+                assert_eq!(full.envelope["data"]["stage"], "build+sign+submit");
+                assert_result_destination(&full.envelope, destination);
+
+                let (primary, oracle) = endpoints(&signer, Some(G7)).await;
+                let profile = witnessing(&once, &primary, &oracle, &audit);
+                let mut sign = to(&signer, &primary, G8, false);
+                sign.sign_only = Some(unsigned);
+                let signed = run_stage(&sign, &profile).await;
+                assert_passed(&signed, destination);
+                assert_eq!(signed.envelope["data"]["stage"], "sign");
+                assert_result_destination(&signed.envelope, destination);
+                let signed_xdr = signed.envelope["data"]["envelope_xdr"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+
+                let (primary, oracle) = endpoints(&signer, Some(G7)).await;
+                let profile = witnessing(&once, &primary, &oracle, &audit);
+                let mut submit = to(&signer, &primary, G8, false);
+                submit.secret_env = None;
+                submit.submit_only = Some(signed_xdr);
+                let submitted = run_stage(&submit, &profile).await;
+                assert_passed(&submitted, destination);
+                assert_eq!(submitted.envelope["data"]["stage"], "submit");
+                assert_result_destination(&submitted.envelope, destination);
+            }
+        }
+
         /// Destination reads use the base. The full pipeline
         /// reads the G base of M0 and M17 on the primary and the oracle,
         /// takes an absent base for absent, and refuses another failed read.
@@ -8521,6 +8648,338 @@ pub(crate) mod tests {
                 assert!(
                     !log.contains(&destination),
                     "{name}: no audit row holds the complete destination"
+                );
+            }
+        }
+
+        use crate::common::mainnet_write_fixture::TRUSTLINE_ASSET;
+
+        /// The fixture destination's G base, M0, and maximum-ID M address.
+        fn destination_forms() -> [String; 3] {
+            let key = stellar_strkey::ed25519::PublicKey::from_string(DESTINATION)
+                .unwrap()
+                .0;
+            let m = |id| {
+                format!(
+                    "{}",
+                    stellar_strkey::ed25519::MuxedAccount { ed25519: key, id }
+                )
+            };
+            [DESTINATION.to_owned(), m(0), m(u64::MAX)]
+        }
+
+        /// The literal M0 and maximum-ID forms of the fixture destination.
+        const DESTINATION_M0: &str =
+            "MBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWAAAAAAAAAAAACKJY";
+        const DESTINATION_MMAX: &str =
+            "MBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMX77777777777752TU";
+
+        /// Each fixture destination form with the literal SHA-256 and
+        /// redaction its audit leg records.
+        const HASHED_FORMS: [(&str, &str, &str); 3] = [
+            (
+                DESTINATION,
+                "8419e4131cc68b0c89dc835394a978dc8cf090e5118e60af862c515c5b787483",
+                "GBPXX...MWIVL",
+            ),
+            (
+                DESTINATION_M0,
+                "64e93b350686c45c3c01d84623636a6f40323d247be272b220d98744292907b4",
+                "MBPXX...ACKJY",
+            ),
+            (
+                DESTINATION_MMAX,
+                "ce738b37887ec1ae76a1c81c5140596d400dc64a883fccc4f13605822726b99b",
+                "MBPXX...752TU",
+            ),
+        ];
+
+        /// The pay rule for the pinned trustline asset in place of native.
+        fn issued_pay_rule() -> String {
+            pay_rule("allow", "").replace("\"native\"", &format!("\"{TRUSTLINE_ASSET}\""))
+        }
+
+        /// `rule` and its copy for the staged commit tool the staged gate
+        /// evaluates.
+        fn with_commit_rule(rule: String) -> Vec<String> {
+            let commit = rule.replace("tool = \"stellar_pay\"", "tool = \"stellar_pay_commit\"");
+            vec![rule, commit]
+        }
+
+        /// A testnet fixture whose primary reports the agent, the
+        /// destination, and the agent's trustline to the pinned asset.
+        async fn testnet_fixture(name: &'static str, rules: Vec<String>) -> MainnetFixture {
+            let agent =
+                stellar_agent_test_support::signed_envelope::account_id_for_seed(AGENT_SEED);
+            let (code, issuer) = TRUSTLINE_ASSET.split_once(':').unwrap();
+            let (key, entry) =
+                crate::test_rpc::trustline_xdr(&agent, code, issuer, 500_000_000, i64::MAX, 1);
+            Spec::new(name)
+                .testnet()
+                .primary(ClassicRpc::testnet(&[&agent, DESTINATION]).with_entry(key, entry))
+                .rules(rules)
+                .build()
+                .await
+        }
+
+        /// Asserts that the one payment leg of the fixture's pending rows
+        /// carries the literal SHA-256 and redaction of `destination`, the
+        /// gate-sized `amount` and `asset`, and that no row holds the
+        /// complete text.
+        pub(crate) fn assert_hashed_leg(
+            fixture: &MainnetFixture,
+            label: &str,
+            destination: &str,
+            amount: &str,
+            asset: &str,
+        ) {
+            let (_, sha256, redacted) = HASHED_FORMS
+                .into_iter()
+                .find(|(form, _, _)| *form == destination)
+                .unwrap();
+            let rows = fixture.audit_rows("value_action_pending");
+            let legs: Vec<&Value> = rows
+                .iter()
+                .filter_map(|row| row["legs"].as_array())
+                .flatten()
+                .collect();
+            assert_eq!(legs.len(), 1, "{label}: {rows:?}");
+            assert_eq!(legs[0]["action"], "payment", "{label}");
+            assert_eq!(legs[0]["destination_sha256"], sha256, "{label}");
+            assert_eq!(legs[0]["destination_redacted"], redacted, "{label}");
+            assert_eq!(legs[0]["amount"], amount, "{label}: {}", legs[0]);
+            assert_eq!(legs[0]["asset"], asset, "{label}: {}", legs[0]);
+            let log = std::fs::read_to_string(&fixture.profile().audit_log_path).unwrap();
+            assert!(
+                !log.contains(destination),
+                "{label}: no row holds the address"
+            );
+        }
+
+        /// The CLI staged submit and the full run each record a payment leg
+        /// hashing the complete G, M0, and maximum-ID destination, native
+        /// and issued, with the literal digest and redaction.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn every_payment_recorder_hashes_the_complete_destination() {
+            assert_eq!(destination_forms()[1], DESTINATION_M0);
+            assert_eq!(destination_forms()[2], DESTINATION_MMAX);
+            let names: [[&'static str; 2]; 6] = [
+                ["recorder-g-native-staged", "recorder-g-native-full"],
+                ["recorder-m0-native-staged", "recorder-m0-native-full"],
+                ["recorder-mmax-native-staged", "recorder-mmax-native-full"],
+                ["recorder-g-issued-staged", "recorder-g-issued-full"],
+                ["recorder-m0-issued-staged", "recorder-m0-issued-full"],
+                ["recorder-mmax-issued-staged", "recorder-mmax-issued-full"],
+            ];
+            for (index, [staged_name, full_name]) in names.into_iter().enumerate() {
+                let issued = index >= 3;
+                let destination = &destination_forms()[index % 3];
+                let (rules, asset, asset_text) = if issued {
+                    (
+                        with_commit_rule(issued_pay_rule()),
+                        TRUSTLINE_ASSET,
+                        "1 USDC",
+                    )
+                } else {
+                    (with_commit_rule(pay_rule("allow", "")), "native", "1 XLM")
+                };
+                let with_destination = |fixture: &MainnetFixture| {
+                    let mut args = testnet_args(fixture);
+                    args.destination = destination.clone();
+                    args.asset = if issued { TRUSTLINE_ASSET } else { "native" }.to_owned();
+                    args.amount = asset_text.to_owned();
+                    args
+                };
+
+                let fixture = testnet_fixture(staged_name, rules.clone()).await;
+                let mut build = with_destination(&fixture);
+                build.build_only = true;
+                build.secret_env = None;
+                let built = run(&fixture, &build).await;
+                assert_eq!(built.code, 0, "{staged_name}: {}", built.envelope);
+                let mut sign = with_destination(&fixture);
+                sign.sign_only = Some(
+                    built.envelope["data"]["envelope_xdr"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned(),
+                );
+                let signed = run(&fixture, &sign).await;
+                assert_eq!(signed.code, 0, "{staged_name}: {}", signed.envelope);
+                assert!(fixture.audit_rows("value_action_pending").is_empty());
+                let mut submit = with_destination(&fixture);
+                submit.secret_env = None;
+                submit.submit_only = Some(
+                    signed.envelope["data"]["envelope_xdr"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned(),
+                );
+                let submitted = run(&fixture, &submit).await;
+                assert_eq!(submitted.code, 0, "{staged_name}: {}", submitted.envelope);
+                assert_eq!(
+                    submitted.envelope["data"]["destination"],
+                    destination.as_str()
+                );
+                assert_hashed_leg(&fixture, staged_name, destination, "10000000", asset);
+
+                let fixture = testnet_fixture(full_name, rules).await;
+                let full = run(&fixture, &with_destination(&fixture)).await;
+                assert_eq!(full.code, 0, "{full_name}: {}", full.envelope);
+                assert_eq!(full.envelope["data"]["destination"], destination.as_str());
+                assert_hashed_leg(&fixture, full_name, destination, "10000000", asset);
+            }
+        }
+
+        /// The mainnet stage carries the complete G, M0, and maximum-ID
+        /// destination its sent envelope pays.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn pay_results_carry_the_complete_destination_on_mainnet() {
+            for (name, destination) in [
+                ("mainnet-pay-result-g", DESTINATION),
+                ("mainnet-pay-result-m0", DESTINATION_M0),
+                ("mainnet-pay-result-mmax", DESTINATION_MMAX),
+            ] {
+                let fixture = Spec::new(name)
+                    .rules(vec![pay_rule("allow", "")])
+                    .build()
+                    .await;
+                let mut args = mainnet_args(&fixture);
+                args.destination = destination.to_owned();
+                let run = run(&fixture, &args).await;
+                assert_eq!(run.code, 0, "{name}: {}", run.envelope);
+                assert_eq!(fixture.sent_envelopes().await.len(), 1, "{name}");
+                super::muxed_destination::assert_result_destination(&run.envelope, destination);
+            }
+        }
+
+        /// A staged envelope of `operations` from the fixture's agent.
+        fn staged_envelope(operations: Vec<Operation>) -> String {
+            let agent =
+                stellar_agent_test_support::signed_envelope::account_id_for_seed(AGENT_SEED);
+            TransactionEnvelope::Tx(TransactionV1Envelope {
+                tx: Transaction {
+                    source_account: g_to_muxed(&agent),
+                    fee: 100 * u32::try_from(operations.len()).unwrap(),
+                    seq_num: SequenceNumber(101),
+                    cond: Preconditions::None,
+                    memo: stellar_xdr::Memo::None,
+                    operations: operations.try_into().unwrap(),
+                    ext: TransactionExt::V0,
+                },
+                signatures: VecM::default(),
+            })
+            .to_xdr_base64(Limits::none())
+            .unwrap()
+        }
+
+        fn native_payment(to: &str) -> Operation {
+            Operation {
+                source_account: None,
+                body: OperationBody::Payment(PaymentOp {
+                    destination: stellar_agent_core::payment_accounts::PaymentAccount::parse(to)
+                        .unwrap()
+                        .to_muxed_account(),
+                    asset: Asset::Native,
+                    amount: 10_000_000,
+                }),
+            }
+        }
+
+        /// A rate-limited pay rule with the opaque-signing opt-in, which an
+        /// envelope the decoder cannot classify matches.
+        fn opaque_rule() -> String {
+            "[[rules]]\nmatch = { tool = \"stellar_pay\", chain = \"stellar:mainnet\" }\n\
+             criteria = [\n{ kind = \"rate_limit\", window = \"1d\", max_calls = 100 },\n]\n\
+             decision = \"allow\"\nallow_opaque_signing = true\n"
+                .to_owned()
+        }
+
+        /// Signs and submits `unsigned` on a testnet fixture under the
+        /// opaque-signing rule; returns both results.
+        async fn sign_and_submit_opaque(name: &'static str, unsigned: String) -> [Run; 2] {
+            let fixture = testnet_fixture(name, with_commit_rule(opaque_rule())).await;
+            let mut sign = testnet_args(&fixture);
+            sign.sign_only = Some(unsigned);
+            let signed = run(&fixture, &sign).await;
+            assert_eq!(signed.code, 0, "{name}: {}", signed.envelope);
+            let mut submit = testnet_args(&fixture);
+            submit.secret_env = None;
+            submit.submit_only = Some(
+                signed.envelope["data"]["envelope_xdr"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            );
+            let submitted = run(&fixture, &submit).await;
+            assert_eq!(submitted.code, 0, "{name}: {}", submitted.envelope);
+            assert_eq!(fixture.sent_envelopes().await.len(), 1, "{name}");
+            [signed, submitted]
+        }
+
+        /// A staged envelope without a payment operation, admitted through
+        /// the opaque-signing opt-in, signs and sends; neither result has a
+        /// destination member or a destination table line.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_staged_envelope_without_payments_signs_with_no_destination() {
+            let unsigned = staged_envelope(vec![Operation {
+                source_account: None,
+                body: OperationBody::ManageData(stellar_xdr::ManageDataOp {
+                    data_name: "k".as_bytes().to_vec().try_into().unwrap(),
+                    data_value: None,
+                }),
+            }]);
+            for result in sign_and_submit_opaque("testnet-pay-opaque-no-payment", unsigned).await {
+                let data = &result.envelope["data"];
+                assert!(data.get("destination").is_none(), "{}", result.envelope);
+                assert!(data.get("destinations").is_none(), "{}", result.envelope);
+                let parsed: PayResult = serde_json::from_value(data.clone()).unwrap();
+                assert!(destination_lines(&parsed.destinations).is_empty());
+            }
+        }
+
+        /// A staged envelope paying G at operation 0 and the maximum-ID M at
+        /// operation 1 lists both on the sign and submit results and their
+        /// table lines; two payments to one maximum-ID M give one destination.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn staged_pay_results_list_differing_destinations() {
+            let unsigned = staged_envelope(vec![
+                native_payment(DESTINATION),
+                native_payment(DESTINATION_MMAX),
+            ]);
+            for result in sign_and_submit_opaque("testnet-pay-opaque-differing", unsigned).await {
+                let data = &result.envelope["data"];
+                assert_eq!(
+                    data["destinations"],
+                    serde_json::json!([
+                        { "operation": 0, "destination": DESTINATION },
+                        { "operation": 1, "destination": DESTINATION_MMAX },
+                    ]),
+                    "{}",
+                    result.envelope
+                );
+                assert!(data.get("destination").is_none(), "{}", result.envelope);
+                let parsed: PayResult = serde_json::from_value(data.clone()).unwrap();
+                assert_eq!(
+                    destination_lines(&parsed.destinations),
+                    [
+                        format!("Destination (operation 0): {DESTINATION}"),
+                        format!("Destination (operation 1): {DESTINATION_MMAX}"),
+                    ]
+                );
+            }
+            let unsigned = staged_envelope(vec![
+                native_payment(DESTINATION_MMAX),
+                native_payment(DESTINATION_MMAX),
+            ]);
+            for result in sign_and_submit_opaque("testnet-pay-opaque-shared", unsigned).await {
+                super::muxed_destination::assert_result_destination(
+                    &result.envelope,
+                    DESTINATION_MMAX,
                 );
             }
         }

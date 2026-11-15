@@ -321,17 +321,11 @@ fn render_summary_line(view: &PendingApprovalView) -> String {
             package_version,
             package_shasum_short,
             capability,
-            destination_redacted,
             destination,
             destination_base,
             ..
         } => format!(
-            "toolset '{toolset_name}' {package_version} ({package_shasum_short}, install {install_id}) requests {capability} to {}{}",
-            if destination_base.is_some() {
-                destination
-            } else {
-                destination_redacted
-            },
+            "toolset '{toolset_name}' {package_version} ({package_shasum_short}, install {install_id}) requests {capability} to {destination}{}",
             base_account_note(destination_base.as_deref())
         ),
         ApprovalSummaryView::TrustlineClawbackOptIn {
@@ -1117,5 +1111,279 @@ mod tests {
                 }
             }
         }
+    }
+
+    use stellar_agent_core::approval::store::ApprovalKind;
+
+    /// The G account the consent cases name and its maximum-ID M address.
+    const CONSENT_G: &str = "GDK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LCRG";
+    const CONSENT_MMAX: &str =
+        "MDK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5L7777777777774ZMO";
+
+    fn consent_context() -> stellar_agent_core::approval::ApprovalContext {
+        let profile = stellar_agent_core::profile::schema::Profile::builder_testnet(
+            "svc", "default", "nonce", "default",
+        )
+        .build();
+        stellar_agent_core::approval::ApprovalContext::from_profile("render-test", &profile)
+    }
+
+    fn gate_entry(toolset: &str, destination: &str) -> PendingApproval {
+        PendingApproval::new_toolset_first_invoke_gate_pending(
+            toolset.to_owned(),
+            "a".repeat(32),
+            "1.0.0".to_owned(),
+            "d".repeat(64),
+            "sign-payment".to_owned(),
+            destination.to_owned(),
+            "XLM".to_owned(),
+            0,
+            10,
+            process_uid_for_attestation().unwrap(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap()
+    }
+
+    /// The stored view of `entry`, the page, the `approve list` line, and
+    /// the `approve` prompt.
+    fn rendered(entry: &PendingApproval) -> (PendingApprovalView, String, String, String) {
+        let dir = TempDir::new().unwrap();
+        let mut store = PendingApprovalStore::open(dir.path().join("consent.toml")).unwrap();
+        store.insert(entry.clone(), 0).unwrap();
+        let view = store.snapshot(0).remove(0);
+        let html = stellar_agent_approval_ui::render_summary_html(&view);
+        let line = render_pending_row(&view, 0);
+        let mut sink = Vec::new();
+        crate::commands::approve::run::write_summary(entry, &consent_context(), &mut sink).unwrap();
+        (view, html, line, String::from_utf8(sink).unwrap())
+    }
+
+    /// A toolset grant to G or to the maximum-ID M shows the complete
+    /// address on the page, the list line, and the prompt; M shows its base
+    /// row and G shows none.
+    #[test]
+    fn toolset_consent_shows_the_complete_destination() {
+        let (_, html, line, run) = rendered(&gate_entry("pay-tools", CONSENT_G));
+        assert!(
+            html.contains(&format!(
+                "Destination</div>\n      <div class=\"addr\">{CONSENT_G}</div>"
+            )),
+            "{html}"
+        );
+        assert!(!html.contains("GDK5L...5LCRG"), "{html}");
+        assert!(!html.contains("Base account"), "{html}");
+        assert!(
+            line.contains(&format!("requests sign-payment to {CONSENT_G}")),
+            "{line}"
+        );
+        assert!(!line.contains("base account"), "{line}");
+        assert!(
+            run.contains(&format!("  Destination:       {CONSENT_G}\n")),
+            "{run}"
+        );
+        assert!(!run.contains("Base account"), "{run}");
+
+        let (_, html, line, run) = rendered(&gate_entry("pay-tools", CONSENT_MMAX));
+        assert!(
+            html.contains(&format!(
+                "Destination</div>\n      <div class=\"addr\">{CONSENT_MMAX}</div>"
+            )),
+            "{html}"
+        );
+        assert!(
+            html.contains(&format!(
+                "Base account</div>\n      <div class=\"addr\">{CONSENT_G}</div>"
+            )),
+            "{html}"
+        );
+        assert!(
+            line.contains(&format!("to {CONSENT_MMAX} (base account {CONSENT_G})")),
+            "{line}"
+        );
+        assert!(
+            run.contains(&format!("  Destination:       {CONSENT_MMAX}\n")),
+            "{run}"
+        );
+        assert!(
+            run.contains(&format!("  Base account:      {CONSENT_G}\n")),
+            "{run}"
+        );
+    }
+
+    /// A payment to the maximum-ID M shows its complete `to` and its base
+    /// row on the page, the list line, and the prompt.
+    #[test]
+    fn payment_consent_shows_the_complete_destination() {
+        let entry = fixtures::payment_pending(
+            SOURCE_G,
+            CONSENT_MMAX,
+            "XLM",
+            2_500_000,
+            None,
+            100,
+            42,
+            process_uid_for_attestation().unwrap(),
+            DEFAULT_TTL_MS,
+        );
+        let (view, html, line, run) = rendered(&entry);
+        let ApprovalSummaryView::Payment { to, to_base, .. } = &view.summary else {
+            panic!("{:?}", view.summary)
+        };
+        assert_eq!(to, CONSENT_MMAX);
+        assert_eq!(to_base.as_deref(), Some(CONSENT_G));
+        assert!(html.contains(CONSENT_MMAX), "{html}");
+        assert!(
+            html.contains(&format!(
+                "Base account</div>\n      <div class=\"addr\">{CONSENT_G}</div>"
+            )),
+            "{html}"
+        );
+        assert!(line.contains(CONSENT_MMAX), "{line}");
+        assert!(
+            line.contains(&format!("(base account {CONSENT_G})")),
+            "{line}"
+        );
+        assert!(run.contains(CONSENT_MMAX), "{run}");
+        assert!(
+            run.contains(&format!("  Base account:      {CONSENT_G}\n")),
+            "{run}"
+        );
+    }
+
+    /// A toolset request whose stored `destination` has a bad checksum, with
+    /// control and multibyte text, renders as inconsistent and escaped, stays
+    /// listable and rejectable, and refuses approval with
+    /// `approval.entry_inconsistent`. A payment whose stored `summary_to`
+    /// has a bad checksum shows the envelope's destination, never the stored
+    /// text, and refuses approval with the same code.
+    #[test]
+    #[serial_test::serial]
+    fn malformed_consent_terms_render_escaped() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        // Stores `entry`, replaces its one `from` with `to` in the stored
+        // file, and reopens the store.
+        fn stored_with(
+            dir: &TempDir,
+            entry: &PendingApproval,
+            from: &str,
+            to: &str,
+        ) -> PendingApprovalStore {
+            let path = dir.path().join("malformed.toml");
+            PendingApprovalStore::open(path.clone())
+                .unwrap()
+                .insert(entry.clone(), 0)
+                .unwrap();
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(text.matches(from).count(), 1, "{text}");
+            std::fs::write(&path, text.replace(from, to)).unwrap();
+            PendingApprovalStore::open(path).unwrap()
+        }
+
+        // The toolset `destination` with a bad checksum.
+        let bad_g = format!("{}A", &CONSENT_G[..CONSENT_G.len() - 1]);
+        let gate = gate_entry("tools", CONSENT_G);
+        let dir = TempDir::new().unwrap();
+        let mut store = stored_with(&dir, &gate, CONSENT_G, &bad_g);
+        let loaded = store.get(&gate.approval_nonce).unwrap().clone();
+        let view = store.snapshot(0).remove(0);
+        assert!(
+            matches!(view.summary, ApprovalSummaryView::Inconsistent { .. }),
+            "{:?}",
+            view.summary
+        );
+        let html = stellar_agent_approval_ui::render_summary_html(&view);
+        assert!(!html.contains(&bad_g), "{html}");
+        let mut sink = Vec::new();
+        crate::commands::approve::run::write_summary(&loaded, &consent_context(), &mut sink)
+            .unwrap();
+        let run = String::from_utf8(sink).unwrap();
+        assert!(run.contains("INCONSISTENT"), "{run}");
+        assert_eq!(
+            stellar_agent_core::approval::verify_entry_terms(&loaded.kind)
+                .unwrap_err()
+                .code(),
+            "approval.entry_inconsistent"
+        );
+        assert!(
+            store
+                .reject(&gate.approval_nonce, 0, DEFAULT_TTL_MS)
+                .unwrap()
+        );
+        assert!(matches!(
+            store.snapshot(0).remove(0).summary,
+            ApprovalSummaryView::Rejected { .. }
+        ));
+
+        // The payment `summary_to` with a bad checksum.
+        let bad_m = format!("{}A", &CONSENT_MMAX[..CONSENT_MMAX.len() - 1]);
+        let payment = fixtures::payment_pending(
+            SOURCE_G,
+            CONSENT_MMAX,
+            "XLM",
+            2_500_000,
+            None,
+            100,
+            42,
+            process_uid_for_attestation().unwrap(),
+            DEFAULT_TTL_MS,
+        );
+        let dir = TempDir::new().unwrap();
+        let mut store = stored_with(&dir, &payment, CONSENT_MMAX, &bad_m);
+        let loaded = store.get(&payment.approval_nonce).unwrap().clone();
+        let view = store.snapshot(0).remove(0);
+        let ApprovalSummaryView::Payment { to, .. } = &view.summary else {
+            panic!("{:?}", view.summary)
+        };
+        assert_eq!(to, CONSENT_MMAX, "the view decodes the envelope");
+        let html = stellar_agent_approval_ui::render_summary_html(&view);
+        assert!(html.contains(CONSENT_MMAX), "{html}");
+        assert!(!html.contains(&bad_m), "{html}");
+        assert!(render_pending_row(&view, 0).contains(CONSENT_MMAX));
+        assert_eq!(
+            stellar_agent_core::approval::verify_stored_destination(&loaded.kind)
+                .unwrap_err()
+                .code(),
+            "approval.entry_inconsistent"
+        );
+        assert!(
+            store
+                .reject(&payment.approval_nonce, 0, DEFAULT_TTL_MS)
+                .unwrap()
+        );
+
+        // Control and multibyte text renders escaped on the page, the list
+        // line, and the prompt.
+        let hostile = "t<b>\u{e9}\u{1b}[31m\u{202e}";
+        let mut entry = gate_entry("tools", CONSENT_MMAX);
+        let (mut view, _, _, _) = rendered(&entry);
+        if let ApprovalSummaryView::ToolsetFirstInvokeGate { toolset_name, .. } = &mut view.summary
+        {
+            hostile.clone_into(toolset_name);
+        }
+        let html = stellar_agent_approval_ui::render_summary_html(&view);
+        assert!(html.contains("t&lt;b&gt;\u{e9}"), "{html}");
+        assert!(!html.contains("<b>"), "{html}");
+        assert!(html.contains(CONSENT_MMAX), "{html}");
+        let line = render_pending_row(&view, 0);
+        assert!(
+            !line.contains('\u{1b}') && !line.contains('\u{202e}'),
+            "{line:?}"
+        );
+        assert!(line.contains(CONSENT_MMAX), "{line}");
+        if let ApprovalKind::ToolsetFirstInvokeGate { toolset_name, .. } = &mut entry.kind {
+            hostile.clone_into(toolset_name);
+        }
+        let mut sink = Vec::new();
+        crate::commands::approve::run::write_summary(&entry, &consent_context(), &mut sink)
+            .unwrap();
+        let run = String::from_utf8(sink).unwrap();
+        assert!(
+            !run.contains('\u{1b}') && !run.contains('\u{202e}'),
+            "{run:?}"
+        );
+        assert!(run.contains(CONSENT_MMAX), "{run}");
     }
 }

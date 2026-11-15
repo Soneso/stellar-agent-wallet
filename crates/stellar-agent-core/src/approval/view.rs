@@ -1909,6 +1909,73 @@ mod tests {
         ));
     }
 
+    /// A toolset request whose stored `destination` has a bad checksum
+    /// renders as inconsistent and refuses with `approval.entry_inconsistent`.
+    /// A payment whose stored `summary_to` has a bad checksum shows the
+    /// envelope's destination and refuses its use with the same code.
+    #[test]
+    fn malformed_consent_terms_render_escaped() {
+        const M_MAX: &str = "MDK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5L7777777777774ZMO";
+        let bad_m = format!("{}A", &M_MAX[..M_MAX.len() - 1]);
+        let mut gate = PendingApproval::new_toolset_first_invoke_gate_pending(
+            "pay-tools".to_owned(),
+            "a".repeat(32),
+            "1.0.0".to_owned(),
+            "d".repeat(64),
+            "sign-payment".to_owned(),
+            M_MAX.to_owned(),
+            "XLM".to_owned(),
+            0,
+            10,
+            process_uid_for_attestation().unwrap(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        if let ApprovalKind::ToolsetFirstInvokeGate { destination, .. } = &mut gate.kind {
+            destination.clone_from(&bad_m);
+        }
+        assert_eq!(
+            super::super::toolset_grant::verify_toolset_gate_entry_terms(&gate.kind)
+                .unwrap_err()
+                .code(),
+            "approval.entry_inconsistent"
+        );
+        let view = PendingApprovalView::from_entry(&gate, TEST_NOW_MS);
+        assert!(
+            matches!(view.summary, ApprovalSummaryView::Inconsistent { .. }),
+            "{:?}",
+            view.summary
+        );
+        assert!(!serde_json::to_string(&view).unwrap().contains(&bad_m));
+
+        let mut payment = fixtures::payment_pending(
+            SOURCE,
+            M_MAX,
+            "XLM",
+            1_000,
+            None,
+            100,
+            1,
+            process_uid_for_attestation().unwrap(),
+            60_000,
+        );
+        if let ApprovalKind::PaymentSimulated { summary_to, .. } = &mut payment.kind {
+            summary_to.clone_from(&bad_m);
+        }
+        let ApprovalSummaryView::Payment { to, .. } =
+            PendingApprovalView::from_entry(&payment, TEST_NOW_MS).summary
+        else {
+            panic!("a payment view")
+        };
+        assert_eq!(to, M_MAX);
+        assert_eq!(
+            super::super::verify_stored_destination(&payment.kind)
+                .unwrap_err()
+                .code(),
+            "approval.entry_inconsistent"
+        );
+    }
+
     /// A path payment shows both legs, an account creation its starting
     /// balance, and a muxed destination its M-strkey.
     #[test]

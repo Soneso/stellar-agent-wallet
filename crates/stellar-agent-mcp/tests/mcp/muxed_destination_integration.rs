@@ -73,6 +73,8 @@ fn source_g() -> String {
 struct MuxRpc {
     entries: Vec<(String, String)>,
     failing: Vec<String>,
+    /// Keys whose reads the endpoint answers with HTTP 401.
+    unauthorized: Vec<String>,
 }
 
 impl Respond for MuxRpc {
@@ -82,6 +84,14 @@ impl Respond for MuxRpc {
         let raw = String::from_utf8_lossy(&request.body);
         let result = match body["method"].as_str().unwrap_or("") {
             "getNetwork" => crate::common::EndpointNetwork::testnet().result(),
+            "getLedgerEntries"
+                if self
+                    .unauthorized
+                    .iter()
+                    .any(|key| raw.contains(key.as_str())) =>
+            {
+                return ResponseTemplate::new(401);
+            }
             "getLedgerEntries" if self.failing.iter().any(|key| raw.contains(key.as_str())) => {
                 return ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "jsonrpc": "2.0", "id": id,
@@ -126,6 +136,17 @@ async fn endpoint(
     extra: Vec<(String, String)>,
     failing: &[String],
 ) -> MockServer {
+    endpoint_refusing(existing, extra, failing, &[]).await
+}
+
+/// [`endpoint`] that also answers reads of each `unauthorized` account
+/// with HTTP 401.
+async fn endpoint_refusing(
+    existing: &[String],
+    extra: Vec<(String, String)>,
+    failing: &[String],
+    unauthorized: &[String],
+) -> MockServer {
     let mut entries = vec![(
         account_ledger_key_xdr(&source_g()),
         account_entry_xdr_with_balance(&source_g(), 100_000_000_000_000),
@@ -142,6 +163,10 @@ async fn endpoint(
         .respond_with(MuxRpc {
             entries,
             failing: failing
+                .iter()
+                .map(|account| account_ledger_key_xdr(account))
+                .collect(),
+            unauthorized: unauthorized
                 .iter()
                 .map(|account| account_ledger_key_xdr(account))
                 .collect(),
@@ -1292,4 +1317,173 @@ async fn issuer_m0_refuses_as_a_base_account() {
 #[serial]
 async fn issuer_m_max_refuses_as_a_base_account() {
     issuer_refuses_as_a_base_account(u64::MAX).await;
+}
+
+/// The G account of `[0xA6; 32]`, its M0, and its maximum-ID M address.
+const RESULT_G: &str = "GCTKNJVGU2TKNJVGU2TKNJVGU2TKNJVGU2TKNJVGU2TKNJVGU2TKNG7S";
+const RESULT_M0: &str = "MCTKNJVGU2TKNJVGU2TKNJVGU2TKNJVGU2TKNJVGU2TKNJVGU2TKMAAAAAAAAAAAABA5O";
+const RESULT_MMAX: &str = "MCTKNJVGU2TKNJVGU2TKNJVGU2TKNJVGU2TKNJVGU2TKNJVGU2TKN7777777777776QHC";
+/// The issuer of the issued cases, the G account of `[0xD6; 32]`.
+const RESULT_ISSUER: &str = "GDLNNVWW23LNNVWW23LNNVWW23LNNVWW23LNNVWW23LNNVWW23LNMSZB";
+/// Another G account, the G account of `[0xA7; 32]`.
+const OTHER_G: &str = "GCT2PJ5HU6T2PJ5HU6T2PJ5HU6T2PJ5HU6T2PJ5HU6T2PJ5HU6T2OJHQ";
+
+/// The pending approvals of `profile` in `approvals`.
+fn pending_count(approvals: &std::path::Path, profile: &str) -> usize {
+    let path = approvals.join(format!("{profile}.toml"));
+    if !path.exists() {
+        return 0;
+    }
+    PendingApprovalStore::open(path)
+        .unwrap()
+        .snapshot(stellar_agent_core::timefmt::now_unix_ms().unwrap())
+        .len()
+}
+
+/// A destination read failing with a backend error refuses the preparation
+/// with `network.rpc_unreachable`, and an HTTP 401 with
+/// `network.rpc_credential_refused`, before any nonce, approval, or send. A
+/// repeated preparation refuses with the same code. An absent account
+/// prepares. G and the maximum-ID M read the same G key.
+#[tokio::test]
+#[serial]
+async fn pay_prepare_destination_read_error_refuses_with_its_code() {
+    let fx = Fixture::new();
+    let base_key = account_ledger_key_xdr(RESULT_G);
+    for destination in [RESULT_G, RESULT_MMAX] {
+        for (failing, unauthorized, code, detail) in [
+            (
+                vec![RESULT_G.to_owned()],
+                vec![],
+                "network.rpc_unreachable",
+                "backend unavailable",
+            ),
+            (
+                vec![],
+                vec![RESULT_G.to_owned()],
+                "network.rpc_credential_refused",
+                "answered a request with HTTP 401",
+            ),
+        ] {
+            let rpc = endpoint_refusing(&[], Vec::new(), &failing, &unauthorized).await;
+            let approvals = tempfile::TempDir::new().unwrap();
+            let server = fx.server(&rpc, approvals.path());
+            for attempt in 0..2 {
+                let result = server
+                    .call_stellar_pay(pay_args(destination))
+                    .await
+                    .expect("a business refusal");
+                let json = json_of(&result);
+                assert_eq!(result.is_error, Some(true), "{destination}: {json}");
+                assert_eq!(
+                    json["error"]["code"], code,
+                    "{destination} #{attempt}: {json}"
+                );
+                assert!(
+                    json["error"]["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains(detail)),
+                    "{destination}: {json}"
+                );
+                assert!(json.get("data").is_none(), "no nonce: {json}");
+            }
+            assert_eq!(pending_count(approvals.path(), &fx.name), 0, "no approval");
+            assert!(bodies(&rpc, "sendTransaction").await.is_empty(), "no send");
+            let reads = read_keys(&rpc).await;
+            assert!(reads.contains(&base_key), "{destination} reads the G key");
+            assert!(
+                !reads.contains(&account_ledger_key_xdr(OTHER_G)),
+                "{destination}"
+            );
+        }
+
+        // An absent account prepares with no identity view.
+        let rpc = endpoint(&[], Vec::new(), &[]).await;
+        let approvals = tempfile::TempDir::new().unwrap();
+        let server = fx.server(&rpc, approvals.path());
+        let data = prepare(&server, &pay_args(destination)).await;
+        assert!(data["nonce"].is_string(), "{data}");
+        assert!(read_keys(&rpc).await.contains(&base_key), "{destination}");
+    }
+}
+
+/// `envelope` with a second native payment to `to` appended.
+fn with_second_payment(envelope: &str, to: MuxedAccount) -> String {
+    let TransactionEnvelope::Tx(mut tx) =
+        TransactionEnvelope::from_xdr_base64(envelope, Limits::none()).unwrap()
+    else {
+        panic!("a v1 envelope");
+    };
+    let mut operations = tx.tx.operations.to_vec();
+    operations.push(stellar_xdr::Operation {
+        source_account: None,
+        body: OperationBody::Payment(PaymentOp {
+            destination: to,
+            asset: stellar_xdr::Asset::Native,
+            amount: 1,
+        }),
+    });
+    tx.tx.operations = operations.try_into().unwrap();
+    tx.tx.fee *= 2;
+    stellar_xdr::WriteXdr::to_xdr_base64(&TransactionEnvelope::Tx(tx), Limits::none()).unwrap()
+}
+
+/// A successful commit carries the complete G, M0, and maximum-ID
+/// destination, native and issued, and no `destinations` member. A
+/// presented envelope with a second payment to another account refuses
+/// `simulation.divergence` and sends nothing.
+#[tokio::test]
+#[serial]
+async fn pay_commit_success_carries_the_complete_destination() {
+    use stellar_agent_test_support::xdr_fixtures::{trustline_entry_xdr, trustline_ledger_key_xdr};
+    let fx = Fixture::new();
+    let trustline = (
+        trustline_ledger_key_xdr(&source_g(), "USDC", RESULT_ISSUER),
+        trustline_entry_xdr(&source_g(), "USDC", RESULT_ISSUER, 10_000_000_000),
+    );
+    for issued in [false, true] {
+        for destination in [RESULT_G, RESULT_M0, RESULT_MMAX] {
+            let rpc = endpoint(
+                &[RESULT_G.to_owned(), RESULT_ISSUER.to_owned()],
+                vec![trustline.clone()],
+                &[],
+            )
+            .await;
+            let approvals = tempfile::TempDir::new().unwrap();
+            let server = fx.server(&rpc, approvals.path());
+            let mut args = pay_args(destination);
+            if issued {
+                args.asset = format!("USDC:{RESULT_ISSUER}");
+                args.amount = Some(serde_json::from_str(r#""10 USDC""#).unwrap());
+            }
+            let data = prepare(&server, &args).await;
+
+            let mut diverged = commit_args(&args, &data);
+            diverged.envelope_xdr = with_second_payment(
+                &diverged.envelope_xdr,
+                MuxedAccount::Ed25519(Uint256(
+                    stellar_strkey::ed25519::PublicKey::from_string(OTHER_G)
+                        .unwrap()
+                        .0,
+                )),
+            );
+            let refused = server.call_stellar_pay_commit(diverged).await.unwrap();
+            assert_eq!(
+                json_of(&refused)["error"]["code"],
+                "simulation.divergence",
+                "{destination}"
+            );
+            assert!(sent_payments(&rpc).await.is_empty(), "nothing is sent");
+
+            let committed = server
+                .call_stellar_pay_commit(commit_args(&args, &data))
+                .await
+                .unwrap();
+            let json = json_of(&committed);
+            assert_ne!(committed.is_error, Some(true), "{json}");
+            assert_eq!(json["data"]["destination"], destination, "{json}");
+            assert!(json["data"].get("destinations").is_none(), "{json}");
+            assert_eq!(sent_payments(&rpc).await.len(), 1, "{destination}");
+        }
+    }
 }
