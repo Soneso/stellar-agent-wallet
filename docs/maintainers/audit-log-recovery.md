@@ -532,8 +532,8 @@ Run the verb again, or let the MCP server acquire the writer again: each acquisi
 **Consent evidence.** Evidence initialization adds two files beside the queue: `<log>.outbox.evidence.0` and `<log>.outbox.evidence.1`.
 Each file is exactly 364,668 bytes: a 124-byte header, up to 4,096 records of 89 bytes, and zero padding.
 The header holds `SAEV0001`, the scope, the evidence generation, the time floor, the record count, the predecessor head, and the tag.
-The tag is HMAC-SHA256 under the audit key over the whole file with its tag bytes zeroed.
-The head is SHA-256 over the whole tagged file.
+The tag is HMAC-SHA256 under the audit key over ASCII `stellar-agent-consent-evidence-tag:v1`, followed by the whole file with bytes 92 through 123 zeroed.
+The head is SHA-256 over ASCII `stellar-agent-consent-evidence:v1`, followed by the whole tagged file.
 The owner value then takes version 2: `{"v":2,"g":G,"closed":C,"legacy":L,"e":{"g":E,"head":H}}`.
 Its `e` commits the evidence generation and the head of one file, and the value carries no recent digests.
 Initialization turns each recent digest of a version 1 owner into a migration pin, and a pin never counts as delivery.
@@ -545,8 +545,46 @@ An image that matches no committed head refuses with `head`, and an older image 
 A missing or version 1 owner beside either evidence file refuses with `evidence image without owner`.
 A drain under such an owner leaves queued consent rows in place, and rows without consent evidence still deliver.
 Every refusal uses `audit.outbox_evidence_unusable` with a fixed reason.
-Ordinary appends, drains, and payments that need no approval never read the evidence files.
-Key rotation refuses an owner that commits evidence with `evidence re-tag unavailable`, before it writes anything.
+Ordinary appends and payments that need no approval never read the evidence files.
+A drain reads them only while repairing an exact rotation fence.
+
+**Evidence transactions.** The active outbox carrier covers the owner reload, authenticated selection, transformation, candidate sync, owner store, and outcome reread.
+The selected generation is checked before any mutation or recommit.
+Generation `u64::MAX` refuses with `evidence-generation overflow`, through `audit.outbox_evidence_unusable`, without writes.
+A read at that generation remains valid.
+The successor uses the other slot, generation plus one, and the selected head as its predecessor.
+It preserves records and the floor unless the internal transformation changes them, and layout validation precedes every candidate write.
+File and directory syncs precede the owner store, which commits evidence and queue fields together.
+An uncertain store triggers a reread under the carrier, and both files remain until the actual owner is known.
+A failed reread remains a storage error.
+A complete recovered candidate receives both syncs before its recommit; a torn candidate never qualifies.
+
+**Evidence rotation.** Key rotation validates the drained queue and checks evidence overflow before replacing the key.
+It publishes the exact zero tag fence of the owner's queue generation, then copies and syncs the selected image into the other slot.
+Only then does the command persist the new key.
+Under that fence, a complete image matching the committed head, generation, scope, and layout authorizes recovery when its old tag fails.
+Missing, torn, foreign, or wrong head bytes never authorize recovery.
+The first new image advances evidence once and preserves every record and the floor.
+Its predecessor is the old committed head, and its tag uses the stored key.
+The owner commits this successor before the second copy is written and synced.
+Both copies verify before the queue generation line is published under the stored key.
+Rotation changes the head.
+
+| Interrupted boundary | Recovery under the stored key |
+| --- | --- |
+| Candidate write or sync | Ignore torn bytes; sync a complete authenticated candidate before recommitting it. |
+| Candidate durable, owner old | Recommit the newest authenticated image before returning facts. |
+| Owner store reports failure | Reread under the carrier and preserve both files. |
+| Fence durable, old image mirror incomplete | Preserve the selected source and finish the mirror before reopening. |
+| Old image mirror durable, key write pending | Copy the current image as needed and reopen without an increment. |
+| New key stored, no successor | Validate the committed source through the exact fence, then create one successor. |
+| First new slot durable, owner old | Sync and recommit the successor once, then copy it. |
+| New owner committed, second slot old | Copy the committed successor without another owner store or increment. |
+| Both new slots durable, queue fenced | Sync and verify the copies, then reopen without another evidence write. |
+
+A keyed acquisition completes this recovery before releasing the fence.
+Rerun `stellar-agent profile rotate-audit-key --profile <NAME>` to finish chain root signing.
+A new rotation advances evidence once more.
 
 **Restore current owner entry.** Stop every process that holds the profile, and preserve both evidence files, the queue, and the keyring entries.
 Restore the most recent trusted owner value at its `-owner` account with the platform keyring tool, then retry a keyed acquisition.

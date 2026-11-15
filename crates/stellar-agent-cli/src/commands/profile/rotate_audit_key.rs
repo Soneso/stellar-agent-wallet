@@ -1735,7 +1735,7 @@ mod tests {
         profile
     }
 
-    /// A profile with initialized consent evidence refuses the rotation with
+    /// A profile with evidence files without a root refuses the rotation with
     /// the evidence code before the key write; the key and both evidence
     /// files stay as they are.
     #[tokio::test]
@@ -1745,13 +1745,15 @@ mod tests {
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
-        let dir = tempfile::tempdir().expect("tmp dir");
+        let dir = tempfile::tempdir_in(storage_sandbox.path()).expect("tmp dir");
         let name = "rotate-evidence";
         let profile = tagged_profile(name, dir.path());
-        open_locked_audit_writer(&profile, name, BindingHistory::NotRecorded)
-            .expect("open the writer")
-            .initialize_consent_evidence()
-            .expect("initialize consent evidence");
+        let outbox_path = stellar_agent_core::audit_log::outbox_path(&profile.audit_log_path);
+        for suffix in [".evidence.0", ".evidence.1"] {
+            let mut slot = outbox_path.clone().into_os_string();
+            slot.push(suffix);
+            std::fs::write(slot, b"evidence without its owner").expect("write evidence fixture");
+        }
         let key_before = load_audit_hmac_key(&profile, name).expect("load the key");
         let outbox = stellar_agent_core::audit_log::outbox_path(&profile.audit_log_path);
         let slots = || {
@@ -1771,11 +1773,11 @@ mod tests {
             Err(RotateRefusal::Wallet(error)) => error,
             Err(RotateRefusal::Integrity(e)) => panic!("unexpected integrity refusal: {e}"),
             Err(RotateRefusal::ProfileAccess(e)) => panic!("unexpected profile refusal: {e}"),
-            Ok(_) => panic!("initialized evidence must refuse the rotation"),
+            Ok(_) => panic!("evidence without an owner must refuse the rotation"),
         };
         assert_eq!(error.code(), "audit.outbox_evidence_unusable", "{error}");
         assert!(
-            error.message().contains("evidence re-tag unavailable"),
+            error.message().contains("evidence image without owner"),
             "{error}"
         );
         let key_after = load_audit_hmac_key(&profile, name).expect("load the key again");

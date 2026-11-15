@@ -2440,7 +2440,7 @@ impl OutboxBatch {
             && !generation_verifies(key, g, &tag)
         {
             // A stopped rotation leaves a lone fence for the next drain.
-            if g == owner.g && rows.is_empty() && clean {
+            if g == owner.g && self.bytes == encode_fence_line(owner.g) && clean {
                 return Ok(OwnerSelection {
                     plan: OwnerDelivery::publish_only(owner.g),
                     loss: None,
@@ -2925,7 +2925,7 @@ impl OutboxBatch {
         check_no_successor_owner(store, self.generation)?;
         let (owner, publish) = match self.owner(store)? {
             Some(owner) if owner.e.is_some() => {
-                read_owner_evidence(log_path, store, self.generation, Some(key))?;
+                read_owner_evidence(log_path, store, &self, Some(key))?;
                 return Ok(EvidenceInit::Done);
             }
             Some(owner) => (owner, None),
@@ -2985,14 +2985,6 @@ impl OutboxBatch {
             }
             None => Ok(EvidenceInit::Migrated),
         }
-    }
-
-    /// Whether this batch's owner state commits consent evidence.
-    pub(crate) fn owner_commits_evidence(
-        &self,
-        store: &dyn TipAnchorStore,
-    ) -> Result<bool, WriterError> {
-        Ok(self.owner(store)?.is_some_and(|owner| owner.e.is_some()))
     }
 
     /// Checks that the carrier record still names this batch's generation.
@@ -3100,18 +3092,13 @@ fn initial_slots_pending(
     Ok(pending)
 }
 
-/// Evidence loaded under the held carrier, before any write.
-enum LoadedEvidence {
-    /// No owner commits evidence and no slot exists.
-    Absent,
-    /// The committed image.
-    Current(EvidenceImage),
-    /// A newer authenticated image the owner must commit first.
-    Newer {
-        owner: Box<OutboxOwnerState>,
-        image: EvidenceImage,
-        head: [u8; 32],
-    },
+/// One selected image and its owner, loaded under the carrier.
+pub(super) struct LoadedEvidence {
+    owner: OutboxOwnerState,
+    image: EvidenceImage,
+    bytes: Vec<u8>,
+    index: usize,
+    recommit: bool,
 }
 
 /// Loads the owner of `carrier_generation` and both slots, and selects.
@@ -3120,7 +3107,8 @@ fn load_owner_evidence(
     store: &dyn TipAnchorStore,
     carrier_generation: u64,
     key: Option<&[u8; 32]>,
-) -> Result<LoadedEvidence, WriterError> {
+    fenced: bool,
+) -> Result<Option<LoadedEvidence>, WriterError> {
     check_no_successor_owner(store, carrier_generation)?;
     let owner = store
         .load_outbox_owner_state(carrier_generation)?
@@ -3130,7 +3118,7 @@ fn load_owner_evidence(
         if consent_evidence::any_slot_exists(log_path)? {
             return Err(evidence_unusable("evidence image without owner"));
         }
-        return Ok(LoadedEvidence::Absent);
+        return Ok(None);
     };
     let key = key.ok_or(WriterError::KeyedLogNeedsKey {
         evidence: "the owner state commits consent evidence",
@@ -3143,39 +3131,258 @@ fn load_owner_evidence(
     ];
     #[cfg(test)]
     test_seam::run_evidence_loaded(log_path);
-    Ok(
-        match consent_evidence::select(&slots, committed.g, &committed.head, &scope, key)
-            .map_err(evidence_unusable)?
-        {
-            Selected::Current(image) => LoadedEvidence::Current(image),
-            Selected::Newer { image, head } => LoadedEvidence::Newer {
-                owner: Box::new(owner),
-                image,
-                head,
-            },
-        },
-    )
+    let (image, head, recommit) =
+        match consent_evidence::select(&slots, committed.g, &committed.head, &scope, key) {
+            Ok(Selected::Current(image)) => (image, committed.head, false),
+            Ok(Selected::Newer { image, head }) => {
+                if fenced
+                    && (image.predecessor != committed.head
+                        || committed.g.checked_add(1) != Some(image.generation))
+                {
+                    return Err(evidence_unusable("head"));
+                }
+                (image, head, true)
+            }
+            Err(reason) if fenced => {
+                let image = slots.iter().flatten().find_map(|bytes| {
+                    if consent_evidence::head(bytes) != committed.head {
+                        return None;
+                    }
+                    consent_evidence::decode_layout(bytes)
+                        .ok()
+                        .filter(|image| image.generation == committed.g && image.scope == scope)
+                });
+                (
+                    image.ok_or_else(|| evidence_unusable(reason))?,
+                    committed.head,
+                    false,
+                )
+            }
+            Err(reason) => return Err(evidence_unusable(reason)),
+        };
+    let index = slots
+        .iter()
+        .position(|slot| {
+            slot.as_ref()
+                .is_some_and(|bytes| consent_evidence::head(bytes) == head)
+        })
+        .ok_or_else(|| evidence_unusable("head"))?;
+    let bytes = slots
+        .into_iter()
+        .nth(index)
+        .flatten()
+        .ok_or_else(|| evidence_unusable("missing image"))?;
+    Ok(Some(LoadedEvidence {
+        owner,
+        image,
+        bytes,
+        index,
+        recommit,
+    }))
 }
 
-/// Recommits a newer image before returning it.
+/// Syncs a complete candidate before its owner store.
+fn sync_evidence_slot(path: &Path) -> Result<(), WriterError> {
+    let file = OpenOptions::new().read(true).write(true).open(path)?;
+    sync_outbox_file(&file, path)?;
+    sync_parent_dir(path)?;
+    Ok(())
+}
+
+/// Writes only the inactive slot, including its file and directory syncs.
+fn write_evidence_slot(path: &Path, bytes: &[u8]) -> Result<(), WriterError> {
+    #[cfg(any(test, feature = "test-helpers"))]
+    test_seam::check_sync(path, test_seam::SyncStep::Create)?;
+    let mut file = create_replacement_0600(path)?;
+    #[cfg(any(test, feature = "test-helpers"))]
+    if let Some(count) = test_seam::take_partial_write(path) {
+        file.write_all(&bytes[..count.min(bytes.len())])?;
+        return Err(io::Error::other("test fault: partial evidence write").into());
+    }
+    file.write_all(bytes)?;
+    sync_outbox_file(&file, path)?;
+    sync_parent_dir(path)?;
+    #[cfg(test)]
+    test_seam::run_replacement_synced(path);
+    Ok(())
+}
+
+/// Checked before any mutation, including a recovered candidate's recommit.
+fn next_evidence_generation(image: &EvidenceImage) -> Result<u64, WriterError> {
+    image
+        .generation
+        .checked_add(1)
+        .ok_or_else(|| evidence_unusable("evidence-generation overflow"))
+}
+
+/// Recommits a synced image before returning facts or transforming records.
 fn commit_owner_evidence(
-    loaded: LoadedEvidence,
+    loaded: &mut LoadedEvidence,
     log_path: &Path,
     store: &dyn TipAnchorStore,
     carrier_generation: u64,
-) -> Result<Option<OutboxEvidence>, WriterError> {
-    match loaded {
-        LoadedEvidence::Absent => Ok(None),
-        LoadedEvidence::Current(image) => Ok(Some(image.into())),
-        LoadedEvidence::Newer { owner, image, head } => {
-            let next = owner.with_evidence(image.generation, head);
-            store_owner_confirmed(store, carrier_generation, &next.to_keyring_value())?;
-            #[cfg(any(test, feature = "test-helpers"))]
-            test_seam::check_stop(&outbox_path(log_path), test_seam::Stop::EvidenceRecommitted)?;
-            #[cfg(not(any(test, feature = "test-helpers")))]
-            let _ = log_path;
-            Ok(Some(image.into()))
+    check: impl Fn() -> Result<(), WriterError>,
+) -> Result<(), WriterError> {
+    if loaded.recommit {
+        sync_evidence_slot(&consent_evidence::slot_paths(log_path)[loaded.index])?;
+        let next = loaded.owner.clone().with_evidence(
+            loaded.image.generation,
+            consent_evidence::head(&loaded.bytes),
+        );
+        check()?;
+        store_owner_confirmed(store, carrier_generation, &next.to_keyring_value())?;
+        loaded.owner = next;
+        loaded.recommit = false;
+        #[cfg(any(test, feature = "test-helpers"))]
+        test_seam::check_stop(&outbox_path(log_path), test_seam::Stop::EvidenceRecommitted)?;
+    }
+    check()
+}
+
+impl OutboxBatch {
+    /// Loads and commits the selected image before a mutation.
+    fn evidence_for_change(
+        &self,
+        log_path: &Path,
+        store: &dyn TipAnchorStore,
+        key: &[u8; 32],
+        fenced: bool,
+        advance: bool,
+    ) -> Result<Option<LoadedEvidence>, WriterError> {
+        let Some(mut loaded) =
+            load_owner_evidence(log_path, store, self.generation, Some(key), fenced)?
+        else {
+            return Ok(None);
+        };
+        if advance {
+            next_evidence_generation(&loaded.image)?;
         }
+        commit_owner_evidence(&mut loaded, log_path, store, self.generation, || {
+            self.check_generation(store)
+        })?;
+        Ok(Some(loaded))
+    }
+
+    /// The shared successor transaction for records, floor, and owner fields.
+    pub(super) fn commit_evidence_change(
+        &self,
+        log_path: &Path,
+        store: &dyn TipAnchorStore,
+        key: &[u8; 32],
+        fenced: bool,
+        transform: impl FnOnce(&mut EvidenceImage, &mut OutboxOwnerState),
+    ) -> Result<LoadedEvidence, WriterError> {
+        let mut loaded = self
+            .evidence_for_change(log_path, store, key, fenced, !fenced)?
+            .ok_or_else(|| evidence_unusable("missing image"))?;
+        if fenced && consent_evidence::tag_verifies(&loaded.bytes, key) {
+            return Ok(loaded);
+        }
+        let generation = next_evidence_generation(&loaded.image)?;
+        let predecessor = consent_evidence::head(&loaded.bytes);
+        transform(&mut loaded.image, &mut loaded.owner);
+        loaded.image.generation = generation;
+        loaded.image.predecessor = predecessor;
+        loaded.bytes = loaded.image.seal(key);
+        consent_evidence::decode(&loaded.bytes, key).map_err(evidence_unusable)?;
+        loaded.index = 1 - loaded.index;
+        write_evidence_slot(
+            &consent_evidence::slot_paths(log_path)[loaded.index],
+            &loaded.bytes,
+        )?;
+        #[cfg(any(test, feature = "test-helpers"))]
+        test_seam::check_stop(&self.path, test_seam::Stop::EvidenceCandidateSynced)?;
+        loaded.owner = loaded
+            .owner
+            .with_evidence(generation, consent_evidence::head(&loaded.bytes));
+        self.check_generation(store)?;
+        store_owner_confirmed(store, self.generation, &loaded.owner.to_keyring_value())?;
+        #[cfg(any(test, feature = "test-helpers"))]
+        test_seam::check_stop(&self.path, test_seam::Stop::EvidenceOwnerStored)?;
+        self.check_generation(store)?;
+        Ok(loaded)
+    }
+
+    /// Publishes the fence, then preserves the selected image in both slots.
+    pub(crate) fn fence_key_change(
+        self,
+        log_path: &Path,
+        store: &dyn TipAnchorStore,
+        key: &[u8; 32],
+    ) -> Result<(), WriterError> {
+        let selected = self.evidence_for_change(log_path, store, key, false, true)?;
+        let target = self
+            .key_change_target(store)?
+            .ok_or_else(|| tagged_refusal(1, "queue not drained before a key change"))?;
+        if let Some(ref loaded) = selected
+            && self.bytes != encode_generation_line(key, loaded.owner.g)
+        {
+            return Err(evidence_unusable("queue not drained"));
+        }
+        if let Some(owner) = target.owner_value() {
+            self.check_generation(store)?;
+            store_owner_confirmed(store, self.generation, &owner)?;
+            #[cfg(any(test, feature = "test-helpers"))]
+            test_seam::check_stop(&self.path, test_seam::Stop::OwnerStored)?;
+        }
+        self.publish_fence(target.generation, store)?;
+        if let Some(loaded) = selected {
+            write_evidence_slot(
+                &consent_evidence::slot_paths(log_path)[1 - loaded.index],
+                &loaded.bytes,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Repairs evidence only while the exact owned fence protects the queue.
+    pub(crate) fn recover_evidence_fence(
+        &self,
+        log_path: &Path,
+        store: &dyn TipAnchorStore,
+        key: Option<&[u8; 32]>,
+        required: bool,
+    ) -> Result<(), WriterError> {
+        let owner = match self.owner(store)? {
+            Some(owner) if owner.e.is_some() => owner,
+            _ => {
+                if required && consent_evidence::any_slot_exists(log_path)? {
+                    return Err(evidence_unusable("evidence image without owner"));
+                }
+                return Ok(());
+            }
+        };
+        if self.bytes != encode_fence_line(owner.g) || self.state != OutboxState::default() {
+            return if required {
+                Err(evidence_unusable("queue not drained"))
+            } else {
+                Ok(())
+            };
+        }
+        let key = key.ok_or(WriterError::KeyedLogNeedsKey {
+            evidence: "the owner state commits consent evidence",
+        })?;
+        let loaded = self.commit_evidence_change(log_path, store, key, true, |_, _| {})?;
+        let paths = consent_evidence::slot_paths(log_path);
+        let other = 1 - loaded.index;
+        if consent_evidence::read_slot(&paths[other])?.as_deref() != Some(loaded.bytes.as_slice()) {
+            write_evidence_slot(&paths[other], &loaded.bytes)?;
+        } else {
+            // Equal bytes can follow an interrupted sync, so both files sync.
+            sync_evidence_slot(&paths[other])?;
+        }
+        sync_evidence_slot(&paths[loaded.index])?;
+        for path in paths {
+            let bytes = consent_evidence::read_slot(&path)?
+                .ok_or_else(|| evidence_unusable("missing image"))?;
+            consent_evidence::decode(&bytes, key).map_err(evidence_unusable)?;
+            if bytes != loaded.bytes {
+                return Err(evidence_unusable("head"));
+            }
+        }
+        #[cfg(any(test, feature = "test-helpers"))]
+        test_seam::check_stop(&self.path, test_seam::Stop::EvidenceCopiesSynced)?;
+        self.check_generation(store)
     }
 }
 
@@ -3195,11 +3402,17 @@ fn commit_owner_evidence(
 pub(crate) fn read_owner_evidence(
     log_path: &Path,
     store: &dyn TipAnchorStore,
-    carrier_generation: u64,
+    batch: &OutboxBatch,
     key: Option<&[u8; 32]>,
 ) -> Result<Option<OutboxEvidence>, WriterError> {
-    let loaded = load_owner_evidence(log_path, store, carrier_generation, key)?;
-    commit_owner_evidence(loaded, log_path, store, carrier_generation)
+    let Some(mut loaded) = load_owner_evidence(log_path, store, batch.generation, key, false)?
+    else {
+        return Ok(None);
+    };
+    commit_owner_evidence(&mut loaded, log_path, store, batch.generation, || {
+        batch.check_generation(store)
+    })?;
+    Ok(Some(loaded.image.into()))
 }
 
 /// [`read_owner_evidence`] under the outbox carrier this call acquires.
@@ -3215,10 +3428,14 @@ pub(crate) fn locked_owner_evidence(
 ) -> Result<Option<OutboxEvidence>, WriterError> {
     let lock = lock_outbox(&outbox_lock_path(log_path), store)?;
     let generation = lock.generation();
-    let loaded = load_owner_evidence(log_path, store, generation, key)?;
-    let evidence = commit_owner_evidence(loaded, log_path, store, generation)?;
+    let Some(mut loaded) = load_owner_evidence(log_path, store, generation, key, false)? else {
+        return Ok(None);
+    };
+    commit_owner_evidence(&mut loaded, log_path, store, generation, || {
+        lock.check_generation(store)
+    })?;
     lock.check_generation(store)?;
-    Ok(evidence)
+    Ok(Some(loaded.image.into()))
 }
 
 /// Returns `<outbox>.next`, the replacement a publication writes.
@@ -3472,6 +3689,12 @@ pub mod test_seam {
         DirectorySynced,
         /// After an evidence read stores the owner of a newer image.
         EvidenceRecommitted,
+        /// After a successor slot and its directory sync.
+        EvidenceCandidateSynced,
+        /// After the successor owner is confirmed, before its second copy.
+        EvidenceOwnerStored,
+        /// After both evidence copies sync, before the queue reopens.
+        EvidenceCopiesSynced,
     }
 
     static STOPS: Mutex<Vec<(PathBuf, Stop)>> = Mutex::new(Vec::new());
@@ -9407,22 +9630,1147 @@ mod tests {
         assert_eq!(evidence_refusal(writer.outbox_evidence()), "owner rollback");
     }
 
-    #[test]
-    fn rotation_refuses_a_v2_owner_before_any_write() {
-        let (_dir, path, store, writer) = initialized();
+    fn rotation_fixture(
+        home: &Path,
+    ) -> (
+        TempDir,
+        PathBuf,
+        Arc<InMemoryTipAnchorStore>,
+        AuditWriter,
+        Vec<u8>,
+    ) {
+        let dir = tempfile::tempdir_in(home).unwrap();
+        let path = log_path(&dir);
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let mut writer = AuditWriter::open(
+            path.clone(),
+            Some(KeyedAuditAccess::new(
+                Zeroizing::new(ROW_KEY),
+                store.clone(),
+            )),
+        )
+        .unwrap();
+        writer.initialize_consent_evidence().unwrap();
+        let mut image =
+            consent_evidence::decode(slots(&path)[0].as_ref().unwrap(), &ROW_KEY).unwrap();
+        image.generation = 7;
+        image.floor_ms = 73;
+        image.records = vec![evidence_record(2), evidence_record(9)];
+        let old = image.seal(&ROW_KEY);
+        plant(&path, 0, &old);
+        let owner = owner_state(&store)
+            .unwrap()
+            .with_evidence(7, consent_evidence::head(&old));
+        store
+            .store_outbox_owner_state(1, &owner.to_keyring_value())
+            .unwrap();
         drop(writer);
-        let mut rotation = rotation_writer(&path, &store);
-        let queue = outbox_bytes(&path);
-        let writes = store.outbox_item_writes();
-        let images = slots(&path);
+        let rotation = rotation_writer(&path, &store);
+        (dir, path, store, rotation, old)
+    }
+
+    fn change_evidence(path: &Path, store: &dyn TipAnchorStore) -> Result<(), WriterError> {
+        let batch = OutboxBatch::read_locked(path, store)?;
+        batch
+            .commit_evidence_change(path, store, &ROW_KEY, false, |image, _| image.floor_ms += 1)?;
+        Ok(())
+    }
+
+    fn arm_evidence_fault(path: &Path, index: usize, fault: usize) {
+        let slot = &consent_evidence::slot_paths(path)[index];
+        match fault {
+            0 => test_seam::arm_sync_failure(slot, test_seam::SyncStep::Create),
+            1 => test_seam::arm_partial_write(slot, 1000),
+            2 => test_seam::arm_sync_failure(slot, test_seam::SyncStep::File),
+            3 => test_seam::arm_sync_failure(slot, test_seam::SyncStep::Directory),
+            _ => unreachable!(),
+        }
+    }
+
+    fn clear_evidence_fault(path: &Path, index: usize, fault: usize) {
+        let slot = &consent_evidence::slot_paths(path)[index];
+        if fault == 1 {
+            test_seam::disarm(slot);
+        } else {
+            let step = match fault {
+                0 => test_seam::SyncStep::Create,
+                2 => test_seam::SyncStep::File,
+                _ => test_seam::SyncStep::Directory,
+            };
+            assert!(test_seam::check_sync(slot, step).is_err());
+        }
+    }
+
+    fn restart_rotation(
+        path: &Path,
+        store: &Arc<InMemoryTipAnchorStore>,
+        key: [u8; 32],
+    ) -> AuditWriter {
+        store.set_reload(Ok(Some(key)));
+        AuditWriter::open_for_key_rotation(
+            path.to_path_buf(),
+            Some(Zeroizing::new(key)),
+            store.clone(),
+            crate::audit_log::BindingHistory::NotRecorded,
+        )
+        .unwrap()
+    }
+
+    fn assert_rotated(
+        path: &Path,
+        store: &InMemoryTipAnchorStore,
+        old: &[u8],
+        generation: u64,
+        key: &[u8; 32],
+    ) {
+        let images = slots(path);
+        assert_eq!(images[0], images[1]);
+        let bytes = images[0].as_ref().unwrap();
+        let image = consent_evidence::decode(bytes, key).unwrap();
+        let old = consent_evidence::decode_layout(old).unwrap();
+        assert_eq!(image.records, old.records);
+        assert_eq!(image.floor_ms, old.floor_ms);
+        assert_eq!(image.generation, generation);
+        assert_eq!(
+            committed(store).unwrap(),
+            EvidenceCommitment {
+                g: generation,
+                head: consent_evidence::head(bytes)
+            }
+        );
+        assert_eq!(
+            outbox_bytes(path),
+            encode_generation_line(key, owner_state(store).unwrap().g)
+        );
+    }
+    #[test]
+    #[serial_test::serial]
+    fn candidate_failures_preserve_selected_image() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        for fault in [1, 0, 2, 3] {
+            let (_dir, path, store, writer, old) = rotation_fixture(storage_sandbox.path());
+            drop(writer);
+            arm_evidence_fault(&path, 0, fault);
+            arm_evidence_fault(&path, 1, fault);
+            assert!(change_evidence(&path, store.as_ref()).is_err());
+            assert_eq!(
+                slots(&path)[0].as_ref(),
+                Some(&old),
+                "selected bytes survive"
+            );
+            clear_evidence_fault(&path, 0, fault);
+            let image = consent_evidence::decode(&old, &ROW_KEY).unwrap();
+            assert_eq!(
+                committed(&store).unwrap().head,
+                consent_evidence::head(&old)
+            );
+            assert_eq!(image.records, vec![evidence_record(2), evidence_record(9)]);
+            assert_eq!(image.floor_ms, 73);
+            let recovered = locked_owner_evidence(&path, store.as_ref(), Some(&ROW_KEY))
+                .unwrap()
+                .unwrap();
+            assert_eq!(recovered.records(), image.records);
+            assert_eq!(recovered.time_floor_ms(), if fault >= 2 { 74 } else { 73 });
+        }
+        let (_dir, path, store, writer, old) = rotation_fixture(storage_sandbox.path());
+        drop(writer);
+        let batch = OutboxBatch::read_locked(&path, store.as_ref()).unwrap();
+        let before = (slots(&path), store.outbox_item_writes());
+        let refused =
+            batch.commit_evidence_change(&path, store.as_ref(), &ROW_KEY, false, |image, _| {
+                image.records.push(image.records[0].clone());
+            });
         assert!(matches!(
-            rotation.fence_outbox_for_key_change(),
-            Err(WriterError::OutboxEvidenceUnusable {
-                reason: "evidence re-tag unavailable"
+            refused,
+            Err(WriterError::OutboxEvidenceUnusable { reason: "layout" })
+        ));
+        assert_eq!(
+            (slots(&path), store.outbox_item_writes()),
+            before,
+            "invalid transformation writes nothing"
+        );
+        let next = batch
+            .commit_evidence_change(&path, store.as_ref(), &ROW_KEY, false, |image, owner| {
+                image.floor_ms = 74;
+                owner.g = 2;
+                owner.record_delivery(1, &[]);
+            })
+            .unwrap();
+        assert_eq!(
+            owner_state(&store).unwrap(),
+            next.owner,
+            "queue fields and evidence commit together"
+        );
+        assert_eq!(next.image.predecessor, consent_evidence::head(&old));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn uncertain_owner_write_selects_actual_commit() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        for reread_fails in [false, true] {
+            let (_dir, path, store, writer, old) = rotation_fixture(storage_sandbox.path());
+            drop(writer);
+            let uncertain = UncertainStore {
+                inner: store.clone(),
+                reread_fails,
+                stored: std::sync::atomic::AtomicBool::new(false),
+            };
+            let result = change_evidence(&path, &uncertain);
+            if reread_fails {
+                assert!(
+                    matches!(result, Err(WriterError::TipAnchorStore(ref error)) if error.to_string().contains("owner reread fault"))
+                );
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "the persisted successor confirms the uncertain write"
+                );
+            }
+            assert_eq!(committed(&store).unwrap().g, 8);
+            assert_eq!(slots(&path)[0].as_ref(), Some(&old));
+            let evidence = locked_owner_evidence(&path, store.as_ref(), Some(&ROW_KEY))
+                .unwrap()
+                .unwrap();
+            assert_eq!(evidence.time_floor_ms(), 74);
+            assert_eq!(
+                evidence.records(),
+                &[evidence_record(2), evidence_record(9)]
+            );
+        }
+        let (_dir, path, store, writer, old) = rotation_fixture(storage_sandbox.path());
+        drop(writer);
+        store.set_owner_failing(false, true);
+        assert!(matches!(
+            change_evidence(&path, store.as_ref()),
+            Err(WriterError::TipAnchorStore(_))
+        ));
+        assert_eq!(
+            committed(&store).unwrap().head,
+            consent_evidence::head(&old)
+        );
+        let images = slots(&path);
+        assert_eq!(images[0].as_ref(), Some(&old));
+        assert_eq!(
+            consent_evidence::decode(images[1].as_ref().unwrap(), &ROW_KEY)
+                .unwrap()
+                .generation,
+            8
+        );
+        store.set_owner_failing(false, false);
+        let recovered = locked_owner_evidence(&path, store.as_ref(), Some(&ROW_KEY))
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.time_floor_ms(), 74);
+        assert_eq!(
+            slots(&path),
+            images,
+            "a failed store keeps both images for recovery"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn evidence_generation_overflow_is_write_free() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        for current in [false, true] {
+            let (_dir, path, store, mut writer, old) = rotation_fixture(storage_sandbox.path());
+            let mut image = consent_evidence::decode(&old, &ROW_KEY).unwrap();
+            image.generation = u64::MAX;
+            let max = image.seal(&ROW_KEY);
+            plant(&path, 1, &max);
+            if current {
+                let owner = owner_state(&store)
+                    .unwrap()
+                    .with_evidence(u64::MAX, consent_evidence::head(&max));
+                store
+                    .store_outbox_owner_state(1, &owner.to_keyring_value())
+                    .unwrap();
+            }
+            let before = (
+                slots(&path),
+                store.outbox_item_writes(),
+                outbox_bytes(&path),
+            );
+            let error = writer.fence_outbox_for_key_change().unwrap_err();
+            assert!(matches!(
+                error,
+                WriterError::OutboxEvidenceUnusable {
+                    reason: "evidence-generation overflow"
+                }
+            ));
+            assert_eq!(
+                crate::audit_log::writer::audit_writer_refusal("fixture", &error).code(),
+                "audit.outbox_evidence_unusable"
+            );
+            assert_eq!(
+                (
+                    slots(&path),
+                    store.outbox_item_writes(),
+                    outbox_bytes(&path)
+                ),
+                before
+            );
+            drop(writer);
+            assert!(matches!(
+                change_evidence(&path, store.as_ref()),
+                Err(WriterError::OutboxEvidenceUnusable {
+                    reason: "evidence-generation overflow"
+                })
+            ));
+            assert_eq!(
+                (
+                    slots(&path),
+                    store.outbox_item_writes(),
+                    outbox_bytes(&path)
+                ),
+                before
+            );
+            let evidence = locked_owner_evidence(&path, store.as_ref(), Some(&ROW_KEY))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                evidence.time_floor_ms(),
+                73,
+                "maximum generation remains readable"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn roll_forward_syncs_a_recovered_candidate() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let (_dir, path, store, writer, old) = rotation_fixture(storage_sandbox.path());
+        drop(writer);
+        let candidate = consent_evidence::slot_paths(&path)[1].clone();
+        test_seam::arm_sync_failure(&candidate, test_seam::SyncStep::Directory);
+        assert!(change_evidence(&path, store.as_ref()).is_err());
+        test_seam::record_syncs(&candidate);
+        test_seam::arm_sync_failure(&candidate, test_seam::SyncStep::Directory);
+        assert!(matches!(
+            locked_owner_evidence(&path, store.as_ref(), Some(&ROW_KEY)),
+            Err(WriterError::Io(_))
+        ));
+        assert_eq!(
+            committed(&store).unwrap().head,
+            consent_evidence::head(&old),
+            "sync precedes recommit"
+        );
+        assert_eq!(
+            test_seam::take_syncs(&candidate),
+            vec![test_seam::SyncStep::File]
+        );
+        test_seam::record_syncs(&candidate);
+        let evidence = locked_owner_evidence(&path, store.as_ref(), Some(&ROW_KEY))
+            .unwrap()
+            .unwrap();
+        assert_eq!(evidence.time_floor_ms(), 74);
+        assert_eq!(
+            test_seam::take_syncs(&candidate),
+            vec![test_seam::SyncStep::File, test_seam::SyncStep::Directory]
+        );
+        assert_eq!(committed(&store).unwrap().g, 8);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rotation_preserves_tag_authenticated_evidence() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let (_dir, path, store, mut writer, old) = rotation_fixture(storage_sandbox.path());
+        let owner = owner_state(&store).unwrap();
+        writer.fence_outbox_for_key_change().unwrap();
+        assert_eq!(slots(&path), [Some(old.clone()), Some(old.clone())]);
+        store.set_reload(Ok(Some(NEXT_KEY)));
+        writer
+            .switch_entry_tag_key(Zeroizing::new(NEXT_KEY), "rotation")
+            .unwrap();
+        assert_rotated(&path, &store, &old, 8, &NEXT_KEY);
+        let next = owner_state(&store).unwrap();
+        assert_eq!(
+            (next.g, next.closed, next.legacy),
+            (owner.g, owner.closed, owner.legacy)
+        );
+        let first = slots(&path)[0].clone().unwrap();
+        assert_ne!(&first[92..124], &old[92..124]);
+        assert_ne!(consent_evidence::head(&first), consent_evidence::head(&old));
+        drop(writer);
+        let mut again = restart_rotation(&path, &store, NEXT_KEY);
+        again.fence_outbox_for_key_change().unwrap();
+        let third = [0x67; 32];
+        store.set_reload(Ok(Some(third)));
+        again
+            .switch_entry_tag_key(Zeroizing::new(third), "another rotation")
+            .unwrap();
+        assert_rotated(&path, &store, &first, 9, &third);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rotation_fence_crash_preserves_the_committed_source() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        for fault in [1, 0, 2, 3] {
+            let (_dir, path, store, mut writer, old) = rotation_fixture(storage_sandbox.path());
+            // Either possible destination is faulted, so writing the selected slot tears it.
+            arm_evidence_fault(&path, 0, fault);
+            arm_evidence_fault(&path, 1, fault);
+            assert!(writer.fence_outbox_for_key_change().is_err());
+            assert_eq!(
+                slots(&path)[0].as_ref(),
+                Some(&old),
+                "the committed source survives the mirror"
+            );
+            assert_eq!(outbox_bytes(&path), encode_fence_line(1));
+            clear_evidence_fault(&path, 0, fault);
+            drop(writer);
+            let resumed = restart_rotation(&path, &store, ROW_KEY);
+            assert_eq!(slots(&path), [Some(old.clone()), Some(old)]);
+            assert_eq!(committed(&store).unwrap().g, 7);
+            assert_eq!(outbox_bytes(&path), header(1));
+            drop(resumed);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rotation_mirror_precedes_key_replacement() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let (_dir, path, store, mut writer, old) = rotation_fixture(storage_sandbox.path());
+        let inactive = consent_evidence::slot_paths(&path)[1].clone();
+        test_seam::record_syncs(&inactive);
+        writer.fence_outbox_for_key_change().unwrap();
+        assert_eq!(
+            slots(&path),
+            [Some(old.clone()), Some(old)],
+            "both old images precede key replacement"
+        );
+        assert_eq!(
+            test_seam::take_syncs(&inactive),
+            vec![test_seam::SyncStep::File, test_seam::SyncStep::Directory]
+        );
+        assert_eq!(outbox_bytes(&path), encode_fence_line(1));
+        let images = slots(&path);
+        let writes = owner_writes(&store);
+        drop(writer);
+        let _resumed = restart_rotation(&path, &store, ROW_KEY);
+        assert_eq!(slots(&path), images);
+        assert_eq!(committed(&store).unwrap().g, 7);
+        assert_eq!(
+            owner_writes(&store),
+            writes,
+            "old key recovery adds no generation"
+        );
+        assert_eq!(outbox_bytes(&path), header(1));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rotation_key_write_crash_recovers_without_old_key() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let (_dir, path, store, mut writer, old) = rotation_fixture(storage_sandbox.path());
+        writer.fence_outbox_for_key_change().unwrap();
+        store.set_reload(Ok(Some(NEXT_KEY)));
+        drop(writer);
+        let resumed = restart_rotation(&path, &store, NEXT_KEY);
+        assert_rotated(&path, &store, &old, 8, &NEXT_KEY);
+        drop(resumed);
+        let writes = store.outbox_item_writes();
+        let _resumed = restart_rotation(&path, &store, NEXT_KEY);
+        assert_eq!(store.outbox_item_writes(), writes);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rotation_first_retag_failure_preserves_old_source() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        for fault in [1, 0, 2, 3] {
+            let (_dir, path, store, mut writer, old) = rotation_fixture(storage_sandbox.path());
+            writer.fence_outbox_for_key_change().unwrap();
+            arm_evidence_fault(&path, 0, fault);
+            arm_evidence_fault(&path, 1, fault);
+            store.set_reload(Ok(Some(NEXT_KEY)));
+            assert!(
+                writer
+                    .switch_entry_tag_key(Zeroizing::new(NEXT_KEY), "rotation")
+                    .is_err()
+            );
+            assert_eq!(
+                slots(&path)[0].as_ref(),
+                Some(&old),
+                "first retag preserves the selected source"
+            );
+            assert_eq!(outbox_bytes(&path), encode_fence_line(1));
+            assert_eq!(committed(&store).unwrap().g, 7);
+            clear_evidence_fault(&path, 0, fault);
+            drop(writer);
+            let _resumed = restart_rotation(&path, &store, NEXT_KEY);
+            assert_rotated(&path, &store, &old, 8, &NEXT_KEY);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rotation_first_retag_sync_precedes_owner() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let (_dir, path, store, mut writer, old) = rotation_fixture(storage_sandbox.path());
+        writer.fence_outbox_for_key_change().unwrap();
+        test_seam::arm_sync_failure(
+            &consent_evidence::slot_paths(&path)[1],
+            test_seam::SyncStep::Directory,
+        );
+        store.set_reload(Ok(Some(NEXT_KEY)));
+        assert!(
+            writer
+                .switch_entry_tag_key(Zeroizing::new(NEXT_KEY), "rotation")
+                .is_err()
+        );
+        assert_eq!(
+            committed(&store).unwrap().head,
+            consent_evidence::head(&old),
+            "owner stays old until candidate directory sync"
+        );
+        assert_eq!(outbox_bytes(&path), encode_fence_line(1));
+        drop(writer);
+        let _resumed = restart_rotation(&path, &store, NEXT_KEY);
+        assert_rotated(&path, &store, &old, 8, &NEXT_KEY);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rotation_candidate_crash_recommits_once() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let (_dir, path, store, mut writer, old) = rotation_fixture(storage_sandbox.path());
+        writer.fence_outbox_for_key_change().unwrap();
+        test_seam::arm_stop(
+            &outbox_path(&path),
+            test_seam::Stop::EvidenceCandidateSynced,
+        );
+        store.set_reload(Ok(Some(NEXT_KEY)));
+        assert!(
+            writer
+                .switch_entry_tag_key(Zeroizing::new(NEXT_KEY), "rotation")
+                .is_err()
+        );
+        assert_eq!(committed(&store).unwrap().g, 7);
+        assert_eq!(outbox_bytes(&path), encode_fence_line(1));
+        drop(writer);
+        let writes = owner_writes(&store);
+        let resumed = restart_rotation(&path, &store, NEXT_KEY);
+        assert_rotated(&path, &store, &old, 8, &NEXT_KEY);
+        assert_eq!(owner_writes(&store), writes + 1);
+        drop(resumed);
+        let _again = restart_rotation(&path, &store, NEXT_KEY);
+        assert_eq!(owner_writes(&store), writes + 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rotation_owner_crash_keeps_the_second_copy_pending() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let (_dir, path, store, mut writer, old) = rotation_fixture(storage_sandbox.path());
+        writer.fence_outbox_for_key_change().unwrap();
+        test_seam::arm_stop(&outbox_path(&path), test_seam::Stop::EvidenceOwnerStored);
+        store.set_reload(Ok(Some(NEXT_KEY)));
+        assert!(
+            writer
+                .switch_entry_tag_key(Zeroizing::new(NEXT_KEY), "rotation")
+                .is_err()
+        );
+        assert_eq!(
+            slots(&path)[0].as_ref(),
+            Some(&old),
+            "the second copy follows the owner commit"
+        );
+        assert_eq!(committed(&store).unwrap().g, 8);
+        assert_eq!(outbox_bytes(&path), encode_fence_line(1));
+        drop(writer);
+        let writes = owner_writes(&store);
+        let _resumed = restart_rotation(&path, &store, NEXT_KEY);
+        assert_rotated(&path, &store, &old, 8, &NEXT_KEY);
+        assert_eq!(
+            owner_writes(&store),
+            writes,
+            "a committed successor is only mirrored"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rotation_second_retag_failure_keeps_the_fence() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        for fault in 0..4 {
+            let (_dir, path, store, mut writer, old) = rotation_fixture(storage_sandbox.path());
+            writer.fence_outbox_for_key_change().unwrap();
+            arm_evidence_fault(&path, 0, fault);
+            store.set_reload(Ok(Some(NEXT_KEY)));
+            assert!(
+                writer
+                    .switch_entry_tag_key(Zeroizing::new(NEXT_KEY), "rotation")
+                    .is_err()
+            );
+            assert_eq!(
+                outbox_bytes(&path),
+                encode_fence_line(1),
+                "second copy failure keeps the fence"
+            );
+            assert_eq!(committed(&store).unwrap().g, 8);
+            drop(writer);
+            let writes = owner_writes(&store);
+            let _resumed = restart_rotation(&path, &store, NEXT_KEY);
+            assert_rotated(&path, &store, &old, 8, &NEXT_KEY);
+            assert_eq!(owner_writes(&store), writes);
+        }
+
+        let (_dir, path, store, mut writer, _old) = rotation_fixture(storage_sandbox.path());
+        writer.fence_outbox_for_key_change().unwrap();
+        let slot = consent_evidence::slot_paths(&path)[0].clone();
+        let written = slot.clone();
+        test_seam::on_replacement_synced(&slot, move || {
+            let bytes = fs::read(&written).unwrap();
+            let mut image = consent_evidence::decode(&bytes, &NEXT_KEY).unwrap();
+            image.floor_ms += 1;
+            fs::write(&written, image.seal(&NEXT_KEY)).unwrap();
+        });
+        store.set_reload(Ok(Some(NEXT_KEY)));
+        assert!(
+            matches!(
+                writer.switch_entry_tag_key(Zeroizing::new(NEXT_KEY), "rotation"),
+                Err(WriterError::OutboxEvidenceUnusable { reason: "head" })
+            ),
+            "a changed second copy refuses before the queue reopens"
+        );
+        assert_eq!(
+            outbox_bytes(&path),
+            encode_fence_line(1),
+            "a changed second copy keeps the fence"
+        );
+        assert_eq!(committed(&store).unwrap().g, 8);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rotation_both_retags_crash_only_reopens_the_queue() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let (_dir, path, store, mut writer, old) = rotation_fixture(storage_sandbox.path());
+        writer.fence_outbox_for_key_change().unwrap();
+        test_seam::arm_stop(&outbox_path(&path), test_seam::Stop::EvidenceCopiesSynced);
+        store.set_reload(Ok(Some(NEXT_KEY)));
+        assert!(
+            writer
+                .switch_entry_tag_key(Zeroizing::new(NEXT_KEY), "rotation")
+                .is_err()
+        );
+        assert_eq!(outbox_bytes(&path), encode_fence_line(1));
+        let images = slots(&path);
+        assert_eq!(images[0], images[1]);
+        drop(writer);
+        let writes = owner_writes(&store);
+        for slot in consent_evidence::slot_paths(&path) {
+            test_seam::arm_sync_failure(&slot, test_seam::SyncStep::Create);
+            test_seam::record_syncs(&slot);
+        }
+        let _resumed = restart_rotation(&path, &store, NEXT_KEY);
+        for slot in consent_evidence::slot_paths(&path) {
+            assert_eq!(
+                test_seam::take_syncs(&slot),
+                vec![test_seam::SyncStep::File, test_seam::SyncStep::Directory],
+                "each complete copy is synced before the queue reopens"
+            );
+        }
+        assert_eq!(
+            slots(&path),
+            images,
+            "complete copies need no evidence write"
+        );
+        assert_eq!(owner_writes(&store), writes);
+        assert_rotated(&path, &store, &old, 8, &NEXT_KEY);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rotation_refuses_uncommitted_retag_sources() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        for shape in 0..10 {
+            let (_dir, path, store, mut writer, old) = rotation_fixture(storage_sandbox.path());
+            writer.fence_outbox_for_key_change().unwrap();
+            let mut image = consent_evidence::decode(&old, &ROW_KEY).unwrap();
+            let bad = match shape {
+                0 => {
+                    image.floor_ms += 1;
+                    image.seal(&ROW_KEY)
+                }
+                1 => old[..1000].to_vec(),
+                2 => {
+                    image.scope = [0xff; 32];
+                    image.seal(&ROW_KEY)
+                }
+                3 => {
+                    image.generation += 1;
+                    image.seal(&ROW_KEY)
+                }
+                4 => Vec::new(),
+                _ => old.clone(),
+            };
+            if shape < 5 {
+                plant(&path, 0, &bad);
+                plant(&path, 1, &bad);
+                if matches!(shape, 2 | 3) {
+                    let owner = owner_state(&store)
+                        .unwrap()
+                        .with_evidence(7, consent_evidence::head(&bad));
+                    store
+                        .store_outbox_owner_state(1, &owner.to_keyring_value())
+                        .unwrap();
+                }
+            } else if shape < 8 {
+                let mut fence = encode_fence_line(if shape == 5 { 2 } else { 1 });
+                if shape == 6 {
+                    fence.extend_from_slice(b"torn");
+                }
+                if shape == 7 {
+                    let at = fence.iter().rposition(|byte| *byte == b'0').unwrap();
+                    fence[at] = b'1';
+                }
+                fs::write(outbox_path(&path), fence).unwrap();
+            } else if shape == 8 {
+                let mut invalid = old.clone();
+                invalid[0] = b'X';
+                consent_evidence::apply_tag(&mut invalid, &ROW_KEY);
+                plant(&path, 0, &invalid);
+                plant(&path, 1, &invalid);
+                let owner = owner_state(&store)
+                    .unwrap()
+                    .with_evidence(7, consent_evidence::head(&invalid));
+                store
+                    .store_outbox_owner_state(1, &owner.to_keyring_value())
+                    .unwrap();
+            } else {
+                for slot in consent_evidence::slot_paths(&path) {
+                    fs::rename(&slot, slot.with_extension("saved")).unwrap();
+                }
+            }
+            let before = (
+                slots(&path),
+                store.outbox_item_writes(),
+                outbox_bytes(&path),
+            );
+            store.set_reload(Ok(Some(NEXT_KEY)));
+            assert!(
+                writer
+                    .switch_entry_tag_key(Zeroizing::new(NEXT_KEY), "rotation")
+                    .is_err(),
+                "uncommitted source or inexact fence refuses"
+            );
+            assert!(
+                writer.drain_outbox().is_err(),
+                "recovery also refuses the source or fence"
+            );
+            assert_eq!(
+                (
+                    slots(&path),
+                    store.outbox_item_writes(),
+                    outbox_bytes(&path)
+                ),
+                before
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn watch_only_acknowledgement_preserves_images() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let (_dir, path, store, writer, _old) = rotation_fixture(storage_sandbox.path());
+        drop(writer);
+        let mut record = store.load_carrier_record().unwrap().unwrap();
+        record.retired = Some(crate::audit_log::tip_anchor::RetiredOutbox {
+            generation: 0,
+            state: String::new(),
+            file: None,
+        });
+        store.store_carrier_record(&record).unwrap();
+        store
+            .store_outbox_state(0, &OutboxState::default())
+            .unwrap();
+        let mut writer = AuditWriter::open_for_outbox_acknowledgement(
+            path.clone(),
+            Some(Zeroizing::new(ROW_KEY)),
+            store.clone(),
+            crate::audit_log::BindingHistory::NotRecorded,
+        )
+        .unwrap();
+        let before = (
+            slots(&path),
+            owner_state(&store),
+            store.outbox_item_writes(),
+        );
+        let result = writer
+            .acknowledge_outbox_loss("inspection", Default::default())
+            .unwrap();
+        assert_eq!(result.drained, 0);
+        assert_eq!(
+            (
+                slots(&path),
+                owner_state(&store),
+                store.outbox_item_writes()
+            ),
+            before,
+            "watch only acknowledgement preserves evidence"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn evidence_transaction_checks_carrier_before_owner_store() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let (_dir, path, store, writer, old) = rotation_fixture(storage_sandbox.path());
+        drop(writer);
+        let before = owner_writes(&store);
+        let watched = store.clone();
+        test_seam::on_replacement_synced(&consent_evidence::slot_paths(&path)[1], move || {
+            let mut record = watched.load_carrier_record().unwrap().unwrap();
+            record.generation += 1;
+            watched.store_carrier_record(&record).unwrap();
+        });
+        assert!(matches!(
+            change_evidence(&path, store.as_ref()),
+            Err(WriterError::CarrierGenerationChanged {
+                held: 1,
+                current: 2
             })
         ));
-        assert_eq!(outbox_bytes(&path), queue);
-        assert_eq!(store.outbox_item_writes(), writes);
+        assert_eq!(
+            owner_writes(&store),
+            before,
+            "a changed carrier stores no owner"
+        );
+        assert_eq!(
+            committed(&store).unwrap().head,
+            consent_evidence::head(&old)
+        );
+        assert_eq!(slots(&path)[0].as_ref(), Some(&old));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn keyless_rotation_refuses_orphaned_evidence() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let dir = tempfile::tempdir_in(storage_sandbox.path()).unwrap();
+        let path = log_path(&dir);
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let mut writer = AuditWriter::open_for_key_rotation(
+            path.clone(),
+            None,
+            store.clone(),
+            crate::audit_log::BindingHistory::NotRecorded,
+        )
+        .unwrap();
+        plant(&path, 0, b"orphaned evidence");
+        let before = (
+            slots(&path),
+            store.outbox_item_writes(),
+            outbox_bytes(&path),
+        );
+        assert!(
+            matches!(
+                writer.fence_outbox_for_key_change(),
+                Err(WriterError::OutboxEvidenceUnusable {
+                    reason: "evidence image without owner"
+                })
+            ),
+            "orphaned slots refuse before the first key write"
+        );
+        assert!(matches!(
+            writer.switch_entry_tag_key(Zeroizing::new(NEXT_KEY), "first key"),
+            Err(WriterError::OutboxEvidenceUnusable {
+                reason: "evidence image without owner"
+            })
+        ));
+        assert_eq!(
+            (
+                slots(&path),
+                store.outbox_item_writes(),
+                outbox_bytes(&path)
+            ),
+            before
+        );
+    }
+
+    #[derive(Debug)]
+    struct ProcessEvidenceStore {
+        root: PathBuf,
+        exit_after_store: bool,
+    }
+
+    impl TipAnchorStore for ProcessEvidenceStore {
+        fn reads_audit_key(&self) -> bool {
+            false
+        }
+        fn load_carrier_record(
+            &self,
+        ) -> Result<Option<crate::audit_log::tip_anchor::CarrierRecord>, TipAnchorStoreError>
+        {
+            Ok(Some(
+                serde_json::from_slice(&fs::read(self.root.join("carrier")).unwrap()).unwrap(),
+            ))
+        }
+        fn store_carrier_record(
+            &self,
+            _: &crate::audit_log::tip_anchor::CarrierRecord,
+        ) -> Result<(), TipAnchorStoreError> {
+            unreachable!()
+        }
+        fn load_outbox_state(&self, _: u64) -> Result<Option<OutboxState>, TipAnchorStoreError> {
+            Ok(None)
+        }
+        fn store_outbox_state(&self, _: u64, _: &OutboxState) -> Result<(), TipAnchorStoreError> {
+            unreachable!()
+        }
+        fn load_outbox_owner_state(
+            &self,
+            generation: u64,
+        ) -> Result<Option<String>, TipAnchorStoreError> {
+            match fs::read_to_string(self.root.join(format!("owner-{generation}"))) {
+                Ok(value) => Ok(Some(value)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(_) => Err(TipAnchorStoreError::new("fixture owner read")),
+            }
+        }
+        fn store_outbox_owner_state(
+            &self,
+            generation: u64,
+            value: &str,
+        ) -> Result<(), TipAnchorStoreError> {
+            let mut file = File::create(self.root.join(format!("owner-{generation}"))).unwrap();
+            file.write_all(value.as_bytes()).unwrap();
+            file.sync_all().unwrap();
+            let mut count = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.root.join("stores"))
+                .unwrap();
+            count.write_all(b"1").unwrap();
+            count.sync_all().unwrap();
+            File::open(&self.root).unwrap().sync_all().unwrap();
+            if self.exit_after_store {
+                std::process::exit(0);
+            }
+            Ok(())
+        }
+        fn outbox_evidence_scope(&self) -> Result<[u8; 32], TipAnchorStoreError> {
+            Ok(fs::read(self.root.join("scope"))
+                .unwrap()
+                .try_into()
+                .unwrap())
+        }
+        fn load_anchor(
+            &self,
+        ) -> Result<Option<crate::audit_log::tip_anchor::TipAnchor>, TipAnchorStoreError> {
+            Ok(None)
+        }
+        fn load_raw(&self) -> Result<Option<String>, TipAnchorStoreError> {
+            Ok(None)
+        }
+        fn store_anchor(
+            &self,
+            _: &crate::audit_log::tip_anchor::TipAnchor,
+        ) -> Result<(), TipAnchorStoreError> {
+            unreachable!()
+        }
+        fn bump_reanchor_count(&self) -> Result<u64, TipAnchorStoreError> {
+            unreachable!()
+        }
+        fn reanchor_count(&self) -> Result<Option<u64>, TipAnchorStoreError> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn evidence_succession_process() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let Ok(root) = std::env::var("EVIDENCE_PROCESS_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let role = std::env::var("EVIDENCE_PROCESS_ROLE").unwrap();
+        let path = root.join("audit/audit.jsonl");
+        if role == "a" {
+            test_seam::on_evidence_loaded(&path, || {
+                let mut output = std::io::stdout();
+                writeln!(output, "loaded").unwrap();
+                output.flush().unwrap();
+                std::io::stdin().read_exact(&mut [0]).unwrap();
+            });
+        } else if role == "b" {
+            test_seam::on_contended(&outbox_lock_path(&path), || {
+                let mut output = std::io::stdout();
+                writeln!(output, "contended").unwrap();
+                output.flush().unwrap();
+            });
+        }
+        let store = ProcessEvidenceStore {
+            root,
+            exit_after_store: role == "a",
+        };
+        let evidence = locked_owner_evidence(&path, &store, Some(&ROW_KEY))
+            .unwrap()
+            .unwrap();
+        assert_eq!(evidence.records(), &[evidence_record(9)]);
+        assert_eq!(evidence.time_floor_ms(), 90);
+        writeln!(std::io::stdout(), "returned newest evidence").unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn stale_owner_succession_across_processes() {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let (dir, path, store, writer, _old) = rotation_fixture(storage_sandbox.path());
+        drop(writer);
+        let root = dir.path();
+        // The fixture log name is used by every child through the shared root.
+        assert_eq!(path, root.join("audit/audit.jsonl"));
+        let newest = sealed(&store, 9, &[9]);
+        plant(&path, 1, &newest);
+        let images = slots(&path);
+        fs::write(
+            root.join("owner-1"),
+            store.load_outbox_owner_state(1).unwrap().unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            root.join("carrier"),
+            serde_json::to_vec(&store.load_carrier_record().unwrap().unwrap()).unwrap(),
+        )
+        .unwrap();
+        fs::write(root.join("scope"), store.outbox_evidence_scope().unwrap()).unwrap();
+        let child_home = root.join("child-home");
+        stellar_agent_test_support::sandbox::mark_sandbox(&child_home).unwrap();
+        let spawn = |role: &str| {
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "audit_log::outbox::tests::evidence_succession_process",
+                    "--nocapture",
+                ])
+                .env("EVIDENCE_PROCESS_ROOT", root)
+                .env("EVIDENCE_PROCESS_ROLE", role)
+                .env("STELLAR_AGENT_HOME", &child_home)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        };
+        let wait_for = |reader: &mut BufReader<std::process::ChildStdout>, marker: &str| {
+            let mut line = String::new();
+            loop {
+                line.clear();
+                assert_ne!(
+                    reader.read_line(&mut line).unwrap(),
+                    0,
+                    "child reaches {marker}"
+                );
+                if line.trim() == marker {
+                    break;
+                }
+            }
+        };
+        let mut a = spawn("a");
+        let mut a_output = BufReader::new(a.stdout.take().unwrap());
+        wait_for(&mut a_output, "loaded");
+        let mut b = spawn("b");
+        let mut b_output = BufReader::new(b.stdout.take().unwrap());
+        wait_for(&mut b_output, "contended");
+        a.stdin.take().unwrap().write_all(b"1").unwrap();
+        assert!(a.wait().unwrap().success());
+        wait_for(&mut b_output, "returned newest evidence");
+        assert!(b.wait().unwrap().success());
+        assert_eq!(
+            fs::read(root.join("stores")).unwrap(),
+            b"1",
+            "exactly one successor owner store"
+        );
+        let actual =
+            OutboxOwnerState::parse(&fs::read_to_string(root.join("owner-1")).unwrap()).unwrap();
+        assert_eq!(
+            actual.e.unwrap(),
+            EvidenceCommitment {
+                g: 9,
+                head: consent_evidence::head(&newest)
+            }
+        );
+        assert_eq!(slots(&path), images);
+        let restarted = spawn("restart").wait_with_output().unwrap();
+        assert!(
+            restarted.status.success(),
+            "{}",
+            String::from_utf8_lossy(&restarted.stderr)
+        );
+        assert!(String::from_utf8_lossy(&restarted.stdout).contains("returned newest evidence"));
+        assert_eq!(
+            fs::read(root.join("stores")).unwrap(),
+            b"1",
+            "restart stores nothing"
+        );
         assert_eq!(slots(&path), images);
     }
 

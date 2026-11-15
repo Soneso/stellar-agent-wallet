@@ -1,0 +1,1 @@
+- Rotate the audit key of initialized consent evidence while preserving its records and time floor, with fenced recovery after interruption.
