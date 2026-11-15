@@ -4815,6 +4815,8 @@ pub struct CommittedDecision {
 /// policy authority authenticates its absence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceiptProjectionIdentity {
+    /// Payment provenance from agreeing authenticated sources.
+    pub destinations: stellar_agent_core::profile::receipt::PaymentDestinations,
     /// The account whose sequence the transaction consumes.
     pub source: String,
     /// The sequence the transaction consumes.
@@ -4894,7 +4896,8 @@ impl CommittedDecision {
             ledger,
             identity.approval_nonce.clone(),
             self.commit_id.to_hex(),
-        ))
+        )
+        .with_destinations(identity.destinations.clone()))
     }
 }
 
@@ -4986,7 +4989,20 @@ fn projection_identity(
         OperationAuthority::Policy { .. } => None,
         OperationAuthority::Approval { approval_nonce, .. } => Some(approval_nonce.clone()),
     };
+    let mut destinations = [
+        consumption.map(|submission| submission.destinations.project()),
+        reservation.map(|_| super::store::reservation_destinations(wire, receipt)),
+    ]
+    .into_iter()
+    .flatten();
+    let first = destinations.next().unwrap_or_default();
+    let destinations = if destinations.any(|value| value != first) {
+        Default::default()
+    } else {
+        first
+    };
     Ok(ReceiptProjectionIdentity {
+        destinations,
         source: source.to_owned(),
         sequence,
         max_time,
@@ -10531,6 +10547,138 @@ pub(crate) mod tests {
         assert!(fx.begin_mint(&second, &successor).is_ok());
     }
 
+    #[test]
+    #[serial]
+    fn every_rebuilt_receipt_keeps_its_destination() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let mut fx = Fx::new();
+        let _ = decided_attempt(&mut fx, 1);
+        let destinations = crate::submit::destination_tests::destination_provenance();
+        fx.rewrite(|wire| {
+            for record in wire
+                .entries
+                .iter_mut()
+                .flat_map(|bucket| &mut bucket.records)
+            {
+                if record.id == envelope_id(1) {
+                    record.destinations = (&destinations).into();
+                }
+            }
+        });
+        let attempt = OperationStatus::new(&fx.store, &fx.profile)
+            .outcome_snapshot(Some(&[1 ^ 0x80; 32]))
+            .unwrap()
+            .remove(0);
+        fx.recorder()
+            .commit_decision(&decide(
+                &attempt,
+                DecidedTransition::Succeeded(agreed(1, "SUCCESS")),
+            ))
+            .unwrap();
+        for _ in 0..2 {
+            let decision = OperationStatus::new(&fx.store, &fx.profile)
+                .committed_decisions(None)
+                .unwrap()
+                .remove(0);
+            assert_eq!(
+                decision.receipt_projection().unwrap().receipt.destinations,
+                destinations
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn unusable_provenance_projects_none() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use super::super::store::StoredDestinations;
+        use stellar_agent_core::profile::receipt::PaymentDestinations;
+        let mut fx = Fx::new();
+        let _ = decided_attempt(&mut fx, 1);
+        let destinations = crate::submit::destination_tests::destination_provenance();
+        let mut wire = fx.wire();
+        let attempt = attempt_of(&mut wire, [1 ^ 0x80; 32]).clone();
+        for record in wire
+            .entries
+            .iter_mut()
+            .flat_map(|bucket| &mut bucket.records)
+        {
+            if record.id == envelope_id(1) {
+                record.destinations = (&destinations).into();
+            }
+        }
+        assert_eq!(
+            projection_identity(&wire, &attempt).unwrap().destinations,
+            destinations
+        );
+        let records: Vec<_> = wire
+            .entries
+            .iter_mut()
+            .flat_map(|bucket| &mut bucket.records)
+            .filter(|record| record.id == envelope_id(1))
+            .collect();
+        records.into_iter().next().unwrap().destinations =
+            StoredDestinations::Value(serde_json::json!(42));
+        let before = serde_json::to_vec(&wire).unwrap();
+        assert_eq!(
+            projection_identity(&wire, &attempt).unwrap().destinations,
+            PaymentDestinations::None
+        );
+        assert_eq!(serde_json::to_vec(&wire).unwrap(), before);
+        for record in wire
+            .entries
+            .iter_mut()
+            .flat_map(|bucket| &mut bucket.records)
+        {
+            if record.id == envelope_id(1) {
+                record.destinations = (&destinations).into();
+            }
+        }
+        let exposure = attempt.exposure.as_ref().unwrap();
+        let ExposureIdentity::Classic {
+            tx_hash,
+            sequence,
+            max_time,
+            ..
+        } = &exposure.identity
+        else {
+            unreachable!()
+        };
+        let auth = wire
+            .authorizations
+            .iter_mut()
+            .find(|auth| auth.id == attempt.authorization_id)
+            .unwrap();
+        auth.consumption = Some(ConsumptionBinding::Transaction(
+            super::super::ledger::SubmissionBinding {
+                destinations: (&PaymentDestinations::Single(
+                    crate::submit::destination_tests::muxed_destination(0),
+                ))
+                    .into(),
+                chain_scope: wire.chain_scope,
+                fee_bump: None,
+                envelope_hash: stellar_agent_core::hex::decode_hex32(&envelope_id(1)).unwrap(),
+                tx_hash: *tx_hash,
+                source: SOURCE.to_owned(),
+                sequence: *sequence,
+                max_time: *max_time,
+                pending_since_ms: T0,
+                submission_ledger: PROJECTED_LEDGER,
+                submission_anchor: None,
+            },
+        ));
+        let before = serde_json::to_vec(&wire).unwrap();
+        assert_eq!(
+            projection_identity(&wire, &attempt).unwrap().destinations,
+            PaymentDestinations::None
+        );
+        assert_eq!(serde_json::to_vec(&wire).unwrap(), before);
+    }
+
     /// Without its projection marker a checked non-inclusion refuses the
     /// successor with `recovery.retry_refused`, and the marker alone admits
     /// it; a receipt claims nothing here.
@@ -11178,6 +11326,15 @@ pub(crate) mod tests {
         n: u8,
         approval: bool,
     ) -> (OperationHandle, Option<String>) {
+        consumed_zero_entry_to(fx, n, approval, Default::default())
+    }
+
+    fn consumed_zero_entry_to(
+        fx: &mut Fx,
+        n: u8,
+        approval: bool,
+        destinations: super::super::store::StoredDestinations,
+    ) -> (OperationHandle, Option<String>) {
         use crate::mainnet::types::{AuditFacts, RecomputedFacts};
         use crate::policy_state::ledger::{ConsumeExpect, SubmissionBinding};
         const AUDIT: AuditFacts = AuditFacts {
@@ -11226,6 +11383,7 @@ pub(crate) mod tests {
                     },
                 ),
                 &ConsumptionBinding::Transaction(SubmissionBinding {
+                    destinations,
                     chain_scope: Some(ChainScope::for_chain(Caip2::Mainnet)),
                     fee_bump: None,
                     envelope_hash: envelope_sha256,
@@ -11284,6 +11442,45 @@ pub(crate) mod tests {
         let mut wire = store.read_for_inspection(profile).unwrap().unwrap();
         let exposure = attempt_of(&mut wire, tx_hash).exposure.clone().unwrap();
         (exposure.source, exposure.submission_ledger)
+    }
+
+    #[test]
+    #[serial]
+    fn a_mainnet_consumption_carries_destinations() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let mut fx = Fx::new();
+        let destinations = crate::submit::destination_tests::destination_provenance();
+        consumed_zero_entry_to(&mut fx, 1, false, (&destinations).into());
+        let attempt = OperationStatus::new(&fx.store, &fx.profile)
+            .outcome_snapshot(Some(&[1 ^ 0x80; 32]))
+            .unwrap()
+            .remove(0);
+        fx.recorder()
+            .commit_decision(&decide(
+                &attempt,
+                DecidedTransition::Succeeded(agreed(1, "SUCCESS")),
+            ))
+            .unwrap();
+        let receipts = stellar_agent_core::profile::receipt::ReceiptStore::open_at(
+            fx._dir.path(),
+            "destinations",
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let decision = OperationStatus::new(&fx.store, &fx.profile)
+                .committed_decisions(None)
+                .unwrap()
+                .remove(0);
+            let projection = decision.receipt_projection().unwrap();
+            assert_eq!(projection.receipt.destinations, destinations);
+            receipts.replace_checked(&projection).unwrap();
+            assert_eq!(
+                receipts.get(&envelope_id(1)).unwrap().unwrap().destinations,
+                destinations
+            );
+        }
     }
 
     /// The submission ledger the verified window's consumption of the
@@ -12226,6 +12423,7 @@ pub(crate) mod tests {
                 },
             );
             let binding = ConsumptionBinding::Transaction(SubmissionBinding {
+                destinations: Default::default(),
                 chain_scope: Some(ChainScope::for_chain(Caip2::Mainnet)),
                 fee_bump: None,
                 envelope_hash,
@@ -12847,6 +13045,7 @@ pub(crate) mod tests {
                 let (_, minted) = live_linked_hold(&mut fx);
                 fx.clock.set(minted.expires_at_ms);
                 let reservation = SubmissionHold {
+                    destinations: Default::default(),
                     chain_scope: ChainScope::for_chain(Caip2::Mainnet),
                     submission_anchor: None,
                     id: "ab".repeat(32),

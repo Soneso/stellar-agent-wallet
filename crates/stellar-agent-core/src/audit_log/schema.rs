@@ -7643,19 +7643,31 @@ mod tests {
                     7,
                     None,
                     None,
-                    destination.as_deref(),
+                    &destination
+                        .clone()
+                        .map(crate::profile::receipt::PaymentDestinations::Single)
+                        .unwrap_or_default(),
                 )
                 .unwrap();
             assert!(matches!(outcome, BeginSubmissionOutcome::Recorded));
             let receipt = store.get(&hash(byte)).unwrap().unwrap();
-            assert_eq!(receipt.destination, destination);
+            assert_eq!(
+                receipt.destinations,
+                destination
+                    .clone()
+                    .map(crate::profile::receipt::PaymentDestinations::Single)
+                    .unwrap_or_default()
+            );
             let wire = serde_json::to_string(&receipt).unwrap();
             assert_eq!(wire.contains("\"destination\""), destination.is_some());
             let mut legacy: serde_json::Value = serde_json::from_str(&wire).unwrap();
             legacy.as_object_mut().unwrap().remove("destination");
             let reread: crate::profile::receipt::SubmissionReceipt =
                 serde_json::from_value(legacy.clone()).unwrap();
-            assert_eq!(reread.destination, None);
+            assert_eq!(
+                reread.destinations,
+                crate::profile::receipt::PaymentDestinations::None
+            );
             assert_eq!(serde_json::to_value(&reread).unwrap(), legacy);
         }
     }

@@ -282,6 +282,12 @@ pub struct FeeBumpFacts {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubmissionBinding {
+    /// Display provenance carried into consumption records and receipt reconstruction.
+    #[serde(
+        default,
+        skip_serializing_if = "super::store::StoredDestinations::is_missing"
+    )]
+    pub destinations: super::store::StoredDestinations,
     /// The network for hashing and validating the submitted envelope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain_scope: Option<super::store::ChainScope>,
@@ -321,6 +327,11 @@ pub struct SubmissionBinding {
 #[derive(Deserialize)]
 #[serde(remote = "SubmissionBinding", deny_unknown_fields)]
 struct StoredSubmissionBinding {
+    #[serde(
+        default,
+        skip_serializing_if = "super::store::StoredDestinations::is_missing"
+    )]
+    destinations: super::store::StoredDestinations,
     #[serde(default)]
     chain_scope: Option<super::store::ChainScope>,
     #[serde(default)]
@@ -1766,6 +1777,11 @@ fn apply_consumption(
     binding: &ConsumptionBinding,
     now: u64,
 ) {
+    let mut binding = binding.clone();
+    if let ConsumptionBinding::Transaction(submission) = &mut binding {
+        submission.destinations = (&submission.destinations.project()).into();
+    }
+    let binding = &binding;
     let holds: Vec<WireAuthorizationHold> = wire
         .holds
         .iter()
@@ -1776,6 +1792,7 @@ fn apply_consumption(
     for hold in holds {
         let record = match binding {
             ConsumptionBinding::Transaction(submission) => WireRecord {
+                destinations: submission.destinations.clone(),
                 chain_scope: submission.chain_scope,
                 ts_ms: hold.ts_ms,
                 amount: hold.amount,
@@ -2824,6 +2841,7 @@ mod tests {
         /// accounting expiry, which owes an undelivered audit event.
         fn owe_expiry(&self) {
             let mut reservation = SubmissionHold {
+                destinations: Default::default(),
                 id: "cd".repeat(32),
                 tx_hash: "ab".repeat(32),
                 source: SOURCE.to_owned(),
@@ -3406,6 +3424,7 @@ mod tests {
         fee_bump: Option<FeeBumpFacts>,
     ) -> ConsumptionBinding {
         ConsumptionBinding::Transaction(SubmissionBinding {
+            destinations: Default::default(),
             chain_scope: Some(crate::policy_state::ChainScope::for_chain(Caip2::Mainnet)),
             fee_bump,
             envelope_hash: tx_hash.map(|byte| byte ^ 0x5a),
@@ -3772,6 +3791,7 @@ mod tests {
                 &l.profile,
                 &[hold(200)],
                 &SubmissionHold {
+                    destinations: Default::default(),
                     chain_scope: crate::policy_state::ChainScope::for_chain(
                         stellar_agent_core::profile::caip2::Caip2::Mainnet,
                     ),
@@ -4705,6 +4725,7 @@ mod tests {
                 &l.profile,
                 &[hold(1)],
                 &SubmissionHold {
+                    destinations: Default::default(),
                     chain_scope: crate::policy_state::ChainScope::for_chain(
                         stellar_agent_core::profile::caip2::Caip2::Mainnet,
                     ),
@@ -6380,6 +6401,7 @@ mod tests {
         let l = Ledger::new();
         let profile = &l.profile;
         let reservation = |id: &str| SubmissionHold {
+            destinations: Default::default(),
             id: id.to_owned(),
             tx_hash: "ab".repeat(32),
             source: SOURCE.to_owned(),
@@ -6743,6 +6765,7 @@ mod tests {
         .unwrap()
         .expect("a stored anchor");
         let binding = SubmissionBinding {
+            destinations: Default::default(),
             chain_scope: Some(scope),
             fee_bump: None,
             envelope_hash: [3; 32],
@@ -7062,7 +7085,7 @@ mod tests {
         }
     }
 
-    /// Every successor is written as version 12, with or without a policy
+    /// These successors use the current write version, with or without a policy
     /// authority, and a version below 10 carrying one refuses the read.
     #[test]
     #[serial]

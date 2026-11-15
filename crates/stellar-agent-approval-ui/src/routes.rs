@@ -632,11 +632,15 @@ pub(crate) fn outcome_to_response(outcome: Outcome) -> Response {
             }),
         ),
         Outcome::NotFound => (StatusCode::OK, json!({ "status": "not_found" })),
-        Outcome::WrongKind => (StatusCode::OK, json!({ "status": "wrong_kind" })),
+        Outcome::WrongKind => (
+            StatusCode::CONFLICT,
+            json!({"status": "wrong_kind", "error": "approval.wrong_kind"}),
+        ),
         Outcome::Inconsistent => (
-            StatusCode::OK,
+            StatusCode::CONFLICT,
             json!({
                 "status": "inconsistent",
+                "error": "approval.entry_inconsistent",
                 "message": crate::templates::INCONSISTENT_MESSAGE,
             }),
         ),
@@ -674,6 +678,31 @@ pub(crate) fn outcome_to_response(outcome: Outcome) -> Response {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, reason = "route test fixture assertions")]
+    #[tokio::test]
+    async fn wrong_kind_and_inconsistent_answer_conflict() {
+        use crate::decision::Outcome;
+        for (outcome, status, code) in [
+            (Outcome::WrongKind, "wrong_kind", "approval.wrong_kind"),
+            (
+                Outcome::Inconsistent,
+                "inconsistent",
+                "approval.entry_inconsistent",
+            ),
+        ] {
+            let response = super::outcome_to_response(outcome);
+            assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["status"], status);
+            assert_eq!(value["error"], code);
+        }
+        assert_eq!(
+            super::outcome_to_response(Outcome::NotFound).status(),
+            axum::http::StatusCode::OK
+        );
+    }
     use axum::{
         body::to_bytes,
         http::{Request, StatusCode, header},

@@ -24,7 +24,9 @@ Every summary value renders control characters as visible escapes such as `\u{1b
 Memos retain their type: `none`, `text "<escaped value>"`, `id <n>`, `hash <hex>`, or `return <hex>`.
 MPP terms and the network are checked against the authorization fingerprint before display or attestation; the charge commit checks the transport, authority, and target against the prepared request.
 The simulated fee reads `not bound to this approval`.
-A request whose stored digest is not the digest of its stored envelope, whose envelope does not decode, whose MPP terms do not match its fingerprint, or whose rule proposal digest does not match what it shows appears as `INCONSISTENT` and offers only Reject; an approve of it is refused with the status `inconsistent` and attests nothing.
+A request whose stored digest is not the digest of its stored envelope, whose envelope does not decode, whose MPP terms do not match its fingerprint, or whose rule proposal digest does not match what it shows appears as `INCONSISTENT` and offers only Reject; an approve of it answers HTTP 409 with `approval.entry_inconsistent` and status `inconsistent`.
+An approve of an entry of another kind answers HTTP 409 with `approval.wrong_kind` and status `wrong_kind`.
+Neither refusal attests anything.
 Each pending approval records who approved it: the local operator, or the operator credential the remote listener verified. The HMAC covers that approver, so an edited or deleted approver invalidates the approval.
 Mainnet remote consent requires an approval origin and leaf SPKI pin in the current verified owner-signed policy.
 Without them, startup refuses with `approval.mainnet_remote_unsupported` before binding.

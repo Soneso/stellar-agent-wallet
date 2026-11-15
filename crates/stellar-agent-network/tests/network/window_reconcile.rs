@@ -125,6 +125,7 @@ fn entry(profile_name: &str, ts_ms: u64, amount: i128) -> WindowEntry {
 
 fn reservation(id: &str, source: &str, sequence: i64, pending_since_ms: u64) -> SubmissionHold {
     SubmissionHold {
+        destinations: Default::default(),
         chain_scope: stellar_agent_network::policy_state::ChainScope::for_chain(
             stellar_agent_core::profile::caip2::Caip2::Testnet,
         ),

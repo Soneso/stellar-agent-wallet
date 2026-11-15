@@ -2259,7 +2259,7 @@ fn presence_recheck_rejects_changed_entry_lifetime() {
             |_, _| panic!("no grant"),
         )
         .unwrap_err();
-        assert_eq!(error.code(), "approval.wrong_kind", "{field}");
+        assert_eq!(error.code(), "approval.presence_changed", "{field}");
         assert!(
             store
                 .get(&entry.approval_nonce)

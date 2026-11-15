@@ -1309,6 +1309,17 @@ mod tests {
         clippy::expect_used,
         reason = "test-only; panics acceptable in unit tests"
     )]
+    #[test]
+    fn approve_reports_the_store_refusal_code() {
+        let error = stellar_agent_core::approval::attest::record_error(
+            &stellar_agent_core::approval::ApprovalError::WrongKind {
+                expected: "PaymentSimulated",
+                actual: "SignWithPasskey",
+            },
+        );
+        let value = serde_json::to_value(super::Envelope::<()>::err(&error)).unwrap();
+        assert_eq!(value["error"]["code"], "approval.wrong_kind");
+    }
 
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;

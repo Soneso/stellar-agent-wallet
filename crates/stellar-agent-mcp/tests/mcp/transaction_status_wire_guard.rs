@@ -138,6 +138,7 @@ async fn check(case: Case) {
                     },
                 )],
                 &SubmissionHold {
+                    destinations: Default::default(),
                     chain_scope: stellar_agent_network::policy_state::ChainScope::for_chain(
                         profile.chain_id,
                     ),

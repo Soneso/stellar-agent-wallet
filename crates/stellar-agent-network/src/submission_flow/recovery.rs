@@ -1445,7 +1445,13 @@ pub(crate) mod tests {
                 1,
                 None,
                 None,
-                destination,
+                &destination
+                    .map(|value| {
+                        stellar_agent_core::profile::receipt::PaymentDestinations::Single(
+                            value.to_owned(),
+                        )
+                    })
+                    .unwrap_or_default(),
             )
             .unwrap();
         rig.receipts.mark_submitted(&envelope_id(n)).unwrap();
@@ -1484,8 +1490,14 @@ pub(crate) mod tests {
             for (n, destination) in (1..=3).zip(stored) {
                 let receipt = rig.receipt(n).unwrap();
                 assert_eq!(
-                    receipt.destination.as_deref(),
-                    destination,
+                    receipt.destinations,
+                    destination
+                        .map(|value| {
+                            stellar_agent_core::profile::receipt::PaymentDestinations::Single(
+                                value.to_owned(),
+                            )
+                        })
+                        .unwrap_or_default(),
                     "{label}: attempt {n}"
                 );
                 assert_eq!(
@@ -1563,11 +1575,14 @@ pub(crate) mod tests {
         receipt_to(&rig, 2, None);
         let carrying = |n: u8, destination: &str| {
             let mut projection = rig.decision(n).receipt_projection().unwrap();
-            projection.receipt.destination = Some(destination.to_owned());
+            projection.receipt.destinations =
+                stellar_agent_core::profile::receipt::PaymentDestinations::Single(
+                    destination.to_owned(),
+                );
             projection
         };
         let bytes = rig.receipt_bytes();
-        for (n, destination) in [(1, muxed(18)), (1, muxed(0)), (2, muxed(17))] {
+        for (n, destination) in [(1, muxed(18)), (1, muxed(0))] {
             let error = repair_proof(
                 &rig.fx.store,
                 &rig.fx.profile,
@@ -1599,11 +1614,29 @@ pub(crate) mod tests {
         assert!(rig.projected(1));
         rig.repair(None).unwrap();
         assert_eq!(
-            rig.receipt(1).unwrap().destination.as_deref(),
-            Some(muxed(17).as_str())
+            rig.receipt(1).unwrap().destinations,
+            stellar_agent_core::profile::receipt::PaymentDestinations::Single(muxed(17))
         );
-        assert_eq!(rig.receipt(2).unwrap().destination, None);
+        assert_eq!(
+            rig.receipt(2).unwrap().destinations,
+            stellar_agent_core::profile::receipt::PaymentDestinations::None
+        );
         assert!(stored_json(&rig, 2).get("destination").is_none());
+        for _ in 0..2 {
+            repair_proof(
+                &rig.fx.store,
+                &rig.fx.profile,
+                &rig.receipts,
+                &rig.writer,
+                &rig.decision(2),
+                Ok(carrying(2, &muxed(17))),
+            )
+            .unwrap();
+            assert_eq!(
+                rig.receipt(2).unwrap().destinations,
+                stellar_agent_core::profile::receipt::PaymentDestinations::Single(muxed(17))
+            );
+        }
     }
 
     /// Accounting expires first; each checked outcome then commits and is
@@ -1691,6 +1724,7 @@ pub(crate) mod tests {
         let (_, commit) = zero_entry_committed(&mut rig.fx, 4, Checked::NotIncluded);
         rig.receipts
             .project_accounting_expiry(&AccountingExpiryProjection {
+                destinations: Default::default(),
                 envelope_hash: &envelope_id(4),
                 tx_hash: &tx_hex(4),
                 source: SOURCE,
@@ -1751,6 +1785,7 @@ pub(crate) mod tests {
             assert_eq!(
                 decision.projection_identity,
                 Some(ReceiptProjectionIdentity {
+                    destinations: Default::default(),
                     source: SOURCE.to_owned(),
                     sequence: 101,
                     max_time: T0 / 1_000 + 60,
@@ -2303,6 +2338,7 @@ pub(crate) mod tests {
             "the exposure adds only the source and the submission ledger"
         );
         let mut exact = ReceiptProjectionIdentity {
+            destinations: Default::default(),
             source: fixtures::account(SIGNER_SEED),
             sequence: SEQUENCE,
             max_time: intent.max_time,

@@ -1093,9 +1093,9 @@ fn prepare_attestation<'k>(
 /// The caller validated `validated` earlier, possibly through another store
 /// handle, and another process may have attested, rejected, consumed, or
 /// replaced it since. The same pending entry means the whole `kind` value,
-/// the subject kind, the `process_uid`, and both lifetime fields are equal. Each refusal carries the code
-/// [`record_attestation_on_store`] gives for the same condition, so a caller
-/// maps both the same way. No row is written for a refused entry.
+/// the subject kind, the `process_uid`, and both lifetime fields are equal.
+/// A changed pending entry refuses with `approval.presence_changed`.
+/// Rejected and consumed entries keep their codes. No refused entry writes a row.
 pub(crate) fn refuse_unless_still_pending(
     store: &PendingApprovalStore,
     validated: &PendingApproval,
@@ -1113,11 +1113,7 @@ pub(crate) fn refuse_unless_still_pending(
         return Err(match current.kind {
             ApprovalKind::Rejected { .. } => rejected_error(),
             ApprovalKind::Consumed { .. } => consumed_error(),
-            _ => WalletError::Approval(ApprovalFailure::WrongKind {
-                detail: "the pending approval changed between validation \
-                         and the attest"
-                    .to_owned(),
-            }),
+            _ => WalletError::Approval(ApprovalFailure::PresenceChanged),
         });
     }
     if current.is_expired(now_ms) {
@@ -1473,12 +1469,15 @@ fn attest_mainnet_presence<const STRICT: bool>(
 
 /// Maps a pending-store failure to its `approval.*` refusal.
 ///
-/// `NotFound`, `Expired` and `AlreadyAttested` keep their own codes, and a
+/// `NotFound`, `Expired`, `AlreadyAttested`, and `WrongKind` keep their own codes, and a
 /// refused stored destination is `approval.entry_inconsistent`. Every other
 /// store failure is `approval.record_failed` with the store's message.
 #[must_use]
 pub fn record_error(e: &ApprovalError) -> WalletError {
     match e {
+        ApprovalError::WrongKind { .. } => WalletError::Approval(ApprovalFailure::WrongKind {
+            detail: e.to_string(),
+        }),
         ApprovalError::DestinationRefused { .. } => {
             WalletError::Approval(ApprovalFailure::EntryInconsistent {
                 detail: e.to_string(),
@@ -1868,6 +1867,51 @@ mod tests {
             .ok_or("pending entry must exist")?;
         assert!(pending.attestation_blob_b64.is_none());
         Ok(())
+    }
+
+    #[test]
+    fn a_store_kind_refusal_keeps_wrong_kind() {
+        let error = ApprovalError::WrongKind {
+            expected: "PaymentSimulated",
+            actual: "SignWithPasskey",
+        };
+        assert_eq!(record_error(&error).code(), "approval.wrong_kind");
+    }
+
+    #[test]
+    fn a_changed_pending_entry_refuses_as_changed_consent() {
+        an_entry_whose_lifetime_changed_since_validation_refuses_with_no_row();
+        an_entry_whose_process_uid_changed_since_validation_refuses_with_no_row();
+        a_rejected_entry_since_validation_refuses_with_its_own_code();
+        a_consumed_entry_since_validation_refuses_with_its_own_code();
+        for (_, entry) in every_attestable_kind() {
+            let dir = TempDir::new().unwrap();
+            let mut store = PendingApprovalStore::open(dir.path().join("a.toml")).unwrap();
+            let mut changed = entry.clone();
+            changed.subject_kind = match changed.subject_kind {
+                crate::approval::subject::SubjectKind::EnvelopeText => {
+                    crate::approval::subject::SubjectKind::IntentDigest
+                }
+                crate::approval::subject::SubjectKind::IntentDigest => {
+                    crate::approval::subject::SubjectKind::EnvelopeText
+                }
+            };
+            store
+                .insert(changed, timefmt::now_unix_ms().unwrap())
+                .unwrap();
+            assert_eq!(
+                attest_validated_copy(&dir, &mut store, &entry).code(),
+                "approval.presence_changed"
+            );
+            assert!(consent_rows(&dir).is_empty());
+            assert!(
+                store
+                    .get(&entry.approval_nonce)
+                    .unwrap()
+                    .attestation_blob_b64
+                    .is_none()
+            );
+        }
     }
 
     #[test]
@@ -3521,7 +3565,11 @@ mod tests {
                     .insert(stored, timefmt::now_unix_ms().unwrap())
                     .unwrap();
                 let err = attest_validated_copy(&dir, &mut store, &entry);
-                assert_eq!(err.code(), "approval.wrong_kind", "{kind} {field}: {err}");
+                assert_eq!(
+                    err.code(),
+                    "approval.presence_changed",
+                    "{kind} {field}: {err}"
+                );
                 assert!(consent_rows(&dir).is_empty(), "{kind} {field}");
                 drop(store);
                 assert!(
@@ -3548,7 +3596,7 @@ mod tests {
                 .unwrap();
 
             let err = attest_validated_copy(&dir, &mut store, &entry);
-            assert_eq!(err.code(), "approval.wrong_kind", "{kind}: {err}");
+            assert_eq!(err.code(), "approval.presence_changed", "{kind}: {err}");
             assert!(consent_rows(&dir).is_empty(), "{kind}: no row is written");
             let left = store.get(&entry.approval_nonce).unwrap();
             assert!(left.attestation_blob_b64.is_none(), "{kind}");
@@ -3740,7 +3788,7 @@ mod tests {
                 let expected = match case {
                     0 => {
                         current.process_uid = "999999".into();
-                        "approval.wrong_kind"
+                        "approval.presence_changed"
                     }
                     1 => {
                         current.attestation_blob_b64 = Some(URL_SAFE_NO_PAD.encode([1; 32]));
@@ -3748,7 +3796,7 @@ mod tests {
                     }
                     _ => {
                         current.expires_at_unix_ms -= 1;
-                        "approval.wrong_kind"
+                        "approval.presence_changed"
                     }
                 };
                 store.insert(current, entry.created_at_unix_ms).unwrap();
@@ -3824,14 +3872,14 @@ mod tests {
                 intent_entry.clone(),
                 flipped(&intent_entry),
                 Some(&intent),
-                Some("approval.wrong_kind"),
+                Some("approval.presence_changed"),
             ),
             (
                 "envelope record edited to the intent digest",
                 envelope_entry.clone(),
                 flipped(&envelope_entry),
                 None,
-                Some("approval.wrong_kind"),
+                Some("approval.presence_changed"),
             ),
         ];
         for (label, challenged, stored, ceremony, refusal) in cases {
@@ -4968,7 +5016,7 @@ mod tests {
                 .insert(stored.clone(), stored.created_at_unix_ms)
                 .unwrap();
             let err = attest_validated_copy(&dir, &mut store, &validated);
-            assert_eq!(err.code(), "approval.wrong_kind", "{kind}: {err}");
+            assert_eq!(err.code(), "approval.presence_changed", "{kind}: {err}");
             assert!(consent_rows(&dir).is_empty(), "{kind}: no row is written");
             drop(store);
             assert!(

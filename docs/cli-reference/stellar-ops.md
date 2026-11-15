@@ -676,6 +676,10 @@ pending receipt holds the wallet's duplicate check.
 
 ### `stellar-agent tx status <HASH> [flags]`
 
+A receipt records `destination` when all payments share one M address.
+Differing destinations with at least one M address appear in `destinations`, with each payment's zero-based operation index and complete G or M address.
+Other receipts omit both fields. Authenticated recovery preserves this display provenance, which authorizes no retry or release.
+
 Asks the endpoint what became of `<HASH>`. On testnet it records a reported
 success on the receipt, unless the receipt of an untimed hold already records
 another network answer. Mainnet follows the rule below. A reported success
@@ -768,6 +772,10 @@ Exits 0 when the lookup completes, whatever the chain reported; exits 1 when the
 profile, the record, or the endpoint could not be reached.
 
 ### `stellar-agent tx receipt clear <ENVELOPE_HASH> --acknowledge [flags]`
+
+The output preserves the receipt's `destination` or per-operation `destinations` field.
+An orphan restored from an authenticated reservation keeps its payment provenance.
+Legacy receipts without provenance omit both fields.
 
 Closes a submission record after reconciling it against the chain. The verb
 decides on the chain's latest answer, not on the record as it was left.

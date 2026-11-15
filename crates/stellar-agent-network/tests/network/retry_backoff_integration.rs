@@ -574,5 +574,10 @@ async fn idempotent_submit_receipt_keeps_the_muxed_destination() {
     assert_eq!(sends, 1, "the repeated request sends nothing");
     let receipt = store.get(&envelope_hash).unwrap().unwrap();
     assert!(matches!(receipt.status, ReceiptStatus::Success));
-    assert_eq!(receipt.destination.as_deref(), Some(envelope.destination()));
+    assert_eq!(
+        receipt.destinations,
+        stellar_agent_core::profile::receipt::PaymentDestinations::Single(
+            envelope.destination().to_owned()
+        )
+    );
 }

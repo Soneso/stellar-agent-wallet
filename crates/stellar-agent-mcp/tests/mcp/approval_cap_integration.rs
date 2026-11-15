@@ -2225,6 +2225,7 @@ async fn split_approval_reconciles_only_one_bounded_pass() {
     for index in 0..6 {
         let id = format!("{index:064x}");
         let reservation = SubmissionHold {
+            destinations: Default::default(),
             chain_scope: stellar_agent_network::policy_state::ChainScope::for_chain(
                 h.profile.chain_id,
             ),

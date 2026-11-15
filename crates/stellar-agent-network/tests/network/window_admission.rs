@@ -88,6 +88,7 @@ fn count_entry(profile_name: &str, ts_ms: u64, max_calls: u32) -> WindowEntry {
 
 fn reservation(id: &str, sequence: i64, now: u64) -> SubmissionHold {
     SubmissionHold {
+        destinations: Default::default(),
         chain_scope: stellar_agent_network::policy_state::ChainScope::for_chain(
             stellar_agent_core::profile::caip2::Caip2::Testnet,
         ),

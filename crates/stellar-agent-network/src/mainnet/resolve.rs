@@ -4320,6 +4320,7 @@ mod tests {
                             auth.id(),
                             &auth.consume_expect(&facts),
                             &ConsumptionBinding::Transaction(SubmissionBinding {
+                                destinations: Default::default(),
                                 chain_scope: Some(crate::policy_state::ChainScope::for_chain(
                                     stellar_agent_core::profile::caip2::Caip2::Mainnet,
                                 )),

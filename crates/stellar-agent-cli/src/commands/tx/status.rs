@@ -132,10 +132,9 @@ struct RecordView {
     /// identifier proves nothing.
     #[serde(skip_serializing_if = "Option::is_none")]
     settlement_decision_id: Option<String>,
-    /// The full muxed `M...` payment destination the receipt records.
-    /// Absent for every other receipt.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    destination: Option<String>,
+    /// Complete payment provenance carried by the receipt.
+    #[serde(flatten)]
+    destinations: stellar_agent_core::profile::receipt::DestinationFields,
 }
 
 /// Authenticated hold identity, available even when its receipt is absent.
@@ -277,8 +276,38 @@ fn record_view(receipt: &SubmissionReceipt, reservation_open: bool) -> RecordVie
         release_code: receipt.release_code.map(ReleaseEvidence::code),
         settlement_evidence: "unavailable",
         settlement_decision_id: receipt.settlement_decision_id.clone(),
-        destination: receipt.destination.clone(),
+        destinations: stellar_agent_core::profile::receipt::DestinationFields(
+            receipt.destinations.clone(),
+        ),
     }
+}
+
+#[cfg(test)]
+pub(super) fn destination_shapes() -> Vec<stellar_agent_core::profile::receipt::PaymentDestinations>
+{
+    use stellar_agent_core::profile::receipt::{OperationDestination, PaymentDestinations};
+    let g = format!("{}", stellar_strkey::ed25519::PublicKey([7; 32]));
+    let m = format!(
+        "{}",
+        stellar_strkey::ed25519::MuxedAccount {
+            ed25519: [7; 32],
+            id: u64::MAX
+        }
+    );
+    vec![
+        PaymentDestinations::None,
+        PaymentDestinations::Single(m.clone()),
+        PaymentDestinations::PerOperation(vec![
+            OperationDestination {
+                operation: 0,
+                destination: g,
+            },
+            OperationDestination {
+                operation: 2,
+                destination: m,
+            },
+        ]),
+    ]
 }
 
 fn status_error_envelope(error: StatusFailure) -> Envelope<()> {
@@ -303,5 +332,37 @@ fn status_error_envelope(error: StatusFailure) -> Envelope<()> {
         StatusFailure::ReconcileRefused(e) => Envelope::err_raw(e.submission_code(), e.to_string()),
         StatusFailure::RepairRefused(e) => Envelope::err(&e),
         StatusFailure::ChainQueryFailed(e) => Envelope::err(&WalletError::Network(e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn receipt_views_show_every_destination() {
+        use stellar_agent_core::profile::receipt::{PaymentDestinations, ReceiptStore};
+        for destinations in super::destination_shapes() {
+            let dir = tempfile::tempdir().expect("directory");
+            let store = ReceiptStore::open_at(dir.path(), "view").expect("receipt store");
+            store
+                .try_begin_to("a", "b", "", 1, 0, 1, &destinations)
+                .expect("claim");
+            let receipt = store.get("a").expect("read").expect("receipt");
+            let value = serde_json::to_value(super::record_view(&receipt, false)).expect("view");
+            match destinations {
+                PaymentDestinations::None => {
+                    assert!(value.get("destination").is_none());
+                    assert!(value.get("destinations").is_none());
+                }
+                PaymentDestinations::Single(destination) => {
+                    assert_eq!(value["destination"], destination);
+                    assert!(value.get("destinations").is_none());
+                }
+                PaymentDestinations::PerOperation(entries) => {
+                    assert_eq!(value["destinations"], serde_json::json!(entries));
+                    assert!(value.get("destination").is_none());
+                }
+            }
+        }
     }
 }

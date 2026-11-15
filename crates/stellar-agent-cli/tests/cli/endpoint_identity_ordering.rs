@@ -393,6 +393,7 @@ fn v1_profile_with_due_reservation(home: &Path, name: &str, rpc_url: &str, sourc
                 },
             )],
             &SubmissionHold {
+                destinations: Default::default(),
                 chain_scope: stellar_agent_network::policy_state::ChainScope::for_chain(
                     profile.chain_id,
                 ),

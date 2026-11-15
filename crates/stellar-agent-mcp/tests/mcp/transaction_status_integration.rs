@@ -178,6 +178,7 @@ pub(super) fn seed_reservation(
                 },
             )],
             &SubmissionHold {
+                destinations: Default::default(),
                 chain_scope: stellar_agent_network::policy_state::ChainScope::for_chain(
                     profile.chain_id,
                 ),
@@ -647,6 +648,7 @@ fn seed_expired_hold(
                 },
             )],
             &SubmissionHold {
+                destinations: Default::default(),
                 chain_scope: stellar_agent_network::policy_state::ChainScope::for_chain(
                     profile.chain_id,
                 ),

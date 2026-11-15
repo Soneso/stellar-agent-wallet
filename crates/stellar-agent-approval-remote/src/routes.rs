@@ -1312,11 +1312,15 @@ fn outcome_to_response(outcome: stellar_agent_approval_ui::Outcome) -> Response 
         ),
         Outcome::UserMismatch => (StatusCode::OK, json!({"status": "user_mismatch"})),
         Outcome::NotFound => (StatusCode::OK, json!({"status": "not_found"})),
-        Outcome::WrongKind => (StatusCode::OK, json!({"status": "wrong_kind"})),
+        Outcome::WrongKind => (
+            StatusCode::CONFLICT,
+            json!({"status": "wrong_kind", "error": "approval.wrong_kind"}),
+        ),
         Outcome::Inconsistent => (
-            StatusCode::OK,
+            StatusCode::CONFLICT,
             json!({
                 "status": "inconsistent",
+                "error": "approval.entry_inconsistent",
                 "message": stellar_agent_approval_ui::INCONSISTENT_MESSAGE,
             }),
         ),
@@ -1365,6 +1369,31 @@ mod tests {
         clippy::panic,
         reason = "test-only; panics acceptable in unit tests"
     )]
+    #[tokio::test]
+    async fn remote_wrong_kind_and_inconsistent_answer_conflict() {
+        use stellar_agent_approval_ui::Outcome;
+        for (outcome, status, code) in [
+            (Outcome::WrongKind, "wrong_kind", "approval.wrong_kind"),
+            (
+                Outcome::Inconsistent,
+                "inconsistent",
+                "approval.entry_inconsistent",
+            ),
+        ] {
+            let response = super::outcome_to_response(outcome);
+            assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["status"], status);
+            assert_eq!(value["error"], code);
+        }
+        assert_eq!(
+            super::outcome_to_response(Outcome::NotFound).status(),
+            axum::http::StatusCode::OK
+        );
+    }
 
     use std::sync::{Arc, Mutex as StdMutex};
 
@@ -2227,8 +2256,10 @@ mod tests {
                 decision_body("approve", &assertion),
             )
             .await;
-            assert_eq!(resp.status(), StatusCode::OK);
-            assert_eq!(body_json(resp).await["status"], "inconsistent");
+            assert_eq!(resp.status(), StatusCode::CONFLICT);
+            let value = body_json(resp).await;
+            assert_eq!(value["status"], "inconsistent");
+            assert_eq!(value["error"], "approval.entry_inconsistent");
             assert_entry_untouched(&store_path, &nonce);
             assert_eq!(fx.audit_rows("approval_attested_remote"), 0);
 

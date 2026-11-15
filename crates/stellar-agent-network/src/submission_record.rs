@@ -95,7 +95,7 @@ use stellar_agent_core::audit_log::writer::{AuditWriter, VerifiedTipFacts};
 use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision, WriterError};
 use stellar_agent_core::error::{NetworkError, SubmissionError, ValidationError, WalletError};
 use stellar_agent_core::profile::receipt::{
-    BeginSubmissionOutcome, ReceiptStatus, ReceiptStore, ReceiptStoreError,
+    BeginSubmissionOutcome, PaymentDestinations, ReceiptStatus, ReceiptStore, ReceiptStoreError,
 };
 use stellar_agent_core::profile::schema::Profile;
 
@@ -195,11 +195,8 @@ pub struct SubmissionIntent {
     /// passed, converted at the moment the intent is built.
     pub send_by_ms: Option<u64>,
 
-    /// The full `M...` destination of a one-operation payment envelope,
-    /// decoded from the bytes about to be sent; `None` for every other
-    /// envelope, including one with several operations. The receipt claim
-    /// records it.
-    pub destination: Option<String>,
+    /// Complete payment provenance decoded from the submitted envelope.
+    pub destinations: PaymentDestinations,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -710,6 +707,7 @@ impl<'a> WalletSubmissionRecorder<'a> {
     fn reservation(&self, intent: &SubmissionIntent) -> SubmissionHold {
         SubmissionHold {
             chain_scope: intent.chain_scope,
+            destinations: intent.destinations.clone(),
             id: intent.envelope_hash.clone(),
             tx_hash: intent.tx_hash.clone(),
             source: intent.source.clone(),
@@ -1090,6 +1088,8 @@ impl WalletSubmissionRecorder<'_> {
         self.require_anchor_before_row()?;
 
         self.claim_receipt(intent)?;
+        #[cfg(test)]
+        destination_record_cut(1)?;
         // The unauthorized path checks reservations only when it sizes entries.
         if !self.window_entries.is_empty() {
             self.window_precheck(intent, linked.is_some())?;
@@ -1159,6 +1159,8 @@ impl WalletSubmissionRecorder<'_> {
             }
         }
 
+        #[cfg(test)]
+        destination_record_cut(2)?;
         // Last, and immediately before the send: `submitted` is what says the
         // bytes left, and it is the flag that makes the receipt un-abandonable.
         // Setting it earlier would strand a receipt for a submission a later
@@ -1350,7 +1352,7 @@ impl WalletSubmissionRecorder<'_> {
     fn claim_receipt(&self, intent: &SubmissionIntent) -> Result<(), WalletError> {
         // The destination is decoded from the envelope about to be sent, so
         // the receipt carries it whatever value legs the policy produced.
-        let destination = intent.destination.as_deref();
+        let destinations = &intent.destinations;
         let claim =
             |releases: Option<&dyn stellar_agent_core::profile::receipt::SequenceReleases>| {
                 self.receipts.begin_submission_to(
@@ -1362,7 +1364,7 @@ impl WalletSubmissionRecorder<'_> {
                     intent.submission_ledger,
                     self.approval.as_ref().map(|a| a.approval_nonce.as_str()),
                     releases,
-                    destination,
+                    destinations,
                 )
             };
         let outcome = if self.profile.chain_id.is_mainnet() {
@@ -1549,6 +1551,7 @@ impl WalletSubmissionRecorder<'_> {
         });
         let binding = ConsumptionBinding::Transaction(SubmissionBinding {
             chain_scope: Some(intent.chain_scope),
+            destinations: (&intent.destinations).into(),
             fee_bump: None,
             envelope_hash,
             tx_hash,
@@ -1626,6 +1629,8 @@ impl WalletSubmissionRecorder<'_> {
             }
         };
 
+        #[cfg(test)]
+        destination_record_cut(3).map_err(AuthorizedPathError::Wallet)?;
         if let Err(e) = self.mark_submitted(&intent.envelope_hash) {
             let refusal = receipt_store_refusal(&e);
             self.unwind_releasing(intent, UnwoundAfter::Reservation, refusal.code(), unsent);
@@ -1798,9 +1803,9 @@ impl WalletSubmissionRecorder<'_> {
         status: ReceiptStatus,
         ledger: Option<u32>,
     ) {
-        if let Err(e) = self
-            .receipts
-            .finalize(&intent.envelope_hash, status, ledger)
+        if let Err(e) =
+            self.receipts
+                .finalize_to(&intent.envelope_hash, status, ledger, &intent.destinations)
         {
             tracing::warn!(
                 profile = %self.profile_name,
@@ -1991,6 +1996,21 @@ fn receipt_store_refusal(e: &ReceiptStoreError) -> WalletError {
 }
 
 #[cfg(test)]
+thread_local! {
+    static DESTINATION_RECORD_CUT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn destination_record_cut(point: u8) -> Result<(), WalletError> {
+    if DESTINATION_RECORD_CUT.get() == point {
+        DESTINATION_RECORD_CUT.set(0);
+        Err(record_unavailable("interrupted submission record"))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod tests {
     #![allow(
         clippy::unwrap_used,
@@ -1999,6 +2019,8 @@ mod tests {
     )]
 
     use super::*;
+
+    include!("submission_destination_tests.rs");
 
     /// Collecting the consumed inbox row before the receipt acknowledges it
     /// leaves the repair successful and idempotent: no inbox row reappears,
@@ -2243,7 +2265,7 @@ mod tests {
                 submission_ledger: 1,
                 submission_anchor: None,
                 send_by_ms: None,
-                destination: None,
+                destinations: PaymentDestinations::None,
             };
             let binding = crate::IntentBinding::new(&exposure, &changed);
             let error = recorder
@@ -2432,7 +2454,7 @@ mod tests {
                 submission_ledger: 1,
                 submission_anchor: None,
                 send_by_ms: None,
-                destination: None,
+                destinations: PaymentDestinations::None,
             }
         };
         let intent = make_intent(&envelope);
@@ -2702,7 +2724,7 @@ mod tests {
             submission_ledger: 1,
             submission_anchor: None,
             send_by_ms: None,
-            destination: None,
+            destinations: PaymentDestinations::None,
         };
         recorder
             .pre_send_bound(&intent, &crate::IntentBinding::new(&exposure, &envelope))
@@ -3026,7 +3048,7 @@ mod tests {
                 submission_ledger: 1,
                 submission_anchor: None,
                 send_by_ms: None,
-                destination: None,
+                destinations: PaymentDestinations::None,
             };
             let result = recorder
                 .pre_send_bound(&intent, &crate::IntentBinding::new(&exposure, &envelope))
@@ -3131,7 +3153,7 @@ mod tests {
             submission_ledger: 123,
             submission_anchor: None,
             send_by_ms: None,
-            destination: None,
+            destinations: PaymentDestinations::None,
         };
         let audit_before = std::fs::read(&profile.audit_log_path).unwrap();
         let window_before = std::fs::read(dir.path().join("state.window")).unwrap();
@@ -3249,7 +3271,7 @@ mod tests {
             submission_ledger: 123,
             submission_anchor: None,
             send_by_ms: None,
-            destination: None,
+            destinations: PaymentDestinations::None,
         };
         recorder.pre_send(&intent).await.unwrap();
         recorder
@@ -3362,7 +3384,7 @@ mod tests {
                 submission_ledger: 123,
                 submission_anchor: None,
                 send_by_ms: None,
-                destination: None,
+                destinations: PaymentDestinations::None,
             };
             recorder.pre_send(&intent).await.unwrap();
             recorder
@@ -3449,7 +3471,7 @@ mod tests {
             submission_ledger: 123,
             submission_anchor: None,
             send_by_ms: Some(now + 1_000),
-            destination: None,
+            destinations: PaymentDestinations::None,
         };
         let unsent = intent("7a", "8b");
         recorder.pre_send(&unsent).await.unwrap();
@@ -3566,7 +3588,7 @@ mod tests {
             submission_ledger: 123,
             submission_anchor: None,
             send_by_ms: None,
-            destination: None,
+            destinations: PaymentDestinations::None,
         };
         recorder.pre_send(&intent).await.unwrap();
         std::fs::remove_file(receipts.file_path().unwrap()).unwrap();
@@ -3845,6 +3867,71 @@ mod tests {
                     .expect("the receipt is claimed")
                     .submitted
             );
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn a_mainnet_consumption_carries_destinations() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            for cut in [0, 3] {
+                let fx = LedgerFixture::new("destination-consumption", NOW);
+                let mut sub = submission();
+                sub.intent.destinations =
+                    crate::submit::destination_tests::destination_provenance();
+                sub.intent.max_time = NOW / 1000 + 60;
+                let holds = holds(&fx, 100);
+                let (id, authorization) = grant(&fx, &sub, &holds, "approval-destination");
+                let recorder = fx.recorder(holds, Some(Arc::clone(&fx.writer)));
+                DESTINATION_RECORD_CUT.set(cut);
+                let result = recorder
+                    .pre_send_authorized(&sub.intent, MainnetSubmitGrant::Tx(authorization))
+                    .await;
+                assert_eq!(result.is_ok(), cut == 0);
+                assert_eq!(DESTINATION_RECORD_CUT.get(), 0);
+                let stored = fx.authorization_record(id);
+                assert_eq!(
+                    stored["consumption"]["transaction"]["destinations"],
+                    sub.intent.destinations.to_stored().unwrap()
+                );
+                let held = fx.window.pending_reservations(&fx.profile).unwrap();
+                assert_eq!(held.len(), 1);
+                assert_eq!(held[0].destinations, sub.intent.destinations);
+                assert_eq!(
+                    receipt(&fx, &sub.intent).unwrap().destinations,
+                    sub.intent.destinations
+                );
+                std::fs::write(fx.receipts.file_path().unwrap(), b"{}").unwrap();
+                let client = crate::client::StellarRpcClient::new(
+                    crate::redact::rpc_error_fixtures::ENDPOINT,
+                )
+                .unwrap();
+                let expired_at = NOW + 1_000_000_000;
+                fx.clock.set(expired_at);
+                fx.window
+                    .reconcile_due(
+                        &fx.profile,
+                        &client,
+                        None,
+                        Some(&fx.receipts),
+                        expired_at,
+                        1,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    receipt(&fx, &sub.intent).unwrap().destinations,
+                    sub.intent.destinations
+                );
+                assert!(
+                    !fx.window
+                        .owed_accounting_expiries(&fx.profile)
+                        .unwrap()
+                        .unacknowledged
+                        .is_empty()
+                );
+            }
         }
 
         /// Asserts that the attempt ended as `NotSent` with `code`, and that
@@ -5335,6 +5422,7 @@ mod tests {
                     audit: covered_audit_facts(tip_facts(&fx.writer)).unwrap(),
                 });
                 let mut binding = SubmissionBinding {
+                    destinations: Default::default(),
                     chain_scope: Some(crate::policy_state::ChainScope::for_chain(
                         stellar_agent_core::profile::caip2::Caip2::Mainnet,
                     )),

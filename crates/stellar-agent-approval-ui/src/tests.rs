@@ -2019,8 +2019,10 @@ async fn approve_sign_with_passkey_via_router_returns_wrong_kind_status() {
         .body(h.view_digest_body(&nonce))
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(body_json(resp).await["status"], "wrong_kind");
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let value = body_json(resp).await;
+    assert_eq!(value["status"], "wrong_kind");
+    assert_eq!(value["error"], "approval.wrong_kind");
 }
 
 /// A missing/unseeded attestation key surfaces `Outcome::Unavailable`
@@ -2911,6 +2913,35 @@ async fn post_approve(
 
 fn digest_body(digest: &serde_json::Value) -> String {
     serde_json::json!({ "view_digest": digest }).to_string()
+}
+
+#[tokio::test]
+#[serial]
+async fn an_approve_of_a_replaced_entry_answers_changed_consent() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let h = Harness::new("replaced-entry");
+    let cookie = h.bootstrap().await;
+    let entry = payment_entry(DEFAULT_TTL_MS);
+    let nonce = h.insert(entry.clone());
+    let shown = detail_island(&h, &cookie, &nonce).await["view_digest"].clone();
+    let path = h.store_path.clone();
+    let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+    let hook_fired = fired.clone();
+    crate::decision::wait_hook::install(move || {
+        hook_fired.set(true);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let before = format!("expires_at_unix_ms = {}", entry.expires_at_unix_ms);
+        let after = format!("expires_at_unix_ms = {}", entry.expires_at_unix_ms + 1);
+        assert_eq!(text.matches(&before).count(), 1);
+        std::fs::write(path, text.replace(&before, &after)).unwrap();
+    });
+    for _ in 0..2 {
+        assert_presence_changed(post_approve(&h, &cookie, &nonce, digest_body(&shown)).await).await;
+        assert_unattested(&h, &nonce);
+    }
+    assert!(fired.get());
 }
 
 async fn assert_presence_changed(resp: axum::response::Response) {

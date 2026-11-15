@@ -752,6 +752,7 @@ async fn a_reservation_refused_at_admission_surfaces_as_the_gate_denial() {
                 &profile,
                 &[entry],
                 &SubmissionHold {
+                    destinations: Default::default(),
                     chain_scope: stellar_agent_network::policy_state::ChainScope::for_chain(
                         profile.chain_id,
                     ),

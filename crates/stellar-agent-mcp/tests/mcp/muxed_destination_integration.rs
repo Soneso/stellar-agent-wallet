@@ -1116,7 +1116,13 @@ async fn mcp_muxed_submission_receipt_keeps_original_address() {
             .expect("the receipt of the send");
         let expected =
             matches!(emitted, MuxedAccount::MuxedEd25519(_)).then(|| destination.clone());
-        assert_eq!(receipt.destination, expected, "{destination}");
+        assert_eq!(
+            receipt.destinations,
+            expected
+                .map(stellar_agent_core::profile::receipt::PaymentDestinations::Single)
+                .unwrap_or_default(),
+            "{destination}"
+        );
     }
 }
 
