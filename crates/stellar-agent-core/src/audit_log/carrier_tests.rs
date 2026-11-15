@@ -10,6 +10,87 @@ use crate::audit_log::{
 #[cfg(unix)]
 use crate::audit_log::{lock::Carrier, outbox::OutboxBatch};
 
+#[test]
+#[serial_test::serial]
+fn concurrent_admission_has_one_winner() {
+    use crate::audit_log::consent_evidence::{RecordState, tests::delivered};
+    use std::sync::mpsc;
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let (_dir, path, store) = fixture();
+    let mut writer = AuditWriter::open(path.clone(), Some(access(&store))).unwrap();
+    writer.initialize_consent_evidence().unwrap();
+    drop(writer);
+    let batch = crate::audit_log::outbox::OutboxBatch::read_locked(&path, store.as_ref()).unwrap();
+    batch
+        .commit_evidence_change(&path, store.as_ref(), &[0x42; 32], false, |image, _| {
+            image.records = (0..4095)
+                .map(|n| {
+                    let mut record = delivered(n);
+                    record.state = RecordState::Reserved;
+                    record.digest = [0; 32];
+                    record.generation = 0;
+                    record.sequence = 0;
+                    record
+                })
+                .collect();
+            Ok(())
+        })
+        .unwrap();
+    drop(batch);
+    let before = store.outbox_item_writes().len();
+    let (loaded_tx, loaded_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    test_seam::on_evidence_loaded(&path, move || {
+        loaded_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    let worker = |identity, done: mpsc::Sender<()>| {
+        let outbox = AuditOutbox::for_log_keyed(&path, store.clone(), Zeroizing::new([0x42; 32]));
+        std::thread::spawn(move || {
+            let result = outbox.reserve_evidence(identity, 9_000, 0);
+            let _ = done.send(());
+            result
+        })
+    };
+    let a = worker([254; 32], done_tx.clone());
+    loaded_rx.recv().unwrap();
+    let contended = release_tx.clone();
+    test_seam::on_contended(&outbox_lock_path(&path), move || {
+        let _ = contended.send(());
+    });
+    let watched = store.clone();
+    test_seam::on_evidence_loaded(&path, move || {
+        if watched.outbox_item_writes().len() == before {
+            let _ = release_tx.send(());
+            done_rx.recv().unwrap();
+        }
+    });
+    let b = worker([255; 32], done_tx);
+    let results = [a.join().unwrap(), b.join().unwrap()];
+    assert_eq!(
+        results.iter().filter(|result| result.is_ok()).count(),
+        1,
+        "exactly one admission wins"
+    );
+    assert_eq!(
+        results
+            .iter()
+            .find_map(|result| result.as_ref().err())
+            .unwrap()
+            .code(),
+        "approval.evidence_capacity"
+    );
+    let writer = AuditWriter::open(path, Some(access(&store))).unwrap();
+    let evidence = writer.outbox_evidence().unwrap().unwrap();
+    assert_eq!(evidence.records().len(), 4096);
+    for n in 0..4095 {
+        assert_eq!(evidence.records()[n].identity, delivered(n as u32).identity);
+    }
+}
+
 fn access(store: &Arc<InMemoryTipAnchorStore>) -> KeyedAuditAccess {
     KeyedAuditAccess::new(Zeroizing::new([0x42; 32]), store.clone())
 }

@@ -853,11 +853,11 @@ pub enum ApprovalFailure {
         "Mainnet consent uses the local passkey page; remote approval is unavailable for mainnet."
     )]
     MainnetRemoteUnsupported,
-    /// Delivery evidence is unavailable; prepare the operation again.
+    /// Delivery evidence is unavailable; storage recovery retains the approval.
     ///
     /// The approval ends by expiry or revocation. Another ceremony refuses `approval.already_attested`.
     #[error(
-        "delivery of this approval's consent row (generation {generation}, row {sequence}) cannot be confirmed; prepare the operation again"
+        "delivery of this approval's consent row (generation {generation}, row {sequence}) cannot be confirmed"
     )]
     ConsentUndelivered {
         /// The queue generation of the consent row.
@@ -865,6 +865,9 @@ pub enum ApprovalFailure {
         /// The row's position in that generation.
         sequence: u64,
     },
+    /// Every retained consent evidence slot is occupied.
+    #[error("Consent evidence capacity is full; retry after an existing approval ends.")]
+    EvidenceCapacity,
 }
 
 impl ApprovalFailure {
@@ -919,6 +922,7 @@ impl ApprovalFailure {
             Self::PresenceCanceled => "approval.presence_canceled",
             Self::MainnetRemoteUnsupported => "approval.mainnet_remote_unsupported",
             Self::ConsentUndelivered { .. } => "approval.consent_undelivered",
+            Self::EvidenceCapacity => "approval.evidence_capacity",
         }
     }
 }
@@ -6843,7 +6847,12 @@ mod tests {
                     sequence: 7,
                 },
                 "approval.consent_undelivered",
-                "delivery of this approval's consent row (generation 3, row 7) cannot be confirmed; prepare the operation again",
+                "delivery of this approval's consent row (generation 3, row 7) cannot be confirmed",
+            ),
+            (
+                ApprovalFailure::EvidenceCapacity,
+                "approval.evidence_capacity",
+                "Consent evidence capacity is full; retry after an existing approval ends.",
             ),
         ];
         for (failure, code, message) in cases {
@@ -6856,6 +6865,25 @@ mod tests {
     }
 
     // ── category() consistency ────────────────────────────────────────────────
+
+    #[test]
+    fn evidence_codes_and_remedy() {
+        let capacity = WalletError::Approval(ApprovalFailure::EvidenceCapacity);
+        assert_eq!(capacity.code(), "approval.evidence_capacity");
+        assert_eq!(
+            capacity.to_string(),
+            "Consent evidence capacity is full; retry after an existing approval ends."
+        );
+        let undelivered = WalletError::Approval(ApprovalFailure::ConsentUndelivered {
+            generation: 3,
+            sequence: 7,
+        });
+        assert_eq!(undelivered.code(), "approval.consent_undelivered");
+        assert_eq!(
+            undelivered.to_string(),
+            "delivery of this approval's consent row (generation 3, row 7) cannot be confirmed"
+        );
+    }
 
     /// Every WalletError variant must return the category matching its wrapper.
     #[test]

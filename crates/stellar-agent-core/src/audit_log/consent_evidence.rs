@@ -52,6 +52,45 @@ use super::outbox::OutboxRowRef;
 /// delivered records, and migration pins together.
 pub const MAX_EVIDENCE_ENTRIES: usize = 4096;
 
+/// A retained slot for an authenticated approval identity and immutable expiry.
+/// Only the owning outbox can create this value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidenceReservation {
+    scope: [u8; 32],
+    identity: [u8; 32],
+    expires_at_ms: u64,
+}
+
+impl EvidenceReservation {
+    pub(super) fn new(scope: [u8; 32], identity: [u8; 32], expires_at_ms: u64) -> Self {
+        Self {
+            scope,
+            identity,
+            expires_at_ms,
+        }
+    }
+
+    pub(super) fn facts(&self) -> ([u8; 32], [u8; 32], u64) {
+        (self.scope, self.identity, self.expires_at_ms)
+    }
+
+    /// Computes retention through waiting expiry and the bounded execution window.
+    /// Callers supply authenticated waiting expiry and rule duration.
+    ///
+    /// # Errors
+    /// Refuses a deadline that overflows milliseconds.
+    pub fn deadline(
+        waiting_expires_at_ms: u64,
+        rule_ttl_ms: u64,
+    ) -> Result<u64, super::WriterError> {
+        waiting_expires_at_ms
+            .checked_add(rule_ttl_ms.min(900_000))
+            .ok_or(super::WriterError::OutboxEvidenceUnusable {
+                reason: "expiry overflow",
+            })
+    }
+}
+
 const HEADER_BYTES: usize = 124;
 const RECORD_BYTES: usize = 89;
 const MAGIC: &[u8; 8] = b"SAEV0001";
@@ -108,6 +147,14 @@ pub(crate) struct EvidenceImage {
 }
 
 impl EvidenceImage {
+    /// Advances the persistent clock and removes only expired live records.
+    pub(super) fn advance_floor(&mut self, now_ms: u64) {
+        self.floor_ms = self.floor_ms.max(now_ms);
+        self.records.retain(|record| {
+            record.state == RecordState::LegacyPin || record.expires_at_ms > self.floor_ms
+        });
+    }
+
     /// The first image of a scope: generation one, zero predecessor, floor
     /// zero, and `records` sorted by identity with duplicates merged.
     pub(crate) fn initial(scope: [u8; 32], mut records: Vec<EvidenceRecord>) -> Self {

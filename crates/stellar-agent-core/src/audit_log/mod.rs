@@ -137,6 +137,8 @@
 //! Consent evidence uses a locked successor transaction with checked generation
 //! advancement. Key rotation fences the queue until the owner and both evidence
 //! copies are durable under the stored key. Records and the time floor survive.
+//! Admission reserves one of 4,096 slots for each authenticated approval lifetime.
+//! Appenders bind Queued references; anchored writers alone create Delivered evidence.
 
 pub mod binding;
 mod carriers;
@@ -166,7 +168,9 @@ pub use carriers::CarrierBindingReport;
 pub use chain::{
     EntryTagCheck, EntryTagKey, check_entry_tag, compute_entry_tag, derive_entry_tag_key,
 };
-pub use consent_evidence::{MAX_EVIDENCE_ENTRIES, OutboxEvidence, evidence_scope};
+pub use consent_evidence::{
+    EvidenceReservation, MAX_EVIDENCE_ENTRIES, OutboxEvidence, evidence_scope,
+};
 pub use entry::{AuditEntry, NewToolInvocation};
 pub use health::{AuditWriterHealth, AuditWriterHealthHandle};
 pub use lock::Carrier;

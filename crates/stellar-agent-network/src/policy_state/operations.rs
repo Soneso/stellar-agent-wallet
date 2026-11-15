@@ -5932,6 +5932,161 @@ pub(crate) mod tests {
     use crate::policy_state::ledger::{ClaimExpect, DomainBinding, PolicyAuthorityBinding};
     use crate::policy_state::store::{RETENTION_MS, ResetConsent, ResetError};
 
+    #[test]
+    #[serial]
+    fn reserved_consent_process() {
+        use std::sync::Arc;
+        use stellar_agent_core::audit_log::tip_anchor::{
+            CarrierRecord, InMemoryTipAnchorStore, TipAnchorStore,
+        };
+        use stellar_agent_core::audit_log::{AuditOutbox, OutboxRowRef};
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let Ok(root) = std::env::var("CONSENT_DRAIN_PROCESS") else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let carrier: CarrierRecord =
+            serde_json::from_slice(&fs::read(root.join("carrier")).unwrap()).unwrap();
+        store.store_carrier_record(&carrier).unwrap();
+        store
+            .store_outbox_owner_state(1, &fs::read_to_string(root.join("owner")).unwrap())
+            .unwrap();
+        let outbox = AuditOutbox::for_log_keyed(
+            &root.join("audit.jsonl"),
+            store.clone(),
+            zeroize::Zeroizing::new([0x42; 32]),
+        );
+        let reservation = outbox.reserve_evidence([55; 32], T0 + 900_000, T0).unwrap();
+        let reference: OutboxRowRef = outbox
+            .with_evidence_reservation(reservation)
+            .append_queued(&AuditEntry::new_approval_attested(
+                "PaymentSimulated",
+                "stellar_pay_commit",
+                None,
+                "ABCDEFGHIJKLMNOPQRSTUV",
+                "cli",
+                "reserved-child",
+            ))
+            .unwrap();
+        // The parent receives the mock owner only after the child's durable append.
+        fs::write(
+            root.join("owner"),
+            store.load_outbox_owner_state(1).unwrap().unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            root.join("reference"),
+            serde_json::to_vec(&reference).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn outbox_drain_never_reacquires_the_window_lock() {
+        use std::sync::Arc;
+        use stellar_agent_core::audit_log::tip_anchor::{
+            InMemoryTipAnchorStore, KeyedAuditAccess, TipAnchorStore,
+        };
+        use stellar_agent_core::audit_log::{AuditWriter, OutboxRowRef};
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let fx = Fx::new();
+        let root = fx._dir.path();
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let mut writer = AuditWriter::open(
+            fx.profile.audit_log_path.clone(),
+            Some(KeyedAuditAccess::new(
+                zeroize::Zeroizing::new([0x42; 32]),
+                store.clone(),
+            )),
+        )
+        .unwrap();
+        writer.initialize_consent_evidence().unwrap();
+        fs::write(
+            root.join("carrier"),
+            serde_json::to_vec(&store.load_carrier_record().unwrap().unwrap()).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            root.join("owner"),
+            store.load_outbox_owner_state(1).unwrap().unwrap(),
+        )
+        .unwrap();
+        let child_home = root.join("child-home");
+        stellar_agent_test_support::sandbox::mark_sandbox(&child_home).unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "policy_state::operations::tests::reserved_consent_process",
+            ])
+            .env("CONSENT_DRAIN_PROCESS", root)
+            .env("STELLAR_AGENT_HOME", &child_home)
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "child: {}; stderr: {}; stdout: {}",
+            child.status,
+            String::from_utf8_lossy(&child.stderr),
+            String::from_utf8_lossy(&child.stdout)
+        );
+        store
+            .store_outbox_owner_state(1, &fs::read_to_string(root.join("owner")).unwrap())
+            .unwrap();
+        let reference: OutboxRowRef =
+            serde_json::from_slice(&fs::read(root.join("reference")).unwrap()).unwrap();
+        assert!(
+            !writer
+                .outbox_evidence()
+                .unwrap()
+                .unwrap()
+                .contains_delivered(&[55; 32], &reference)
+        );
+        struct LockedAudit<'a> {
+            writer: &'a mut AuditWriter,
+            store: &'a PersistedWindowStore,
+            profile: &'a Profile,
+            observed: bool,
+        }
+        impl OperationAudit for LockedAudit<'_> {
+            fn append(&mut self, entry: AuditEntry) -> Result<(), String> {
+                assert!(
+                    WindowStoreLock::acquire_for(
+                        self.store.path(),
+                        &self.profile.policy_window_state_key_id
+                    )
+                    .is_err(),
+                    "the recorder retains its single window lock"
+                );
+                self.observed = true;
+                OperationAudit::append(self.writer, entry)
+            }
+        }
+        let mut audit = LockedAudit {
+            writer: &mut writer,
+            store: &fx.store,
+            profile: &fx.profile,
+            observed: false,
+        };
+        OperationRecorder::new(&fx.store, &fx.profile, &mut audit, REQUEST_ID)
+            .open(&request("reserved-drain", canonical(1)))
+            .unwrap();
+        assert!(audit.observed);
+        assert!(
+            writer
+                .outbox_evidence()
+                .unwrap()
+                .unwrap()
+                .contains_delivered(&[55; 32], &reference),
+            "a real drain delivers while the window lock stays held"
+        );
+    }
+
     const T0: u64 = 1_800_000_000_000;
     const CAP: i128 = 1_000;
     const APPROVAL_MS: u64 = 600_000;
