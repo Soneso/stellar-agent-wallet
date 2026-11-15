@@ -53,7 +53,7 @@
 //! Coverage never rewrites a grant. The attestation binds the stored
 //! destination text, so a G grant and an M grant attest different bytes.
 
-use std::fs;
+use std::fs::{self, TryLockError};
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
@@ -66,6 +66,7 @@ use crate::approval::attestation::{
     ATTESTATION_VERSION, ATTESTATION_VERSION_V2, AttestationScope, AttestedLifetime,
     compute_attestation, compute_toolset_gate_digest, verify_toolset_gate_attestation,
 };
+use crate::file_lock::HeldFileLock;
 use crate::payment_accounts::PaymentAccount;
 
 /// The kind name a grant's version 3 attestation binds.
@@ -130,7 +131,7 @@ pub const TOOLSET_GRANT_DEFAULT_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 /// The capability and destination are private, so a grant built or
 /// deserialized outside the store names a destination its capability admits.
 /// A stored grant loads as written, and matching checks its destination.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "GrantRecord", into = "GrantRecord")]
 #[non_exhaustive]
 pub struct ToolsetGrant {
@@ -326,6 +327,35 @@ impl ToolsetGrant {
             && amount_stroops <= self.amount_max_stroops
     }
 
+    /// Whether this grant covers `query` and verifies under `attestation_key`
+    /// and `binding` with the current layout, a lifetime within the default TTL,
+    /// and an issue time between the installation cutoff and the query's clock.
+    fn verifies_for(
+        &self,
+        query: &GrantQuery<'_>,
+        attestation_key: &[u8; 32],
+        binding: &super::AttestationBinding<'_>,
+    ) -> bool {
+        self.matches(
+            query.toolset_name,
+            query.install_id,
+            query.package_version,
+            query.package_shasum,
+            query.capability,
+            query.destination,
+            query.asset,
+            query.amount_stroops,
+            query.now_unix_ms,
+        ) && self.attestation_version == ATTESTATION_VERSION
+            && self.verify_attestation(attestation_key, binding)
+            && self
+                .expires_at_unix_ms
+                .saturating_sub(self.granted_at_unix_ms)
+                <= TOOLSET_GRANT_DEFAULT_TTL_MS
+            && self.granted_at_unix_ms >= query.not_before_unix_ms
+            && self.granted_at_unix_ms <= query.now_unix_ms
+    }
+
     fn covers_destination(&self, destination: &str) -> bool {
         if self.capability == SIGN_PAYMENT_CAPABILITY {
             payment_grant_covers(&self.destination, destination)
@@ -432,12 +462,45 @@ pub struct GrantQuery<'a> {
     pub not_before_unix_ms: u64,
 }
 
+/// The lock sidecar of the grant store at `path`: `<path>.lock`.
+///
+/// Persistence renames a new data file over the old one, so the data file
+/// cannot carry the lock. The sidecar is never renamed or rewritten.
+fn grant_lock_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+fn lock_error(error: TryLockError) -> ApprovalError {
+    match error {
+        TryLockError::WouldBlock => ApprovalError::WriterLocked,
+        TryLockError::Error(e) => ApprovalError::from_io(e),
+    }
+}
+
+/// Reads every stored grant at `path`; an absent file holds none.
+fn load_grants(path: &Path) -> Result<Vec<ToolsetGrant>, ApprovalError> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(ApprovalError::from_io(e)),
+    };
+    let sf: GrantStoreFile = toml::from_str(&content).map_err(|e| ApprovalError::Toml {
+        detail: format!(
+            "toolset grant store: {}",
+            toml_error_position(&content, e.span().map(|s| s.start))
+        ),
+    })?;
+    Ok(sf.grants.into_iter().map(ToolsetGrant::stored).collect())
+}
+
 /// TOML-file-backed store of first-invoke grants.
 ///
 /// Stored at `<grants_dir>/<profile>.toolset_grants.toml` with mode `0o600` on
-/// Unix.  Does NOT acquire an exclusive file lock (grants are write-rarely,
-/// read-often; concurrent reads are acceptable; the MCP server is single-process
-/// and writes are sequentialised through the async call path).
+/// Unix. A handle holds an exclusive advisory lock on the `<path>.lock`
+/// sidecar from before it loads until it drops, so writers in every process
+/// serialize and a [`ToolsetGrantReader`] excludes them.
 ///
 /// Expired grants are pruned on each `open()` call.
 ///
@@ -447,6 +510,7 @@ pub struct GrantQuery<'a> {
 pub struct ToolsetGrantStore {
     path: PathBuf,
     grants: Vec<ToolsetGrant>,
+    _lock: HeldFileLock,
 }
 
 impl std::fmt::Debug for ToolsetGrantStore {
@@ -459,14 +523,16 @@ impl std::fmt::Debug for ToolsetGrantStore {
 }
 
 impl ToolsetGrantStore {
-    /// Opens the grant store at `path`.
+    /// Opens the grant store at `path` for writing.
     ///
-    /// Creates the parent directory if absent.  Loads grants from the TOML
-    /// file if it exists, pruning any that have already expired according to
-    /// `now_unix_ms`.
+    /// Creates the parent directory and the lock sidecar if absent, and takes
+    /// the sidecar's exclusive lock without blocking. Loads grants from the
+    /// TOML file if it exists, pruning any that have already expired according
+    /// to `now_unix_ms`.
     ///
     /// # Errors
     ///
+    /// - [`ApprovalError::WriterLocked`] while another handle or a reader holds the lock.
     /// - [`ApprovalError::Io`] on I/O failure.
     /// - [`ApprovalError::Toml`] if the file cannot be parsed.
     pub fn open(path: PathBuf, now_unix_ms: u64) -> Result<Self, ApprovalError> {
@@ -487,25 +553,25 @@ impl ToolsetGrantStore {
             }
         }
 
-        let grants = if path.exists() {
-            let content = fs::read_to_string(&path).map_err(ApprovalError::from_io)?;
-            let sf: GrantStoreFile = toml::from_str(&content).map_err(|e| ApprovalError::Toml {
-                detail: format!(
-                    "toolset grant store: {}",
-                    toml_error_position(&content, e.span().map(|s| s.start))
-                ),
-            })?;
-            // Prune expired grants on load.
-            sf.grants
-                .into_iter()
-                .map(ToolsetGrant::stored)
-                .filter(|g| !g.is_expired(now_unix_ms))
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let sidecar = options
+            .open(grant_lock_path(&path))
+            .map_err(ApprovalError::from_io)?;
+        let lock = HeldFileLock::try_lock(sidecar).map_err(lock_error)?;
 
-        Ok(Self { path, grants })
+        let mut grants = load_grants(&path)?;
+        grants.retain(|g| !g.is_expired(now_unix_ms));
+        Ok(Self {
+            path,
+            grants,
+            _lock: lock,
+        })
     }
 
     /// Returns the first verified grant covering the invocation, or `None`.
@@ -524,24 +590,9 @@ impl ToolsetGrantStore {
         attestation_key: &[u8; 32],
         binding: &super::AttestationBinding<'_>,
     ) -> Option<&ToolsetGrant> {
-        self.grants.iter().find(|g| {
-            g.matches(
-                query.toolset_name,
-                query.install_id,
-                query.package_version,
-                query.package_shasum,
-                query.capability,
-                query.destination,
-                query.asset,
-                query.amount_stroops,
-                query.now_unix_ms,
-            ) && g.attestation_version == ATTESTATION_VERSION
-                && g.verify_attestation(attestation_key, binding)
-                && g.expires_at_unix_ms.saturating_sub(g.granted_at_unix_ms)
-                    <= TOOLSET_GRANT_DEFAULT_TTL_MS
-                && g.granted_at_unix_ms >= query.not_before_unix_ms
-                && g.granted_at_unix_ms <= query.now_unix_ms
-        })
+        self.grants
+            .iter()
+            .find(|g| g.verifies_for(query, attestation_key, binding))
     }
 
     /// Inserts a new `ToolsetGrant` and persists the store.
@@ -650,6 +701,65 @@ impl ToolsetGrantStore {
             .map_err(ApprovalError::from_io)?;
 
         Ok(())
+    }
+}
+
+/// A read-only view of a grant store under the sidecar's shared lock.
+///
+/// While a reader lives, no [`ToolsetGrantStore`] opens, so no grant is
+/// inserted or revoked. Readers coexist. Opening one creates no directory,
+/// sidecar, or data file, and the view prunes nothing.
+pub struct ToolsetGrantReader {
+    grants: Vec<ToolsetGrant>,
+    _lock: HeldFileLock,
+}
+
+impl std::fmt::Debug for ToolsetGrantReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolsetGrantReader")
+            .field("grant_count", &self.grants.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ToolsetGrantReader {
+    /// Takes the shared lock of the existing sidecar of `path` without
+    /// blocking, then loads the grants. An absent data file holds no grant.
+    ///
+    /// Returns `Ok(None)` when the sidecar does not exist.
+    ///
+    /// # Errors
+    ///
+    /// - [`ApprovalError::WriterLocked`] while a [`ToolsetGrantStore`] holds the lock.
+    /// - [`ApprovalError::Io`] on another I/O failure.
+    /// - [`ApprovalError::Toml`] if the data file cannot be parsed.
+    pub fn open_existing(path: &Path) -> Result<Option<Self>, ApprovalError> {
+        let sidecar = match fs::File::open(grant_lock_path(path)) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(ApprovalError::from_io(e)),
+        };
+        let lock = HeldFileLock::try_lock_shared(sidecar).map_err(lock_error)?;
+        Ok(Some(Self {
+            grants: load_grants(path)?,
+            _lock: lock,
+        }))
+    }
+
+    /// Returns the stored grant equal to `expected` in every field when it
+    /// still verifies for `query`, as [`ToolsetGrantStore::find_matching`]
+    /// verifies. Another grant covering the same invocation is not returned.
+    #[must_use]
+    pub fn find_verified(
+        &self,
+        expected: &ToolsetGrant,
+        query: &GrantQuery<'_>,
+        attestation_key: &[u8; 32],
+        binding: &super::AttestationBinding<'_>,
+    ) -> Option<&ToolsetGrant> {
+        self.grants
+            .iter()
+            .find(|g| *g == expected && g.verifies_for(query, attestation_key, binding))
     }
 }
 
@@ -1877,6 +1987,180 @@ mod tests {
         );
     }
 
+    /// Names and bytes of every file in `dir`, sorted by name.
+    fn snapshot(dir: &Path) -> Vec<(std::ffi::OsString, Vec<u8>)> {
+        let mut entries: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (
+                    entry.file_name(),
+                    fs::read(entry.path()).unwrap_or_default(),
+                )
+            })
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    #[test]
+    fn a_grant_writer_excludes_a_second_writer_until_it_drops() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("default.toolset_grants.toml");
+        let first = grant_to("sign-payment", DEST_G).unwrap();
+        let second = grant_to("sign-payment", OTHER_G).unwrap();
+        let mut writer = ToolsetGrantStore::open(path.clone(), NOW_MS).unwrap();
+        writer.insert(first.clone()).unwrap();
+        let written = fs::read(&path).unwrap();
+        assert!(
+            matches!(
+                ToolsetGrantStore::open(path.clone(), NOW_MS),
+                Err(ApprovalError::WriterLocked)
+            ),
+            "a second writer must refuse while the first handle lives"
+        );
+        assert_eq!(fs::read(&path).unwrap(), written);
+        let other_profile = dir.path().join("other.toolset_grants.toml");
+        ToolsetGrantStore::open(other_profile, NOW_MS).expect("another profile's store opens");
+        drop(writer);
+        let mut writer = ToolsetGrantStore::open(path.clone(), NOW_MS).unwrap();
+        assert_eq!(writer.grants, std::slice::from_ref(&first));
+        writer.insert(second.clone()).unwrap();
+        drop(writer);
+        let reopened = ToolsetGrantStore::open(path, NOW_MS).unwrap();
+        assert_eq!(reopened.grants, [first, second], "no insert is lost");
+    }
+
+    #[test]
+    fn a_grant_reader_excludes_every_writer_and_finds_only_its_grant() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("default.toolset_grants.toml");
+        let original = grant_to("sign-payment", DEST_G).unwrap();
+        let equal_coverage = grant_to("sign-payment", DEST_G).unwrap();
+        let query = test_query();
+        type Mutation = fn(&mut ToolsetGrantStore, &ToolsetGrant);
+        let mutations: [(&str, Mutation); 3] = [
+            ("insert", |store, grant| {
+                store.insert(grant.clone()).unwrap()
+            }),
+            ("revoke_toolset", |store, grant| {
+                store.revoke_toolset(&grant.toolset_name).unwrap();
+            }),
+            ("revoke_all", |store, _| {
+                store.revoke_all().unwrap();
+            }),
+        ];
+        for (name, mutate) in mutations {
+            let mut writer = ToolsetGrantStore::open(path.clone(), NOW_MS).unwrap();
+            writer.revoke_all().unwrap();
+            writer.insert(equal_coverage.clone()).unwrap();
+            writer.insert(original.clone()).unwrap();
+            drop(writer);
+            let reader = ToolsetGrantReader::open_existing(&path).unwrap().unwrap();
+            let second_reader = ToolsetGrantReader::open_existing(&path).unwrap();
+            assert!(second_reader.is_some(), "readers coexist");
+            let before = fs::read(&path).unwrap();
+            assert!(
+                matches!(
+                    ToolsetGrantStore::open(path.clone(), NOW_MS),
+                    Err(ApprovalError::WriterLocked)
+                ),
+                "{name} must not open beside a reader"
+            );
+            assert_eq!(fs::read(&path).unwrap(), before);
+            let found = reader.find_verified(&original, &query, &KEY, &binding());
+            assert_eq!(found, Some(&original), "the reader finds its exact grant");
+            drop((reader, second_reader));
+            let mut writer = ToolsetGrantStore::open(path.clone(), NOW_MS).unwrap();
+            mutate(&mut writer, &original);
+            let after = writer.grants.clone();
+            drop(writer);
+            let reopened = ToolsetGrantReader::open_existing(&path).unwrap().unwrap();
+            assert_eq!(reopened.grants, after, "{name} persists as written");
+            assert_eq!(
+                reopened
+                    .find_verified(&original, &query, &KEY, &binding())
+                    .is_some(),
+                name == "insert",
+                "{name}: a revoked grant is not resurrected"
+            );
+        }
+    }
+
+    #[test]
+    fn a_grant_reader_finds_no_other_grant_of_equal_coverage() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("default.toolset_grants.toml");
+        let original = grant_to("sign-payment", DEST_G).unwrap();
+        let replacement = grant_to("sign-payment", DEST_G).unwrap();
+        drop(store_with_grant(&dir, replacement.clone()));
+        let reader = ToolsetGrantReader::open_existing(&path).unwrap().unwrap();
+        let query = test_query();
+        assert!(replacement.verifies_for(&query, &KEY, &binding()));
+        assert_eq!(
+            reader.find_verified(&original, &query, &KEY, &binding()),
+            None
+        );
+        assert_eq!(
+            reader.find_verified(&replacement, &query, &KEY, &binding()),
+            Some(&replacement)
+        );
+    }
+
+    #[test]
+    fn a_grant_reader_creates_and_prunes_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("default.toolset_grants.toml");
+        let empty = snapshot(dir.path());
+        assert!(ToolsetGrantReader::open_existing(&path).unwrap().is_none());
+        assert!(
+            ToolsetGrantReader::open_existing(&dir.path().join("absent").join("grants.toml"))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            snapshot(dir.path()),
+            empty,
+            "an absent sidecar is not created"
+        );
+
+        drop(store_with_grant(
+            &dir,
+            grant_to("sign-payment", DEST_G).unwrap(),
+        ));
+        let stored = snapshot(dir.path());
+        let expired = ToolsetGrantStore::open(path.clone(), u64::MAX).unwrap();
+        assert!(expired.is_empty());
+        drop(expired);
+        let reader = ToolsetGrantReader::open_existing(&path).unwrap().unwrap();
+        assert_eq!(reader.grants.len(), 1, "a reader prunes no expired grant");
+        drop(reader);
+        assert_eq!(snapshot(dir.path()), stored);
+
+        fs::remove_file(&path).unwrap();
+        let reader = ToolsetGrantReader::open_existing(&path).unwrap().unwrap();
+        assert!(
+            reader.grants.is_empty(),
+            "an absent data file holds no grant"
+        );
+        drop(reader);
+        fs::write(&path, "[[grants]]\ngrant_id = ").unwrap();
+        let without_data = snapshot(dir.path());
+        assert!(matches!(
+            ToolsetGrantReader::open_existing(&path),
+            Err(ApprovalError::Toml { .. })
+        ));
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(matches!(
+            ToolsetGrantReader::open_existing(&path),
+            Err(ApprovalError::Io { .. })
+        ));
+        fs::remove_dir(&path).unwrap();
+        fs::write(&path, "[[grants]]\ngrant_id = ").unwrap();
+        assert_eq!(snapshot(dir.path()), without_data);
+    }
+
     #[test]
     fn g_and_m_grants_reopen_with_their_stored_bytes() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -1890,6 +2174,7 @@ mod tests {
             store.insert(grant.clone()).unwrap();
         }
         let written = fs::read_to_string(&path).unwrap();
+        drop(store);
         let reopened = ToolsetGrantStore::open(path.clone(), NOW_MS).unwrap();
         for (stored, original) in reopened.grants.iter().zip(&grants) {
             assert_eq!(stored.destination, original.destination);
@@ -2138,12 +2423,15 @@ mod tests {
         store.insert(added.clone()).unwrap();
         grants.push(added);
         assert_eq!(fs::read_to_string(&path).unwrap(), file(&grants));
+        drop(store);
         let mut store = ToolsetGrantStore::open(path.clone(), NOW_MS).unwrap();
         assert!(found(&store, OTHER_G) && found(&store, DEST_MMAX));
         assert_eq!(store.revoke_toolset("old-toolset").unwrap(), 1);
+        drop(store);
         let store = ToolsetGrantStore::open(path.clone(), NOW_MS).unwrap();
         assert_eq!(store.len(), 3);
         assert!(store.grants.iter().all(|g| g.grant_id != bad.grant_id));
+        drop(store);
         fs::write(&path, &text).unwrap();
         let store = ToolsetGrantStore::open(path, bad.expires_at_unix_ms).unwrap();
         assert!(store.is_empty(), "expired grants prune on load");

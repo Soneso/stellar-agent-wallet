@@ -26,9 +26,8 @@
 //!    `ToolsetFirstInvokeGate` entry.
 //! 7. **adversarial_different_destination_reprompts** — a plain `G...` destination
 //!    different from the grant's destination re-prompts the first-invoke gate.
-//! 8. **adversarial_muxed_destination_reprompts** — muxed `M...` destination
-//!    cannot satisfy a grant that bounds a plain `G...` dest; M-addresses collapse
-//!    to their underlying G, which differs from DEST_G.
+//! 8. **adversarial_muxed_destination_reprompts**: a G grant covers an M
+//!    address of its own account and re-prompts for an M address of another.
 //! 9. **amount_exceeds_grant_max_reprompts** — an amount above the grant's
 //!    `amount_max_stroops` re-prompts the first-invoke gate.
 //! 10. **gated_tool_only_via_both_gates** — `stellar_pay_commit` is unreachable
@@ -126,18 +125,6 @@ const DEST_G: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
 /// (Same as SOURCE_G — any two distinct valid strkeys suffice for the test.)
 const DEST_G2: &str = "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI";
 
-/// A syntactically valid muxed M-strkey used for adversarial tests.
-///
-/// The underlying G-key of this muxed address is NOT DEST_G.  The grant is
-/// bounded to DEST_G; the M-address encodes a different G-key and a mux ID.
-/// This tests that M-addresses never satisfy a G-bounded grant even when the
-/// grant-matching path is presented with the raw M-string.
-///
-/// Source: the same M-strkey used in `fee_bump.rs` fee_source_muxed_strkey_rejected
-/// test, confirming syntactic validity.  The underlying G differs from DEST_G.
-const DEST_M_OTHER_G: &str =
-    "MA7QYNF7SOWQ3GLR2BGMZEHXR6DROW7HY3A3ZB3BNYB3QAVYUHX3AAAAAAAAAAAPCIBORA";
-
 /// Toolset name used in all tests.
 const TOOLSET_NAME: &str = "test-payment-toolset";
 
@@ -156,16 +143,50 @@ const ASSET_XLM: &str = "XLM";
 /// Contains a single native `Payment` operation from `source` to `dest`
 /// for `amount_stroops` (amount in stroops).
 fn payment_envelope_xdr(source: &str, dest: &str, amount_stroops: i64) -> String {
+    payment_envelope_xdr_to(
+        source,
+        stellar_xdr::MuxedAccount::Ed25519(stellar_xdr::Uint256(g_bytes(dest))),
+        amount_stroops,
+    )
+}
+
+fn g_bytes(g: &str) -> [u8; 32] {
+    stellar_strkey::ed25519::PublicKey::from_string(g)
+        .expect("valid G-strkey")
+        .0
+}
+
+/// The M address of `base` with mux ID `id`, and a native payment envelope
+/// from [`SOURCE_G`] to it.
+fn muxed_payment(base: &str, id: u64, amount_stroops: i64) -> (String, String) {
+    let address =
+        stellar_strkey::Strkey::MuxedAccountEd25519(stellar_strkey::ed25519::MuxedAccount {
+            ed25519: g_bytes(base),
+            id,
+        })
+        .to_string()
+        .as_str()
+        .to_owned();
+    let destination = stellar_xdr::MuxedAccount::MuxedEd25519(stellar_xdr::MuxedAccountMed25519 {
+        id,
+        ed25519: stellar_xdr::Uint256(g_bytes(base)),
+    });
+    (
+        address,
+        payment_envelope_xdr_to(SOURCE_G, destination, amount_stroops),
+    )
+}
+
+fn payment_envelope_xdr_to(
+    source: &str,
+    destination: stellar_xdr::MuxedAccount,
+    amount_stroops: i64,
+) -> String {
     use stellar_xdr::{
         Asset, Limits, Memo, MuxedAccount, Operation, OperationBody, PaymentOp, Preconditions,
         SequenceNumber, Transaction, TransactionEnvelope, TransactionExt, TransactionV1Envelope,
         Uint256, VecM, WriteXdr,
     };
-    fn g_bytes(g: &str) -> [u8; 32] {
-        stellar_strkey::ed25519::PublicKey::from_string(g)
-            .expect("valid G-strkey")
-            .0
-    }
     let tx = Transaction {
         source_account: MuxedAccount::Ed25519(Uint256(g_bytes(source))),
         fee: 100,
@@ -175,7 +196,7 @@ fn payment_envelope_xdr(source: &str, dest: &str, amount_stroops: i64) -> String
         operations: vec![Operation {
             source_account: None,
             body: OperationBody::Payment(PaymentOp {
-                destination: MuxedAccount::Ed25519(Uint256(g_bytes(dest))),
+                destination,
                 asset: Asset::Native,
                 amount: amount_stroops,
             }),
@@ -391,6 +412,126 @@ async fn payment_outer_gate_reaches_routed_approval_and_denies_unlisted() {
             "policy.approval_required"
         );
     }
+}
+
+/// Names whose sanitized display can equal `name` or that differ from it only
+/// in case, whitespace, affixes, or length.
+fn display_aliases(name: &str) -> Vec<String> {
+    let (head, tail) = name.split_at(4);
+    vec![
+        format!("\x1b[0m{name}"),
+        format!("{name}\x1b[0m"),
+        format!("\x1b]0;title\x07{name}"),
+        format!("{head}\x1b[1m{tail}"),
+        format!("{name}\u{7}"),
+        format!("{head}\n{tail}"),
+        format!(" {name}"),
+        format!("{name} "),
+        name.to_uppercase(),
+        format!("x{name}"),
+        format!("{name}x"),
+        format!("{name}{}", "a".repeat(200)),
+    ]
+}
+
+/// Routing uses the names as sent. Under a permitting testnet outer gate, an
+/// alias of an installed toolset or of a matrix action reaches no handler,
+/// queues no approval, and sends no request, and the outer gate evaluates
+/// the original strings.
+#[tokio::test]
+#[serial]
+async fn display_aliases_of_toolset_and_action_names_reach_no_route() {
+    use crate::common::policy_mock::CapturingPolicyEngine;
+    let _root = crate::common::isolated_data_root();
+    let key = setup_mock_keyring();
+    let rpc = wiremock::MockServer::start().await;
+    let approval = TempDir::new().unwrap();
+    let grants = TempDir::new().unwrap();
+    let toolsets = TempDir::new().unwrap();
+    let grant_file = grants.path().join("grants.toml");
+    write_toolset(
+        toolsets.path(),
+        TOOLSET_NAME,
+        &["sign-payment", "sign-rule-create", "read-balance"],
+    );
+    insert_valid_grant(
+        &grant_file,
+        TOOLSET_NAME,
+        CAPABILITY,
+        DEST_G,
+        ASSET_XLM,
+        0,
+        10_000_000,
+        &key,
+    );
+    let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
+        .rpc_url(rpc.uri())
+        .with_noop_engine()
+        .build();
+    let mut server = allow_server_for(profile, approval.path(), &grant_file, toolsets.path());
+    let capture = CapturingPolicyEngine::new();
+    server.set_policy_engine_for_test(Arc::new(capture.clone()));
+
+    let mut cases = Vec::new();
+    for action in [
+        "stellar_pay_commit",
+        "stellar_pay",
+        "stellar_rule_create_commit",
+        "stellar_balances",
+    ] {
+        for alias in display_aliases(action) {
+            cases.push((TOOLSET_NAME.to_owned(), alias, "toolset.unknown_action"));
+        }
+    }
+    for action in ["stellar_pay_commit", "stellar_balances"] {
+        for alias in display_aliases(TOOLSET_NAME) {
+            cases.push((alias, action.to_owned(), "toolset.not_installed"));
+        }
+    }
+    for (toolset, action, code) in cases {
+        let mut invoke = payment_invoke(&action, DEST_G, 10_000_000);
+        invoke.toolset.clone_from(&toolset);
+        let error = server
+            .call_stellar_toolset_invoke(invoke)
+            .await
+            .expect_err("an alias reaches no handler");
+        assert!(
+            error_message(&error).starts_with(code),
+            "{toolset:?}/{action:?}: {}",
+            error_message(&error)
+        );
+        let evaluated = capture.arguments_for("stellar_toolset_invoke");
+        assert_eq!(
+            evaluated.last(),
+            Some(&serde_json::json!({ "toolset": toolset, "action": action })),
+            "the outer gate evaluates the names as sent"
+        );
+    }
+    assert_eq!(
+        count_pending_approvals(approval.path(), TEST_PROFILE_NAME),
+        0
+    );
+    assert!(rpc.received_requests().await.unwrap().is_empty());
+
+    // The exact names route: the payment reaches its forced approval and the
+    // read-only action reaches its handler's RPC request.
+    let result = server
+        .call_stellar_toolset_invoke(payment_invoke("stellar_pay_commit", DEST_G, 10_000_000))
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::common::assert_business_envelope(&result).0,
+        "policy.approval_required"
+    );
+    assert_eq!(
+        count_pending_approvals(approval.path(), TEST_PROFILE_NAME),
+        1
+    );
+    rpc.reset().await;
+    let mut balances = payment_invoke("stellar_balances", DEST_G, 1);
+    balances.args = serde_json::json!({ "account_id": DEST_G });
+    let _ = server.call_stellar_toolset_invoke(balances).await;
+    assert!(!rpc.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1785,15 +1926,10 @@ async fn adversarial_different_destination_reprompts() {
 // Test 8: adversarial muxed destination → re-prompt
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A muxed `M...` destination does not satisfy a grant bounded to a plain
-/// `G...` destination.
-///
-/// M-addresses are never stored in grants (grants record the G-strkey supplied
-/// by the toolset at first-invoke time).  Even if an M-address encoded the same
-/// underlying G as the grant's destination, the grant-matching path compares
-/// the raw destination string and would not match the M-form.  This test uses
-/// an M-address whose underlying G differs from DEST_G, confirming the re-prompt
-/// fires via the parameter-mismatch path.
+/// A G grant covers the M addresses of its own account only: an envelope
+/// paying an M address of another account re-prompts the first-invoke gate,
+/// and one paying an M address of the granted account reaches the forced
+/// per-action approval.
 #[tokio::test]
 #[serial]
 async fn adversarial_muxed_destination_reprompts() {
@@ -1818,20 +1954,15 @@ async fn adversarial_muxed_destination_reprompts() {
         &key,
     );
 
-    // The toolset arg `destination` is an M-address whose underlying G is NOT DEST_G.
-    // The envelope destination uses SOURCE_G (any valid G suffices; the envelope
-    // decode path extracts the G from the op's destination MuxedAccount).
-    let envelope_xdr = payment_envelope_xdr(SOURCE_G, SOURCE_G, amount_stroops);
     let server = build_allow_server(approval_dir.path(), &grant_file, toolsets_dir.path());
-
-    let args = StellarToolsetInvokeArgs {
+    let invoke = |(destination, envelope_xdr): (String, String)| StellarToolsetInvokeArgs {
         toolset: TOOLSET_NAME.to_owned(),
         action: "stellar_pay_commit".to_owned(),
         chain_id: Some("stellar:testnet".to_owned()),
         args: serde_json::json!({
             "envelope_xdr": envelope_xdr,
             "source": SOURCE_G,
-            "destination": DEST_M_OTHER_G,
+            "destination": destination,
             "nonce": "fake-nonce",
             "expires_at_unix_ms": 9_999_999_999_u64,
             "asset": "native",
@@ -1840,18 +1971,43 @@ async fn adversarial_muxed_destination_reprompts() {
         }),
     };
 
-    let result = server.call_stellar_toolset_invoke(args).await;
+    let other_base = muxed_payment(DEST_G2, 7, amount_stroops);
+    let other_address = other_base.0.clone();
+    let err = server
+        .call_stellar_toolset_invoke(invoke(other_base))
+        .await
+        .expect_err("an M address of another account is not covered");
     assert!(
-        result.is_err(),
-        "M-address destination must not satisfy a G-bounded grant; must re-prompt"
+        err.message
+            .starts_with("toolset.first_invoke_approval_required"),
+        "{err:?}"
     );
-    let err = result.unwrap_err();
-    let msg = error_message(&err);
-    // M-address destinations are either refused as an invalid address format or
-    // cause the grant not to match and the first-invoke gate fires.
-    assert!(
-        msg.contains("first_invoke_approval_required") || msg.contains("invalid_destination"),
-        "expected first-invoke gate or invalid-destination refusal for M-address; got: {msg}"
+    let nonce = error_payload(&err)["approval_nonce"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let store = PendingApprovalStore::open(
+        approval_dir
+            .path()
+            .join(format!("{TEST_PROFILE_NAME}.toml")),
+    )
+    .unwrap();
+    assert!(matches!(
+        &store.get(&nonce).unwrap().kind,
+        stellar_agent_core::approval::store::ApprovalKind::ToolsetFirstInvokeGate {
+            destination, ..
+        } if *destination == other_address
+    ));
+    drop(store);
+
+    let same_base = muxed_payment(DEST_G, 7, amount_stroops);
+    let result = server
+        .call_stellar_toolset_invoke(invoke(same_base))
+        .await
+        .expect("an M address of the granted account is covered");
+    assert_eq!(
+        crate::common::assert_business_envelope(&result).0,
+        "policy.approval_required"
     );
 }
 

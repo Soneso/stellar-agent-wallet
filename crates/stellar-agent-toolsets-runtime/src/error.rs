@@ -184,6 +184,40 @@ pub enum ToolsetRuntimeError {
     /// grant-store lookup or approval queuing occurs.
     #[error("toolset.invalid_authoritative_amount: authoritative_amount_stroops must be > 0")]
     InvalidAuthoritativeAmount,
+
+    /// Gated path: an install, uninstall, or grant write holds the lock the
+    /// call needs, or a grant lease excludes the grant write it needs.
+    #[error(
+        "toolset.coordination_busy: the toolset installation or its grants are being changed; retry"
+    )]
+    CoordinationBusy,
+
+    /// Grant recheck: the toolsets lock file or the grant lock file is
+    /// absent. A recheck creates neither; a new gated resolution does.
+    #[error(
+        "toolset.coordination_unavailable: a toolset or grant lock file is absent; resolve the invocation again"
+    )]
+    CoordinationUnavailable,
+
+    /// Grant recheck: the invocation differs from the one the grant was
+    /// verified for. A new gated resolution checks the new invocation.
+    #[error(
+        "toolset.grant_invocation_mismatch: the verified grant covers another invocation; resolve this invocation"
+    )]
+    GrantInvocationMismatch,
+
+    /// Grant recheck: the verified installation changed, or its grant was
+    /// revoked, replaced, or no longer verifies.
+    #[error(
+        "toolset.grant_changed: the verified grant or its installation changed; resolve the invocation again"
+    )]
+    GrantChanged,
+
+    /// Grant recheck: the verified grant's stored expiry has passed.
+    #[error(
+        "toolset.grant_expired: the verified grant has expired; the first-invoke approval is required again"
+    )]
+    GrantExpired,
 }
 
 #[cfg(test)]
@@ -228,6 +262,11 @@ mod tests {
             },
             ToolsetRuntimeError::InvalidAuthoritativeAmount,
             ToolsetRuntimeError::BindingMismatch,
+            ToolsetRuntimeError::CoordinationBusy,
+            ToolsetRuntimeError::CoordinationUnavailable,
+            ToolsetRuntimeError::GrantInvocationMismatch,
+            ToolsetRuntimeError::GrantChanged,
+            ToolsetRuntimeError::GrantExpired,
         ];
 
         // Collect display strings and verify they are all distinct.
@@ -311,5 +350,28 @@ mod tests {
             !e.to_string().contains("-1"),
             "rejected amount must not appear in error message"
         );
+
+        for (e, code) in [
+            (
+                ToolsetRuntimeError::CoordinationBusy,
+                "toolset.coordination_busy",
+            ),
+            (
+                ToolsetRuntimeError::CoordinationUnavailable,
+                "toolset.coordination_unavailable",
+            ),
+            (
+                ToolsetRuntimeError::GrantInvocationMismatch,
+                "toolset.grant_invocation_mismatch",
+            ),
+            (ToolsetRuntimeError::GrantChanged, "toolset.grant_changed"),
+            (ToolsetRuntimeError::GrantExpired, "toolset.grant_expired"),
+        ] {
+            let display = e.to_string();
+            assert!(display.starts_with(code), "{display}");
+            for leak in ["/", "\\", ".toml", ".lock", "attestation_blob"] {
+                assert!(!display.contains(leak), "{display} leaks {leak}");
+            }
+        }
     }
 }

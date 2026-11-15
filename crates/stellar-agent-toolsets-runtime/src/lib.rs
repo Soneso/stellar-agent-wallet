@@ -80,18 +80,20 @@ pub use matrix::{
     resolve_action,
 };
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
+use stellar_agent_core::approval::toolset_grant::ToolsetGrantReader;
 use stellar_agent_core::approval::{
-    DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, DEFAULT_TTL_MS, GrantQuery, PendingApproval,
-    TOOLSET_GRANT_DEFAULT_TTL_MS, ToolsetGrant, ToolsetGrantStore, build_attested_grant,
-    default_toolset_grants_path, open_with_retry,
+    ApprovalError, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, DEFAULT_TTL_MS, GrantQuery,
+    PendingApproval, TOOLSET_GRANT_DEFAULT_TTL_MS, ToolsetGrant, ToolsetGrantStore,
+    build_attested_grant, default_toolset_grants_path, open_with_retry,
 };
 use stellar_agent_toolsets::{Capability, CapabilitySet, sanitise_display};
 pub use stellar_agent_toolsets_install::PinKey;
 use stellar_agent_toolsets_install::{
-    TOOLSETS_LOCK_FILE_NAME, ToolsetInstallError, ToolsetPinRecord,
+    TOOLSETS_LOCK_FILE_NAME, ToolsetInstallError, ToolsetPinRecord, ToolsetsReadLock,
+    lock_existing_toolsets_shared, lock_toolsets_shared,
 };
 use tracing::debug;
 
@@ -520,6 +522,9 @@ pub enum GatedResolveOutcome {
     Resolved {
         /// The static tool name constant (`"stellar_pay_commit"`).
         tool_name: &'static str,
+        /// The grant that matched, with the installation and invocation it
+        /// was verified for.
+        grant: Box<VerifiedToolsetGrant>,
     },
     /// The first-invoke gate fired: no current grant exists or the parameters
     /// are novel. A `ToolsetFirstInvokeGate` pending approval was queued;
@@ -534,6 +539,346 @@ pub enum GatedResolveOutcome {
     },
 }
 
+/// The invocation a grant was verified for. The resolved tool and capability
+/// follow from `action` through the closed gated matrix.
+#[derive(PartialEq, Eq)]
+struct GrantInvocation {
+    profile_name: String,
+    chain_id: String,
+    toolset_name: String,
+    action: String,
+    destination: String,
+    asset: String,
+    amount_stroops: i64,
+    toolsets_root: PathBuf,
+    grant_store_path: PathBuf,
+}
+
+/// A grant the gated resolver verified, with the authenticated installation
+/// and the exact invocation it was verified for.
+///
+/// Only the resolver constructs one. It is a snapshot: it grants no signing
+/// authority and holds no lock. [`acquire_toolset_grant_lease`] checks it
+/// against the current records and locks them.
+pub struct VerifiedToolsetGrant {
+    pin: ToolsetPinRecord,
+    grant: ToolsetGrant,
+    invocation: GrantInvocation,
+}
+
+impl std::fmt::Debug for VerifiedToolsetGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VerifiedToolsetGrant")
+            .field("grant_id", &self.grant.grant_id)
+            .field("expires_at_unix_ms", &self.grant.expires_at_unix_ms)
+            .finish_non_exhaustive()
+    }
+}
+
+impl VerifiedToolsetGrant {
+    /// The stored identifier of the verified grant.
+    #[must_use]
+    pub fn grant_id(&self) -> &str {
+        &self.grant.grant_id
+    }
+
+    /// The grant's stored expiry in Unix milliseconds. No check renews it.
+    #[must_use]
+    pub fn expires_at_unix_ms(&self) -> u64 {
+        self.grant.expires_at_unix_ms
+    }
+
+    /// The authenticated install record the grant was verified against.
+    #[must_use]
+    pub fn pin(&self) -> &ToolsetPinRecord {
+        &self.pin
+    }
+}
+
+/// The current invocation a [`VerifiedToolsetGrant`] is rechecked for.
+///
+/// Every field must equal the invocation the grant was verified for.
+pub struct GrantRecheckParams<'a> {
+    /// Package name of the toolset.
+    pub toolset_name: &'a str,
+    /// Action name, exactly as invoked.
+    pub action: &'a str,
+    /// Root directory of installed toolsets.
+    pub toolsets_root: &'a Path,
+    /// Profile name that locates the grant store.
+    pub profile_name: &'a str,
+    /// The profile's attestation key.
+    pub attestation_key: &'a [u8; 32],
+    /// The binding under which the profile's grants are attested.
+    pub attestation_binding: &'a stellar_agent_core::approval::AttestationBinding<'a>,
+    /// Destination from the authoritative envelope decode.
+    pub authoritative_destination: &'a str,
+    /// Asset from the authoritative envelope decode.
+    pub authoritative_asset: &'a str,
+    /// Payment amount in stroops from the authoritative envelope decode.
+    pub authoritative_amount_stroops: i64,
+    /// The installation's pin key.
+    pub pin_key: Option<&'a PinKey>,
+    /// Optional override for the grant store path (test-only).
+    #[cfg(feature = "test-helpers")]
+    pub grant_store_path_override: Option<PathBuf>,
+}
+
+/// Shared locks on the toolsets root and the profile's grant store, held
+/// with the grant they protect, in that order.
+///
+/// While a lease lives, no install, forced reinstall, or uninstall in the
+/// root and no grant insertion or revocation of the profile proceeds. The
+/// lease does not stop the clock: a consumer checks
+/// [`VerifiedToolsetGrant::expires_at_unix_ms`] at the moment it relies on it.
+#[derive(Debug)]
+pub struct ToolsetGrantLease {
+    grant: VerifiedToolsetGrant,
+    _grants: ToolsetGrantReader,
+    _root: ToolsetsReadLock,
+}
+
+impl ToolsetGrantLease {
+    /// The grant as checked when the lease was acquired.
+    #[must_use]
+    pub fn grant(&self) -> &VerifiedToolsetGrant {
+        &self.grant
+    }
+}
+
+/// Locks and rechecks `expected` for the current invocation in `params`.
+///
+/// Takes the shared root lock, then the shared grant lock, from existing
+/// lock files only. The reread install record must equal the snapshot, and
+/// the grant itself, not another of equal coverage, must still verify. The
+/// clock is read after both locks and again before returning; the stored
+/// expiry is never renewed.
+///
+/// # Errors
+///
+/// [`ToolsetRuntimeError::GrantInvocationMismatch`] when any invocation field
+/// differs, `CoordinationUnavailable`, `CoordinationBusy`, `GrantChanged`,
+/// `GrantExpired`, [`ToolsetRuntimeError::Io`] for an unavailable clock, and
+/// the binding, install, manifest, capability, amount, and store errors of
+/// [`resolve_toolset_sign_payment_gated`].
+pub fn acquire_toolset_grant_lease(
+    expected: &VerifiedToolsetGrant,
+    params: &GrantRecheckParams<'_>,
+) -> Result<ToolsetGrantLease, ToolsetRuntimeError> {
+    acquire_lease_with_clock(expected, params, &mut || {
+        stellar_agent_core::timefmt::now_unix_ms()
+            .map_err(|_| ToolsetRuntimeError::Io("clock_unavailable".to_owned()))
+    })
+}
+
+/// Rechecks `expected` as [`acquire_toolset_grant_lease`] does and releases
+/// the locks at once.
+///
+/// # Errors
+///
+/// As [`acquire_toolset_grant_lease`].
+pub fn recheck_toolset_grant(
+    expected: &VerifiedToolsetGrant,
+    params: &GrantRecheckParams<'_>,
+) -> Result<(), ToolsetRuntimeError> {
+    acquire_toolset_grant_lease(expected, params).map(drop)
+}
+
+fn acquire_lease_with_clock(
+    expected: &VerifiedToolsetGrant,
+    params: &GrantRecheckParams<'_>,
+    clock: &mut dyn FnMut() -> Result<u64, ToolsetRuntimeError>,
+) -> Result<ToolsetGrantLease, ToolsetRuntimeError> {
+    if params.attestation_binding.profile_name != params.profile_name {
+        return Err(ToolsetRuntimeError::BindingMismatch);
+    }
+    #[cfg(feature = "test-helpers")]
+    let override_path = params.grant_store_path_override.clone();
+    #[cfg(not(feature = "test-helpers"))]
+    let override_path = None;
+    let invocation = GrantInvocation {
+        profile_name: params.profile_name.to_owned(),
+        chain_id: params.attestation_binding.chain_id.to_owned(),
+        toolset_name: params.toolset_name.to_owned(),
+        action: params.action.to_owned(),
+        destination: params.authoritative_destination.to_owned(),
+        asset: params.authoritative_asset.to_owned(),
+        amount_stroops: params.authoritative_amount_stroops,
+        toolsets_root: params.toolsets_root.to_path_buf(),
+        grant_store_path: grant_store_path(params.profile_name, override_path)?,
+    };
+    if invocation != expected.invocation {
+        return Err(ToolsetRuntimeError::GrantInvocationMismatch);
+    }
+
+    let root = lock_existing_toolsets_shared(params.toolsets_root)
+        .map_err(root_lock_error)?
+        .ok_or(ToolsetRuntimeError::CoordinationUnavailable)?;
+    let install = verify_gated_install(
+        params.toolset_name,
+        params.action,
+        params.toolsets_root,
+        params.pin_key,
+        params.authoritative_amount_stroops,
+    )?;
+    if install.pin != expected.pin {
+        return Err(ToolsetRuntimeError::GrantChanged);
+    }
+    let grants = ToolsetGrantReader::open_existing(&invocation.grant_store_path)
+        .map_err(grant_store_open_error)?
+        .ok_or(ToolsetRuntimeError::CoordinationUnavailable)?;
+
+    let now_unix_ms = clock()?;
+    if expected.grant.is_expired(now_unix_ms) {
+        return Err(ToolsetRuntimeError::GrantExpired);
+    }
+    let capability = install.capability.to_string();
+    let query = grant_query(&invocation, &install.pin, &capability, now_unix_ms);
+    if grants
+        .find_verified(
+            &expected.grant,
+            &query,
+            params.attestation_key,
+            params.attestation_binding,
+        )
+        .is_none()
+    {
+        return Err(ToolsetRuntimeError::GrantChanged);
+    }
+    if expected.grant.is_expired(clock()?) {
+        return Err(ToolsetRuntimeError::GrantExpired);
+    }
+    Ok(ToolsetGrantLease {
+        grant: VerifiedToolsetGrant {
+            pin: install.pin,
+            grant: expected.grant.clone(),
+            invocation,
+        },
+        _grants: grants,
+        _root: root,
+    })
+}
+
+/// The install record and gated route both resolution and recheck verify.
+struct GatedInstall {
+    pin: ToolsetPinRecord,
+    tool_name: &'static str,
+    capability: Capability,
+}
+
+/// Verifies the pin, the manifest, the gated action, the declared
+/// capability, the `allowed_tools` narrowing, and a positive amount, in
+/// that order, for an already name-validated `toolset_name`.
+fn verify_gated_install(
+    toolset_name: &str,
+    action: &str,
+    toolsets_root: &Path,
+    pin_key: Option<&PinKey>,
+    amount_stroops: i64,
+) -> Result<GatedInstall, ToolsetRuntimeError> {
+    let pin = read_verified_pin(toolset_name, toolsets_root, pin_key)?;
+    verify_manifest_digest(toolset_name, toolsets_root, &pin)?;
+
+    // Part (a): the action resolves in the GATED matrix, not the ungated one;
+    // part (b) follows from the matrix itself.
+    let (tool_name, capability) = resolve_gated_action(action)?;
+
+    // Part (c): the granting capability is declared.
+    if !pin.capabilities.contains(capability) {
+        return Err(ToolsetRuntimeError::CapabilityNotDeclared {
+            action: sanitise_display(action, 128),
+            capability: capability.to_string(),
+        });
+    }
+
+    // Part (d): the tool survives the allowed_tools narrowing.
+    if !allowed_by_narrowing(&pin.allowed_tools, tool_name) {
+        return Err(ToolsetRuntimeError::ToolNotAllowed {
+            tool: sanitise_display(tool_name, 128),
+            action: sanitise_display(action, 128),
+        });
+    }
+
+    // A zero or negative amount is structurally invalid for a payment, and a
+    // grant of the bucket [0, N] would otherwise cover it. The caller's
+    // envelope decode is not trusted to have enforced positivity.
+    if amount_stroops <= 0 {
+        return Err(ToolsetRuntimeError::InvalidAuthoritativeAmount);
+    }
+    Ok(GatedInstall {
+        pin,
+        tool_name,
+        capability,
+    })
+}
+
+/// Grants issued before this instant belong to an earlier installation: the
+/// start of the second after the authenticated install time. An install time
+/// that does not parse honors no grant.
+fn install_cutoff_ms(pin: &ToolsetPinRecord) -> u64 {
+    stellar_agent_core::timefmt::parse_rfc3339_utc(&pin.installed_at).map_or_else(
+        || {
+            tracing::warn!(
+                toolset = %pin.package,
+                "first-invoke gate: the pin's install time does not parse; honoring no grant"
+            );
+            u64::MAX
+        },
+        |installed_secs| (installed_secs + 1) * 1_000,
+    )
+}
+
+fn grant_query<'a>(
+    invocation: &'a GrantInvocation,
+    pin: &'a ToolsetPinRecord,
+    capability: &'a str,
+    now_unix_ms: u64,
+) -> GrantQuery<'a> {
+    GrantQuery {
+        toolset_name: &invocation.toolset_name,
+        install_id: &pin.install_id,
+        package_version: &pin.version,
+        package_shasum: &pin.shasum,
+        capability,
+        destination: &invocation.destination,
+        asset: &invocation.asset,
+        amount_stroops: invocation.amount_stroops,
+        now_unix_ms,
+        not_before_unix_ms: install_cutoff_ms(pin),
+    }
+}
+
+/// The grant store path of `profile_name`, or `override_path` when given.
+fn grant_store_path(
+    profile_name: &str,
+    override_path: Option<PathBuf>,
+) -> Result<PathBuf, ToolsetRuntimeError> {
+    match override_path {
+        Some(path) => Ok(path),
+        None => default_toolset_grants_path(profile_name).map_err(|e| {
+            ToolsetRuntimeError::GrantStoreError {
+                detail: format!("grant_store_path: {e}"),
+            }
+        }),
+    }
+}
+
+fn root_lock_error(error: ToolsetInstallError) -> ToolsetRuntimeError {
+    match error {
+        ToolsetInstallError::Busy => ToolsetRuntimeError::CoordinationBusy,
+        other => ToolsetRuntimeError::Io(install_error_kind_str(&other)),
+    }
+}
+
+fn grant_store_open_error(error: ApprovalError) -> ToolsetRuntimeError {
+    match error {
+        ApprovalError::WriterLocked => ToolsetRuntimeError::CoordinationBusy,
+        other => ToolsetRuntimeError::GrantStoreError {
+            detail: format!("open: {other}"),
+        },
+    }
+}
+
 /// The GATED resolver for toolset-routed `sign-payment` invocations.
 ///
 /// This is a **DISTINCT entry point** from [`resolve_toolset_and_check`] — it is
@@ -545,9 +890,16 @@ pub enum GatedResolveOutcome {
 ///    from the current installation.
 ///    If none → queue `ToolsetFirstInvokeGate` approval, return
 ///    [`GatedResolveOutcome::FirstInvokeApprovalRequired`], REFUSE.
-/// 3. On grant match → return [`GatedResolveOutcome::Resolved`]. The CALLER
-///    MUST then route to `stellar_pay_commit` with the per-action
-///    `PaymentSimulated` approval FORCED ON UNCONDITIONALLY.
+/// 3. On grant match → return [`GatedResolveOutcome::Resolved`] with the
+///    [`VerifiedToolsetGrant`]. The CALLER MUST then route to
+///    `stellar_pay_commit` with the per-action `PaymentSimulated` approval
+///    FORCED ON UNCONDITIONALLY.
+///
+/// # Locks
+///
+/// Steps 1 and 2 hold the shared root lock, and step 2 the exclusive grant
+/// lock, each taken without waiting and created when absent. Both release
+/// before a first-invoke approval is queued.
 ///
 /// # Security
 ///
@@ -574,6 +926,8 @@ pub enum GatedResolveOutcome {
 /// - [`ToolsetRuntimeError::UnknownToolsetAction`]: action not in the gated matrix.
 /// - [`ToolsetRuntimeError::CapabilityNotDeclared`]: `sign-payment` not declared.
 /// - [`ToolsetRuntimeError::ToolNotAllowed`]: tool excluded by `allowed_tools`.
+/// - [`ToolsetRuntimeError::CoordinationBusy`]: an install, uninstall, or grant
+///   writer holds the root or grant lock, or a grant lease holds the grant lock.
 /// - [`ToolsetRuntimeError::GrantStoreError`]: I/O error accessing the grant store.
 /// - [`ToolsetRuntimeError::Io`]: I/O error accessing the pending-approval store.
 ///
@@ -596,110 +950,53 @@ pub fn resolve_toolset_sign_payment_gated(
     stellar_agent_toolsets_install::validate_package_name(toolset_name)
         .map_err(|_| ToolsetRuntimeError::ToolsetNotInstalled)?;
 
-    // ── Step 0b: Read and verify pin ONCE (TOCTOU avoidance) ─────────────────
-    let pin = read_verified_pin(toolset_name, params.toolsets_root, params.pin_key)?;
-    verify_manifest_digest(toolset_name, params.toolsets_root, &pin)?;
-
-    // ── Step 1: Gated four-part check ─────────────────────────────────────────
-    //
-    // Part (a): action must resolve in the GATED matrix (not the ungated one).
-    // The gated matrix returns (tool_name, granting_capability) for sign-payment.
-    let (tool_name, granting_capability) = resolve_gated_action(action)?;
-
-    // Part (b): tool_name IS in the gated matrix by construction (implied by (a)).
-
-    // Part (c): granting_capability must be in the toolset's declared CapabilitySet.
-    if !pin.capabilities.contains(granting_capability) {
-        return Err(ToolsetRuntimeError::CapabilityNotDeclared {
-            action: sanitise_display(action, 128),
-            capability: granting_capability.to_string(),
-        });
-    }
-
-    // Part (d): tool must be in allowed_tools (intersective narrowing).
-    if !allowed_by_narrowing(&pin.allowed_tools, tool_name) {
-        return Err(ToolsetRuntimeError::ToolNotAllowed {
-            tool: sanitise_display(tool_name, 128),
-            action: sanitise_display(action, 128),
-        });
-    }
-
-    // Reject non-positive authoritative amounts before ANY grant-store lookup.
-    // A zero or negative amount from the decoded envelope is structurally invalid
-    // for a payment. Checking here fails closed on BOTH the grant-hit and the
-    // no-grant paths: a grant covering the [0, N] bucket would otherwise match a
-    // zero-stroop invoke and resolve to the signing tool. The caller's
-    // authoritative envelope decode is not trusted to have enforced positivity.
+    // ── Step 1: Under the shared root lock, read and verify the pin ONCE and
+    // run the gated four-part check ────────────────────────────────────────────
+    let root_lock = lock_toolsets_shared(params.toolsets_root)
+        .map_err(root_lock_error)?
+        .ok_or(ToolsetRuntimeError::ToolsetNotInstalled)?;
+    let GatedInstall {
+        pin,
+        tool_name,
+        capability: granting_capability,
+    } = verify_gated_install(
+        toolset_name,
+        action,
+        params.toolsets_root,
+        params.pin_key,
+        params.authoritative_amount_stroops,
+    )?;
     let amount = params.authoritative_amount_stroops;
-    if amount <= 0 {
-        return Err(ToolsetRuntimeError::InvalidAuthoritativeAmount);
-    }
 
     // ── Step 2: First-invoke gate check ──────────────────────────────────────
     //
-    // Load the grant store and look for a verified, current grant from the
-    // current installation.
+    // Under the exclusive grant lock, look for a verified, current grant
+    // from the current installation.
     // All matching is computed from the AUTHORITATIVE envelope params.
-    let grant_store_path = {
-        #[cfg(feature = "test-helpers")]
-        {
-            if let Some(ref p) = params.grant_store_path_override {
-                p.clone()
-            } else {
-                default_toolset_grants_path(params.profile_name).map_err(|e| {
-                    ToolsetRuntimeError::GrantStoreError {
-                        detail: format!("grant_store_path: {e}"),
-                    }
-                })?
-            }
-        }
-        #[cfg(not(feature = "test-helpers"))]
-        {
-            default_toolset_grants_path(params.profile_name).map_err(|e| {
-                ToolsetRuntimeError::GrantStoreError {
-                    detail: format!("grant_store_path: {e}"),
-                }
-            })?
-        }
+    #[cfg(feature = "test-helpers")]
+    let override_path = params.grant_store_path_override.clone();
+    #[cfg(not(feature = "test-helpers"))]
+    let override_path = None;
+    let invocation = GrantInvocation {
+        profile_name: params.profile_name.to_owned(),
+        chain_id: params.attestation_binding.chain_id.to_owned(),
+        toolset_name: toolset_name.to_owned(),
+        action: action.to_owned(),
+        destination: params.authoritative_destination.to_owned(),
+        asset: params.authoritative_asset.to_owned(),
+        amount_stroops: amount,
+        toolsets_root: params.toolsets_root.to_path_buf(),
+        grant_store_path: grant_store_path(params.profile_name, override_path)?,
     };
-
     let grant_store =
-        ToolsetGrantStore::open(grant_store_path, params.now_unix_ms).map_err(|e| {
-            ToolsetRuntimeError::GrantStoreError {
-                detail: format!("open: {e}"),
-            }
-        })?;
+        ToolsetGrantStore::open(invocation.grant_store_path.clone(), params.now_unix_ms)
+            .map_err(grant_store_open_error)?;
 
     let capability_str = granting_capability.to_string();
-    let not_before_unix_ms = stellar_agent_core::timefmt::parse_rfc3339_utc(&pin.installed_at)
-        .map_or_else(
-            || {
-                tracing::warn!(
-                    toolset = %toolset_name,
-                    "first-invoke gate: the pin's install time does not parse; honoring no grant"
-                );
-                u64::MAX
-            },
-            |installed_secs| (installed_secs + 1) * 1_000,
-        );
-    let matching_grant = grant_store.find_matching(
-        &GrantQuery {
-            toolset_name,
-            install_id: &pin.install_id,
-            package_version: &pin.version,
-            package_shasum: &pin.shasum,
-            capability: &capability_str,
-            destination: params.authoritative_destination,
-            asset: params.authoritative_asset,
-            amount_stroops: params.authoritative_amount_stroops,
-            now_unix_ms: params.now_unix_ms,
-            not_before_unix_ms,
-        },
-        params.attestation_key,
-        params.attestation_binding,
-    );
-
-    if matching_grant.is_some() {
+    let query = grant_query(&invocation, &pin, &capability_str, params.now_unix_ms);
+    if let Some(grant) =
+        grant_store.find_matching(&query, params.attestation_key, params.attestation_binding)
+    {
         // Grant found — the first-invoke gate is short-circuited.
         // The CALLER MUST force the per-action PaymentSimulated approval
         // unconditionally (Override Allow → RequireApproval).
@@ -708,11 +1005,20 @@ pub fn resolve_toolset_sign_payment_gated(
             capability = %capability_str,
             "first-invoke gate: matching grant found; routing to gated tool (per-action approval will be forced on by caller)"
         );
-        return Ok(GatedResolveOutcome::Resolved { tool_name });
+        let grant = Box::new(VerifiedToolsetGrant {
+            grant: grant.clone(),
+            pin,
+            invocation,
+        });
+        return Ok(GatedResolveOutcome::Resolved { tool_name, grant });
     }
 
     // ── No current grant: queue the first-invoke gate approval ───────────────
-    // (Non-positive amounts were already rejected before the grant lookup.)
+    // Both locks release first, so a grant writer is never held up behind
+    // the pending-approval store.
+    drop((grant_store, root_lock));
+    #[cfg(test)]
+    tests::before_first_invoke_queue();
 
     // Compute the bucket bounds from the authoritative amount. Conservative:
     // the bucket is the range [0, amount] — any future invoke with amount >
@@ -815,6 +1121,8 @@ pub type GrantStorePathOverride = Option<std::path::PathBuf>;
 /// # Errors
 ///
 /// - [`ToolsetRuntimeError::BindingMismatch`] when the binding names another profile.
+/// - [`ToolsetRuntimeError::CoordinationBusy`] while another grant writer or a
+///   grant lease holds the grant lock.
 /// - [`ToolsetRuntimeError::GrantStoreError`] on grant store I/O failure.
 #[allow(clippy::too_many_arguments)]
 pub fn record_first_invoke_grant(
@@ -859,21 +1167,9 @@ pub fn record_first_invoke_grant(
         detail: format!("build_attested_grant: {e}"),
     })?;
 
-    let grant_store_path = if let Some(p) = grant_store_path_override {
-        p
-    } else {
-        default_toolset_grants_path(profile_name).map_err(|e| {
-            ToolsetRuntimeError::GrantStoreError {
-                detail: format!("grant_store_path: {e}"),
-            }
-        })?
-    };
-
-    let mut store = ToolsetGrantStore::open(grant_store_path, now_unix_ms).map_err(|e| {
-        ToolsetRuntimeError::GrantStoreError {
-            detail: format!("open: {e}"),
-        }
-    })?;
+    let grant_store_path = grant_store_path(profile_name, grant_store_path_override)?;
+    let mut store =
+        ToolsetGrantStore::open(grant_store_path, now_unix_ms).map_err(grant_store_open_error)?;
 
     let grant_clone = grant.clone();
     store
@@ -959,6 +1255,21 @@ fn install_error_kind_str(e: &ToolsetInstallError) -> String {
 )]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// Runs on the resolver's thread just before it opens the
+        /// pending-approval store on a first-invoke miss.
+        static BEFORE_FIRST_INVOKE_QUEUE: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn before_first_invoke_queue() {
+        BEFORE_FIRST_INVOKE_QUEUE.with_borrow_mut(|hook| {
+            if let Some(hook) = hook {
+                hook();
+            }
+        });
+    }
 
     /// The pin key every fixture record is tagged under.
     fn test_pin_key() -> &'static PinKey {
@@ -1859,7 +2170,11 @@ mod tests {
             }
         }
 
-        fn record_grant(&self) {
+        fn record_grant(&self) -> ToolsetGrant {
+            self.record_grant_result().unwrap()
+        }
+
+        fn record_grant_result(&self) -> Result<ToolsetGrant, ToolsetRuntimeError> {
             let profile = stellar_agent_core::profile::schema::Profile::builder_testnet(
                 "svc", "test", "nonce", "test",
             )
@@ -1883,7 +2198,61 @@ mod tests {
                 &context.binding(),
                 self.params().grant_store_path_override,
             )
-            .unwrap();
+        }
+
+        /// Resolves the fixture invocation, which must find a grant.
+        fn resolve(&self) -> VerifiedToolsetGrant {
+            match resolve_toolset_sign_payment_gated(&self.params()).unwrap() {
+                GatedResolveOutcome::Resolved {
+                    tool_name: "stellar_pay_commit",
+                    grant,
+                } => *grant,
+                other => panic!("expected Resolved: {other:?}"),
+            }
+        }
+
+        fn recheck_params(&self) -> GrantRecheckParams<'_> {
+            let params = self.params();
+            GrantRecheckParams {
+                toolset_name: params.toolset_name,
+                action: params.action,
+                toolsets_root: params.toolsets_root,
+                profile_name: params.profile_name,
+                attestation_key: params.attestation_key,
+                attestation_binding: params.attestation_binding,
+                authoritative_destination: params.authoritative_destination,
+                authoritative_asset: params.authoritative_asset,
+                authoritative_amount_stroops: params.authoritative_amount_stroops,
+                pin_key: params.pin_key,
+                grant_store_path_override: params.grant_store_path_override,
+            }
+        }
+
+        /// Acquires a lease with the clock fixed at [`Self::NOW_MS`].
+        fn lease(
+            &self,
+            token: &VerifiedToolsetGrant,
+        ) -> Result<ToolsetGrantLease, ToolsetRuntimeError> {
+            acquire_lease_with_clock(token, &self.recheck_params(), &mut || Ok(Self::NOW_MS))
+        }
+
+        fn recheck(&self, token: &VerifiedToolsetGrant) -> Result<(), ToolsetRuntimeError> {
+            recheck_at_fixture_time(token, &self.recheck_params())
+        }
+
+        fn grants_path(&self) -> PathBuf {
+            self.dir.path().join("grants.toml")
+        }
+
+        fn approval_count(&self) -> usize {
+            let path = self.dir.path().join("approvals").join("test.toml");
+            if !path.exists() {
+                return 0;
+            }
+            stellar_agent_core::approval::PendingApprovalStore::open(path)
+                .unwrap()
+                .snapshot(0)
+                .len()
         }
 
         fn set_install_time(&self, installed_at: &str) {
@@ -2042,13 +2411,10 @@ attestation_version = 3
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let fixture = GatedGrantFixture::new();
-        fixture.record_grant();
-        assert!(matches!(
-            resolve_toolset_sign_payment_gated(&fixture.params()).unwrap(),
-            GatedResolveOutcome::Resolved {
-                tool_name: "stellar_pay_commit"
-            }
-        ));
+        let recorded = fixture.record_grant();
+        let grant = fixture.resolve();
+        assert_eq!(grant.grant_id(), recorded.grant_id);
+        assert_eq!(grant.expires_at_unix_ms(), recorded.expires_at_unix_ms);
     }
 
     #[test]
@@ -2355,7 +2721,7 @@ attestation_version = 3
         let uid = process_uid_for_attestation().unwrap();
 
         // Write a matching grant to the grant store before calling the resolver.
-        record_first_invoke_grant(
+        let recorded = record_first_invoke_grant(
             "test",
             "pay-toolset",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -2396,8 +2762,14 @@ attestation_version = 3
 
         let outcome = resolve_toolset_sign_payment_gated(&params).unwrap();
         match outcome {
-            GatedResolveOutcome::Resolved { tool_name } => {
+            GatedResolveOutcome::Resolved { tool_name, grant } => {
                 assert_eq!(tool_name, "stellar_pay_commit");
+                assert_eq!(grant.grant_id(), recorded.grant_id);
+                assert_eq!(
+                    grant.expires_at_unix_ms(),
+                    now_unix_ms + TOOLSET_GRANT_DEFAULT_TTL_MS
+                );
+                assert_eq!(grant.pin().install_id, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
             }
             GatedResolveOutcome::FirstInvokeApprovalRequired { .. } => {
                 panic!("expected Resolved, got FirstInvokeApprovalRequired");
@@ -2500,7 +2872,7 @@ attestation_version = 3
         let attestation_key = [0u8; 32];
         let uid = process_uid_for_attestation().unwrap();
 
-        record_first_invoke_grant(
+        let recorded = record_first_invoke_grant(
             "test",
             "rule-toolset",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -2541,8 +2913,12 @@ attestation_version = 3
 
         let outcome = resolve_toolset_sign_payment_gated(&params).unwrap();
         match outcome {
-            GatedResolveOutcome::Resolved { tool_name } => {
+            GatedResolveOutcome::Resolved { tool_name, grant } => {
                 assert_eq!(tool_name, "stellar_rule_create_commit");
+                assert_eq!(grant.grant_id(), recorded.grant_id);
+                assert_eq!(grant.expires_at_unix_ms(), recorded.expires_at_unix_ms);
+                assert_eq!(grant.grant.destination(), smart_account);
+                assert_eq!(grant.grant.asset, SIGN_RULE_CREATE_ASSET_SENTINEL);
             }
             GatedResolveOutcome::FirstInvokeApprovalRequired { .. } => {
                 panic!("expected Resolved, got FirstInvokeApprovalRequired");
@@ -2950,69 +3326,114 @@ attestation_version = 3
         assert!(found.is_some(), "persisted grant must be findable in store");
     }
 
-    #[test]
+    /// A signed `pay-toolset` 1.0.0 package and its trust files in a toolsets
+    /// root. The package bytes and signature are deterministic, so another
+    /// process rebuilds the same package for the same root.
     #[cfg(feature = "test-helpers")]
-    fn a_grant_approved_for_an_earlier_install_is_not_honored() {
-        use ed25519_dalek::{Signer as _, SigningKey};
-        use std::io::Write as _;
-        use stellar_agent_core::approval::{ApprovalKind, PendingApprovalStore};
-        use stellar_agent_toolsets_install::{
-            InstallOptions, install_toolset, lock_toolsets, read_pin, sha256_hex_of,
-        };
+    struct SignedInstall {
+        root: PathBuf,
+        package: Vec<u8>,
+        shasum: String,
+        signature: [u8; 64],
+        publisher: [u8; 32],
+    }
 
-        let fixture = GatedGrantFixture::new();
-        let manifest = b"---\nname: pay-toolset\ndescription: test payment toolset\nmetadata:\n  stellar-agent-capabilities: sign-payment\n---\nBody.\n";
-        let mut archive = tar::Builder::new(Vec::new());
-        let mut header = tar::Header::new_gnu();
-        header.set_size(u64::try_from(manifest.len()).unwrap());
-        header.set_mode(0o644);
-        header.set_cksum();
-        archive
-            .append_data(&mut header, "pay-toolset/TOOLSET.md", &manifest[..])
+    #[cfg(feature = "test-helpers")]
+    impl SignedInstall {
+        /// Builds the package and writes its trust files in `root`.
+        fn new(root: &Path) -> Self {
+            let signed = Self::package(root);
+            std::fs::write(
+                root.join("trust.txt"),
+                stellar_strkey::ed25519::PublicKey(signed.publisher).to_string(),
+            )
             .unwrap();
-        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        encoder.write_all(&archive.into_inner().unwrap()).unwrap();
-        let package = encoder.finish().unwrap();
-        let shasum = sha256_hex_of(&package);
-        let signer = SigningKey::from_bytes(&[17; 32]);
-        let publisher = signer.verifying_key().to_bytes();
-        let signature = signer
-            .sign(&stellar_agent_toolsets_install::signature::build_preimage(
+            std::fs::write(root.join("auditor-trust.txt"), "").unwrap();
+            signed
+        }
+
+        /// Builds the package for a root whose trust files exist.
+        fn package(root: &Path) -> Self {
+            use ed25519_dalek::{Signer as _, SigningKey};
+            use std::io::Write as _;
+
+            let manifest = b"---\nname: pay-toolset\ndescription: test payment toolset\nmetadata:\n  stellar-agent-capabilities: sign-payment\n---\nBody.\n";
+            let mut archive = tar::Builder::new(Vec::new());
+            let mut header = tar::Header::new_gnu();
+            header.set_size(u64::try_from(manifest.len()).unwrap());
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, "pay-toolset/TOOLSET.md", &manifest[..])
+                .unwrap();
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(&archive.into_inner().unwrap()).unwrap();
+            let package = encoder.finish().unwrap();
+            let shasum = stellar_agent_toolsets_install::sha256_hex_of(&package);
+            let signer = SigningKey::from_bytes(&[17; 32]);
+            let publisher = signer.verifying_key().to_bytes();
+            let signature = signer
+                .sign(&stellar_agent_toolsets_install::signature::build_preimage(
+                    "pay-toolset",
+                    "1.0.0",
+                    &shasum,
+                ))
+                .to_bytes();
+            Self {
+                root: root.to_path_buf(),
+                package,
+                shasum,
+                signature,
+                publisher,
+            }
+        }
+
+        /// Forces an install under the exclusive root lock.
+        fn try_install(&self) -> Result<(), ToolsetInstallError> {
+            let lock = stellar_agent_toolsets_install::lock_toolsets(&self.root)?;
+            stellar_agent_toolsets_install::install_toolset(
                 "pay-toolset",
                 "1.0.0",
-                &shasum,
-            ))
-            .to_bytes();
-        let trust = fixture.dir.path().join("trust.txt");
-        std::fs::write(
-            &trust,
-            stellar_strkey::ed25519::PublicKey(publisher).to_string(),
-        )
-        .unwrap();
-        let auditor_trust = fixture.dir.path().join("auditor-trust.txt");
-        std::fs::write(&auditor_trust, "").unwrap();
-        let install = || {
-            let lock = lock_toolsets(fixture.dir.path()).unwrap();
-            install_toolset(
-                "pay-toolset",
-                "1.0.0",
-                &package,
-                &shasum,
-                &signature,
-                &publisher,
-                fixture.dir.path(),
-                &trust,
+                &self.package,
+                &self.shasum,
+                &self.signature,
+                &self.publisher,
+                &self.root,
+                &self.root.join("trust.txt"),
                 None,
-                &auditor_trust,
-                &InstallOptions {
+                &self.root.join("auditor-trust.txt"),
+                &stellar_agent_toolsets_install::InstallOptions {
                     force: true,
                     override_attestation: true,
-                    ..InstallOptions::default()
+                    ..stellar_agent_toolsets_install::InstallOptions::default()
                 },
                 &lock,
                 test_pin_key(),
             )
-            .unwrap();
+            .map(drop)
+        }
+
+        /// Uninstalls under the exclusive root lock.
+        fn uninstall(&self) -> Result<(), ToolsetInstallError> {
+            let lock = stellar_agent_toolsets_install::lock_toolsets(&self.root)?;
+            stellar_agent_toolsets_install::uninstall_toolset("pay-toolset", &self.root, &lock)
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "test-helpers")]
+    #[serial_test::serial]
+    fn a_grant_approved_for_an_earlier_install_is_not_honored() {
+        use stellar_agent_core::approval::{ApprovalKind, PendingApprovalStore};
+        use stellar_agent_toolsets_install::read_pin;
+
+        let _storage = storage_guard();
+        let fixture = GatedGrantFixture::new();
+        let signed = SignedInstall::new(fixture.dir.path());
+        let try_install = || signed.try_install();
+        let install = || {
+            try_install().unwrap();
             // Both authentic pins carry the same second, independent of test duration.
             fixture.set_install_time("2026-01-01T00:00:00Z");
             read_pin("pay-toolset", fixture.dir.path(), Some(test_pin_key()))
@@ -3086,6 +3507,59 @@ attestation_version = 3
         assert_eq!(install_id, &pin_b.install_id);
         assert_eq!(package_version, &pin_b.version);
         assert_eq!(package_shasum, &pin_b.shasum);
+        drop(store);
+
+        // A lease on installation B's grant holds off a forced reinstall, an
+        // uninstall, and every grant writer; each leaves the pin unchanged.
+        record_first_invoke_grant(
+            "test",
+            "pay-toolset",
+            &pin_b.install_id,
+            &pin_b.version,
+            &pin_b.shasum,
+            "sign-payment",
+            GatedGrantFixture::DESTINATION,
+            "XLM",
+            0,
+            10,
+            "1000",
+            GatedGrantFixture::NOW_MS,
+            &GatedGrantFixture::KEY,
+            &fixture.binding,
+            Some(fixture.grants_path()),
+        )
+        .unwrap();
+        let token = fixture.resolve();
+        assert_eq!(token.pin(), &pin_b);
+        let lease = fixture.lease(&token).unwrap();
+        let uninstall = || signed.uninstall();
+        assert!(matches!(try_install(), Err(ToolsetInstallError::Busy)));
+        assert!(matches!(uninstall(), Err(ToolsetInstallError::Busy)));
+        let current = read_pin("pay-toolset", fixture.dir.path(), Some(test_pin_key()));
+        assert_eq!(
+            current.unwrap().unwrap(),
+            pin_b,
+            "the leased pin is unchanged"
+        );
+        assert!(matches!(
+            fixture.record_grant_result(),
+            Err(ToolsetRuntimeError::CoordinationBusy)
+        ));
+        drop(lease);
+
+        let pin_c = install();
+        assert_ne!(pin_c.install_id, pin_b.install_id);
+        let error = fixture.recheck(&token).unwrap_err();
+        assert!(
+            matches!(error, ToolsetRuntimeError::GrantChanged),
+            "{error:?}"
+        );
+        uninstall().unwrap();
+        let error = fixture.recheck(&token).unwrap_err();
+        assert!(
+            matches!(error, ToolsetRuntimeError::ToolsetNotInstalled),
+            "{error:?}"
+        );
     }
 
     #[test]
@@ -3131,5 +3605,890 @@ attestation_version = 3
             assert!(std::error::Error::source(&error).is_none());
         }
         assert!(!untouched.exists(), "neither entry point opens a store");
+    }
+
+    // ── Verified grants, leases, and rechecks ─────────────────────────────────
+
+    /// Every file under `dir` with its bytes; directories appear with no bytes.
+    #[cfg(feature = "test-helpers")]
+    fn tree(dir: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                entries.extend(tree(&path));
+                entries.push((path, None));
+            } else {
+                let bytes = std::fs::read(&path).unwrap();
+                entries.push((path, Some(bytes)));
+            }
+        }
+        entries.sort();
+        entries
+    }
+
+    /// Rechecks with the clock fixed at [`GatedGrantFixture::NOW_MS`].
+    #[cfg(feature = "test-helpers")]
+    fn recheck_at_fixture_time(
+        token: &VerifiedToolsetGrant,
+        params: &GrantRecheckParams<'_>,
+    ) -> Result<(), ToolsetRuntimeError> {
+        acquire_lease_with_clock(token, params, &mut || Ok(GatedGrantFixture::NOW_MS)).map(drop)
+    }
+
+    /// Wallet state confined to a sandbox until the guard and sandbox drop.
+    #[cfg(feature = "test-helpers")]
+    type StorageGuard = (
+        stellar_agent_test_support::StellarAgentHomeGuard,
+        stellar_agent_test_support::sandbox::StateSandbox,
+    );
+
+    #[cfg(feature = "test-helpers")]
+    fn storage_guard() -> StorageGuard {
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let guard = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        (guard, sandbox)
+    }
+
+    /// The fixture with one recorded grant and the token resolving it returns.
+    #[cfg(feature = "test-helpers")]
+    fn leased_fixture() -> (StorageGuard, GatedGrantFixture, VerifiedToolsetGrant) {
+        let storage = storage_guard();
+        let fixture = GatedGrantFixture::new();
+        fixture.record_grant();
+        let token = fixture.resolve();
+        (storage, fixture, token)
+    }
+
+    #[test]
+    #[cfg(feature = "test-helpers")]
+    #[serial_test::serial]
+    fn the_resolved_grant_keeps_its_stored_identity_and_expiry() {
+        let _storage = storage_guard();
+        let fixture = GatedGrantFixture::new();
+        let grant = build_attested_grant(
+            "pay-toolset".to_owned(),
+            "a".repeat(32),
+            "1.0.0".to_owned(),
+            "d".repeat(64),
+            "sign-payment".to_owned(),
+            GatedGrantFixture::DESTINATION.to_owned(),
+            "XLM".to_owned(),
+            0,
+            10,
+            "1000".to_owned(),
+            GatedGrantFixture::NOW_MS,
+            60_000,
+            &GatedGrantFixture::KEY,
+            &fixture.binding,
+        )
+        .unwrap();
+        ToolsetGrantStore::open(fixture.grants_path(), 0)
+            .unwrap()
+            .insert(grant.clone())
+            .unwrap();
+        let mut params = fixture.params();
+        params.now_unix_ms = GatedGrantFixture::NOW_MS + 1_000;
+        let GatedResolveOutcome::Resolved { grant: token, .. } =
+            resolve_toolset_sign_payment_gated(&params).unwrap()
+        else {
+            panic!("the stored grant covers the invocation")
+        };
+        assert_eq!(token.grant_id(), grant.grant_id);
+        assert_eq!(
+            token.expires_at_unix_ms(),
+            GatedGrantFixture::NOW_MS + 60_000
+        );
+        assert_eq!(token.grant, grant);
+        let pin = read_pin("pay-toolset", fixture.dir.path(), Some(test_pin_key()));
+        assert_eq!(token.pin(), &pin.unwrap().unwrap());
+        let rendered = format!("{token:?}");
+        assert!(rendered.contains(&grant.grant_id), "{rendered}");
+        for hidden in [
+            grant.attestation_blob_b64.as_deref().unwrap(),
+            fixture.dir.path().to_str().unwrap(),
+        ] {
+            assert!(!rendered.contains(hidden), "{rendered}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "test-helpers")]
+    #[serial_test::serial]
+    fn the_public_lease_reads_the_system_clock() {
+        let (_storage, fixture, expired) = leased_fixture();
+        let error = acquire_toolset_grant_lease(&expired, &fixture.recheck_params()).unwrap_err();
+        assert!(
+            matches!(error, ToolsetRuntimeError::GrantExpired),
+            "{error:?}"
+        );
+
+        let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+        let recorded = record_first_invoke_grant(
+            "test",
+            "pay-toolset",
+            &"a".repeat(32),
+            "1.0.0",
+            &"d".repeat(64),
+            "sign-payment",
+            GatedGrantFixture::DESTINATION,
+            "XLM",
+            0,
+            10,
+            "1000",
+            now,
+            &GatedGrantFixture::KEY,
+            &fixture.binding,
+            Some(fixture.grants_path()),
+        )
+        .unwrap();
+        let mut params = fixture.params();
+        params.now_unix_ms = now;
+        let GatedResolveOutcome::Resolved { grant: current, .. } =
+            resolve_toolset_sign_payment_gated(&params).unwrap()
+        else {
+            panic!("the current grant covers the invocation")
+        };
+        assert_eq!(current.grant_id(), recorded.grant_id);
+        let lease = acquire_toolset_grant_lease(&current, &fixture.recheck_params()).unwrap();
+        assert_eq!(lease.grant().grant_id(), recorded.grant_id);
+        drop(lease);
+        recheck_toolset_grant(&current, &fixture.recheck_params()).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "test-helpers")]
+    #[serial_test::serial]
+    fn a_lease_holds_off_every_writer_until_it_drops() {
+        fn assert_send<T: Send>() {}
+        assert_send::<ToolsetGrantLease>();
+        let (_sandbox, fixture, token) = leased_fixture();
+        let lease = fixture.lease(&token).unwrap();
+        assert_eq!(lease.grant().grant_id(), token.grant_id());
+        assert_eq!(
+            lease.grant().expires_at_unix_ms(),
+            token.expires_at_unix_ms()
+        );
+        let second = fixture.lease(&token);
+        assert!(second.is_ok(), "two leases coexist: {second:?}");
+        let grants = std::fs::read(fixture.grants_path()).unwrap();
+
+        assert!(matches!(
+            fixture.record_grant_result(),
+            Err(ToolsetRuntimeError::CoordinationBusy)
+        ));
+        assert!(matches!(
+            ToolsetGrantStore::open(fixture.grants_path(), 0),
+            Err(ApprovalError::WriterLocked)
+        ));
+        assert!(matches!(
+            resolve_toolset_sign_payment_gated(&fixture.params()),
+            Err(ToolsetRuntimeError::CoordinationBusy)
+        ));
+        assert!(matches!(
+            stellar_agent_toolsets_install::lock_toolsets(fixture.dir.path()),
+            Err(ToolsetInstallError::Busy)
+        ));
+        assert_eq!(std::fs::read(fixture.grants_path()).unwrap(), grants);
+        assert_eq!(fixture.approval_count(), 0);
+        drop((lease, second));
+
+        fixture.record_grant();
+        drop(stellar_agent_toolsets_install::lock_toolsets(fixture.dir.path()).unwrap());
+        fixture.recheck(&token).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "test-helpers")]
+    #[serial_test::serial]
+    fn a_recheck_refuses_another_invocation() {
+        let (_sandbox, fixture, token) = leased_fixture();
+        let other_binding =
+            stellar_agent_core::approval::AttestationBinding::new("other", "stellar:testnet");
+        let pubnet =
+            stellar_agent_core::approval::AttestationBinding::new("test", "stellar:pubnet");
+        let other_root = tempfile::TempDir::new().unwrap();
+        type Change = fn(&mut GrantRecheckParams<'_>);
+        let changes: [(&str, Change); 7] = [
+            ("toolset", |p| p.toolset_name = "pay-toolset-2"),
+            ("action", |p| p.action = "stellar_rule_create_commit"),
+            ("destination", |p| {
+                p.authoritative_destination =
+                    "GAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQDZ7H";
+            }),
+            ("amount within the bucket", |p| {
+                p.authoritative_amount_stroops = 5;
+            }),
+            ("asset", |p| {
+                p.authoritative_asset =
+                    "USDC:GAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQDZ7H";
+            }),
+            ("grant store", |p| {
+                p.grant_store_path_override = Some(PathBuf::from("other.toml"));
+            }),
+            ("chain", |_| {}),
+        ];
+        let before = tree(fixture.dir.path());
+        for (name, change) in changes {
+            let mut params = fixture.recheck_params();
+            change(&mut params);
+            if name == "chain" {
+                params.attestation_binding = &pubnet;
+            }
+            let error = recheck_at_fixture_time(&token, &params).unwrap_err();
+            assert!(
+                matches!(error, ToolsetRuntimeError::GrantInvocationMismatch),
+                "{name}: {error:?}"
+            );
+        }
+        let mut params = fixture.recheck_params();
+        params.toolsets_root = other_root.path();
+        let error = recheck_at_fixture_time(&token, &params).unwrap_err();
+        assert!(matches!(
+            error,
+            ToolsetRuntimeError::GrantInvocationMismatch
+        ));
+        params = fixture.recheck_params();
+        params.profile_name = "other";
+        params.attestation_binding = &other_binding;
+        let error = recheck_at_fixture_time(&token, &params).unwrap_err();
+        assert!(matches!(
+            error,
+            ToolsetRuntimeError::GrantInvocationMismatch
+        ));
+        params.profile_name = "test";
+        let error = recheck_at_fixture_time(&token, &params).unwrap_err();
+        assert!(matches!(error, ToolsetRuntimeError::BindingMismatch));
+        assert_eq!(tree(fixture.dir.path()), before);
+        assert_eq!(fixture.approval_count(), 0);
+
+        let mut invoke = fixture.params();
+        invoke.authoritative_amount_stroops = 5;
+        let GatedResolveOutcome::Resolved { grant: rebound, .. } =
+            resolve_toolset_sign_payment_gated(&invoke).unwrap()
+        else {
+            panic!("a new resolution binds the new amount")
+        };
+        let mut params = fixture.recheck_params();
+        params.authoritative_amount_stroops = 5;
+        recheck_at_fixture_time(&rebound, &params).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "test-helpers")]
+    #[serial_test::serial]
+    fn a_recheck_finds_only_the_verified_grant_and_installation() {
+        let (_sandbox, fixture, token) = leased_fixture();
+        let recheck = || fixture.recheck(&token);
+
+        // A matching grant stored ahead of the original leaves it valid.
+        let original = std::fs::read_to_string(fixture.grants_path()).unwrap();
+        let mut store = ToolsetGrantStore::open(fixture.grants_path(), 0).unwrap();
+        store.revoke_all().unwrap();
+        drop(store);
+        let replacement = fixture.record_grant();
+        let ahead = std::fs::read_to_string(fixture.grants_path()).unwrap();
+        std::fs::write(
+            fixture.grants_path(),
+            format!("{ahead}\n{}", original.trim_start()),
+        )
+        .unwrap();
+        recheck().unwrap();
+
+        // Only the replacement remains: equal coverage is not the same consent.
+        std::fs::write(fixture.grants_path(), &ahead).unwrap();
+        let error = recheck().unwrap_err();
+        assert!(
+            matches!(error, ToolsetRuntimeError::GrantChanged),
+            "{error:?}"
+        );
+        assert_eq!(fixture.resolve().grant_id(), replacement.grant_id);
+
+        // Revoked.
+        let mut store = ToolsetGrantStore::open(fixture.grants_path(), 0).unwrap();
+        store.revoke_toolset("pay-toolset").unwrap();
+        drop(store);
+        let error = recheck().unwrap_err();
+        assert!(
+            matches!(error, ToolsetRuntimeError::GrantChanged),
+            "{error:?}"
+        );
+
+        // An edited lifetime no longer verifies.
+        std::fs::write(
+            fixture.grants_path(),
+            original.replace("expires_at_unix_ms = ", "expires_at_unix_ms = 1"),
+        )
+        .unwrap();
+        let error = recheck().unwrap_err();
+        assert!(
+            matches!(error, ToolsetRuntimeError::GrantChanged),
+            "{error:?}"
+        );
+        std::fs::write(fixture.grants_path(), &original).unwrap();
+        recheck().unwrap();
+
+        // A new authentic install record is another installation.
+        fixture.set_install_time("1970-01-01T00:00:01Z");
+        let error = recheck().unwrap_err();
+        assert!(
+            matches!(error, ToolsetRuntimeError::GrantChanged),
+            "{error:?}"
+        );
+        fixture.set_install_time("1970-01-01T00:00:00Z");
+        recheck().unwrap();
+
+        // An edited record, capability, or manifest refuses as at resolution.
+        let manifest = fixture.dir.path().join("pay-toolset").join("TOOLSET.md");
+        let manifest_bytes = std::fs::read(&manifest).unwrap();
+        std::fs::write(&manifest, "---\nname: pay-toolset\n---\n").unwrap();
+        let error = recheck().unwrap_err();
+        assert!(matches!(
+            error,
+            ToolsetRuntimeError::ContentDigestMismatch { .. }
+        ));
+        std::fs::remove_file(&manifest).unwrap();
+        let error = recheck().unwrap_err();
+        assert!(matches!(
+            error,
+            ToolsetRuntimeError::ContentDigestMismatch { .. }
+        ));
+        std::fs::write(&manifest, manifest_bytes).unwrap();
+        recheck().unwrap();
+        add_stored_capability(fixture.dir.path(), "pay-toolset", "read-balance");
+        let error = recheck().unwrap_err();
+        assert!(matches!(error, ToolsetRuntimeError::PinUnverifiable { .. }));
+        write_toolset_fixture(
+            fixture.dir.path(),
+            "pay-toolset",
+            "read-balance",
+            vec![],
+            "1970-01-01T00:00:00Z",
+        );
+        let error = recheck().unwrap_err();
+        assert!(
+            matches!(error, ToolsetRuntimeError::CapabilityNotDeclared { .. }),
+            "{error:?}"
+        );
+        write_toolset_fixture(
+            fixture.dir.path(),
+            "pay-toolset",
+            "sign-payment",
+            vec!["stellar_balances".to_owned()],
+            "1970-01-01T00:00:00Z",
+        );
+        let error = recheck().unwrap_err();
+        assert!(
+            matches!(error, ToolsetRuntimeError::ToolNotAllowed { .. }),
+            "{error:?}"
+        );
+        assert_eq!(fixture.approval_count(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "test-helpers")]
+    #[serial_test::serial]
+    fn a_recheck_creates_repairs_and_prunes_nothing() {
+        let (_sandbox, fixture, token) = leased_fixture();
+        let grants = fixture.grants_path();
+        let sidecar = fixture.dir.path().join("grants.toml.lock");
+        let root_lock = fixture.dir.path().join(TOOLSETS_LOCK_FILE_NAME);
+        assert!(
+            sidecar.is_file() && root_lock.is_file(),
+            "resolution made both"
+        );
+        let stored = std::fs::read(&grants).unwrap();
+        let check = |expected: fn(&ToolsetRuntimeError) -> bool, case: &str| {
+            let before = tree(fixture.dir.path());
+            let error = fixture.recheck(&token).unwrap_err();
+            assert!(expected(&error), "{case}: {error:?}");
+            assert_eq!(tree(fixture.dir.path()), before, "{case} changed the tree");
+        };
+
+        std::fs::remove_file(&sidecar).unwrap();
+        check(
+            |e| matches!(e, ToolsetRuntimeError::CoordinationUnavailable),
+            "absent grant sidecar",
+        );
+        std::fs::write(&sidecar, "").unwrap();
+        std::fs::remove_file(&root_lock).unwrap();
+        check(
+            |e| matches!(e, ToolsetRuntimeError::CoordinationUnavailable),
+            "absent root lock",
+        );
+        std::fs::write(&root_lock, "").unwrap();
+        std::fs::remove_file(&grants).unwrap();
+        check(
+            |e| matches!(e, ToolsetRuntimeError::GrantChanged),
+            "absent data file",
+        );
+        std::fs::write(&grants, "[[grants]]\ngrant_id = ").unwrap();
+        check(
+            |e| matches!(e, ToolsetRuntimeError::GrantStoreError { .. }),
+            "malformed data file",
+        );
+        std::fs::remove_file(&grants).unwrap();
+        std::fs::create_dir(&grants).unwrap();
+        check(
+            |e| matches!(e, ToolsetRuntimeError::GrantStoreError { .. }),
+            "unreadable data file",
+        );
+        std::fs::remove_dir(&grants).unwrap();
+        std::fs::write(&grants, &stored).unwrap();
+        let before = tree(fixture.dir.path());
+        let error =
+            acquire_lease_with_clock(&token, &fixture.recheck_params(), &mut || Ok(u64::MAX))
+                .unwrap_err();
+        assert!(matches!(error, ToolsetRuntimeError::GrantExpired));
+        assert_eq!(
+            tree(fixture.dir.path()),
+            before,
+            "an expired grant stays stored"
+        );
+        assert_eq!(fixture.approval_count(), 0);
+
+        // Ordinary resolution of a store without lock files recreates them
+        // and returns the existing grant unchanged, without a prompt.
+        std::fs::remove_file(&sidecar).unwrap();
+        std::fs::remove_file(&root_lock).unwrap();
+        let again = fixture.resolve();
+        assert_eq!(again.grant_id(), token.grant_id());
+        assert!(sidecar.is_file() && root_lock.is_file());
+        assert_eq!(std::fs::read(&grants).unwrap(), stored);
+        fixture.recheck(&token).unwrap();
+        assert_eq!(fixture.approval_count(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "test-helpers")]
+    #[serial_test::serial]
+    fn a_lease_reads_a_fresh_clock_under_its_locks_and_never_renews() {
+        let (_sandbox, fixture, token) = leased_fixture();
+        let expiry = token.expires_at_unix_ms();
+        let issued = token.grant.granted_at_unix_ms;
+        let stored = std::fs::read(fixture.grants_path()).unwrap();
+        let acquire = |samples: &[u64]| {
+            let mut samples = samples.iter().copied();
+            acquire_lease_with_clock(&token, &fixture.recheck_params(), &mut || {
+                assert!(
+                    matches!(
+                        ToolsetGrantStore::open(fixture.grants_path(), 0),
+                        Err(ApprovalError::WriterLocked)
+                    ),
+                    "the clock is read while the grant lock is held"
+                );
+                samples
+                    .next()
+                    .ok_or_else(|| ToolsetRuntimeError::Io("clock_unavailable".to_owned()))
+            })
+        };
+        let lease = acquire(&[expiry - 1, expiry - 1]).unwrap();
+        assert_eq!(lease.grant().expires_at_unix_ms(), expiry);
+        drop(lease);
+        for (samples, case) in [
+            (&[expiry][..], "at expiry"),
+            (&[expiry + 1][..], "after expiry"),
+            (&[expiry - 1, expiry][..], "expiry crossed before return"),
+        ] {
+            let error = acquire(samples).unwrap_err();
+            assert!(
+                matches!(error, ToolsetRuntimeError::GrantExpired),
+                "{case}: {error:?}"
+            );
+        }
+        let error = acquire(&[issued - 1, issued - 1]).unwrap_err();
+        assert!(
+            matches!(error, ToolsetRuntimeError::GrantChanged),
+            "a clock before the issue time verifies no grant: {error:?}"
+        );
+        let error = acquire(&[]).unwrap_err();
+        assert_eq!(error.to_string(), "toolset.io_error: clock_unavailable");
+        let error = acquire(&[expiry - 1]).unwrap_err();
+        assert_eq!(error.to_string(), "toolset.io_error: clock_unavailable");
+        assert_eq!(std::fs::read(fixture.grants_path()).unwrap(), stored);
+        assert_eq!(token.expires_at_unix_ms(), expiry);
+        assert_eq!(fixture.approval_count(), 0);
+        drop(ToolsetGrantStore::open(fixture.grants_path(), 0).unwrap());
+    }
+
+    #[test]
+    #[cfg(feature = "test-helpers")]
+    #[serial_test::serial]
+    fn a_first_invoke_miss_releases_both_locks_before_queueing() {
+        let _storage = storage_guard();
+        let fixture = GatedGrantFixture::new();
+        let grants = fixture.grants_path();
+        let root = fixture.dir.path().to_path_buf();
+        let ran = std::rc::Rc::new(std::cell::Cell::new(false));
+        let seen = std::rc::Rc::clone(&ran);
+        BEFORE_FIRST_INVOKE_QUEUE.set(Some(Box::new(move || {
+            ToolsetGrantStore::open(grants.clone(), 0)
+                .expect("a grant writer opens while queueing");
+            drop(
+                stellar_agent_toolsets_install::lock_toolsets(&root).expect("an install proceeds"),
+            );
+            seen.set(true);
+        })));
+        let outcome = resolve_toolset_sign_payment_gated(&fixture.params());
+        BEFORE_FIRST_INVOKE_QUEUE.set(None);
+        assert!(matches!(
+            outcome.unwrap(),
+            GatedResolveOutcome::FirstInvokeApprovalRequired { .. }
+        ));
+        assert!(ran.get(), "the hook ran before the approval store opened");
+        assert_eq!(fixture.approval_count(), 1);
+    }
+
+    // ── Locks across processes ────────────────────────────────────────────────
+
+    #[cfg(feature = "test-helpers")]
+    const LOCK_PROCESS_TEST: &str = "tests::lease_and_writer_locks_hold_across_processes";
+    #[cfg(feature = "test-helpers")]
+    const LOCK_PROCESS_ROLE: &str = "TOOLSET_LOCK_PROCESS_ROLE";
+    #[cfg(feature = "test-helpers")]
+    const LOCK_PROCESS_ROOT: &str = "TOOLSET_LOCK_PROCESS_ROOT";
+
+    /// Records the fixture grant terms for `pin` in the grant store of `root`.
+    #[cfg(feature = "test-helpers")]
+    fn record_grant_for(
+        root: &Path,
+        pin: &ToolsetPinRecord,
+    ) -> Result<ToolsetGrant, ToolsetRuntimeError> {
+        record_first_invoke_grant(
+            "test",
+            "pay-toolset",
+            &pin.install_id,
+            &pin.version,
+            &pin.shasum,
+            "sign-payment",
+            GatedGrantFixture::DESTINATION,
+            "XLM",
+            0,
+            10,
+            "1000",
+            GatedGrantFixture::NOW_MS,
+            &GatedGrantFixture::KEY,
+            &stellar_agent_core::approval::AttestationBinding::new("test", "stellar:testnet"),
+            Some(root.join("grants.toml")),
+        )
+    }
+
+    /// Every file under `root` with its bytes, except the lock files.
+    #[cfg(feature = "test-helpers")]
+    fn protected_files(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+        tree(root)
+            .into_iter()
+            .filter(|(path, _)| path.extension().is_none_or(|ext| ext != "lock"))
+            .collect()
+    }
+
+    /// A copy of this test binary in one role, synchronized through its
+    /// standard input and output pipes.
+    #[cfg(feature = "test-helpers")]
+    struct LockPeer {
+        role: &'static str,
+        child: std::process::Child,
+        stdout: std::io::BufReader<std::process::ChildStdout>,
+    }
+
+    #[cfg(feature = "test-helpers")]
+    impl LockPeer {
+        fn spawn(role: &'static str, root: &Path, home: &Path) -> Self {
+            use std::process::{Command, Stdio};
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", LOCK_PROCESS_TEST, "--nocapture"])
+                .env(LOCK_PROCESS_ROLE, role)
+                .env(LOCK_PROCESS_ROOT, root)
+                .env("STELLAR_AGENT_HOME", home)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+            Self {
+                role,
+                child,
+                stdout,
+            }
+        }
+
+        /// Reads the child's output through the line `marker`.
+        fn wait_for(&mut self, marker: &str) {
+            use std::io::BufRead as _;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if self.stdout.read_line(&mut line).unwrap() == 0 {
+                    let (_, report) = self.finish();
+                    panic!("{report}; the child printed no {marker} line");
+                }
+                if line.trim() == marker {
+                    return;
+                }
+            }
+        }
+
+        /// Sends the byte the child waits for.
+        fn release(&mut self) {
+            use std::io::Write as _;
+            let stdin = self.child.stdin.as_mut().unwrap();
+            stdin.write_all(b"1").unwrap();
+            stdin.flush().unwrap();
+        }
+
+        /// Waits for the child's exit and describes its status and stderr.
+        fn finish(&mut self) -> (std::process::ExitStatus, String) {
+            use std::io::Read as _;
+            drop(self.child.stdin.take());
+            let mut stderr = String::new();
+            if let Some(mut pipe) = self.child.stderr.take() {
+                pipe.read_to_string(&mut stderr).unwrap();
+            }
+            let status = self.child.wait().unwrap();
+            let report = format!("child {}: {status}; stderr: {stderr}", self.role);
+            (status, report)
+        }
+    }
+
+    #[cfg(feature = "test-helpers")]
+    fn signal_parent(marker: &str) {
+        use std::io::Write as _;
+        let mut output = std::io::stdout();
+        writeln!(output, "{marker}").unwrap();
+        output.flush().unwrap();
+    }
+
+    #[cfg(feature = "test-helpers")]
+    fn await_parent() {
+        use std::io::Read as _;
+        std::io::stdin().read_exact(&mut [0]).unwrap();
+    }
+
+    /// Signals that a lock is held, then exits on the parent's byte without
+    /// running the destructor of the caller's guard.
+    #[cfg(feature = "test-helpers")]
+    fn exit_holding_the_lock() -> ! {
+        signal_parent("locked");
+        await_parent();
+        std::process::exit(0)
+    }
+
+    /// The child side of [`lease_and_writer_locks_hold_across_processes`].
+    #[cfg(feature = "test-helpers")]
+    fn lock_process_child(role: &str, root: &Path) {
+        let grants = root.join("grants.toml");
+        match role {
+            "writers" => {
+                let signed = SignedInstall::package(root);
+                let pin = stellar_agent_toolsets_install::read_pin(
+                    "pay-toolset",
+                    root,
+                    Some(test_pin_key()),
+                )
+                .unwrap()
+                .unwrap();
+                let install = signed.try_install();
+                assert!(
+                    matches!(install, Err(ToolsetInstallError::Busy)),
+                    "a forced install refuses during the lease: {install:?}"
+                );
+                let uninstall = signed.uninstall();
+                assert!(
+                    matches!(uninstall, Err(ToolsetInstallError::Busy)),
+                    "an uninstall refuses during the lease: {uninstall:?}"
+                );
+                let recorded = record_grant_for(root, &pin);
+                assert!(
+                    matches!(recorded, Err(ToolsetRuntimeError::CoordinationBusy)),
+                    "grant recording refuses during the lease: {recorded:?}"
+                );
+                let revoker = ToolsetGrantStore::open(grants.clone(), 0);
+                assert!(
+                    matches!(revoker, Err(ApprovalError::WriterLocked)),
+                    "revocation refuses during the lease: {revoker:?}"
+                );
+                signal_parent("refused");
+                await_parent();
+                record_grant_for(root, &pin).unwrap();
+                signal_parent("recorded");
+                await_parent();
+                let removed = ToolsetGrantStore::open(grants, 0)
+                    .unwrap()
+                    .revoke_toolset("pay-toolset")
+                    .unwrap();
+                assert_eq!(removed, 2, "revocation removes both grants");
+                signal_parent("revoked");
+                await_parent();
+                signed.try_install().unwrap();
+                signal_parent("reinstalled");
+                await_parent();
+                signed.uninstall().unwrap();
+                signal_parent("uninstalled");
+            }
+            "root" => {
+                let _held = stellar_agent_toolsets_install::lock_toolsets(root).unwrap();
+                exit_holding_the_lock();
+            }
+            "grants" => {
+                let _held = ToolsetGrantStore::open(grants, 0).unwrap();
+                exit_holding_the_lock();
+            }
+            "approvals" => {
+                let _held = stellar_agent_core::approval::PendingApprovalStore::open(
+                    root.join("approvals").join("test.toml"),
+                )
+                .unwrap();
+                exit_holding_the_lock();
+            }
+            other => panic!("unknown role {other}"),
+        }
+    }
+
+    /// The shared lease and the exclusive writers exclude each other across
+    /// processes. A child that exits holding a lock releases it, and the
+    /// resolver releases both locks before it waits on the approval store.
+    #[test]
+    #[cfg(feature = "test-helpers")]
+    #[serial_test::serial]
+    #[allow(clippy::too_many_lines)]
+    fn lease_and_writer_locks_hold_across_processes() {
+        use stellar_agent_core::approval::PendingApprovalStore;
+
+        if let (Ok(role), Some(root)) = (
+            std::env::var(LOCK_PROCESS_ROLE),
+            std::env::var_os(LOCK_PROCESS_ROOT),
+        ) {
+            lock_process_child(&role, Path::new(&root));
+            return;
+        }
+        let storage = storage_guard();
+        let home = storage.1.path().join("child-home");
+        stellar_agent_test_support::sandbox::mark_sandbox(&home).unwrap();
+        let fixture = GatedGrantFixture::new();
+        let root = fixture.dir.path();
+        let signed = SignedInstall::new(root);
+        let install = || {
+            signed.try_install().unwrap();
+            // Grants recorded at the fixture time postdate this install.
+            fixture.set_install_time("2026-01-01T00:00:00Z");
+            stellar_agent_toolsets_install::read_pin("pay-toolset", root, Some(test_pin_key()))
+                .unwrap()
+                .unwrap()
+        };
+        let pin = install();
+        record_grant_for(root, &pin).unwrap();
+        let token = fixture.resolve();
+
+        // Child holder: each exclusive lock refuses the recheck until the
+        // child exits without releasing it.
+        for role in ["root", "grants"] {
+            let mut peer = LockPeer::spawn(role, root, &home);
+            peer.wait_for("locked");
+            let held = fixture.recheck(&token);
+            peer.release();
+            let (status, report) = peer.finish();
+            let reacquired = (0..200).any(|_| {
+                fixture.recheck(&token).is_ok() || {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    false
+                }
+            });
+            assert!(status.success(), "{report}");
+            assert!(
+                matches!(held, Err(ToolsetRuntimeError::CoordinationBusy)),
+                "the child's {role} lock refuses the recheck: {held:?}; {report}"
+            );
+            assert!(
+                reacquired,
+                "the lock releases at the child's exit: {report}"
+            );
+        }
+
+        // Parent holder: every writer in the child refuses during the lease
+        // and succeeds after it.
+        let lease = fixture.lease(&token).unwrap();
+        let before = protected_files(root);
+        let mut peer = LockPeer::spawn("writers", root, &home);
+        peer.wait_for("refused");
+        let during = protected_files(root);
+        drop(lease);
+        peer.release();
+        peer.wait_for("recorded");
+        let recorded = fixture.recheck(&token);
+        peer.release();
+        peer.wait_for("revoked");
+        let revoked = fixture.recheck(&token);
+        peer.release();
+        peer.wait_for("reinstalled");
+        let reinstalled = fixture.recheck(&token);
+        peer.release();
+        peer.wait_for("uninstalled");
+        let uninstalled = fixture.recheck(&token);
+        let (status, report) = peer.finish();
+        assert!(status.success(), "{report}");
+        assert!(
+            during == before,
+            "the refused writers change no protected byte: {report}"
+        );
+        assert!(
+            recorded.is_ok(),
+            "another grant leaves the original: {recorded:?}; {report}"
+        );
+        assert!(
+            matches!(revoked, Err(ToolsetRuntimeError::GrantChanged)),
+            "a revoked grant refuses: {revoked:?}; {report}"
+        );
+        assert!(
+            matches!(reinstalled, Err(ToolsetRuntimeError::GrantChanged)),
+            "a reinstall refuses: {reinstalled:?}; {report}"
+        );
+        assert!(
+            matches!(uninstalled, Err(ToolsetRuntimeError::ToolsetNotInstalled)),
+            "an uninstall refuses: {uninstalled:?}; {report}"
+        );
+
+        // Child-held approval store: at the queue hook both writers proceed.
+        let _fresh = install();
+        let mut peer = Some(LockPeer::spawn("approvals", root, &home));
+        peer.as_mut().unwrap().wait_for("locked");
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let record = std::rc::Rc::clone(&seen);
+        let approvals = root.join("approvals").join("test.toml");
+        let grants = fixture.grants_path();
+        let hook_root = root.to_path_buf();
+        BEFORE_FIRST_INVOKE_QUEUE.set(Some(Box::new(move || {
+            let held = PendingApprovalStore::open(approvals.clone()).map(drop);
+            let grant_writer = ToolsetGrantStore::open(grants.clone(), 0).map(drop);
+            let root_writer = stellar_agent_toolsets_install::lock_toolsets(&hook_root).map(drop);
+            let mut peer = peer.take().unwrap();
+            peer.release();
+            *record.borrow_mut() = Some((held, grant_writer, root_writer, peer.finish()));
+        })));
+        let outcome = resolve_toolset_sign_payment_gated(&fixture.params());
+        BEFORE_FIRST_INVOKE_QUEUE.set(None);
+        let (held, grant_writer, root_writer, (status, report)) =
+            seen.take().expect("the resolver reaches the queue hook");
+        assert!(status.success(), "{report}");
+        assert!(
+            matches!(held, Err(ApprovalError::WriterLocked)),
+            "the child holds the approval store at the hook: {held:?}; {report}"
+        );
+        assert!(
+            grant_writer.is_ok(),
+            "a grant writer opens at the hook: {grant_writer:?}; {report}"
+        );
+        assert!(
+            root_writer.is_ok(),
+            "an installer locks the root at the hook: {root_writer:?}; {report}"
+        );
+        assert!(
+            matches!(
+                outcome,
+                Ok(GatedResolveOutcome::FirstInvokeApprovalRequired { .. })
+            ),
+            "the miss queues after the child exits: {outcome:?}; {report}"
+        );
+        assert_eq!(fixture.approval_count(), 1, "{report}");
     }
 }

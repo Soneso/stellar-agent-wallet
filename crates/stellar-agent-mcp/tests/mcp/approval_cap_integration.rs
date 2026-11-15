@@ -1070,7 +1070,7 @@ async fn toolset_forced_approval_keeps_allow_effects_and_reservation() {
     h.server.set_toolsets_root_for_test(tools.path().to_owned());
     h.server
         .set_toolset_pin_key_for_test(crate::common::toolset_pin_key());
-    h.server.set_grant_store_path_for_test(grant_path);
+    h.server.set_grant_store_path_for_test(grant_path.clone());
     let sim = h.simulate_pay(AMOUNT).await;
     assert!(sim["data"]["approval"].is_null());
     let args = h.pay_args(&sim["data"], AMOUNT, None);
@@ -1089,6 +1089,12 @@ async fn toolset_forced_approval_keeps_allow_effects_and_reservation() {
     assert_eq!(
         prompt["error"]["code"], "policy.approval_required",
         "{prompt}"
+    );
+    // The resolver's toolset and grant locks end with its call.
+    drop(ToolsetGrantStore::open(grant_path, now).expect("a grant writer opens after the call"));
+    drop(
+        stellar_agent_toolsets_install::lock_toolsets(tools.path())
+            .expect("an install proceeds after the call"),
     );
     let nonce = {
         let store =

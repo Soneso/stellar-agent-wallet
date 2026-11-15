@@ -325,6 +325,60 @@ A matching grant suppresses only the first-invoke re-prompt. Per-action payment
 approval fires on every toolset-routed payment: a policy-engine `Allow` becomes
 `RequireApproval`, and the approval binds the actual executed envelope.
 
+### Grant and installation locks
+
+Grant writers and installers coordinate through two advisory lock files:
+
+- `<toolsets_root>/.toolsets.lock`: install, forced reinstall, and uninstall
+  hold it exclusively. The gated resolver holds it shared.
+- `<grant store>.lock`, beside the per-profile grant store: every grant
+  insertion and revocation holds it exclusively from before it loads the store
+  until its last write. This includes `approve`, the approval UI, and
+  `audit acknowledge-outbox-loss`. The gated resolver holds it exclusively while it looks
+  for a grant.
+
+The resolver takes the toolsets lock before the grant lock and never waits for
+either. It releases both before it queues a first-invoke approval. A held lock
+refuses `audit acknowledge-outbox-loss` with `approval.writer_locked` before it
+revokes anything. The resolver and the grant writer `record_first_invoke_grant`
+return `toolset.coordination_busy` as a library result, which each surface
+wraps:
+
+- MCP `stellar_toolset_invoke` answers an internal error whose message is
+  `toolset.enforcement_error:` followed by the nested
+  `toolset.coordination_busy` diagnostic.
+- `approve` answers `approval.grant_persist`, whose detail is the nested
+  `toolset.coordination_busy` diagnostic. Its consent audit row is already
+  written, and the pending approval stays queued.
+
+Retry once the other operation ends. The resolver creates an absent lock file
+and keeps existing grants and their expiry, so grants recorded before the lock
+files existed still match.
+
+A resolved grant can be rechecked for the same invocation under shared locks.
+The recheck finds that exact grant and installation again; another grant with
+equal coverage does not substitute for it. It reads the clock after taking both
+locks, refuses at or after the stored expiry, and never renews it. It creates,
+repairs, and prunes nothing. While it holds its locks, no install, uninstall, or
+grant change proceeds.
+
+The recheck is a runtime library function that no CLI command or MCP tool calls.
+It returns these refusals as library results, with no surface wrapper:
+
+- `toolset.grant_invocation_mismatch`: the invocation differs from the one the
+  grant was verified for.
+- `toolset.coordination_busy`: an install, uninstall, or grant writer holds a
+  lock.
+- `toolset.coordination_unavailable`: a lock file is absent.
+- `toolset.grant_changed`: the installation changed, or the grant was revoked,
+  replaced, or no longer verifies.
+- `toolset.grant_expired`: the clock reads at or after the stored expiry.
+- `toolset.io_error: clock_unavailable`: the clock cannot be read.
+
+Binding, install record, manifest, capability, amount, and grant store failures
+return the resolver's existing results. The locks bind only wallet processes; they do not stop
+edits by other programs, which the record and grant authentication still catch.
+
 ## CLI commands
 
 The subcommand group is `stellar-agent toolsets` (plural). All four subcommands are
@@ -489,6 +543,13 @@ evaluates it as a destructive tool before the routed tool's gate runs.
   "args": { "account_id": "GABC...WXYZ" }
 }
 ```
+
+The dispatcher compares `toolset` and `action` exactly as sent. A name with an
+escape sequence, a control character, other whitespace or case, or an extra prefix
+or suffix names no installed toolset or matrix tool: it answers
+`toolset.not_installed` or `toolset.unknown_action`, queues nothing, and while the
+profile is halted it is refused as an unknown tool. The dispatcher's own policy
+gate evaluates the same original strings. Error and log text sanitizes them.
 
 No signing, key, or policy tool is reachable through an ungated capability, so an
 `action` naming a signing tool returns `toolset.unknown_action` (the tool is not in

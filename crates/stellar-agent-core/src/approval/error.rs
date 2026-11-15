@@ -34,11 +34,12 @@ pub enum ApprovalError {
         detail: String,
     },
 
-    /// The approval store file is locked by another writer.
+    /// The approval store or toolset grant store is locked by another handle.
     ///
-    /// Only one `PendingApprovalStore` per store file is permitted across all
-    /// processes.  The caller should retry after a short delay or surface
-    /// `approval.writer_locked` to the user.
+    /// Only one `PendingApprovalStore` per store file, and one
+    /// `ToolsetGrantStore` per grant file, is permitted across all processes.
+    /// A `ToolsetGrantReader` also excludes grant writers. The caller should
+    /// retry after a short delay or surface `approval.writer_locked` to the user.
     #[error("approval store is locked by another writer (approval.writer_locked)")]
     WriterLocked,
 
