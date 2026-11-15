@@ -34,11 +34,15 @@ use stellar_agent_test_support::{
     webauthn::{TestAuthenticator, fixture_authenticator},
 };
 
+#[path = "signed_origin_commit/mod.rs"]
+mod signed_origin_commit;
+
 struct Fixture {
     fixture: MainnetConsentFixture,
     entry: PendingApproval,
     leaf: PinnedLeaf,
     files: tempfile::TempDir,
+    audit: Option<Arc<Mutex<stellar_agent_core::audit_log::AuditWriter>>>,
 }
 
 impl Fixture {
@@ -89,6 +93,7 @@ impl Fixture {
             entry,
             leaf,
             files,
+            audit: None,
         }
     }
 
@@ -110,7 +115,9 @@ impl Fixture {
                 self.fixture.name(),
                 &profile,
             ),
-            Arc::new(Mutex::new(self.fixture.audit_writer())),
+            self.audit
+                .clone()
+                .unwrap_or_else(|| Arc::new(Mutex::new(self.fixture.audit_writer()))),
             None,
         )
         .with_mainnet_authority(self.fixture.authority());
@@ -184,6 +191,7 @@ struct Browser {
     client: Client,
     address: SocketAddr,
     origin: String,
+    rp_id: String,
     cookie: String,
 }
 impl Browser {
@@ -198,6 +206,11 @@ impl Browser {
                 .unwrap(),
             address,
             origin: origin.to_owned(),
+            rp_id: url::Url::parse(origin)
+                .unwrap()
+                .host_str()
+                .unwrap()
+                .to_owned(),
             cookie: String::new(),
         }
     }
@@ -264,7 +277,7 @@ impl Browser {
                 .try_into()
                 .unwrap(),
             &self.origin,
-            SIGNED_RP_ID,
+            &self.rp_id,
             5,
             count,
         );
@@ -308,14 +321,14 @@ impl Browser {
             .await;
         assert_eq!(response.status(), StatusCode::OK);
         let options: Value = response.json().await.unwrap();
-        assert_eq!(options["rp_id"], SIGNED_RP_ID);
+        assert_eq!(options["rp_id"], self.rp_id);
         let assertion = fixture_authenticator().assert(
             B64.decode(options["challenge"].as_str().unwrap())
                 .unwrap()
                 .try_into()
                 .unwrap(),
             &self.origin,
-            SIGNED_RP_ID,
+            &self.rp_id,
             5,
             count,
         );
@@ -340,6 +353,37 @@ fn island(html: &str, id: &str) -> Value {
             .unwrap(),
     )
     .unwrap()
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn signed_origin_consent_persists_v5_receipt_and_commits() {
+    let f = signed_origin_commit::consent(SIGNED_ORIGIN).await;
+    signed_origin_commit::commit(&f).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn max_origin_receipt_survives_reload_and_commit() {
+    let host = format!(
+        "{}.{}.{}.{}",
+        "a".repeat(63),
+        "b".repeat(63),
+        "c".repeat(63),
+        "d".repeat(61)
+    );
+    let origin = format!("https://{host}:65535");
+    assert_eq!(origin.len(), 267);
+    let f = signed_origin_commit::consent(&origin).await;
+    signed_origin_commit::check_times(&f);
+    signed_origin_commit::commit(&f).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn signed_origin_reload_respects_stored_time() {
+    let f = signed_origin_commit::consent(SIGNED_ORIGIN).await;
+    signed_origin_commit::check_times(&f);
 }
 
 #[tokio::test]
@@ -423,6 +467,26 @@ async fn signed_origin_serves_at_a_nondefault_port() {
         );
         let bad = browser.client.execute(request).await.unwrap();
         assert_eq!(bad.status(), StatusCode::MISDIRECTED_REQUEST);
+        assert_eq!(
+            bad.json::<Value>().await.unwrap()["error"],
+            "host_header_rejected"
+        );
+        let authority = origin.trim_start_matches("https://");
+        let alternate = if authority.contains(':') {
+            SIGNED_RP_ID.to_owned()
+        } else {
+            format!("{SIGNED_RP_ID}:443")
+        };
+        let mut request = browser.request("GET", "/").build().unwrap();
+        request
+            .headers_mut()
+            .insert("host", alternate.parse().unwrap());
+        let response = browser.client.execute(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"],
+            "host_header_rejected"
+        );
         handle.shutdown().await.unwrap();
     }
 }
@@ -1182,12 +1246,56 @@ async fn signed_origin_trust_comes_from_policy_alone() {
         browser.login_with(&foreign, 3).await,
         StatusCode::BAD_REQUEST
     );
+    let profile_only = TestAuthenticator::from_seed([0x23; 32], vec![0x5b; 16]);
+    let store_only = TestAuthenticator::from_seed([0x24; 32], vec![0x5c; 16]);
+    let both = TestAuthenticator::from_seed([0x25; 32], vec![0x5d; 16]);
+    f.edit_remote(|remote| {
+        remote["allowed_credentials"] = json!([
+            profile_only.credential_id_b64url(),
+            both.credential_id_b64url()
+        ]);
+    });
+    let credentials = stellar_agent_core::approval::OperatorApprovalCredentialStore::new(
+        authority.credentials_path().to_path_buf(),
+    );
+    for auth in [&store_only, &both] {
+        credentials
+            .enroll(stellar_agent_core::approval::OperatorApprovalCredential {
+                credential_id_b64url: auth.credential_id_b64url(),
+                public_key_sec1_b64: auth.public_key_sec1_b64url(),
+                rp_id: SIGNED_RP_ID.to_owned(),
+                label: "unsigned credential".to_owned(),
+                registered_at_unix_ms: now(),
+                sign_count: Some(0),
+                source: Default::default(),
+            })
+            .unwrap();
+    }
+    let before = f.counter_bytes();
+    for (label, auth) in [
+        ("profile only", &profile_only),
+        ("store only", &store_only),
+        ("both", &both),
+    ] {
+        assert_eq!(
+            browser.login_with(auth, 1).await,
+            StatusCode::BAD_REQUEST,
+            "{label}"
+        );
+        assert_eq!(
+            f.counter_bytes(),
+            before,
+            "{label}: refusal writes no counter"
+        );
+        assert!(f.stored().mainnet_presence.is_none(), "{label}");
+    }
+    browser.login(3).await;
     f.fixture.sign_signed_origin_policy(
         &[&TestAuthenticator::from_seed([0x22; 32], vec![0x6b; 16])],
         &f.leaf.pin,
     );
     assert_eq!(
-        browser.login_with(&fixture_authenticator(), 3).await,
+        browser.login_with(&fixture_authenticator(), 4).await,
         StatusCode::BAD_REQUEST
     );
     assert_eq!(

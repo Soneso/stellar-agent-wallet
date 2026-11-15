@@ -1316,103 +1316,134 @@ fn consent_rows(path: &std::path::Path) -> Vec<serde_json::Value> {
 #[test]
 #[serial]
 fn consent_store_crashes_preserve_atomic_replacement() {
-    use crate::approval::store::persist_test_seam::{self, Step};
-    use crate::audit_log::{
-        AuditOutbox, AuditWriter, BindingHistory, tip_anchor::InMemoryTipAnchorStore,
-    };
-    for queued in [false, true] {
-        for step in [
-            Step::TemporarySynced,
-            Step::Renamed,
-            Step::FileSynced,
-            Step::DirectorySynced,
-        ] {
-            let fixture = MainnetConsentFixture::new(PROFILE);
-            let policy = fixture.current_policy();
-            let entry = fixture.payment(DEFAULT_TTL_MS);
-            let anchors = Arc::new(InMemoryTipAnchorStore::new());
-            let mut writer = AuditWriter::open_with_tip_anchor(
-                fixture.audit_path(),
-                Some(zeroize::Zeroizing::new([0x5a; 32])),
-                anchors.clone(),
-                BindingHistory::NotRecorded,
-            )
-            .unwrap();
-            let outbox = AuditOutbox::for_log_keyed(
-                &fixture.audit_path(),
-                anchors,
-                zeroize::Zeroizing::new([0x5a; 32]),
-            );
-            let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
-            store.insert(entry.clone(), now_ms()).unwrap();
-            let before = std::fs::read(fixture.store_path()).unwrap();
-            persist_test_seam::on_step(&fixture.store_path(), step, || {
-                panic!("test crash: approval replacement")
-            });
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                crate::approval::attest::attest_and_persist_with_row(
-                    &mut store,
-                    &entry,
-                    &ATTESTATION_KEY,
-                    &fixture.binding(),
-                    Surface::Cli,
-                    if queued {
-                        ConsentAudit::Outbox(&outbox)
-                    } else {
-                        ConsentAudit::Writer(&mut writer)
-                    },
-                    ConsentAuthorization::Mainnet {
-                        presence: fixture.presence(&entry, &policy),
-                        policy: &policy,
-                    },
-                    |_, _| panic!("no grant"),
+    for signed in [true, false] {
+        use crate::approval::store::persist_test_seam::{self, Step};
+        use crate::audit_log::{
+            AuditOutbox, AuditWriter, BindingHistory, tip_anchor::InMemoryTipAnchorStore,
+        };
+        for queued in [false, true] {
+            for step in [
+                Step::TemporarySynced,
+                Step::Renamed,
+                Step::FileSynced,
+                Step::DirectorySynced,
+            ] {
+                let mut fixture = MainnetConsentFixture::new(PROFILE);
+                if signed {
+                    fixture.sign_signed_origin_policy(
+                        &[&fixture_authenticator()],
+                        &SIGNED_CERT_SPKI_SHA256,
+                    );
+                }
+                let policy = fixture.current_policy();
+                let entry = fixture.payment(DEFAULT_TTL_MS);
+                let anchors = Arc::new(InMemoryTipAnchorStore::new());
+                let mut writer = AuditWriter::open_with_tip_anchor(
+                    fixture.audit_path(),
+                    Some(zeroize::Zeroizing::new([0x5a; 32])),
+                    anchors.clone(),
+                    BindingHistory::NotRecorded,
                 )
-            }));
-            assert!(result.is_err(), "replacement stops at {step:?}");
-            drop(store);
-            let mut reopened = PendingApprovalStore::open(fixture.store_path()).unwrap();
-            let record = reopened.get(&entry.approval_nonce).unwrap();
-            let published = step != Step::TemporarySynced;
-            assert_eq!(
-                record.mainnet_presence.is_some(),
-                published,
-                "publication boundary: {step:?}"
-            );
-            assert_eq!(record.attestation_blob_b64.is_some(), published);
-            if published {
-                let bytes = std::fs::read(fixture.store_path()).unwrap();
-                let error = crate::approval::attest::attest_and_persist_with_row(
-                    &mut reopened,
-                    &entry,
-                    &ATTESTATION_KEY,
-                    &fixture.binding(),
-                    Surface::Cli,
-                    ConsentAudit::Writer(&mut writer),
-                    ConsentAuthorization::Mainnet {
-                        presence: fixture.presence(&entry, &policy),
-                        policy: &policy,
-                    },
-                    |_, _| panic!("no grant"),
-                )
-                .unwrap_err();
-                assert_eq!(error.code(), "approval.already_attested");
-                assert_eq!(std::fs::read(fixture.store_path()).unwrap(), bytes);
-            } else {
-                assert_eq!(std::fs::read(fixture.store_path()).unwrap(), before);
+                .unwrap();
+                let outbox = AuditOutbox::for_log_keyed(
+                    &fixture.audit_path(),
+                    anchors,
+                    zeroize::Zeroizing::new([0x5a; 32]),
+                );
+                let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
+                store.insert(entry.clone(), now_ms()).unwrap();
+                let before = std::fs::read(fixture.store_path()).unwrap();
+                let presence = presence_for_site(&fixture, &entry, &policy);
+                let counter_path =
+                    crate::approval::default_operator_approval_credentials_path(fixture.name())
+                        .unwrap();
+                let counters =
+                    crate::approval::OperatorApprovalCredentialStore::new(counter_path.clone());
+                counters
+                    .check_policy_sign_count(
+                        presence.credential(),
+                        if signed {
+                            SIGNED_RP_ID
+                        } else {
+                            MAINNET_APPROVAL_RP_ID
+                        },
+                        presence.sign_count(),
+                    )
+                    .unwrap();
+                let counter_bytes = std::fs::read(&counter_path).unwrap();
+                persist_test_seam::on_step(&fixture.store_path(), step, || {
+                    panic!("test crash: approval replacement")
+                });
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::approval::attest::attest_and_persist_with_row(
+                        &mut store,
+                        &entry,
+                        &ATTESTATION_KEY,
+                        &fixture.binding(),
+                        Surface::Cli,
+                        if queued {
+                            ConsentAudit::Outbox(&outbox)
+                        } else {
+                            ConsentAudit::Writer(&mut writer)
+                        },
+                        ConsentAuthorization::Mainnet {
+                            presence,
+                            policy: &policy,
+                        },
+                        |_, _| panic!("no grant"),
+                    )
+                }));
+                assert!(result.is_err(), "replacement stops at {step:?}");
+                drop(store);
+                assert_eq!(
+                    std::fs::read(&counter_path).unwrap(),
+                    counter_bytes,
+                    "counter survives restart"
+                );
+                let mut reopened = PendingApprovalStore::open(fixture.store_path()).unwrap();
+                let record = reopened.get(&entry.approval_nonce).unwrap();
+                let published = step != Step::TemporarySynced;
+                assert_eq!(
+                    record.mainnet_presence.is_some(),
+                    published,
+                    "publication boundary: {step:?}"
+                );
+                assert_eq!(record.attestation_blob_b64.is_some(), published);
+                if published {
+                    let bytes = std::fs::read(fixture.store_path()).unwrap();
+                    let error = crate::approval::attest::attest_and_persist_with_row(
+                        &mut reopened,
+                        &entry,
+                        &ATTESTATION_KEY,
+                        &fixture.binding(),
+                        Surface::Cli,
+                        ConsentAudit::Writer(&mut writer),
+                        ConsentAuthorization::Mainnet {
+                            presence: presence_for_site(&fixture, &entry, &policy),
+                            policy: &policy,
+                        },
+                        |_, _| panic!("no grant"),
+                    )
+                    .unwrap_err();
+                    assert_eq!(error.code(), "approval.already_attested");
+                    assert_eq!(std::fs::read(fixture.store_path()).unwrap(), bytes);
+                } else {
+                    assert_eq!(std::fs::read(fixture.store_path()).unwrap(), before);
+                }
+                drop(reopened);
+                if matches!(step, Step::Renamed | Step::FileSynced) {
+                    std::fs::write(fixture.store_path(), &before).unwrap();
+                    let lost_rename = PendingApprovalStore::open(fixture.store_path()).unwrap();
+                    let record = lost_rename.get(&entry.approval_nonce).unwrap();
+                    assert!(record.mainnet_presence.is_none());
+                    assert!(record.attestation_blob_b64.is_none());
+                }
+                assert_eq!(
+                    writer.drain_outbox().unwrap(),
+                    usize::from(queued && !published)
+                );
+                assert_eq!(consent_rows(&fixture.audit_path()).len(), 1);
             }
-            drop(reopened);
-            if matches!(step, Step::Renamed | Step::FileSynced) {
-                std::fs::write(fixture.store_path(), &before).unwrap();
-                let lost_rename = PendingApprovalStore::open(fixture.store_path()).unwrap();
-                let record = lost_rename.get(&entry.approval_nonce).unwrap();
-                assert!(record.mainnet_presence.is_none());
-                assert!(record.attestation_blob_b64.is_none());
-            }
-            assert_eq!(
-                writer.drain_outbox().unwrap(),
-                usize::from(queued && !published)
-            );
-            assert_eq!(consent_rows(&fixture.audit_path()).len(), 1);
         }
     }
 }
@@ -2052,115 +2083,151 @@ fn the_confirmation_returns_the_queued_reference() {
 #[test]
 #[serial]
 fn consent_crash_boundaries_keep_approval_state_consistent() {
-    use crate::audit_log::{
-        AuditOutbox, AuditWriter, BindingHistory, tip_anchor::InMemoryTipAnchorStore,
-    };
-    for boundary in ["direct-row", "direct-anchor", "queue"] {
-        let fixture = MainnetConsentFixture::new(PROFILE);
-        let policy = fixture.current_policy();
-        let entry = fixture.payment(DEFAULT_TTL_MS);
-        let anchors = Arc::new(InMemoryTipAnchorStore::new());
-        let mut writer = AuditWriter::open_with_tip_anchor(
-            fixture.audit_path(),
-            Some(zeroize::Zeroizing::new([0x5a; 32])),
-            anchors.clone(),
-            BindingHistory::NotRecorded,
-        )
-        .unwrap();
-        let outbox = AuditOutbox::for_log_keyed(
-            &fixture.audit_path(),
-            anchors.clone(),
-            zeroize::Zeroizing::new([0x5a; 32]),
-        );
-        let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
-        store.insert(entry.clone(), now_ms()).unwrap();
-        let before = std::fs::read(fixture.store_path()).unwrap();
-        if boundary == "direct-row" {
-            writer.set_fail_after_entry_before_sidecar(true);
-        } else {
-            crate::approval::attest::consent_test_seam::on_written(&fixture.store_path(), || {
-                panic!("test crash: consent persistence")
-            });
-        }
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    for signed in [true, false] {
+        use crate::audit_log::{
+            AuditOutbox, AuditWriter, BindingHistory, tip_anchor::InMemoryTipAnchorStore,
+        };
+        for boundary in ["direct-row", "direct-anchor", "queue"] {
+            let mut fixture = MainnetConsentFixture::new(PROFILE);
+            if signed {
+                fixture.sign_signed_origin_policy(
+                    &[&fixture_authenticator()],
+                    &SIGNED_CERT_SPKI_SHA256,
+                );
+            }
+            let policy = fixture.current_policy();
+            let entry = fixture.payment(DEFAULT_TTL_MS);
+            let anchors = Arc::new(InMemoryTipAnchorStore::new());
+            let mut writer = AuditWriter::open_with_tip_anchor(
+                fixture.audit_path(),
+                Some(zeroize::Zeroizing::new([0x5a; 32])),
+                anchors.clone(),
+                BindingHistory::NotRecorded,
+            )
+            .unwrap();
+            let outbox = AuditOutbox::for_log_keyed(
+                &fixture.audit_path(),
+                anchors.clone(),
+                zeroize::Zeroizing::new([0x5a; 32]),
+            );
+            let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
+            store.insert(entry.clone(), now_ms()).unwrap();
+            let before = std::fs::read(fixture.store_path()).unwrap();
+            let presence = presence_for_site(&fixture, &entry, &policy);
+            let counter_path =
+                crate::approval::default_operator_approval_credentials_path(fixture.name())
+                    .unwrap();
+            let counters =
+                crate::approval::OperatorApprovalCredentialStore::new(counter_path.clone());
+            counters
+                .check_policy_sign_count(
+                    presence.credential(),
+                    if signed {
+                        SIGNED_RP_ID
+                    } else {
+                        MAINNET_APPROVAL_RP_ID
+                    },
+                    presence.sign_count(),
+                )
+                .unwrap();
+            let counter_bytes = std::fs::read(&counter_path).unwrap();
+            if boundary == "direct-row" {
+                writer.set_fail_after_entry_before_sidecar(true);
+            } else {
+                crate::approval::attest::consent_test_seam::on_written(
+                    &fixture.store_path(),
+                    || panic!("test crash: consent persistence"),
+                );
+            }
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::approval::attest::attest_and_persist_with_row(
+                    &mut store,
+                    &entry,
+                    &ATTESTATION_KEY,
+                    &fixture.binding(),
+                    Surface::Cli,
+                    if boundary == "queue" {
+                        ConsentAudit::Outbox(&outbox)
+                    } else {
+                        ConsentAudit::Writer(&mut writer)
+                    },
+                    ConsentAuthorization::Mainnet {
+                        presence,
+                        policy: &policy,
+                    },
+                    |_, _| panic!("no grant"),
+                )
+            }));
+            if boundary == "direct-row" {
+                assert!(result.unwrap().is_err());
+            } else {
+                assert!(
+                    result.is_err(),
+                    "consent stops before persistence: {boundary}"
+                );
+            }
+            assert_eq!(
+                std::fs::read(fixture.store_path()).unwrap(),
+                before,
+                "audit boundary precedes receipt publication"
+            );
+            drop(store);
+            drop(writer);
+            assert_eq!(
+                std::fs::read(&counter_path).unwrap(),
+                counter_bytes,
+                "counter survives restart"
+            );
+            let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
+            assert!(
+                store
+                    .get(&entry.approval_nonce)
+                    .unwrap()
+                    .mainnet_presence
+                    .is_none()
+            );
+            let mut writer = AuditWriter::open_with_tip_anchor(
+                fixture.audit_path(),
+                Some(zeroize::Zeroizing::new([0x5a; 32])),
+                anchors,
+                BindingHistory::NotRecorded,
+            )
+            .unwrap();
+            assert_eq!(consent_rows(&fixture.audit_path()).len(), 1);
+            assert_eq!(writer.drain_outbox().unwrap(), 0);
+            let consent = || ConsentAuthorization::Mainnet {
+                presence: presence_for_site(&fixture, &entry, &policy),
+                policy: &policy,
+            };
             crate::approval::attest::attest_and_persist_with_row(
                 &mut store,
                 &entry,
                 &ATTESTATION_KEY,
                 &fixture.binding(),
                 Surface::Cli,
-                if boundary == "queue" {
-                    ConsentAudit::Outbox(&outbox)
-                } else {
-                    ConsentAudit::Writer(&mut writer)
-                },
-                ConsentAuthorization::Mainnet {
-                    presence: fixture.presence(&entry, &policy),
-                    policy: &policy,
-                },
+                ConsentAudit::Writer(&mut writer),
+                consent(),
                 |_, _| panic!("no grant"),
             )
-        }));
-        if boundary == "direct-row" {
-            assert!(result.unwrap().is_err());
-        } else {
-            assert!(
-                result.is_err(),
-                "consent stops before persistence: {boundary}"
-            );
+            .unwrap();
+            drop(store);
+            let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
+            let durable = std::fs::read(fixture.store_path()).unwrap();
+            let error = crate::approval::attest::attest_and_persist_with_row(
+                &mut store,
+                &entry,
+                &ATTESTATION_KEY,
+                &fixture.binding(),
+                Surface::Cli,
+                ConsentAudit::Writer(&mut writer),
+                consent(),
+                |_, _| panic!("no grant"),
+            )
+            .unwrap_err();
+            assert_eq!(error.code(), "approval.already_attested");
+            assert_eq!(std::fs::read(fixture.store_path()).unwrap(), durable);
+            assert_eq!(consent_rows(&fixture.audit_path()).len(), 2);
         }
-        assert_eq!(std::fs::read(fixture.store_path()).unwrap(), before);
-        drop(store);
-        drop(writer);
-        let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
-        assert!(
-            store
-                .get(&entry.approval_nonce)
-                .unwrap()
-                .mainnet_presence
-                .is_none()
-        );
-        let mut writer = AuditWriter::open_with_tip_anchor(
-            fixture.audit_path(),
-            Some(zeroize::Zeroizing::new([0x5a; 32])),
-            anchors,
-            BindingHistory::NotRecorded,
-        )
-        .unwrap();
-        assert_eq!(consent_rows(&fixture.audit_path()).len(), 1);
-        assert_eq!(writer.drain_outbox().unwrap(), 0);
-        let consent = || ConsentAuthorization::Mainnet {
-            presence: fixture.presence(&entry, &policy),
-            policy: &policy,
-        };
-        crate::approval::attest::attest_and_persist_with_row(
-            &mut store,
-            &entry,
-            &ATTESTATION_KEY,
-            &fixture.binding(),
-            Surface::Cli,
-            ConsentAudit::Writer(&mut writer),
-            consent(),
-            |_, _| panic!("no grant"),
-        )
-        .unwrap();
-        drop(store);
-        let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
-        let durable = std::fs::read(fixture.store_path()).unwrap();
-        let error = crate::approval::attest::attest_and_persist_with_row(
-            &mut store,
-            &entry,
-            &ATTESTATION_KEY,
-            &fixture.binding(),
-            Surface::Cli,
-            ConsentAudit::Writer(&mut writer),
-            consent(),
-            |_, _| panic!("no grant"),
-        )
-        .unwrap_err();
-        assert_eq!(error.code(), "approval.already_attested");
-        assert_eq!(std::fs::read(fixture.store_path()).unwrap(), durable);
-        assert_eq!(consent_rows(&fixture.audit_path()).len(), 2);
     }
 }
 
@@ -2631,66 +2698,169 @@ fn mainnet_presence_audit_is_correlated_and_redacted() {
 #[test]
 #[serial]
 fn mainnet_presence_store_round_trip_and_partial_record_refusal() {
-    let fixture = MainnetConsentFixture::new(PROFILE);
-    let entry = fixture.payment(DEFAULT_TTL_MS);
-    let (store, _) = fixture.consent(&entry);
-    let original = store.get(&entry.approval_nonce).unwrap().clone();
-    drop(store);
-    let reopened = PendingApprovalStore::open(fixture.store_path()).unwrap();
-    let loaded = reopened.get(&entry.approval_nonce).unwrap();
-    assert_eq!(loaded.attestation_version, 5);
-    assert_eq!(loaded.mainnet_presence, original.mainnet_presence);
-    assert_eq!(loaded.attestation_blob_b64, original.attestation_blob_b64);
-    assert!(matches!(
-        loaded.attested_approver,
-        Some(AttestedApprover::MainnetPasskey { .. })
-    ));
-    drop(reopened);
+    for signed in [true, false] {
+        let mut fixture = MainnetConsentFixture::new(PROFILE);
+        if signed {
+            fixture
+                .sign_signed_origin_policy(&[&fixture_authenticator()], &SIGNED_CERT_SPKI_SHA256);
+        }
+        let entry = fixture.payment(DEFAULT_TTL_MS);
+        let policy = fixture.current_policy();
+        let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
+        store.insert(entry.clone(), now_ms()).unwrap();
+        attest_and_persist(
+            &mut store,
+            &entry,
+            &ATTESTATION_KEY,
+            &fixture.binding(),
+            Surface::Cli,
+            ConsentAudit::Writer(&mut fixture.audit_writer()),
+            ConsentAuthorization::Mainnet {
+                presence: presence_for_site(&fixture, &entry, &policy),
+                policy: &policy,
+            },
+            |_, _| panic!("no grant"),
+        )
+        .unwrap();
+        let original = store.get(&entry.approval_nonce).unwrap().clone();
+        drop(store);
+        let reopened = PendingApprovalStore::open(fixture.store_path()).unwrap();
+        let loaded = reopened.get(&entry.approval_nonce).unwrap();
+        assert_eq!(loaded.attestation_version, 5);
+        assert_eq!(loaded.mainnet_presence, original.mainnet_presence);
+        assert_eq!(loaded.attestation_blob_b64, original.attestation_blob_b64);
+        assert!(matches!(
+            loaded.attested_approver,
+            Some(AttestedApprover::MainnetPasskey { .. })
+        ));
+        drop(reopened);
 
-    let text = std::fs::read_to_string(fixture.store_path()).unwrap();
-    let edits: [(&str, TableEdit); 7] = [
-        ("version 5 with a local approver and no receipt", |t| {
-            t.remove("mainnet_presence").unwrap();
-            t.remove("attested_approver").unwrap();
-            t["attested_approver"]["kind"] = toml_edit::value("local");
-        }),
-        ("receipt removed", |t| {
-            t.remove("mainnet_presence").unwrap();
-        }),
-        ("version 4 with a receipt", |t| {
-            t["attestation_version"] = toml_edit::value(4);
-        }),
-        ("local approver with a receipt", |t| {
-            t.remove("attested_approver").unwrap();
-            t["attested_approver"]["kind"] = toml_edit::value("local");
-        }),
-        ("approver for another credential", |t| {
-            t["attested_approver"]["credential_id_b64url"] =
-                toml_edit::value(URL_SAFE_NO_PAD.encode([1; 16]));
-        }),
-        ("unknown receipt field", |t| {
-            t["mainnet_presence"]["extra"] = toml_edit::value(1);
-        }),
-        ("receipt version", |t| {
-            t["mainnet_presence"]["version"] = toml_edit::value(3);
-        }),
-    ];
-    for (label, edit) in edits {
-        let mut doc: toml_edit::DocumentMut = text.parse().unwrap();
-        let tables = doc["pending"].as_array_of_tables_mut().unwrap();
-        let table = tables
-            .iter_mut()
-            .find(|t| t["approval_nonce"].as_str() == Some(entry.approval_nonce.as_str()))
-            .unwrap();
-        edit(table);
-        std::fs::write(fixture.store_path(), doc.to_string()).unwrap();
-        assert!(
-            PendingApprovalStore::open(fixture.store_path()).is_err(),
-            "{label}"
+        let text = std::fs::read_to_string(fixture.store_path()).unwrap();
+        let mut edits: Vec<(&str, TableEdit)> = vec![
+            ("version 5 with a local approver and no receipt", |t| {
+                t.remove("mainnet_presence").unwrap();
+                t.remove("attested_approver").unwrap();
+                t["attested_approver"]["kind"] = toml_edit::value("local");
+            }),
+            ("receipt removed", |t| {
+                t.remove("mainnet_presence").unwrap();
+            }),
+            ("version 4 with a receipt", |t| {
+                t["attestation_version"] = toml_edit::value(4);
+            }),
+            ("local approver with a receipt", |t| {
+                t.remove("attested_approver").unwrap();
+                t["attested_approver"]["kind"] = toml_edit::value("local");
+            }),
+            ("approver for another credential", |t| {
+                t["attested_approver"]["credential_id_b64url"] =
+                    toml_edit::value(URL_SAFE_NO_PAD.encode([1; 16]));
+            }),
+            ("unknown receipt field", |t| {
+                t["mainnet_presence"]["extra"] = toml_edit::value(1);
+            }),
+            ("receipt version", |t| {
+                t["mainnet_presence"]["version"] = toml_edit::value(3);
+            }),
+        ];
+        if signed {
+            edits.extend([
+                (
+                    "missing pin",
+                    (|t: &mut toml_edit::Table| {
+                        t["mainnet_presence"]
+                            .as_table_mut()
+                            .unwrap()
+                            .remove("cert_spki_sha256");
+                    }) as TableEdit,
+                ),
+                (
+                    "missing listener digest",
+                    (|t: &mut toml_edit::Table| {
+                        t["mainnet_presence"]
+                            .as_table_mut()
+                            .unwrap()
+                            .remove("listener_policy_digest");
+                    }) as TableEdit,
+                ),
+                (
+                    "missing both identity fields",
+                    (|t: &mut toml_edit::Table| {
+                        let receipt = t["mainnet_presence"].as_table_mut().unwrap();
+                        receipt.remove("cert_spki_sha256");
+                        receipt.remove("listener_policy_digest");
+                    }) as TableEdit,
+                ),
+                (
+                    "unicode unknown field",
+                    (|t: &mut toml_edit::Table| {
+                        t["mainnet_presence"]["秘密"] = toml_edit::value("保密");
+                    }) as TableEdit,
+                ),
+            ]);
+        }
+        for (label, edit) in edits {
+            let mut doc: toml_edit::DocumentMut = text.parse().unwrap();
+            let tables = doc["pending"].as_array_of_tables_mut().unwrap();
+            let table = tables
+                .iter_mut()
+                .find(|t| t["approval_nonce"].as_str() == Some(entry.approval_nonce.as_str()))
+                .unwrap();
+            edit(table);
+            let malformed = doc.to_string();
+            std::fs::write(fixture.store_path(), &malformed).unwrap();
+            let error = PendingApprovalStore::open(fixture.store_path()).unwrap_err();
+            let crate::approval::ApprovalError::Toml { detail } = error else {
+                panic!("{label}: expected typed TOML refusal, got {error:?}");
+            };
+            assert!(
+                detail.starts_with("TOML parse error at line "),
+                "{label}: {detail}"
+            );
+            assert!(
+                !detail.contains("秘密") && !detail.contains("保密"),
+                "{label}: {detail}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(fixture.store_path()).unwrap(),
+                malformed,
+                "{label}"
+            );
+        }
+        let malformed = format!("# é界\n{text}\n[unterminated\n");
+        std::fs::write(fixture.store_path(), &malformed).unwrap();
+        let error = PendingApprovalStore::open(fixture.store_path()).unwrap_err();
+        assert!(matches!(error, crate::approval::ApprovalError::Toml { .. }));
+        assert!(!error.to_string().contains("é界"));
+        assert_eq!(
+            std::fs::read_to_string(fixture.store_path()).unwrap(),
+            malformed
         );
+        std::fs::write(fixture.store_path(), &text).unwrap();
+        assert!(PendingApprovalStore::open(fixture.store_path()).is_ok());
     }
-    std::fs::write(fixture.store_path(), &text).unwrap();
-    assert!(PendingApprovalStore::open(fixture.store_path()).is_ok());
+}
+
+fn presence_for_site(
+    fixture: &MainnetConsentFixture,
+    entry: &PendingApproval,
+    policy: &VerifiedPolicy,
+) -> VerifiedMainnetPresence {
+    if policy.mainnet().unwrap().approval_origin.is_none() {
+        return fixture.presence(entry, policy);
+    }
+    let identity = ListenerIdentity::capture(policy).unwrap();
+    let pending = issue_mainnet_intent_presence(
+        entry,
+        &fixture.binding(),
+        policy,
+        PresenceListener::SignedOrigin(&identity),
+        None,
+        now_ms(),
+        Instant::now(),
+    )
+    .unwrap();
+    verify_issued(pending).unwrap()
 }
 
 // ── Trustline clawback opt-in ───────────────────────────────────────────────

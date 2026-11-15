@@ -1297,6 +1297,112 @@ mod tests {
         }
     }
 
+    /// Both processes observe the old file, then serialize their updates
+    /// through the credential sidecar lock. A stale presentation cannot
+    /// replace a higher committed counter.
+    #[test]
+    fn policy_counter_two_processes_reload_under_lock() {
+        use std::io::{Read as _, Write as _};
+        use std::net::{TcpListener, TcpStream};
+        use std::process::{Command, Stdio};
+        const CHILD: &str = "POLICY_COUNTER_TEST_CHILD";
+        const LIMIT: Duration = Duration::from_secs(30);
+        fn receive(stream: &mut TcpStream, expected: u8) {
+            let mut byte = [0];
+            stream.read_exact(&mut byte).unwrap();
+            assert_eq!(byte[0], expected, "process barrier");
+        }
+        fn configure(stream: &TcpStream) {
+            stream.set_read_timeout(Some(LIMIT)).unwrap();
+            stream.set_write_timeout(Some(LIMIT)).unwrap();
+        }
+        if let Ok(role) = std::env::var(CHILD) {
+            let path = PathBuf::from(std::env::var_os("POLICY_COUNTER_TEST_PATH").unwrap());
+            let count: u32 = std::env::var("POLICY_COUNTER_TEST_COUNT")
+                .unwrap()
+                .parse()
+                .unwrap();
+            let mut stream =
+                TcpStream::connect(std::env::var("POLICY_COUNTER_TEST_ADDRESS").unwrap()).unwrap();
+            configure(&stream);
+            let store = OperatorApprovalCredentialStore::new(path.clone());
+            assert!(store.load().unwrap().credentials.is_empty());
+            stream.write_all(b"R").unwrap();
+            receive(&mut stream, b'G');
+            let barrier = std::sync::Mutex::new(stream.try_clone().unwrap());
+            let first = role == "first";
+            test_hooks::install(&path, move |point| {
+                if (first && point == test_hooks::Point::Locked)
+                    || (!first && point == test_hooks::Point::Busy)
+                {
+                    let mut stream = barrier.lock().unwrap();
+                    stream.write_all(if first { b"L" } else { b"B" }).unwrap();
+                    receive(&mut stream, b'C');
+                }
+            });
+            let result =
+                store.check_policy_sign_count(&policy_credential(&[0x38; 16]), SIGNED_HOST, count);
+            test_hooks::clear(&path);
+            if !first && count != 0 {
+                assert!(
+                    matches!(result, Err(ApprovalError::SignCounterRegression { .. })),
+                    "stale process refuses the lower counter: {result:?}"
+                );
+            } else {
+                result.unwrap();
+            }
+            return;
+        }
+        for (higher, older) in [(7, 5), (0, 0)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("counters.toml");
+            let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let spawn = |role: &str, count: u32| {
+                Command::new(std::env::current_exe().unwrap())
+                    .arg("--exact")
+                    .arg("approval::operator_credentials::tests::policy_counter_two_processes_reload_under_lock")
+                    .arg("--nocapture")
+                    .env(CHILD, role)
+                    .env("POLICY_COUNTER_TEST_PATH", &path)
+                    .env("POLICY_COUNTER_TEST_COUNT", count.to_string())
+                    .env("POLICY_COUNTER_TEST_ADDRESS", listener.local_addr().unwrap().to_string())
+                    .stdout(Stdio::piped()).stderr(Stdio::piped())
+                    .spawn().unwrap()
+            };
+            let first = spawn("first", higher);
+            let (mut first_barrier, _) = listener.accept().unwrap();
+            configure(&first_barrier);
+            receive(&mut first_barrier, b'R');
+            let second = spawn("second", older);
+            let (mut second_barrier, _) = listener.accept().unwrap();
+            configure(&second_barrier);
+            receive(&mut second_barrier, b'R');
+            first_barrier.write_all(b"G").unwrap();
+            receive(&mut first_barrier, b'L');
+            second_barrier.write_all(b"G").unwrap();
+            receive(&mut second_barrier, b'B');
+            first_barrier.write_all(b"C").unwrap();
+            let first = first.wait_with_output().unwrap();
+            second_barrier.write_all(b"C").unwrap();
+            let second = second.wait_with_output().unwrap();
+            for result in [first, second] {
+                assert!(
+                    result.status.success(),
+                    "counter process: {} {}",
+                    String::from_utf8_lossy(&result.stdout),
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+            let rows = all_rows(&path);
+            assert_eq!(rows.len(), 1, "one policy row after both processes");
+            assert_eq!(
+                rows[0].sign_count,
+                Some(higher),
+                "the higher counter survives"
+            );
+        }
+    }
+
     /// A policy row grants no trust: `list` and `find_by_credential_id` never
     /// return it, and the enrollment methods never act on it. Enrolled rows
     /// keep their bytes, written without the source field.

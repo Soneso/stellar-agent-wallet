@@ -526,6 +526,147 @@ async fn gate_of_running_server(run: &ClassicRun) -> serde_json::Value {
     wire(&refusal)
 }
 
+/// A signed listener can persist only under the policy it issued under.
+/// A re-sign keeps the record unauthorised at the MCP commit boundary.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn signed_origin_resign_between_issuance_and_persistence_refuses() {
+    use stellar_agent_core::approval::{
+        ConsentAudit, ConsentAuthorization, ListenerIdentity, MainnetApprovalAuthority,
+        PresenceListener, Surface, attest_and_persist, issue_mainnet_intent_presence,
+        mainnet_fixtures::{MainnetConsentFixture, SIGNED_CERT_SPKI_SHA256, SIGNED_ORIGIN},
+        verify_mainnet_presence,
+    };
+    for change in ["control", "same pin", "changed pin"] {
+        let mut run = ClassicRun::new(Tool::Pay).await;
+        let signed = run.f.raw.replace("sequence = 7", "sequence = 8").replace(
+            "[mainnet]",
+            &format!("[mainnet]\napproval_origin = \"{SIGNED_ORIGIN}\"\napproval_cert_spki_sha256 = \"{}\"", stellar_agent_core::hex::encode(&SIGNED_CERT_SPKI_SHA256)),
+        );
+        Fixture::write_policy(&signed);
+        run.restart().unwrap();
+        let policy = MainnetApprovalAuthority::for_profile(PROFILE)
+            .unwrap()
+            .load_current()
+            .unwrap()
+            .into_policy();
+        let identity = ListenerIdentity::capture(&policy).unwrap();
+        let xdr = run.args["envelope_xdr"].as_str().unwrap().to_owned();
+        let entry = approval_for(Tool::Pay, &run.f, &xdr, 600_000);
+        let pending = issue_mainnet_intent_presence(
+            &entry,
+            &binding(),
+            &policy,
+            PresenceListener::SignedOrigin(&identity),
+            None,
+            now_ms(),
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        let assertion = MainnetConsentFixture::sign_issued(&fixture_authenticator(), &pending);
+        let presence = verify_mainnet_presence(
+            pending,
+            MainnetConsentFixture::input(&assertion),
+            now_ms(),
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        if change != "control" {
+            let newer = signed.replace("sequence = 8", "sequence = 9");
+            Fixture::write_policy(&if change == "changed pin" {
+                newer.replace(
+                    &stellar_agent_core::hex::encode(&SIGNED_CERT_SPKI_SHA256),
+                    &"cd".repeat(32),
+                )
+            } else {
+                newer
+            });
+        }
+        let mut store = PendingApprovalStore::open(store_path(&run.f)).unwrap();
+        store.insert(entry.clone(), now_ms()).unwrap();
+        let before = std::fs::read(store_path(&run.f)).unwrap();
+        let audit = stellar_agent_network::mainnet::audit_readiness::audit_readiness(
+            run.f.server.security_profile(),
+            PROFILE,
+        )
+        .unwrap();
+        let result = attest_and_persist(
+            &mut store,
+            &entry,
+            &attestation_key(&run.f),
+            &binding(),
+            Surface::ServeRemote,
+            ConsentAudit::Writer(&mut audit.writer().lock().unwrap()),
+            ConsentAuthorization::Mainnet {
+                presence,
+                policy: &policy,
+            },
+            |_, _| panic!("no grant"),
+        );
+        if change != "control" {
+            let recorded = store.get(&entry.approval_nonce).unwrap();
+            assert!(
+                recorded.attestation_blob_b64.is_none(),
+                "{change}: no persisted authority"
+            );
+            assert!(recorded.mainnet_presence.is_none(), "{change}: no receipt");
+            assert_eq!(
+                std::fs::read(store_path(&run.f)).unwrap(),
+                before,
+                "{change}"
+            );
+            assert_eq!(
+                result.unwrap_err().code(),
+                "approval.listener_policy_stale",
+                "{change}"
+            );
+        } else {
+            result.unwrap();
+            assert_eq!(
+                store
+                    .get(&entry.approval_nonce)
+                    .unwrap()
+                    .attestation_version,
+                5
+            );
+        }
+        let blob = store
+            .get(&entry.approval_nonce)
+            .unwrap()
+            .attestation_blob_b64
+            .clone()
+            .unwrap_or_else(|| URL_SAFE_NO_PAD.encode([0; 32]));
+        drop(store);
+        let rows =
+            std::fs::read_to_string(&run.f.server.security_profile().audit_log_path).unwrap();
+        let consents = rows
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|row| row["kind"] == "approval_attested" && row["origin"] == "serve-remote")
+            .count();
+        assert_eq!(
+            consents,
+            usize::from(change == "control"),
+            "{change}: consent audit"
+        );
+        if change != "control" {
+            run.restart().unwrap();
+        }
+        let diagnostics = Diagnostics::install();
+        let result = run
+            .commit_with(run.commit_args_for(&xdr, &entry.approval_nonce, &blob))
+            .await;
+        if change == "control" {
+            assert_classic_accepted_for(change, &run, &result, &entry.approval_nonce);
+        } else {
+            assert_uniform(change, &result);
+            diagnostics.assert_refused_with(change, "approval.presence_required");
+            assert_classic_unsigned(change, &run, &entry);
+        }
+    }
+}
+
 /// A consent recorded before a policy change authorizes nothing after it:
 /// the running server answers every change with its restart refusal and its
 /// gate with the uniform refusal; a server started on a policy re-signed at
