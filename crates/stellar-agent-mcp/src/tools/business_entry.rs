@@ -606,3 +606,78 @@ impl<'s> X402Steps<'s> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, reason = "test assertions")]
+
+    use super::*;
+    use stellar_agent_core::profile::receipt::{OperationDestination, PaymentDestinations};
+    use stellar_agent_network::policy_state::{
+        OperationId, OperationResult, OperationState, OperationView, SlotKind,
+    };
+
+    const G: &str = "GADQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOZPI";
+    const M_MAX: &str = "MADQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQP77777777777754MA";
+
+    fn data_of(destinations: PaymentDestinations, compacted: bool) -> Value {
+        let view = OperationView {
+            operation_id: OperationId::from_bytes([0x5a; 16]),
+            business_id: BusinessId::parse("order-7").unwrap(),
+            state: OperationState::Sending,
+            tool: None,
+            kind: Some(OperationKind::Pay),
+            slot_kind: SlotKind::Envelope,
+            intent_digest: [1; 32],
+            attempts: 1,
+            result: Some(OperationResult::default()),
+            created_at_ms: None,
+            closed_at_ms: None,
+            waiting_expires_at_ms: None,
+            execution_expires_at_ms: None,
+            compacted,
+            history_incomplete: false,
+            destinations,
+        };
+        let result = replay_result(&view);
+        let text = &result.content[0].as_text().unwrap().text;
+        serde_json::from_str::<Value>(text).unwrap()["data"].clone()
+    }
+
+    /// The MCP replay of a pay record carries the complete destination or
+    /// the per-operation list; a tombstone carries neither member.
+    #[test]
+    fn a_pay_replay_carries_its_destination() {
+        let single = data_of(PaymentDestinations::Single(M_MAX.to_owned()), false);
+        assert_eq!(single["destination"], M_MAX, "{single}");
+        assert!(single.get("destinations").is_none(), "{single}");
+        assert_eq!(single["next"], "wait", "{single}");
+
+        let listed = data_of(
+            PaymentDestinations::PerOperation(vec![
+                OperationDestination {
+                    operation: 0,
+                    destination: G.to_owned(),
+                },
+                OperationDestination {
+                    operation: 2,
+                    destination: M_MAX.to_owned(),
+                },
+            ]),
+            false,
+        );
+        assert_eq!(
+            listed["destinations"],
+            serde_json::json!([
+                { "operation": 0, "destination": G },
+                { "operation": 2, "destination": M_MAX },
+            ]),
+            "{listed}"
+        );
+        assert!(listed.get("destination").is_none(), "{listed}");
+
+        let tombstone = data_of(PaymentDestinations::None, true);
+        assert!(tombstone.get("destination").is_none(), "{tombstone}");
+        assert!(tombstone.get("destinations").is_none(), "{tombstone}");
+    }
+}

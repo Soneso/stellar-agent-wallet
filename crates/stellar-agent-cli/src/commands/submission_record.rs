@@ -1629,6 +1629,198 @@ mod tests {
         }
     }
 
+    /// The fixture destination's G, M0, and maximum-ID forms with the
+    /// literal SHA-256 and redaction a payment leg records.
+    const HASHED_FORMS: [(&str, &str, &str); 3] = [
+        (
+            "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL",
+            "8419e4131cc68b0c89dc835394a978dc8cf090e5118e60af862c515c5b787483",
+            "GBPXX...MWIVL",
+        ),
+        (
+            "MBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWAAAAAAAAAAAACKJY",
+            "64e93b350686c45c3c01d84623636a6f40323d247be272b220d98744292907b4",
+            "MBPXX...ACKJY",
+        ),
+        (
+            "MBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMX77777777777752TU",
+            "ce738b37887ec1ae76a1c81c5140596d400dc64a883fccc4f13605822726b99b",
+            "MBPXX...752TU",
+        ),
+    ];
+
+    /// One gate-sized native payment leg of 1 XLM to `destination`.
+    fn payment_effects(destination: &str) -> ValueEffects {
+        ValueEffects::single(stellar_agent_core::policy::v1::ValueLeg {
+            kind: stellar_agent_core::policy::v1::ActionKind::Payment,
+            amount: Some(10_000_000),
+            asset: Some("native".to_owned()),
+            destination: Some(destination.to_owned()),
+        })
+    }
+
+    /// `build_recorder` given a payment leg whose destination is lowercase
+    /// refuses `validation.address_invalid` before it writes a receipt, a
+    /// hold, or an audit row.
+    #[test]
+    #[serial_test::serial]
+    fn a_malformed_payment_leg_refuses_before_exposure() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let name = "recorder-malformed-leg";
+        let mut profile = Profile::builder_testnet_named(name, "svc", name, "n-svc", name).build();
+        profile.audit_log_path = home.path().join("audit.jsonl");
+        let effects = payment_effects(&HASHED_FORMS[0].0.to_lowercase());
+        let Err(refused) = build_recorder(SubmitRecord {
+            profile: &profile,
+            profile_name: name.to_owned(),
+            verb: "pay",
+            tool: "stellar_pay_commit",
+            policy_decision: stellar_agent_core::audit_log::PolicyDecision::Allow,
+            chain_id: "stellar:testnet",
+            effects: Some(&effects),
+            unvalued: None,
+            audit: None,
+            now_ms: 1_900_000_000_000,
+        }) else {
+            panic!("the malformed leg refuses")
+        };
+        assert_eq!(refused.code(), "validation.address_invalid");
+        assert!(open_receipts(name).unwrap().all().unwrap().is_empty());
+        assert!(!PersistedWindowStore::for_profile(name).path().exists());
+        assert!(!profile.audit_log_path.exists());
+    }
+
+    /// The legs `prepare_mainnet_recorder` records for `effects`, or its
+    /// refusal, under a policy authority, with the fixture whose home holds
+    /// the run's receipts, window, and audit log.
+    #[cfg(feature = "mainnet-write")]
+    async fn mainnet_recorder_legs(
+        name: &'static str,
+        effects: &ValueEffects,
+    ) -> (
+        Result<Vec<ValueLegRecord>, WalletError>,
+        stellar_agent_core::approval::mainnet_fixtures::MainnetConsentFixture,
+    ) {
+        use crate::common::mainnet_confirm::{
+            ConfirmDecision, MainnetWriteSummary, cli_mainnet_authority,
+        };
+        use stellar_agent_core::approval::mainnet_fixtures::MainnetConsentFixture;
+        use stellar_agent_core::mainnet::decision::{AuthorityScope, MainnetDecision};
+        use stellar_agent_core::profile::name::ResolvedProfileName;
+
+        let fixture = MainnetConsentFixture::new(name);
+        let chain_key = &fixture.profile().audit_log_hash_chain_key_id;
+        stellar_agent_network::keyring::rotate_keyring_secret_32(
+            &chain_key.service,
+            &chain_key.account,
+        )
+        .unwrap();
+        let context = stellar_agent_network::NetworkContext::mainnet_write(
+            fixture.profile(),
+            &ResolvedProfileName::from_flag(name),
+            &fixture.home().join("profiles"),
+            stellar_agent_network::MainnetEndpointFlags::default(),
+        )
+        .unwrap();
+        let readiness = stellar_agent_network::mainnet::audit_readiness::audit_readiness(
+            context.profile(),
+            context.profile_name(),
+        )
+        .unwrap();
+        let policy = fixture.current_policy();
+        let envelope = stellar_agent_test_support::SignedTestEnvelope::builder([8; 32])
+            .unsigned()
+            .build();
+        let summary = MainnetWriteSummary::from_envelope(
+            envelope.envelope_xdr(),
+            stellar_agent_network::mainnet::MainnetConsumer::CliPay,
+            500,
+        )
+        .unwrap();
+        let decision = MainnetDecision::for_test(
+            stellar_agent_core::policy::Decision::Allow,
+            None,
+            policy.digest(),
+            policy.sequence(),
+            3,
+            name,
+            context.chain().caip2_str(),
+            1_900_000_000_000,
+            300_000,
+            AuthorityScope::Classic,
+        );
+        let mut slot = None;
+        let authority = cli_mainnet_authority(
+            &decision,
+            ConfirmDecision::RequireApproval { ttl_ms: 300_000 },
+            &summary,
+            &context,
+            &policy,
+            &fixture.store_path(),
+            &mut slot,
+        )
+        .await
+        .unwrap();
+        let legs = prepare_mainnet_recorder(
+            &context,
+            "stellar_pay",
+            stellar_agent_core::audit_log::PolicyDecision::Allow,
+            decision.provenance(),
+            Some(effects),
+            &readiness,
+            None,
+            &authority,
+        )
+        .map(|prepared| prepared.legs);
+        (legs, fixture)
+    }
+
+    /// The mainnet recorder's payment legs for G, M0, and the maximum-ID M
+    /// carry the literal SHA-256 and redaction of the complete destination.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn the_mainnet_recorder_hashes_the_complete_destination() {
+        for (index, (destination, sha256, redacted)) in HASHED_FORMS.into_iter().enumerate() {
+            let name = ["recorder-hash-g", "recorder-hash-m0", "recorder-hash-mmax"][index];
+            let (legs, _) = mainnet_recorder_legs(name, &payment_effects(destination)).await;
+            let legs = legs.unwrap();
+            assert_eq!(legs.len(), 1, "{destination}");
+            assert_eq!(legs[0].destination_sha256.as_deref(), Some(sha256));
+            assert_eq!(legs[0].destination_redacted.as_deref(), Some(redacted));
+            assert_eq!(legs[0].amount, Some(10_000_000));
+            assert_eq!(legs[0].asset.as_deref(), Some("native"));
+        }
+    }
+
+    /// The mainnet recorder given a payment leg whose destination is
+    /// lowercase refuses `validation.address_invalid` before any receipt,
+    /// hold, or audit row. The fixture and its home stay alive through every
+    /// check, and a read error of the evidence fails the test.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn a_malformed_payment_leg_refuses_before_exposure_on_mainnet() {
+        let effects = payment_effects(&HASHED_FORMS[2].0.to_lowercase());
+        let (refused, fixture) =
+            mainnet_recorder_legs("recorder-malformed-mainnet", &effects).await;
+        assert_eq!(refused.err().unwrap().code(), "validation.address_invalid");
+        let name = "recorder-malformed-mainnet";
+        let profile = fixture.profile();
+        assert!(open_receipts(name).unwrap().all().unwrap().is_empty());
+        assert!(
+            PersistedWindowStore::for_profile(name)
+                .pending_reservations(profile)
+                .unwrap()
+                .is_empty()
+        );
+        let log = std::fs::read_to_string(&profile.audit_log_path).unwrap();
+        assert!(!log.contains("value_action_pending"), "{log}");
+        drop(fixture);
+    }
+
     /// A submission that was never sent carries no `details`.
     ///
     /// There is no transaction to reconcile, and `outcome: "unknown"` would

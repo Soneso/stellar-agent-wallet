@@ -3369,6 +3369,57 @@ async fn invalid_requirements_do_not_consume_window() {
     }
 }
 
+/// The authorized row's leg of one admitted x402 payment through `tool`.
+async fn admitted_x402_leg(tool: Tool, profile_name: &str, seed: u8) -> serde_json::Value {
+    let mut fixture = fixture(profile_name, [seed; 32], |rpc| {
+        rpc.network = NetworkAnswer::Protocols(vec![30])
+    })
+    .await;
+    fixture
+        .server
+        .set_policy_engine_for_test(Arc::new(cap_engine_with_recipient(
+            profile_name,
+            100_000_000,
+            Some(PAY_TO),
+        )));
+    let result = call_with(
+        &fixture,
+        tool,
+        &payment_required_with(|r| r["payTo"] = PAY_TO.into()),
+    )
+    .await;
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "{tool:?}: {}",
+        result_json(&result)
+    );
+    let (authorized, _) = x402_rows(&fixture.profile);
+    authorized[0]["legs"][0].clone()
+}
+
+/// The x402 create adapter keeps the generic leg conversion: its leg holds
+/// the redacted recipient and no destination digest.
+#[tokio::test]
+#[serial]
+async fn x402_payment_legs_keep_the_generic_conversion() {
+    let leg = admitted_x402_leg(Tool::CreatePayment, "x402-generic-create", 0xf1).await;
+    assert_eq!(leg["action"], "x402_payment", "{leg}");
+    assert_eq!(leg["destination_redacted"], "GAAAA...AAWHF", "{leg}");
+    assert!(leg.get("destination_sha256").is_none(), "{leg}");
+}
+
+/// The authenticated x402 adapter keeps the generic leg conversion: its leg
+/// holds the redacted recipient and no destination digest.
+#[tokio::test]
+#[serial]
+async fn authenticated_x402_legs_keep_the_generic_conversion() {
+    let leg = admitted_x402_leg(Tool::AuthenticatedPayment, "x402-generic-auth", 0xf2).await;
+    assert_eq!(leg["action"], "x402_payment", "{leg}");
+    assert_eq!(leg["destination_redacted"], "GAAAA...AAWHF", "{leg}");
+    assert!(leg.get("destination_sha256").is_none(), "{leg}");
+}
+
 /// The admitted leg is the transfer the payer signs, for a G, a C, and an M
 /// recipient. The window holds its amount and asset, and the authorized row
 /// its asset and redacted recipient. The signed invocation calls the contract

@@ -301,6 +301,14 @@ Sends a payment from a source account to a destination, enforcing SEP-29 memo-re
   `reason`, `provider`, and `ledger` where they apply. `--output table` prints a
   `Cross-check:` line after the result line. `--build-only` reports no
   `cross_check`.
+- **Result destinations.** Every stage decodes the destinations from the
+  envelope it outputs, signs, or sends, never from `<DESTINATION>`. When all
+  payment operations pay one destination, `data.destination` holds that
+  complete G or M address. When they differ, `data.destinations` lists
+  `{"operation": n, "destination": "..."}` for each payment operation in
+  order. An envelope without a payment operation carries neither member and
+  still signs and sends. `--output table` prints `Destination: <address>`, or
+  one `Destination (operation n): <address>` line per entry.
 - **Relayer.** `--use-oz-relayer` is not implemented in this build. Passing it emits an AGPL-3.0 disclosure to stderr and declines the operation rather than submitting.
 
 Argument groups (enforced by the parser):

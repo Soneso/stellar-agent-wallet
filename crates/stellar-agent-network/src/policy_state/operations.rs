@@ -57,7 +57,7 @@ use stellar_agent_core::policy::pin::{self, PinScope};
 use stellar_agent_core::policy::state_lock::WindowStoreLock;
 use stellar_agent_core::profile::caip2::Caip2;
 use stellar_agent_core::profile::receipt::{
-    AttemptRef, CheckedReceiptProjection, ReceiptStatus, SequenceReleases,
+    AttemptRef, CheckedReceiptProjection, PaymentDestinations, ReceiptStatus, SequenceReleases,
 };
 use stellar_agent_core::profile::schema::Profile;
 
@@ -2910,6 +2910,36 @@ pub struct OperationView {
     pub compacted: bool,
     /// Whether recovery recorded history loss for an attempt.
     pub history_incomplete: bool,
+    /// The payment destinations of a pay record; `None` for other kinds and
+    /// for a tombstone.
+    pub destinations: PaymentDestinations,
+}
+
+/// The destinations of a pay record, from its validated canonical intent or
+/// its stored envelope; `None` when neither holds payment terms.
+fn record_destinations(record: &WireOperation) -> PaymentDestinations {
+    use stellar_agent_core::approval::{ClassicIntent, IntentPayload};
+    if record.kind != OperationKind::Pay {
+        return PaymentDestinations::None;
+    }
+    match &record.intent {
+        IntentSlot::Canonical { intent, .. } => {
+            match serde_json::from_value::<ClassicIntent>(intent.clone()) {
+                Ok(intent) => match intent.payload() {
+                    IntentPayload::Pay { destination, .. } => {
+                        PaymentDestinations::Single(destination.clone())
+                    }
+                    _ => PaymentDestinations::None,
+                },
+                Err(_) => PaymentDestinations::None,
+            }
+        }
+        IntentSlot::Envelope { .. } => record.envelope_xdr.as_deref().map_or(
+            PaymentDestinations::None,
+            crate::operation_entry::envelope_result_destinations,
+        ),
+        IntentSlot::X402 { .. } => PaymentDestinations::None,
+    }
 }
 
 impl OperationView {
@@ -2930,6 +2960,7 @@ impl OperationView {
             execution_expires_at_ms: record.execution_expires_at_ms,
             compacted: false,
             history_incomplete: record.history_incomplete(),
+            destinations: record_destinations(record),
         }
     }
 
@@ -2950,6 +2981,7 @@ impl OperationView {
             execution_expires_at_ms: None,
             compacted: true,
             history_incomplete: false,
+            destinations: PaymentDestinations::None,
         }
     }
 }
@@ -14146,6 +14178,256 @@ pub(crate) mod tests {
                 )
                 .with_epoch(Some(P7)),
             );
+        }
+    }
+
+    /// The destinations a replay of a retained pay record carries, read back
+    /// from the committed window.
+    mod replay_destinations {
+        use super::*;
+        use crate::operation_entry::replay_json;
+        use stellar_agent_core::approval::{
+            ClassicIntent, IntentAsset, IntentBase, IntentPayload, MemoFact,
+        };
+        use stellar_xdr::WriteXdr as _;
+
+        const G: &str = "GADQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOZPI";
+        const M_MAX: &str = "MADQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQP77777777777754MA";
+
+        fn manage_data() -> stellar_xdr::Operation {
+            stellar_xdr::Operation {
+                source_account: None,
+                body: stellar_xdr::OperationBody::ManageData(stellar_xdr::ManageDataOp {
+                    data_name: "k".as_bytes().to_vec().try_into().unwrap(),
+                    data_value: None,
+                }),
+            }
+        }
+
+        fn envelope_text(operations: Vec<stellar_xdr::Operation>) -> String {
+            crate::submit::destination_tests::envelope_for_destinations(operations)
+                .to_xdr_base64(stellar_xdr::Limits::none())
+                .unwrap()
+        }
+
+        fn pay(to: &str) -> stellar_xdr::Operation {
+            crate::submit::destination_tests::payment(to)
+        }
+
+        fn canonical_pay(destination: &str) -> IntentSlot {
+            let intent = ClassicIntent::new(
+                IntentBase::new(
+                    Caip2::Mainnet.to_string(),
+                    G.to_owned(),
+                    [7; 32],
+                    100,
+                    MemoFact::None,
+                )
+                .unwrap(),
+                IntentPayload::Pay {
+                    destination: destination.to_owned(),
+                    asset: IntentAsset::Native,
+                    amount_stroops: 10,
+                },
+            )
+            .unwrap();
+            IntentSlot::Canonical {
+                intent_digest: *intent.digest().as_bytes(),
+                intent: serde_json::to_value(&intent).unwrap(),
+            }
+        }
+
+        fn envelope_slot(n: u8) -> IntentSlot {
+            IntentSlot::Envelope {
+                unsigned_envelope_sha256: [n; 32],
+                intent_digest: [n ^ 0x0f; 32],
+                max_time: 0,
+            }
+        }
+
+        fn open_pay(
+            fx: &mut Fx,
+            business_id: &str,
+            intent: IntentSlot,
+            envelope_xdr: Option<String>,
+        ) -> OperationHandle {
+            let kind = if matches!(intent, IntentSlot::X402 { .. }) {
+                OperationKind::X402Payment
+            } else {
+                OperationKind::Pay
+            };
+            let opened = fx
+                .recorder()
+                .open(&OpenRequest {
+                    business_id: BusinessId::parse(business_id).unwrap(),
+                    tool: if kind == OperationKind::Pay {
+                        OperationTool::CliPay
+                    } else {
+                        OperationTool::X402CreatePayment
+                    },
+                    kind,
+                    intent,
+                    envelope_xdr,
+                    prepared_decision: Some(serde_json::json!({ "decision": "allow" })),
+                    rule_ttl_ms: None,
+                })
+                .unwrap();
+            match opened {
+                OpenOutcome::New(handle) => handle,
+                other => panic!("expected a new record, got {other:?}"),
+            }
+        }
+
+        fn view_of(fx: &Fx, store: &PersistedWindowStore, business_id: &str) -> OperationView {
+            OperationStatus::new(store, &fx.profile)
+                .view(&BusinessId::parse(business_id).unwrap())
+                .unwrap()
+                .unwrap()
+        }
+
+        /// A canonical record before its first envelope replays the
+        /// destination of its validated intent. An envelope record replays its
+        /// stored envelope's destinations: one shared destination, or the list
+        /// of each payment operation when they differ. A non-payment record
+        /// and a canonical intent that does not validate carry neither member.
+        #[test]
+        #[serial]
+        fn a_pay_replay_carries_its_destination() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let mut fx = Fx::new();
+            let canonical = open_pay(&mut fx, "canonical", canonical_pay(M_MAX), None);
+            assert!(fx.record(canonical.id()).envelope_xdr.is_none());
+            let replay = replay_json(&view_of(&fx, &fx.store, "canonical"));
+            assert_eq!(replay["destination"], M_MAX, "{replay}");
+            assert!(replay.get("destinations").is_none(), "{replay}");
+
+            open_pay(
+                &mut fx,
+                "shared",
+                envelope_slot(1),
+                Some(envelope_text(vec![pay(M_MAX), pay(M_MAX)])),
+            );
+            assert_eq!(
+                view_of(&fx, &fx.store, "shared").destinations,
+                PaymentDestinations::Single(M_MAX.to_owned())
+            );
+            let replay = replay_json(&view_of(&fx, &fx.store, "shared"));
+            assert_eq!(replay["destination"], M_MAX, "{replay}");
+            assert!(replay.get("destinations").is_none(), "{replay}");
+
+            open_pay(
+                &mut fx,
+                "differing",
+                envelope_slot(2),
+                Some(envelope_text(vec![pay(G), manage_data(), pay(M_MAX)])),
+            );
+            let replay = replay_json(&view_of(&fx, &fx.store, "differing"));
+            assert_eq!(
+                replay["destinations"],
+                serde_json::json!([
+                    { "operation": 0, "destination": G },
+                    { "operation": 2, "destination": M_MAX },
+                ]),
+                "{replay}"
+            );
+            assert!(replay.get("destination").is_none(), "{replay}");
+
+            open_pay(
+                &mut fx,
+                "unvalidated",
+                IntentSlot::Canonical {
+                    intent_digest: [3; 32],
+                    intent: serde_json::json!({ "op": "pay", "destination": M_MAX }),
+                },
+                Some(envelope_text(vec![pay(M_MAX)])),
+            );
+            open_pay(
+                &mut fx,
+                "x402",
+                IntentSlot::X402 {
+                    intent_digest: [4; 32],
+                    intent: x402_intent("100"),
+                },
+                None,
+            );
+            for business_id in ["unvalidated", "x402"] {
+                let view = view_of(&fx, &fx.store, business_id);
+                assert_eq!(view.destinations, PaymentDestinations::None);
+                let replay = replay_json(&view);
+                let keys: Vec<&String> = replay.as_object().unwrap().keys().collect();
+                assert_eq!(
+                    keys,
+                    ["business_id", "next", "operation", "status"],
+                    "{business_id}: {replay}"
+                );
+            }
+        }
+
+        /// A record left sending when the process ended before its response
+        /// replays from a fresh store on the same file with `next` `wait` and
+        /// its destination.
+        #[test]
+        #[serial]
+        fn a_pay_replay_carries_its_destination_after_a_restart() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let mut fx = Fx::new();
+            let handle = open_pay(
+                &mut fx,
+                "sent",
+                envelope_slot(5),
+                Some(envelope_text(vec![pay(M_MAX)])),
+            );
+            let mint = fx.mint_request(tx(5), fx.approval(), vec![]);
+            fx.begin_mint(&handle, &mint).unwrap();
+            let restarted = PersistedWindowStore::at_path(fx.store.path().to_path_buf());
+            let view = view_of(&fx, &restarted, "sent");
+            assert_eq!(view.state, OperationState::Sending);
+            let replay = replay_json(&view);
+            assert_eq!(replay["next"], "wait", "{replay}");
+            assert_eq!(replay["destination"], M_MAX, "{replay}");
+        }
+
+        /// A tombstone keeps only its intent digest, so its replay carries
+        /// neither destination member.
+        #[test]
+        #[serial]
+        fn a_pay_replay_carries_its_destination_except_a_tombstone() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let mut fx = Fx::new();
+            let handle = open_pay(
+                &mut fx,
+                "compacted",
+                envelope_slot(6),
+                Some(envelope_text(vec![pay(M_MAX)])),
+            );
+            assert_eq!(
+                replay_json(&view_of(&fx, &fx.store, "compacted"))["destination"],
+                M_MAX
+            );
+            fx.rewrite(|wire| {
+                let section = wire.operations.as_mut().unwrap();
+                let index = section
+                    .records
+                    .iter()
+                    .position(|record| record.id == handle.id())
+                    .unwrap();
+                let mut record = section.records.remove(index);
+                record.state = OperationState::Expired;
+                record.closed_at_ms = Some(T0);
+                section.tombstones.push(record.tombstone());
+            });
+            let view = view_of(&fx, &fx.store, "compacted");
+            assert!(view.compacted);
+            assert_eq!(view.destinations, PaymentDestinations::None);
+            let replay = replay_json(&view);
+            assert!(replay.get("destination").is_none(), "{replay}");
+            assert!(replay.get("destinations").is_none(), "{replay}");
         }
     }
 }

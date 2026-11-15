@@ -2036,4 +2036,124 @@ mod tests {
             assert_eq!(html.contains("Base account"), id.is_some(), "{destination}");
         }
     }
+
+    const CONSENT_G: &str = "GDK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LCRG";
+    const CONSENT_MMAX: &str =
+        "MDK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5L7777777777774ZMO";
+
+    /// The remote detail page of a stored `entry`.
+    fn remote_page(entry: PendingApproval) -> String {
+        let dir = TempDir::new().unwrap();
+        let mut store = PendingApprovalStore::open(dir.path().join("consent.toml")).unwrap();
+        store.insert(entry, NOW_MS).unwrap();
+        let view = store.snapshot(NOW_MS).remove(0);
+        render_detail_page(
+            &view,
+            &test_context(),
+            &"c".repeat(64),
+            None,
+            None,
+            &neutral(),
+        )
+    }
+
+    fn gate_to(destination: &str) -> PendingApproval {
+        PendingApproval::new_toolset_first_invoke_gate_pending(
+            "pay-tools".to_owned(),
+            "a".repeat(32),
+            "1.0.0".to_owned(),
+            "d".repeat(64),
+            "sign-payment".to_owned(),
+            destination.to_owned(),
+            "XLM".to_owned(),
+            0,
+            10,
+            process_uid_for_attestation().unwrap(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap()
+    }
+
+    /// The remote page shows the complete G and maximum-ID M destination of
+    /// a toolset grant, with a base row for M only.
+    #[test]
+    fn toolset_consent_shows_the_complete_destination() {
+        let html = remote_page(gate_to(CONSENT_G));
+        assert!(
+            html.contains(&format!(
+                "Destination</div>\n      <div class=\"addr\">{CONSENT_G}</div>"
+            )),
+            "{html}"
+        );
+        assert!(!html.contains("GDK5L...5LCRG"), "{html}");
+        assert!(!html.contains("Base account"), "{html}");
+        let html = remote_page(gate_to(CONSENT_MMAX));
+        assert!(
+            html.contains(&format!(
+                "Destination</div>\n      <div class=\"addr\">{CONSENT_MMAX}</div>"
+            )),
+            "{html}"
+        );
+        assert!(
+            html.contains(&format!(
+                "Base account</div>\n      <div class=\"addr\">{CONSENT_G}</div>"
+            )),
+            "{html}"
+        );
+    }
+
+    /// The remote page of a payment to the maximum-ID M shows the complete
+    /// address and its base row.
+    #[test]
+    fn payment_consent_shows_the_complete_destination() {
+        let html = remote_page(stellar_agent_core::approval::fixtures::payment_pending(
+            SOURCE_G,
+            CONSENT_MMAX,
+            "XLM",
+            2_500_000,
+            None,
+            100,
+            42,
+            process_uid_for_attestation().unwrap(),
+            DEFAULT_TTL_MS,
+        ));
+        assert!(html.contains(CONSENT_MMAX), "{html}");
+        assert!(
+            html.contains(&format!(
+                "Base account</div>\n      <div class=\"addr\">{CONSENT_G}</div>"
+            )),
+            "{html}"
+        );
+    }
+
+    /// Control and multibyte toolset text renders escaped on the remote
+    /// page beside the complete destination.
+    #[test]
+    fn malformed_consent_terms_render_escaped() {
+        let dir = TempDir::new().unwrap();
+        let mut store = PendingApprovalStore::open(dir.path().join("consent.toml")).unwrap();
+        store.insert(gate_to(CONSENT_MMAX), NOW_MS).unwrap();
+        let mut view = store.snapshot(NOW_MS).remove(0);
+        if let stellar_agent_core::approval::view::ApprovalSummaryView::ToolsetFirstInvokeGate {
+            toolset_name,
+            ..
+        } = &mut view.summary
+        {
+            "t<b>\u{e9}\u{202e}".clone_into(toolset_name);
+        }
+        let html = render_detail_page(
+            &view,
+            &test_context(),
+            &"c".repeat(64),
+            None,
+            None,
+            &neutral(),
+        );
+        assert!(html.contains("t&lt;b&gt;\u{e9}"), "{html}");
+        assert!(
+            !html.contains("<b>") && !html.contains('\u{202e}'),
+            "{html}"
+        );
+        assert!(html.contains(CONSENT_MMAX), "{html}");
+    }
 }

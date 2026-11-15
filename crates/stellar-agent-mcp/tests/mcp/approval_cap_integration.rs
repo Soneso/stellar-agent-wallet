@@ -1136,6 +1136,148 @@ async fn toolset_forced_approval_keeps_allow_effects_and_reservation() {
     h.assert_legs("value_action_pending", "payment", Some(AMOUNT));
 }
 
+/// The toolset route's forced commit records a payment leg hashing the
+/// complete G, M0, and maximum-ID destination of the grant's account, with the
+/// literal digest and redaction, the gate-sized amount and asset, and no row
+/// holding the address. Its success carries the complete destination.
+#[tokio::test]
+#[serial]
+async fn every_payment_recorder_hashes_the_complete_destination() {
+    for (index, (destination, sha256, redacted)) in [
+        (
+            DEST,
+            "21a69b39409ada7a918f60199db819ed7a2c4f11f049c48dca37e3db2688adad",
+            "GA5ZS...4KZVN",
+        ),
+        (
+            "MA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KAAAAAAAAAAAAB2QA",
+            "abcbc3c681989a64ad53637c2b1efc1bcbbe2354f712d40714971981f266cde7",
+            "MA5ZS...AB2QA",
+        ),
+        (
+            "MA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4L7777777777776KKM",
+            "51b2dbb0e8bdf2c98cbde3a823707957ac0b92aac5437fc033a4e8216e338c66",
+            "MA5ZS...76KKM",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let h = Harness::with_policy_chain(
+            &format!("cap-toolset-hash-{index}"),
+            "allow",
+            Outcome::Success,
+            "",
+            "stellar:testnet",
+        )
+        .await;
+        let tools = tempfile::tempdir().unwrap();
+        stellar_agent_toolsets_install::write_toolset_for_test(
+            tools.path(),
+            "payment-toolset",
+            &["sign-payment"],
+            &[],
+            "2026-06-02T00:00:00Z",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &crate::common::toolset_pin_key(),
+        )
+        .unwrap();
+        let grant_path = tools.path().join("grants.toml");
+        let now = now_unix_ms().unwrap();
+        let grant = build_attested_grant(
+            "payment-toolset".to_owned(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "1.0.0".to_owned(),
+            "0".repeat(64),
+            "sign-payment".to_owned(),
+            DEST.to_owned(),
+            "XLM".to_owned(),
+            1,
+            100_000_000,
+            process_uid_for_attestation().unwrap(),
+            now,
+            TOOLSET_GRANT_DEFAULT_TTL_MS,
+            &ATTESTATION_KEY,
+            &stellar_agent_core::approval::AttestationBinding::new(&h.name, "stellar:testnet"),
+        )
+        .unwrap();
+        ToolsetGrantStore::open(grant_path.clone(), now)
+            .unwrap()
+            .insert(grant)
+            .unwrap();
+        let mut h = h;
+        h.server.set_toolsets_root_for_test(tools.path().to_owned());
+        h.server
+            .set_toolset_pin_key_for_test(crate::common::toolset_pin_key());
+        h.server.set_grant_store_path_for_test(grant_path);
+        let sim = result_json(
+            &h.server
+                .call_stellar_pay(
+                    serde_json::from_value(json!({
+                        "chain_id": "stellar:testnet", "source": h.source,
+                        "destination": destination, "asset": "native",
+                        "amount_in_stroops": AMOUNT.to_string()
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(sim["ok"], true, "{destination}: {sim}");
+        let with_destination = |approval: Option<(String, String)>| {
+            let mut args = h.pay_args(&sim["data"], AMOUNT, approval);
+            args.destination = destination.to_owned();
+            args
+        };
+        let invoke = |params| StellarToolsetInvokeArgs {
+            toolset: "payment-toolset".to_owned(),
+            action: "stellar_pay_commit".to_owned(),
+            chain_id: Some("stellar:testnet".to_owned()),
+            args: params,
+        };
+        let prompt = result_json(
+            &h.server
+                .call_stellar_toolset_invoke(invoke(pay_json(&with_destination(None))))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            prompt["error"]["code"], "policy.approval_required",
+            "{destination}: {prompt}"
+        );
+        let nonce = {
+            let store =
+                PendingApprovalStore::open(h.approval_dir.path().join(format!("{}.toml", h.name)))
+                    .unwrap();
+            let entries = store.snapshot(now_unix_ms().unwrap());
+            assert_eq!(entries.len(), 1, "{destination}");
+            entries[0].approval_nonce.clone()
+        };
+        let approval = h.attest_nonce(&nonce, sim["data"]["envelope_xdr"].as_str().unwrap());
+        let result = result_json(
+            &h.server
+                .call_stellar_toolset_invoke(invoke(pay_json(&with_destination(Some(approval)))))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(result["ok"], true, "{destination}: {result}");
+        assert_eq!(result["data"]["destination"], destination, "{result}");
+        assert!(result["data"].get("destinations").is_none(), "{result}");
+        h.assert_legs("value_action_pending", "payment", Some(AMOUNT));
+        let rows = crate::common::audit_rows(&h.profile);
+        let pending = crate::common::rows_of_kind(&rows, "value_action_pending");
+        let leg = &pending[0]["legs"][0];
+        assert_eq!(leg["destination_sha256"], sha256, "{destination}: {leg}");
+        assert_eq!(
+            leg["destination_redacted"], redacted,
+            "{destination}: {leg}"
+        );
+        assert_eq!(leg["asset"], "native", "{destination}: {leg}");
+        let log = std::fs::read_to_string(&h.profile.audit_log_path).unwrap();
+        assert!(!log.contains(destination), "{destination}: no row holds it");
+    }
+}
+
 #[tokio::test]
 #[serial]
 async fn approved_claim_preserves_non_debit_audit_leg() {

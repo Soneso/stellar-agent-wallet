@@ -307,7 +307,7 @@ var stellarAgentApproval = (function () {
         return s.toolset_name + " " + s.package_version + " " + MIDDOT +
           " sha256 " + s.package_shasum_short + " " + MIDDOT +
           " install " + s.install_id + " " + MIDDOT + " requests " + s.capability +
-          " " + MIDDOT + " to " + (s.destination_base ? s.destination : s.destination_redacted);
+          " " + MIDDOT + " to " + s.destination;
       case "trustline_clawback_opt_in":
         return s.code + " " + MIDDOT + " " + s.issuer_redacted;
       case "inconsistent":

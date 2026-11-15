@@ -345,6 +345,12 @@ async fn every_value_verb_replays_its_business_id() {
         assert_eq!(data["operation"]["state"], stored["state"], "{verb:?}");
         assert_eq!(stored["state"], "sent_outcome_unknown", "{verb:?}");
         assert_eq!(data["next"], "wait", "{verb:?}");
+        if verb == Verb::Pay {
+            assert_eq!(data["destination"], DESTINATION, "{verb:?}");
+        } else {
+            assert!(data.get("destination").is_none(), "{verb:?}");
+        }
+        assert!(data.get("destinations").is_none(), "{verb:?}");
         assert_eq!(retried.code, 1, "{verb:?}: the unknown-outcome exit code");
         assert_eq!(Effects::of(&fixture).await, before, "{verb:?}");
 
@@ -352,11 +358,16 @@ async fn every_value_verb_replays_its_business_id() {
             let tx_hash = stellar_agent_network::submit::redact_tx_hash(
                 stored["result"]["tx_hash"].as_str().unwrap(),
             );
+            let destination = if verb == Verb::Pay {
+                format!("  destination {DESTINATION}")
+            } else {
+                String::new()
+            };
             assert_eq!(
                 text.trim_end(),
                 format!(
                     "Operation replayed: business_id {id}  state sent_outcome_unknown  \
-                     tx_hash {tx_hash}  next wait"
+                     tx_hash {tx_hash}{destination}  next wait"
                 ),
                 "{verb:?}: one line"
             );
@@ -826,6 +837,7 @@ fn replay_exit_codes_follow_the_state() {
             execution_expires_at_ms: None,
             compacted: false,
             history_incomplete: false,
+            destinations: stellar_agent_core::profile::receipt::PaymentDestinations::None,
         };
         let expected = i32::from(state != OperationState::Succeeded);
         assert_eq!(replay_exit_code(&view), expected, "{state:?}");

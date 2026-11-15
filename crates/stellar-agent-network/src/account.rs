@@ -574,6 +574,8 @@ impl SignerView {
 ///   account does not exist on the network.
 /// - [`WalletError::Network`] wrapping [`NetworkError::RpcTimeout`] if the RPC
 ///   request times out.
+/// - [`WalletError::Network`] wrapping [`NetworkError::RpcCredentialRejected`]
+///   if the endpoint answers HTTP 401 or 403.
 /// - [`WalletError::Network`] wrapping [`NetworkError::RpcUnreachable`] if the
 ///   endpoint is unreachable.
 /// - [`WalletError::Protocol`] wrapping [`ProtocolError::XdrCodecFailed`]
@@ -1290,8 +1292,10 @@ fn project_home_domain(bytes: &[u8]) -> Option<String> {
 ///
 /// - [`WalletError::Protocol`] wrapping [`ProtocolError::XdrCodecFailed`] if
 ///   the key or returned XDR cannot be encoded / decoded.
+/// - [`WalletError::Network`] wrapping [`NetworkError::RpcCredentialRejected`]
+///   if the endpoint answers HTTP 401 or 403.
 /// - [`WalletError::Network`] wrapping [`NetworkError::RpcUnreachable`] or
-///   [`NetworkError::RpcTimeout`] on transport errors.
+///   [`NetworkError::RpcTimeout`] on other transport errors.
 ///
 /// # Panics
 ///
@@ -1464,7 +1468,9 @@ pub async fn fetch_trustline_entry(
 /// (e.g. data-entry lookups that already validated the account separately).
 ///
 /// Every text field takes the error display scrubbed with
-/// [`RpcEndpoint::scrub`], because that display can carry server text.
+/// [`RpcEndpoint::scrub`], because that display can carry server text. An
+/// HTTP 401 or 403 answer is the endpoint refusing the credential, so it maps
+/// to [`NetworkError::RpcCredentialRejected`], as the identity request does.
 fn map_rpc_error_generic(e: &RpcError, endpoint: &RpcEndpoint) -> WalletError {
     match e {
         RpcError::TransactionSubmissionTimeout => WalletError::Network(NetworkError::RpcTimeout {
@@ -1474,14 +1480,30 @@ fn map_rpc_error_generic(e: &RpcError, endpoint: &RpcEndpoint) -> WalletError {
         RpcError::Xdr(_) => WalletError::Protocol(ProtocolError::XdrCodecFailed {
             detail: endpoint.scrub_display(e),
         }),
-        _ => WalletError::Network(rpc_unreachable(endpoint, "", e)),
+        _ => match crate::retry::rejected_status(e) {
+            Some(status @ (401 | 403)) => {
+                WalletError::Network(NetworkError::RpcCredentialRejected {
+                    url: endpoint.authority(),
+                    status,
+                })
+            }
+            _ => WalletError::Network(rpc_unreachable(endpoint, "", e)),
+        },
     }
 }
 
 /// Maps a failed signer-set `getLedgerEntries` read against `endpoint` to
-/// [`NetworkError::RpcUnreachable`], with the server text scrubbed.
+/// [`NetworkError::RpcUnreachable`], with the server text scrubbed. An HTTP
+/// 401 or 403 answer maps to [`NetworkError::RpcCredentialRejected`], as the
+/// other account reads do.
 fn map_signer_fetch_error(e: &RpcError, endpoint: &RpcEndpoint) -> WalletError {
-    WalletError::Network(rpc_unreachable(endpoint, GET_LEDGER_ENTRIES_FAILED, e))
+    match crate::retry::rejected_status(e) {
+        Some(status @ (401 | 403)) => WalletError::Network(NetworkError::RpcCredentialRejected {
+            url: endpoint.authority(),
+            status,
+        }),
+        _ => WalletError::Network(rpc_unreachable(endpoint, GET_LEDGER_ENTRIES_FAILED, e)),
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1565,6 +1587,31 @@ mod tests {
                 (read, expected) => panic!("{latest}: {read:?} against {expected:?}"),
             }
             server.verify().await;
+        }
+    }
+
+    /// A signer-set read answered with HTTP 401 refuses with the credential
+    /// code, and one answered with HTTP 500 keeps the unreachable code.
+    #[tokio::test]
+    async fn signer_set_read_refuses_a_rejected_credential() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        const OWNER: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+        for (status, code) in [
+            (401, "network.rpc_credential_refused"),
+            (500, "network.rpc_unreachable"),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+            let client = StellarRpcClient::new(&server.uri()).unwrap();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+            let error = fetch_account_signers(&client, &[OWNER.to_owned()], deadline)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), code, "HTTP {status}: {error}");
         }
     }
 

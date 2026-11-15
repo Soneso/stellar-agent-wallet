@@ -1008,25 +1008,10 @@ pub(super) fn write_summary(
             },
             None,
         ) => {
-            // Redact destination to first-5-last-5.
-            // Fields are rendered from VALIDATED STORED values — never from
-            // agent-relayed content (wallet-owned rendering).
-            // A muxed destination shows in full with its base account, because
-            // the grant covers that exact key and ID only.
-            let dest_redacted =
-                if stellar_agent_core::payment_accounts::PaymentAccount::parse(destination)
-                    .is_ok_and(|account| account.muxed_id().is_some())
-                {
-                    destination.clone()
-                } else if destination.len() >= 10 {
-                    format!(
-                        "{}...{}",
-                        &destination[..5],
-                        &destination[destination.len() - 5..]
-                    )
-                } else {
-                    "<redacted>".to_owned()
-                };
+            // Fields are rendered from validated stored values, never from
+            // agent-relayed content. The destination shows in full, with the
+            // base account of an M address, because the grant covers that
+            // exact account.
             format!(
                 "  Kind:              ToolsetFirstInvokeGate\n  \
                  Toolset:           {toolset}\n  \
@@ -1043,7 +1028,7 @@ pub(super) fn write_summary(
                 shasum_short = esc(&package_shasum.chars().take(12).collect::<String>()),
                 install_id = esc(install_id),
                 capability = esc(capability),
-                dest = esc(&dest_redacted),
+                dest = esc(destination),
                 base = base_account_line(destination),
                 asset_text = esc(asset),
                 amount_max = stroop_amount(*amount_max_stroops, asset),
