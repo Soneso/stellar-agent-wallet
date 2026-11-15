@@ -212,6 +212,19 @@ fn tmp_audit_writer() -> (Arc<Mutex<AuditWriter>>, PathBuf, TempDir) {
     (Arc::new(Mutex::new(writer)), path, dir)
 }
 
+/// Creates a marked wallet home below the workspace target directory.
+///
+/// The MCP server of step 6 resolves wallet state under `STELLAR_AGENT_HOME`,
+/// so the test holds this home behind a `StellarAgentHomeGuard`.
+fn storage_sandbox() -> TempDir {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp/test-sandboxes");
+    std::fs::create_dir_all(&root).expect("sandbox root directory");
+    let home = tempfile::tempdir_in(root.canonicalize().expect("sandbox root resolves"))
+        .expect("storage sandbox");
+    stellar_agent_test_support::sandbox::mark_sandbox(home.path()).expect("marked storage sandbox");
+    home
+}
+
 /// Constructs a `ContextRuleManager` against testnet with a signers manager,
 /// both writing to one audit log under the returned `TempDir`, which the
 /// caller holds while it uses the manager. Rule install requires the signers
@@ -617,6 +630,9 @@ fn write_read_rules_toolset_pin(toolsets_root: &Path, toolset_name: &str) {
 #[tokio::test]
 #[serial_test::serial]
 async fn policy_observability_full_flow_testnet_acceptance() {
+    let storage_sandbox = storage_sandbox();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let tmp = tempfile::tempdir().expect("tempdir must be created");
     let registry_path = tmp.path().join("networks.toml");

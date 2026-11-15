@@ -382,6 +382,10 @@ fn audit_rows(home: &std::path::Path, profile: &str) -> Vec<serde_json::Value> {
 #[tokio::test]
 #[serial_test::serial]
 async fn pay_timeout_is_recorded_and_tx_status_reconciles_it() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     #[cfg(feature = "live-platform-keyring")]
     if std::env::var("STELLAR_AGENT_TEST_LIVE_PLATFORM_KEYRING").as_deref()
         == Ok("real-platform-keyring")

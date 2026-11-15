@@ -205,6 +205,10 @@ fn minimum_reserve_document(tools: &[&str], margin_stroops: i64) -> PolicyDocume
 #[tokio::test]
 #[serial]
 async fn t1_classic_trustline_add_two_phase_happy_path_under_minimum_reserve_rule() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
 
     let (source_g, source_seed) = fresh_keypair();

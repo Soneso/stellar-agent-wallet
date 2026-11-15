@@ -342,6 +342,10 @@ async fn bootstrap_session(client: &reqwest::Client, bootstrap_url: &str) -> Ses
 #[tokio::test]
 #[serial]
 async fn t1_serve_approve_then_commit_on_testnet() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
 
     let (payer_g, payer_seed) = fresh_keypair();
@@ -595,6 +599,10 @@ async fn t1_serve_approve_then_commit_on_testnet() {
 #[tokio::test]
 #[serial]
 async fn t2_serve_reject_then_commit_refused() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
 
     let (payer_g, payer_seed) = fresh_keypair();

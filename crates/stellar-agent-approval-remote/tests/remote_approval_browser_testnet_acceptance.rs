@@ -72,10 +72,6 @@
     clippy::panic,
     reason = "test-only; panics and unwraps are acceptable in testnet acceptance tests"
 )]
-#![allow(
-    unsafe_code,
-    reason = "test-only STELLAR_AGENT_HOME override for isolated TLS cert storage, matching stellar_agent_approval_remote::tls's own test convention"
-)]
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -106,7 +102,9 @@ use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_core::timefmt;
 use stellar_agent_mcp::server::{StellarPayArgs, StellarPayCommitArgs, WalletServer};
 use stellar_agent_network::{StellarRpcClient, fetch_account};
+use stellar_agent_test_support::StellarAgentHomeGuard;
 use stellar_agent_test_support::keyring_mock;
+use stellar_agent_test_support::sandbox::StateSandbox;
 use tempfile::TempDir;
 use zeroize::Zeroizing;
 
@@ -564,6 +562,10 @@ async fn assert_result_status_attested(page: &chromiumoxide::Page) {
 #[serial]
 #[ignore = "requires testnet, chromium, and explicit --ignored flag"]
 async fn remote_approval_browser_drives_real_payment_commit() {
+    // The marked home holds TLS and wallet state for the whole body; the
+    // guard restores the inherited value on drop, also after a panic.
+    let tls_home_dir = StateSandbox::new().expect("TLS home sandbox");
+    let _home = StellarAgentHomeGuard::new(tls_home_dir.path());
     keyring_mock::install().expect("mock keyring store init");
 
     let (payer_g, payer_seed) = fresh_keypair();
@@ -577,31 +579,7 @@ async fn remote_approval_browser_drives_real_payment_commit() {
 
     let attestation_key = [0x33u8; 32];
     let approval_dir = TempDir::new().expect("approval temp dir");
-    let tls_home_dir = TempDir::new().expect("TLS home temp dir");
     let operator_credentials_path = approval_dir.path().join("operator_credentials.toml");
-
-    // Isolated TLS cert storage: `provision_or_load`'s STELLAR_AGENT_HOME
-    // override only compiles under `cfg(test)` or `test-helpers` — both
-    // active for this crate under the `testnet-acceptance` feature.
-    //
-    // RAII guard ensures the env var is cleared even if this test panics
-    // partway through (otherwise a panic here leaks it for the rest of the
-    // process's lifetime, affecting any sibling test that reads it) —
-    // mirrors the `ProxyGuard` pattern used for the same class of problem in
-    // `stellar-agent-smart-account`'s `list_rules_no_indexer_call_mock.rs`.
-    struct StellarAgentHomeGuard;
-    impl Drop for StellarAgentHomeGuard {
-        fn drop(&mut self) {
-            unsafe {
-                std::env::remove_var("STELLAR_AGENT_HOME");
-            }
-        }
-    }
-    let _stellar_agent_home_guard = StellarAgentHomeGuard;
-    unsafe {
-        stellar_agent_test_support::sandbox::mark_sandbox(tls_home_dir.path()).unwrap();
-        std::env::set_var("STELLAR_AGENT_HOME", tls_home_dir.path());
-    }
 
     let mut profile =
         Profile::builder_testnet("stellar-agent", &payer_g, "stellar-agent-nonce", &payer_g)

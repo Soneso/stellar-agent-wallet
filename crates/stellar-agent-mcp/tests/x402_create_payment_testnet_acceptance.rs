@@ -491,6 +491,10 @@ fn verify_auth_entry_signature(
 #[tokio::test]
 #[serial]
 async fn a6_create_payment_returns_signed_payload() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (g_strkey, seed) = fresh_keypair();
     let (recipient, _recipient_seed) = fresh_keypair();
     fund_via_friendbot(&g_strkey).await;
@@ -553,6 +557,10 @@ async fn a6_create_payment_returns_signed_payload() {
 #[tokio::test]
 #[serial]
 async fn a6_create_payment_with_witness_passes() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (g_strkey, seed) = fresh_keypair();
     let (recipient, _recipient_seed) = fresh_keypair();
     fund_via_friendbot(&g_strkey).await;
@@ -649,6 +657,10 @@ async fn a6_create_payment_with_witness_passes() {
 #[tokio::test]
 #[serial]
 async fn a6_invalid_scheme_returns_error() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (g_strkey, seed) = fresh_keypair();
     fund_via_friendbot(&g_strkey).await;
     let server = build_test_server(&g_strkey, &seed, "x402-test-signer-scheme");
@@ -699,6 +711,10 @@ async fn a6_invalid_scheme_returns_error() {
 #[tokio::test]
 #[serial]
 async fn a6_chain_id_mismatch_returns_error_data() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (g_strkey, seed) = fresh_keypair();
     fund_via_friendbot(&g_strkey).await;
     let server = build_test_server(&g_strkey, &seed, "x402-test-signer-chain");

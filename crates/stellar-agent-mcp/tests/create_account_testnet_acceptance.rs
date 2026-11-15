@@ -158,6 +158,10 @@ fn seed_keyring(profile: &Profile, seed: &Zeroizing<[u8; 32]>) {
 #[tokio::test]
 #[serial]
 async fn t1_sponsored_create_account_two_phase_happy_path() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
 
     let (sponsor_g, sponsor_seed) = fresh_keypair();

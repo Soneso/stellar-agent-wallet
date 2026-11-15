@@ -512,6 +512,10 @@ fn verify_auth_entry_signature(
 #[tokio::test]
 #[serial]
 async fn a6f_neg1_unreachable_domain_aborts_before_payment() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (g_strkey, seed) = fresh_keypair();
     // NOTE: No Friendbot funding — the gate aborts before any RPC call.
     let server = build_test_server(&g_strkey, &seed, "x402-auth-test-neg1");
@@ -581,6 +585,10 @@ async fn a6f_neg1_unreachable_domain_aborts_before_payment() {
 #[tokio::test]
 #[serial]
 async fn a6f_neg2_invalid_home_domain_aborts_before_payment() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (g_strkey, seed) = fresh_keypair();
     // NOTE: No Friendbot funding — the gate aborts before any network I/O.
     let server = build_test_server(&g_strkey, &seed, "x402-auth-test-neg2");
@@ -659,6 +667,10 @@ async fn a6f_neg2_invalid_home_domain_aborts_before_payment() {
 #[tokio::test]
 #[serial]
 async fn a6f_positive_testanchor_sep10_authenticated_payment() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (g_strkey, seed) = fresh_keypair();
     let (recipient, _recipient_seed) = fresh_keypair();
     fund_via_friendbot(&g_strkey).await;

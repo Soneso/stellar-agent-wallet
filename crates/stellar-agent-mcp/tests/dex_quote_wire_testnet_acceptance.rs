@@ -69,6 +69,10 @@ const QTY_IN_ABOVE_2_POW_53: &str = "9007199254740993";
 #[serial]
 #[ignore = "live testnet acceptance; run in the testnet-acceptance CI job via -- --ignored"]
 async fn dex_quote_wire_round_trips_qty_in_above_2_pow_53() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
 
     // builder_testnet's derived-name arg only needs to be stable and unique;
