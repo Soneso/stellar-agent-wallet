@@ -25,6 +25,7 @@ use stellar_agent_core::profile::{
 };
 
 use super::WindowStoreError;
+use super::notices::CommittedBatch;
 use super::operations::{
     APPROVAL_NONCE_MAX, CapacityDetail, FILE_THRESHOLD, OperationAudit, OperationId, OperationLink,
     OperationRecorder, Session, WindowSection,
@@ -496,6 +497,12 @@ impl<'a> ApprovalRecorder<'a> {
         Self {
             recorder: OperationRecorder::new(store, profile, audit, request_id),
         }
+    }
+
+    /// Moves out the transitions this recorder's steps committed since the
+    /// last call; see [`OperationRecorder::take_committed`].
+    pub fn take_committed(&mut self) -> CommittedBatch {
+        self.recorder.take_committed()
     }
 
     /// Opens a pending record, links its operation and records the waiting edge.
@@ -1164,6 +1171,50 @@ pub(in crate::policy_state) mod tests {
         assert_eq!(fx.rows.entries.len(), rows + 1);
     }
 
+    /// The approval recorder's drain moves out the waiting edge once, with
+    /// the operation's identity, business id, history time and the durable
+    /// record id `find_by_nonce` reports.
+    #[test]
+    #[serial]
+    fn recorder_drains_once_including_approval() {
+        let mut fx = Fx::new(300_000);
+        let operation = fx.operation;
+        let facts = fx.facts.clone();
+        let mut recorder = fx.recorder();
+        recorder.open_pending(operation, &facts).unwrap();
+        let batch = recorder.take_committed();
+        assert!(recorder.take_committed().is_empty());
+        let found = ApprovalStatus::new(&fx.store, fx.fixture.profile())
+            .find_by_nonce(&facts.nonce)
+            .unwrap()
+            .unwrap();
+        let record = fx.wire().operations.unwrap().records.remove(0);
+        let edges: Vec<_> = batch
+            .into_iter()
+            .map(|edge| {
+                (
+                    edge.operation_id(),
+                    edge.business_id().as_str().to_owned(),
+                    edge.state(),
+                    edge.attempt_index(),
+                    edge.at_ms(),
+                    edge.approval_record_id(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            edges,
+            vec![(
+                operation,
+                "order-1".to_owned(),
+                OperationState::AwaitingApproval,
+                None,
+                record.history.last().unwrap().at_ms,
+                Some(found.record.id),
+            )]
+        );
+    }
+
     #[test]
     #[serial]
     fn open_pending_refuses_a_non_prepared_or_linked_operation() {
@@ -1244,7 +1295,14 @@ pub(in crate::policy_state) mod tests {
         for (ttl, execution) in [(86_400_000, 900_000), (300_000, 300_000)] {
             let mut fx = Fx::new(ttl);
             fx.open();
-            let view = fx.consent();
+            let id = fx.id();
+            let mut recorder =
+                ApprovalRecorder::new(&fx.store, fx.fixture.profile(), &mut fx.rows, "request");
+            let view = recorder
+                .record_consent(id, &fx.witness, &fx.payload)
+                .unwrap();
+            // A consent write names no state edge, so it adds no entry.
+            assert!(recorder.take_committed().is_empty());
             let consent = view.record.consent.unwrap();
             assert_eq!(
                 consent.consent_at_ms,
@@ -1613,7 +1671,10 @@ pub(in crate::policy_state) mod tests {
             let operation_before = fx.wire().operations.unwrap().records.remove(0);
             assert_eq!(operation_before.state, OperationState::AwaitingApproval);
             let id = fx.id();
-            let view = fx.recorder().revoke(id).unwrap();
+            let mut recorder = fx.recorder();
+            let view = recorder.revoke(id).unwrap();
+            // A revocation names no state edge, so it adds no entry.
+            assert!(recorder.take_committed().is_empty());
             assert_eq!(
                 view.record.state,
                 if expired {

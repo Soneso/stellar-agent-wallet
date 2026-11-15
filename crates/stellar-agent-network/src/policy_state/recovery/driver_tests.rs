@@ -2443,6 +2443,55 @@ async fn driver_four_timed_attempts_share_one_prefix() {
     }
 }
 
+/// The first attempt's checked decision commits, then the second attempt's
+/// reservation write refuses: the call refuses, and the caller's batch keeps
+/// the decision's edge beside the durable decision.
+#[tokio::test]
+#[serial]
+async fn driver_batch_keeps_decision_before_later_error() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    use super::super::store::COMMIT_FAULT_AFTER_PREPARED;
+    let fx = Fixture::new(2, NOW / 1000 - 10);
+    let pair = fx.pair([60, 60], NOW, 0).await;
+    let mut reservations = 0;
+    WRITE_HOOK.with_borrow_mut(|hook| {
+        *hook = Some(Box::new(move |stage| {
+            if stage == 1 {
+                reservations += 1;
+                if reservations == 2 {
+                    WRITE_FAULT.set((1, COMMIT_FAULT_AFTER_PREPARED));
+                }
+            }
+        }));
+    });
+    let hook = Hook;
+    let left = StellarRpcClient::new(&pair[0].uri()).unwrap();
+    let right = StellarRpcClient::new(&pair[1].uri()).unwrap();
+    let mut committed = CommittedBatch::default();
+    let result = recover_outcomes_committed(
+        &fx.fx.store,
+        &fx.fx.profile,
+        EndpointPair::from_clients(&left, Some(&right)),
+        &fx.writer,
+        None,
+        &mut committed,
+    )
+    .await;
+    drop(hook);
+    assert_eq!(result.unwrap_err().code(), "submission.record_unavailable");
+    let decided = fx.fx.record(fx.ids[0]);
+    assert!(decided.attempts[0].decision.is_some());
+    assert!(fx.fx.record(fx.ids[1]).attempts[0].decision.is_none());
+    let edges: Vec<_> = committed
+        .into_iter()
+        .map(|edge| (edge.operation_id(), edge.state(), edge.attempt_index()))
+        .collect();
+    assert_eq!(edges, vec![(fx.ids[0], decided.state, Some(1))]);
+    assert_eq!(decided.state, OperationState::NotIncluded);
+}
+
 #[tokio::test]
 #[serial]
 async fn driver_each_peer_failure_preserves_only_successful_evidence() {

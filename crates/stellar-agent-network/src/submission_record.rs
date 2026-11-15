@@ -103,9 +103,9 @@ use crate::mainnet::consumed::AuthorizationConsumed;
 use crate::mainnet::refusal::AuthorizedPathError;
 use crate::mainnet::{AuditFacts, AuthorizationDomain, MainnetPrecondition, RecomputedFacts};
 use crate::policy_state::{
-    ConsumptionBinding, ConsumptionExposure, ExposureIdentity, OperationId, OperationRecorder,
-    OperationResult, OperationState, PersistedWindowStore, SubmissionBinding, SubmissionHold,
-    TransitionEvidence, WindowStoreError,
+    CommittedBatch, ConsumptionBinding, ConsumptionExposure, ExposureIdentity, OperationId,
+    OperationRecorder, OperationResult, OperationState, PersistedWindowStore, SubmissionBinding,
+    SubmissionHold, TransitionEvidence, WindowStoreError,
 };
 use crate::sequence_floor::SequenceFloorHook;
 use crate::submit::{MainnetSubmitGrant, redact_tx_hash};
@@ -424,6 +424,33 @@ pub fn end_operation_attempt(
     attempt: OperationAttempt,
     end: &AttemptEnd,
 ) -> Result<(), WalletError> {
+    end_operation_attempt_committed(
+        window,
+        profile,
+        writer,
+        request_id,
+        attempt,
+        end,
+        &mut CommittedBatch::default(),
+    )
+}
+
+/// [`end_operation_attempt`], appending the transitions it commits to
+/// `committed`, the sweep's adoptions and expiries included. An error adds
+/// no entries; it does not establish rollback.
+///
+/// # Errors
+///
+/// The errors of [`end_operation_attempt`].
+pub fn end_operation_attempt_committed(
+    window: &PersistedWindowStore,
+    profile: &Profile,
+    writer: &AuditWriterHandle,
+    request_id: &str,
+    attempt: OperationAttempt,
+    end: &AttemptEnd,
+    committed: &mut CommittedBatch,
+) -> Result<(), WalletError> {
     let (to, evidence) = match end {
         AttemptEnd::NotSent { code } => (
             OperationState::NotSent,
@@ -448,13 +475,15 @@ pub fn end_operation_attempt(
         ),
     };
     let mut guard = lock_audit(writer)?;
-    OperationRecorder::new(window, profile, &mut *guard, request_id)
-        .transition(
-            attempt.operation_id,
-            Some(attempt.attempt_index),
-            to,
-            &evidence,
-        )
+    let mut recorder = OperationRecorder::new(window, profile, &mut *guard, request_id);
+    let ended = recorder.transition(
+        attempt.operation_id,
+        Some(attempt.attempt_index),
+        to,
+        &evidence,
+    );
+    committed.append(recorder.take_committed());
+    ended
         .map(|_| ())
         .map_err(crate::operation_entry::operation_refusal)
 }
@@ -487,6 +516,10 @@ pub struct WalletSubmissionRecorder<'a> {
     operation: Option<OperationAttempt>,
     pre_exposure_ledger: Option<u32>,
     observation: Option<crate::policy_state::WindowObservation>,
+    /// The transitions the attempt ends committed, until
+    /// [`Self::take_committed`] moves them out. The submit layer's callbacks
+    /// take `&self`, so a mutex holds them.
+    committed: std::sync::Mutex<CommittedBatch>,
 }
 
 impl std::fmt::Debug for WalletSubmissionRecorder<'_> {
@@ -586,6 +619,7 @@ impl<'a> WalletSubmissionRecorder<'a> {
             operation: None,
             pre_exposure_ledger: None,
             observation: None,
+            committed: std::sync::Mutex::default(),
         }
     }
 
@@ -679,6 +713,17 @@ impl<'a> WalletSubmissionRecorder<'a> {
         });
     }
 
+    /// Moves out the transitions the recorder's attempt ends committed since
+    /// the last call, and leaves its batch empty.
+    pub fn take_committed(&self) -> CommittedBatch {
+        std::mem::take(
+            &mut *self
+                .committed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
     /// Records `end` for the recorder's operation attempt. The submission's
     /// own result stands either way, so a failure is logged; the attempt
     /// then stays `Sending` until recovery reads it.
@@ -686,14 +731,21 @@ impl<'a> WalletSubmissionRecorder<'a> {
         let (Some(attempt), Some(writer)) = (self.operation, self.audit.as_ref()) else {
             return;
         };
-        if let Err(error) = end_operation_attempt(
+        let mut committed = CommittedBatch::default();
+        let ended = end_operation_attempt_committed(
             &self.window,
             self.profile,
             writer,
             &self.request_id,
             attempt,
             end,
-        ) {
+            &mut committed,
+        );
+        self.committed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .append(committed);
+        if let Err(error) = ended {
             tracing::warn!(
                 profile = %self.profile_name,
                 tool = %self.tool,
@@ -3996,6 +4048,67 @@ mod tests {
             staged.end_refused_attempt("network.rpc_timeout");
             assert_eq!(fx.operation_record(attempt), before);
             assert_eq!(before["state"], "sending");
+        }
+
+        /// The recorder accumulates the edges its attempt ends commit, an
+        /// unsent cleanup through the stage-marked wrapper and a sent
+        /// outcome through the callback, and each drain moves them out once.
+        #[tokio::test]
+        #[serial]
+        async fn submission_recorder_drain_includes_unsent_cleanup() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let edges = |batch: CommittedBatch| -> Vec<_> {
+                batch
+                    .into_iter()
+                    .map(|edge| (edge.operation_id(), edge.state(), edge.attempt_index()))
+                    .collect()
+            };
+            let sub = submission();
+            let fx = LedgerFixture::new("operation-drain-unsent", NOW);
+            let (attempt, _) = fx.linked_attempt(sub.binding.clone(), &[], "order-1");
+            let staged = crate::submission_flow::StageMarkedRecorder::new(
+                fx.recorder(vec![], Some(Arc::clone(&fx.writer)))
+                    .with_operation(Some(attempt)),
+            );
+            staged.end_refused_attempt("auth.signer_unavailable");
+            assert_eq!(
+                edges(staged.take_committed()),
+                vec![(
+                    attempt.operation_id,
+                    OperationState::NotSent,
+                    Some(attempt.attempt_index)
+                )]
+            );
+            assert!(staged.take_committed().is_empty());
+
+            let fx = LedgerFixture::new("operation-drain-sent", NOW);
+            let (attempt, authorization) = fx.linked_attempt(sub.binding.clone(), &[], "order-2");
+            let recorder = fx
+                .recorder(vec![], Some(Arc::clone(&fx.writer)))
+                .with_operation(Some(attempt));
+            recorder
+                .pre_send_authorized(&sub.intent, MainnetSubmitGrant::Tx(authorization))
+                .await
+                .unwrap();
+            recorder
+                .outcome(
+                    &sub.intent,
+                    &SubmissionOutcome::TransportAfterSend {
+                        error: "connection reset".to_owned(),
+                    },
+                )
+                .await;
+            assert_eq!(
+                edges(recorder.take_committed()),
+                vec![(
+                    attempt.operation_id,
+                    OperationState::SentOutcomeUnknown,
+                    Some(attempt.attempt_index)
+                )]
+            );
+            assert!(recorder.take_committed().is_empty());
         }
 
         /// The recorder's outcome ends the attempt, after the exposure the
