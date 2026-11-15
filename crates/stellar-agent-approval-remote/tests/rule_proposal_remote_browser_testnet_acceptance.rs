@@ -87,12 +87,6 @@
     clippy::too_many_lines,
     reason = "test-only; panics and unwraps are acceptable in testnet acceptance tests"
 )]
-#![allow(
-    unsafe_code,
-    reason = "test-only STELLAR_AGENT_HOME / STELLAR_AGENT_NETWORKS_TOML overrides for isolated \
-              passkeys/verifier-registry storage, matching stellar_agent_approval_remote::tls's \
-              own test convention"
-)]
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -133,7 +127,10 @@ use stellar_agent_smart_account::deployment::{
     deploy_smart_account, deploy_webauthn_verifier,
 };
 use stellar_agent_smart_account::managers::credentials::{AddPasskeyOutcome, CredentialsManager};
+use stellar_agent_test_support::StellarAgentHomeGuard;
+use stellar_agent_test_support::env_guard::ScopedEnvVar;
 use stellar_agent_test_support::keyring_mock;
+use stellar_agent_test_support::sandbox::StateSandbox;
 use tempfile::TempDir;
 use tokio::sync::Mutex as TokioMutex;
 use zeroize::Zeroizing;
@@ -363,21 +360,6 @@ impl Drop for BrowserGuard {
             tokio::task::block_in_place(|| {
                 let _ = tokio::runtime::Handle::current().block_on(browser.kill());
             });
-        }
-    }
-}
-
-/// RAII guard clearing the `STELLAR_AGENT_HOME` / `STELLAR_AGENT_NETWORKS_TOML`
-/// env-var overrides even if the test panics partway through — otherwise a
-/// panic here leaks the override for the rest of the process's lifetime,
-/// affecting any sibling test.
-struct EnvOverrideGuard;
-
-impl Drop for EnvOverrideGuard {
-    fn drop(&mut self) {
-        unsafe {
-            std::env::remove_var("STELLAR_AGENT_HOME");
-            std::env::remove_var("STELLAR_AGENT_NETWORKS_TOML");
         }
     }
 }
@@ -817,6 +799,10 @@ async fn propose_and_extract_nonce(
 #[serial]
 #[ignore = "requires testnet, chromium, and explicit --ignored flag"]
 async fn rule_proposal_remote_browser_drives_real_rule_install() {
+    // The marked home holds TLS, passkeys, and wallet state for the whole
+    // body; both guards restore the inherited values on drop.
+    let tls_home_dir = StateSandbox::new().expect("TLS/passkeys home sandbox");
+    let _home = StellarAgentHomeGuard::new(tls_home_dir.path());
     keyring_mock::install().expect("mock keyring store init");
 
     let (proposer_g, proposer_seed) = fresh_keypair();
@@ -825,18 +811,13 @@ async fn rule_proposal_remote_browser_drives_real_rule_install() {
 
     let attestation_key = [0x44u8; 32];
     let approval_dir = TempDir::new().expect("approval temp dir");
-    let tls_home_dir = TempDir::new().expect("TLS/passkeys home temp dir");
     let networks_toml_path = tls_home_dir.path().join("networks.toml");
     let operator_credentials_path = approval_dir.path().join("operator_credentials.toml");
 
-    let _env_guard = EnvOverrideGuard;
-    unsafe {
-        stellar_agent_test_support::sandbox::mark_sandbox(tls_home_dir.path()).unwrap();
-        stellar_agent_test_support::sandbox::mark_sandbox(networks_toml_path.parent().unwrap())
-            .unwrap();
-        std::env::set_var("STELLAR_AGENT_HOME", tls_home_dir.path());
-        std::env::set_var("STELLAR_AGENT_NETWORKS_TOML", &networks_toml_path);
-    }
+    let _networks_toml = ScopedEnvVar::new(
+        "STELLAR_AGENT_NETWORKS_TOML",
+        Some(networks_toml_path.as_os_str()),
+    );
 
     // ── 1. Deploy the WebAuthn verifier + a fresh smart account ─────────────
     let verifier_address = deploy_verifier_to_registry(&networks_toml_path).await;
@@ -1306,6 +1287,8 @@ async fn negative_test_fixture() -> (WalletServer, TempDir, String, String, [u8;
 #[serial]
 #[ignore = "requires testnet and explicit --ignored flag"]
 async fn commit_without_attestation_is_approval_required() {
+    let storage_sandbox = StateSandbox::new().expect("storage sandbox");
+    let _storage_home = StellarAgentHomeGuard::new(storage_sandbox.path());
     let (server, _approval_dir, smart_account_strkey, proposer_g, _attestation_key) =
         negative_test_fixture().await;
 
@@ -1351,6 +1334,8 @@ async fn commit_without_attestation_is_approval_required() {
 #[serial]
 #[ignore = "requires testnet and explicit --ignored flag"]
 async fn tampered_snapshot_is_simulation_divergence() {
+    let storage_sandbox = StateSandbox::new().expect("storage sandbox");
+    let _storage_home = StellarAgentHomeGuard::new(storage_sandbox.path());
     let (server, approval_dir, smart_account_strkey, proposer_g, _attestation_key) =
         negative_test_fixture().await;
 
@@ -1403,6 +1388,8 @@ async fn tampered_snapshot_is_simulation_divergence() {
 #[serial]
 #[ignore = "requires testnet and explicit --ignored flag"]
 async fn operator_reject_then_commit_is_rejected() {
+    let storage_sandbox = StateSandbox::new().expect("storage sandbox");
+    let _storage_home = StellarAgentHomeGuard::new(storage_sandbox.path());
     let (server, approval_dir, smart_account_strkey, proposer_g, _attestation_key) =
         negative_test_fixture().await;
 
@@ -1462,6 +1449,8 @@ async fn operator_reject_then_commit_is_rejected() {
 #[serial]
 #[ignore = "requires testnet and explicit --ignored flag"]
 async fn toolset_gated_first_invoke_entry_is_consumed() {
+    let storage_sandbox = StateSandbox::new().expect("storage sandbox");
+    let _storage_home = StellarAgentHomeGuard::new(storage_sandbox.path());
     let (server, approval_dir, smart_account_strkey, proposer_g, attestation_key) =
         negative_test_fixture().await;
 

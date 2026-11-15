@@ -106,6 +106,19 @@ fn harness_dir() -> PathBuf {
         .expect("interop harness directory")
 }
 
+/// Creates a marked wallet home below the workspace target directory.
+///
+/// The window-state recorder resolves its path under `STELLAR_AGENT_HOME`,
+/// so each test holds this home behind a `StellarAgentHomeGuard`.
+fn storage_sandbox() -> TempDir {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp/test-sandboxes");
+    std::fs::create_dir_all(&root).expect("sandbox root directory");
+    let home = tempfile::tempdir_in(root.canonicalize().expect("sandbox root resolves"))
+        .expect("storage sandbox");
+    stellar_agent_test_support::sandbox::mark_sandbox(home.path()).expect("marked storage sandbox");
+    home
+}
+
 fn prepare_harness(directory: &Path) {
     let node = Command::new("node")
         .args(["-p", "process.versions.node"])
@@ -290,6 +303,9 @@ async fn native_balance(rpc: &StellarRpcClient, account: &str) -> i64 {
 #[tokio::test]
 #[serial]
 async fn released_server_accepts_wallet_credential_and_settles_exact_transfer() {
+    let storage_sandbox = storage_sandbox();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let harness = harness_dir();
     prepare_harness(&harness);
 
@@ -635,6 +651,9 @@ async fn owner_signed_v1_period_cap_refuses_charge_before_signing() {
     use stellar_agent_mpp::BeforeSignError;
     use stellar_agent_network::policy_state::{PersistedWindowStore, WindowStoreError};
 
+    let storage_sandbox = storage_sandbox();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let harness = harness_dir();
     prepare_harness(&harness);
     let (payer, payer_seed) = fresh_keypair();

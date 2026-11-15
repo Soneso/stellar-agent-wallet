@@ -215,6 +215,10 @@ fn extract_text(result: rmcp::model::CallToolResult) -> String {
 #[tokio::test]
 #[serial]
 async fn sign_and_submit_self_payment_succeeds() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     // ── Fresh keypair + Friendbot funding ────────────────────────────────────
     let (g_strkey, seed) = fresh_keypair();
     fund_via_friendbot(&g_strkey).await;
@@ -312,6 +316,10 @@ async fn sign_and_submit_self_payment_succeeds() {
 #[tokio::test]
 #[serial]
 async fn sign_and_submit_invalid_xdr_returns_sep43_error() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (g_strkey, seed) = fresh_keypair();
 
     let server = build_test_server(&g_strkey, &seed);
@@ -356,6 +364,10 @@ async fn sign_and_submit_invalid_xdr_returns_sep43_error() {
 #[tokio::test]
 #[serial]
 async fn sign_and_submit_passphrase_mismatch_returns_sep43_error() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (g_strkey, seed) = fresh_keypair();
 
     let server = build_test_server(&g_strkey, &seed);

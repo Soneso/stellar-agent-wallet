@@ -229,6 +229,10 @@ fn seed_keyring(profile: &Profile, seed: &Zeroizing<[u8; 32]>, attestation_key: 
 #[tokio::test]
 #[serial]
 async fn pay_with_approval_commits_and_submits_on_testnet() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
 
     let (g_strkey, seed) = fresh_keypair();
@@ -450,6 +454,10 @@ fn per_tx_cap_document(tools: &[&str]) -> PolicyDocument {
 #[tokio::test]
 #[serial]
 async fn pay_v1_engine_commit_records_matching_leg_content_on_testnet() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
 
     let (g_strkey, seed) = fresh_keypair();

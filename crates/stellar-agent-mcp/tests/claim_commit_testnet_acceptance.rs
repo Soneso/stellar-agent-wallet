@@ -317,6 +317,10 @@ async fn submit_testnet_signed_xdr(
 #[tokio::test]
 #[serial]
 async fn t1_claim_two_phase_happy_path() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
 
     let (creator_g, creator_seed) = fresh_keypair();
@@ -558,6 +562,10 @@ async fn t1_claim_two_phase_happy_path() {
 #[tokio::test]
 #[serial]
 async fn t2_predicate_expired_refused() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
 
     let (creator_g, creator_seed) = fresh_keypair();

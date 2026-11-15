@@ -1073,6 +1073,10 @@ async fn cross_port_cookie_does_not_authorize_enrollment() {
 #[serial]
 #[ignore = "requires chromium and explicit --ignored flag"]
 async fn cross_port_cookie_does_not_authorize_decision() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().expect("mock keyring store init");
     let dir = TempDir::new().expect("tempdir");
     let store_path = dir.path().join("default.toml");

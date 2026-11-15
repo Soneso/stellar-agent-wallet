@@ -265,6 +265,10 @@ fn prepared_preimage(prepared: &serde_json::Value) -> HashIdPreimage {
 #[tokio::test]
 #[serial]
 async fn sdk_v17_address_v2_entry_signed_through_sep43_settles_on_testnet() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let harness = harness_dir();
     prepare_harness(&harness);
 

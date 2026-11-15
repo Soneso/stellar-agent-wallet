@@ -452,6 +452,10 @@ fn run_pay(
 #[tokio::test]
 #[serial_test::serial]
 async fn pay_v1_per_tx_cap_denies_over_cap_and_submits_under_cap() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     // The v1 policy path registers the platform keyring store before the gate
     // and refuses when registration fails, so this suite needs a functioning
     // platform keyring (macOS Keychain locally; a headless Secret Service,

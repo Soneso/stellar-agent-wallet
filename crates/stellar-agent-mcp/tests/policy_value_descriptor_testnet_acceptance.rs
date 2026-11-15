@@ -294,6 +294,10 @@ async fn simulate_self_payment_envelope(server: &WalletServer, g_strkey: &str) -
 #[tokio::test]
 #[serial]
 async fn value_gate_allow_per_tx_cap_commits_on_testnet() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
 
     let (g_strkey, seed) = fresh_keypair();
@@ -402,6 +406,10 @@ async fn value_gate_allow_per_tx_cap_commits_on_testnet() {
 #[tokio::test]
 #[serial]
 async fn value_gate_deny_per_tx_cap_exceeded_blocks_before_submit() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
 
     let (g_strkey, seed) = fresh_keypair();
@@ -461,6 +469,10 @@ async fn value_gate_deny_per_tx_cap_exceeded_blocks_before_submit() {
 #[tokio::test]
 #[serial]
 async fn value_gate_deny_opaque_unsizable_blocks_raw_signing() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
 
     let (g_strkey, seed) = fresh_keypair();
@@ -520,6 +532,10 @@ async fn value_gate_deny_opaque_unsizable_blocks_raw_signing() {
 #[tokio::test]
 #[serial]
 async fn value_gate_allow_opaque_signing_exemption_permits_raw_signing() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
 
     let (g_strkey, seed) = fresh_keypair();

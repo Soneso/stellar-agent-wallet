@@ -376,6 +376,10 @@ fn run_trustline(
 #[tokio::test]
 #[serial_test::serial]
 async fn profile_init_then_enroll_signer_enables_a_real_signing_operation() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     // `enroll-signer` and `trustline` both register the platform keyring
     // store before touching it, so this suite needs a functioning platform
     // keyring (macOS Keychain locally; a headless Secret Service, provisioned

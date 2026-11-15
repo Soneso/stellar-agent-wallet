@@ -233,6 +233,10 @@ fn build_payment_xdr(source: &str, dest: &str, amount_stroops: i64) -> String {
 #[tokio::test]
 #[serial]
 async fn gated_toolset_first_invoke_and_forced_per_action_testnet() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (g_strkey, seed) = fresh_keypair();
     fund_via_friendbot(&g_strkey).await;
 
