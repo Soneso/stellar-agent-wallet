@@ -2311,8 +2311,14 @@ impl<'a> From<&'a ProviderRecord> for ProviderRecordView<'a> {
 /// prove no independence, which the operator attests.
 #[must_use]
 pub fn same_provider_operator(left: &str, right: &str) -> bool {
-    let fold = |name: &str| name.trim().to_uppercase().to_lowercase();
-    fold(left) == fold(right)
+    provider_operator_fold(left) == provider_operator_fold(right)
+}
+
+/// Trims Unicode white space and folds a provider operator name through
+/// upper case then lower case, preserving internal spacing and punctuation.
+#[must_use]
+pub fn provider_operator_fold(name: &str) -> String {
+    name.trim().to_uppercase().to_lowercase()
 }
 
 /// The most bytes an RPC credential value may hold.

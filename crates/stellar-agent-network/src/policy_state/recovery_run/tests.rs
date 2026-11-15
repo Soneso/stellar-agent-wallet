@@ -466,7 +466,7 @@ fn contextual_schedule_table() {
                 earliest_retry_ms: Some(31000),
             };
             assert_eq!(
-                classify_recovery_stop(reason, stage, Some(method), &stop.roles),
+                classify_recovery_stop(reason, stage),
                 RecoveryClass::Automatic,
                 "{reason:?}/{stage:?}"
             );
@@ -506,7 +506,7 @@ fn contextual_schedule_table() {
             earliest_retry_ms: None,
         };
         assert_eq!(
-            classify_recovery_stop(reason, stage, method, &stop.roles),
+            classify_recovery_stop(reason, stage),
             RecoveryClass::Explicit
         );
         assert_eq!(stop_schedule(&stop, 0, 10).unwrap(), None);

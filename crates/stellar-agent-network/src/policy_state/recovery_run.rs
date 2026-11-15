@@ -338,12 +338,7 @@ pub fn recovery_expiry(max_time: u64) -> Option<u64> {
 
 /// Classifies contextual failures without inferring configuration from answer quality.
 #[must_use]
-pub fn classify_recovery_stop(
-    reason: RecoveryStopReason,
-    stage: RecoveryStage,
-    _method: Option<RecoveryRunMethod>,
-    _roles: &[RecoveryRole],
-) -> RecoveryClass {
+pub fn classify_recovery_stop(reason: RecoveryStopReason, stage: RecoveryStage) -> RecoveryClass {
     use RecoveryStopReason as R;
     if matches!(
         reason,
@@ -360,16 +355,15 @@ pub fn classify_recovery_stop(
 pub(super) fn recovery_configuration_digest(
     profile: &stellar_agent_core::profile::schema::Profile,
 ) -> String {
-    use stellar_agent_core::profile::schema::provider_host;
+    use stellar_agent_core::profile::schema::{provider_host, provider_operator_fold};
     let providers = profile.providers.as_ref();
     let fields = [
         provider_host(&profile.rpc_url).unwrap_or_default(),
-        providers
-            .and_then(|p| p.primary.as_ref())
-            .map_or("", |p| p.operator.as_str())
-            .trim()
-            .to_uppercase()
-            .to_lowercase(),
+        provider_operator_fold(
+            providers
+                .and_then(|p| p.primary.as_ref())
+                .map_or("", |p| p.operator.as_str()),
+        ),
         provider_host(
             profile
                 .oracle_provider_url
@@ -377,12 +371,11 @@ pub(super) fn recovery_configuration_digest(
                 .map_or("", url::Url::as_str),
         )
         .unwrap_or_default(),
-        providers
-            .and_then(|p| p.oracle.as_ref())
-            .map_or("", |p| p.operator.as_str())
-            .trim()
-            .to_uppercase()
-            .to_lowercase(),
+        provider_operator_fold(
+            providers
+                .and_then(|p| p.oracle.as_ref())
+                .map_or("", |p| p.operator.as_str()),
+        ),
     ];
     let mut hash = Sha256::new();
     hash.update(b"stellar-agent/recovery-configuration/v1\0");
@@ -393,10 +386,7 @@ pub(super) fn recovery_configuration_digest(
     stellar_agent_core::hex::encode(&hash.finalize())
 }
 
-pub(super) fn configuration_reopens(
-    snapshot: Option<&RecoveryRunSnapshot>,
-    configuration: &str,
-) -> bool {
+fn configuration_reopens(snapshot: Option<&RecoveryRunSnapshot>, configuration: &str) -> bool {
     snapshot
         .and_then(RecoveryRunSnapshot::record)
         .is_some_and(|run| {
@@ -410,6 +400,16 @@ pub(super) fn configuration_reopens(
                     .as_ref()
                     .is_some_and(|scan| scan.configuration != configuration)
         })
+}
+
+pub(super) fn recovery_runnable(
+    view: &RecoveryRunView,
+    snapshot: Option<&RecoveryRunSnapshot>,
+    now: u64,
+    configuration: &str,
+) -> bool {
+    view.earliest_retry_ms.is_some_and(|due| now >= due)
+        || configuration_reopens(snapshot, configuration)
 }
 
 /// Binds a classic exposure using length-prefixed fields and big-endian integers.
@@ -514,9 +514,7 @@ fn stop_schedule(
     count: u8,
     max_time: u64,
 ) -> Result<Option<u64>, WindowStoreError> {
-    if classify_recovery_stop(stop.reason, stop.stage, stop.method, &stop.roles)
-        == RecoveryClass::Explicit
-    {
+    if classify_recovery_stop(stop.reason, stop.stage) == RecoveryClass::Explicit {
         return Ok(None);
     }
     let retry = recovery_retry_time(stop.stopped_at_ms, count)?;
@@ -525,6 +523,13 @@ fn stop_schedule(
     } else {
         retry
     }))
+}
+
+fn legacy_coverage(run: &WireRecoveryRun, stop: &RecoveryStop) -> bool {
+    run.version == 1
+        && stop.reason == RecoveryStopReason::CoverageRequired
+        && stop.class == RecoveryClass::Explicit
+        && stop.earliest_retry_ms.is_none()
 }
 
 fn validate_run(
@@ -567,21 +572,11 @@ fn validate_run(
         }
         (RecoveryRunPhase::Resolved, None) => decision && run.consecutive_stops == 0,
         (RecoveryRunPhase::Stopped, Some(stop)) => {
-            let legacy_coverage = run.version == 1
-                && stop.reason == RecoveryStopReason::CoverageRequired
-                && stop.class == RecoveryClass::Explicit
-                && stop.earliest_retry_ms.is_none();
             run.consecutive_stops == run.automatic_runs
                 && stop.stopped_at_ms >= run.run_started_ms
                 && valid_context(stop, recovery_expiry(*max_time).is_some(), account)
-                && (legacy_coverage
-                    || (stop.class
-                        == classify_recovery_stop(
-                            stop.reason,
-                            stop.stage,
-                            stop.method,
-                            &stop.roles,
-                        )
+                && (legacy_coverage(run, stop)
+                    || (stop.class == classify_recovery_stop(stop.reason, stop.stage)
                         && stop_schedule(stop, run.consecutive_stops - 1, *max_time).ok()
                             == Some(stop.earliest_retry_ms)))
         }
@@ -671,10 +666,7 @@ pub fn normalize_recovery_run(
         .map_or(run.run_started_ms, |s| s.stopped_at_ms);
     let due = if let Some(stop) = &run.stop {
         view.state = V::Stopped(stop.reason);
-        if run.version == 1
-            && stop.reason == R::CoverageRequired
-            && stop.class == RecoveryClass::Explicit
-        {
+        if legacy_coverage(run, stop) {
             view.class = Some(RecoveryClass::Automatic);
             recovery_retry_time(stop.stopped_at_ms, run.consecutive_stops - 1).ok()
         } else {

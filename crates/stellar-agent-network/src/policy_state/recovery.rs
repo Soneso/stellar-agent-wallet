@@ -23,9 +23,9 @@ use super::operations::{
 use super::recovery_run::{
     RecoveryClass, RecoveryRole, RecoveryRunMethod, RecoveryRunPhase, RecoveryRunState,
     RecoveryRunView, RecoveryStage, RecoveryStop, RecoveryStopReason, WireRecoveryRun,
-    classify_recovery_stop, configuration_reopens, normalize_recovery_run,
-    recovery_configuration_digest, recovery_deadline, recovery_expiry, recovery_exposure_digest,
-    recovery_retry_time,
+    classify_recovery_stop, normalize_recovery_run, recovery_configuration_digest,
+    recovery_deadline, recovery_expiry, recovery_exposure_digest, recovery_retry_time,
+    recovery_runnable,
 };
 use super::recovery_scan::{self, RecoveryScan};
 use super::{PersistedWindowStore, WindowStoreError};
@@ -652,17 +652,8 @@ struct Scan {
     entries: Vec<(u32, u64)>,
 }
 
-fn scan_page(
-    page: &GetLedgersResponse,
-    cursor: u32,
-    max_time: u64,
-    requested: usize,
-) -> Option<Scan> {
-    if requested != 1 {
-        return None;
-    }
+fn scan_page(page: &GetLedgersResponse, cursor: u32, max_time: u64) -> Option<Scan> {
     let close = recovery_scan::ledger(page, cursor, cursor).ok()?;
-    cursor.checked_add(1)?;
     Some(Scan {
         answer: LedgerAnswer {
             expiry_ledger: Some(cursor),
@@ -719,7 +710,7 @@ async fn history(
         budget.failed(retention);
         return Err(ReadFailure::Failed(retention));
     }
-    let scan = scan_page(&page, target, max_time, PAGE_SIZE);
+    let scan = scan_page(&page, target, max_time);
     if scan.is_none() {
         budget.failed(RecoveryReason::MissingField);
     }
@@ -727,24 +718,18 @@ async fn history(
 }
 
 async fn scan_history(
-    pair: &EndpointPair<'_>,
+    clients: [&StellarRpcClient; 2],
     shared: [(&SharedObservation, u32); 2],
-    attempt: &RecoveryAttempt,
+    range: (Option<u32>, SequenceReleaseInput, u64),
     exposure: &str,
-    configuration: String,
+    configuration: &str,
     progress: &mut Option<RecoveryScan>,
     budget: &mut Budget,
 ) {
     budget.context(RecoveryEndpoint::Primary, RecoveryMethod::GetLedgers, None);
-    let Some(start) = attempt.pre_exposure_ledger else {
+    let (start, release, max_time) = range;
+    let Some(start) = start else {
         budget.failed(RecoveryReason::MissingProvenance);
-        return;
-    };
-    let (Some(release), Some(oracle), ExposureIdentity::Classic { max_time, .. }) = (
-        matched_sequence_release(attempt),
-        pair.oracle,
-        &attempt.exposure,
-    ) else {
         return;
     };
     if start > release.primary_ledger {
@@ -753,18 +738,17 @@ async fn scan_history(
     }
     if progress
         .as_ref()
-        .is_none_or(|scan| scan.configuration != configuration)
+        .is_some_and(|scan| scan.configuration != configuration)
     {
-        *progress = Some(RecoveryScan::new(configuration, exposure, start));
+        *progress = None;
     }
-    let Some(scan) = progress else {
-        return;
-    };
+    let scan = progress
+        .get_or_insert_with(|| RecoveryScan::new(configuration.to_owned(), exposure, start));
     let mut tips =
         shared.map(|(s, tip)| s.report.latest_ledger.max(tip).max(release.primary_ledger));
     while scan.end.is_none() && scan.next_unread <= release.primary_ledger {
         let mut closes = [0; 2];
-        for (index, client) in [pair.primary, oracle].into_iter().enumerate() {
+        for (index, client) in clients.into_iter().enumerate() {
             budget.context(
                 if index == 0 {
                     RecoveryEndpoint::Primary
@@ -802,11 +786,11 @@ async fn scan_history(
             }
             tips[index] = page.latest_ledger;
         }
-        if scan.next_unread == release.primary_ledger && closes[0] <= *max_time {
+        if scan.next_unread == release.primary_ledger && closes[0] <= max_time {
             budget.failed(RecoveryReason::Disagreement);
             return;
         }
-        if let Err(reason) = scan.accept(closes, *max_time) {
+        if let Err(reason) = scan.accept(closes, max_time) {
             budget.failed(if reason == RecoveryStopReason::Disagreement {
                 RecoveryReason::Disagreement
             } else {
@@ -1160,10 +1144,25 @@ type AccountRead = Result<[AccountAnswer; 2], &'static str>;
 /// The detail of an account answer below its endpoint's readiness ledger.
 const ACCOUNT_LEDGER_REGRESSED: &str = "account.ledger_regressed";
 
+/// A typed missing account, eligible for history only when both peers agree.
+const ACCOUNT_NOT_FOUND: &str = "account.not_found";
+
 fn matched_sequence_release(attempt: &RecoveryAttempt) -> Option<SequenceReleaseInput> {
     attempt
         .sequence_release
         .filter(|release| release.primary_ledger == release.witness_ledger)
+}
+
+/// Only a scan already durable before this run's hash reads can decide history.
+fn complete_history_end(
+    run: &WireRecoveryRun,
+    attempt: &RecoveryAttempt,
+    configuration: &str,
+) -> Option<u32> {
+    run.scan
+        .as_ref()
+        .filter(|scan| scan.configuration == configuration && !attempt.recovery.history_incomplete)
+        .and_then(|scan| scan.end.map(|(ledger, _)| ledger))
 }
 
 /// Proves `attempt` not included, from a recorded sequence release and a
@@ -1173,7 +1172,7 @@ fn matched_sequence_release(attempt: &RecoveryAttempt) -> Option<SequenceRelease
 /// attempt's and each account ledger at or past that endpoint's expiry
 /// ledger. The complete-history branch needs two covered absences whose
 /// oldest ledgers reach back to the pre-exposure ledger and whose latest
-/// ledgers reach each expiry ledger, with intact history. A regressed or
+/// ledgers reach the stored scan end, with intact history. A regressed or
 /// failed account read decides nothing and falls back to nothing.
 ///
 /// # Errors
@@ -1229,6 +1228,13 @@ fn classify_non_inclusion(
     if attempt.recovery.history_incomplete {
         return Err("history_incomplete");
     }
+    let end = attempt
+        .recovery_run
+        .as_ref()
+        .and_then(|snapshot| snapshot.record())
+        .and_then(|run| run.scan.as_ref())
+        .and_then(|scan| scan.end)
+        .map_or(release.primary_ledger, |(ledger, _)| ledger);
     let mut coverage = [None, None];
     for (index, answer) in outcome.iter().enumerate() {
         match (
@@ -1238,7 +1244,7 @@ fn classify_non_inclusion(
             answer.time_defect,
         ) {
             (Some("NOT_FOUND"), Some(oldest), Some(latest), None)
-                if oldest <= pre_exposure && latest >= bounds[index] =>
+                if oldest <= pre_exposure && latest >= end =>
             {
                 coverage[index] = Some(EndpointCoverage {
                     first_ledger: pre_exposure,
@@ -1462,14 +1468,14 @@ async fn account_read(
             budget.failed(RecoveryReason::AccountUnavailable);
             Ok(Err(ACCOUNT_LEDGER_REGRESSED))
         }
+        Ok(Err(crate::client::RecoveryReadError::Validation(WalletError::Network(
+            stellar_agent_core::error::NetworkError::AccountNotFound { .. },
+        )))) => {
+            budget.failed(RecoveryReason::AccountUnavailable);
+            Ok(Err(ACCOUNT_NOT_FOUND))
+        }
         Ok(Err(error)) => {
-            let reason = read_failure(&error);
-            // An absent account is an availability answer, never coverage.
-            budget.failed(if reason == RecoveryReason::CoverageRequired {
-                RecoveryReason::AccountUnavailable
-            } else {
-                reason
-            });
+            budget.failed(read_failure(&error));
             Ok(Err("endpoint_unreachable"))
         }
     }
@@ -1729,7 +1735,7 @@ fn contextual_stop(
     } else {
         roles
     };
-    let class = classify_recovery_stop(reason, stage, method, &roles);
+    let class = classify_recovery_stop(reason, stage);
     let earliest_retry_ms = if class == RecoveryClass::Automatic {
         Some(
             recovery_retry_time(now, count)?.max(if reason == R::AwaitingExpiry {
@@ -1862,6 +1868,7 @@ async fn collect_outcomes(
         Ok(shared) => shared,
         Err(_) => return Ok(prefix(budget)),
     };
+    let configuration = recovery_configuration_digest(driver.profile);
     for attempt in attempts {
         budget.deadline = call_deadline;
         if Instant::now() >= budget.deadline {
@@ -1901,10 +1908,12 @@ async fn collect_outcomes(
         };
         let started = super::store::now_ms()?;
         let view = run_view(attempt, started);
-        let configuration = recovery_configuration_digest(driver.profile);
-        if !view.earliest_retry_ms.is_some_and(|due| started >= due)
-            && !configuration_reopens(attempt.recovery_run.as_ref(), &configuration)
-        {
+        if !recovery_runnable(
+            &view,
+            attempt.recovery_run.as_ref(),
+            started,
+            &configuration,
+        ) {
             continue;
         }
         let saved_scan = attempt
@@ -1964,12 +1973,13 @@ async fn collect_outcomes(
             })?;
         #[cfg(test)]
         driver_tests::configure_budget(&mut budget);
-        let target = timed.then_some(
+        let history_end = complete_history_end(&run, &owned, &configuration);
+        let target = history_end.or(timed.then_some(
             primary
                 .report
                 .latest_ledger
                 .min(oracle.report.latest_ledger),
-        );
+        ));
         let source_usable = owned
             .account
             .as_deref()
@@ -2053,6 +2063,7 @@ async fn collect_outcomes(
             .iter()
             .all(|answer| answer.status.as_deref() == Some("NOT_FOUND"));
         let mut accounts = None;
+        let mut absent_accounts = false;
         let mut account_partial = Vec::new();
         if read_all
             && absent
@@ -2094,6 +2105,10 @@ async fn collect_outcomes(
                 }
             }
             let [left, right] = reads;
+            absent_accounts = matches!(
+                (left, right),
+                (Err(ACCOUNT_NOT_FOUND), Err(ACCOUNT_NOT_FOUND))
+            );
             account_partial = partial_account_rows(
                 [left, right],
                 (
@@ -2101,13 +2116,19 @@ async fn collect_outcomes(
                     Some(oracle.report.latest_ledger),
                 ),
             )?;
-            accounts = Some(match (left, right) {
-                (Ok(left), Ok(right)) => Ok([left, right]),
-                (Err(ACCOUNT_LEDGER_REGRESSED), _) | (_, Err(ACCOUNT_LEDGER_REGRESSED)) => {
-                    Err(ACCOUNT_LEDGER_REGRESSED)
-                }
-                (Err(detail), _) | (_, Err(detail)) => Err(detail),
-            });
+            accounts = if absent_accounts {
+                // Both failures came from typed absence in this account pair.
+                budget.failure = None;
+                None
+            } else {
+                Some(match (left, right) {
+                    (Ok(left), Ok(right)) => Ok([left, right]),
+                    (Err(ACCOUNT_LEDGER_REGRESSED), _) | (_, Err(ACCOUNT_LEDGER_REGRESSED)) => {
+                        Err(ACCOUNT_LEDGER_REGRESSED)
+                    }
+                    (Err(detail), _) | (_, Err(detail)) => Err(detail),
+                })
+            };
         }
         let partial = if read_all {
             Vec::new()
@@ -2144,16 +2165,19 @@ async fn collect_outcomes(
             }
         }
         let mut scan_progress = run.scan.clone();
-        if !high_roles.is_empty() && matches!(&accounts, Some(Ok(_))) && budget.failure.is_none() {
+        if (absent_accounts || (!high_roles.is_empty() && matches!(&accounts, Some(Ok(_)))))
+            && budget.failure.is_none()
+            && let Some(release) = matched_sequence_release(&owned)
+        {
             budget.attempt_limit = ATTEMPT_REQUESTS;
             let tips = [scans.0.as_ref(), scans.1.as_ref()]
                 .map(|scan| scan.and_then(|s| s.answer.latest_ledger).unwrap_or(0));
             scan_history(
-                pair,
+                [pair.primary, oracle_client],
                 [(&primary, tips[0]), (&oracle, tips[1])],
-                &owned,
+                (owned.pre_exposure_ledger, release, max_time),
                 &run.exposure,
-                configuration,
+                &configuration,
                 &mut scan_progress,
                 &mut budget,
             )
@@ -2186,7 +2210,8 @@ async fn collect_outcomes(
                 _,
                 _
             ))
-        ) {
+        ) && history_end.is_none()
+        {
             evaluation.decision = None;
             if let Some(recovery) = &mut evaluation.input.recovery {
                 recovery.last_outcome = Some("evidence_pending".to_owned());
@@ -2384,15 +2409,16 @@ pub(crate) async fn recover_outcomes_committed(
     if !profile.chain_id.is_mainnet() || attempts.is_empty() {
         return Ok(RecoveryReport::default());
     }
+    let configuration = recovery_configuration_digest(profile);
     let runnable: Vec<_> = attempts
         .iter()
         .filter(|a| {
-            configuration_reopens(
+            recovery_runnable(
+                &run_view(a, now_ms),
                 a.recovery_run.as_ref(),
-                &recovery_configuration_digest(profile),
-            ) || run_view(a, now_ms)
-                .earliest_retry_ms
-                .is_some_and(|due| now_ms >= due)
+                now_ms,
+                &configuration,
+            )
         })
         .cloned()
         .collect();
@@ -2797,7 +2823,7 @@ mod tests {
     }
 
     fn deciding(ledger: u32, close: u64, max_time: u64) -> Scan {
-        scan_page(&page(ledger, 1, ledger, close), ledger, max_time, 1).unwrap()
+        scan_page(&page(ledger, 1, ledger, close), ledger, max_time).unwrap()
     }
 
     /// Success confirms every record with its amount and time. Failure keeps

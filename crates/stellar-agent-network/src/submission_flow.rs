@@ -445,9 +445,9 @@ const SEQUENCES_MISSING_EVIDENCE: &str = "sequence recovery evidence missing; ";
 /// reservation in place.
 ///
 /// After a completed legacy stage, the recovery stage runs the bounded
-/// recovery driver of [`crate::policy_state::recover_outcomes`] once, then repairs the receipt of every retained committed recovery
-/// decision when `receipts` and the writer are available. Idle passes repair
-/// too. Accounting obligations drain in [`finish_reconciliation`].
+/// recovery driver of [`crate::policy_state::recover_outcomes`] once, then repairs the receipt of
+/// every retained committed recovery decision when `receipts` and the writer are available.
+/// Idle passes repair too. Accounting obligations drain in [`finish_reconciliation`].
 pub async fn reconcile_pass(
     profile: &Profile,
     window: &PersistedWindowStore,
@@ -801,30 +801,47 @@ pub(crate) fn warn_status_recovery_refusal(
 /// refusal is cached too, so no later step acquires again.
 struct OnceWriter<F> {
     acquire: F,
-    state: Option<Result<Arc<Mutex<AuditWriter>>, Option<WalletError>>>,
+    state: WriterState,
+}
+
+enum WriterState {
+    Unacquired,
+    Acquired(Arc<Mutex<AuditWriter>>),
+    Refused(Option<WalletError>),
 }
 
 impl<F: Fn() -> Result<Arc<Mutex<AuditWriter>>, WalletError>> OnceWriter<F> {
-    fn result(&mut self) -> &mut Result<Arc<Mutex<AuditWriter>>, Option<WalletError>> {
-        self.state
-            .get_or_insert_with(|| (self.acquire)().map_err(Some))
+    fn result(&mut self) -> &mut WriterState {
+        if matches!(self.state, WriterState::Unacquired) {
+            self.state = match (self.acquire)() {
+                Ok(writer) => WriterState::Acquired(writer),
+                Err(error) => WriterState::Refused(Some(error)),
+            };
+        }
+        &mut self.state
     }
 
     /// The acquired writer, or `None` after a refusal.
     fn handle(&mut self) -> Option<Arc<Mutex<AuditWriter>>> {
-        self.result().as_ref().ok().cloned()
+        match self.result() {
+            WriterState::Acquired(writer) => Some(Arc::clone(writer)),
+            _ => None,
+        }
     }
 
     /// The acquired writer, or the cached refusal for the drain to report.
+    #[expect(
+        clippy::expect_used,
+        reason = "the drain's FnOnce consumes a refusal once"
+    )]
     fn for_drain(&mut self) -> Result<Arc<Mutex<AuditWriter>>, WalletError> {
-        match self.result() {
-            Ok(writer) => Ok(Arc::clone(writer)),
-            Err(refusal) => Err(refusal.take().unwrap_or_else(|| {
-                WalletError::Submission(SubmissionError::RecordUnavailable {
-                    detail: "the audit writer acquisition refused".to_owned(),
-                })
-            })),
-        }
+        let result = match self.result() {
+            WriterState::Acquired(writer) => Some(Ok(Arc::clone(writer))),
+            WriterState::Refused(refusal) => refusal.take().map(Err),
+            WriterState::Unacquired => None,
+        };
+        // result acquires first, and only the drain's FnOnce takes the error.
+        result.expect("the status drain consumes its writer result once")
     }
 }
 
@@ -927,7 +944,7 @@ pub async fn transaction_status_committed(
     }
     let mut writer = OnceWriter {
         acquire: writer,
-        state: None,
+        state: WriterState::Unacquired,
     };
     let mut sequences = "not run";
     if profile.chain_id.is_mainnet()

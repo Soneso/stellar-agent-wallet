@@ -5275,6 +5275,7 @@ impl<'a> OperationStatus<'a> {
         let Some(wire) = self.read()? else {
             return Ok(Vec::new());
         };
+        let configuration = super::recovery_run::recovery_configuration_digest(self.profile);
         let mut candidates = Vec::new();
         for record in records(&wire) {
             if record.state != OperationState::SentOutcomeUnknown || record.kind.is_x402() {
@@ -5306,11 +5307,7 @@ impl<'a> OperationStatus<'a> {
                     attempt.decision.is_some(),
                     now,
                 );
-                if view.earliest_retry_ms.is_some_and(|due| now >= due)
-                    || super::recovery_run::configuration_reopens(
-                        run.as_ref(),
-                        &super::recovery_run::recovery_configuration_digest(self.profile),
-                    )
+                if super::recovery_run::recovery_runnable(&view, run.as_ref(), now, &configuration)
                 {
                     candidates.push((
                         attempt.started_at_ms,
