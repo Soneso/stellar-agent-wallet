@@ -7,6 +7,7 @@ use sha2::{Digest as _, Sha256};
 
 use super::WindowStoreError;
 use super::operations::{ExposureIdentity, OperationId, WireAttempt};
+use super::recovery_scan::RecoveryScan;
 
 /// The largest stored run object, including its JSON framing.
 pub const RECOVERY_RUN_MAX: usize = 1_024;
@@ -42,6 +43,10 @@ pub enum RecoveryStopReason {
     ClockRegression,
     /// A covered account sequence requires unavailable history.
     CoverageRequired,
+    /// An unread ledger is no longer retained.
+    HistoryLost,
+    /// The exposure has no authenticated starting ledger.
+    MissingProvenance,
     /// Authenticated recovery metadata or source identity is unusable.
     RecordUnusable,
     /// An unfinished reservation reaches its lease deadline.
@@ -153,11 +158,11 @@ pub struct RecoveryStop {
     pub earliest_retry_ms: Option<u64>,
 }
 
-/// The interpreted version-one run record.
+/// The interpreted run record, with an optional paired scan in version two.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WireRecoveryRun {
-    /// The record version, exactly one.
+    /// The record version, one without a scan or two with a scan.
     pub version: u8,
     /// The lowercase SHA-256 exposure binding.
     pub exposure: String,
@@ -178,6 +183,18 @@ pub struct WireRecoveryRun {
         deserialize_with = "deserialize_stop"
     )]
     pub stop: Option<RecoveryStop>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_scan"
+    )]
+    pub(super) scan: Option<RecoveryScan>,
+}
+
+fn deserialize_scan<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<RecoveryScan>, D::Error> {
+    RecoveryScan::deserialize(d).map(Some)
 }
 
 fn deserialize_stop<'de, D: serde::Deserializer<'de>>(
@@ -269,6 +286,7 @@ impl RecoveryRunSnapshot {
                         &exposure.identity,
                         account,
                         attempt.decision.is_some(),
+                        attempt,
                     )
                 })
             });
@@ -323,21 +341,75 @@ pub fn recovery_expiry(max_time: u64) -> Option<u64> {
 pub fn classify_recovery_stop(
     reason: RecoveryStopReason,
     stage: RecoveryStage,
-    method: Option<RecoveryRunMethod>,
-    roles: &[RecoveryRole],
+    _method: Option<RecoveryRunMethod>,
+    _roles: &[RecoveryRole],
 ) -> RecoveryClass {
     use RecoveryStopReason as R;
-    if matches!(reason, R::ConfigurationRequired | R::RecordUnusable)
-        || matches!(stage, RecoveryStage::Configuration | RecoveryStage::Record)
-        || (reason == R::CoverageRequired
-            && stage == RecoveryStage::Account
-            && method == Some(RecoveryRunMethod::GetLedgerEntries)
-            && !roles.is_empty())
+    if matches!(
+        reason,
+        R::ConfigurationRequired | R::RecordUnusable | R::HistoryLost | R::MissingProvenance
+    ) || matches!(stage, RecoveryStage::Configuration | RecoveryStage::Record)
     {
         RecoveryClass::Explicit
     } else {
         RecoveryClass::Automatic
     }
+}
+
+/// Hashes only normalized provider hosts and declared operators, in role order.
+pub(super) fn recovery_configuration_digest(
+    profile: &stellar_agent_core::profile::schema::Profile,
+) -> String {
+    use stellar_agent_core::profile::schema::provider_host;
+    let providers = profile.providers.as_ref();
+    let fields = [
+        provider_host(&profile.rpc_url).unwrap_or_default(),
+        providers
+            .and_then(|p| p.primary.as_ref())
+            .map_or("", |p| p.operator.as_str())
+            .trim()
+            .to_uppercase()
+            .to_lowercase(),
+        provider_host(
+            profile
+                .oracle_provider_url
+                .as_ref()
+                .map_or("", url::Url::as_str),
+        )
+        .unwrap_or_default(),
+        providers
+            .and_then(|p| p.oracle.as_ref())
+            .map_or("", |p| p.operator.as_str())
+            .trim()
+            .to_uppercase()
+            .to_lowercase(),
+    ];
+    let mut hash = Sha256::new();
+    hash.update(b"stellar-agent/recovery-configuration/v1\0");
+    for field in fields {
+        hash.update((field.len() as u64).to_be_bytes());
+        hash.update(field.as_bytes());
+    }
+    stellar_agent_core::hex::encode(&hash.finalize())
+}
+
+pub(super) fn configuration_reopens(
+    snapshot: Option<&RecoveryRunSnapshot>,
+    configuration: &str,
+) -> bool {
+    snapshot
+        .and_then(RecoveryRunSnapshot::record)
+        .is_some_and(|run| {
+            run.automatic_runs < 16
+                && run
+                    .stop
+                    .as_ref()
+                    .is_some_and(|stop| stop.class == RecoveryClass::Explicit)
+                && run
+                    .scan
+                    .as_ref()
+                    .is_some_and(|scan| scan.configuration != configuration)
+        })
 }
 
 /// Binds a classic exposure using length-prefixed fields and big-endian integers.
@@ -409,6 +481,10 @@ fn valid_context(stop: &RecoveryStop, timed: bool, account: Option<&str>) -> boo
         R::AccountUnavailable | R::CoverageRequired => {
             stop.stage == S::Account && !stop.roles.is_empty()
         }
+        R::HistoryLost => {
+            stop.stage == S::Target && stop.ledger.is_some() && !stop.roles.is_empty()
+        }
+        R::MissingProvenance => stop.stage == S::Target && paired,
         R::RecordUnusable => {
             stop.stage == S::Account
                 && account
@@ -458,11 +534,25 @@ fn validate_run(
     exposure: &ExposureIdentity,
     account: Option<&str>,
     decision: bool,
+    attempt: &WireAttempt,
 ) -> bool {
     let ExposureIdentity::Classic { max_time, .. } = exposure else {
         return false;
     };
-    if run.version != 1
+    let scan_valid = match (run.version, &run.scan) {
+        (1, None) => true,
+        (2, Some(scan)) => scan.valid(
+            attempt.pre_exposure_ledger,
+            attempt
+                .sequence_released
+                .as_ref()
+                .filter(|r| r.primary_ledger == r.witness_ledger)
+                .map(|r| r.primary_ledger),
+            *max_time,
+        ),
+        _ => false,
+    };
+    if !scan_valid
         || !(1..=16).contains(&run.automatic_runs)
         || run.consecutive_stops > 16
         || recovery_exposure_digest(id, index, exposure).ok().as_ref() != Some(&run.exposure)
@@ -477,13 +567,23 @@ fn validate_run(
         }
         (RecoveryRunPhase::Resolved, None) => decision && run.consecutive_stops == 0,
         (RecoveryRunPhase::Stopped, Some(stop)) => {
+            let legacy_coverage = run.version == 1
+                && stop.reason == RecoveryStopReason::CoverageRequired
+                && stop.class == RecoveryClass::Explicit
+                && stop.earliest_retry_ms.is_none();
             run.consecutive_stops == run.automatic_runs
                 && stop.stopped_at_ms >= run.run_started_ms
                 && valid_context(stop, recovery_expiry(*max_time).is_some(), account)
-                && stop.class
-                    == classify_recovery_stop(stop.reason, stop.stage, stop.method, &stop.roles)
-                && stop_schedule(stop, run.consecutive_stops - 1, *max_time).ok()
-                    == Some(stop.earliest_retry_ms)
+                && (legacy_coverage
+                    || (stop.class
+                        == classify_recovery_stop(
+                            stop.reason,
+                            stop.stage,
+                            stop.method,
+                            &stop.roles,
+                        )
+                        && stop_schedule(stop, run.consecutive_stops - 1, *max_time).ok()
+                            == Some(stop.earliest_retry_ms)))
         }
         _ => false,
     }
@@ -571,8 +671,16 @@ pub fn normalize_recovery_run(
         .map_or(run.run_started_ms, |s| s.stopped_at_ms);
     let due = if let Some(stop) = &run.stop {
         view.state = V::Stopped(stop.reason);
-        view.class = Some(stop.class);
-        stop.earliest_retry_ms
+        if run.version == 1
+            && stop.reason == R::CoverageRequired
+            && stop.class == RecoveryClass::Explicit
+        {
+            view.class = Some(RecoveryClass::Automatic);
+            recovery_retry_time(stop.stopped_at_ms, run.consecutive_stops - 1).ok()
+        } else {
+            view.class = Some(stop.class);
+            stop.earliest_retry_ms
+        }
     } else {
         view.state = V::Running;
         // validate_run guarantees a representable running retry time.

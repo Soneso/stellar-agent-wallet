@@ -1957,7 +1957,8 @@ pub fn check_endpoint_url(
 
 /// Returns the URL crate's host with exactly one trailing dot removed.
 /// Invalid URLs, hostless URLs, and empty hosts have no provider host.
-pub(crate) fn provider_host(raw: &str) -> Option<String> {
+#[must_use]
+pub fn provider_host(raw: &str) -> Option<String> {
     let url = Url::parse(raw).ok()?;
     let host = url.host_str()?;
     let host = host.strip_suffix('.').unwrap_or(host);

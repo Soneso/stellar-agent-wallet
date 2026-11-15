@@ -396,7 +396,7 @@ async fn recovery_two_not_found_without_coverage_keeps_hold() {
 
 #[tokio::test]
 #[serial]
-async fn recovery_fresh_concurrence_ignores_saved_bounds() {
+async fn recovery_fresh_concurrence_does_not_accumulate_legacy_bounds() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let _storage_home =
         stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
@@ -404,7 +404,17 @@ async fn recovery_fresh_concurrence_ignores_saved_bounds() {
     let endpoints = Endpoints::new(NOW / 1_000).await;
     endpoints.oracle_history.store(false, Ordering::SeqCst);
     fx.run(&endpoints).await;
-    assert_eq!(fx.record()["attempts"][0]["recovery"]["primary_upper"], 12);
+    for field in [
+        "primary_cursor",
+        "primary_upper",
+        "witness_cursor",
+        "witness_upper",
+    ] {
+        assert!(
+            fx.record()["attempts"][0]["recovery"][field].is_null(),
+            "legacy field {field} must stay empty"
+        );
+    }
     // Each later run is due at the stop's automatic retry time.
     fx._clock.set(NOW + 30_000);
     let endpoints = Endpoints::new(NOW / 1_000 + 30).await;

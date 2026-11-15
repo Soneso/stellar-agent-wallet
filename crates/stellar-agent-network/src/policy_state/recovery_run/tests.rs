@@ -14,6 +14,148 @@ use stellar_agent_core::policy::state_lock::WindowStoreLock;
 
 const SOURCE: &str = "GAAQEAYEAUDAOCAJBIFQYDIOB4IBCEQTCQKRMFYYDENBWHA5DYPSABGM";
 
+#[test]
+#[serial]
+fn scan_configuration_digest_vector_and_secret_free() {
+    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+    use stellar_agent_core::profile::schema::{
+        PrimaryProviderRecord, Profile, ProviderRecord, Providers,
+    };
+    let mut profile = Profile::builder_testnet("sign", "test", "nonce", "test").build();
+    profile.rpc_url = "http://127.0.0.1".into();
+    profile.oracle_provider_url = Some("http://127.0.0.2".parse().unwrap());
+    let mut providers = Providers::default();
+    providers.primary = Some(PrimaryProviderRecord::new(" PRIMARY ", "127.0.0.1"));
+    providers.oracle = Some(ProviderRecord::new("Oracle", "127.0.0.2", true));
+    profile.providers = Some(providers);
+    let digest = recovery_configuration_digest(&profile);
+    assert_eq!(
+        digest,
+        "c9105d348ecb8885cde87e249aaef3dae312c8a8e2ccb3cccbb9b26ad618c17b"
+    );
+    profile.rpc_url = "http://token:secret@127.0.0.1:9000/private?credential=hidden".into();
+    profile.oracle_provider_url = Some("http://127.0.0.2/other?secret=hidden".parse().unwrap());
+    assert_eq!(recovery_configuration_digest(&profile), digest);
+    profile
+        .providers
+        .as_mut()
+        .unwrap()
+        .oracle
+        .as_mut()
+        .unwrap()
+        .operator = "different".into();
+    assert_ne!(recovery_configuration_digest(&profile), digest);
+    profile
+        .providers
+        .as_mut()
+        .unwrap()
+        .oracle
+        .as_mut()
+        .unwrap()
+        .operator = "oracle".into();
+    profile.oracle_provider_url = Some("http://127.0.0.3".parse().unwrap());
+    assert_ne!(recovery_configuration_digest(&profile), digest);
+}
+
+#[test]
+#[serial]
+fn scan_record_v2_validation_and_size() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let (mut fx, id, _) = fixture();
+    fx.rewrite(|wire| {
+        wire.operations.as_mut().unwrap().records[0].attempts[0].pre_exposure_ledger = Some(10)
+    });
+    fx.recorder()
+        .record_evidence(
+            id,
+            1,
+            &EvidenceInput {
+                sequence_released: Some(super::super::operations::SequenceReleaseInput {
+                    primary_ledger: 20,
+                    witness_ledger: 20,
+                    min_close_time_ms: 11000,
+                }),
+                ..EvidenceInput::default()
+            },
+        )
+        .unwrap();
+    let attempt = fx.record(id).attempts[0].clone();
+    let legacy = running(id, &attempt).to_string();
+    fx.rewrite(|wire| install(wire, id, &legacy));
+    let bytes = std::fs::read(fx.store.path()).unwrap();
+    assert_eq!(
+        selected(&fx)
+            .recovery_run
+            .unwrap()
+            .record()
+            .unwrap()
+            .version,
+        1
+    );
+    assert_eq!(std::fs::read(fx.store.path()).unwrap(), bytes);
+    let mut valid = running(id, &attempt);
+    valid["version"] = json!(2);
+    valid["scan"] = serde_json::to_value(RecoveryScan::new(
+        "11".repeat(32),
+        valid["exposure"].as_str().unwrap(),
+        10,
+    ))
+    .unwrap();
+    assert!(read(id, &attempt, &valid.to_string()).record().is_some());
+    for (path, value) in [
+        ("/scan/next_unread", json!(9)),
+        ("/scan/next_unread", json!(21)),
+        ("/scan/preceding_close", json!(0)),
+        ("/scan/end", json!([15])),
+        ("/scan/end", json!([15, 0])),
+        ("/scan/configuration", json!("bad")),
+        ("/scan/digest", json!("A".repeat(64))),
+        ("/version", json!(1)),
+    ] {
+        let mut bad = valid.clone();
+        *bad.pointer_mut(path).unwrap() = value;
+        if path == "/scan/next_unread" {
+            bad["scan"]["preceding_close"] = json!(10);
+        }
+        let snapshot = read(id, &attempt, &bad.to_string());
+        assert!(snapshot.record().is_none(), "isolates {path}");
+        assert_eq!(
+            normalize_recovery_run(Some(&snapshot), 10, 0, false, 30000).state,
+            RecoveryRunState::Stopped(RecoveryStopReason::RecordUnusable)
+        );
+    }
+    let mut ended = valid.clone();
+    ended["scan"]["end"] = json!([15, 11]);
+    ended["scan"]["preceding_close"] = json!(11);
+    ended["scan"]["next_unread"] = json!(16);
+    assert!(read(id, &attempt, &ended.to_string()).record().is_some());
+    ended["scan"]["next_unread"] = json!(17);
+    assert!(read(id, &attempt, &ended.to_string()).record().is_none());
+    valid.as_object_mut().unwrap().remove("scan");
+    assert!(read(id, &attempt, &valid.to_string()).record().is_none());
+    let mut maximal = attempt.clone();
+    maximal.pre_exposure_ledger = Some(u32::MAX - 1);
+    maximal.sequence_released.as_mut().unwrap().primary_ledger = u32::MAX;
+    maximal.sequence_released.as_mut().unwrap().witness_ledger = u32::MAX;
+    let mut value = stopped(id, &maximal);
+    value["version"] = json!(2);
+    value["automatic_runs"] = json!(16);
+    value["consecutive_stops"] = json!(16);
+    value["run_started_ms"] = json!(u64::MAX - 20000);
+    value["run_deadline_ms"] = json!(u64::MAX);
+    value["stop"] = json!({"reason":"history_lost","stage":"target","method":"get_ledgers",
+        "roles":["primary","oracle"],"ledger":u32::MAX,"target":u32::MAX,
+        "stopped_at_ms":u64::MAX,"class":"explicit","earliest_retry_ms":null});
+    value["scan"] = json!({"configuration":"f".repeat(64),"digest":"f".repeat(64),
+        "next_unread":u32::MAX,"preceding_close":u64::MAX,"end":[u32::MAX-1,u64::MAX]});
+    let raw = value.to_string();
+    assert!(raw.len() <= RECOVERY_RUN_MAX, "{} bytes", raw.len());
+    assert!(read(id, &maximal, &raw).record().is_some());
+}
+
 fn fixture() -> (Fx, OperationId, WireAttempt) {
     let mut fx = Fx::new();
     let id = unknown_with(&mut fx, 1, 10, vec![]).id();
@@ -310,6 +452,7 @@ fn contextual_schedule_table() {
             R::Deadline,
             R::RequestBudget,
             R::AccountUnavailable,
+            R::CoverageRequired,
         ] {
             let stop = RecoveryStop {
                 reason,
@@ -333,10 +476,16 @@ fn contextual_schedule_table() {
     }
     for (reason, stage, method, roles) in [
         (
-            R::CoverageRequired,
-            S::Account,
-            Some(M::GetLedgerEntries),
+            R::HistoryLost,
+            S::Target,
+            Some(M::GetLedgers),
             vec![RecoveryRole::Primary],
+        ),
+        (
+            R::MissingProvenance,
+            S::Target,
+            Some(M::GetLedgers),
+            vec![RecoveryRole::Primary, RecoveryRole::Oracle],
         ),
         (R::RecordUnusable, S::Record, None, vec![]),
         (R::ConfigurationRequired, S::Configuration, None, vec![]),
@@ -1031,19 +1180,20 @@ fn run_context_contract() {
             row["stop"]["earliest_retry_ms"] = Value::Null;
             let snapshot = read(id, &attempt, &row.to_string());
             assert!(snapshot.record().is_some());
-            let view = normalize_recovery_run(Some(&snapshot), 10, 0, false, 0);
+            let view = normalize_recovery_run(Some(&snapshot), 10, 0, false, 1000);
             assert_eq!(
                 view.state,
                 RecoveryRunState::Stopped(RecoveryStopReason::CoverageRequired)
             );
-            assert_eq!(view.earliest_retry_ms, None);
+            assert_eq!(view.class, Some(RecoveryClass::Automatic));
+            assert_eq!(view.earliest_retry_ms, Some(31000));
             row["stop"]
                 .as_object_mut()
                 .unwrap()
                 .remove("earliest_retry_ms");
             assert!(
                 read(id, &attempt, &row.to_string()).record().is_none(),
-                "explicit nullable time is required"
+                "the stored retry field is required"
             );
         }
     }
