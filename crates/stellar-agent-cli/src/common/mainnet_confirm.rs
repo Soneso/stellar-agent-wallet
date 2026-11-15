@@ -1021,8 +1021,11 @@ mod tests {
         let MainnetAuthority::Approval(borrowed) = authority else {
             panic!("approval authority")
         };
-        let address = std::ptr::from_ref(borrowed);
-        assert_eq!(borrowed.expires_at_ms() - borrowed.created_at_ms(), 300_000);
+        let address = std::ptr::from_ref(borrowed.witness());
+        assert_eq!(
+            borrowed.witness().expires_at_ms() - borrowed.witness().created_at_ms(),
+            300_000
+        );
         assert_eq!(address, std::ptr::from_ref(witness.as_ref().unwrap()));
         assert_eq!(driver::ceremonies().len(), 1);
         assert_eq!(shown_summaries().len(), 1);

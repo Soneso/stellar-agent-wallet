@@ -775,9 +775,25 @@ pub(crate) struct ResolverFixture {
     pub(crate) now: u64,
     pub(crate) clock: TestClockGuard,
     pub(crate) anchor_failure: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    decisions: Vec<stellar_agent_core::mainnet::decision::MainnetDecision>,
 }
 
 impl ResolverFixture {
+    pub(crate) fn captured_decision(
+        &self,
+    ) -> stellar_agent_core::mainnet::decision::MainnetDecision {
+        self.decisions.last().unwrap().clone()
+    }
+
+    /// A bounded decision with the fixture's verified policy provenance.
+    pub(crate) fn approval_authority<'w>(
+        &self,
+        witness: &'w stellar_agent_core::approval::witness::ApprovalWitness,
+    ) -> super::authority::MainnetAuthority<'w> {
+        let decision = self.decisions.last().unwrap();
+        super::authority::MainnetAuthority::from_decision(decision, Some(witness)).unwrap()
+    }
+
     pub(crate) fn new() -> Self {
         Self::configured(|_| {}, str::to_owned)
     }
@@ -953,7 +969,107 @@ impl ResolverFixture {
             crate::MainnetEndpointFlags::default(),
         )
         .unwrap();
+        // Capture permitting decisions before tests change observations or state.
+        use stellar_agent_core::mainnet::decision::{
+            EvaluationScope, MainnetEvaluationRequest, evaluate_mainnet,
+        };
+        use stellar_agent_core::policy::v1::{
+            AccountReserveLookupError, AccountReservesView, ActionKind, ValueClass, ValueLeg,
+        };
+        use stellar_agent_core::policy::{McpToolRegistration, ToolDescriptor, ToolValueKind};
+        struct Funded;
+        impl AccountReservesView for Funded {
+            fn reserves_stroops(&self, _: i64) -> i64 {
+                10_000_000
+            }
+            fn balance_stroops(&self) -> Result<i64, AccountReserveLookupError> {
+                Ok(i64::MAX)
+            }
+        }
+        let doc: toml_edit::DocumentMut = raw.parse().unwrap();
+        let decisions = doc["rules"]
+            .as_array_of_tables()
+            .unwrap()
+            .iter()
+            .map(|rule| {
+                let tool = match rule["match"]["tool"].as_str().unwrap() {
+                    "stellar_pay" => "stellar_pay",
+                    "stellar_pay_commit" => "stellar_pay_commit",
+                    "stellar_x402_create_payment" => "stellar_x402_create_payment",
+                    "stellar_x402_authenticated_payment" => "stellar_x402_authenticated_payment",
+                    name => panic!("unsupported fixture tool: {name}"),
+                };
+                let mut descriptor = ToolDescriptor::from_registration(&McpToolRegistration {
+                    name: tool,
+                    destructive_hint: true,
+                    read_only_hint: false,
+                    chain_id_required: true,
+                    value_kind: ToolValueKind::MovesValue,
+                });
+                descriptor.chain_id = profile.chain_id.caip2_str().to_owned();
+                let asset = rule["criteria"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find_map(|c| {
+                        c.as_inline_table()
+                            .and_then(|c| c.get("assets"))
+                            .and_then(toml_edit::Value::as_array)
+                            .and_then(|a| a.get(0))
+                            .and_then(toml_edit::Value::as_str)
+                    })
+                    .unwrap();
+                let scope = if tool == "stellar_x402_authenticated_payment" {
+                    EvaluationScope::X402Authenticated {
+                        home_domain: MESSAGE_HOME_DOMAIN.to_owned(),
+                        tool: tool.to_owned(),
+                    }
+                } else {
+                    EvaluationScope::Classic
+                };
+                let destination = rule["criteria"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find_map(|c| {
+                        c.as_inline_table()
+                            .and_then(|c| c.get("allowlist"))
+                            .and_then(toml_edit::Value::as_array)
+                            .and_then(|a| a.get(0))
+                            .and_then(toml_edit::Value::as_str)
+                    })
+                    .unwrap_or(source.destination());
+                evaluate_mainnet(
+                    &policy,
+                    scope,
+                    now,
+                    MainnetEvaluationRequest {
+                        chain_id: profile.chain_id.caip2_str(),
+                        tool: &descriptor,
+                        args: &serde_json::json!({}),
+                        profile: &profile,
+                        value: Some(ValueClass::single(ValueLeg {
+                            kind: if tool.starts_with("stellar_pay") {
+                                ActionKind::Payment
+                            } else {
+                                ActionKind::X402Payment
+                            },
+                            amount: Some(0),
+                            asset: Some(asset.to_owned()),
+                            destination: Some(destination.to_owned()),
+                        })),
+                        account_view: Some(&Funded),
+                        identity_view: None,
+                        counterparty_cache: None,
+                        sep10_sessions: None,
+                        sep45_sessions: None,
+                    },
+                )
+                .unwrap()
+            })
+            .collect();
         Self {
+            decisions,
             dir,
             _home: home,
             profile,
@@ -1484,12 +1600,52 @@ impl ResolverFixture {
         message: &super::message::MessageFacts,
         approval: &stellar_agent_core::approval::witness::ApprovalWitness,
     ) -> super::message::MessageUseReceipt {
+        use stellar_agent_core::mainnet::decision::{
+            AuthorityScope, EvaluationScope, MainnetEvaluationRequest, evaluate_mainnet,
+        };
+        use stellar_agent_core::policy::{McpToolRegistration, ToolDescriptor, ToolValueKind};
+        let mut decision = self.captured_decision();
+        if !matches!(decision.scope(), AuthorityScope::X402Authenticated { home_domain, .. } if home_domain == &message.domain.home_domain)
+        {
+            let mut tool = ToolDescriptor::from_registration(&McpToolRegistration {
+                name: "stellar_x402_authenticated_payment",
+                destructive_hint: true,
+                read_only_hint: false,
+                chain_id_required: true,
+                value_kind: ToolValueKind::MovesValue,
+            });
+            tool.chain_id = self.profile.chain_id.caip2_str().to_owned();
+            decision = evaluate_mainnet(
+                &self.policy,
+                EvaluationScope::X402Authenticated {
+                    home_domain: message.domain.home_domain.clone(),
+                    tool: tool.name.clone(),
+                },
+                self.now,
+                MainnetEvaluationRequest {
+                    chain_id: self.profile.chain_id.caip2_str(),
+                    tool: &tool,
+                    args: &serde_json::json!({}),
+                    profile: &self.profile,
+                    value: decision
+                        .value_effects()
+                        .cloned()
+                        .map(stellar_agent_core::policy::v1::ValueClass::Value),
+                    account_view: None,
+                    identity_view: None,
+                    counterparty_cache: None,
+                    sep10_sessions: None,
+                    sep45_sessions: None,
+                },
+            )
+            .unwrap();
+        }
+        let authority =
+            super::authority::MainnetAuthority::from_decision(&decision, Some(approval)).unwrap();
         let intent = x402_intent(root, MainnetConsumer::X402Authenticated);
-        let authorization = super::resolve::resolve_message_sign(self.message_request(
-            &intent,
-            message,
-            &super::authority::MainnetAuthority::Approval(approval),
-        ))
+        let authorization = super::resolve::resolve_message_sign(
+            self.message_request(&intent, message, &authority),
+        )
         .unwrap();
         super::resolve::consume_message_sign(&self.context, authorization, &self.window).unwrap()
     }

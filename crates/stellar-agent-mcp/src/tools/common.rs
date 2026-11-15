@@ -76,6 +76,17 @@ pub(crate) enum DispatchOutcome {
 }
 
 impl DispatchOutcome {
+    pub(crate) fn captured_interval(&self) -> Result<(u64, u64), ToolError> {
+        let start = self.now_ms().ok_or_else(invalid_policy_interval)?;
+        let end = start
+            .checked_add(self.governing_ttl_ms())
+            .ok_or_else(invalid_policy_interval)?;
+        if end <= start {
+            return Err(invalid_policy_interval());
+        }
+        Ok((start, end))
+    }
+
     pub(crate) fn governing_ttl_ms(&self) -> u64 {
         match self {
             Self::Allow(allowed) => allowed.governing_ttl_ms,
@@ -2064,7 +2075,14 @@ impl WalletServer {
             Err(_) => return Ok(outcome),
         };
         // The commit's own approval requirement governs a tie.
-        stricter_outcome(outcome, evaluation, now_ms, mainnet, CommitSide::Evaluation)
+        stricter_outcome(
+            outcome,
+            evaluation,
+            now_ms,
+            mainnet,
+            CommitSide::Evaluation,
+            commit_tool == "stellar_pay_commit",
+        )
     }
 
     /// The outcome that governs a commit: the stricter of the commit's own
@@ -2109,7 +2127,14 @@ impl WalletServer {
                 now_ms,
             )
             .await?;
-        stricter_outcome(outcome, evaluation, now_ms, true, CommitSide::Outcome)
+        stricter_outcome(
+            outcome,
+            evaluation,
+            now_ms,
+            true,
+            CommitSide::Outcome,
+            prepare_tool == "stellar_pay",
+        )
     }
 
     /// Refreshes verified local state without reconciling through RPC and
@@ -2333,13 +2358,21 @@ enum CommitSide {
     Evaluation,
 }
 
+fn invalid_policy_interval() -> ToolError {
+    ToolError::Business(business_error_result(
+        "policy.unexpected_decision",
+        "the captured policy interval is invalid",
+    ))
+}
+
 /// The stricter of `outcome` and the other name's `evaluation`, read at
 /// `now_ms`.
 ///
 /// An approval requirement of either side governs, the `commit` side on a
 /// tie, and otherwise `outcome` governs. The governing decision takes the
-/// shorter lifetime of the two. On mainnet an approval requirement takes
-/// that lifetime in its request too, and a denial refuses. Off mainnet a
+/// earlier absolute end for payments, preserving the declared request TTL.
+/// Other mainnet approvals take the shorter duration in their request.
+/// On mainnet a denial refuses. Off mainnet a
 /// denial leaves `outcome` unchanged.
 ///
 /// # Errors
@@ -2353,6 +2386,7 @@ fn stricter_outcome(
     now_ms: u64,
     mainnet: bool,
     commit: CommitSide,
+    payment: bool,
 ) -> Result<DispatchOutcome, ToolError> {
     if let Decision::Deny(reason) = &evaluation.decision {
         return if mainnet {
@@ -2363,6 +2397,19 @@ fn stricter_outcome(
     }
     let evaluated_ttl_ms = evaluation.governing_ttl_ms;
     let ttl_ms = outcome.governing_ttl_ms().min(evaluated_ttl_ms);
+    let payment_end = if payment {
+        let (start, end) = outcome.captured_interval()?;
+        let evaluated_end = now_ms
+            .checked_add(evaluated_ttl_ms)
+            .ok_or_else(invalid_policy_interval)?;
+        let end = end.min(evaluated_end);
+        if end <= start || end <= now_ms {
+            return Err(invalid_policy_interval());
+        }
+        Some(end)
+    } else {
+        None
+    };
     let request = match evaluation.decision {
         Decision::RequireApproval(request) => Some(request),
         Decision::Allow => None,
@@ -2393,6 +2440,16 @@ fn stricter_outcome(
         }
         _ => outcome,
     };
+    if let Some(end) = payment_end {
+        let start = governing.now_ms().ok_or_else(invalid_policy_interval)?;
+        let remaining = end.checked_sub(start).ok_or_else(invalid_policy_interval)?;
+        governing.bound_governing_ttl(remaining);
+        match &mut governing {
+            DispatchOutcome::Allow(allowed) => allowed.governing_ttl_ms = remaining,
+            DispatchOutcome::RequireApproval(approval) => approval.governing_ttl_ms = remaining,
+        }
+        return Ok(governing);
+    }
     governing.bound_governing_ttl(ttl_ms);
     if mainnet {
         governing.write_approval_lifetime(ttl_ms)
@@ -3190,6 +3247,147 @@ impl WalletServer {
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod payment_interval_tests {
+    #![allow(clippy::unwrap_used, clippy::panic, reason = "test assertions")]
+    use super::*;
+    use stellar_agent_core::mainnet::decision::AuthorityScope;
+    use stellar_agent_core::policy::v1::{ActionKind, ValueEffects, ValueLeg};
+
+    fn evaluation(required: bool, start: u64, ttl: u64, index: u32) -> GateEvaluation {
+        let mut request = ApprovalRequest::new(String::new(), 123);
+        request.reason = Some(format!("rule {index}"));
+        GateEvaluation::mainnet(MainnetDecision::for_test(
+            if required {
+                Decision::RequireApproval(request)
+            } else {
+                Decision::Allow
+            },
+            Some(ValueEffects::single(ValueLeg {
+                kind: ActionKind::Payment,
+                amount: Some(i128::from(index) + 7),
+                asset: Some("native".to_owned()),
+                destination: None,
+            })),
+            [index as u8; 32],
+            i64::from(index) + 9,
+            index,
+            "operator",
+            "stellar:mainnet",
+            start,
+            ttl,
+            AuthorityScope::Classic,
+        ))
+    }
+
+    fn outcome(required: bool, start: u64, ttl: u64) -> DispatchOutcome {
+        let evaluated = evaluation(required, start, ttl, 0);
+        match evaluated.decision {
+            Decision::RequireApproval(request) => {
+                DispatchOutcome::RequireApproval(ApprovalOutcome {
+                    request,
+                    governing_ttl_ms: ttl,
+                    now_ms: Some(start),
+                    value_effects: evaluated.value_effects,
+                    decision: evaluated.mainnet,
+                })
+            }
+            _ => DispatchOutcome::Allow(AllowOutcome {
+                governing_ttl_ms: ttl,
+                now_ms: Some(start),
+                value_effects: evaluated.value_effects,
+                decision: evaluated.mainnet,
+            }),
+        }
+    }
+
+    #[test]
+    fn staggered_payment_ends_preserve_selection_and_effects() {
+        for (left, right, side, selected, effects) in [
+            (true, false, CommitSide::Outcome, 0, 7),
+            (false, true, CommitSide::Outcome, 1, 7),
+            (true, true, CommitSide::Outcome, 0, 7),
+            (true, true, CommitSide::Evaluation, 1, 8),
+            (false, false, CommitSide::Outcome, 0, 7),
+        ] {
+            let first = outcome(left, 1_000, 1_000);
+            let second = evaluation(right, 1_500, 800, 1);
+            let paired = stricter_outcome(first, second, 1_500, true, side, true).unwrap();
+            assert_eq!(paired.captured_interval().unwrap().1, 2_000);
+            let decision = paired.mainnet_decision().unwrap();
+            assert_eq!(decision.rule_index(), selected);
+            assert_eq!(decision.policy_digest(), [selected as u8; 32]);
+            assert_eq!(decision.policy_sequence(), i64::from(selected) + 9);
+            assert_eq!(
+                decision.evaluated_at_ms(),
+                if selected == 0 { 1_000 } else { 1_500 }
+            );
+            assert_eq!(
+                decision.governing_ttl_ms(),
+                2_000 - decision.evaluated_at_ms()
+            );
+            let sized = match &paired {
+                DispatchOutcome::Allow(value) => &value.value_effects,
+                DispatchOutcome::RequireApproval(value) => {
+                    assert_eq!(value.request.ttl_seconds, 123);
+                    assert_eq!(value.request.reason, Some(format!("rule {selected}")));
+                    &value.value_effects
+                }
+            };
+            assert_eq!(sized.as_ref().unwrap().legs()[0].amount, Some(effects));
+            let repeated = stricter_outcome(
+                paired,
+                evaluation(false, 1_999, 900, 2),
+                1_999,
+                true,
+                CommitSide::Outcome,
+                true,
+            )
+            .unwrap();
+            assert_eq!(repeated.captured_interval().unwrap().1, 2_000);
+            assert_eq!(repeated.mainnet_decision().unwrap().rule_index(), selected);
+        }
+    }
+
+    #[test]
+    fn payment_intervals_refuse_zero_overflow_and_elapsed_ends() {
+        for (start, ttl, other_start, other_ttl) in [
+            (1_000, 0, 1_000, 1),
+            (u64::MAX - 1, 2, u64::MAX - 1, 1),
+            (1_000, 2_000, u64::MAX - 1, 2),
+            (1_000, 500, 1_500, 2_000),
+        ] {
+            assert!(
+                stricter_outcome(
+                    outcome(true, start, ttl),
+                    evaluation(false, other_start, other_ttl, 1),
+                    other_start,
+                    true,
+                    CommitSide::Outcome,
+                    true
+                )
+                .is_err()
+            );
+        }
+        for remaining in [1, 999, 1_000, 1_001] {
+            let paired = stricter_outcome(
+                outcome(false, 1_000, remaining),
+                evaluation(true, 1_000, 2_000, 1),
+                1_000,
+                true,
+                CommitSide::Evaluation,
+                true,
+            )
+            .unwrap();
+            assert_eq!(paired.captured_interval().unwrap().1, 1_000 + remaining);
+            let DispatchOutcome::RequireApproval(approval) = paired else {
+                panic!("approval")
+            };
+            assert_eq!(approval.request.ttl_seconds, 123);
+        }
+    }
+}
 
 #[cfg(test)]
 mod signed_intent_observation_tests {
@@ -4770,13 +4968,14 @@ pub(crate) mod tests {
         let server = make_server_with_engine(engine);
         let envelope =
             stellar_agent_test_support::signed_envelope::SignedTestEnvelope::for_source([0x31; 32]);
+        let captured_ms = policy_now_ms().unwrap();
 
         let decoded = server
             .paired_commit_outcome(
                 DispatchOutcome::Allow(AllowOutcome {
                     value_effects: None,
                     governing_ttl_ms: 600_000,
-                    now_ms: None,
+                    now_ms: Some(captured_ms),
                     decision: None,
                 }),
                 envelope.envelope_xdr(),
@@ -4789,6 +4988,8 @@ pub(crate) mod tests {
         match decoded {
             Ok(DispatchOutcome::RequireApproval(approval)) => {
                 assert_eq!(approval.request.nonce, "commit-nonce");
+                assert_eq!(approval.now_ms, Some(captured_ms));
+                assert_eq!(approval.governing_ttl_ms, 120_000);
             }
             other => panic!("expected the commit request, got {other:?}"),
         }
@@ -7251,7 +7452,11 @@ pub(crate) mod tests {
                     panic!("missing paired approval requirement")
                 };
                 assert_eq!(approval.governing_ttl_ms, expected * 1000);
-                assert_eq!(u64::from(approval.request.ttl_seconds), expected);
+                assert_eq!(approval.request.ttl_seconds, commit.or(prepare).unwrap());
+                assert_eq!(
+                    approval.now_ms.unwrap() + approval.governing_ttl_ms,
+                    initial_now + expected * 1000
+                );
                 assert_eq!(approval.request.reason.as_deref(), Some("operator rule"));
                 assert!(
                     approval.value_effects.is_some(),
@@ -7551,6 +7756,7 @@ pub(crate) mod tests {
             for (prepare, commit, ttl_ms, reason) in [
                 (Some(120_u32), Some(60_u32), 60_000, "commit rule"),
                 (Some(60), Some(120), 60_000, "commit rule"),
+                (Some(900), None, 600_000, "prepare rule"),
                 (Some(120), None, 120_000, "prepare rule"),
                 (None, Some(60), 60_000, "commit rule"),
                 (None, None, 600_000, ""),
@@ -7596,8 +7802,14 @@ pub(crate) mod tests {
                 )
                 .await;
                 assert_eq!(
-                    run.entry.expires_at_unix_ms - run.entry.created_at_unix_ms,
-                    ttl_ms,
+                    run.entry.expires_at_unix_ms,
+                    (run.entry.created_at_unix_ms + ttl_ms).min(
+                        stellar_agent_network::operation_entry::envelope_max_time(
+                            run.args["envelope_xdr"].as_str().unwrap()
+                        )
+                        .unwrap()
+                            * 1000
+                    ),
                     "{prepare:?} {commit:?}"
                 );
                 assert_eq!(
@@ -7606,6 +7818,51 @@ pub(crate) mod tests {
                     "{prepare:?} {commit:?}"
                 );
             }
+        }
+
+        #[tokio::test]
+        #[serial_test::serial(keyring)]
+        #[serial_test::serial]
+        async fn resumed_payment_retains_envelope_facts_and_waiting_end() {
+            use stellar_xdr::{
+                LedgerEntryData, Limits, ReadXdr as _, SequenceNumber, WriteXdr as _,
+            };
+            let run = ClassicRun::new(Tool::Pay).await;
+            let original = stored_approval(&run.f, &run.entry.approval_nonce).unwrap();
+            let original_wire = serde_json::to_value(&original).unwrap();
+            let mut entries = fixture_entries(&run.f);
+            for entry in &mut entries {
+                let mut data = LedgerEntryData::from_xdr_base64(
+                    entry["xdr"].as_str().unwrap(),
+                    Limits::none(),
+                )
+                .unwrap();
+                if let LedgerEntryData::Account(ref mut account) = data {
+                    account.seq_num = SequenceNumber(999);
+                    entry["xdr"] = data.to_xdr_base64(Limits::none()).unwrap().into();
+                }
+            }
+            *run.control.entries.lock().unwrap() = Some(entries);
+            let result = wire(&Tool::Pay.prepare(&run.f.server, &run.args).await);
+            assert_eq!(result["ok"], true, "{result}");
+            let data = &result["data"];
+            assert_eq!(data["envelope_xdr"], run.args["envelope_xdr"]);
+            assert_eq!(data["approval"]["summary"]["simulated_seq_num"], 2);
+            assert_eq!(
+                data["approval"]["summary"]["memo_details"],
+                serde_json::json!({"kind":"none"})
+            );
+            let entry =
+                stored_approval(&run.f, data["approval"]["approval_nonce"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(entry.expires_at_unix_ms, original.expires_at_unix_ms);
+            assert_eq!(
+                serde_json::to_value(stored_approval(&run.f, &original.approval_nonce).unwrap())
+                    .unwrap(),
+                original_wire
+            );
+            assert_eq!(run.f.seed_reads.load(Ordering::SeqCst), 0);
+            assert_no_pre_send_entry(&run);
         }
 
         #[tokio::test]
@@ -11774,6 +12031,7 @@ pub(crate) mod tests {
         /// invocation, and the tool's gate verifies it.
         struct X402Approval<'a> {
             guard: crate::server::MainnetWriteGuard<'a>,
+            decision: MainnetDecision,
             approval: stellar_agent_core::approval::witness::ApprovalWitness,
             signer: stellar_agent_network::keyring::EnrolledSigner,
             handle: stellar_agent_network::keyring::KeyringSignHandle,
@@ -11845,6 +12103,7 @@ pub(crate) mod tests {
                 let store = f.server.window_store.clone();
                 Self {
                     guard,
+                    decision: outcome.mainnet_decision().unwrap().clone(),
                     approval,
                     signer,
                     handle,
@@ -11893,9 +12152,11 @@ pub(crate) mod tests {
                     policy: self.guard.policy,
                     enablement: self.guard.enablement,
                     authority:
-                        &stellar_agent_network::mainnet::authority::MainnetAuthority::Approval(
-                            &self.approval,
-                        ),
+                        &stellar_agent_network::mainnet::authority::MainnetAuthority::from_decision(
+                            &self.decision,
+                            Some(&self.approval),
+                        )
+                        .unwrap(),
                     audit: self.audit(),
                     store: &self.store,
                     authenticated: None,
@@ -12248,9 +12509,11 @@ pub(crate) mod tests {
                     approved.guard.context,
                     approved.guard.policy,
                     approved.guard.enablement,
-                    &stellar_agent_network::mainnet::authority::MainnetAuthority::Approval(
-                        &approved.approval,
-                    ),
+                    &stellar_agent_network::mainnet::authority::MainnetAuthority::from_decision(
+                        &approved.decision,
+                        Some(&approved.approval),
+                    )
+                    .unwrap(),
                     &approved.signer,
                     &approved.handle,
                     approved.audit(),
@@ -12592,9 +12855,12 @@ pub(crate) mod tests {
                 signer: &signer,
                 policy: guard.policy,
                 enablement: guard.enablement,
-                authority: &stellar_agent_network::mainnet::authority::MainnetAuthority::Approval(
-                    &approval,
-                ),
+                authority:
+                    &stellar_agent_network::mainnet::authority::MainnetAuthority::from_decision(
+                        outcome.mainnet_decision().unwrap(),
+                        Some(&approval),
+                    )
+                    .unwrap(),
                 audit,
                 store: &store,
                 operation: None,

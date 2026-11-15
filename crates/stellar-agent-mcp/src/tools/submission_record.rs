@@ -227,7 +227,7 @@ fn authority_tombstone(
     Ok(Some(ApprovalTombstone {
         store_dir,
         profile_name: record.profile_name.clone(),
-        approval_nonce: witness.nonce().to_owned(),
+        approval_nonce: witness.witness().nonce().to_owned(),
     }))
 }
 
@@ -1498,22 +1498,16 @@ mod tests {
         ] {
             let f = Fixture::new(|raw| raw);
             let witness = payment_witness(&f).await;
-            let decision = stellar_agent_core::mainnet::decision::MainnetDecision::for_test(
-                stellar_agent_core::policy::Decision::Allow,
-                None,
-                [4; 32],
-                7,
-                0,
-                "operator",
-                "stellar:mainnet",
-                stellar_agent_core::timefmt::now_unix_ms().unwrap(),
-                600_000,
-                stellar_agent_core::mainnet::decision::AuthorityScope::Classic,
-            );
+            let outcome = f
+                .server
+                .dispatch_gate("stellar_pay", &f.args(), "stellar:mainnet")
+                .await
+                .unwrap();
+            let decision = outcome.mainnet_decision().unwrap();
             let authority = if defect == "policy" {
-                MainnetAuthority::from_decision(&decision, None).unwrap()
+                MainnetAuthority::from_decision(decision, None).unwrap()
             } else {
-                MainnetAuthority::Approval(&witness)
+                MainnetAuthority::from_decision(decision, Some(&witness)).unwrap()
             };
             let profile = f.server.security_profile();
             let readiness = stellar_agent_network::mainnet::audit_readiness::audit_readiness(

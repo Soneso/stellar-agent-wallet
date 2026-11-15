@@ -159,6 +159,7 @@ struct Harness {
     sends: Arc<Mutex<Vec<WindowSnapshot>>>,
     polls: Arc<AtomicUsize>,
     signer_reads: Arc<AtomicI64>,
+    nonce_reads: Arc<AtomicI64>,
     policy_dir: TempDir,
     approval_dir: TempDir,
     rpc: MockServer,
@@ -216,13 +217,24 @@ decision = "allow"
         let root = crate::common::isolated_data_root();
         let signer_reads = Arc::new(AtomicI64::new(0));
         let observed_reads = Arc::clone(&signer_reads);
-        keyring_mock::install_with_read_hooks(vec![keyring_mock::ReadHook::new(
-            "svc",
-            name,
-            Arc::new(move || {
-                observed_reads.fetch_add(1, Ordering::SeqCst);
-            }),
-        )])
+        let nonce_reads = Arc::new(AtomicI64::new(0));
+        let observed_nonces = Arc::clone(&nonce_reads);
+        keyring_mock::install_with_read_hooks(vec![
+            keyring_mock::ReadHook::new(
+                "svc",
+                name,
+                Arc::new(move || {
+                    observed_reads.fetch_add(1, Ordering::SeqCst);
+                }),
+            ),
+            keyring_mock::ReadHook::new(
+                "n-svc",
+                "n-acct",
+                Arc::new(move || {
+                    observed_nonces.fetch_add(1, Ordering::SeqCst);
+                }),
+            ),
+        ])
         .expect("hooked mock keyring");
         let signer = SigningKey::from_bytes(&[0x61; 32]);
         let source = stellar_strkey::ed25519::PublicKey(signer.verifying_key().to_bytes())
@@ -338,6 +350,7 @@ decision = "allow"
             sends,
             polls,
             signer_reads,
+            nonce_reads,
             policy_dir,
             approval_dir,
             rpc,
@@ -1080,9 +1093,13 @@ async fn toolset_forced_approval_keeps_allow_effects_and_reservation() {
         chain_id: Some("stellar:testnet".to_owned()),
         args: params,
     };
+    let mut contradictory = pay_json(&args);
+    contradictory["amount_in_stroops"] = json!("1");
+    contradictory["memo_text"] = json!("caller memo");
+    contradictory["fee"] = json!("500");
     let prompt = result_json(
         &h.server
-            .call_stellar_toolset_invoke(invoke(pay_json(&args)))
+            .call_stellar_toolset_invoke(invoke(contradictory))
             .await
             .unwrap(),
     );
@@ -1102,6 +1119,36 @@ async fn toolset_forced_approval_keeps_allow_effects_and_reservation() {
                 .unwrap();
         let entries = store.snapshot(now_unix_ms().unwrap());
         assert_eq!(entries.len(), 1, "toolset queues per-action approval");
+        let entry = store.get(&entries[0].approval_nonce).unwrap();
+        let stellar_agent_core::approval::ApprovalKind::PaymentSimulated {
+            summary_simulated_seq_num,
+            summary_simulated_fee_stroops,
+            envelope_xdr_b64,
+            summary_amount_stroops,
+            summary_memo,
+            ..
+        } = &entry.kind
+        else {
+            panic!("payment entry")
+        };
+        assert_eq!(*summary_simulated_seq_num, 43);
+        assert_eq!(*summary_simulated_fee_stroops, 100);
+        assert_eq!(
+            envelope_xdr_b64,
+            sim["data"]["envelope_xdr"].as_str().unwrap()
+        );
+        assert_eq!(*summary_amount_stroops, 60_000_000);
+        assert!(summary_memo.is_none());
+        let facts = stellar_agent_core::approval::attest::classic_entry_summary(&entry.kind)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            facts.memo,
+            stellar_agent_core::envelope_decode::ClassicMemo::None
+        );
+        assert!(h.sends.lock().unwrap().is_empty());
+        assert_eq!(h.signer_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(h.window().pending, 0);
         entries[0].approval_nonce.clone()
     };
     for candidate in [nonce.clone(), "A".repeat(22)] {
@@ -1483,6 +1530,149 @@ async fn rule_approval_shape_reaches_pending_and_response() {
             assert_eq!(request.reason, pending.reason);
         }
     }
+}
+
+/// Every admitted memo survives a public preparation and a reopened approval store.
+#[tokio::test]
+#[serial]
+async fn payment_approval_facts_come_from_the_retained_envelope() {
+    use stellar_agent_core::approval::{ApprovalKind, attest::classic_entry_summary};
+    let h = Harness::new("payment-facts", "require_approval", Outcome::Success).await;
+    for (field, value, details, legacy) in [
+        (
+            "memo_text",
+            Value::Null,
+            json!({"kind":"none"}),
+            Value::Null,
+        ),
+        ("memo_text", json!(""), json!({"kind":"none"}), Value::Null),
+        (
+            "memo_text",
+            json!("é"),
+            json!({"kind":"text","value":"é"}),
+            json!("é"),
+        ),
+        (
+            "memo_id",
+            json!(0),
+            json!({"kind":"id","value":"0"}),
+            json!(0),
+        ),
+        (
+            "memo_id",
+            json!(u64::MAX),
+            json!({"kind":"id","value":"18446744073709551615"}),
+            json!(u64::MAX),
+        ),
+        (
+            "memo_hash_hex",
+            json!("ab".repeat(32)),
+            json!({"kind":"hash","value":vec![171;32]}),
+            json!("ab".repeat(32)),
+        ),
+        (
+            "memo_return_hex",
+            json!("ab".repeat(32)),
+            json!({"kind":"return","value":vec![171;32]}),
+            json!("ab".repeat(32)),
+        ),
+    ] {
+        let mut args = json!({"chain_id":"stellar:testnet", "source":h.source,
+            "destination":DEST,"asset":"native","amount_in_stroops":"60000000","fee":"177"});
+        args[field] = value;
+        let response = result_json(
+            &h.server
+                .call_stellar_pay(serde_json::from_value(args).unwrap())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(response["ok"], true, "{response}");
+        let data = &response["data"];
+        let approval = &data["approval"];
+        let summary = &approval["summary"];
+        assert_eq!(summary["memo_details"], details);
+        assert_eq!(summary["memo"], legacy);
+        assert_eq!(summary["to"], DEST);
+        assert_eq!(summary["amount_stroops"], "60000000");
+        assert_eq!(summary["asset"], "XLM");
+        assert_eq!(summary["simulated_fee_stroops"], "177");
+        assert_eq!(summary["simulated_seq_num"], 43);
+        let store =
+            PendingApprovalStore::open(h.approval_dir.path().join(format!("{}.toml", h.name)))
+                .unwrap();
+        let entry = store
+            .get(approval["approval_nonce"].as_str().unwrap())
+            .unwrap();
+        let ApprovalKind::PaymentSimulated {
+            envelope_xdr_b64,
+            summary_memo,
+            summary_simulated_seq_num,
+            ..
+        } = &entry.kind
+        else {
+            panic!("payment")
+        };
+        assert_eq!(envelope_xdr_b64, data["envelope_xdr"].as_str().unwrap());
+        assert!(summary_memo.is_none());
+        assert_eq!(*summary_simulated_seq_num, 43);
+        let facts = classic_entry_summary(&entry.kind).unwrap().unwrap();
+        assert_eq!(serde_json::to_value(facts.memo).unwrap(), details);
+    }
+    assert_eq!(h.signer_reads.load(Ordering::SeqCst), 0);
+    assert!(h.sends.lock().unwrap().is_empty());
+    assert_eq!(h.window().pending, 0);
+}
+
+/// Persistence delay keeps the captured end to the millisecond and expired calls mint no token.
+#[tokio::test]
+#[serial]
+async fn payment_approval_delay_keeps_the_captured_end() {
+    use stellar_agent_core::policy::v1::criteria::state_store::set_query_time_for_test;
+    let mut h = Harness::with_approval_fields(
+        "payment-delay",
+        "require_approval",
+        Outcome::Success,
+        "ttl_secs = 2\nreason = \"review\"",
+    )
+    .await;
+    let evaluated = now_unix_ms().unwrap();
+    let policy_clock = set_query_time_for_test(evaluated);
+    let end = evaluated + 2_000;
+    for remaining in [1, 999, 1_000, 1_001] {
+        h.server
+            .set_clock_for_test(Arc::new(MockClock::new(move || Ok(end - remaining))));
+        let response = h.simulate_pay(AMOUNT).await;
+        assert_eq!(response["ok"], true, "{response}");
+        let approval = &response["data"]["approval"];
+        let store =
+            PendingApprovalStore::open(h.approval_dir.path().join(format!("{}.toml", h.name)))
+                .unwrap();
+        let entry = store
+            .get(approval["approval_nonce"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(entry.created_at_unix_ms, evaluated);
+        assert_eq!(entry.expires_at_unix_ms, end);
+        assert_eq!(approval["expires_at_unix_ms"], end);
+        assert_eq!(entry.reason.as_deref(), Some("review"));
+    }
+    let path = h.approval_dir.path().join(format!("{}.toml", h.name));
+    let before = std::fs::read(&path).unwrap();
+    let nonce_reads = h.nonce_reads.load(Ordering::SeqCst);
+    h.server
+        .set_clock_for_test(Arc::new(MockClock::new(move || Ok(end))));
+    let refused = h.server.call_stellar_pay(serde_json::from_value(json!({"chain_id":"stellar:testnet", "source":h.source,"destination":DEST,"asset":"native","amount_in_stroops":"60000000"})).unwrap()).await;
+    assert!(refused.is_err(), "elapsed persistence refuses");
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert_eq!(h.nonce_reads.load(Ordering::SeqCst), nonce_reads);
+    policy_clock.set(u64::MAX - 1);
+    let overflow = h.server.call_stellar_pay(serde_json::from_value(json!({"chain_id":"stellar:testnet", "source":h.source,"destination":DEST,"asset":"native","amount_in_stroops":"60000000"})).unwrap()).await;
+    assert!(overflow.is_ok(), "overflow returns a typed policy refusal");
+    let overflow = result_json(&overflow.unwrap());
+    assert_eq!(overflow["error"]["code"], "policy.unexpected_decision");
+    assert_eq!(h.nonce_reads.load(Ordering::SeqCst), nonce_reads);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert_eq!(h.signer_reads.load(Ordering::SeqCst), 0);
+    assert!(h.sends.lock().unwrap().is_empty());
 }
 
 /// An allowed submission records and spends no approval the gate did not verify.
@@ -2107,7 +2297,12 @@ async fn split_approval_round_trip(pair: ClassicPair) {
     .await;
     let sim = pair.simulate(&h).await;
     assert_eq!(sim["ok"], true, "{sim}");
-    pair.assert_pending(&h, &sim["data"], 617_000, "Commit review");
+    let ttl = if matches!(pair, ClassicPair::Pay) {
+        600_000
+    } else {
+        617_000
+    };
+    pair.assert_pending(&h, &sim["data"], ttl, "Commit review");
     assert_eq!(h.window().pending, 0);
     let data = &sim["data"];
     let nonce = data["approval"]["approval_nonce"].as_str().unwrap();
@@ -2215,7 +2410,7 @@ async fn split_pay_approval_commit_cap_reserves_and_settles() {
     )
     .await;
     let sim = h.simulate_pay(AMOUNT).await;
-    ClassicPair::Pay.assert_pending(&h, &sim["data"], 617_000, "Commit review");
+    ClassicPair::Pay.assert_pending(&h, &sim["data"], 600_000, "Commit review");
     let result = h
         .commit_pay(h.pay_args(&sim["data"], AMOUNT, Some(h.attest(&sim["data"]))))
         .await;
@@ -2284,7 +2479,7 @@ async fn split_pay_approval_uses_destination_identity_view() {
     .await;
     let sim = h.simulate_pay(AMOUNT).await;
     assert_eq!(sim["ok"], true, "{sim}");
-    ClassicPair::Pay.assert_pending(&h, &sim["data"], 617_000, "Commit review");
+    ClassicPair::Pay.assert_pending(&h, &sim["data"], 600_000, "Commit review");
 
     // The source has no home domain and this destination has an unresolved one,
     // so only the destination's identity view makes the commit refuse.
@@ -2405,7 +2600,7 @@ async fn split_approval_reconciles_only_one_bounded_pass() {
     }
     let sim = h.simulate_pay(AMOUNT).await;
     assert_eq!(sim["ok"], true, "{sim}");
-    ClassicPair::Pay.assert_pending(&h, &sim["data"], 617_000, "Commit review");
+    ClassicPair::Pay.assert_pending(&h, &sim["data"], 600_000, "Commit review");
     let requests = h.rpc.received_requests().await.unwrap();
     let statuses = requests
         .iter()

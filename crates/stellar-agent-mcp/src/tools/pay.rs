@@ -14,7 +14,7 @@ use stellar_xdr::Memo;
 
 use crate::server::WalletServer;
 use crate::tools::common::{
-    APPROVAL_TTL_MS, CLASSIC_SINGLE_OPERATION_COUNT, DEFAULT_NONCE_TTL_MS, DispatchOutcome,
+    CLASSIC_SINGLE_OPERATION_COUNT, DEFAULT_NONCE_TTL_MS, DispatchOutcome,
     commit_envelope_and_verify_nonce, commit_path_error_result, hash_to_lower_hex,
     ledger_err_result, nonce_id_prefix, redacted_wallet_error_envelope,
     resolve_classic_fee_per_op_stroops, total_classic_fee_stroops, validate_g_strkey,
@@ -322,30 +322,49 @@ impl std::fmt::Debug for StellarPayCommitArgs {
 // Free helpers used by the simulate handler
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Returns a JSON representation of a [`Memo`] suitable for the approval
-/// summary block.
-///
-/// `Memo::None` → `null`.  Text → string.  Id → number.  Hash/Return → hex string.
-fn memo_summary_for_json(memo: &Memo) -> serde_json::Value {
+/// The approval response's facts, decoded from its retained envelope.
+fn payment_approval_summary(envelope: &str) -> Result<serde_json::Value, rmcp::ErrorData> {
+    use stellar_agent_core::envelope_decode::{
+        ClassicOperation, ClassicTransactionKind, classic_summary,
+    };
+    let summary = classic_summary(envelope, ClassicTransactionKind::Payment).map_err(|e| {
+        rmcp::ErrorData::internal_error(format!("approval.envelope_invalid: {e}"), None)
+    })?;
+    let ClassicOperation::Payment {
+        destination,
+        asset,
+        amount_stroops,
+    } = summary.operation
+    else {
+        return Err(rmcp::ErrorData::internal_error(
+            "approval envelope must contain one payment",
+            None,
+        ));
+    };
+    Ok(json!({
+        "to": destination,
+        "amount_stroops": amount_stroops.to_string(),
+        "asset": asset,
+        "memo": memo_summary_for_json(&summary.memo),
+        "memo_details": summary.memo,
+        "simulated_fee_stroops": summary.fee_stroops.to_string(),
+        "simulated_seq_num": summary.seq_num,
+    }))
+}
+
+/// The legacy memo projection beside the complete tagged memo.
+fn memo_summary_for_json(
+    memo: &stellar_agent_core::envelope_decode::ClassicMemo,
+) -> serde_json::Value {
+    use stellar_agent_core::envelope_decode::ClassicMemo;
     match memo {
-        Memo::None => serde_json::Value::Null,
-        Memo::Text(t) => {
-            // Invariant: memo_text was constructed from a valid UTF-8 JSON string
-            // by the caller. `from_utf8` (not `from_utf8_lossy`) is used here so a
-            // forged non-UTF-8 memo surfaces a visible "<invalid-utf8>" marker
-            // rather than silently substituting U+FFFD.
-            let s = std::str::from_utf8(t.as_slice()).unwrap_or("<invalid-utf8>");
-            serde_json::Value::String(s.to_owned())
+        ClassicMemo::None => serde_json::Value::Null,
+        ClassicMemo::Text(text) => json!(text),
+        ClassicMemo::Id(id) => json!(id),
+        ClassicMemo::Hash(bytes) | ClassicMemo::Return(bytes) => {
+            json!(stellar_agent_core::hex::encode(bytes))
         }
-        Memo::Id(id) => serde_json::json!(id),
-        Memo::Hash(h) => {
-            let hex = hash_to_lower_hex(h);
-            serde_json::Value::String(hex)
-        }
-        Memo::Return(h) => {
-            let hex = hash_to_lower_hex(h);
-            serde_json::Value::String(hex)
-        }
+        _ => serde_json::Value::Null,
     }
 }
 
@@ -372,20 +391,6 @@ fn memo_json(memo: &Memo) -> serde_json::Value {
             let hex = hash_to_lower_hex(h);
             json!({ "type": "return", "value": hex })
         }
-    }
-}
-
-/// Returns the human-readable approval summary representation for a [`Memo`].
-fn memo_summary(memo: &Memo) -> Option<String> {
-    match memo {
-        Memo::Text(t) => Some(
-            std::str::from_utf8(t.as_slice())
-                .unwrap_or("<invalid-utf8>")
-                .to_owned(),
-        ),
-        Memo::Id(id) => Some(id.to_string()),
-        Memo::None => None,
-        _ => Some("<binary memo>".to_owned()),
     }
 }
 
@@ -474,37 +479,19 @@ fn resolve_payment_amount(
 // ─────────────────────────────────────────────────────────────────────────────
 
 impl WalletServer {
-    /// Persists a [`PendingApproval`] entry for a `stellar_pay` simulate call.
-    ///
-    /// Opens (or creates) the profile-scoped approval store at
-    /// `~/.local/share/stellar-agent/approvals/<profile_name>.toml`, constructs
-    /// an unattested entry from the payment arguments, inserts it, and returns
-    /// the entry for nonce / expiry extraction by the caller.
+    /// Persists the retained payment envelope with its captured interval in
+    /// the profile's approval store, under one lock and one clock observation.
     ///
     /// # Errors
     ///
     /// Returns a string error description on any I/O, store-lock, or clock
-    /// failure.  The caller maps this to an `internal_error` MCP response.
-    ///
-    /// # Feature gate
-    ///
-    /// Exposed as `pub` when the `test-helpers` feature is enabled, for use in
-    /// integration tests.  `pub(crate)` otherwise. Under that same gate, this
-    /// honours [`WalletServer::set_approval_dir_for_test`] so a test-isolated
-    /// `stellar_pay` simulate call under a `RequireApproval` policy never
-    /// writes into the real `default_approval_dir()`, mirroring the override
-    /// already applied in `invoke_stellar_pay_commit_toolset_gated`.
-    #[allow(clippy::too_many_arguments)]
-    #[cfg_attr(not(any(test, feature = "test-helpers")), allow(dead_code))]
+    /// failure, invalid envelope or elapsed interval. The caller maps this to
+    /// an `internal_error` MCP response.
     pub(crate) fn persist_pay_pending_approval(
         &self,
         envelope_xdr: &str,
-        summary_to: &str,
-        summary_stroops: i64,
-        summary_asset: &str,
-        summary_memo: Option<String>,
-        summary_simulated_total_stroops: u32,
-        summary_simulated_seq_num: i64,
+        created_at_ms: u64,
+        expires_at_ms: u64,
         profile_name: &str,
         request: &stellar_agent_core::policy::ApprovalRequest,
     ) -> Result<PendingApproval, String> {
@@ -526,24 +513,19 @@ impl WalletServer {
 
         let uid =
             process_uid_for_attestation().map_err(|e| format!("process UID unavailable: {e}"))?;
-        let entry = PendingApproval::new_payment_pending(
-            envelope_xdr.to_owned(),
-            envelope_xdr.as_bytes(),
-            summary_to.to_owned(),
-            summary_stroops,
-            summary_asset.to_owned(),
-            summary_memo,
-            summary_simulated_total_stroops,
-            summary_simulated_seq_num,
-            uid,
-            APPROVAL_TTL_MS,
-        )
-        .map_err(|e| format!("PendingApproval::new_payment_pending failed: {e}"))?;
-
-        let entry = entry.with_policy_request(request);
-
-        let now_ms = now_unix_ms()
+        let now_ms = self
+            .clock
+            .now_unix_ms()
             .map_err(|e| format!("approval store insert: current time unavailable: {e}"))?;
+        let entry = PendingApproval::new_payment_pending_until(
+            envelope_xdr.to_owned(),
+            uid,
+            created_at_ms,
+            expires_at_ms,
+            now_ms,
+            request,
+        )
+        .map_err(|e| format!("payment approval construction failed: {e}"))?;
         store
             .insert(entry.clone(), now_ms)
             .map_err(|e| format!("approval store insert failed: {e}"))?;
@@ -1049,38 +1031,6 @@ impl WalletServer {
             },
         );
 
-        // ── Mint nonce ────────────────────────────────────────────────────────
-        let now_ms = now_unix_ms()
-            .map_err(|e| rmcp::ErrorData::internal_error(format!("clock_error: {e}"), None))?;
-        let expiry_unix_ms = now_ms.saturating_add(DEFAULT_NONCE_TTL_MS);
-
-        let nonce = match self.nonce_mint.mint(
-            self.tool_catalogue.as_ref(),
-            envelope_xdr.as_bytes(),
-            now_ms,
-            expiry_unix_ms,
-            "stellar_pay_commit",
-            &args.chain_id,
-        ) {
-            Ok(n) => n,
-            Err(err) => {
-                return Ok(crate::tools::common::business_error_result(
-                    "nonce.mint_failed",
-                    err.to_string(),
-                ));
-            }
-        };
-
-        let nonce_b64 = nonce.to_base64();
-        let nonce_id_prefix = nonce_id_prefix(&nonce);
-        tracing::info!(
-            tool = "stellar_pay",
-            chain = %args.chain_id,
-            nonce_id = %nonce_id_prefix,
-            decision = "simulated",
-            "Payment simulation complete; nonce minted"
-        );
-
         // ── Build asset wire representation ───────────────────────────────────
         let asset_json = match &asset {
             Asset::Native => json!({ "type": "native" }),
@@ -1123,65 +1073,70 @@ impl WalletServer {
             Err(error) => return error.into_result(),
         };
 
-        // `process_uid_for_attestation` at simulate time is the user running the
-        // MCP server process.  The CLI-side `stellar-agent approve` MUST run as
-        // the same user because the HMAC input binds `process_uid`; an
-        // attestation produced by a different UID fails HMAC verification at
-        // commit time.  This is the cross-account-on-host non-replay binding.
         let approval_block =
             if let DispatchOutcome::RequireApproval(ref approval) = dispatch_outcome {
-                // Derive asset string for summary.
-                let asset_str = match &asset {
-                    stellar_agent_network::Asset::Native => "XLM".to_owned(),
-                    stellar_agent_network::Asset::Credit { code, issuer } => {
-                        format!("{code}:{issuer}")
-                    }
-                    _ => "unknown".to_owned(),
+                let (created_at_ms, policy_end) = match dispatch_outcome.captured_interval() {
+                    Ok(interval) => interval,
+                    Err(error) => return error.into_result(),
                 };
-                // Derive memo string for summary (None if Memo::None).
-                let memo_summary = memo_summary(&memo);
-
+                let expires_at_ms = prepared
+                    .waiting_end
+                    .map_or(policy_end, |end| policy_end.min(end));
                 let profile_name = self.profile_name_for_approval();
-                match self.persist_pay_pending_approval(
-                    &envelope_xdr,
-                    &args.destination,
-                    amount_stroops_i64,
-                    &asset_str,
-                    memo_summary,
-                    total_fee_stroops,
-                    source_sequence.saturating_add(1),
-                    &profile_name,
-                    &approval.request,
-                ) {
-                    Ok(entry) => {
-                        let approval_expires = entry.expires_at_unix_ms;
-                        let approval_nonce = entry.approval_nonce.clone();
-                        Some(json!({
-                            "approval_nonce": approval_nonce,
-                            "profile": &profile_name,
-                            "chain_id": self.context.chain_id.caip2_str(),
-                            "expires_at_unix_ms": approval_expires,
-                            "reason": entry.reason,
-                            "summary": {
-                                "to": &args.destination,
-                                "amount_stroops": amount_stroops_i64.to_string(),
-                                "asset": &asset_str,
-                                "memo": memo_summary_for_json(&memo),
-                                "simulated_fee_stroops": total_fee_stroops.to_string(),
-                                "simulated_seq_num": source_sequence + 1,
-                            }
-                        }))
-                    }
-                    Err(e) => {
-                        return Err(rmcp::ErrorData::internal_error(
-                            format!("approval.store_error: {e}"),
-                            None,
-                        ));
-                    }
-                }
+                let entry = self
+                    .persist_pay_pending_approval(
+                        &envelope_xdr,
+                        created_at_ms,
+                        expires_at_ms,
+                        &profile_name,
+                        &approval.request,
+                    )
+                    .map_err(|e| {
+                        rmcp::ErrorData::internal_error(format!("approval.store_error: {e}"), None)
+                    })?;
+                Some(json!({
+                    "approval_nonce": entry.approval_nonce,
+                    "profile": &profile_name,
+                    "chain_id": self.context.chain_id.caip2_str(),
+                    "expires_at_unix_ms": entry.expires_at_unix_ms,
+                    "reason": entry.reason,
+                    "summary": payment_approval_summary(&envelope_xdr)?,
+                }))
             } else {
                 None
             };
+
+        // ── Mint nonce ────────────────────────────────────────────────────────
+        let now_ms = now_unix_ms()
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("clock_error: {e}"), None))?;
+        let expiry_unix_ms = now_ms.saturating_add(DEFAULT_NONCE_TTL_MS);
+
+        let nonce = match self.nonce_mint.mint(
+            self.tool_catalogue.as_ref(),
+            envelope_xdr.as_bytes(),
+            now_ms,
+            expiry_unix_ms,
+            "stellar_pay_commit",
+            &args.chain_id,
+        ) {
+            Ok(n) => n,
+            Err(err) => {
+                return Ok(crate::tools::common::business_error_result(
+                    "nonce.mint_failed",
+                    err.to_string(),
+                ));
+            }
+        };
+
+        let nonce_b64 = nonce.to_base64();
+        let nonce_id_prefix = nonce_id_prefix(&nonce);
+        tracing::info!(
+            tool = "stellar_pay",
+            chain = %args.chain_id,
+            nonce_id = %nonce_id_prefix,
+            decision = "simulated",
+            "Payment simulation complete; nonce minted"
+        );
 
         // ── Build response ────────────────────────────────────────────────────
         let simulation = json!({
@@ -1636,12 +1591,7 @@ impl WalletServer {
             )
             .await
             {
-                Ok(verified) => {
-                    witness = verified;
-                    witness
-                        .as_ref()
-                        .map(stellar_agent_network::mainnet::authority::MainnetAuthority::Approval)
-                }
+                Ok(_) => None,
                 Err(result) => return Ok(result),
             }
         };
@@ -2025,10 +1975,7 @@ impl WalletServer {
         args: StellarPayCommitArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         use super::common::approval_required_indistinguishable;
-        use stellar_agent_core::approval::{
-            DEFAULT_TTL_MS, PendingApproval, process_uid_for_attestation,
-        };
-        use stellar_agent_core::profile::schema::default_approval_dir;
+        use stellar_agent_core::approval::DEFAULT_TTL_MS;
 
         // ── Forced approval check ─────────────────────────────────────────────
         //
@@ -2058,7 +2005,7 @@ impl WalletServer {
             // Force per-action approval unconditionally.
             // Synthesise a PaymentSimulated pending approval from the authoritative
             // envelope params.
-            let authoritative =
+            let _authoritative =
                 match decode_authoritative_args(&args.envelope_xdr, "stellar_pay_commit") {
                     Ok(a) => a,
                     Err(e) => {
@@ -2069,87 +2016,32 @@ impl WalletServer {
                     }
                 };
 
-            let summary_to = authoritative
-                .get("destination")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-            let summary_amount_stroops = authoritative
-                .get("amount_stroops")
-                .and_then(crate::tools::amount_wire::value_as_stroops_i64)
-                .unwrap_or(0_i64);
-            let summary_asset = authoritative
-                .get("asset")
-                .and_then(|v| v.as_str())
-                .unwrap_or("XLM")
-                .to_owned();
-
-            // The approval binds the envelope text supplied to the commit verifier.
-            let uid = process_uid_for_attestation().map_err(|e| {
-                rmcp::ErrorData::internal_error(format!("approval.uid_unavailable: {e}"), None)
+            let now_ms = self.clock.now_unix_ms().map_err(|e| {
+                rmcp::ErrorData::internal_error(format!("approval.clock_error: {e}"), None)
             })?;
-
-            let simulated_fee = authoritative
-                .get("total_fee_stroops")
-                .and_then(|v| v.as_u64())
-                .and_then(|f| u32::try_from(f).ok())
-                .unwrap_or(100_u32);
-            let simulated_seq = authoritative
-                .get("sequence_number")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0_i64);
-
-            let pending = PendingApproval::new_payment_pending(
-                args.envelope_xdr.clone(),
-                args.envelope_xdr.as_bytes(),
-                summary_to,
-                summary_amount_stroops,
-                summary_asset,
-                args.memo_text.as_ref().map(|m| m.as_str().to_owned()),
-                simulated_fee,
-                simulated_seq,
-                uid,
-                DEFAULT_TTL_MS,
-            )
-            .map_err(|e| {
-                rmcp::ErrorData::internal_error(format!("toolset.gated_approval_create: {e}"), None)
+            let end = now_ms.checked_add(DEFAULT_TTL_MS).ok_or_else(|| {
+                rmcp::ErrorData::internal_error("approval interval overflows", None)
             })?;
+            let request = stellar_agent_core::policy::ApprovalRequest::new(
+                String::new(),
+                (DEFAULT_TTL_MS / 1000) as u32,
+            );
+            let pending = self
+                .persist_pay_pending_approval(
+                    &args.envelope_xdr,
+                    now_ms,
+                    end,
+                    &self.profile_name_for_approval(),
+                    &request,
+                )
+                .map_err(|e| {
+                    rmcp::ErrorData::internal_error(
+                        format!("toolset.gated_approval_create: {e}"),
+                        None,
+                    )
+                })?;
 
             let approval_nonce = pending.approval_nonce.clone();
-
-            // Persist the pending approval.
-            #[cfg(any(test, feature = "test-helpers"))]
-            let approvals_dir = {
-                if let Some(ref override_dir) = self.approval_dir_override {
-                    override_dir.clone()
-                } else {
-                    default_approval_dir().map_err(|e| {
-                        rmcp::ErrorData::internal_error(format!("approval.dir_error: {e}"), None)
-                    })?
-                }
-            };
-            #[cfg(not(any(test, feature = "test-helpers")))]
-            let approvals_dir = default_approval_dir().map_err(|e| {
-                rmcp::ErrorData::internal_error(format!("approval.dir_error: {e}"), None)
-            })?;
-
-            let profile_name = self.profile_name_for_approval();
-            let store_path = approvals_dir.join(format!("{profile_name}.toml"));
-            let mut store =
-                open_with_retry(&store_path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF)
-                    .map_err(|e| {
-                        rmcp::ErrorData::internal_error(format!("approval.store_open: {e}"), None)
-                    })?;
-
-            let now_ms = now_unix_ms().map_err(|e| {
-                rmcp::ErrorData::internal_error(
-                    format!("approval.store_insert: current time unavailable: {e}"),
-                    None,
-                )
-            })?;
-            store.insert(pending, now_ms).map_err(|e| {
-                rmcp::ErrorData::internal_error(format!("approval.store_insert: {e}"), None)
-            })?;
 
             tracing::debug!(
                 nonce = %approval_nonce,
@@ -2401,13 +2293,16 @@ mod tests {
     #[test]
     fn memo_text_valid_utf8_round_trips() -> Result<(), stellar_xdr::Error> {
         let memo = Memo::Text(StringM::<28>::try_from("hello stellar")?);
-
-        assert_eq!(memo_summary(&memo), Some("hello stellar".to_owned()));
         assert_eq!(
             memo_json(&memo),
             json!({ "type": "text", "value": "hello stellar" })
         );
-        assert_eq!(memo_summary_for_json(&memo), json!("hello stellar"));
+        assert_eq!(
+            memo_summary_for_json(&stellar_agent_core::envelope_decode::ClassicMemo::Text(
+                "hello stellar".to_owned()
+            )),
+            json!("hello stellar")
+        );
 
         Ok(())
     }
@@ -2415,13 +2310,10 @@ mod tests {
     #[test]
     fn memo_text_invalid_utf8_renders_invalid_utf8_marker() -> Result<(), stellar_xdr::Error> {
         let memo = Memo::Text(StringM::<28>::try_from(vec![0xff, 0xfe])?);
-
-        assert_eq!(memo_summary(&memo), Some("<invalid-utf8>".to_owned()));
         assert_eq!(
             memo_json(&memo),
             json!({ "type": "text", "value": "<invalid-utf8>" })
         );
-        assert_eq!(memo_summary_for_json(&memo), json!("<invalid-utf8>"));
 
         Ok(())
     }
@@ -2430,35 +2322,42 @@ mod tests {
     fn memo_hash_round_trips() {
         let memo = Memo::Hash(Hash([0xab; 32]));
         let expected_hex = "ab".repeat(32);
-
-        assert_eq!(memo_summary(&memo), Some("<binary memo>".to_owned()));
         assert_eq!(
             memo_json(&memo),
             json!({ "type": "hash", "value": expected_hex })
         );
-        assert_eq!(memo_summary_for_json(&memo), json!(expected_hex));
+        assert_eq!(
+            memo_summary_for_json(&stellar_agent_core::envelope_decode::ClassicMemo::Hash(
+                [0xab; 32]
+            )),
+            json!(expected_hex)
+        );
     }
 
     #[test]
     fn memo_return_round_trips() {
         let memo = Memo::Return(Hash([0xcd; 32]));
         let expected_hex = "cd".repeat(32);
-
-        assert_eq!(memo_summary(&memo), Some("<binary memo>".to_owned()));
         assert_eq!(
             memo_json(&memo),
             json!({ "type": "return", "value": expected_hex })
         );
-        assert_eq!(memo_summary_for_json(&memo), json!(expected_hex));
+        assert_eq!(
+            memo_summary_for_json(&stellar_agent_core::envelope_decode::ClassicMemo::Return(
+                [0xcd; 32]
+            )),
+            json!(expected_hex)
+        );
     }
 
     #[test]
     fn memo_none_renders_empty() {
         let memo = Memo::None;
-
-        assert_eq!(memo_summary(&memo), None);
         assert_eq!(memo_json(&memo), json!({ "type": "none" }));
-        assert_eq!(memo_summary_for_json(&memo), serde_json::Value::Null);
+        assert_eq!(
+            memo_summary_for_json(&stellar_agent_core::envelope_decode::ClassicMemo::None),
+            serde_json::Value::Null
+        );
     }
 
     #[test]

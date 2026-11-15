@@ -2620,6 +2620,42 @@ async fn busy_mainnet_resimulation(busy: usize) {
     };
     let gates = AtomicUsize::new(0);
     let exposures = AtomicUsize::new(0);
+    use stellar_agent_core::mainnet::decision::{
+        EvaluationScope, MainnetEvaluationRequest, evaluate_mainnet,
+    };
+    use stellar_agent_core::policy::v1::{ActionKind, ValueClass, ValueLeg};
+    use stellar_agent_core::policy::{McpToolRegistration, ToolDescriptor, ToolValueKind};
+    let mut descriptor = ToolDescriptor::from_registration(&McpToolRegistration {
+        name: "stellar_x402_create_payment",
+        destructive_hint: true,
+        read_only_hint: false,
+        chain_id_required: true,
+        value_kind: ToolValueKind::MovesValue,
+    });
+    descriptor.chain_id = profile.chain_id.caip2_str().to_owned();
+    let decision = evaluate_mainnet(
+        &policy,
+        EvaluationScope::Classic,
+        stellar_agent_network::mainnet::clock::now_ms().unwrap(),
+        MainnetEvaluationRequest {
+            chain_id: profile.chain_id.caip2_str(),
+            tool: &descriptor,
+            args: &serde_json::json!({}),
+            profile,
+            value: Some(ValueClass::single(ValueLeg {
+                kind: ActionKind::X402Payment,
+                amount: Some(i128::from(AMOUNT)),
+                asset: Some(requirements.asset.clone()),
+                destination: Some(requirements.pay_to.clone()),
+            })),
+            account_view: None,
+            identity_view: None,
+            counterparty_cache: None,
+            sep10_sessions: None,
+            sep45_sessions: None,
+        },
+    )
+    .unwrap();
     let result = create_payment_authorized(
         &requirements,
         MainnetConsumer::X402Create,
@@ -2627,7 +2663,7 @@ async fn busy_mainnet_resimulation(busy: usize) {
             &context,
             &policy,
             &enablement,
-            &MainnetAuthority::Approval(&approval),
+            &MainnetAuthority::from_decision(&decision, Some(&approval)).unwrap(),
             &signer,
             &signing_handle,
             readiness,
