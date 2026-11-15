@@ -15,6 +15,13 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+#[cfg(test)]
+#[path = "../tests/cli/acceptance_storage.rs"]
+mod acceptance_child_fixture;
+#[cfg(all(test, feature = "live-platform-keyring"))]
+use acceptance_child_fixture::route as acceptance_storage;
+#[cfg(all(not(test), feature = "live-platform-keyring"))]
+mod acceptance_storage;
 mod advisory;
 mod commands;
 pub mod common;
@@ -318,22 +325,40 @@ const BODY_STACK_SIZE: usize = 8 * 1024 * 1024;
 
 /// Opens native storage only for the explicit live acceptance entry point.
 #[cfg(feature = "live-platform-keyring")]
-fn live_acceptance_entry() -> Result<(), stellar_agent_core::error::WalletError> {
+fn live_acceptance_entry(explicit: bool) -> Result<(), stellar_agent_core::error::WalletError> {
     use stellar_agent_network::keyring::live::{
         LivePlatformKeyring, init_platform_keyring_store_live,
     };
-    if std::env::var("STELLAR_AGENT_TEST_LIVE_PLATFORM_KEYRING").as_deref()
-        != Ok("real-platform-keyring")
-    {
-        return Err(stellar_agent_core::error::WalletError::Auth(
+    let refusal = |detail: &str| {
+        stellar_agent_core::error::WalletError::Auth(
             stellar_agent_core::error::AuthError::KeyringPlatformError {
-                detail:
-                    "STELLAR_AGENT_TEST_STORAGE_ISOLATED: live acceptance requires its named permit"
-                        .into(),
+                detail: format!("STELLAR_AGENT_TEST_STORAGE_ISOLATED: {detail}"),
             },
-        ));
-    }
-    init_platform_keyring_store_live(LivePlatformKeyring::acknowledge_real_platform_keyring())
+        )
+    };
+    acceptance_storage::dispatch(
+        explicit,
+        cfg!(feature = "live-platform-keyring"),
+        std::env::var("STELLAR_AGENT_TEST_KEYRING").ok().as_deref(),
+        std::env::var("STELLAR_AGENT_TEST_LIVE_PLATFORM_KEYRING")
+            .ok()
+            .as_deref(),
+        || {
+            if explicit {
+                Err(refusal(
+                    "live child entry requires platform acceptance selection",
+                ))
+            } else {
+                Ok(())
+            }
+        },
+        || {
+            init_platform_keyring_store_live(
+                LivePlatformKeyring::acknowledge_real_platform_keyring(),
+            )
+        },
+    )
+    .map_err(refusal)?
 }
 
 /// Selects the process role before either role initializes its runtime.
@@ -344,12 +369,14 @@ fn main() {
     #[allow(unused_mut)]
     let mut args = std::env::args_os().collect::<Vec<_>>();
     #[cfg(feature = "live-platform-keyring")]
-    if args
-        .get(1)
-        .is_some_and(|arg| arg == "--test-live-platform-keyring")
     {
-        args.remove(1);
-        if let Err(error) = live_acceptance_entry() {
+        let explicit = args
+            .get(1)
+            .is_some_and(|arg| arg == "--test-live-platform-keyring");
+        if explicit {
+            args.remove(1);
+        }
+        if let Err(error) = live_acceptance_entry(explicit) {
             common::render::render_json(&stellar_agent_core::envelope::Envelope::<()>::err_raw(
                 "auth.keyring_platform_error",
                 error.to_string(),
@@ -675,9 +702,14 @@ mod tests {
     #[serial_test::serial]
     fn live_acceptance_entry_requires_its_named_permit() {
         use stellar_agent_test_support::env_guard::ScopedEnvVar;
+        let _selection = ScopedEnvVar::new(
+            "STELLAR_AGENT_TEST_KEYRING",
+            Some(std::ffi::OsStr::new("platform")),
+        );
         for permit in [None, Some(std::ffi::OsStr::new("invalid"))] {
             let _env = ScopedEnvVar::new("STELLAR_AGENT_TEST_LIVE_PLATFORM_KEYRING", permit);
-            let error = live_acceptance_entry().expect_err("missing live permit must refuse");
+            let error = live_acceptance_entry(true).expect_err("missing live permit must refuse");
+            assert!(error.to_string().contains("exact permit"));
             assert!(
                 error
                     .to_string()
@@ -734,7 +766,13 @@ mod tests {
     #[serial_test::serial]
     fn startup_refusal_log_omits_the_requested_profile() {
         use stellar_agent_test_support::log_capture::{CaptureWriter, inert_dispatcher};
-        let home = tempfile::tempdir().expect("test home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("test home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let capture = CaptureWriter::new();
         let subscriber = tracing_subscriber::fmt()

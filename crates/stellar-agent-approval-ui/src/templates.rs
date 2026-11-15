@@ -1758,7 +1758,14 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn mainnet_consent_page_shows_the_muxed_base_account() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         use stellar_agent_core::approval::IntentView;
         let dir = TempDir::new().unwrap();

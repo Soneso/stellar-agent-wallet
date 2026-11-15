@@ -52,7 +52,6 @@
 )]
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -156,32 +155,35 @@ impl Run {
 /// overlays that select another profile or endpoint are removed.
 fn run(home: &Path, verb: Verb, extra: &[&str]) -> Run {
     let rule_id = RULE_ID.to_string();
-    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
-    let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-        .args(verb.subcommand())
-        .args([
-            "--account",
-            ACCOUNT,
-            "--rule-id",
-            rule_id.as_str(),
-            "--profile",
-            PROFILE,
-        ])
-        .args(extra)
-        .env("STELLAR_AGENT_HOME", home)
-        .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
-        .env(
-            "STELLAR_AGENT_HEADLESS_KEYRING_KEY",
-            URL_SAFE_NO_PAD.encode(HEADLESS_KEY),
-        )
-        .env_remove("STELLAR_AGENT_PROFILE")
-        .env_remove("STELLAR_AGENT_CHAIN_ID")
-        .env_remove("STELLAR_AGENT_RPC_URL")
-        .env_remove("STELLAR_AGENT_SECONDARY_RPC_URL")
-        .env_remove("STELLAR_AGENT_ORACLE_PROVIDER_URL")
-        .env_remove("STELLAR_AGENT_MCP_SIGNER_DEFAULT")
-        .output()
-        .expect("stellar-agent binary must run");
+    let output = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home,
+    )
+    .expect("isolated CLI child")
+    .args(verb.subcommand())
+    .args([
+        "--account",
+        ACCOUNT,
+        "--rule-id",
+        rule_id.as_str(),
+        "--profile",
+        PROFILE,
+    ])
+    .args(extra)
+    .env("STELLAR_AGENT_HOME", home)
+    .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+    .env(
+        "STELLAR_AGENT_HEADLESS_KEYRING_KEY",
+        URL_SAFE_NO_PAD.encode(HEADLESS_KEY),
+    )
+    .env_remove("STELLAR_AGENT_PROFILE")
+    .env_remove("STELLAR_AGENT_CHAIN_ID")
+    .env_remove("STELLAR_AGENT_RPC_URL")
+    .env_remove("STELLAR_AGENT_SECONDARY_RPC_URL")
+    .env_remove("STELLAR_AGENT_ORACLE_PROVIDER_URL")
+    .env_remove("STELLAR_AGENT_MCP_SIGNER_DEFAULT")
+    .output()
+    .expect("stellar-agent binary must run");
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let line = stdout
@@ -456,7 +458,7 @@ fn simulation_source(envelope: &TransactionV1Envelope) -> [u8; 32] {
 /// endpoint, and its first RPC is the simulation.
 fn mainnet_signer_free_case(verb: Verb) {
     let counter = ConnectionCounter::start().expect("loopback connection counter");
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     save_with_audit_key(
         home.path(),
         &mainnet_profile(home.path(), &counter.https_uri()),
@@ -565,7 +567,7 @@ fn assert_outcome(home: &Path, verb: Verb, run: &Run) {
 /// sentinel without an account lookup or a submission, and succeeds.
 async fn signer_free_request_shape_case(verb: Verb) {
     let server = start_mock(RuleResponder::without_account()).await;
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     save_with_audit_key(home.path(), &testnet_profile(home.path(), &server.uri()));
 
     let run = run(home.path(), verb, &[]);
@@ -633,7 +635,7 @@ async fn signer_free_request_shape_signers_refresh() {
 /// it, and succeeds.
 async fn explicit_source_case(verb: Verb) {
     let server = start_mock(RuleResponder::with_account(EXPLICIT_SOURCE_G)).await;
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     save_with_audit_key(home.path(), &testnet_profile(home.path(), &server.uri()));
 
     let run = run(home.path(), verb, &["--source-account", EXPLICIT_SOURCE_G]);
@@ -700,7 +702,7 @@ async fn explicit_source_signers_refresh() {
 /// on a mainnet profile without a minted audit key, before any connection.
 fn malformed_source_case(verb: Verb) {
     let counter = ConnectionCounter::start().expect("loopback connection counter");
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     save_without_audit_key(
         home.path(),
         &mainnet_profile(home.path(), &counter.https_uri()),
@@ -754,7 +756,7 @@ fn malformed_source_signers_refresh() {
 /// connection.
 fn audit_key_required_case(verb: Verb) {
     let counter = ConnectionCounter::start().expect("loopback connection counter");
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     save_without_audit_key(
         home.path(),
         &mainnet_profile(home.path(), &counter.https_uri()),

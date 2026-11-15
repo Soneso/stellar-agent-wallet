@@ -54,7 +54,6 @@
 )]
 
 use std::path::Path;
-use std::process::Command;
 
 use serde_json::Value;
 use stellar_agent_core::profile::loader::save_new_to_dir;
@@ -151,11 +150,10 @@ fn run_cli_with_env(
     overlay: &[(&str, &str)],
 ) -> Run {
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
-    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
-    let mut command = Command::new(bin_path);
+    let mut command = stellar_agent_test_support::cli_child::cli_command(bin_path, home)
+        .expect("isolated CLI child");
     command
         .args(args)
-        .env("STELLAR_AGENT_HOME", home)
         // Force the headless backend: no run in this suite may reach the OS
         // login keychain.
         .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
@@ -185,8 +183,8 @@ fn run_cli_with_env(
 
 /// Creates a temp home carrying the `default`, env-named, and flag-named
 /// fixtures.
-fn home_with_all_fixtures() -> tempfile::TempDir {
-    let home = tempfile::tempdir().expect("temp home");
+fn home_with_all_fixtures() -> stellar_agent_test_support::sandbox::StateSandbox {
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     write_profile(home.path(), "default", DEFAULT_PROFILE_RPC, None);
     write_profile(home.path(), ENV_PROFILE, ENV_PROFILE_RPC, None);
     write_profile(home.path(), FLAG_PROFILE, FLAG_PROFILE_RPC, None);
@@ -203,7 +201,7 @@ fn home_with_all_fixtures() -> tempfile::TempDir {
 /// host's real profile directory, so it is pinned first rather than assumed.
 #[test]
 fn the_child_process_reads_the_redirected_data_root() {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     write_profile(home.path(), ENV_PROFILE, ENV_PROFILE_RPC, None);
 
     let run = run_cli(
@@ -225,7 +223,7 @@ fn the_child_process_reads_the_redirected_data_root() {
 
 #[test]
 fn profile_show_redacts_every_url_component_with_credentials() {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     write_profile(
         home.path(),
         "redacted",
@@ -361,7 +359,7 @@ fn counterparty_list_profile_flag_beats_the_environment_variable() {
 
 #[test]
 fn pool_list_uses_the_profile_named_by_the_environment_variable() {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     // Only the env-named profile exists: a run that resolved `"default"` would
     // refuse with `validation.profile_not_found` instead of reaching the
     // pool-not-initialised refusal, which is what distinguishes the two.
@@ -386,7 +384,7 @@ fn pool_list_uses_the_profile_named_by_the_environment_variable() {
 
 #[test]
 fn pool_list_profile_flag_beats_the_environment_variable() {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     // Only the flag-named profile exists, so a run that honoured the variable
     // over the flag would refuse with `validation.profile_not_found`.
     write_profile(home.path(), FLAG_PROFILE, FLAG_PROFILE_RPC, None);
@@ -410,7 +408,7 @@ fn pool_list_profile_flag_beats_the_environment_variable() {
 
 #[test]
 fn profile_init_creates_the_profile_named_by_the_environment_variable() {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
 
     let run = run_cli(
         home.path(),
@@ -443,7 +441,7 @@ fn profile_init_creates_the_profile_named_by_the_environment_variable() {
 
 #[test]
 fn profile_init_profile_flag_beats_the_environment_variable() {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
 
     let run = run_cli(
         home.path(),
@@ -508,7 +506,7 @@ fn write_malformed_audit_log(home: &Path, profile: &str) {
 
 #[test]
 fn startup_advisory_scans_the_audit_log_of_the_environment_variable_profile() {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     write_profile(home.path(), ENV_PROFILE, ENV_PROFILE_RPC, None);
     write_malformed_audit_log(home.path(), ENV_PROFILE);
     write_malformed_audit_log(home.path(), "default");
@@ -532,7 +530,7 @@ fn startup_advisory_scans_the_audit_log_of_the_environment_variable_profile() {
 
 #[test]
 fn startup_advisory_profile_flag_beats_the_environment_variable() {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     write_profile(home.path(), FLAG_PROFILE, FLAG_PROFILE_RPC, None);
     write_malformed_audit_log(home.path(), FLAG_PROFILE);
     write_malformed_audit_log(home.path(), ENV_PROFILE);
@@ -631,7 +629,7 @@ fn assert_reached_only_the_unreachable_endpoint(run: &Run, verb: &str) {
 #[test]
 fn the_moved_verbs_audit_under_the_profile_named_by_the_environment_variable() {
     for (verb, argv) in MOVED_VERB_ARGS {
-        let home = tempfile::tempdir().expect("temp home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
         write_profile(home.path(), ENV_PROFILE, ENV_PROFILE_RPC, None);
         write_profile(home.path(), "default", DEFAULT_PROFILE_RPC, None);
         write_malformed_audit_log(home.path(), ENV_PROFILE);
@@ -657,7 +655,7 @@ fn the_moved_verbs_audit_under_the_profile_named_by_the_environment_variable() {
 #[test]
 fn the_moved_verbs_let_the_profile_flag_beat_the_environment_variable() {
     for (verb, argv) in MOVED_VERB_ARGS {
-        let home = tempfile::tempdir().expect("temp home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
         write_profile(home.path(), ENV_PROFILE, ENV_PROFILE_RPC, None);
         write_profile(home.path(), FLAG_PROFILE, FLAG_PROFILE_RPC, None);
         write_malformed_audit_log(home.path(), ENV_PROFILE);
@@ -753,7 +751,7 @@ fn remove_rpc_url(home: &Path, name: &str) {
 
 #[test]
 fn chain_id_environment_overlay_refuses_testnet_profile() {
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     write_profile(home.path(), "testnet", UNREACHABLE_RPC, None);
     let run = run_cli_with_env(
         home.path(),
@@ -768,7 +766,7 @@ fn chain_id_environment_overlay_refuses_testnet_profile() {
 /// Trust-root overlays are refused on a testnet profile, naming the key.
 #[test]
 fn trust_root_environment_overlays_refuse_testnet_profile() {
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     write_profile(home.path(), "testnet", UNREACHABLE_RPC, None);
     for (variable, value, key) in [
         (
@@ -802,7 +800,7 @@ fn trust_root_environment_overlays_refuse_testnet_profile() {
 
 #[test]
 fn rpc_environment_overlay_refuses_mainnet_profile() {
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     write_mainnet_profile(home.path(), "mainnet", UNREACHABLE_HTTPS_RPC);
     let run = run_cli_with_env(
         home.path(),
@@ -816,7 +814,7 @@ fn rpc_environment_overlay_refuses_mainnet_profile() {
 
 #[test]
 fn trustline_mainnet_rpc_overlay_refuses_before_endpoint_contact() {
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let endpoint = connection_counter();
     let overlay_url = endpoint.https_uri();
     write_mainnet_profile(home.path(), "mainnet", &overlay_url);
@@ -841,7 +839,7 @@ fn trustline_mainnet_rpc_overlay_refuses_before_endpoint_contact() {
 
 #[test]
 fn trustline_mainnet_environment_refuses_before_endpoint_contact() {
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let endpoint = connection_counter();
     write_mainnet_profile(home.path(), "mainnet", &endpoint.https_uri());
     let run = run_trustline(home.path(), Some("mainnet"), &[]);
@@ -885,7 +883,7 @@ const IMPLICIT_SELECTION_VERBS: &[(&str, &[&str])] = &[
 #[test]
 fn value_verbs_refuse_a_mainnet_profile_named_by_the_environment() {
     for (verb, argv) in IMPLICIT_SELECTION_VERBS {
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let endpoint = connection_counter();
         write_mainnet_profile(home.path(), "mainnet", &endpoint.https_uri());
         let run = run_cli(home.path(), Some("mainnet"), argv);
@@ -913,7 +911,7 @@ fn value_verbs_refuse_a_mainnet_profile_saved_as_default() {
         vec!["trustline", "--from", SOURCE_G, "--asset", "USDC"],
     ));
     for (verb, argv) in verbs {
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let endpoint = connection_counter();
         write_mainnet_profile(home.path(), "default", &endpoint.https_uri());
         let run = run_cli(home.path(), None, &argv);
@@ -933,7 +931,7 @@ fn value_verbs_refuse_a_mainnet_profile_saved_as_default() {
 /// `trustline.profile_load_failed`.
 #[test]
 fn trustline_mainnet_profile_without_rpc_url_reports_the_typed_code() {
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     write_mainnet_profile(home.path(), "mainnet", UNREACHABLE_HTTPS_RPC);
     remove_rpc_url(home.path(), "mainnet");
     let run = run_trustline(home.path(), None, &["--profile", "mainnet"]);
@@ -946,7 +944,7 @@ fn trustline_mainnet_profile_without_rpc_url_reports_the_typed_code() {
 
 #[test]
 fn trustline_mainnet_flag_passes_selection() {
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     write_mainnet_profile(home.path(), "mainnet", UNREACHABLE_HTTPS_RPC);
     let run = run_trustline(home.path(), Some("mainnet"), &["--profile", "mainnet"]);
     assert_ne!(
@@ -958,7 +956,7 @@ fn trustline_mainnet_flag_passes_selection() {
 }
 
 fn assert_registration_environment_refuses(verb: &str, extra: &[&str]) {
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     write_mainnet_profile(home.path(), "mainnet", UNREACHABLE_HTTPS_RPC);
     let registry = home.path().join("networks.toml");
     let mut args = vec!["smart-account", verb];
@@ -1007,7 +1005,7 @@ fn protected_secondary_and_signer_environment_overlays_refuse_mainnet() {
         ),
         ("STELLAR_AGENT_MCP_SIGNER_DEFAULT", "x"),
     ] {
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         write_mainnet_profile(home.path(), "mainnet", UNREACHABLE_HTTPS_RPC);
         let run = run_cli_with_env(
             home.path(),
@@ -1026,7 +1024,7 @@ fn protected_secondary_and_signer_environment_overlays_refuse_mainnet() {
 fn oracle_environment_overlay_refuses_mainnet_profile() {
     let file_oracle = "https://oracle.example.invalid/";
     for overlay in ["https://overlay.example.invalid/", file_oracle] {
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let mut profile =
             Profile::builder_mainnet_named("mainnet", UNREACHABLE_HTTPS_RPC, "s", "a", "n", "a")
                 .audit_log_path(home.path().join("audit").join("mainnet.jsonl"))
@@ -1048,7 +1046,7 @@ fn oracle_environment_overlay_refuses_mainnet_profile() {
 /// The testnet control: the same variable applies to a testnet profile.
 #[test]
 fn oracle_environment_overlay_applies_to_testnet_profile() {
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     write_profile(home.path(), "testnet", UNREACHABLE_RPC, None);
     let run = run_cli_with_env(
         home.path(),
@@ -1084,7 +1082,7 @@ fn pay_base() -> Vec<&'static str> {
 fn plaintext_mainnet_endpoint_refuses_on_show_and_on_a_value_verb() {
     let counter = connection_counter();
     let plaintext = counter.https_uri().replacen("https://", "http://", 1);
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     write_mainnet_profile(home.path(), "mainnet", &plaintext);
     let mut pay = pay_base();
     pay.extend(["--profile", "mainnet"]);
@@ -1104,7 +1102,7 @@ fn plaintext_mainnet_endpoint_refuses_on_show_and_on_a_value_verb() {
 #[test]
 fn mainnet_profile_flags_refuse_before_endpoint_contact() {
     let rpc = connection_counter();
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     write_mainnet_profile(home.path(), "mainnet", &rpc.https_uri());
     for (flags, code) in [
         (
@@ -1130,7 +1128,7 @@ fn mainnet_profile_flags_refuse_before_endpoint_contact() {
 #[tokio::test]
 async fn mainnet_flag_on_zero_config_refuses_before_endpoint_contact() {
     let rpc = wiremock::MockServer::start().await;
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let endpoint = rpc.uri();
     let mut args = pay_base();
     args.extend(["--network", "mainnet", "--rpc-url", &endpoint]);
@@ -1143,7 +1141,7 @@ async fn mainnet_flag_on_zero_config_refuses_before_endpoint_contact() {
 #[test]
 fn mainnet_signers_list_rpc_flag_refuses_before_endpoint_contact() {
     let rpc = connection_counter();
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     write_mainnet_profile(home.path(), "mainnet", &rpc.https_uri());
     let run = run_cli(
         home.path(),
@@ -1169,7 +1167,7 @@ fn mainnet_signers_list_rpc_flag_refuses_before_endpoint_contact() {
 
 #[test]
 fn fees_stats_mainnet_equal_rpc_flag_refuses() {
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let endpoint = "https://mainnet.sorobanrpc.com";
     write_mainnet_profile(home.path(), "mainnet", endpoint);
     let run = run_cli(
@@ -1192,7 +1190,7 @@ fn fees_stats_mainnet_equal_rpc_flag_refuses() {
 /// `validation.usage_error` envelope, and neither stream echoes the userinfo.
 #[test]
 fn credentialed_rpc_flag_is_a_usage_error_without_echoing_credentials() {
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     write_mainnet_profile(home.path(), "mainnet", UNREACHABLE_HTTPS_RPC);
     let mut args = pay_base();
     args.extend([
@@ -1215,7 +1213,7 @@ fn credentialed_rpc_flag_is_a_usage_error_without_echoing_credentials() {
 fn registration_profile_load_failures_leave_the_registry_absent() {
     for verb in ["register-multicall", "unregister-multicall"] {
         for malformed in [false, true] {
-            let home = tempfile::tempdir().unwrap();
+            let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
             let registry = home.path().join("networks.toml");
             if malformed {
                 std::fs::create_dir_all(home.path().join("profiles")).unwrap();
@@ -1752,7 +1750,7 @@ fn guarded_table_failures(
 #[test]
 fn every_guarded_path_refuses_a_mainnet_profile_before_endpoint_contact() {
     let endpoint = connection_counter();
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     write_mainnet_profile_with_oracle(home.path(), "mainnet", &endpoint.https_uri());
     let failures = guarded_table_failures(
         home.path(),
@@ -1775,7 +1773,7 @@ fn every_guarded_path_refuses_a_mainnet_profile_before_endpoint_contact() {
 #[test]
 fn every_guarded_path_refuses_a_mainnet_flag_without_a_profile() {
     let endpoint = connection_counter();
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let mut failures = guarded_table_failures(
         home.path(),
         &endpoint,
@@ -1836,7 +1834,7 @@ fn every_guarded_path_refuses_a_mainnet_flag_without_a_profile() {
 #[test]
 fn list_rules_refuses_a_mainnet_profile_named_by_the_environment() {
     let endpoint = connection_counter();
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     write_mainnet_profile(home.path(), "mainnet", &endpoint.https_uri());
     let run = run_cli(
         home.path(),
@@ -1910,7 +1908,7 @@ fn multicall_registry_error_precedes_writer_and_signer() {
 fn provider_records_show_and_refuse_overlays() {
     use stellar_agent_core::profile::schema::{PrimaryProviderRecord, ProviderRecord};
     for mainnet in [false, true] {
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let builder = if mainnet {
             // A mainnet profile with a second endpoint names its primary too.
             Profile::builder_mainnet_named(
@@ -1977,7 +1975,7 @@ fn provider_records_show_and_refuse_overlays() {
 #[test]
 fn testnet_environment_url_overlay_revalidates_provider_host() {
     use stellar_agent_core::profile::schema::ProviderRecord;
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let profile = Profile::builder_testnet_named("providers", "s", "a", "n", "a")
         .secondary_rpc_url("https://secondary.example".to_owned())
         .secondary_provider(ProviderRecord::new(

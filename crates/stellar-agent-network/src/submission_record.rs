@@ -3366,7 +3366,13 @@ mod tests {
     #[serial_test::serial]
     async fn pending_row_carries_the_witness_and_success_writes_no_submitted_row() {
         stellar_agent_test_support::keyring_mock::install().unwrap();
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let witness = crate::cross_check::CrossCheckWitness::for_crate_tests(
             "https://oracle.example",
@@ -4945,7 +4951,14 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn a_public_not_sent_report_after_the_receipt_mark_releases_nothing() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let fx = LedgerFixture::new("consume-mark-race", NOW);
@@ -4983,7 +4996,14 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn a_failed_mark_submitted_releases_the_total_debit() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let fx = LedgerFixture::new("consume-mark-total", NOW);
@@ -5015,7 +5035,14 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn a_reported_non_send_keeps_the_authorized_total_debit() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let fx = LedgerFixture::new("consume-not-sent-total", NOW);
@@ -5141,7 +5168,14 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn the_unsent_capability_releases_the_total_only_before_the_send() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             use stellar_agent_core::policy::v1::criteria::state_store::{
@@ -5197,7 +5231,14 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn a_reservation_epoch_refusal_keeps_its_code() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             use stellar_agent_core::policy::v1::criteria::state_store::{

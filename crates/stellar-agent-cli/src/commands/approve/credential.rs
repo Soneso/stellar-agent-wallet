@@ -1149,7 +1149,13 @@ pub(crate) mod tests {
         use stellar_agent_core::profile::schema::Profile;
 
         stellar_agent_test_support::keyring_mock::install().unwrap();
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let profile = Profile::builder_mainnet_named(
             "main",
@@ -1519,7 +1525,13 @@ pub(crate) mod tests {
     #[serial_test::serial]
     async fn credential_enrollment_requires_a_persisted_mainnet_profile() {
         use stellar_agent_core::profile::schema::Profile;
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let _tty = crate::common::tty::tests::test_tty(true, true);
         let testnet = Profile::builder_testnet_named("test", "s", "a", "n", "b").build();

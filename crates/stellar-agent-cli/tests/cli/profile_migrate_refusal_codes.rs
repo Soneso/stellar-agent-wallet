@@ -20,7 +20,6 @@
 )]
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use serde_json::Value;
 
@@ -52,15 +51,18 @@ fn write_v1_profile(home: &Path, name: &str, chain_id: &str, rpc_url: Option<&st
 /// Runs `stellar-agent profile migrate <name>` and returns the exit code and
 /// stdout.
 fn run_migrate(home: &Path, name: &str) -> (i32, String) {
-    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
-    let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-        .args(["profile", "migrate", name])
-        .env("STELLAR_AGENT_HOME", home)
-        .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
-        .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY)
-        .env_remove("STELLAR_AGENT_PROFILE")
-        .output()
-        .expect("binary runs");
+    let output = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home,
+    )
+    .expect("isolated CLI child")
+    .args(["profile", "migrate", name])
+    .env("STELLAR_AGENT_HOME", home)
+    .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+    .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY)
+    .env_remove("STELLAR_AGENT_PROFILE")
+    .output()
+    .expect("binary runs");
     (
         output.status.code().expect("process exits with a code"),
         String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -85,7 +87,7 @@ fn refused_v1_mainnet_files_report_validation_codes_and_stay_unchanged() {
         (Some(SENTINEL_HTTP), "validation.config_invalid"),
         (Some(SENTINEL_HTTPS), "validation.config_invalid"),
     ] {
-        let home = tempfile::tempdir().expect("temp home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
         let path = write_v1_profile(home.path(), "treasury", "stellar:mainnet", rpc_url);
         let before = std::fs::read(&path).expect("fixture reads");
 
@@ -108,7 +110,7 @@ fn refused_v1_mainnet_files_report_validation_codes_and_stay_unchanged() {
 /// A profile with no file reports `validation.profile_not_found`.
 #[test]
 fn a_missing_profile_reports_not_found() {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     std::fs::create_dir_all(home.path().join("profiles")).expect("profiles dir");
 
     let (code, stdout) = run_migrate(home.path(), "never-written");
@@ -124,7 +126,7 @@ fn a_missing_profile_reports_not_found() {
 /// The control: a v1 mainnet file with an HTTPS endpoint migrates.
 #[test]
 fn a_v1_mainnet_file_with_an_https_endpoint_migrates() {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     let path = write_v1_profile(
         home.path(),
         "treasury",

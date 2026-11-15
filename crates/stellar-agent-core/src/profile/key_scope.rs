@@ -775,13 +775,19 @@ mod tests {
 
     struct Fixture {
         _guard: StellarAgentHomeGuard,
-        home: tempfile::TempDir,
+        home: stellar_agent_test_support::sandbox::StateSandbox,
         dir: PathBuf,
     }
 
     impl Fixture {
         fn new() -> Self {
-            let home = tempfile::tempdir().unwrap();
+            let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                home.path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let guard = StellarAgentHomeGuard::new(home.path());
             let dir = default_profile_dir().unwrap();
             std::fs::create_dir_all(&dir).unwrap();

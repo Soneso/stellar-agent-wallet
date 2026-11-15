@@ -1046,7 +1046,13 @@ mod tests {
     fn open_audit_writer_is_origin_aware() {
         use stellar_agent_core::profile::loader as profile_loader;
         use stellar_agent_test_support::{StellarAgentHomeGuard, keyring_mock};
-        let dir = tempfile::TempDir::new().expect("tempdir");
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().expect("tempdir");
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = StellarAgentHomeGuard::new(dir.path());
         keyring_mock::install().expect("mock store");
 
@@ -1078,7 +1084,13 @@ mod tests {
     #[serial_test::serial]
     fn open_audit_writer_refuses_a_named_absent_profile() {
         use stellar_agent_test_support::{StellarAgentHomeGuard, keyring_mock};
-        let dir = tempfile::TempDir::new().expect("tempdir");
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().expect("tempdir");
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = StellarAgentHomeGuard::new(dir.path());
         keyring_mock::install().expect("mock store");
 
@@ -1106,7 +1118,13 @@ mod tests {
     #[serial_test::serial]
     fn open_audit_writer_synthesizes_when_no_profile_was_named() {
         use stellar_agent_test_support::{StellarAgentHomeGuard, keyring_mock};
-        let dir = tempfile::TempDir::new().expect("tempdir");
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().expect("tempdir");
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = StellarAgentHomeGuard::new(dir.path());
         keyring_mock::install().expect("mock store");
 

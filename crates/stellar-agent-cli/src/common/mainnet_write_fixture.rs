@@ -342,16 +342,12 @@ struct MockKeyringScope;
 impl MockKeyringScope {
     fn set() -> Self {
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
-        stellar_agent_network::keyring::KEEP_REGISTERED_STORE
-            .store(true, std::sync::atomic::Ordering::SeqCst);
         Self
     }
 }
 
 impl Drop for MockKeyringScope {
     fn drop(&mut self) {
-        stellar_agent_network::keyring::KEEP_REGISTERED_STORE
-            .store(false, std::sync::atomic::Ordering::SeqCst);
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
     }
 }
@@ -377,7 +373,7 @@ pub(crate) struct MainnetFixture {
     _keyring: MockKeyringScope,
     _profile_var: ProfileEnvVarGuard,
     _home: StellarAgentHomeGuard,
-    _dir: tempfile::TempDir,
+    _dir: stellar_agent_test_support::sandbox::StateSandbox,
 }
 
 /// Fails the fixture when a ceremony runner exited non-zero, with what it
@@ -390,7 +386,13 @@ fn require_runner(step: &str, code: i32) {
 impl MainnetFixture {
     async fn new(mut spec: Spec) -> Self {
         crate::common::render::take_rendered_for_test();
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let home_guard = StellarAgentHomeGuard::new(home.path());
         let profile_var = ProfileEnvVarGuard::cleared();
         let keyring = MockKeyringScope::set();
@@ -516,7 +518,7 @@ impl MainnetFixture {
         keyring: MockKeyringScope,
         profile_var: ProfileEnvVarGuard,
         home_guard: StellarAgentHomeGuard,
-        home: tempfile::TempDir,
+        home: stellar_agent_test_support::sandbox::StateSandbox,
     ) -> Self {
         let calls = Rc::new(Cell::new(0));
         clear_shown_summaries();

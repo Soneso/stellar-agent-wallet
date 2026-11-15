@@ -55,13 +55,12 @@ fn noop_profile_toml(owner_profile: &str, chain_id: &str, rpc_url: &str) -> Stri
 
 /// An isolated `STELLAR_AGENT_HOME` with a `profiles/` directory.
 struct ProfileHome {
-    dir: tempfile::TempDir,
+    dir: stellar_agent_test_support::sandbox::StateSandbox,
 }
 
 impl ProfileHome {
     fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        stellar_agent_test_support::sandbox::mark_sandbox(dir.path()).unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         std::fs::create_dir_all(dir.path().join("profiles")).unwrap();
         Self { dir }
     }
@@ -81,7 +80,7 @@ impl ProfileHome {
 
     /// Builds a `Command` for the MCP binary bound to this home directory.
     fn command(&self, args: &[&str]) -> Command {
-        let mut command = server_command();
+        let mut command = server_command(self.dir.path());
         command
             .args(args)
             .env("STELLAR_AGENT_HOME", self.dir.path())

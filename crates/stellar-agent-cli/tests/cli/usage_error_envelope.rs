@@ -12,7 +12,7 @@
     reason = "test-only; assertions panic on violation"
 )]
 
-use std::process::{Command, Output};
+use std::process::Output;
 
 use serde_json::Value;
 
@@ -21,16 +21,19 @@ const HEADLESS_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
 
 /// Runs the binary with `args` against an isolated home.
 fn run(args: &[&str]) -> Output {
-    let home = tempfile::tempdir().expect("temp home");
-    stellar_agent_test_support::sandbox::mark_sandbox(home.path()).expect("mark fixture directory");
-    Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-        .args(args)
-        .env("STELLAR_AGENT_HOME", home.path())
-        .env_remove("STELLAR_AGENT_PROFILE")
-        .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
-        .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY)
-        .output()
-        .expect("binary runs")
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
+    stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home.path(),
+    )
+    .expect("isolated CLI child")
+    .args(args)
+    .env("STELLAR_AGENT_HOME", home.path())
+    .env_remove("STELLAR_AGENT_PROFILE")
+    .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+    .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY)
+    .output()
+    .expect("binary runs")
 }
 
 /// Asserts `output` is a usage refusal: exit `1`, empty stderr, and stdout
@@ -178,7 +181,7 @@ fn credentials_missing_name_marker_is_not_echoed() {
 
 #[test]
 fn credentials_registry_marker_is_not_echoed() {
-    let home = tempfile::tempdir().expect("test home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("test home");
     std::fs::create_dir_all(home.path().join("passkeys")).expect("passkeys directory");
     std::fs::write(
         home.path().join("passkeys/default.toml"),
@@ -189,16 +192,18 @@ fn credentials_registry_marker_is_not_echoed() {
         vec!["credentials", "list"],
         vec!["credentials", "show", "fixture"],
     ] {
-        stellar_agent_test_support::sandbox::mark_sandbox(home.path())
-            .expect("mark fixture directory");
-        let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-            .args(args)
-            .env("STELLAR_AGENT_HOME", home.path())
-            .env_remove("STELLAR_AGENT_PROFILE")
-            .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
-            .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY)
-            .output()
-            .expect("binary runs");
+        let output = stellar_agent_test_support::cli_child::cli_command(
+            env!("CARGO_BIN_EXE_stellar-agent"),
+            home.path(),
+        )
+        .expect("isolated CLI child")
+        .args(args)
+        .env("STELLAR_AGENT_HOME", home.path())
+        .env_remove("STELLAR_AGENT_PROFILE")
+        .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+        .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY)
+        .output()
+        .expect("binary runs");
         assert_eq!(output.status.code(), Some(1));
         let envelope: Value = serde_json::from_slice(&output.stdout).expect("JSON envelope");
         assert_eq!(
@@ -219,22 +224,25 @@ fn credentials_registry_marker_is_not_echoed() {
 
 #[test]
 fn profile_migration_refusal_omits_the_requested_name() {
-    let home = tempfile::tempdir().expect("test home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("test home");
     std::fs::create_dir_all(home.path().join("profiles")).expect("profiles directory");
     std::fs::write(
         home.path().join("profiles/CREDMARKER7.toml"),
         "version = 987654321\n",
     )
     .expect("profile fixture");
-    stellar_agent_test_support::sandbox::mark_sandbox(home.path()).expect("mark fixture directory");
-    let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-        .args(["profile", "migrate", "--profile", "CREDMARKER7"])
-        .env("STELLAR_AGENT_HOME", home.path())
-        .env_remove("STELLAR_AGENT_PROFILE")
-        .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
-        .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY)
-        .output()
-        .expect("binary runs");
+    let output = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home.path(),
+    )
+    .expect("isolated CLI child")
+    .args(["profile", "migrate", "--profile", "CREDMARKER7"])
+    .env("STELLAR_AGENT_HOME", home.path())
+    .env_remove("STELLAR_AGENT_PROFILE")
+    .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+    .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY)
+    .output()
+    .expect("binary runs");
     assert_eq!(output.status.code(), Some(1));
     let envelope: Value = serde_json::from_slice(&output.stdout).expect("JSON envelope");
     assert_eq!(envelope["error"]["code"], "internal.unexpected_state");

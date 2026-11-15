@@ -15,7 +15,7 @@
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serial_test::serial;
-use std::{process::Command, sync::Arc};
+use std::sync::Arc;
 use stellar_agent_core::{
     approval::{
         AttestationBinding, DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore, envelope_sha256,
@@ -44,7 +44,7 @@ enum ApprovalCase {
 }
 
 fn approve_binary_case(mainnet: bool, case: ApprovalCase) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let home = dir.path();
     let name = if mainnet {
         "treasury-mainnet"
@@ -196,8 +196,11 @@ fn approve_binary_case(mainnet: bool, case: ApprovalCase) {
     } else {
         &nonce
     };
-    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_stellar-agent"));
+    let mut command = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home,
+    )
+    .expect("isolated CLI child");
     command.args(["approve", "--id", requested_nonce, "--profile", name]);
     if !matches!(case, ApprovalCase::ClosedStdin) {
         command.arg("--yes");

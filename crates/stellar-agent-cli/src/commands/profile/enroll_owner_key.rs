@@ -711,7 +711,13 @@ mod tests {
     #[serial]
     async fn enroll_preserves_other_profiles_older_form_entries() {
         keyring_mock::install().expect("mock store");
-        let home = tempfile::tempdir().expect("home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let profile_dir =
             stellar_agent_core::profile::schema::default_profile_dir().expect("profile dir");
@@ -970,11 +976,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn enroll_nonexistent_profile_returns_exit_1() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let args = EnrollOwnerKeyArgs {
             profile: Some("__nonexistent_enroll_owner_key__".to_owned()),
             secret_env: "__UNSET_ENROLL_OWNER_KEY_VAR__".to_owned(),
@@ -983,6 +988,10 @@ mod tests {
         };
         let code = run(&args).await;
         assert_eq!(code, 1);
+        fixture.assert_refusal(
+            Some("validation.profile_not_found"),
+            &["the requested profile was not found"],
+        );
     }
     /// An enabled mainnet installation of profile `operator` under a fresh
     /// data root: the owner `[31; 32]` enrolled, its signed v2 policy at
@@ -990,8 +999,8 @@ mod tests {
     /// `profile enable-mainnet` keeps. `var` holds the seed `[32; 32]` of the
     /// candidate owner and `previous_var` the enrolled owner's seed.
     struct Enabled {
-        _dir: tempfile::TempDir,
         _home: stellar_agent_test_support::StellarAgentHomeGuard,
+        _dir: stellar_agent_test_support::sandbox::StateSandbox,
         profile: Profile,
         owner_entry: KeyringEntry,
         nonce_entry: KeyringEntry,
@@ -1025,7 +1034,13 @@ mod tests {
                 },
             };
             keyring_mock::install().unwrap();
-            let dir = tempfile::tempdir().unwrap();
+            let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                dir.path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
             let signer = stellar_strkey::ed25519::PublicKey([2; 32])
                 .to_string()
@@ -1863,7 +1878,13 @@ mod tests {
             },
         };
         keyring_mock::install().unwrap();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let keys = [41_u8, 42, 43].map(|seed| ed25519_dalek::SigningKey::from_bytes(&[seed; 32]));
         let address = |key: &ed25519_dalek::SigningKey| {

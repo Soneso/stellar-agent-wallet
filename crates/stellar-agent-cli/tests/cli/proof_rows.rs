@@ -179,8 +179,11 @@ impl Run {
 /// The binary in `home` with `args`, under the headless backend and with
 /// every overlay that selects another profile, endpoint or secret removed.
 pub(crate) fn command_in(home: &Path, args: &[String]) -> Command {
-    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_stellar-agent"));
+    let mut command = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home,
+    )
+    .expect("isolated CLI child");
     command
         .args(args)
         .env("STELLAR_AGENT_HOME", home)
@@ -235,7 +238,7 @@ fn profile_not_found_message() -> String {
 /// an argv that fails parsing with `validation.usage_error` fails the guard.
 #[test]
 fn every_cli_proof_row_reaches_the_profile_load() {
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let message = profile_not_found_message();
     let mut failures = Vec::new();
     for row in CLI_PROOF_ROWS {
@@ -315,7 +318,7 @@ fn every_mpp_subcommand_refuses_a_mainnet_profile_before_any_connection() {
     use stellar_agent_core::profile::loader::save_new_to_dir;
     use stellar_agent_core::profile::schema::Profile;
 
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let exposed = leaf_subcommands(home.path(), &["mpp".to_owned()]);
     let listed: std::collections::BTreeSet<String> = MPP_SUBCOMMANDS
         .iter()

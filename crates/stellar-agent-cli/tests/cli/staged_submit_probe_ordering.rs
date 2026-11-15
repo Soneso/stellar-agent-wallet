@@ -36,7 +36,6 @@
 )]
 
 use std::path::Path;
-use std::process::Command;
 
 use serde_json::{Value, json};
 use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
@@ -209,8 +208,8 @@ async fn received_methods(server: &MockServer) -> Vec<String> {
 /// `(exit_code, stdout_envelope)`.
 fn run_cli(home: &Path, args: &[&str]) -> (i32, Value) {
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
-    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
-    let output = Command::new(bin_path)
+    let output = stellar_agent_test_support::cli_child::cli_command(bin_path, home)
+        .expect("isolated CLI child")
         .args(args)
         .env("STELLAR_AGENT_HOME", home)
         .env_remove("STELLAR_AGENT_PROFILE")
@@ -345,7 +344,7 @@ fn pay_submit_only_args<'a>(
 async fn pay_submit_only_checks_readiness_before_the_account_read() {
     let envelope = SignedTestEnvelope::for_source(SOURCE_SEED);
     let server = start_mock_on(&envelope, TESTNET_PASSPHRASE, FRESH_CLOSE_AGE_SECS).await;
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     init_persisted_profile(home.path(), "ready-pay");
     let uri = server.uri();
 
@@ -361,7 +360,7 @@ async fn pay_submit_only_checks_readiness_before_the_account_read() {
 async fn pay_submit_only_refuses_a_stale_endpoint_before_the_account_read() {
     let envelope = SignedTestEnvelope::for_source(SOURCE_SEED);
     let server = start_mock_on(&envelope, TESTNET_PASSPHRASE, STALE_CLOSE_AGE_SECS).await;
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     init_persisted_profile(home.path(), "stale-pay");
     let uri = server.uri();
 
@@ -377,7 +376,7 @@ async fn pay_submit_only_refuses_a_stale_endpoint_before_the_account_read() {
 async fn pay_submit_only_probes_before_the_gate_on_the_zero_config_profile() {
     let envelope = SignedTestEnvelope::for_source(SOURCE_SEED);
     let server = start_mock(&envelope).await;
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
 
     let (code, out) = run_cli(
         home.path(),
@@ -405,7 +404,7 @@ async fn pay_submit_only_probes_before_the_gate_on_the_zero_config_profile() {
 async fn pay_submit_only_probes_before_the_audit_preflight_on_a_persisted_profile() {
     let envelope = SignedTestEnvelope::for_source(SOURCE_SEED);
     let server = start_mock(&envelope).await;
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     init_persisted_profile(home.path(), "probe-order-pay");
 
     let (code, out) = run_cli(
@@ -467,7 +466,7 @@ fn claim_envelope() -> SignedTestEnvelope {
 async fn claim_submit_only_probes_before_the_gate_on_the_zero_config_profile() {
     let envelope = claim_envelope();
     let server = start_mock(&envelope).await;
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
 
     let (code, out) = run_cli(
         home.path(),
@@ -494,7 +493,7 @@ async fn claim_submit_only_probes_before_the_gate_on_the_zero_config_profile() {
 async fn claim_submit_only_probes_before_the_audit_preflight_on_a_persisted_profile() {
     let envelope = claim_envelope();
     let server = start_mock(&envelope).await;
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     init_persisted_profile(home.path(), "probe-order-claim");
 
     let (code, out) = run_cli(
@@ -555,7 +554,7 @@ fn claim_submit_only_args<'a>(
 async fn claim_submit_only_checks_readiness_before_the_account_read() {
     let envelope = claim_envelope();
     let server = start_mock_on(&envelope, TESTNET_PASSPHRASE, FRESH_CLOSE_AGE_SECS).await;
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     init_persisted_profile(home.path(), "ready-claim");
     let uri = server.uri();
 
@@ -571,7 +570,7 @@ async fn claim_submit_only_checks_readiness_before_the_account_read() {
 async fn claim_submit_only_refuses_a_stale_endpoint_before_the_account_read() {
     let envelope = claim_envelope();
     let server = start_mock_on(&envelope, TESTNET_PASSPHRASE, STALE_CLOSE_AGE_SECS).await;
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     init_persisted_profile(home.path(), "stale-claim");
     let uri = server.uri();
 

@@ -762,8 +762,8 @@ impl LedgerFixture {
 /// reads them, so the witness producer loads the policy the resolver is
 /// handed. A test that uses it runs under `#[serial]`.
 pub(crate) struct ResolverFixture {
-    pub(crate) dir: TempDir,
     _home: stellar_agent_test_support::StellarAgentHomeGuard,
+    pub(crate) dir: stellar_agent_test_support::sandbox::StateSandbox,
     pub(crate) profile: Profile,
     pub(crate) context: crate::MainnetWriteContext,
     pub(crate) policy: stellar_agent_core::mainnet::verified_policy::VerifiedPolicy,
@@ -801,7 +801,13 @@ impl ResolverFixture {
         #[cfg(feature = "test-helpers")]
         stellar_agent_core::audit_log::writer::AuditWriterRegistry::remove_for_test("operator");
         stellar_agent_test_support::keyring_mock::install().unwrap();
-        let dir = TempDir::new().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let now = stellar_agent_core::timefmt::now_unix_ms().unwrap() - 300_000;
         let clock = set_now_ms_for_test(now);

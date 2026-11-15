@@ -334,7 +334,13 @@ async fn call(server: &WalletServer, tool: &str) -> (String, String) {
 #[tokio::test]
 #[serial]
 async fn mainnet_oracle_required_refuses_write_tools_after_the_oracle_is_removed() {
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        home.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home = StellarAgentHomeGuard::new(home.path());
     let endpoint = ConnectionCounter::start().expect("loopback connection counter");
     let complete = complete_profile(home.path(), &endpoint.https_uri());

@@ -18,7 +18,6 @@
 )]
 
 use std::path::Path;
-use std::process::Command;
 
 use serde_json::Value;
 use wiremock::matchers::{method, path, query_param};
@@ -39,17 +38,21 @@ const ESCAPED_DATA: &str =
 /// Runs the CLI with an isolated data root and returns its exit code and the
 /// envelope it printed.
 fn run_cli(home: &Path, args: &[&str]) -> (i32, String, Value) {
-    let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-        .args(args)
-        .env("STELLAR_AGENT_HOME", home)
-        .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
-        .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY)
-        .env_remove("STELLAR_AGENT_PROFILE")
-        .env_remove("STELLAR_AGENT_CHAIN_ID")
-        .env_remove("STELLAR_AGENT_RPC_URL")
-        .env_remove("STELLAR_AGENT_SECONDARY_RPC_URL")
-        .output()
-        .expect("stellar-agent binary must run");
+    let output = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home,
+    )
+    .expect("isolated CLI child")
+    .args(args)
+    .env("STELLAR_AGENT_HOME", home)
+    .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+    .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY)
+    .env_remove("STELLAR_AGENT_PROFILE")
+    .env_remove("STELLAR_AGENT_CHAIN_ID")
+    .env_remove("STELLAR_AGENT_RPC_URL")
+    .env_remove("STELLAR_AGENT_SECONDARY_RPC_URL")
+    .output()
+    .expect("stellar-agent binary must run");
 
     let code = output.status.code().expect("process must exit with a code");
     let stdout = String::from_utf8(output.stdout).expect("stdout must be UTF-8");
@@ -75,7 +78,7 @@ async fn balances_envelope_keeps_only_host_and_port_of_echoed_urls() {
         .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/json"))
         .mount(&server)
         .await;
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
 
     let (code, stdout, envelope) = run_cli(
         home.path(),

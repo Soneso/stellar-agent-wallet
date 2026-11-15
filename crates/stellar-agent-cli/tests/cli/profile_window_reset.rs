@@ -27,7 +27,7 @@ const NAME: &str = "reset-ceremony";
 
 struct Fixture {
     _guard: StellarAgentHomeGuard,
-    home: tempfile::TempDir,
+    home: stellar_agent_test_support::sandbox::StateSandbox,
     profile: Profile,
     path: PathBuf,
 }
@@ -38,7 +38,13 @@ impl Fixture {
     }
 
     fn for_chain(existing: bool, mainnet: bool) -> Self {
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let guard = StellarAgentHomeGuard::new(home.path());
         keyring_core::set_default_store(Arc::new(
             stellar_agent_headless_keyring::store::HeadlessStore::new(
@@ -109,7 +115,11 @@ impl Fixture {
     }
 
     fn command(&self, reason: &str) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_stellar-agent"));
+        let mut command = stellar_agent_test_support::cli_child::cli_command(
+            env!("CARGO_BIN_EXE_stellar-agent"),
+            self.home.path(),
+        )
+        .expect("isolated CLI child");
         command
             .args(["profile", "reset-window-state", NAME, "--reason", reason])
             .env("STELLAR_AGENT_HOME", self.home.path())
@@ -851,26 +861,30 @@ fn owner_seed_engine_ceremony_output_excludes_secrets() {
             let secret = stellar_strkey::ed25519::PrivateKey(seed)
                 .as_unredacted()
                 .to_string();
-            let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-                .args([
-                    "profile",
-                    "sign-policy",
-                    "--profile",
-                    NAME,
-                    "--secret-env",
-                    "CEREMONY_OWNER",
-                ])
-                .env("STELLAR_AGENT_HOME", f.home.path())
-                .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
-                .env(
-                    "STELLAR_AGENT_HEADLESS_KEYRING_KEY",
-                    URL_SAFE_NO_PAD.encode(HEADLESS_KEY),
-                )
-                .env("CEREMONY_OWNER", secret.as_str())
-                .env_remove("STELLAR_AGENT_PROFILE")
-                .env_remove("STELLAR_AGENT_RPC_URL")
-                .output()
-                .unwrap();
+            let output = stellar_agent_test_support::cli_child::cli_command(
+                env!("CARGO_BIN_EXE_stellar-agent"),
+                f.home.path(),
+            )
+            .expect("isolated CLI child")
+            .args([
+                "profile",
+                "sign-policy",
+                "--profile",
+                NAME,
+                "--secret-env",
+                "CEREMONY_OWNER",
+            ])
+            .env("STELLAR_AGENT_HOME", f.home.path())
+            .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+            .env(
+                "STELLAR_AGENT_HEADLESS_KEYRING_KEY",
+                URL_SAFE_NO_PAD.encode(HEADLESS_KEY),
+            )
+            .env("CEREMONY_OWNER", secret.as_str())
+            .env_remove("STELLAR_AGENT_PROFILE")
+            .env_remove("STELLAR_AGENT_RPC_URL")
+            .output()
+            .unwrap();
             for bytes in [&output.stdout, &output.stderr] {
                 assert!(!String::from_utf8_lossy(bytes).contains(secret.as_str()));
                 assert!(

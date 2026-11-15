@@ -1329,7 +1329,13 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn operator_remove_refuses_an_unsafe_profile_name() {
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let _profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         let outside = home.path().join("outside");
@@ -1380,7 +1386,13 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn operator_enroll_refuses_an_unsafe_profile_name() {
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let _profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         let credential = remove_test_credential(3);
@@ -1437,7 +1449,13 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn operator_import_refuses_a_label_with_a_control_character() {
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let _profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         let credential = remove_test_credential(4);
@@ -1493,7 +1511,13 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn operator_remove_selects_the_resolved_profile_store() {
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let _profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         let store = |name: &str| {

@@ -76,8 +76,8 @@ pub const SIGNED_CERT_SPKI_SHA256: [u8; 32] = [0xab; 32];
 
 /// An enabled mainnet profile with a signed policy, under a temporary home.
 pub struct MainnetConsentFixture {
-    home: tempfile::TempDir,
     _guard: StellarAgentHomeGuard,
+    home: stellar_agent_test_support::sandbox::StateSandbox,
     name: String,
     profile: Profile,
     owner: ed25519_dalek::SigningKey,
@@ -206,7 +206,14 @@ impl MainnetConsentFixture {
     #[must_use]
     pub fn with_profile(name: &str, edit: impl FnOnce(&mut Profile)) -> Self {
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring");
-        let home = tempfile::TempDir::new().expect("temporary home");
+        let home =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect("temporary home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let guard = StellarAgentHomeGuard::new(home.path());
         let mut profile = Profile::builder_mainnet_named(
             name,

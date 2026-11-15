@@ -53,7 +53,9 @@
     reason = "test-only; panics and unwraps are acceptable in testnet acceptance tests"
 )]
 
-use std::process::Command;
+#[path = "cli/acceptance_storage.rs"]
+mod acceptance_storage;
+
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
@@ -162,8 +164,7 @@ fn run_pay(
     args.extend_from_slice(extra);
 
     stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
-    let output = Command::new(bin_path)
-        .args(cfg!(feature = "live-platform-keyring").then_some("--test-live-platform-keyring"))
+    let output = acceptance_storage::command(bin_path, home, None)
         .args(&args)
         .env(SECRET_ENV_VAR, source_secret)
         .env("STELLAR_AGENT_HOME", home)

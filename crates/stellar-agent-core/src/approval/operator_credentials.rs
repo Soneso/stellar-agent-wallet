@@ -1597,7 +1597,13 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn default_path_refuses_a_profile_name_that_escapes_the_directory() {
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         for name in [
             "../escape",

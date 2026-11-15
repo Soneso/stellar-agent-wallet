@@ -33,7 +33,7 @@
 //! # Fixture setup
 //!
 //! Mirrors `pay_policy_v1_testnet_acceptance.rs`: a per-run unique profile
-//! name, an owner keypair enrolled into the real OS keyring through
+//! name, an owner keypair enrolled into the selected acceptance store through
 //! `profile enroll-owner-key`, a signed V1 policy document, and a
 //! Friendbot-funded source and destination. Every keyring entry the fixture
 //! writes is removed by an RAII guard.
@@ -53,7 +53,9 @@
     reason = "test-only; panics and unwraps are acceptable in testnet acceptance tests"
 )]
 
-use std::process::Command;
+#[path = "cli/acceptance_storage.rs"]
+mod acceptance_storage;
+
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
@@ -260,8 +262,7 @@ fn write_signed_policy_toml(home: &std::path::Path, profile: &str, owner: &Signi
 
 fn rotate_audit_key_via_cli(home: &std::path::Path, profile: &str) -> KeyringGuard {
     stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
-    let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-        .args(cfg!(feature = "live-platform-keyring").then_some("--test-live-platform-keyring"))
+    let output = acceptance_storage::command(env!("CARGO_BIN_EXE_stellar-agent"), home, None)
         .args(["profile", "rotate-audit-key", profile])
         .env("STELLAR_AGENT_HOME", home)
         .output()
@@ -286,8 +287,7 @@ fn enroll_owner_key_via_cli(
     owner_g_strkey: &str,
 ) -> KeyringGuard {
     stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
-    let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-        .args(cfg!(feature = "live-platform-keyring").then_some("--test-live-platform-keyring"))
+    let output = acceptance_storage::command(env!("CARGO_BIN_EXE_stellar-agent"), home, None)
         .args([
             "profile",
             "enroll-owner-key",
@@ -313,7 +313,7 @@ fn enroll_owner_key_via_cli(
 }
 
 /// Removes the profile's window-state HMAC key and its generation counter,
-/// both of which the first recorded submission mints in the real keyring.
+/// both of which the first recorded submission mints in the selected store.
 fn window_state_guards(profile: &str) -> Vec<KeyringGuard> {
     let base =
         stellar_agent_core::profile::schema::KeyringEntryRef::default_policy_window_state_key(
@@ -336,8 +336,7 @@ fn run_cli(
     env: &[(&str, &str)],
 ) -> (i32, serde_json::Value) {
     stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_stellar-agent"));
-    command.args(cfg!(feature = "live-platform-keyring").then_some("--test-live-platform-keyring"));
+    let mut command = acceptance_storage::command(env!("CARGO_BIN_EXE_stellar-agent"), home, None);
     command.args(args).env("STELLAR_AGENT_HOME", home);
     for (key, value) in env {
         command.env(key, value);
@@ -382,24 +381,25 @@ fn audit_rows(home: &std::path::Path, profile: &str) -> Vec<serde_json::Value> {
 #[tokio::test]
 #[serial_test::serial]
 async fn pay_timeout_is_recorded_and_tx_status_reconciles_it() {
-    let storage_sandbox =
-        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
-    let _storage_home =
-        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-    #[cfg(feature = "live-platform-keyring")]
-    if std::env::var("STELLAR_AGENT_TEST_LIVE_PLATFORM_KEYRING").as_deref()
-        == Ok("real-platform-keyring")
-    {
-        use stellar_agent_network::keyring::live::{
-            LivePlatformKeyring, init_platform_keyring_store_live,
-        };
-        init_platform_keyring_store_live(LivePlatformKeyring::acknowledge_real_platform_keyring())
-            .expect("live acceptance platform store");
-    }
-    stellar_agent_network::init_platform_keyring_store()
-        .expect("platform keyring store must initialise on this host");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+    // Parent key reads and child key writes share this owned home and the
+    // explicitly selected acceptance backend. Native access needs its permit.
+    acceptance_storage::dispatch(stellar_agent_network::init_platform_keyring_store, || {
+        #[cfg(feature = "live-platform-keyring")]
+        {
+            use stellar_agent_network::keyring::live::{
+                LivePlatformKeyring, init_platform_keyring_store_live,
+            };
+            init_platform_keyring_store_live(
+                LivePlatformKeyring::acknowledge_real_platform_keyring(),
+            )
+        }
+        #[cfg(not(feature = "live-platform-keyring"))]
+        unreachable!("selection requires the native feature")
+    })
+    .expect("selected acceptance store");
 
-    let home = tempfile::TempDir::new().expect("tempdir");
     let profile_name = unique_profile_name();
 
     let owner_signing_key = SigningKey::generate(&mut OsRng);

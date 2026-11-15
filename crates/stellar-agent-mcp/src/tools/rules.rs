@@ -1165,7 +1165,13 @@ mod tests {
         use stellar_agent_core::profile::schema::Profile;
         use stellar_agent_test_support::{StellarAgentHomeGuard, keyring_mock};
 
-        let home = tempfile::tempdir().expect("temp home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home_guard = StellarAgentHomeGuard::new(home.path());
         keyring_mock::install().expect("mock keyring store");
 

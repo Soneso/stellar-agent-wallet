@@ -7,13 +7,12 @@
 )]
 
 use std::path::Path;
-use std::process::Command;
 use stellar_agent_core::profile::schema::{KeyringEntryRef, Profile};
 
 const ACCOUNT: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
 
-fn shared_home(mainnet: bool) -> tempfile::TempDir {
-    let home = tempfile::tempdir().unwrap();
+fn shared_home(mainnet: bool) -> stellar_agent_test_support::sandbox::StateSandbox {
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     for name in ["alice", "bob"] {
         let signer = KeyringEntryRef::default_signer(name);
         let nonce = KeyringEntryRef::default_nonce(name);
@@ -50,20 +49,23 @@ fn shared_home(mainnet: bool) -> tempfile::TempDir {
 }
 
 fn run(home: &Path, args: &[&str]) -> (i32, serde_json::Value, String) {
-    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
-    let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-        .args(args)
-        .env("STELLAR_AGENT_HOME", home)
-        .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
-        .env(
-            "STELLAR_AGENT_HEADLESS_KEYRING_KEY",
-            "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
-        )
-        .env("STELLAR_AGENT_LOG", "info")
-        .env_remove("STELLAR_AGENT_PROFILE")
-        .env_remove("STELLAR_AGENT_RPC_URL")
-        .output()
-        .unwrap();
+    let output = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home,
+    )
+    .expect("isolated CLI child")
+    .args(args)
+    .env("STELLAR_AGENT_HOME", home)
+    .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+    .env(
+        "STELLAR_AGENT_HEADLESS_KEYRING_KEY",
+        "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+    )
+    .env("STELLAR_AGENT_LOG", "info")
+    .env_remove("STELLAR_AGENT_PROFILE")
+    .env_remove("STELLAR_AGENT_RPC_URL")
+    .output()
+    .unwrap();
     let text = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let value =

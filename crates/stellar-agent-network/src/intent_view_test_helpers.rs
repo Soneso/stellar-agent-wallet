@@ -43,7 +43,7 @@ pub struct IntentViewFixture {
     expected_requests: usize,
     _clock: crate::mainnet::clock::TestClockGuard,
     _home: stellar_agent_test_support::StellarAgentHomeGuard,
-    _dir: tempfile::TempDir,
+    _dir: stellar_agent_test_support::sandbox::StateSandbox,
 }
 
 impl IntentViewFixture {
@@ -53,12 +53,13 @@ impl IntentViewFixture {
     /// Panics if fixture construction or observation fails.
     pub async fn new(mode: &'static str) -> Self {
         stellar_agent_test_support::keyring_mock::install().unwrap();
-        let scratch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
-        std::fs::create_dir_all(&scratch).unwrap();
-        let dir = tempfile::Builder::new()
-            .prefix("intent-view-")
-            .tempdir_in(scratch)
-            .unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let clock = crate::mainnet::clock::set_now_ms_for_test(1000);
         let endpoint = MockServer::start().await;

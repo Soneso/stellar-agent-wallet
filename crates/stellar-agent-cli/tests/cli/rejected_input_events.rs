@@ -4,7 +4,7 @@
 #![allow(clippy::expect_used, clippy::panic, reason = "test assertions")]
 
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 use std::sync::Arc;
 
 use base64::Engine as _;
@@ -35,8 +35,11 @@ const SECRET_VAR: &str = "EVENT_FIXTURE_SIGNER_SECRET";
 const OPERATION_ID: &str = "c0ffee42abababababababababababababababababababababababab1ced7ea5";
 
 fn run(home: &Path, args: &[&str], log_format: &str) -> Output {
-    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_stellar-agent"));
+    let mut command = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home,
+    )
+    .expect("isolated CLI child");
     command
         .args(args)
         .env("STELLAR_AGENT_HOME", home)
@@ -145,7 +148,7 @@ fn save_profile_with_audit_log(home: &Path, rpc_url: &str, audit_log_path: &Path
 #[test]
 #[serial]
 fn timelock_events_hold_no_argument() {
-    let home = tempfile::tempdir().expect("home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
     save_profile(home.path(), "http://127.0.0.1:1");
     let hex = "ab".repeat(32);
     let long_function = format!("{MARKER}{}", "x".repeat(600));
@@ -249,7 +252,7 @@ async fn run_against_timelock(simulation: Value, args: Vec<String>) -> Output {
         })
         .mount(&server)
         .await;
-    let home = tempfile::tempdir().expect("home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
     save_profile(home.path(), &server.uri());
     tokio::task::spawn_blocking(move || {
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -344,7 +347,7 @@ async fn timelock_execute_of_a_never_scheduled_operation_holds_no_operation_id()
 #[serial]
 fn pool_size_refusal_holds_no_size() {
     const REFUSED_SIZE: &str = "4242424";
-    let home = tempfile::tempdir().expect("home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
     let output = run(
         home.path(),
         &["pool", "init", "--size", REFUSED_SIZE],
@@ -364,7 +367,7 @@ fn pool_size_refusal_holds_no_size() {
 #[test]
 #[serial]
 fn rules_list_event_holds_no_account() {
-    let home = tempfile::tempdir().expect("home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
     save_profile(home.path(), "http://127.0.0.1:1");
     let output = run(
         home.path(),
@@ -390,7 +393,7 @@ fn rules_list_event_holds_no_account() {
 #[test]
 #[serial]
 fn counterparty_refresh_event_holds_no_home_domain() {
-    let home = tempfile::tempdir().expect("home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
     save_profile(home.path(), "http://127.0.0.1:1");
     let output = run(
         home.path(),
@@ -412,7 +415,7 @@ fn counterparty_refresh_event_holds_no_home_domain() {
 #[test]
 #[serial]
 fn approval_reports_hold_no_unsaved_profile() {
-    let home = tempfile::tempdir().expect("home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
     save_profile(home.path(), "http://127.0.0.1:1");
     for (verb, message, count) in [
         ("list", "approval list completed", "pending_count"),
@@ -467,7 +470,7 @@ fn approval_reports_hold_no_unsaved_profile() {
 #[test]
 #[serial]
 fn trustline_refusal_event_holds_no_asset() {
-    let home = tempfile::tempdir().expect("home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
     save_profile(home.path(), "http://127.0.0.1:1");
     let from = stellar_strkey::ed25519::PublicKey([1; 32]).to_string();
     for asset in [MARKER, "CODE:credmarker7"] {
@@ -493,7 +496,7 @@ fn trustline_refusal_event_holds_no_asset() {
 #[test]
 #[serial]
 fn xdr_arguments_report_the_accepted_form() {
-    let home = tempfile::tempdir().expect("home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
     save_profile(home.path(), "http://127.0.0.1:1");
     let verifier = stellar_strkey::Contract([0x32; 32]).to_string();
     for value in ["~", "AAAA"] {
@@ -621,7 +624,7 @@ async fn missing_rule_refusal_holds_no_rule_id() {
         })
         .mount(&server)
         .await;
-    let home = tempfile::tempdir().expect("home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
     save_profile(home.path(), &server.uri());
     let policy = stellar_strkey::Contract([0x32; 32]).to_string();
     let home_path = home.path().to_owned();
@@ -895,7 +898,7 @@ async fn signer_verb_events_hold_no_rule_values() {
 #[test]
 #[serial]
 fn timelock_schedule_submit_event_holds_no_delay() {
-    let home = tempfile::tempdir().expect("home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
     save_profile(home.path(), "http://127.0.0.1:1");
     let output = run(
         home.path(),
@@ -942,7 +945,7 @@ fn verifier_address_refusals_hold_no_address() {
     const ED25519: &str = "smart-account operation failed (sa.auth_entry_construction_failed): \
                            --signer-ed25519 verifier must be a valid Stellar C-strkey; supply \
                            --verifier or configure the verifier entry in networks.toml";
-    let home = tempfile::tempdir().expect("home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
     save_profile(home.path(), "http://127.0.0.1:1");
     let mut registry = VerifierRegistry::open_at(home.path().join("networks.toml")).expect("open");
     registry
@@ -1030,7 +1033,7 @@ fn verifier_address_refusals_hold_no_address() {
 #[test]
 #[serial]
 fn deploy_c_audit_event_holds_no_path() {
-    let home = tempfile::tempdir().expect("home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
     let audit_log = home.path().join(MARKER);
     std::fs::create_dir(&audit_log).expect("directory at the audit path");
     save_profile_with_audit_log(home.path(), "http://127.0.0.1:1", &audit_log);

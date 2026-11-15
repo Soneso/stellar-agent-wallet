@@ -40,18 +40,7 @@ pub(super) const CHILD: &str = "CLI_TEST_CAPTURE_CHILD";
 /// The child test process that runs only `name`, with `env` overlaid.
 pub(crate) fn child_command(name: &str, env: &[(&str, &str)]) -> std::process::Command {
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-    // The child inherits no variable with the loader's prefix. Profile
-    // overlays and home, log, and keyring settings are stripped alike; only
-    // `env` and the fixed settings below supply them. Clearing inheritance also excludes variables introduced after this
-    // snapshot.
-    command
-        .env_clear()
-        .envs(std::env::vars_os().filter(|(key, _)| {
-            !key.to_string_lossy()
-                .trim()
-                .to_ascii_uppercase()
-                .starts_with(stellar_agent_core::profile::loader::env_prefix())
-        }));
+    stellar_agent_test_support::cli_child::filter_wallet_environment(&mut command);
     command
         .args([name, "--nocapture", "--test-threads=1", "--format=terse"])
         .env(CHILD, name)
@@ -69,6 +58,15 @@ pub(crate) struct EnvGuard {
 }
 
 impl EnvGuard {
+    /// Clears a variable while the caller holds the default serial test lock.
+    #[allow(unsafe_code, reason = "serialized test environment")]
+    pub(crate) fn cleared(var: String) -> Self {
+        let previous = std::env::var_os(&var);
+        // SAFETY: callers hold the default serial test lock through drop.
+        unsafe { std::env::remove_var(&var) };
+        Self { var, previous }
+    }
+
     /// Sets a variable while the caller holds the default serial test lock.
     #[allow(
         unsafe_code,

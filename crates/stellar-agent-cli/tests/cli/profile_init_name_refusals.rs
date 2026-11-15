@@ -30,7 +30,6 @@
 )]
 
 use std::path::Path;
-use std::process::Command;
 
 use serde_json::Value;
 
@@ -44,8 +43,8 @@ const HEADLESS_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
 /// Extra arguments are appended after `--profile`.
 fn run_init(home: &Path, profile: &str, extra: &[&str]) -> (i32, Value, String) {
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
-    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
-    let output = Command::new(bin_path)
+    let output = stellar_agent_test_support::cli_child::cli_command(bin_path, home)
+        .expect("isolated CLI child")
         .args([
             "profile",
             "init",
@@ -71,7 +70,7 @@ fn run_init(home: &Path, profile: &str, extra: &[&str]) -> (i32, Value, String) 
 
 /// Asserts `init` refused `profile` as an invalid name and wrote nothing.
 fn assert_refused(profile: &str, expected_reason: &str) {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     let (code, json, _) = run_init(home.path(), profile, &[]);
 
     assert_eq!(code, 1, "an unusable profile name must exit 1: {json}");
@@ -148,7 +147,7 @@ fn a_leading_dash_name_is_refused() {
 fn a_name_that_only_resembles_a_device_is_still_created() {
     // The guard must not swallow the ordinary case: `COM0` is not a Windows
     // device, and a dash away from the first character is not a flag.
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     for profile in ["COM0", "smoke-fp2"] {
         let (code, json, _) = run_init(home.path(), profile, &[]);
         assert_eq!(code, 0, "'{profile}' must remain a usable name: {json}");
@@ -165,7 +164,7 @@ fn a_name_that_only_resembles_a_device_is_still_created() {
 
 #[test]
 fn profile_init_redacts_rpc_url_and_preserves_saved_url() {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     let url = "https://mainnet.example/v1/SENTINEL-PATH?token=SENTINEL-QUERY";
     let (code, json, stdout) = run_init(
         home.path(),
@@ -189,23 +188,26 @@ fn profile_init_redacts_rpc_url_and_preserves_saved_url() {
 /// the schema-defined argument, and neither stream carries rejected userinfo.
 #[test]
 fn profile_init_refuses_credentialed_rpc_before_creating_file() {
-    let home = tempfile::tempdir().expect("temp home");
-    stellar_agent_test_support::sandbox::mark_sandbox(home.path()).expect("mark fixture directory");
-    let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-        .args([
-            "profile",
-            "init",
-            "--profile",
-            "credentials",
-            "--network",
-            "mainnet",
-            "--rpc-url",
-            "https://loginsentinel:SENTINEL@mainnet.example",
-        ])
-        .env("STELLAR_AGENT_HOME", home.path())
-        .env_remove("STELLAR_AGENT_PROFILE")
-        .output()
-        .expect("binary runs");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
+    let output = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home.path(),
+    )
+    .expect("isolated CLI child")
+    .args([
+        "profile",
+        "init",
+        "--profile",
+        "credentials",
+        "--network",
+        "mainnet",
+        "--rpc-url",
+        "https://loginsentinel:SENTINEL@mainnet.example",
+    ])
+    .env("STELLAR_AGENT_HOME", home.path())
+    .env_remove("STELLAR_AGENT_PROFILE")
+    .output()
+    .expect("binary runs");
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 stdout");
     let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
     assert_eq!(output.status.code(), Some(1), "{stdout}{stderr}");
@@ -229,7 +231,7 @@ fn profile_init_refuses_credentialed_rpc_before_creating_file() {
 /// `validation.profile_already_exists`, and the existing file is untouched.
 #[test]
 fn existing_destination_refuses_before_the_endpoint_rule() {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     let profiles = home.path().join("profiles");
     std::fs::create_dir_all(&profiles).expect("profiles dir");
     let path = profiles.join("pin-order.toml");

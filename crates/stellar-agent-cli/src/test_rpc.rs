@@ -435,12 +435,18 @@ pub(crate) async fn clients_built_by<F: Future>(call: F) -> (F::Output, usize) {
 pub(crate) struct ZeroConfig {
     _home: stellar_agent_test_support::StellarAgentHomeGuard,
     _profile_var: stellar_agent_test_support::ProfileEnvVarGuard,
-    _dir: tempfile::TempDir,
+    _dir: stellar_agent_test_support::sandbox::StateSandbox,
 }
 
 /// Sets up the isolation of [`ZeroConfig`] for the lifetime of the value.
 pub(crate) fn zero_config() -> ZeroConfig {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = stellar_agent_test_support::sandbox::StateSandbox::new().expect("tempdir");
+    assert!(
+        dir.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
     let profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
     stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
@@ -807,7 +813,7 @@ pub(crate) struct ImplicitSelection {
     pub(crate) name: &'static str,
     _profile_var: stellar_agent_test_support::ProfileEnvVarGuard,
     _home: stellar_agent_test_support::StellarAgentHomeGuard,
-    _dir: tempfile::TempDir,
+    _dir: stellar_agent_test_support::sandbox::StateSandbox,
 }
 
 impl ImplicitSelection {
@@ -817,7 +823,13 @@ impl ImplicitSelection {
         reason = "test-only process environment mutation; serialised by #[serial]"
     )]
     pub(crate) fn new(source: ImplicitSource) -> Self {
-        let dir = tempfile::TempDir::new().expect("tempdir");
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().expect("tempdir");
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         let name = match source {

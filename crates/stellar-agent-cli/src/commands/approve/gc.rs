@@ -255,7 +255,13 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn gc_nonexistent_profile_creates_store_and_exits_0() {
-        let home = TempDir::new().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home_guard = StellarAgentHomeGuard::new(home.path());
         assert_eq!(
             default_approval_dir().unwrap(),
@@ -279,7 +285,13 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn gc_run_with_real_store_evicts_expired_and_exits_0() {
-        let home = TempDir::new().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home_guard = StellarAgentHomeGuard::new(home.path());
         let dir = default_approval_dir().unwrap();
         assert_eq!(dir, home.path().join("approvals"));
@@ -325,7 +337,13 @@ mod tests {
     async fn flag_selects_the_combined_collection() {
         use clap::Parser as _;
         use stellar_agent_core::approval::{ApprovalKind, ConsumedOutcome};
-        let home = TempDir::new().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home_guard = StellarAgentHomeGuard::new(home.path());
         let profile = "__stellar_agent_approve_test_gc_consumed";
         let path = default_approval_dir()

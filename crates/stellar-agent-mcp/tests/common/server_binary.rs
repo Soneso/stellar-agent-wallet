@@ -13,8 +13,7 @@
 //! `<bin dir>/../tmp/server-alias-<len>-<mtime_ns>/`. It is published without
 //! overwriting an existing file, so concurrent test processes share one
 //! alias, and an existing alias is used only when its bytes equal the
-//! canonical file. Each process resolves the alias once. The command runs the
-//! child under a scratch `STELLAR_AGENT_HOME` unless the caller sets one.
+//! canonical file. Each process resolves the alias once. The caller owns the marked home through child shutdown.
 
 #![allow(dead_code, reason = "shared helper; each suite uses the part it needs")]
 
@@ -35,54 +34,29 @@ fn alias_name() -> String {
     format!("stellar-agent-mcp{}", std::env::consts::EXE_SUFFIX)
 }
 
-/// A command that starts the server child under its alias.
-///
-/// The command sets `STELLAR_AGENT_HOME` to a scratch home of this process
-/// below `<bin dir>/../tmp`, so a child never reaches the default state
-/// directory. A caller that sets its own home replaces it.
+/// Starts the server alias with a caller-owned marked home and no usable keyring.
+/// Explicit fixture overrides apply after the ordinary environment filter.
 ///
 /// # Panics
-///
-/// Panics with the reason when the canonical executable is missing, reports
-/// the other feature state, the alias cannot be published, or the scratch
-/// home cannot be created.
+/// Panics if the isolated executable or its matching version cannot be verified.
 #[must_use]
-#[allow(
-    clippy::panic,
-    reason = "test helper; a child that cannot start fails the calling test with the reason"
-)]
-pub fn server_command() -> Command {
+#[allow(clippy::expect_used, reason = "fixture setup must succeed")]
+pub fn server_command(home: &Path) -> Command {
     static CACHE: AliasCache = AliasCache::new();
-    static HOME: AliasCache = AliasCache::new();
-    let bin_dir = || {
-        let exe = std::env::current_exe().map_err(|err| format!("test executable: {err}"))?;
-        bin_dir_of(&exe)
-    };
-    let path = CACHE.get_with(|| resolve(&bin_dir()?));
-    let home = HOME.get_with(|| scratch_home(&bin_dir()?));
-    match (path, home) {
-        (Ok(path), Ok(home)) => {
-            let mut command = Command::new(path);
-            command.env("STELLAR_AGENT_HOME", home);
-            command
-        }
-        (Err(reason), _) | (_, Err(reason)) => panic!("{reason}"),
-    }
-}
-
-/// Creates the scratch home of this process below `<bin dir>/../tmp`. It
-/// stays after the process ends, like the alias directory beside it.
-fn scratch_home(bin_dir: &Path) -> Result<PathBuf, String> {
-    let root = bin_dir.join("..").join("tmp");
-    std::fs::create_dir_all(&root).map_err(|err| format!("{}: {err}", root.display()))?;
-    let home = tempfile::Builder::new()
-        .prefix("server-home-")
-        .tempdir_in(&root)
-        .map(tempfile::TempDir::keep)
-        .map_err(|err| format!("scratch home in {}: {err}", root.display()))?;
-    let home = home.canonicalize().map_err(|err| err.to_string())?;
-    stellar_agent_test_support::sandbox::mark_sandbox(&home).map_err(|err| err.to_string())?;
-    Ok(home)
+    let path = CACHE
+        .get_with(|| {
+            let exe = std::env::current_exe().map_err(|err| format!("test executable: {err}"))?;
+            resolve(&bin_dir_of(&exe)?)
+        })
+        .as_ref()
+        .expect("resolve isolated server alias");
+    let mut command = stellar_agent_test_support::cli_child::cli_command(path, home)
+        .expect("isolated server command");
+    command
+        .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+        .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", "invalid-fixture-key")
+        .env("STELLAR_AGENT_LOG", "error");
+    command
 }
 
 /// One alias resolution per process.
@@ -138,27 +112,13 @@ fn bin_dir_of(exe: &Path) -> Result<PathBuf, String> {
 fn resolve(dir: &Path) -> Result<PathBuf, String> {
     let canonical = locate_in(dir)?;
     let bytes = std::fs::read(&canonical).map_err(|error| error.to_string())?;
-    if !isolated_executable(&bytes) {
+    if !stellar_agent_test_support::sandbox::isolated_executable(&bytes) {
         return Err("child lacks storage isolation; run cargo test -p stellar-agent-cli -p stellar-agent-mcp --no-run".to_owned());
     }
     verify_marker(&canonical, cfg!(feature = "mainnet-write"))?;
     let alias = alias_path(&canonical)?;
     publish(&canonical, &alias)?;
     Ok(alias)
-}
-
-/// Reports whether executable bytes contain the isolation marker.
-fn isolated_executable(bytes: &[u8]) -> bool {
-    const MARKER: &[u8] = b"STELLAR_AGENT_TEST_STORAGE_ISOLATED";
-    bytes.windows(MARKER.len()).any(|window| window == MARKER)
-}
-
-#[test]
-fn child_executable_requires_the_isolation_literal() {
-    assert!(isolated_executable(
-        b"prefix STELLAR_AGENT_TEST_STORAGE_ISOLATED suffix"
-    ));
-    assert!(!isolated_executable(b"production executable"));
 }
 
 /// The canonical executable in `dir`.
@@ -184,7 +144,10 @@ fn locate_in(dir: &Path) -> Result<PathBuf, String> {
 ///
 /// Returns the reason when the run fails or the marker differs.
 fn verify_marker(canonical: &Path, mainnet_write: bool) -> Result<(), String> {
-    let output = Command::new(canonical)
+    let home =
+        stellar_agent_test_support::sandbox::StateSandbox::new().map_err(|e| e.to_string())?;
+    let output = stellar_agent_test_support::cli_child::cli_command(canonical, home.path())
+        .map_err(|e| e.to_string())?
         .arg("--version")
         .output()
         .map_err(|err| format!("{} --version: {err}", canonical.display()))?;
@@ -444,11 +407,18 @@ mod tests {
         let source = std::fs::read_to_string(&canonical).unwrap();
         std::fs::write(
             &canonical,
-            source.replace("# STELLAR_AGENT_TEST_STORAGE_ISOLATED\n", ""),
+            source.replace(
+                "# STELLAR_AGENT_TEST_STORAGE_ISOLATED\n",
+                "printf executed > \"$0.executed\"\n",
+            ),
         )
         .unwrap();
         let reason = resolve(&fixture.path().join("bin")).unwrap_err();
         assert!(reason.contains("child lacks storage isolation"), "{reason}");
+        assert!(
+            !canonical.with_extension("executed").exists(),
+            "rejected bytes never execute"
+        );
     }
 
     #[cfg(unix)]
@@ -706,7 +676,8 @@ mod tests {
 
     #[test]
     fn the_server_command_targets_the_alias() {
-        let command = server_command();
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let command = server_command(sandbox.path());
         let program = Path::new(command.get_program());
         assert_eq!(
             program.file_name().unwrap().to_str(),
@@ -725,14 +696,6 @@ mod tests {
             .map(PathBuf::from)
             .unwrap();
         assert!(home.is_dir(), "{}", home.display());
-        assert_eq!(
-            home.parent().unwrap().canonicalize().unwrap(),
-            program
-                .parent()
-                .and_then(Path::parent)
-                .unwrap()
-                .canonicalize()
-                .unwrap()
-        );
+        assert_eq!(home, sandbox.path());
     }
 }

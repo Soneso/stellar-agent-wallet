@@ -377,7 +377,13 @@ mod tests {
             Arc,
             atomic::{AtomicUsize, Ordering},
         };
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let reads = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&reads);
@@ -754,7 +760,14 @@ mod tests {
     #[serial_test::serial(keyring)]
     #[serial_test::serial]
     async fn muxed_supplied_xdr_preserved() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         use base64::Engine as _;
         use stellar_xdr::{

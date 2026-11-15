@@ -41,7 +41,7 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 
 use base64::Engine as _;
@@ -122,8 +122,11 @@ impl Run {
 }
 
 fn run_cli(home: &Path, args: &[&str], stdin: Option<&[u8]>) -> Run {
-    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_stellar-agent"));
+    let mut command = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home,
+    )
+    .expect("isolated CLI child");
     command
         .args(args)
         .env("STELLAR_AGENT_HOME", home)
@@ -162,8 +165,8 @@ fn run_cli(home: &Path, args: &[&str], stdin: Option<&[u8]>) -> Run {
 }
 
 /// A home holding a self-consistent testnet profile and nothing else.
-fn fresh_home() -> tempfile::TempDir {
-    let home = tempfile::tempdir().expect("temp home");
+fn fresh_home() -> stellar_agent_test_support::sandbox::StateSandbox {
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     let profiles = home.path().join("profiles");
     std::fs::create_dir_all(&profiles).expect("create profiles dir");
     std::fs::write(

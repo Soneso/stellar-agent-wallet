@@ -1571,7 +1571,13 @@ mod tests {
     #[serial_test::serial(keyring)]
     #[serial_test::serial]
     async fn toolset_args_marker_is_not_echoed() {
-        let home = tempfile::tempdir().expect("home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let capture = stellar_agent_test_support::log_capture::CaptureWriter::new();
@@ -1700,7 +1706,13 @@ mod tests {
     #[serial_test::serial(keyring)]
     #[serial_test::serial]
     async fn toolset_name_and_action_marker_is_not_echoed() {
-        let home = tempfile::tempdir().expect("home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let capture = stellar_agent_test_support::log_capture::CaptureWriter::new();
@@ -1772,7 +1784,13 @@ mod tests {
     #[serial_test::serial(keyring)]
     #[serial_test::serial]
     async fn gated_toolset_args_marker_is_not_echoed() {
-        let home = tempfile::tempdir().expect("home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let capture = stellar_agent_test_support::log_capture::CaptureWriter::new();
         let subscriber = tracing_subscriber::fmt()

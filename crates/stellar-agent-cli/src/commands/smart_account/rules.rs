@@ -4213,7 +4213,13 @@ mod tests {
     #[test]
     #[serial]
     fn webauthn_registry_lookup_via_from_defaults_readonly() {
-        let dir = tempfile::TempDir::new().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let passkeys_dir = dir.path().join("passkeys");
         std::fs::create_dir_all(&passkeys_dir).unwrap();
         std::fs::write(passkeys_dir.join("project-a.toml"), PASSKEY_PROJECT_A_TOML).unwrap();
@@ -5631,145 +5637,182 @@ mod tests {
 
     /// `--kind raw` without `--policy-address` is refused before any network
     /// call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn add_policy_raw_requires_policy_address() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let mut args = add_policy_args(PolicyKind::Raw);
         args.install_param = Some("AAAAAA==".to_owned());
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
         let code = add_policy_run(&args).await;
         assert_eq!(code, 1, "raw mode without --policy-address must be refused");
+        fixture.assert_refusal(
+            Some("validation.address_invalid"),
+            &["--kind raw requires --policy-address"],
+        );
     }
 
     /// `--kind spending-limit` without `--limit` is refused before any network
     /// call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn add_policy_spending_limit_requires_limit() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let mut args = add_policy_args(PolicyKind::SpendingLimit);
         args.period = Some(17_280);
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
         let code = add_policy_run(&args).await;
         assert_eq!(
             code, 1,
             "spending-limit mode without --limit must be refused"
         );
+        fixture.assert_refusal(
+            Some("validation.address_invalid"),
+            &["--kind spending-limit requires --limit"],
+        );
     }
 
     /// `--kind spending-limit` combined with the raw-mode `--policy-address`
     /// flag is refused (mode conflict) before any network call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn add_policy_spending_limit_rejects_raw_flags() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let mut args = add_policy_args(PolicyKind::SpendingLimit);
         args.limit = Some(10_000_000);
         args.period = Some(17_280);
         args.policy_address = Some(ADD_POLICY_TEST_ACCOUNT.to_owned());
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
         let code = add_policy_run(&args).await;
         assert_eq!(
             code, 1,
             "spending-limit mode must reject the raw --policy-address flag"
         );
+        fixture.assert_refusal(
+            Some("validation.address_invalid"),
+            &["--policy-address / --install-param", "--kind raw"],
+        );
     }
 
     /// `--kind spending-limit` with no `--policy` override and no registered
     /// policy for the network fails closed before any network call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn add_policy_spending_limit_missing_registry_fails_closed() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
-        let dir = tempfile::tempdir().unwrap();
-        let registry_path = dir.path().join("networks.toml");
-
-        // SAFETY: serialised by #[serial]; no concurrent env access.
-        #[allow(unsafe_code, reason = "test-only env override; #[serial] serialises")]
-        unsafe {
-            std::env::set_var(
-                stellar_agent_smart_account::verifiers::STELLAR_AGENT_NETWORKS_TOML_ENV,
-                &registry_path,
-            );
-        }
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
+        let registry_path = fixture.sandbox.path().join("missing-networks.toml");
+        let _registry = stellar_agent_test_support::env_guard::ScopedEnvVar::new(
+            stellar_agent_smart_account::verifiers::STELLAR_AGENT_NETWORKS_TOML_ENV,
+            Some(registry_path.as_os_str()),
+        );
 
         let mut args = add_policy_args(PolicyKind::SpendingLimit);
         args.limit = Some(10_000_000);
         args.period = Some(17_280);
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
         let code = add_policy_run(&args).await;
-
-        // SAFETY: same as set; serialised by #[serial].
-        #[allow(unsafe_code, reason = "test-only env cleanup; #[serial] serialises")]
-        unsafe {
-            std::env::remove_var(
-                stellar_agent_smart_account::verifiers::STELLAR_AGENT_NETWORKS_TOML_ENV,
-            );
-        }
 
         assert_eq!(
             code, 1,
             "spending-limit mode must fail closed when no policy is registered"
         );
+        fixture.assert_refusal(
+            Some("validation.address_invalid"),
+            &[
+                "no spending-limit policy deployed",
+                "smart-account deploy-spending-limit-policy",
+            ],
+        );
     }
 
     /// `--kind spending-limit --limit 0` is refused before any registry lookup
     /// or network call (OZ `InvalidLimitOrPeriod` pre-flight).
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn add_policy_spending_limit_rejects_zero_limit() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let mut args = add_policy_args(PolicyKind::SpendingLimit);
         args.limit = Some(0);
         args.period = Some(17_280);
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
         let code = add_policy_run(&args).await;
         assert_eq!(code, 1, "limit == 0 must be refused");
+        fixture.assert_refusal(
+            Some("sa.spending_limit_install_refused"),
+            &["--limit must be positive"],
+        );
     }
 
     /// `--kind spending-limit --limit -1` is refused before any registry
     /// lookup or network call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn add_policy_spending_limit_rejects_negative_limit() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let mut args = add_policy_args(PolicyKind::SpendingLimit);
         args.limit = Some(-1);
         args.period = Some(17_280);
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
         let code = add_policy_run(&args).await;
         assert_eq!(code, 1, "negative limit must be refused");
+        fixture.assert_refusal(
+            Some("sa.spending_limit_install_refused"),
+            &["--limit must be positive"],
+        );
     }
 
     /// `--kind spending-limit --period 0` is refused before any registry
     /// lookup or network call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn add_policy_spending_limit_rejects_zero_period() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let mut args = add_policy_args(PolicyKind::SpendingLimit);
         args.limit = Some(10_000_000);
         args.period = Some(0);
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
         let code = add_policy_run(&args).await;
         assert_eq!(code, 1, "period == 0 must be refused");
+        fixture.assert_refusal(
+            Some("sa.spending_limit_install_refused"),
+            &["--period must be non-zero"],
+        );
     }
 
     // ── add-policy --kind simple-threshold pre-flight tests ───────────────────
 
     /// `--kind simple-threshold` without `--threshold` is refused before any
     /// network call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn add_policy_simple_threshold_requires_threshold() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
-        let args = add_policy_args(PolicyKind::SimpleThreshold);
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
+        let mut args = add_policy_args(PolicyKind::SimpleThreshold);
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
         let code = add_policy_run(&args).await;
         assert_eq!(
             code, 1,
             "simple-threshold mode without --threshold must be refused"
+        );
+        fixture.assert_refusal(
+            Some("validation.address_invalid"),
+            &["--kind simple-threshold requires --threshold"],
         );
     }
 
@@ -5777,67 +5820,77 @@ mod tests {
     /// lookup (the builder's client-side `InvalidThreshold` pre-flight fires
     /// even when `--policy` is supplied, so no registry access is needed for
     /// this assertion).
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn add_policy_simple_threshold_rejects_zero_threshold() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let mut args = add_policy_args(PolicyKind::SimpleThreshold);
         args.threshold = Some(0);
         args.policy = Some(ADD_POLICY_TEST_ACCOUNT.to_owned());
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
+        args.policy = Some(stellar_strkey::Contract([8; 32]).to_string().to_string());
         let code = add_policy_run(&args).await;
         assert_eq!(code, 1, "threshold == 0 must be refused");
+        fixture.assert_refusal(
+            Some("sa.simple_threshold_install_refused"),
+            &["--threshold must be non-zero"],
+        );
     }
 
     /// `--kind simple-threshold` combined with the raw-mode `--policy-address`
     /// flag is refused (mode conflict) before any network call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn add_policy_simple_threshold_rejects_raw_flags() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let mut args = add_policy_args(PolicyKind::SimpleThreshold);
         args.threshold = Some(2);
         args.policy_address = Some(ADD_POLICY_TEST_ACCOUNT.to_owned());
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
         let code = add_policy_run(&args).await;
         assert_eq!(
             code, 1,
             "simple-threshold mode must reject the raw --policy-address flag"
         );
+        fixture.assert_refusal(
+            Some("validation.address_invalid"),
+            &["--weighted-signer-* are only valid with the matching --kind"],
+        );
     }
 
     /// `--kind simple-threshold` with no `--policy` override and no
     /// registered policy for the network fails closed before any network call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn add_policy_simple_threshold_missing_registry_fails_closed() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
-        let dir = tempfile::tempdir().unwrap();
-        let registry_path = dir.path().join("networks.toml");
-
-        #[allow(unsafe_code, reason = "test-only env override; #[serial] serialises")]
-        unsafe {
-            std::env::set_var(
-                stellar_agent_smart_account::verifiers::STELLAR_AGENT_NETWORKS_TOML_ENV,
-                &registry_path,
-            );
-        }
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
+        let registry_path = fixture.sandbox.path().join("missing-networks.toml");
+        let _registry = stellar_agent_test_support::env_guard::ScopedEnvVar::new(
+            stellar_agent_smart_account::verifiers::STELLAR_AGENT_NETWORKS_TOML_ENV,
+            Some(registry_path.as_os_str()),
+        );
 
         let mut args = add_policy_args(PolicyKind::SimpleThreshold);
         args.threshold = Some(2);
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
         let code = add_policy_run(&args).await;
-
-        #[allow(unsafe_code, reason = "test-only env cleanup; #[serial] serialises")]
-        unsafe {
-            std::env::remove_var(
-                stellar_agent_smart_account::verifiers::STELLAR_AGENT_NETWORKS_TOML_ENV,
-            );
-        }
 
         assert_eq!(
             code, 1,
             "simple-threshold mode must fail closed when no policy is registered"
+        );
+        fixture.assert_refusal(
+            Some("validation.address_invalid"),
+            &[
+                "no simple-threshold policy deployed",
+                "smart-account deploy-policy --kind simple-threshold",
+            ],
         );
     }
 
@@ -5845,117 +5898,155 @@ mod tests {
 
     /// `--kind weighted-threshold` without `--threshold` is refused before any
     /// network call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn add_policy_weighted_threshold_requires_threshold() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let mut args = add_policy_args(PolicyKind::WeightedThreshold);
         args.weighted_signer_delegated = vec![format!("{ADD_POLICY_TEST_ACCOUNT_G}=1")];
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
+        args.weighted_signer_delegated =
+            vec![format!("{}=1", stellar_strkey::ed25519::PublicKey([9; 32]))];
         let code = add_policy_run(&args).await;
         assert_eq!(
             code, 1,
             "weighted-threshold mode without --threshold must be refused"
         );
+        fixture.assert_refusal(
+            Some("validation.address_invalid"),
+            &["--kind weighted-threshold requires --threshold"],
+        );
     }
 
     /// `--kind weighted-threshold` without any `--weighted-signer-*` flag is
     /// refused before any network call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn add_policy_weighted_threshold_requires_a_signer() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let mut args = add_policy_args(PolicyKind::WeightedThreshold);
         args.threshold = Some(1);
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
         let code = add_policy_run(&args).await;
         assert_eq!(
             code, 1,
             "weighted-threshold mode without any weighted-signer flag must be refused"
         );
+        fixture.assert_refusal(
+            Some("validation.address_invalid"),
+            &[
+                "requires at least one",
+                "--weighted-signer-delegated or --weighted-signer-webauthn",
+            ],
+        );
     }
 
     /// `--kind weighted-threshold` combined with the raw-mode `--policy-address`
     /// flag is refused (mode conflict) before any network call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn add_policy_weighted_threshold_rejects_raw_flags() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let mut args = add_policy_args(PolicyKind::WeightedThreshold);
         args.threshold = Some(1);
         args.weighted_signer_delegated = vec![format!("{ADD_POLICY_TEST_ACCOUNT_G}=1")];
         args.policy_address = Some(ADD_POLICY_TEST_ACCOUNT.to_owned());
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
+        args.weighted_signer_delegated =
+            vec![format!("{}=1", stellar_strkey::ed25519::PublicKey([9; 32]))];
         let code = add_policy_run(&args).await;
         assert_eq!(
             code, 1,
             "weighted-threshold mode must reject the raw --policy-address flag"
         );
+        fixture.assert_refusal(
+            Some("validation.address_invalid"),
+            &[
+                "--policy-address / --install-param / --limit / --period",
+                "only valid with the matching --kind",
+            ],
+        );
     }
 
     /// A malformed `--weighted-signer-delegated` flag (missing `=<weight>`) is
     /// refused before any network call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn add_policy_weighted_threshold_rejects_malformed_signer_flag() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let mut args = add_policy_args(PolicyKind::WeightedThreshold);
         args.threshold = Some(1);
         args.weighted_signer_delegated = vec![ADD_POLICY_TEST_ACCOUNT_G.to_owned()];
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
+        args.policy = Some(stellar_strkey::Contract([8; 32]).to_string().to_string());
         let code = add_policy_run(&args).await;
         assert_eq!(
             code, 1,
             "a weighted-signer flag missing '=<weight>' must be refused"
         );
+        fixture.assert_refusal(Some("validation.address_invalid"), &["<identity>=<weight>"]);
     }
 
     /// A non-numeric weight suffix is refused before any network call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn add_policy_weighted_threshold_rejects_non_numeric_weight() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let mut args = add_policy_args(PolicyKind::WeightedThreshold);
         args.threshold = Some(1);
         args.weighted_signer_delegated = vec![format!("{ADD_POLICY_TEST_ACCOUNT_G}=not-a-number")];
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
+        args.policy = Some(stellar_strkey::Contract([8; 32]).to_string().to_string());
         let code = add_policy_run(&args).await;
         assert_eq!(code, 1, "a non-numeric weight must be refused");
+        fixture.assert_refusal(
+            Some("validation.address_invalid"),
+            &["weight must be a u32"],
+        );
     }
 
     /// `--kind weighted-threshold` with no `--policy` override and no
     /// registered policy for the network fails closed before any network call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn add_policy_weighted_threshold_missing_registry_fails_closed() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
-        let dir = tempfile::tempdir().unwrap();
-        let registry_path = dir.path().join("networks.toml");
-
-        #[allow(unsafe_code, reason = "test-only env override; #[serial] serialises")]
-        unsafe {
-            std::env::set_var(
-                stellar_agent_smart_account::verifiers::STELLAR_AGENT_NETWORKS_TOML_ENV,
-                &registry_path,
-            );
-        }
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
+        let registry_path = fixture.sandbox.path().join("missing-networks.toml");
+        let _registry = stellar_agent_test_support::env_guard::ScopedEnvVar::new(
+            stellar_agent_smart_account::verifiers::STELLAR_AGENT_NETWORKS_TOML_ENV,
+            Some(registry_path.as_os_str()),
+        );
 
         let mut args = add_policy_args(PolicyKind::WeightedThreshold);
         args.threshold = Some(1);
         args.weighted_signer_delegated = vec![format!("{ADD_POLICY_TEST_ACCOUNT_G}=1")];
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
+        args.weighted_signer_delegated =
+            vec![format!("{}=1", stellar_strkey::ed25519::PublicKey([9; 32]))];
         let code = add_policy_run(&args).await;
-
-        #[allow(unsafe_code, reason = "test-only env cleanup; #[serial] serialises")]
-        unsafe {
-            std::env::remove_var(
-                stellar_agent_smart_account::verifiers::STELLAR_AGENT_NETWORKS_TOML_ENV,
-            );
-        }
 
         assert_eq!(
             code, 1,
             "weighted-threshold mode must fail closed when no policy is registered"
+        );
+        fixture.assert_refusal(
+            Some("validation.address_invalid"),
+            &[
+                "no weighted-threshold policy deployed",
+                "smart-account deploy-policy --kind weighted-threshold",
+            ],
         );
     }
 
@@ -6059,12 +6150,11 @@ mod tests {
 
     /// An invalid `--source-account` G-strkey is refused before any manager
     /// construction or network call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn get_spending_limit_run_rejects_invalid_source_account() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
-        let args = GetSpendingLimitArgs {
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
+        let mut args = GetSpendingLimitArgs {
             common: CommonRulesReadArgs {
                 profile: None,
                 account: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
@@ -6076,8 +6166,12 @@ mod tests {
             rule_id: 1,
             source_account: "not-a-valid-g-strkey".to_owned(),
         };
+        args.common.profile = None;
+        args.common.rpc_url = Some(fixture.rpc.https_uri());
+        args.common.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
         let code = get_spending_limit_run(&args).await;
         assert_eq!(code, 1, "invalid --source-account must be refused");
+        fixture.assert_refusal(Some("validation.address_invalid"), &["--source-account"]);
     }
 
     // ── set-spending-limit ────────────────────────────────────────────────────
@@ -6174,25 +6268,37 @@ mod tests {
     }
 
     /// `--limit 0` is refused before any signer resolution or network call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn set_spending_limit_rejects_zero_limit() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
-        let args = set_spending_limit_args(0);
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
+        let mut args = set_spending_limit_args(0);
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
         let code = set_spending_limit_run(&args).await;
         assert_eq!(code, 1, "limit == 0 must be refused");
+        fixture.assert_refusal(
+            Some("sa.spending_limit_install_refused"),
+            &["--limit must be positive"],
+        );
     }
 
     /// `--limit -1` is refused before any signer resolution or network call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn set_spending_limit_rejects_negative_limit() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
-        let args = set_spending_limit_args(-1);
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
+        let mut args = set_spending_limit_args(-1);
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
         let code = set_spending_limit_run(&args).await;
         assert_eq!(code, 1, "negative limit must be refused");
+        fixture.assert_refusal(
+            Some("sa.spending_limit_install_refused"),
+            &["--limit must be positive"],
+        );
     }
 
     /// A mainnet profile exits 1 before any request reaches its endpoint.
@@ -6223,7 +6329,13 @@ mod tests {
     #[serial_test::serial]
     async fn set_spending_limit_mainnet_flag_without_profile_reaches_no_endpoint() {
         let rpc = wiremock::MockServer::start().await;
-        let dir = tempfile::TempDir::new().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let _env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         let mut args = set_spending_limit_args(10_000_000);

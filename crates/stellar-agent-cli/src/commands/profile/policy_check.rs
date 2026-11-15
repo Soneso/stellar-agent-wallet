@@ -167,7 +167,13 @@ pub(crate) mod tests {
     #[test]
     #[serial_test::serial]
     fn policy_check_exit_codes() {
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let profile = Profile::builder_testnet_named("main", "s", "a", "n", "b").build();
         let v1 = "version = 1\nscope = \"profile:main\"\n[[rules]]\nmatch = { tool = \"stellar_balances\", chain = \"*\" }\ncriteria = []\ndecision = \"allow\"\n";

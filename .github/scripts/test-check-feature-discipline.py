@@ -2148,6 +2148,10 @@ MUTATIONS = {
 
 
 MUTATIONS.update({
+    "fold-acceptance-helper": ("d15_refuses_a_live_child_flag_outside_acceptance", "if (helper_use or helper_path) and relative not in acceptance_children:", "if False:", "D15 accepts an ordinary acceptance helper caller"),
+    "fold-acceptance-helper-text": ("d15_refuses_a_live_child_flag_outside_acceptance", "helper_use = re.search(r'\\b(?:acceptance_storage|acceptance_child_fixture)\\b\\s*(?:::|as\\b|[;,}])', bare)", "helper_use = re.search(r'\\b(?:acceptance_storage|acceptance_child_fixture)\\b\\s*(?:::|as\\b|[;,}])', code + '')", "D15 mistakes quoted helper text for a caller"),
+    "fold-acceptance-helper-path": ("d15_refuses_a_live_child_flag_outside_acceptance", "helper_path = any(", "helper_path = False and any(", "D15 accepts an ordinary acceptance helper path"),
+    "fold-acceptance-helper-alias": ("d15_refuses_a_live_child_flag_outside_acceptance", "acceptance_storage|acceptance_child_fixture", "acceptance_storage|unused_fixture", "D15 accepts an ordinary acceptance helper alias"),
     "fold-build-dependency": ("d14_refuses_a_build_dependency_on_a_storage_crate", "if names[package] in storage:", "if False:", "D14 accepts a build dependency on storage"),
     "fold-live-execution": ("d14_refuses_live_execution_outside_the_platform_job", "if not allowed and not compile_only:", "if False:", "D14 accepts live execution outside acceptance"),
     "fold-live-child": ("d15_refuses_a_live_child_flag_outside_acceptance", "if '--test-live-platform-keyring' in code and relative not in acceptance_children:", "if False:", "D15 accepts a live child outside acceptance"),
@@ -2300,6 +2304,18 @@ def d15_fixture(m, tmp, source, manifest=None):
 def case_d15_child(m, tmp, checker):
     c = d15_fixture(m, tmp, 'fn test() { child.arg("--test-live-platform-keyring"); }')
     assert any('live child entry outside acceptance' in e for e in c.errors), 'D15 accepts a live child outside acceptance'
+    c = d15_fixture(m, tmp, 'fn test() { acceptance_storage::command(executable, home); }')
+    assert any('acceptance helper outside acceptance' in e for e in c.errors), 'D15 accepts an ordinary acceptance helper caller'
+    c = d15_fixture(m, tmp, 'use crate::acceptance_child_fixture as selected; fn test() { selected::command(executable, home); }')
+    assert any('acceptance helper outside acceptance' in e for e in c.errors), 'D15 accepts an ordinary acceptance helper alias'
+    for source in [
+        '#[path = "../acceptance_storage.rs"] mod selected;',
+        '#[cfg_attr(test, path = "../acceptance_storage.rs")] mod selected;',
+    ]:
+        c = d15_fixture(m, tmp, source)
+        assert any('acceptance helper outside acceptance' in e for e in c.errors), 'D15 accepts an ordinary acceptance helper path'
+    c = d15_fixture(m, tmp, 'fn test() { let text = "acceptance_storage::command"; let path = "fixtures/acceptance_storage.rs"; }')
+    assert not c.errors, 'D15 mistakes quoted helper text for a caller'
 
 
 @unit('d15_refuses_a_native_constructor_in_a_doc_block')

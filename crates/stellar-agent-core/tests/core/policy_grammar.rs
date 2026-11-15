@@ -2368,7 +2368,14 @@ fn total_evaluation(
 #[test]
 #[serial_test::serial]
 fn total_budget_attempt_overflow_denies() {
-    let guard_home = tempfile::tempdir().unwrap();
+    let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        guard_home
+            .path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
     let store = PolicyStateStore::new();
     store
@@ -2409,7 +2416,14 @@ fn total_key_for(asset: &str, value: ValueClass) -> StateKey {
 #[test]
 #[serial_test::serial]
 fn total_budget_spellings_of_one_asset_share_one_key() {
-    let guard_home = tempfile::tempdir().unwrap();
+    let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        guard_home
+            .path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
     let native_sac = CanonicalAsset::Native
         .sac_contract_id(TESTNET_PASSPHRASE)
@@ -2440,7 +2454,14 @@ fn total_budget_spellings_of_one_asset_share_one_key() {
 #[test]
 #[serial_test::serial]
 fn total_budget_multileg_overflow_denies() {
-    let guard_home = tempfile::tempdir().unwrap();
+    let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        guard_home
+            .path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
     use stellar_agent_core::policy::v1::criteria::total_budget::TotalBudgetCriterion;
     let store = PolicyStateStore::new();
@@ -2459,7 +2480,14 @@ fn total_budget_multileg_overflow_denies() {
 #[test]
 #[serial_test::serial]
 fn total_budget_multileg_sizing_refuses_overflow() {
-    let guard_home = tempfile::tempdir().unwrap();
+    let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        guard_home
+            .path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
     use stellar_agent_core::policy::v1::criteria::total_budget::TotalBudgetCriterion;
     let store = PolicyStateStore::new();
@@ -2494,7 +2522,14 @@ fn query_epoch_overflow_errors() {
 #[test]
 #[serial_test::serial]
 fn total_budget_overlay_overflow_denies() {
-    let guard_home = tempfile::tempdir().unwrap();
+    let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        guard_home
+            .path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
     use stellar_agent_core::policy::v1::criteria::total_budget::TotalBudgetCriterion;
     let store = PolicyStateStore::new();
@@ -3990,7 +4025,14 @@ fn m_of(key: [u8; 32], id: u64) -> String {
 #[test]
 #[serial_test::serial]
 fn muxed_explicit_memo() {
-    let guard_home = tempfile::tempdir().unwrap();
+    let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        guard_home
+            .path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
     let key = [0xA9; 32];
     let criterion = MemoBindingCriterion::new(vec![
@@ -4099,7 +4141,14 @@ fn same_on_both(engine: &PolicyEngineV1, destination: &str) -> Decision {
 #[test]
 #[serial_test::serial]
 fn muxed_signed_policy_matrix() {
-    let guard_home = tempfile::tempdir().unwrap();
+    let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        guard_home
+            .path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
     let key = [0xAA; 32];
     let other = [0xEA; 32];
@@ -4218,7 +4267,14 @@ fn muxed_signed_policy_matrix() {
 #[test]
 #[serial_test::serial]
 fn muxed_budget_and_counterparty_accounting() {
-    let guard_home = tempfile::tempdir().unwrap();
+    let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        guard_home
+            .path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
     let _clock = set_query_time_for_test(NOW_MS);
     let key = [0xAB; 32];

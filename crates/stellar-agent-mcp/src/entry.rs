@@ -689,7 +689,8 @@ async fn serve<I: IntoIterator<Item = String>>(display_name: &'static str, args:
     // A missing backend (for example a headless host with no D-Bus secret
     // service) is not fatal: the server still starts and serves its read-only
     // and simulate surface. The default-profile fallback uses the Noop policy
-    // engine, which never reads the keyring. Signing tools fail closed with a
+    // engine, which accepts the absence of a registered store. When a store
+    // exists, owner and policy-pin reads still propagate its errors. Signing tools fail closed with a
     // keyring error at call time, and a profile that selects the v1 policy
     // engine fails to start because building it requires the owner key from the
     // keyring. No key material is exposed and no gate is bypassed by degrading

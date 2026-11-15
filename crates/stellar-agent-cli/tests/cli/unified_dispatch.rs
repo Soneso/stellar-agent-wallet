@@ -9,13 +9,17 @@ use std::time::Duration;
 use serial_test::serial;
 
 pub(super) struct Binary {
-    pub(super) home: tempfile::TempDir,
+    pub(super) home: stellar_agent_test_support::sandbox::StateSandbox,
     path: PathBuf,
 }
 
 impl Binary {
     pub(super) fn new(name: &str) -> Self {
-        let home = tempfile::tempdir().expect("isolated home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("isolated home");
+        stellar_agent_test_support::sandbox::require_isolated_executable(std::path::Path::new(
+            env!("CARGO_BIN_EXE_stellar-agent"),
+        ))
+        .expect("isolated executable before copying");
         let path = home
             .path()
             .join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
@@ -24,7 +28,9 @@ impl Binary {
     }
 
     pub(super) fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(&self.path);
+        let mut command =
+            stellar_agent_test_support::cli_child::cli_command(&self.path, self.home.path())
+                .expect("isolated CLI child");
         command.args(args);
         self.isolate(&mut command);
         command
@@ -68,7 +74,9 @@ impl Binary {
                 reserve <= u64::from(MAIN_STACK_KIB) * 1024,
                 "the executable reserves {reserve} bytes for its main thread"
             );
-            let mut command = Command::new(&self.path);
+            let mut command =
+                stellar_agent_test_support::cli_child::cli_command(&self.path, self.home.path())
+                    .expect("isolated CLI child");
             command.args(args);
             self.isolate(&mut command);
             Self::output(&mut command).expect("copied executable runs")
@@ -77,8 +85,7 @@ impl Binary {
 
     /// Points the command at the scratch home and the test keyring.
     fn isolate(&self, command: &mut Command) {
-        stellar_agent_test_support::sandbox::mark_sandbox(self.home.path())
-            .expect("mark fixture directory");
+        stellar_agent_test_support::cli_child::filter_wallet_environment(command);
         command
             .current_dir(self.home.path())
             .env("STELLAR_AGENT_HOME", self.home.path())

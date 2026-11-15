@@ -506,7 +506,13 @@ mod tests {
     async fn a_testnet_chain_with_a_mainnet_passphrase_reports_the_signing_refusal() {
         use stellar_agent_network::signing::Signer;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let signer = stellar_agent_network::signing::SoftwareSigningKey::new_from_bytes([0x51; 32]);

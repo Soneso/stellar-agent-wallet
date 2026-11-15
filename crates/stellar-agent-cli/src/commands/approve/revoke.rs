@@ -380,19 +380,11 @@ pub(super) mod tests {
         pub(in crate::commands::approve) entry: PendingApproval,
         handle: OperationHandle,
     }
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            stellar_agent_network::keyring::KEEP_REGISTERED_STORE
-                .store(false, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
     impl Fixture {
         pub(in crate::commands::approve) fn new() -> Self {
             Self::from_core(MainnetConsentFixture::new("revocation"))
         }
         fn from_core(core: MainnetConsentFixture) -> Self {
-            stellar_agent_network::keyring::KEEP_REGISTERED_STORE
-                .store(true, std::sync::atomic::Ordering::SeqCst);
             let entry = core.payment(300_000);
             let clock = set_now_ms_for_test(entry.created_at_unix_ms);
             let store = PersistedWindowStore::for_profile(core.name());

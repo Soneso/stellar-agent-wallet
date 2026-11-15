@@ -1105,11 +1105,10 @@ mod tests {
     /// exits 1 at profile resolution without reaching the bind; either way the
     /// contract is a clean non-panicking exit-1. The bind-conflict path itself
     /// is covered at the library level in `stellar-agent-approval-ui`.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn run_with_bound_port_and_absent_profile_exits_1_without_panic() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let args = ServeArgs {
@@ -1125,18 +1124,54 @@ mod tests {
         };
         let code = run(args).await;
         assert_eq!(code, 1);
+        fixture.assert_refusal(
+            Some("validation.profile_not_found"),
+            &["the requested profile was not found"],
+        );
     }
 
     /// `--remote` without a `[remote_approval]` profile block must exit `1`
     /// cleanly (fail-closed) rather than attempting to bind or provision TLS.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn run_remote_without_profile_block_exits_1_without_panic() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
+        let _keyring = stellar_agent_test_support::keyring_mock::DefaultStoreGuard::cleared();
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let name = "remote-fixture";
+        let profile = stellar_agent_core::profile::schema::Profile::builder_testnet_named(
+            name,
+            "fixture-signer",
+            "default",
+            "fixture-nonce",
+            "default",
+        )
+        .policy_engine(stellar_agent_core::profile::schema::PolicyEngineKind::Noop)
+        .rpc_url(fixture.rpc.https_uri())
+        .build();
+        stellar_agent_core::profile::loader::save_to_dir(
+            name,
+            &profile,
+            &fixture.sandbox.path().join("profiles"),
+        )
+        .unwrap();
+        stellar_agent_network::keyring::rotate_keyring_secret_32(
+            &profile.audit_log_hash_chain_key_id.service,
+            &profile.audit_log_hash_chain_key_id.account,
+        )
+        .unwrap();
+        let (_audit, _) = open_audit_writer(
+            &profile,
+            crate::common::profile_access::ProfileOrigin::Persisted,
+            name,
+        )
+        .unwrap();
+        let before = crate::common::test_support::tree(fixture.sandbox.path());
+        let mutations = stellar_agent_test_support::keyring_mock::record_mutations().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let args = ServeArgs {
-            profile: Some("__stellar_agent_serve_test_absent_profile_remote".to_owned()),
-            port: 0,
+            profile: Some(name.to_owned()),
+            port: listener.local_addr().unwrap().port(),
             no_open: true,
             open_by_operator: false,
             notify: NotifyMode::Off,
@@ -1147,5 +1182,14 @@ mod tests {
         };
         let code = run(args).await;
         assert_eq!(code, 1);
+        fixture.assert_refusal(None, &["approve.remote_not_configured"]);
+        assert_eq!(
+            crate::common::test_support::tree(fixture.sandbox.path()),
+            before
+        );
+        assert!(
+            mutations.mutations().is_empty(),
+            "refusal writes no keyring entries"
+        );
     }
 }

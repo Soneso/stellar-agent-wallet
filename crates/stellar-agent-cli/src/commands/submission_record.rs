@@ -1054,7 +1054,13 @@ mod tests {
     fn settlement_oracle_in_follows_the_profile_chain() {
         use stellar_agent_core::profile::schema::{PrimaryProviderRecord, ProviderRecord};
         stellar_agent_test_support::keyring_mock::install().unwrap();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let mainnet = Profile::builder_mainnet_named(
             "oracle-wrapper",
@@ -1665,7 +1671,13 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_malformed_payment_leg_refuses_before_exposure() {
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let name = "recorder-malformed-leg";
@@ -2232,7 +2244,13 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn the_gate_drain_delivers_an_old_obligation_after_a_refused_pass() {
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let mut f = drain_fixture("gate-refused-drain");
         f.window = PersistedWindowStore::for_profile(&f.name);
@@ -2494,16 +2512,17 @@ pub(crate) mod intent_gate_fixture {
     }
 
     pub(crate) fn home() -> (
-        tempfile::TempDir,
+        stellar_agent_test_support::sandbox::StateSandbox,
         stellar_agent_test_support::StellarAgentHomeGuard,
     ) {
         stellar_agent_test_support::keyring_mock::install().unwrap();
-        let scratch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
-        std::fs::create_dir_all(&scratch).unwrap();
-        let home = tempfile::Builder::new()
-            .prefix("intent-gate-")
-            .tempdir_in(scratch)
-            .unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         (home, guard)
     }

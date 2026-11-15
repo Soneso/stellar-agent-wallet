@@ -387,7 +387,15 @@ fn registry_with_entry(router_address: &str) -> MulticallRegistry {
 #[serial_test::serial]
 async fn h1_three_native_sac_symbol_calls_confirm() {
     stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
-    let data_root = tempfile::tempdir().expect("temporary wallet data root");
+    let data_root = stellar_agent_test_support::sandbox::StateSandbox::new()
+        .expect("temporary wallet data root");
+    assert!(
+        data_root
+            .path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(data_root.path());
     let secondary_rpc_url = stellar_agent_test_support::testnet_secondary_rpc_url();
 
@@ -511,7 +519,13 @@ async fn check_host_cap(
     expected_index: Option<u32>,
 ) {
     stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
-    let dir = tempfile::tempdir().unwrap();
+    let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        dir.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
     let (audit, _) = audit_writer_in(dir.path());
     let empty_registry = MulticallRegistry::load(&dir.path().join("empty.json")).unwrap();
@@ -607,7 +621,15 @@ fn audit_writer_in(dir: &std::path::Path) -> (Arc<Mutex<AuditWriter>>, std::path
 #[serial_test::serial]
 async fn h5_bundle_under_a_rule_other_than_0_checks_its_signer_set() {
     stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
-    let data_root = tempfile::tempdir().expect("temporary wallet data root");
+    let data_root = stellar_agent_test_support::sandbox::StateSandbox::new()
+        .expect("temporary wallet data root");
+    assert!(
+        data_root
+            .path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(data_root.path());
     let secondary_rpc_url = stellar_agent_test_support::testnet_secondary_rpc_url();
     let timeout = Duration::from_secs(TIMEOUT_SECS);

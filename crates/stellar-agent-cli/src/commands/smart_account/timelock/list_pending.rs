@@ -368,7 +368,13 @@ mod tests {
     async fn list_pending_mainnet_profile_reaches_inspection_rpc() {
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
         let rpc = wiremock::MockServer::start().await;
-        let home = tempfile::tempdir().expect("home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let _env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         let audit_log_path = home.path().join("audit.jsonl");

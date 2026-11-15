@@ -1668,7 +1668,14 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn default_networks_toml_path_treats_empty_override_as_unset() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         match default_networks_toml_path_with_override(Some("")) {
             Ok(path) => assert!(
@@ -1727,77 +1734,27 @@ mod tests {
         }
     }
 
-    /// `default_networks_toml_path_with_override(None)` falls through to the
-    /// canonical data root.  Best-effort: this depends on
-    /// [`stellar_agent_core::profile::schema::canonical_data_root`] being
-    /// resolvable on the test host.  When unresolvable (rare CI / container
-    /// environment), the function returns `NetworksTomlIo` — also a valid
-    /// outcome, so the test accepts either successful resolution (with the
-    /// expected per-platform shape) or that error.
+    /// A valid marked root resolves the registry through the public entry point.
     #[test]
     #[serial_test::serial]
     fn default_networks_toml_path_falls_through_to_canonical_root() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(
-            &guard_home.path().join(if cfg!(target_os = "macos") {
-                PathBuf::from(stellar_agent_test_support::sandbox::MACOS_WALLET_SUFFIX.trim())
-            } else if cfg!(target_os = "windows") {
-                PathBuf::from("Soneso")
-                    .join(stellar_agent_test_support::sandbox::WALLET_DIRECTORY_COMPONENT.trim())
-                    .join("data")
-            } else {
-                PathBuf::from(
-                    stellar_agent_test_support::sandbox::WALLET_DIRECTORY_COMPONENT.trim(),
-                )
-            }),
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            sandbox
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
         );
-        match default_networks_toml_path_with_override(None) {
-            Ok(path) => {
-                assert!(
-                    path.ends_with("networks.toml"),
-                    "canonical path must end with networks.toml, got: {path:?}"
-                );
-                #[cfg(target_os = "linux")]
-                {
-                    let expected_suffix = PathBuf::from(
-                        stellar_agent_test_support::sandbox::WALLET_DIRECTORY_COMPONENT.trim(),
-                    )
-                    .join("networks.toml");
-                    assert!(
-                        path.ends_with(&expected_suffix),
-                        "Linux canonical path must be <data-root>/stellar-agent/networks.toml, got: {path:?}"
-                    );
-                }
-                #[cfg(target_os = "macos")]
-                {
-                    let expected_suffix = PathBuf::from(
-                        stellar_agent_test_support::sandbox::MACOS_WALLET_SUFFIX.trim(),
-                    )
-                    .join("networks.toml");
-                    assert!(
-                        path.ends_with(&expected_suffix),
-                        "macOS canonical path must use the documented suffix and networks.toml, got: {path:?}"
-                    );
-                }
-                #[cfg(target_os = "windows")]
-                {
-                    let expected_suffix = PathBuf::from("Soneso")
-                        .join(
-                            stellar_agent_test_support::sandbox::WALLET_DIRECTORY_COMPONENT.trim(),
-                        )
-                        .join("data")
-                        .join("networks.toml");
-                    assert!(
-                        path.ends_with(&expected_suffix),
-                        "Windows canonical path must be <data-root>/Soneso/stellar-agent/data/networks.toml, got: {path:?}"
-                    );
-                }
-            }
-            Err(SaError::NetworksTomlIo { .. }) => {
-                // Acceptable on hosts with no resolvable data directory.
-            }
-            Err(e) => panic!("unexpected error: {e:?}"),
-        }
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let _override = stellar_agent_test_support::env_guard::ScopedEnvVar::new(
+            STELLAR_AGENT_NETWORKS_TOML_ENV,
+            None,
+        );
+        assert_eq!(
+            default_networks_toml_path().unwrap(),
+            sandbox.path().join("networks.toml")
+        );
     }
 
     /// `persist()` creates a missing parent directory with mode `0700` on Unix.

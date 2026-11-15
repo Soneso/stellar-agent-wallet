@@ -48,7 +48,13 @@ fn mainnet_read_only_tools_match_registry_both_directions() {
 #[serial]
 fn startup_advisory_is_emitted_only_when_transaction_status_is_unmatched() {
     keyring_mock::install().unwrap();
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        home.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home = StellarAgentHomeGuard::new(home.path());
     let dir = default_policy_dir().unwrap();
     std::fs::create_dir_all(&dir).unwrap();
@@ -102,7 +108,13 @@ fn startup_advisory_is_emitted_only_when_transaction_status_is_unmatched() {
 fn policy_failure_preserves_typed_cause_and_wire_code() {
     use stellar_agent_core::policy::{BuildRegistryError, PolicyError};
     keyring_mock::install().unwrap();
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        home.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home = StellarAgentHomeGuard::new(home.path());
     let dir = default_policy_dir().unwrap();
     std::fs::create_dir_all(&dir).unwrap();
@@ -155,7 +167,13 @@ fn policy_failure_preserves_typed_cause_and_wire_code() {
 #[serial]
 fn noop_does_not_require_an_owner_namespace() {
     keyring_mock::install().unwrap();
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        home.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home = StellarAgentHomeGuard::new(home.path());
     let mut profile = Profile::builder_testnet_named("operator", "s", "a", "n", "a").build();
     profile.policy.engine = stellar_agent_core::profile::schema::PolicyEngineKind::Noop;
@@ -181,7 +199,13 @@ fn selected_startup_verifies_the_installation_binding() {
     };
     use stellar_agent_mcp::transport::{build_selected_server, build_server};
     keyring_mock::install().unwrap();
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        home.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home = StellarAgentHomeGuard::new(home.path());
     let profile = Profile::builder_mainnet_named(
         "operator",

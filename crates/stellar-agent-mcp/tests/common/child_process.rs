@@ -82,6 +82,8 @@ enum StdoutEvent {
     Unparsed(String),
     /// The child closed stdout.
     Closed,
+    /// Reading stdout failed before a clean EOF.
+    ReadError(std::io::ErrorKind, String),
 }
 
 /// Why a response wait ended without the response.
@@ -93,6 +95,8 @@ pub enum ResponseError {
     Closed,
     /// The child wrote a line that is not JSON.
     Unparsed(String),
+    /// Reading stdout failed, with its original kind and diagnostic.
+    ReadError(std::io::ErrorKind, String),
 }
 
 /// The events the stdout reader delivered that no wait has taken yet.
@@ -509,13 +513,14 @@ impl ChildDriver {
                 loop {
                     let mut line = String::new();
                     let event = match lines.read_line(&mut line) {
-                        Ok(0) | Err(_) => StdoutEvent::Closed,
+                        Ok(0) => StdoutEvent::Closed,
+                        Err(error) => StdoutEvent::ReadError(error.kind(), error.to_string()),
                         Ok(_) => match serde_json::from_str::<Value>(line.trim()) {
                             Ok(message) => StdoutEvent::Message(message),
                             Err(_) => StdoutEvent::Unparsed(line),
                         },
                     };
-                    let closed = matches!(event, StdoutEvent::Closed);
+                    let closed = matches!(event, StdoutEvent::Closed | StdoutEvent::ReadError(..));
                     let id = match &event {
                         StdoutEvent::Message(message) => message.get("id").cloned(),
                         _ => None,
@@ -540,10 +545,11 @@ impl ChildDriver {
                 let mut chunk = [0_u8; 8192];
                 loop {
                     match pipe.read(&mut chunk) {
-                        Ok(0) | Err(_) => {
+                        Ok(0) => {
                             stderr.close();
                             return;
                         }
+                        Err(_) => return,
                         Ok(read) => stderr.append(&chunk[..read]),
                     }
                 }
@@ -669,6 +675,10 @@ impl ChildDriver {
                     }
                 }
                 Some(StdoutEvent::Unparsed(line)) => return Err(ResponseError::Unparsed(line)),
+                Some(StdoutEvent::ReadError(kind, message)) => {
+                    self.stdout_closed = true;
+                    return Err(ResponseError::ReadError(kind, message));
+                }
                 Some(StdoutEvent::Closed) => {
                     self.stdout_closed = true;
                     return Err(ResponseError::Closed);
@@ -683,17 +693,33 @@ impl ChildDriver {
     ///
     /// # Panics
     ///
-    /// When the response does not arrive, with the stderr collected so far.
+    /// When the response does not arrive, with bounded exit and stderr diagnostics.
     pub fn response(&mut self, id: impl Into<Value>) -> Value {
         let id = id.into();
+        let started = Instant::now();
         match self.response_within(id.clone(), RESPONSE_DEADLINE) {
             Ok(message) => message,
-            Err(error) => panic!(
-                "the child gave no response with id {id} within {RESPONSE_DEADLINE:?}: \
-                 {error:?}\nstderr: {}",
-                self.stderr()
-            ),
+            Err(error) => panic!("{}", self.response_failure(&id, &error, started)),
         }
+    }
+
+    fn response_failure(&mut self, id: &Value, error: &ResponseError, started: Instant) -> String {
+        let status = self.wait_for_exit(self.exit_deadline);
+        let state = status.map_or_else(
+            || "still running".to_owned(),
+            |status| format!("natural exit {status}"),
+        );
+        let collection = if self.stderr.closed.load(Ordering::Acquire) {
+            "complete"
+        } else {
+            "incomplete"
+        };
+        format!(
+            "the child gave no response with id {id}: {error:?}; {state}; elapsed {:?}; \
+             stderr collection {collection}\nstderr: {}",
+            started.elapsed(),
+            self.stderr(),
+        )
     }
 
     /// Sends `message` unchanged and returns the response with its id.
@@ -894,8 +920,8 @@ impl ChildDriver {
 
     /// Waits at most `deadline` for the child to exit and returns its status,
     /// or `None` when it is still running. After the exit, the stderr reader
-    /// is joined within what remains of `deadline`, so [`ChildDriver::stderr`]
-    /// holds what the child wrote. The stdout reader is left as it is, so a
+    /// is joined within what remains of `deadline`. Collected stderr can be
+    /// incomplete when the reader fails or outlives that bound. The stdout reader stays as it is, so a
     /// paused reader stays paused.
     ///
     /// # Panics
@@ -1660,7 +1686,8 @@ mod windows_tests {
     /// second kill returns `Ok` too.
     #[test]
     fn a_hosted_kill_after_the_exit_is_ok() {
-        let mut command = crate::common::server_binary::server_command();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let mut command = crate::common::server_binary::server_command(home.path());
         command.arg("--no-such-flag");
         let mut driver = ChildDriver::spawn_in_pseudo_console(command).unwrap();
         let status = driver.wait_for_exit(EXIT_DEADLINE);
@@ -1694,6 +1721,67 @@ mod tests {
 
     /// The notification line the shell children print.
     const NOTIFICATION: &str = r#"{"jsonrpc":"2.0","method":"notifications/message"}"#;
+
+    #[test]
+    fn response_failure_reports_natural_exit_and_stderr() {
+        let mut driver = ChildDriver::spawn(sh("printf 'final diagnostic\\n' >&2; exit 7"))
+            .with_exit_deadline(Duration::from_secs(2));
+        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver.response(9)))
+            .expect_err("a missing response must fail");
+        let message = failure.downcast_ref::<String>().unwrap();
+        assert!(message.contains("natural exit exit status: 7"), "{message}");
+        assert!(message.contains("final diagnostic"), "{message}");
+        assert!(message.contains("stderr collection complete"), "{message}");
+        assert!(message.contains("elapsed "), "{message}");
+    }
+
+    #[test]
+    fn stdout_read_error_is_not_eof() {
+        struct FailedReader<T>(T);
+        impl<T: Read> Read for FailedReader<T> {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                let _keep_pipe_owned = &self.0;
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "stdout fixture failure",
+                ))
+            }
+        }
+        let mut child = sh("exit 0")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        #[cfg(target_os = "linux")]
+        let stdout_fd = std::os::fd::AsRawFd::as_raw_fd(&stdout);
+        let pid = child.id();
+        let mut driver = ChildDriver::from_parts(
+            Process::Std(child),
+            pid,
+            Box::new(stdin),
+            Box::new(FailedReader(stdout)),
+            Box::new(FailedReader(stderr)),
+            #[cfg(target_os = "linux")]
+            stdout_fd,
+        )
+        .unwrap();
+        assert_eq!(
+            driver.response_within(1, RESPONSE_DEADLINE),
+            Err(ResponseError::ReadError(
+                std::io::ErrorKind::InvalidData,
+                "stdout fixture failure".to_owned()
+            )),
+        );
+        let diagnostic = driver.response_failure(&json!(1), &ResponseError::Closed, Instant::now());
+        assert!(
+            diagnostic.contains("stderr collection incomplete"),
+            "{diagnostic}"
+        );
+    }
 
     /// Requests are matched by id: an earlier response with another id and a
     /// notification do not answer the request, and a later wait claims the
@@ -1966,7 +2054,8 @@ mod tests {
     #[test]
     fn the_wait_reports_an_early_child_exit() {
         const NEVER_PRINTED: &str = "a line the refused server never prints";
-        let mut command = crate::common::server_binary::server_command();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let mut command = crate::common::server_binary::server_command(home.path());
         command.arg("--no-such-flag");
         let mut driver = ChildDriver::spawn(command);
         let started = Instant::now();
@@ -2338,5 +2427,11 @@ mod tests {
             process_exists(helper),
             "the helper still holds stderr when wait_for_exit returns"
         );
+        let diagnostic = driver.response_failure(&json!(8), &ResponseError::Closed, started);
+        assert!(
+            diagnostic.contains("stderr collection incomplete"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("natural exit"), "{diagnostic}");
     }
 }

@@ -33,7 +33,6 @@
 )]
 
 use std::path::Path;
-use std::process::Command;
 
 use serde_json::Value;
 use stellar_agent_core::profile::loader::{MIRRORED_UPPER_BOUND_MAX_SCAN_ID, save_new_to_dir};
@@ -85,15 +84,18 @@ impl Run {
 }
 
 fn run_cli(home: &Path, args: &[&str]) -> Run {
-    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
-    let out = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-        .args(args)
-        .env("STELLAR_AGENT_HOME", home)
-        .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
-        .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY)
-        .env_remove("STELLAR_AGENT_PROFILE")
-        .output()
-        .expect("binary runs");
+    let out = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home,
+    )
+    .expect("isolated CLI child")
+    .args(args)
+    .env("STELLAR_AGENT_HOME", home)
+    .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+    .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY)
+    .env_remove("STELLAR_AGENT_PROFILE")
+    .output()
+    .expect("binary runs");
     Run {
         code: out.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -119,7 +121,7 @@ fn prepend_key_to_toml(path: &Path, line: &str) {
 /// does.
 #[test]
 fn out_of_bounds_scan_id_is_operator_correctable_on_both_surfaces() {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     let toml = write_profile(home.path(), PROFILE);
     prepend_key_to_toml(
         &toml,
@@ -154,7 +156,7 @@ fn out_of_bounds_scan_id_is_operator_correctable_on_both_surfaces() {
 /// same catch-all, so the fix is not special-cased to one field.
 #[test]
 fn out_of_bounds_horizon_is_operator_correctable_on_both_surfaces() {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     let toml = write_profile(home.path(), PROFILE);
     prepend_key_to_toml(&toml, "session_rule_max_horizon_ledgers = 10001");
 
@@ -175,7 +177,7 @@ fn out_of_bounds_horizon_is_operator_correctable_on_both_surfaces() {
 /// into the generic config code.
 #[test]
 fn a_missing_profile_is_still_not_found_on_both_surfaces() {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     std::fs::create_dir_all(home.path().join("profiles")).expect("profiles dir");
 
     let show = run_cli(home.path(), &["profile", "show", "i124-absent"]);
@@ -208,7 +210,7 @@ fn a_missing_profile_is_still_not_found_on_both_surfaces() {
 /// identical on both surfaces, and is out of scope here.
 #[test]
 fn a_path_bearing_load_failure_is_redacted_identically_on_both_surfaces() {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     let toml = write_profile(home.path(), PROFILE);
     // Remove the required [policy] section to reach `MissingPolicySection`,
     // whose Display is the one carrying a path.
@@ -258,7 +260,7 @@ fn a_path_bearing_load_failure_is_redacted_identically_on_both_surfaces() {
 /// default endpoint, and the refusal keeps its own code.
 #[test]
 fn a_mainnet_profile_without_rpc_url_has_its_own_code_on_both_surfaces() {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     let name = "mainnet-no-endpoint";
     let profile = Profile::builder_mainnet_named(
         name,
@@ -297,24 +299,26 @@ fn a_mainnet_profile_without_rpc_url_has_its_own_code_on_both_surfaces() {
 
 #[test]
 fn protected_overlay_has_its_own_code_on_both_surfaces() {
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     write_profile(home.path(), PROFILE);
     for args in [
         vec!["profile", "show", PROFILE],
         vec!["counterparty", "list", "--profile", PROFILE],
     ] {
-        stellar_agent_test_support::sandbox::mark_sandbox(home.path())
-            .expect("mark fixture directory");
-        let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-            .args(args)
-            .env("STELLAR_AGENT_HOME", home.path())
-            .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
-            .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY)
-            .env_remove("STELLAR_AGENT_PROFILE")
-            .env_remove("STELLAR_AGENT_RPC_URL")
-            .env("STELLAR_AGENT_CHAIN_ID", "stellar:mainnet")
-            .output()
-            .unwrap();
+        let output = stellar_agent_test_support::cli_child::cli_command(
+            env!("CARGO_BIN_EXE_stellar-agent"),
+            home.path(),
+        )
+        .expect("isolated CLI child")
+        .args(args)
+        .env("STELLAR_AGENT_HOME", home.path())
+        .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+        .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY)
+        .env_remove("STELLAR_AGENT_PROFILE")
+        .env_remove("STELLAR_AGENT_RPC_URL")
+        .env("STELLAR_AGENT_CHAIN_ID", "stellar:mainnet")
+        .output()
+        .unwrap();
         let run = Run {
             code: output.status.code().unwrap(),
             stdout: String::from_utf8(output.stdout).unwrap(),
@@ -326,7 +330,7 @@ fn protected_overlay_has_its_own_code_on_both_surfaces() {
 
 #[test]
 fn provider_attestation_has_its_own_code_on_both_surfaces() {
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let name = "provider-refusal";
     let profile =
         Profile::builder_mainnet_named(name, "https://primary.example", "s", "a", "n", "a")

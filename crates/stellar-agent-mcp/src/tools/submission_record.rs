@@ -949,7 +949,13 @@ mod tests {
         use stellar_agent_network::SubmissionRecorder;
         for exemption in [false, true] {
             stellar_agent_test_support::keyring_mock::install().unwrap();
-            let dir = tempfile::tempdir().unwrap();
+            let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                dir.path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
             let profile = Profile::builder_testnet_named(
                 "intent",
@@ -1361,7 +1367,14 @@ mod tests {
     #[serial_test::serial(keyring)]
     #[serial_test::serial]
     fn allowed_recorder_requires_a_registered_tool() {
-        let dir = tempfile::tempdir().expect("isolated audit directory");
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new()
+            .expect("isolated audit directory");
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let profile = Profile::builder_testnet("signer", "default", "nonce", "default").build();
         let audit = Arc::new(Mutex::new(

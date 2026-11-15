@@ -226,9 +226,8 @@ fn keyringless_profiles_serve_reads_and_refuse_signing() {
     use std::process::Stdio;
 
     for named in [false, true] {
-        let home = TempDir::new().unwrap();
-        stellar_agent_test_support::sandbox::mark_sandbox(home.path()).unwrap();
-        let mut command = crate::common::server_binary::server_command();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let mut command = crate::common::server_binary::server_command(home.path());
         if named {
             std::fs::create_dir(home.path().join("profiles")).unwrap();
             std::fs::write(
@@ -327,7 +326,13 @@ fn engine_selection_refuses_unreadable_owner_state() {
 #[test]
 #[serial]
 fn unsigned_engine_selection_refuses_before_payment() {
-    let home = TempDir::new().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        home.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
     let suffix = "engine_selection";
     let name = test_profile_name(suffix);
@@ -908,7 +913,13 @@ decision = "allow"
 
     // One scratch home holds the policy directory and, through
     // STELLAR_AGENT_HOME, the policy-window state the engine opens.
-    let home = TempDir::new().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        home.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
     let policy_dir = TempDir::new_in(home.path()).unwrap();
     let policy_filename = format!("{profile_name}.toml");

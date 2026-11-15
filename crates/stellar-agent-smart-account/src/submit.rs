@@ -4262,7 +4262,14 @@ mod tests {
         #[tokio::test]
         #[serial_test::serial]
         async fn initial_and_recovery_simulates_retry_busy() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             stellar_agent_test_support::keyring_mock::install().unwrap();
@@ -4343,7 +4350,14 @@ mod tests {
         #[tokio::test]
         #[serial_test::serial]
         async fn multicall_secondary_is_bounded() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             stellar_agent_test_support::keyring_mock::install().unwrap();
@@ -4395,7 +4409,14 @@ mod tests {
         #[tokio::test]
         #[serial_test::serial]
         async fn deadline_after_a_busy_sleep_keeps_the_stage_error() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             stellar_agent_test_support::keyring_mock::install().unwrap();

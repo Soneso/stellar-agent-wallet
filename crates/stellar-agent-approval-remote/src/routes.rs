@@ -2222,7 +2222,14 @@ mod tests {
     #[test]
     #[serial]
     fn a_refused_destination_is_rejected_remotely_and_never_approved() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {

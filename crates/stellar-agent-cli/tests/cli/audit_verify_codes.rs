@@ -1,6 +1,5 @@
 //! Audit verification exposes the verifier code in the binary envelope.
 
-use std::process::Command;
 use stellar_agent_core::audit_log::{
     entry::{AuditEntry, NewToolInvocation},
     schema::PolicyDecision,
@@ -9,7 +8,7 @@ use stellar_agent_core::audit_log::{
 
 #[test]
 fn tampered_log_exits_1_with_chain_broken_code() -> Result<(), Box<dyn std::error::Error>> {
-    let dir = tempfile::tempdir()?;
+    let dir = stellar_agent_test_support::sandbox::StateSandbox::new()?;
     let path = dir.path().join("audit.jsonl");
     {
         let mut writer = AuditWriter::open(path.clone(), None)?;
@@ -34,12 +33,15 @@ fn tampered_log_exits_1_with_chain_broken_code() -> Result<(), Box<dyn std::erro
         .map(serde_json::to_string)
         .collect::<Result<Vec<_>, _>>()?;
     std::fs::write(&path, tampered.join("\n") + "\n")?;
-    let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-        .args(["audit", "verify"])
-        .arg(&path)
-        .env("STELLAR_AGENT_HOME", dir.path())
-        .env_remove("STELLAR_AGENT_PROFILE")
-        .output()?;
+    let output = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        dir.path(),
+    )?
+    .args(["audit", "verify"])
+    .arg(&path)
+    .env("STELLAR_AGENT_HOME", dir.path())
+    .env_remove("STELLAR_AGENT_PROFILE")
+    .output()?;
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     let envelope: serde_json::Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(

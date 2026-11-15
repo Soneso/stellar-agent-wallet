@@ -38,7 +38,6 @@
 )]
 
 use std::path::Path;
-use std::process::Command;
 
 use serde_json::Value;
 use stellar_agent_core::profile::loader::save_new_to_dir;
@@ -95,8 +94,8 @@ impl Run {
 
 fn run_cli(home: &Path, env_profile: Option<&str>, args: &[&str]) -> Run {
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
-    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
-    let mut command = Command::new(bin_path);
+    let mut command = stellar_agent_test_support::cli_child::cli_command(bin_path, home)
+        .expect("isolated CLI child");
     command
         .args(args)
         .env("STELLAR_AGENT_HOME", home)
@@ -219,7 +218,7 @@ fn assert_refused_without_naming(run: &Run, verb: &str, profile: &str) {
 #[test]
 fn a_profile_named_by_the_flag_that_has_no_file_is_refused() {
     for (verb, argv) in SYNTHESIS_BACKED_VERBS {
-        let home = tempfile::tempdir().expect("temp home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
         let mut args = argv.to_vec();
         args.extend_from_slice(&["--profile", ABSENT_PROFILE]);
 
@@ -231,7 +230,7 @@ fn a_profile_named_by_the_flag_that_has_no_file_is_refused() {
 #[test]
 fn a_profile_named_by_the_environment_variable_that_has_no_file_is_refused() {
     for (verb, argv) in SYNTHESIS_BACKED_VERBS {
-        let home = tempfile::tempdir().expect("temp home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
 
         let run = run_cli(home.path(), Some(ABSENT_PROFILE), argv);
         assert_refused_without_naming(&run, verb, ABSENT_PROFILE);
@@ -246,7 +245,7 @@ fn a_profile_named_by_the_environment_variable_that_has_no_file_is_refused() {
 #[test]
 fn an_explicitly_named_default_with_no_file_is_refused() {
     for (verb, argv) in SYNTHESIS_BACKED_VERBS {
-        let home = tempfile::tempdir().expect("temp home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
         let mut args = argv.to_vec();
         args.extend_from_slice(&["--profile", "default"]);
 
@@ -260,7 +259,7 @@ fn an_explicitly_named_default_with_no_file_is_refused() {
 #[test]
 fn a_default_named_by_the_environment_variable_with_no_file_is_refused() {
     for (verb, argv) in SYNTHESIS_BACKED_VERBS {
-        let home = tempfile::tempdir().expect("temp home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
 
         let run = run_cli(home.path(), Some("default"), argv);
         assert_refused_without_naming(&run, verb, "default");
@@ -280,7 +279,7 @@ fn a_default_named_by_the_environment_variable_with_no_file_is_refused() {
 #[test]
 fn no_profile_named_and_no_default_file_still_synthesizes() {
     for (verb, argv) in SYNTHESIS_BACKED_VERBS {
-        let home = tempfile::tempdir().expect("temp home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
 
         let run = run_cli(home.path(), None, argv);
         assert_ne!(
@@ -315,7 +314,7 @@ fn no_profile_named_and_no_default_file_still_synthesizes() {
 #[test]
 fn a_stale_environment_variable_refuses_instead_of_synthesizing() {
     for (verb, argv) in SYNTHESIS_BACKED_VERBS {
-        let home = tempfile::tempdir().expect("temp home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
         write_profile(home.path(), "i112-the-real-profile");
 
         let run = run_cli(home.path(), Some(ABSENT_PROFILE), argv);
@@ -346,7 +345,7 @@ fn the_flag_beats_the_variable_at_the_verbs_own_load() {
     for (verb, argv) in SYNTHESIS_BACKED_VERBS {
         // The flag names an absent profile, the variable names one that
         // exists: the flag must win, so the run refuses naming the flag's.
-        let home = tempfile::tempdir().expect("temp home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
         write_profile(home.path(), "i112-present");
         let mut args = argv.to_vec();
         args.extend_from_slice(&["--profile", ABSENT_PROFILE]);
@@ -362,7 +361,7 @@ fn the_flag_beats_the_variable_at_the_verbs_own_load() {
 
         // The mirror image: the flag names one that exists, the variable an
         // absent one. The flag must win again, so the run loads and proceeds.
-        let home = tempfile::tempdir().expect("temp home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
         write_profile(home.path(), "i112-present");
         let mut args = argv.to_vec();
         args.extend_from_slice(&["--profile", "i112-present"]);
@@ -385,7 +384,7 @@ fn the_flag_beats_the_variable_at_the_verbs_own_load() {
 #[test]
 fn a_named_profile_with_a_file_is_loaded() {
     for (verb, argv) in SYNTHESIS_BACKED_VERBS {
-        let home = tempfile::tempdir().expect("temp home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
         write_profile(home.path(), "i112-present");
         let mut args = argv.to_vec();
         args.extend_from_slice(&["--profile", "i112-present"]);

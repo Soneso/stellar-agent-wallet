@@ -404,7 +404,13 @@ mod tests {
             Arc,
             atomic::{AtomicUsize, Ordering},
         };
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let reads = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&reads);

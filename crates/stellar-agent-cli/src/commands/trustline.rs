@@ -1773,7 +1773,13 @@ pub(crate) mod tests {
     /// code, the rendered envelope, the requests the endpoint received and
     /// the initializer's calls.
     async fn run_unpersisted_mainnet() -> (i32, serde_json::Value, usize, usize) {
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let _env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         let calls = std::rc::Rc::new(std::cell::Cell::new(0));
@@ -1876,7 +1882,13 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn run_initialises_keyring_store_before_signer_resolution() {
-        let home = tempfile::tempdir().expect("home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -2025,7 +2037,13 @@ pub(crate) mod tests {
     /// mocked endpoint, under a profile fee cap of 1000 stroops, and returns
     /// the one envelope it printed and the methods the endpoint received.
     async fn run_with_fee(name: &str, fee: &str) -> (serde_json::Value, Vec<String>) {
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let rpc = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
@@ -2166,7 +2184,13 @@ pub(crate) mod tests {
     ) -> std::time::Duration {
         const SEED: [u8; 32] = [0x5c; 32];
 
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let from = stellar_agent_test_support::signed_envelope::account_id_for_seed(SEED);
         let mut profile =
@@ -2297,11 +2321,17 @@ pub(crate) mod tests {
     ) -> (
         Profile,
         String,
-        tempfile::TempDir,
+        stellar_agent_test_support::sandbox::StateSandbox,
         stellar_agent_test_support::StellarAgentHomeGuard,
     ) {
         const SEED: [u8; 32] = [0x5d; 32];
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let home_guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let from = stellar_agent_test_support::signed_envelope::account_id_for_seed(SEED);
         let mut profile = Profile::builder_testnet_named(name, "svc-endpoint", &from, "n", "a")
@@ -2601,7 +2631,13 @@ pub(crate) mod tests {
             const FROM: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
             const ISSUER: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
 
-            let home = tempfile::tempdir().unwrap();
+            let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                home.path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
             let rpc = wiremock::MockServer::start().await;
             wiremock::Mock::given(wiremock::matchers::method("POST"))

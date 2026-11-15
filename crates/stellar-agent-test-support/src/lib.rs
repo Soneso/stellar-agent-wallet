@@ -61,6 +61,7 @@
 
 #[cfg(feature = "test-helpers")]
 pub mod auth_tree_rpc;
+pub mod cli_child;
 pub mod connection_counter;
 #[cfg(feature = "wiremock-helpers")]
 pub mod echo_id_responder;

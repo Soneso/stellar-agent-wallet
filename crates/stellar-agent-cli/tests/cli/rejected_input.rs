@@ -2,14 +2,14 @@
 #![allow(clippy::expect_used, reason = "test assertions")]
 
 use serde_json::Value;
-use std::process::{Command, Output};
+use std::process::Output;
 use stellar_agent_test_support::rejected_value::{CREDENTIAL_MARKER, assert_no_marker_in_text};
 
 const HEADLESS_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
 
 fn run(home: &std::path::Path, args: &[&str]) -> Output {
-    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
-    Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
+    stellar_agent_test_support::cli_child::cli_command(env!("CARGO_BIN_EXE_stellar-agent"), home)
+        .expect("isolated CLI child")
         .args(args)
         .env("STELLAR_AGENT_HOME", home)
         .env_remove("STELLAR_AGENT_PROFILE")
@@ -30,7 +30,7 @@ fn assert_refusal(output: &Output, code: &str, message: &str) {
 }
 #[test]
 fn rejected_input_cli_install() {
-    let home = tempfile::tempdir().expect("home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
     let publisher = stellar_strkey::ed25519::PublicKey([1; 32]).to_string();
     let signature = "0".repeat(128);
     let invalid_signature = format!("CREDMARKER7{}", "0".repeat(117));
@@ -98,7 +98,7 @@ fn rejected_input_cli_install() {
 }
 #[test]
 fn rejected_input_cli_friendbot_network() {
-    let home = tempfile::tempdir().expect("home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
     assert_refusal(
         &run(
             home.path(),
@@ -117,7 +117,7 @@ fn rejected_input_cli_friendbot_network() {
 #[test]
 fn rejected_input_cli_policy_and_context() {
     use stellar_agent_core::profile::{loader::save_to_dir, schema::Profile};
-    let home = tempfile::tempdir().expect("home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
     let name = "marker-test";
     let profile = Profile::builder_testnet_named(name, "signer", "account", "nonce", "account")
         .with_noop_engine()

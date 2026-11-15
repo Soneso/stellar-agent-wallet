@@ -6,13 +6,18 @@
     reason = "test assertions require a running binary"
 )]
 mod tests {
-    use std::process::Command;
 
     fn assert_version(flag: &str) {
-        let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-            .arg(flag)
-            .output()
-            .expect("CLI binary runs");
+        let child_sandbox =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect("sandbox");
+        let output = stellar_agent_test_support::cli_child::cli_command(
+            env!("CARGO_BIN_EXE_stellar-agent"),
+            child_sandbox.path(),
+        )
+        .expect("isolated CLI child")
+        .arg(flag)
+        .output()
+        .expect("CLI binary runs");
         assert!(output.status.success(), "{flag}: {:?}", output.status);
         assert!(output.stderr.is_empty(), "{flag}: {:?}", output.stderr);
         let stdout = String::from_utf8(output.stdout).expect("version output is UTF-8");

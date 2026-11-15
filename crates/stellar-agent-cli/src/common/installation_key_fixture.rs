@@ -12,14 +12,20 @@ pub(crate) struct InstallationKeyFixture {
     entry: keyring_core::Entry,
     expected_value: String,
     _home: stellar_agent_test_support::StellarAgentHomeGuard,
-    dir: tempfile::TempDir,
+    dir: stellar_agent_test_support::sandbox::StateSandbox,
 }
 
 #[allow(clippy::unwrap_used, reason = "test-only fixture assertions")]
 impl InstallationKeyFixture {
     pub(crate) fn new(service: &str) -> Self {
         crate::common::render::take_rendered_for_test();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let mut coordinate = KeyringEntryRef::toolset_pin_key();

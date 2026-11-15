@@ -863,16 +863,6 @@ mod tests {
         use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
         use clap::Parser as _;
 
-        struct KeepMock;
-        impl Drop for KeepMock {
-            fn drop(&mut self) {
-                stellar_agent_network::keyring::KEEP_REGISTERED_STORE
-                    .store(false, std::sync::atomic::Ordering::SeqCst);
-            }
-        }
-        stellar_agent_network::keyring::KEEP_REGISTERED_STORE
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        let _mock = KeepMock;
         let fixture = MainnetConsentFixture::new(name);
         let key = &fixture.profile().audit_log_hash_chain_key_id;
         keyring_core::Entry::new(&key.service, &key.account)

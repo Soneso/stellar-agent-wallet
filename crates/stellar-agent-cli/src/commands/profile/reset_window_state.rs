@@ -637,11 +637,10 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn reset_window_state_nonexistent_profile_returns_exit_1() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let args = ResetWindowStateArgs {
             name: Some("__nonexistent_reset_window_state__".to_owned()),
             profile: None,
@@ -650,6 +649,10 @@ mod tests {
         };
         let code = run(&args).await;
         assert_eq!(code, 1);
+        fixture.assert_refusal(
+            Some("validation.profile_not_found"),
+            &["the requested profile was not found"],
+        );
     }
 
     #[test]
@@ -663,7 +666,13 @@ mod tests {
         };
         use stellar_agent_core::profile::schema::{Profile, generation_account};
         stellar_agent_test_support::keyring_mock::install().unwrap();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let profile =
             Profile::builder_testnet_named("reset-anchor", "signer", "account", "nonce", "account")
@@ -785,7 +794,13 @@ mod tests {
         };
         use stellar_agent_test_support::keyring_mock::{ReadHook, install_with_read_hooks};
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let name = "reset-nonce-lock";
         let profile = Profile::builder_testnet_named(name, "signer", "account", "nonce", "account")

@@ -1976,7 +1976,14 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn muxed_approval_shows_base_account() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let key = [0xAE; 32];
         let g = format!("{}", stellar_strkey::ed25519::PublicKey(key));

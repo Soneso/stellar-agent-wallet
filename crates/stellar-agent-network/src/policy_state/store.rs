@@ -14979,7 +14979,14 @@ mod tests {
     #[test]
     #[serial]
     fn recovery_expiry_receipt_flag_replays_after_crash() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         use super::super::operations::tests::{
             Checked, Fx, checked_transition, commit_on, decided_attempt, envelope_id,
@@ -15068,7 +15075,14 @@ mod tests {
     #[test]
     #[serial]
     fn recovery_projection_acknowledgement_survives_commit_point() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         use super::super::operations::tests::{
             Checked, Fx, accounting_state, commit_checked, envelope_id,
@@ -15132,7 +15146,14 @@ mod tests {
     #[test]
     #[serial]
     fn recovery_projection_heals_late_expiry_write() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         use super::super::operations::tests::{
             Fx, Sink, accounting_state, decide, decided_attempt, envelope_id, expire_reservation,
@@ -15229,7 +15250,14 @@ mod tests {
     #[test]
     #[serial]
     fn an_expiry_commits_before_its_receipt_projection() {
-        let guard_home = tempfile::tempdir().unwrap();
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
@@ -20181,7 +20209,14 @@ mod tests {
         #[test]
         #[serial]
         fn an_operator_clear_keeps_the_total_debit() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-clear");
@@ -20217,7 +20252,14 @@ mod tests {
         #[test]
         #[serial]
         fn an_unsent_reservation_releases_only_its_own_total() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-unsent");
@@ -20351,7 +20393,14 @@ mod tests {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
             let _storage_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             if let Some(role) = std::env::var_os(TWO_PROCESS_ROLE) {
@@ -20407,7 +20456,14 @@ mod tests {
         #[test]
         #[serial]
         fn two_spellings_in_one_batch_share_one_allocation() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-batch-spellings");
@@ -20439,7 +20495,14 @@ mod tests {
         #[test]
         #[serial]
         fn pre_exposure_cancellation_keeps_the_total() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-cancel");
@@ -20494,7 +20557,14 @@ mod tests {
         #[test]
         #[serial]
         fn a_row_sum_overflow_refuses() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-row-overflow");
@@ -20510,7 +20580,14 @@ mod tests {
         #[test]
         #[serial]
         fn a_hold_sum_overflow_refuses() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-hold-overflow");
@@ -20528,7 +20605,14 @@ mod tests {
         #[test]
         #[serial]
         fn record_and_persist_refuses_a_total_entry() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-unconditional");
@@ -20551,7 +20635,14 @@ mod tests {
         #[test]
         #[serial]
         fn record_authorized_admits_a_total_once() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-authorized");
@@ -20566,7 +20657,14 @@ mod tests {
         #[test]
         #[serial]
         fn a_total_admission_binds_the_pin() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-bind");
@@ -20600,7 +20698,14 @@ mod tests {
         #[test]
         #[serial]
         fn negative_incoming_totals_refuse() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-negative");
@@ -20630,7 +20735,14 @@ mod tests {
         #[test]
         #[serial]
         fn the_successor_is_validated_before_commit() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-validate");
@@ -20659,7 +20771,14 @@ mod tests {
         #[test]
         #[serial]
         fn an_admission_overflow_refuses() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-admit-overflow");
@@ -20674,7 +20793,14 @@ mod tests {
         #[test]
         #[serial]
         fn a_mixed_digest_batch_accumulates_per_digest() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-mixed");
@@ -20684,7 +20810,14 @@ mod tests {
         #[test]
         #[serial]
         fn same_digest_batch_cannot_overshoot() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-batch");
@@ -20735,7 +20868,14 @@ mod tests {
         #[test]
         #[serial]
         fn post_confirm_recording_skips_total_entries() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             const CHILD: &str = "STELLAR_AGENT_TOTAL_BUDGET_CHILD";
@@ -20818,7 +20958,14 @@ mod tests {
         #[test]
         #[serial]
         fn a_negative_stored_total_never_lowers_the_reported_use() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-stored-negative-use");
@@ -20845,7 +20992,14 @@ mod tests {
         #[test]
         #[serial]
         fn a_negative_stored_total_refuses_only_its_bucket() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-stored-negative");
@@ -20910,7 +21064,14 @@ mod tests {
         #[test]
         #[serial]
         fn new_fields_need_version_twelve() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-below-twelve");
@@ -20978,7 +21139,14 @@ mod tests {
         #[test]
         #[serial]
         fn prepared_successors_validate_before_writing() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-prepared");
@@ -21055,7 +21223,14 @@ mod tests {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
             let _storage_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let (f, total) = total_reset_fixture();
@@ -21141,7 +21316,14 @@ mod tests {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
             let _storage_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             for seam in [
@@ -21198,7 +21380,14 @@ mod tests {
         #[test]
         #[serial]
         fn a_pin_advanced_before_upgrade_moves_nothing() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-pin-advanced");
@@ -21217,7 +21406,14 @@ mod tests {
         #[test]
         #[serial]
         fn pruned_earlier_history_retires_the_digest() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-pruned");
@@ -21236,7 +21432,14 @@ mod tests {
         #[test]
         #[serial]
         fn a_new_digest_admits_after_retirement() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-new-digest");
@@ -21250,7 +21453,14 @@ mod tests {
         #[test]
         #[serial]
         fn retirement_is_written_once() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-once");
@@ -21273,7 +21483,14 @@ mod tests {
         #[test]
         #[serial]
         fn retirement_survives_a_commit_fault() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             for seam in [
@@ -21316,7 +21533,14 @@ mod tests {
         #[test]
         #[serial]
         fn earlier_history_without_a_pin_refuses() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-no-pin");
@@ -21347,7 +21571,14 @@ mod tests {
         #[test]
         #[serial]
         fn retirement_leaves_the_original_untouched() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-original");
@@ -21385,7 +21616,14 @@ mod tests {
         #[test]
         #[serial]
         fn retirement_rereads_under_the_lock() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-reread");
@@ -21436,7 +21674,14 @@ mod tests {
         #[test]
         #[serial]
         fn this_build_always_writes_version_twelve() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-twelve");
@@ -21520,7 +21765,14 @@ mod tests {
         #[test]
         #[serial]
         fn an_older_reader_refuses_version_twelve() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             const OLDER_MAX: u32 = 11;
@@ -22092,7 +22344,14 @@ mod tests {
         #[test]
         #[serial]
         fn retirement_refuses_every_total_admission() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-retired-writers");
@@ -22123,7 +22382,14 @@ mod tests {
         #[test]
         #[serial]
         fn retirement_survives_pruning() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-retired-pruned");
@@ -22244,7 +22510,14 @@ mod tests {
         #[test]
         #[serial]
         fn record_and_persist_refuses_a_total_limit_on_a_windowed_key() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("shape-persist-limit");
@@ -22259,7 +22532,14 @@ mod tests {
         #[test]
         #[serial]
         fn record_and_persist_refuses_an_amount_limit_on_a_total_key() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("shape-persist-key");
@@ -22274,7 +22554,14 @@ mod tests {
         #[test]
         #[serial]
         fn record_authorized_refuses_a_total_limit_on_a_windowed_key() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("shape-authorized-limit");
@@ -22285,7 +22572,14 @@ mod tests {
         #[test]
         #[serial]
         fn record_authorized_refuses_an_amount_limit_on_a_total_key() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("shape-authorized-key");
@@ -22296,7 +22590,14 @@ mod tests {
         #[test]
         #[serial]
         fn record_pending_refuses_a_total_limit_on_a_windowed_key() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("shape-pending-limit");
@@ -22307,7 +22608,14 @@ mod tests {
         #[test]
         #[serial]
         fn record_pending_refuses_an_amount_limit_on_a_total_key() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("shape-pending-key");
@@ -22318,7 +22626,14 @@ mod tests {
         #[test]
         #[serial]
         fn record_pending_linked_refuses_a_total_limit_on_a_windowed_key() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("shape-linked-limit");
@@ -22338,7 +22653,14 @@ mod tests {
         #[test]
         #[serial]
         fn record_pending_linked_refuses_an_amount_limit_on_a_total_key() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("shape-linked-key");
@@ -22358,7 +22680,14 @@ mod tests {
         #[test]
         #[serial]
         fn a_signed_intent_refuses_a_total_limit_on_a_windowed_key() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("shape-intent-limit");
@@ -22373,7 +22702,14 @@ mod tests {
         #[test]
         #[serial]
         fn a_signed_intent_refuses_an_amount_limit_on_a_total_key() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("shape-intent-key");
@@ -22388,7 +22724,14 @@ mod tests {
         #[test]
         #[serial]
         fn a_total_entry_needs_its_epoch() {
-            let guard_home = tempfile::tempdir().unwrap();
+            let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                guard_home
+                    .path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("shape-epoch");

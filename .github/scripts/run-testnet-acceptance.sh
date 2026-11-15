@@ -23,11 +23,11 @@
 #                   encrypted headless store with a key generated for this
 #                   run, so no suite reaches the machine's own keyring.
 #   STELLAR_AGENT_TEST_KEYRING
-#                   platform or unset. With platform, the driver unsets
+#                   headless (the default) or platform. With platform, the driver unsets
 #                   STELLAR_AGENT_KEYRING_BACKEND and
 #                   STELLAR_AGENT_HEADLESS_KEYRING_KEY and skips the headless
-#                   default, so the spawned binary uses the platform keyring
-#                   of the session. Any other value, the empty one included,
+#                   default. Declared native routes use the session keyring;
+#                   fixture routes retain their own stores. Any other value, the empty one included,
 #                   fails the run before the first suite.
 #   MAINNET_WRITE   on or off (default off). With on, every suite of a crate
 #                   that declares a mainnet-write feature builds with that
@@ -86,14 +86,8 @@ STELLAR_AGENT_HOME=$(mktemp -d "$storage_root/acceptance.XXXXXX")
 touch "$STELLAR_AGENT_HOME/.stellar-agent-test-sandbox"
 export STELLAR_AGENT_HOME
 
-# The suites spawn the real binary, which reads its audit keys, window-state
-# generation counters and tip anchors from the OS keyring. On macOS that is
-# the login Keychain, and an unsigned development build is a program the
-# Keychain has not seen before, so it asks the person at the machine for
-# access, once per item per build, and waits for an answer that an unattended
-# run never gives. The encrypted headless store needs no such permission.
-# An environment that already selects a backend keeps it, and
-# STELLAR_AGENT_TEST_KEYRING=platform selects the platform keyring instead.
+# Native-capable routes use the selected headless or platform store.
+# Other suites retain their explicit fixture storage.
 if [ "${STELLAR_AGENT_TEST_KEYRING-}" = platform ]; then
   unset STELLAR_AGENT_KEYRING_BACKEND STELLAR_AGENT_HEADLESS_KEYRING_KEY
   export STELLAR_AGENT_TEST_LIVE_PLATFORM_KEYRING=real-platform-keyring
@@ -172,25 +166,97 @@ check_mainnet_write() {
   return 1
 }
 
-# Refuses a set STELLAR_AGENT_TEST_KEYRING other than platform, so a
+# Refuses an unknown STELLAR_AGENT_TEST_KEYRING selection, so a
 # misspelled value never runs the leg against a keyring the caller did not
 # ask for.
 check_test_keyring() {
-  if [ -z "${STELLAR_AGENT_TEST_KEYRING+set}" ] || [ "$STELLAR_AGENT_TEST_KEYRING" = platform ]; then
+  if [ "${STELLAR_AGENT_TEST_KEYRING-headless}" = headless ] || [ "${STELLAR_AGENT_TEST_KEYRING-}" = platform ]; then
     return 0
   fi
-  echo "error: STELLAR_AGENT_TEST_KEYRING must be platform or unset, not '${STELLAR_AGENT_TEST_KEYRING}'" >&2
+  echo "error: STELLAR_AGENT_TEST_KEYRING must be headless, platform or unset, not '${STELLAR_AGENT_TEST_KEYRING}'" >&2
   return 1
 }
 
-# Prints the --features list of one suite: the suite's feature, preceded by
-# mainnet-write when MAINNET_WRITE is on and the crate's manifest declares a
-# mainnet-write feature. A crate without that feature has no mainnet-write
-# gate of its own, and naming the feature would fail its build.
+# Audited storage routes; a crate feature alone does not grant native access.
+suite_storage() {
+  case "$1/$2" in
+    stellar-agent-sep10/sep10_round_trip_testnet_acceptance) echo no-keyring ;;
+    stellar-agent-sep10/sep10_replay_adversarial) echo no-keyring ;;
+    stellar-agent-sep43/sep43_sdk_v17_interop_testnet_acceptance) echo no-keyring ;;
+    stellar-agent-sep48/sep48_preview_testnet_acceptance) echo no-keyring ;;
+    stellar-agent-sep7/sep7_testnet_acceptance) echo no-keyring ;;
+    stellar-agent-anchor/anchor_testnet_acceptance) echo no-keyring ;;
+    stellar-agent-x402-identity/sep10_gate_testnet_acceptance) echo no-keyring ;;
+    stellar-agent-network/fee_bump_testnet) echo no-keyring ;;
+    stellar-agent-network/fee_bump_idempotent_testnet) echo no-keyring ;;
+    stellar-agent-pool/pool_testnet_init) echo fixture ;;
+    stellar-agent-pool/pool_concurrent_testnet) echo fixture ;;
+    stellar-agent-pool/load_testnet) echo fixture ;;
+    stellar-agent-stablecoin/trustline_testnet_acceptance) echo no-keyring ;;
+    stellar-agent-x402/x402_exact_testnet_acceptance) echo no-keyring ;;
+    stellar-agent-mpp/sponsored_testnet_acceptance) echo fixture ;;
+    stellar-agent-dex/dex_swap_testnet_acceptance) echo no-keyring ;;
+    stellar-agent-defindex/defindex_vault_testnet_acceptance) echo no-keyring ;;
+    stellar-agent-defindex/defindex_deposit_submit_testnet_acceptance) echo no-keyring ;;
+    stellar-agent-mcp/pay_commit_testnet_acceptance) echo fixture ;;
+    stellar-agent-mcp/create_account_testnet_acceptance) echo fixture ;;
+    stellar-agent-mcp/trustline_classic_testnet_acceptance) echo fixture ;;
+    stellar-agent-mcp/policy_value_descriptor_testnet_acceptance) echo fixture ;;
+    stellar-agent-mcp/rule_create_commit_testnet_acceptance) echo fixture ;;
+    stellar-agent-mcp/sep43_sign_and_submit_transaction_testnet_acceptance) echo fixture ;;
+    stellar-agent-mcp/toolset_sign_payment_gated_testnet_acceptance) echo fixture ;;
+    stellar-agent-mcp/x402_create_payment_testnet_acceptance) echo fixture ;;
+    stellar-agent-mcp/x402_authenticated_payment_testnet_acceptance) echo fixture ;;
+    stellar-agent-mcp/claim_commit_testnet_acceptance) echo fixture ;;
+    stellar-agent-mcp/approve_serve_testnet_acceptance) echo fixture ;;
+    stellar-agent-mcp/dex_quote_wire_testnet_acceptance) echo fixture ;;
+    stellar-agent-cli/claim_testnet_acceptance) echo native-capable ;;
+    stellar-agent-cli/pay_policy_v1_testnet_acceptance) echo native-capable ;;
+    stellar-agent-cli/pay_timeout_reconcile_testnet_acceptance) echo native-capable ;;
+    stellar-agent-cli/cli_submit_only_network_binding_testnet_acceptance) echo native-capable ;;
+    stellar-agent-cli/profile_init_enroll_signer_testnet_acceptance) echo native-capable ;;
+    stellar-agent-cli/smart_account_execute_testnet_acceptance) echo native-capable ;;
+    stellar-agent-cli/smart_account_multicall_cli_testnet_acceptance) echo fixture ;;
+    stellar-agent-cli/cap85_external_ref_cli_testnet_acceptance) echo native-capable ;;
+    stellar-agent-smart-account/deploy_c_testnet_acceptance) echo no-keyring ;;
+    stellar-agent-smart-account/quorum_authorization_info_testnet_acceptance) echo fixture ;;
+    stellar-agent-smart-account/smart_account_caps_testnet_acceptance) echo fixture ;;
+    stellar-agent-smart-account/smart_account_signers_testnet_acceptance) echo fixture ;;
+    stellar-agent-smart-account/smart_account_rules_testnet_acceptance) echo fixture ;;
+    stellar-agent-smart-account/smart_account_rules_pinning_testnet_acceptance) echo fixture ;;
+    stellar-agent-smart-account/smart_account_list_rules_testnet_acceptance) echo fixture ;;
+    stellar-agent-smart-account/smart_account_policy_mutators_testnet_acceptance) echo fixture ;;
+    stellar-agent-smart-account/smart_account_session_rule_expiry_testnet_acceptance) echo fixture ;;
+    stellar-agent-smart-account/smart_account_session_rule_horizon_testnet_acceptance) echo fixture ;;
+    stellar-agent-smart-account/smart_account_sim_audit_testnet_acceptance) echo fixture ;;
+    stellar-agent-smart-account/smart_account_migrate_verifier_testnet_acceptance) echo fixture ;;
+    stellar-agent-smart-account-acceptance/cap85_external_ref_testnet_acceptance) echo fixture ;;
+    stellar-agent-smart-account/smart_account_multicall_testnet_acceptance) echo fixture ;;
+    stellar-agent-smart-account/smart_account_timelock_testnet_acceptance) echo fixture ;;
+    stellar-agent-smart-account-acceptance/smart_account_rules_webauthn_testnet_acceptance) echo fixture ;;
+    stellar-agent-smart-account/smart_account_delegation_testnet_acceptance) echo fixture ;;
+    stellar-agent-smart-account-acceptance/smart_account_policy_observability_testnet_acceptance) echo fixture ;;
+    stellar-agent-smart-account-acceptance/smart_account_ergonomics_testnet_acceptance) echo fixture ;;
+    stellar-agent-approval-remote/operator_enroll_browser_acceptance) echo fixture ;;
+    stellar-agent-approval-remote/mainnet_presence_browser_acceptance) echo fixture ;;
+    stellar-agent-approval-remote/remote_approval_browser_testnet_acceptance) echo fixture ;;
+    stellar-agent-approval-remote/rule_proposal_remote_browser_testnet_acceptance) echo fixture ;;
+    *) echo "error: unclassified acceptance suite $1/$2" >&2; return 1 ;;
+  esac
+}
+
+# Prints each suite's features for the selected mainnet and storage modes.
 suite_features() {
-  local crate="$1" feature="$2"
-  if [ "${STELLAR_AGENT_TEST_KEYRING-}" = platform ] && grep -qE '^live-platform-keyring *=' "crates/$crate/Cargo.toml"; then
-    feature="$feature,live-platform-keyring"
+  local crate="$1" feature="$2" target="$3" storage
+  storage=$(suite_storage "$crate" "$target") || return 1
+  if [ "$storage" = native-capable ]; then
+    if ! grep -qE '^live-platform-keyring *=' "crates/$crate/Cargo.toml"; then
+      echo "error: native suite $crate/$target lacks live-platform-keyring" >&2
+      return 1
+    fi
+    if [ "${STELLAR_AGENT_TEST_KEYRING-headless}" = platform ]; then
+      feature="$feature,live-platform-keyring"
+    fi
   fi
   if [ "$MAINNET_WRITE" = "on" ] && grep -qE '^mainnet-write *=' "crates/$crate/Cargo.toml"; then
     printf 'mainnet-write,%s\n' "$feature"
@@ -314,7 +380,7 @@ in_share() {
 # suite runs.
 run_suite() {
   local crate="$1" feature="$2" target="$3" features log status summary executed deterministic tmp_root start
-  features=$(suite_features "$crate" "$feature")
+  features=$(suite_features "$crate" "$feature" "$target") || return 3
   tmp_root=${TMPDIR:-/tmp}
   log=$(mktemp "${tmp_root%/}/run-testnet-acceptance.XXXXXX")
   start=$SECONDS
@@ -379,6 +445,7 @@ main() {
   local matched=0 index
   for line in "${SUITES[@]}"; do
     read -r crate feature target <<< "$line"
+    suite_features "$crate" "$feature" "$target" > /dev/null || exit 3
     if [[ "$crate/$target" == *"$FILTER"* ]]; then matched=1; fi
   done
   if [ "$matched" -eq 0 ]; then
@@ -407,7 +474,7 @@ main() {
       sleep "$PACE"
     fi
     ran=$((ran + 1))
-    echo "::group::$suite"
+    echo "::group::$suite [storage=$(suite_storage "$crate" "$target")]"
     run_suite "$crate" "$feature" "$target"
     rc=$?
     attempts=1
