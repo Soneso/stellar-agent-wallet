@@ -138,7 +138,9 @@
 //! advancement. Key rotation fences the queue until the owner and both evidence
 //! copies are durable under the stored key. Records and the time floor survive.
 //! Admission reserves one of 4,096 slots for each authenticated approval lifetime.
-//! Appenders bind Queued references; anchored writers alone create Delivered evidence.
+//! Appenders bind Queued references; anchored writers alone transition Queued records to Delivered.
+//! Pin adoption replaces one migration pin with Delivered evidence of a caller-verified reference.
+//! Bindings carry the authenticated source image; verification authenticates it and repairs nothing.
 
 pub mod binding;
 mod carriers;

@@ -1,0 +1,2 @@
+- Adopt a migration pin as Delivered consent evidence of a caller-verified queue reference, with exact retries and `missing migration pin` for an absent proof.
+- Authenticate consent evidence during carrier binding and `audit verify`. A binding commits a newer source image before staging it, and verification refuses a pending image with `owner recommit required` without repairing it.
