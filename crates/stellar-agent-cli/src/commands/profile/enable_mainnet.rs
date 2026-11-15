@@ -28,6 +28,14 @@
 //! body, `verified` when the verified load passed and `unavailable`
 //! otherwise, and `null` when no signed body was read. `--check` and
 //! `--state` write no preview.
+//! `--check` reads the window state authenticated and without writes; a
+//! failed authenticated read fails the `total_budget_usage` check. Its
+//! `total_budget_usage` member lists each signed total-budget bound with its
+//! committed use and remaining amount in decimal stroops. It is `[]` when
+//! the current pinned body has no bound and the usage read succeeds, and
+//! `null` whenever the use is unknown, including a failed usage read such as
+//! a retired digest. The check then explains the reason in `detail` and
+//! includes `code` when available.
 //!
 //! The ceremony writes the spending preview to stderr as one JSON line
 //! before its first write: the bounds of the rebound body with
@@ -75,7 +83,10 @@ use stellar_agent_core::{
         v1::{
             PolicyStateStore,
             mainnet_minimum::{self, RequirementStatus},
-            presets::{AuthorityStatus, PRESET_FEE_PER_OPERATION_STROOPS, summarize},
+            presets::{
+                AuthorityStatus, PRESET_FEE_PER_OPERATION_STROOPS, TotalBound, summarize,
+                total_bounds,
+            },
             verified::{OwnerKeySource, PolicyInspection, PolicyLoad, inspect_verified_policy},
         },
     },
@@ -92,7 +103,7 @@ use stellar_agent_core::{
 };
 use stellar_agent_network::{
     keyring::{EnrolledRole, KeyringOperation, enrolled_signer, map_keyring_operation_error},
-    policy_state::PersistedWindowStore,
+    policy_state::{PersistedWindowStore, TotalUsage, TotalUsageError, WindowStoreError},
 };
 
 type Failure = (&'static str, String);
@@ -137,6 +148,7 @@ fn oracle_check(profile: &Profile) -> Check {
             Status::Failed
         },
         detail: result.err().map(|error| error.to_string()),
+        code: None,
     }
 }
 
@@ -146,6 +158,9 @@ struct Check {
     status: Status,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
+    /// The stable code of a usage failure; only the usage check sets it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'static str>,
 }
 
 fn precondition(detail: impl Into<String>) -> Failure {
@@ -361,6 +376,7 @@ pub(super) fn execute(
                 Status::Failed
             },
             detail: result.err(),
+            code: None,
         });
     };
     let disk = loader::read_mainnet_view_on_disk(name, profile_dir);
@@ -428,24 +444,21 @@ pub(super) fn execute(
         },
     );
     if args.check {
-        let state = PolicyStateStore::new();
-        let inspection = window
-            .load_into(name, profile, &state)
-            .map_err(|e| e.to_string())
-            .and_then(|()| owner.clone())
-            .map(|owner| {
-                inspect_verified_policy(
-                    &PolicyLoad {
-                        path: policy_path,
-                        profile,
-                        profile_name: name,
-                        owner_pubkey: &owner,
-                        owner_source: OwnerKeySource::Keyring,
-                        window_path: window.path(),
-                    },
-                    state,
-                )
-            });
+        // The body inspection runs on an empty memory store; the window state
+        // is read separately, authenticated and without writing.
+        let inspection = owner.clone().map(|owner| {
+            inspect_verified_policy(
+                &PolicyLoad {
+                    path: policy_path,
+                    profile,
+                    profile_name: name,
+                    owner_pubkey: &owner,
+                    owner_source: OwnerKeySource::Keyring,
+                    window_path: window.path(),
+                },
+                PolicyStateStore::new(),
+            )
+        });
         // The installed body's bounds, labeled by the outcome of its
         // verified load; `null` when no signed body was read.
         let spending_summary = inspection.as_ref().ok().and_then(|inspection| {
@@ -460,12 +473,15 @@ pub(super) fn execute(
         });
         checks.extend(inspection_checks(&inspection, name, profile, profile_dir));
         checks.push(oracle_check(profile));
+        let (total_budget_usage, usage_check) = total_budget_usage(window, profile, &inspection);
+        checks.push(usage_check);
         let valid = checks.iter().all(|c| c.status != Status::Failed);
         return Ok(serde_json::json!({
             "profile": name,
             "valid": valid,
             "checks": checks,
             "spending_summary": spending_summary,
+            "total_budget_usage": total_budget_usage,
         }));
     }
     if let Some(failed) = checks.iter().find(|check| check.status == Status::Failed) {
@@ -731,8 +747,8 @@ fn ensure_policy_pin(
 /// order.
 ///
 /// The pin check fails when the pin could not be read or the comparison
-/// refused. `inspection` is `Err` when the inspection could not run: the
-/// window state did not load or the owner key is unusable.
+/// refused. `inspection` is `Err` when the inspection could not run because
+/// the owner key is unusable.
 fn inspection_checks(
     inspection: &Result<PolicyInspection, String>,
     name: &str,
@@ -743,6 +759,7 @@ fn inspection_checks(
         item: item.into(),
         status,
         detail,
+        code: None,
     };
     let not_loaded = || Some("the verified policy did not load".to_owned());
     let mut checks = Vec::new();
@@ -876,6 +893,126 @@ fn inspection_checks(
         );
     }
     checks
+}
+
+/// The `total_budget_usage` member of `--check` and its check.
+///
+/// The authenticated window state is read first without a lock, and a failed
+/// read is a failed check. Use is reported only for the verified body whose
+/// digest the inspected pin and the pin read under the shared window lock
+/// both name, and only when that usage read succeeds. The member is then the
+/// rows, or `[]` for a body without a bound. Otherwise the member is `null`;
+/// the check explains the reason in `detail` and includes `code` when
+/// available. It is failed for a failed authenticated read and not evaluated
+/// for every other reason.
+fn total_budget_usage(
+    window: &PersistedWindowStore,
+    profile: &Profile,
+    inspection: &Result<PolicyInspection, String>,
+) -> (serde_json::Value, Check) {
+    let unavailable = |code: Option<&'static str>, text: String, failed: bool| {
+        let detail = match code {
+            Some(code) if !text.starts_with(code) => format!("{code}: {text}"),
+            _ => text,
+        };
+        let status = if failed {
+            Status::Failed
+        } else {
+            Status::NotEvaluated
+        };
+        let check = Check {
+            item: "total_budget_usage".into(),
+            status,
+            detail: Some(detail),
+            code,
+        };
+        (serde_json::Value::Null, check)
+    };
+    let refused = |error: TotalUsageError| {
+        let failed = matches!(error, TotalUsageError::State(_));
+        unavailable(Some(error.code()), error.to_string(), failed)
+    };
+    if let Err(error) = window.chain_scope(profile) {
+        return refused(TotalUsageError::State(error));
+    }
+    let (verified, document, pin) = match inspection {
+        Ok(PolicyInspection {
+            verified: Ok(verified),
+            document: Some(document),
+            pin,
+        }) => (verified, document, pin),
+        Ok(PolicyInspection {
+            verified: Err(error),
+            ..
+        }) => return unavailable(Some(error.wire_code()), error.to_string(), false),
+        _ => return unavailable(None, "the verified policy did not load".into(), false),
+    };
+    let digest = verified.digest();
+    #[cfg(test)]
+    tests::before_usage_read();
+    match pin {
+        Some(PinState::Present(pin)) if pin.digest() == digest => {}
+        Some(PinState::Present(_)) => {
+            return refused(TotalUsageError::Unavailable(
+                WindowStoreError::TotalEpochStale,
+            ));
+        }
+        _ => return refused(TotalUsageError::Policy(PolicyError::PinAbsent)),
+    }
+    let Some(bounds) = total_bounds(document, &profile.network_passphrase) else {
+        return refused(TotalUsageError::Policy(
+            PolicyError::PolicyFileParseFailed {
+                detail: "a total_budget criterion has no readable asset or amount".into(),
+            },
+        ));
+    };
+    match window.total_usage(profile, digest) {
+        Ok(usage) => match usage_rows(&bounds, &usage) {
+            Some(rows) => (
+                rows,
+                Check {
+                    item: "total_budget_usage".into(),
+                    status: Status::Passed,
+                    detail: None,
+                    code: None,
+                },
+            ),
+            None => refused(TotalUsageError::Unavailable(WindowStoreError::Invalid {
+                detail: "a total-budget remaining amount cannot be computed".into(),
+            })),
+        },
+        Err(error) => refused(error),
+    }
+}
+
+/// One row per signed bound, with the committed use of its scope and asset
+/// in decimal stroops. Remaining is zero when the use exceeds the bound; this
+/// display floor is not an admission clamp. `None` when a subtraction fails.
+fn usage_rows(bounds: &[TotalBound], usage: &[TotalUsage]) -> Option<serde_json::Value> {
+    bounds
+        .iter()
+        .map(|bound| {
+            let bucket = format!("total:{}", bound.asset);
+            let used = usage
+                .iter()
+                .find(|u| u.scope_specificity == bound.scope_specificity && u.bucket == bucket)
+                .map_or(0, |u| u.used_stroops);
+            let remaining = if used > bound.max_stroops {
+                0
+            } else {
+                bound.max_stroops.checked_sub(used)?
+            };
+            Some(serde_json::json!({
+                "asset": bound.asset,
+                "scope_specificity": bound.scope_specificity,
+                "rule_indexes": bound.rule_indexes,
+                "max_stroops": bound.max_stroops.to_string(),
+                "used_stroops": used.to_string(),
+                "remaining_stroops": remaining.to_string(),
+            }))
+        })
+        .collect::<Option<Vec<_>>>()
+        .map(serde_json::Value::from)
 }
 
 /// Writes the installation binding into the policy body.
@@ -1978,11 +2115,16 @@ mod tests {
                 .map(|r| (*r).to_owned()),
         );
         expected_items.push("oracle_provider_url".to_owned());
+        expected_items.push("total_budget_usage".to_owned());
         assert_eq!(items, expected_items);
         assert_eq!(output["valid"], false);
         for item in &expected_items {
             let (status, detail) = check_of(&output, item);
             let expected = match item.as_str() {
+                "total_budget_usage" => (
+                    "not_evaluated",
+                    Some("the verified policy did not load".to_owned()),
+                ),
                 "owner_key" | "verified_policy" | "enrolled_signer" => (
                     "failed",
                     Some(
@@ -2756,6 +2898,29 @@ mod tests {
                 summary["authority_status"],
                 if failed { "unavailable" } else { "verified" }
             );
+            // The body at sequence 7 is not the pinned authority at sequence
+            // 1, so its use is unknown; the other fields stay byte-identical.
+            let usage = data
+                .as_object_mut()
+                .unwrap()
+                .remove("total_budget_usage")
+                .unwrap();
+            assert!(usage.is_null(), "{usage}");
+            let usage_check = data["checks"].as_array_mut().unwrap().pop().unwrap();
+            assert_eq!(
+                usage_check,
+                serde_json::json!({
+                    "item": "total_budget_usage",
+                    "status": "not_evaluated",
+                    "code": if failed { "policy.sequence_rollback" } else { "policy.total_epoch_stale" },
+                    "detail": if failed {
+                        "policy.sequence_rollback"
+                    } else {
+                        "policy.total_epoch_stale: the total-budget debit was sized under a policy \
+                         other than the pinned one"
+                    },
+                })
+            );
             let envelope = Envelope::ok_with_request_id(data, "fixed-id".into());
             let mut bytes = Vec::new();
             render::render_json_to(&mut bytes, &envelope).unwrap();
@@ -2791,6 +2956,36 @@ mod tests {
         assert_eq!(persisted(&fixture), before);
         assert_eq!(fixture.pin(), pin);
         assert_eq!(get(&fixture.nonce_ref()), nonce);
+
+        assert!(output["total_budget_usage"].is_null(), "{output}");
+
+        // An earlier build's history and committed total rows are read
+        // without a retirement, a sweep, or any other write.
+        let store = PersistedWindowStore::at_path(fixture.window.clone());
+        use stellar_agent_network::policy_state::store::total_intent_test_helpers::{
+            EARLIER_BUILD_VERSION, TOTAL_INTENTS_VERSION, seal_total_rows,
+        };
+        for (version, epoch) in [
+            (EARLIER_BUILD_VERSION, None),
+            (TOTAL_INTENTS_VERSION, Some([7; 32])),
+        ] {
+            seal_total_rows(
+                &store,
+                &fixture.profile,
+                version,
+                None,
+                &[(1, "total:native", 6, epoch)],
+            );
+            let before = persisted(&fixture);
+            let output = fixture.run().unwrap();
+            assert_eq!(output["spending_summary"]["authority_status"], "verified");
+            assert!(output["total_budget_usage"].is_null(), "{output}");
+            assert!(fixture.preview.borrow().is_empty());
+            assert_eq!(persisted(&fixture), before, "version {version}");
+            assert_eq!(fixture.pin(), pin);
+            assert_eq!(get(&fixture.nonce_ref()), nonce);
+        }
+        let before = persisted(&fixture);
 
         fixture.args.check = false;
         fixture.args.state = true;
@@ -4013,4 +4208,5 @@ mod tests {
     }
 
     include!("enable_mainnet_authoring_tests.rs");
+    include!("enable_mainnet_usage_tests.rs");
 }

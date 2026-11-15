@@ -254,8 +254,9 @@ pub use store::{
     RECONCILE_MIN_AGE_MS, REPORTED_SUCCESS_CODE, RETENTION_EXPIRED_CODE, ReconcileFailure,
     ReconcileFailureKind, ReconcileReport, ReportedAnswer, ResetConsent, ResetError, ResetOutcome,
     ResetRecord, ScheduleTerminal, SettledSubmission, SignedIntentLegView, SignedIntentView,
-    StateDefect, SubmissionAnchor, SubmissionHold, UnrecordedAnswer, deliver_accounting_expiries,
-    deliver_accounting_expiry, drain_accounting_obligations, project_accounting_expiries,
+    StateDefect, SubmissionAnchor, SubmissionHold, TotalUsage, TotalUsageError, UnrecordedAnswer,
+    deliver_accounting_expiries, deliver_accounting_expiry, drain_accounting_obligations,
+    project_accounting_expiries,
 };
 
 /// Records a confirmed call's contribution into `engine`'s window state and

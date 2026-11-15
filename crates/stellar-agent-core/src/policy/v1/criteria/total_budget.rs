@@ -29,6 +29,9 @@ use crate::policy::v1::criteria::state_store::{StateKey, WindowEntry, WindowLimi
 use crate::policy::v1::value::{ValueClass, asset_normalise};
 use crate::policy::{DenyReason, PolicyError};
 
+/// The scope specificity of every total-budget bucket.
+pub const TOTAL_BUDGET_SCOPE_SPECIFICITY: u8 = 1;
+
 /// Refuses a call that would exceed the policy's total allocation of an asset.
 ///
 /// # Examples
@@ -72,7 +75,7 @@ impl TotalBudgetCriterion {
     fn state_key(&self, ctx: &EvalContext<'_>) -> StateKey {
         StateKey::new(
             ctx.profile_name,
-            1,
+            TOTAL_BUDGET_SCOPE_SPECIFICITY,
             &format!(
                 "total:{}",
                 total_budget_identity(&self.asset, &ctx.profile.network_passphrase)

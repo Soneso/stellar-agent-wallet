@@ -44,6 +44,51 @@ pub(in crate::policy_state) fn append_closed_intent(
     wire.version = WIRE_VERSION_TOTAL_INTENTS;
 }
 
+/// A committed total-budget row of a usage fixture: scope, bucket, amount,
+/// and epoch.
+pub type FixtureRow<'a> = (u8, &'a str, i128, Option<[u8; 32]>);
+
+/// Seals a committed window file for a usage fixture of `profile` at
+/// `store`: `version`, the `retired` digest, and one confirmed row per
+/// `rows` item, under a freshly minted key and generation 1.
+///
+/// # Panics
+/// Panics when the key, the file, or the counter cannot be written.
+pub fn seal_total_rows(
+    store: &PersistedWindowStore,
+    profile: &Profile,
+    version: u32,
+    retired: Option<[u8; 32]>,
+    rows: &[FixtureRow<'_>],
+) {
+    let mut wire = WireFile {
+        chain_scope: Some(ChainScope::for_chain(profile.chain_id)),
+        version,
+        generation: 1,
+        retired_total_epoch: retired,
+        ..WireFile::default()
+    };
+    for &(scope, bucket, amount, epoch) in rows {
+        find_or_insert_bucket(&mut wire.entries, &StateKey::new("", scope, bucket, 0))
+            .records
+            .push(WireRecord {
+                ts_ms: 1_700_000_000_000,
+                amount,
+                epoch,
+                ..WireRecord::confirmed_defaults()
+            });
+    }
+    let (key, _) = store.load_or_mint_key(profile).unwrap();
+    store.write_atomic(&key, &wire).unwrap();
+    write_generation(&generation_entry_ref(profile), &wire).unwrap();
+}
+
+/// The total-intents write version, for usage fixtures.
+pub const TOTAL_INTENTS_VERSION: u32 = WIRE_VERSION_TOTAL_INTENTS;
+
+/// The last version an earlier build wrote without total epochs.
+pub const EARLIER_BUILD_VERSION: u32 = WIRE_VERSION_OPERATIONS;
+
 /// Obtains a refusal from checked admission or final-envelope binding.
 /// The caller holds a marked state sandbox and the serial test lock.
 ///

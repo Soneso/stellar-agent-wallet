@@ -678,6 +678,29 @@ repeats the summary as `spending_summary`.
 `unavailable` otherwise. The summary is `null` when no signed policy was
 read. `--check` and `--state` write no preview.
 
+`--check` also adds `total_budget_usage`, the committed use of each signed
+`total_budget` bound. It first reads the window state authenticated without a
+lock. The usage read then holds the existing shared window lock across the
+pin read and a second authenticated state read. Neither read creates or
+changes a file, lock, keyring value, or counter. Each row names `asset`, `scope_specificity`, `rule_indexes`,
+`max_stroops`, `used_stroops`, and `remaining_stroops`. Amounts are exact
+decimal stroop strings. Bounds of one asset with different maxima are
+separate rows with the same use. Remaining is `"0"` when the use exceeds the
+bound; the display floor changes no admission. The use counts settled sums,
+rows, retained intent legs, and every persisted hold, including an expired
+hold that no committed sweep has removed yet. A later write's sweep can free
+that hold's capacity. The member is `[]` when the current pinned body has no
+total bound and the usage read succeeds. It is `null` when the use is
+unknown, including a failed usage read; the `total_budget_usage` check
+explains the reason in `detail` and includes `code` when available.
+Unknown use comes from a body that is not the pinned authority, a pin that
+changes during the read, an absent pin or lock file, history from a build
+before version 12, a retired digest, or an amount that cannot be summed. Those cases leave `valid` unchanged.
+An authenticated state read that fails is a failed check with its code, such
+as `policy.window_state_unverifiable`. The report is no spending authority
+and no promise about a later admission. Version 16 window state carries
+intent legs; usage adds no format version.
+
 See [the policy schema and minimum](../profiles.md#mainnet-policy-body) for
 required signed fields and rules. After enablement, complete and sign the
 policy, run `--check`, and restart the MCP server.
