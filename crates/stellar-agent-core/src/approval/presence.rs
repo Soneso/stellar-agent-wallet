@@ -787,29 +787,95 @@ pub fn mainnet_consent_subject(
     }
 }
 
-/// The entry fields every challenge and view digest binds, in order.
+/// Signed inbox fields shared by pending and durable receipt reconstruction.
+pub(crate) struct SignedEntry<'a> {
+    nonce: &'a str,
+    kind: &'a str,
+    uid: &'a str,
+    created: u64,
+    expires: u64,
+}
+
+/// Inputs to the shared receipt and challenge verifier.
+pub(crate) trait ReceiptEntry {
+    fn signed_fields(&self) -> Result<SignedEntry<'_>, WalletError>;
+    fn consent_subject(&self, binding: &AttestationBinding<'_>) -> Result<[u8; 32], WalletError>;
+}
+
+impl ReceiptEntry for PendingApproval {
+    fn signed_fields(&self) -> Result<SignedEntry<'_>, WalletError> {
+        Ok(SignedEntry {
+            nonce: &self.approval_nonce,
+            kind: self.kind.kind_name(),
+            uid: &self.process_uid,
+            created: self.created_at_unix_ms,
+            expires: self.expires_at_unix_ms,
+        })
+    }
+
+    fn consent_subject(&self, binding: &AttestationBinding<'_>) -> Result<[u8; 32], WalletError> {
+        mainnet_consent_subject(self, binding)
+    }
+}
+
+impl ReceiptEntry for super::witness::ApprovalFacts {
+    fn signed_fields(&self) -> Result<SignedEntry<'_>, WalletError> {
+        let record = self.record();
+        let payload = record
+            .consent
+            .as_ref()
+            .and_then(|c| c.payload.as_ref())
+            .ok_or_else(presence_invalid)?;
+        Ok(SignedEntry {
+            nonce: &record.nonce,
+            kind: super::witness::inbox_kind(record.kind),
+            uid: &payload.process_uid,
+            created: record.created_at_ms,
+            expires: record.expires_at_ms,
+        })
+    }
+
+    fn consent_subject(&self, _: &AttestationBinding<'_>) -> Result<[u8; 32], WalletError> {
+        let record = self.record();
+        let payload = record
+            .consent
+            .as_ref()
+            .and_then(|c| c.payload.as_ref())
+            .ok_or_else(presence_invalid)?;
+        match (record.subject_kind, payload.challenge_subject) {
+            (super::subject::SubjectKind::EnvelopeText, None) => Ok(record.subject),
+            (super::subject::SubjectKind::IntentDigest, Some(subject)) => Ok(subject),
+            _ => Err(presence_invalid()),
+        }
+    }
+}
+
 fn entry_fields(
     preimage: &mut Preimage,
-    entry: &PendingApproval,
+    entry: &impl ReceiptEntry,
     binding: &AttestationBinding<'_>,
     subject: &[u8; 32],
 ) {
+    let Ok(entry) = entry.signed_fields() else {
+        preimage.overflow = true;
+        return;
+    };
     preimage
-        .lp(entry.approval_nonce.as_bytes())
+        .lp(entry.nonce.as_bytes())
         .lp(binding.profile_name.as_bytes())
         .lp(binding.chain_id.as_bytes())
-        .lp(entry.kind.kind_name().as_bytes())
+        .lp(entry.kind.as_bytes())
         .fixed(subject)
-        .lp(entry.process_uid.as_bytes())
-        .u64(entry.created_at_unix_ms)
-        .u64(entry.expires_at_unix_ms);
+        .lp(entry.uid.as_bytes())
+        .u64(entry.created)
+        .u64(entry.expires);
 }
 
 /// The consent fields every mainnet challenge and consent view digest binds,
 /// in order: the entry fields, then the policy.
 fn consent_fields(
     preimage: &mut Preimage,
-    entry: &PendingApproval,
+    entry: &impl ReceiptEntry,
     binding: &AttestationBinding<'_>,
     subject: &[u8; 32],
     policy: &VerifiedPolicy,
@@ -948,10 +1014,10 @@ pub(crate) enum ChallengeLayout<'a> {
 }
 
 /// Every input of one challenge.
-pub(crate) struct ChallengeFacts<'a> {
+pub(crate) struct ChallengeFacts<'a, E = PendingApproval> {
     pub(crate) random: &'a [u8; 32],
     pub(crate) request_id: &'a str,
-    pub(crate) entry: &'a PendingApproval,
+    pub(crate) entry: &'a E,
     pub(crate) binding: &'a AttestationBinding<'a>,
     pub(crate) subject: &'a [u8; 32],
     pub(crate) policy: &'a VerifiedPolicy,
@@ -964,7 +1030,9 @@ pub(crate) struct ChallengeFacts<'a> {
 
 /// The challenge of the module documentation in the layout `facts` names;
 /// `None` for a field longer than `u32::MAX` bytes.
-pub(crate) fn mainnet_presence_challenge(facts: &ChallengeFacts<'_>) -> Option<[u8; 32]> {
+pub(crate) fn mainnet_presence_challenge<E: ReceiptEntry>(
+    facts: &ChallengeFacts<'_, E>,
+) -> Option<[u8; 32]> {
     let (domain, extension) = match facts.layout {
         ChallengeLayout::Legacy => (CHALLENGE_DOMAIN, None),
         ChallengeLayout::Intent { intent, pin } => (INTENT_CHALLENGE_DOMAIN, Some((intent, pin))),
@@ -1962,12 +2030,12 @@ impl MainnetPresenceReceipt {
     /// its version is checked against that selection.
     fn challenge_for(
         &self,
-        entry: &PendingApproval,
+        entry: &impl ReceiptEntry,
         binding: &AttestationBinding<'_>,
         policy: &VerifiedPolicy,
         intent: Option<&ClassicIntent>,
     ) -> Result<[u8; 32], WalletError> {
-        let subject = mainnet_consent_subject(entry, binding)?;
+        let subject = entry.consent_subject(binding)?;
         let site = PresenceSite::of(policy)?;
         let random = self.random().ok_or_else(presence_invalid)?;
         let intent_digest = intent.map(|intent| *intent.digest().as_bytes());
@@ -2228,6 +2296,33 @@ pub(crate) fn verify_receipt_for_intent(
     intent: Option<&ClassicIntent>,
     now_ms: u64,
 ) -> Result<StoredPresence, WalletError> {
+    verify_receipt_entry(entry, receipt, binding, policy, intent, now_ms)
+}
+
+pub(crate) fn verify_receipt_for_facts(
+    facts: &super::witness::ApprovalFacts,
+    binding: &AttestationBinding<'_>,
+    policy: &VerifiedPolicy,
+    intent: Option<&ClassicIntent>,
+    now_ms: u64,
+) -> Result<StoredPresence, WalletError> {
+    let payload = facts
+        .record()
+        .consent
+        .as_ref()
+        .and_then(|c| c.payload.as_ref())
+        .ok_or_else(presence_invalid)?;
+    verify_receipt_entry(facts, &payload.receipt, binding, policy, intent, now_ms)
+}
+
+fn verify_receipt_entry(
+    entry: &impl ReceiptEntry,
+    receipt: &MainnetPresenceReceipt,
+    binding: &AttestationBinding<'_>,
+    policy: &VerifiedPolicy,
+    intent: Option<&ClassicIntent>,
+    now_ms: u64,
+) -> Result<StoredPresence, WalletError> {
     if !receipt.is_well_formed() {
         return Err(presence_invalid());
     }
@@ -2240,7 +2335,7 @@ pub(crate) fn verify_receipt_for_intent(
         .ok_or_else(presence_invalid)?;
     if receipt.issued_at_unix_ms > receipt.verified_at_unix_ms
         || receipt.verified_at_unix_ms >= receipt.expires_at_unix_ms
-        || receipt.expires_at_unix_ms > entry.expires_at_unix_ms
+        || receipt.expires_at_unix_ms > entry.signed_fields()?.expires
         || window > MAINNET_PRESENCE_CHALLENGE_TTL_MS
         || receipt.verified_at_unix_ms > now_ms
     {
@@ -2277,17 +2372,20 @@ pub(crate) fn verify_receipt_for_intent(
 /// absent intent describes every entry; an entry kind without a classic
 /// intent form has no intent.
 fn intent_describes(
-    entry: &PendingApproval,
+    entry: &impl ReceiptEntry,
     binding: &AttestationBinding<'_>,
     intent: Option<&ClassicIntent>,
 ) -> bool {
     let Some(intent) = intent else {
         return true;
     };
-    let kind = match entry.kind {
-        ApprovalKind::PaymentSimulated { .. } => ApprovedKind::Payment,
-        ApprovalKind::ClaimSimulated { .. } => ApprovedKind::Claim,
-        ApprovalKind::TrustlineSimulated { .. } => ApprovedKind::Trustline,
+    let Ok(fields) = entry.signed_fields() else {
+        return false;
+    };
+    let kind = match fields.kind {
+        "PaymentSimulated" => ApprovedKind::Payment,
+        "ClaimSimulated" => ApprovedKind::Claim,
+        "TrustlineSimulated" => ApprovedKind::Trustline,
         _ => return false,
     };
     intent.base().chain_id() == binding.chain_id && intent.approved_kind() == kind

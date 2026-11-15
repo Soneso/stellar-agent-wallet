@@ -550,6 +550,7 @@ pub(super) mod tests {
                 receipt: entry.mainnet_presence.clone().unwrap(),
                 process_uid: entry.process_uid.clone(),
                 outbox_row: None,
+                challenge_subject: None,
             };
             self.clock.set(payload.receipt.verified_at_unix_ms());
             let view = self.view();

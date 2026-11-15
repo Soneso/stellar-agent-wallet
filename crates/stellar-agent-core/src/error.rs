@@ -425,6 +425,16 @@ pub enum ApprovalFailure {
         /// Non-secret operator-facing diagnostic.
         detail: String,
     },
+    /// The durable approval has been revoked.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.revoked"`.
+    #[error("{detail}")]
+    Revoked {
+        /// Non-secret operator-facing diagnostic.
+        detail: String,
+    },
     /// The pending approval has expired.
     ///
     /// # Wire code
@@ -876,6 +886,7 @@ impl ApprovalFailure {
     pub const fn code(&self) -> &'static str {
         match self {
             Self::NotFound { .. } => "approval.not_found",
+            Self::Revoked { .. } => "approval.revoked",
             Self::Expired { .. } => "approval.expired",
             Self::AlreadyAttested { .. } => "approval.already_attested",
             Self::UserMismatch { .. } => "approval.user_mismatch",
@@ -6567,7 +6578,19 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used, reason = "test assertion")]
     fn approval_failure_wire_codes_and_messages() {
+        let revoked = WalletError::Approval(ApprovalFailure::Revoked {
+            detail: "this approval has been revoked".to_owned(),
+        });
+        let envelope = serde_json::to_value(crate::envelope::Envelope::<()>::err(&revoked))
+            .expect("error envelope");
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error"]["code"], "approval.revoked");
+        assert_eq!(
+            envelope["error"]["message"],
+            "this approval has been revoked"
+        );
         let tls = WalletError::Approval(ApprovalFailure::RemoteTlsUnavailable {
             detail: "cert_path is absent".to_owned(),
         });
@@ -6584,6 +6607,12 @@ mod tests {
                     detail: "operator diagnostic".to_owned(),
                 },
                 "approval.not_found",
+            ),
+            (
+                ApprovalFailure::Revoked {
+                    detail: "operator diagnostic".to_owned(),
+                },
+                "approval.revoked",
             ),
             (
                 ApprovalFailure::Expired {
