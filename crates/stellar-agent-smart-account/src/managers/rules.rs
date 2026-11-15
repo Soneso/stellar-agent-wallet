@@ -5921,7 +5921,8 @@ pub(crate) fn sa_error_to_invocation_result(
         SaError::TimelockListPendingFailed { .. } => SaInvocationResult::PreSubmissionRefused,
         // Simulation-audit mismatch fires immediately before
         // submit_transaction_and_wait; the transaction was never sent.
-        SaError::AuthMismatch { .. } | SaError::IntentRecordUnavailable { .. } | SaError::IntentBindingMismatch { .. } => SaInvocationResult::PreSubmissionRefused,
+        SaError::AuthMismatch { .. } | SaError::IntentRecordUnavailable { .. } | SaError::IntentBindingMismatch { .. }
+            | SaError::TotalEpochUnavailable { .. } | SaError::TotalEpochStale | SaError::TotalEpochRetired => SaInvocationResult::PreSubmissionRefused,
     }
 }
 
@@ -7368,6 +7369,22 @@ mod tests {
             sa_error_to_invocation_result(&SaError::MainnetWriteForbidden),
             SaInvocationResult::PreSubmissionRefused
         ));
+    }
+
+    #[test]
+    fn intent_total_epoch_refusals_precede_submission() {
+        for error in [
+            SaError::TotalEpochUnavailable {
+                detail: "検証-é".into(),
+            },
+            SaError::TotalEpochStale,
+            SaError::TotalEpochRetired,
+        ] {
+            assert!(matches!(
+                sa_error_to_invocation_result(&error),
+                stellar_agent_core::audit_log::schema::SaInvocationResult::PreSubmissionRefused
+            ));
+        }
     }
 
     #[test]

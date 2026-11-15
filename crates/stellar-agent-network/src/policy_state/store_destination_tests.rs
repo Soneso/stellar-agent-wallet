@@ -145,7 +145,7 @@ fn reservations_carry_destinations_at_the_current_version() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let _storage_home =
         stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-    assert_eq!(WIRE_VERSION_MAX, WIRE_VERSION_TOTAL_SUMS);
+    assert_eq!(WIRE_VERSION_MAX, WIRE_VERSION_TOTAL_INTENTS);
     assert_eq!(
         serde_json::from_str::<StoredDestinations>("null").unwrap(),
         StoredDestinations::Null
@@ -158,7 +158,7 @@ fn reservations_carry_destinations_at_the_current_version() {
         .unwrap();
     let wire = store.read_for_inspection(&profile).unwrap().unwrap();
     assert_eq!(wire.version, WIRE_VERSION_DESTINATION);
-    assert_eq!(WIRE_VERSION_MAX, WIRE_VERSION_TOTAL_SUMS);
+    assert_eq!(WIRE_VERSION_MAX, WIRE_VERSION_TOTAL_INTENTS);
     assert_eq!(
         store.pending_reservations(&profile).unwrap()[0].destinations,
         hold.destinations

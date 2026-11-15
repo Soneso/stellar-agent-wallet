@@ -946,6 +946,15 @@ Each queried window counts a closed charge through the later of its observation 
 
 A closed intent record remains until more than one week has passed since its observation.
 
+Total-budget legs charge the pinned policy allocation before signing, including repeated criteria for the same asset.
+Cancellation with the original unexposed proof releases those legs. Exposure, binding, and replay remove that cancellation authority.
+Witnessed closure does not refund totals, because the authorization may have been used before closure.
+Collection conserves the charge in settled sums, and linked submission bookkeeping adds no second debit.
+Window state with total-bearing intents requires a build supporting version 16.
+Ordinary payments continue within the remaining signed allocation; reset does not replenish it.
+Different authority requires `profile sign-policy --profile <profile> --secret-env OWNER_SEED`.
+Checked outcome recovery has no CLI or MCP entry point; `tx status` does not release unknown total charges.
+
 A schedule charge closes when both endpoints, above every authorization expiration, report its operation done or unset.
 
 Intents without an authenticated purpose remain open. Calls whose authorization tree names `approve`, `increase_allowance` or `approve_for_all` retain their charges without closure by authorization expiry.

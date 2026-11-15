@@ -240,6 +240,12 @@ refreshes, clock changes, and owner resets. A signed, sent, or confirmed debit
 stays counted. An operator clear keeps it counted. A checked failure or
 non-inclusion releases that attempt's debit and keeps its fee charged. An
 x402 or MPP debit stays counted for the life of the signed policy.
+Smart-account signing also charges total-budget legs under the pinned digest.
+Only cancellation with the original unexposed proof releases its intent charge.
+Replaying admission invalidates that proof, and binding prevents cancellation.
+Witnessed invocation or schedule closure stops future use but proves no historical non-use.
+Collection transfers the full charge into settled sums, preserving duplicate criterion debits.
+Linked submission records carry receipt bookkeeping and never add another total charge.
 A final charge is a debit no supported release changes: authorized x402 or MPP
 spend, and a classic payment with a checked success. One week after its date it
 folds into one settled sum for its policy digest, scope, and asset. The sum

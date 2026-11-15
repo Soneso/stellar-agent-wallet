@@ -1498,6 +1498,7 @@ Stateful spending criteria read amounts and counts from `PolicyStateStore`. Conf
   An authenticated recovery run record requires version 13 (`WIRE_VERSION_RECOVERY_RUN`). Builds capped at 12 refuse it.
   Destination fields on records, consumption bindings, or accounting expiries require version 14 (`WIRE_VERSION_DESTINATION`). Builds capped at 13 refuse it.
   Final total-budget charges and settled sums require version 15 (`WIRE_VERSION_TOTAL_SUMS`). Builds capped at 14 refuse it.
+  Total-budget intent legs require version 16 (`WIRE_VERSION_TOTAL_INTENTS`). Builds capped at 15 refuse both current and prepared images.
   Each committed version floor stays after its fields are removed.
 - **Authorization ledger**: open and claimed records hold window capacity outside the bucket records. Durable admission counts every total hold until a committed sweep removes it. Hydration counts total holds as an ordinary writer's sweep would leave them at its clock reading. Reconciliation, confirmation, and release never see a hold. Expiry is measured on the store's own clock, and a transaction sweeps expired authorizations under the lock before it counts. Invalidation or expiry releases only unclaimed holds. A signing claim records its time before the signer runs. Expiry converts claimed holds to confirmed spend dated at the claim and bound to its chain. A consumed transaction authorization's holds become submission pending records; a consumed Soroban intent's become confirmed authorized spend. Settled history is pruned after the retention window once its approval ends; open and claimed records stay. A window state reset keeps every record whose approval can still be presented and settles a record that holds capacity as expired.
 - **Key**: the profile's `policy_window_state_key_id` keyring coordinate (`stellar-agent-policy-window-<profile>` by convention), lazily minted on first write.
@@ -1513,6 +1514,7 @@ A total debit leaves its sum in four ways. An unclaimed hold is invalidated, or 
 
 `select_wire_version` writes version 12 unless stored fields or a committed floor require a higher version.
 A recovery run record requires at least version 13; destination fields require version 14; final total-budget charges and settled sums require version 15. Each committed floor stays after pruning.
+Total-bearing intents require version 16. A committed version 16 floor stays after collection or cancellation.
 Builds capped at 12 refuse version 13, builds capped at 13 refuse version 14, and builds capped at 14 refuse version 15 with `UnsupportedVersion`.
 
 A total row is final when no supported release can change it. Admitted authorized spend and a consumption without a transaction are final. So is a counted row of an authorization whose retained attempt holds a checked success, whatever status it reached. A success decided while its claim still holds keeps the hold charged; the conversion of the hold marks the row final while the decision is retained. Final means no later release applies, not that an external authorization executed.
@@ -1531,7 +1533,8 @@ A refused admission signs and sends nothing. An in-process refusal before the fi
 
 A bounded invocation charge closes when a later policy check or admission witnesses both profile endpoints above every authorization and envelope bound.
 
-Envelope cancellation, unwinding, reconciliation, accounting expiry and operator clears leave an exposed charge unchanged; only witnessed closure and retention end it.
+Envelope cancellation, unwinding, reconciliation, accounting expiry, and operator clears leave an exposed charge unchanged.
+Witnessed closure and retention end windowed accounting; total-budget charges remain in their original epochs.
 
 Only the endpoints stored in the profile authorize charge closure. Endpoint overrides can bound signatures but cannot close charges.
 
@@ -1542,6 +1545,16 @@ A refused admission still commits the closures its witness establishes.
 Each queried window counts a closed charge through the later of its observation plus that window and its admitted accounting horizon.
 
 A closed intent record remains until more than one week has passed since its observation.
+
+Collection adds its total legs to checked settled sums before removing the source intent in the same successor.
+Each sum keeps the maximum existing timestamp and authenticated closure time, with duplicate legs counted separately.
+Overflow refuses before any audit append or durable mutation.
+Reset collects on its working successor before capturing total rows and sums.
+Linked receipt rows never enter total projections, final promotion, or folding; their ordinary lifecycle remains intact.
+Admission and binding compare total epochs with the pin under the exclusive window lock, including replay.
+The retirement threshold remains 12. Upgrading versions 12 through 15 creates no additional retirement marker.
+Stale policy evaluation requires reloading the pinned policy; retired history requires different signed authority through `profile sign-policy`.
+Checked recovery remains a library surface without CLI or MCP integration. Exposed unknown totals stay charged without proof of non-use.
 
 A schedule charge closes when both endpoints, above every authorization expiration, report its operation done or unset.
 

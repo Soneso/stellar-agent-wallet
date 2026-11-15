@@ -1,0 +1,1 @@
+- Smart-account signing admits total-budget legs under the pinned policy. Unexposed cancellation releases them; witnessed closure retains their charge.

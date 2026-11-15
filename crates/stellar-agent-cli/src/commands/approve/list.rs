@@ -1163,7 +1163,11 @@ mod tests {
     /// address on the page, the list line, and the prompt; M shows its base
     /// row and G shows none.
     #[test]
+    #[serial_test::serial]
     fn toolset_consent_shows_the_complete_destination() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (_, html, line, run) = rendered(&gate_entry("pay-tools", CONSENT_G));
         assert!(
             html.contains(&format!(
@@ -1214,7 +1218,11 @@ mod tests {
     /// A payment to the maximum-ID M shows its complete `to` and its base
     /// row on the page, the list line, and the prompt.
     #[test]
+    #[serial_test::serial]
     fn payment_consent_shows_the_complete_destination() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let entry = fixtures::payment_pending(
             SOURCE_G,
             CONSENT_MMAX,

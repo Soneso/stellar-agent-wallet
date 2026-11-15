@@ -13307,12 +13307,21 @@ pub(crate) mod tests {
         #[test]
         #[serial]
         fn a_release_after_a_repin_cannot_credit_the_new_digest() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let guard_home = tempfile::tempdir().unwrap();
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             const D8: [u8; 32] = [8; 32];
             let mut fx = Fx::new();
             decided_total_attempt(&mut fx, 1, "consumed");
+            fx.rewrite(|wire| {
+                super::super::super::store::total_intent_test_helpers::append_closed_intent(
+                    wire, [9; 32], 2, T0,
+                )
+            });
+            assert_eq!(total_of(&fx, [9; 32]), 2);
             repin(&fx, D8);
             fx.store
                 .record_authorized(&fx.profile, &[total_in(10, D8)])
@@ -13331,6 +13340,11 @@ pub(crate) mod tests {
                 fx.store.record_authorized(&fx.profile, &[total_in(1, D8)]),
                 Err(WindowStoreError::PolicyDenied { .. })
             ));
+            assert_eq!(total_of(&fx, [9; 32]), 2);
+            fx.clock.set(past_retention());
+            fx.prune_now();
+            assert!(fx.wire().signed_intents.is_empty());
+            assert_eq!(total_of(&fx, [9; 32]), 2);
         }
 
         /// A reset refuses while the attempt is unresolved. After its checked
@@ -13339,6 +13353,9 @@ pub(crate) mod tests {
         #[test]
         #[serial]
         fn a_replay_after_a_reset_cannot_credit_the_new_allocation() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let guard_home = tempfile::tempdir().unwrap();
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
@@ -13364,7 +13381,18 @@ pub(crate) mod tests {
             fx.recorder()
                 .acknowledge_projection(handle.id(), 1, commit)
                 .unwrap();
+            fx.rewrite(|wire| {
+                super::super::super::store::total_intent_test_helpers::append_closed_intent(
+                    wire,
+                    [9; 32],
+                    2,
+                    T0 - super::super::super::store::RETENTION_MS - 1,
+                )
+            });
+            assert_eq!(total_of(&fx, [9; 32]), 2);
             reset(&fx, "reset-2").unwrap();
+            assert!(fx.wire().signed_intents.is_empty());
+            assert_eq!(total_of(&fx, [9; 32]), 2);
             fx.store
                 .record_authorized(&fx.profile, &[total(10)])
                 .unwrap();
@@ -13374,6 +13402,7 @@ pub(crate) mod tests {
                 "{replayed:?}"
             );
             assert_eq!(sum(&fx), 10, "replay after reset reduces the new 10");
+            assert_eq!(total_of(&fx, [9; 32]), 2);
             assert!(matches!(
                 fx.store.record_authorized(&fx.profile, &[total(1)]),
                 Err(WindowStoreError::PolicyDenied { .. })
@@ -13733,6 +13762,43 @@ pub(crate) mod tests {
                 fx.record(handle.id()).state,
                 OperationState::SentOutcomeUnknown
             );
+        }
+
+        #[test]
+        #[serial]
+        fn intent_total_overflow_precedes_operation_audit() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let mut fx = Fx::new();
+            decided_total_attempt(&mut fx, 1, "consumed");
+            fx.rewrite(|wire| {
+                super::super::super::store::total_intent_test_helpers::append_closed_intent(
+                    wire, [9; 32], 1, T0,
+                );
+                wire.total_sums
+                    .push(super::super::super::store::WireTotalSum {
+                        scope_specificity: 1,
+                        bucket: "total:native".into(),
+                        epoch: [9; 32],
+                        amount: i128::MAX,
+                        settled_until_ms: T0,
+                    });
+            });
+            fx.clock.set(past_retention());
+            let attempt = snapshot(&fx, 1);
+            let before = fs::read(fx.store.path()).unwrap();
+            let generation = fx.wire().generation;
+            let audit_rows = fx.sink.entries.len();
+            let result = fx
+                .recorder()
+                .commit_decision(&decide(&attempt, succeeded()));
+            assert!(
+                matches!(result, Err(WindowStoreError::Invalid { ref detail }) if detail == "a total-budget sum overflows")
+            );
+            assert_eq!(fx.sink.entries.len(), audit_rows);
+            assert_eq!(fs::read(fx.store.path()).unwrap(), before);
+            assert_eq!(fx.wire().generation, generation);
         }
 
         /// A checked success whose claim still holds a total of 6 stays when

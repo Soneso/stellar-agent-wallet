@@ -1316,6 +1316,9 @@ pub(crate) fn store_refusal(error: crate::policy_state::WindowStoreError) -> Wal
     if let Some(error) = error.chain_validation_error() {
         return WalletError::Validation(error);
     }
+    if let Some(error) = error.total_epoch_error() {
+        return error.into();
+    }
     match error {
         WindowStoreError::PolicyDenied { reason } => WalletError::PolicyDenied { reason },
         WindowStoreError::IntentBindingMismatch { field } => mismatch(field),
@@ -1365,6 +1368,59 @@ mod tests {
         );
         assert!(empty_plan(0).is_err());
         assert_eq!(plan.permitted_signings().len(), 1);
+    }
+
+    #[test]
+    fn intent_total_account_spellings_keep_the_base_identity() {
+        let source = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+        let plan = SignedIntentPlan::new(
+            TESTNET_PASSPHRASE,
+            "fixture",
+            source,
+            1,
+            [7; 32],
+            vec![],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.facts.intent_id(),
+            "intent-81fe93946f940554a2cf311403afec303ebd5bfa92c70e1862c2a06ae0646e51"
+        );
+        for id in [0, 7] {
+            let muxed = stellar_strkey::ed25519::MuxedAccount {
+                ed25519: [0; 32],
+                id,
+            }
+            .to_string()
+            .to_string();
+            let result = SignedIntentPlan::new(
+                TESTNET_PASSPHRASE,
+                "fixture",
+                &muxed,
+                1,
+                [7; 32],
+                vec![],
+                None,
+            );
+            assert_eq!(
+                result.err().unwrap().code(),
+                "submission.intent_binding_mismatch"
+            );
+        }
+        let result = SignedIntentPlan::new(
+            TESTNET_PASSPHRASE,
+            "fixture",
+            &source.to_lowercase(),
+            1,
+            [7; 32],
+            vec![],
+            None,
+        );
+        assert_eq!(
+            result.err().unwrap().code(),
+            "submission.intent_binding_mismatch"
+        );
     }
 
     #[test]
