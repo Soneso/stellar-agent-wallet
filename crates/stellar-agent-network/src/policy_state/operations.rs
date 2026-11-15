@@ -4588,6 +4588,36 @@ impl<'a> OperationRecorder<'a> {
         })
     }
 
+    /// Writes owned run metadata with its evidence and optional checked decision.
+    pub(super) fn write_recovery_run(
+        &mut self,
+        expected: &RecoveryAttempt,
+        input: &EvidenceInput,
+        run: &super::WireRecoveryRun,
+        decision: Option<&CheckedRecoveryDecision>,
+    ) -> Result<(), WindowStoreError> {
+        let raw: RawRecoveryRun = serde_json::from_str(
+            &serde_json::to_string(run).map_err(|_| invalid("recovery run serialization"))?,
+        )
+        .map_err(|_| invalid("recovery run serialization"))?;
+        self.run(None, |session| {
+            let input = EvidenceInput {
+                expected_attempt: Some(expected.clone()),
+                ..input.clone()
+            };
+            session.record_evidence(expected.operation_id, expected.attempt_index, &input)?;
+            if let Some(decision) = decision {
+                session.commit_decision(decision)?;
+            }
+            let index = record_index(&session.wire, expected.operation_id)?;
+            section_mut(&mut session.wire).records[index]
+                .attempt_mut(expected.attempt_index)?
+                .recovery_run = Some(raw);
+            session.changed = true;
+            Ok(())
+        })
+    }
+
     /// Commits a checked recovery decision in one generation. The commit
     /// holds the state, the agreed outcome or non-inclusion proof, the
     /// disagreement reset, the bucket disposition and the native release
@@ -5188,6 +5218,67 @@ impl<'a> OperationStatus<'a> {
         tx_hash: Option<&[u8; 32]>,
     ) -> Result<Vec<RecoveryAttempt>, WindowStoreError> {
         self.unknown_attempts(tx_hash, true)
+    }
+
+    /// Filters authenticated scheduling views before the driver's oldest-four limit.
+    pub(super) fn runnable_snapshot(
+        &self,
+        tx_hash: Option<&[u8; 32]>,
+        now: u64,
+    ) -> Result<Vec<RecoveryAttempt>, WindowStoreError> {
+        if tx_hash.is_some() {
+            return self.outcome_snapshot(tx_hash);
+        }
+        let Some(wire) = self.read()? else {
+            return Ok(Vec::new());
+        };
+        let mut candidates = Vec::new();
+        for record in records(&wire) {
+            if record.state != OperationState::SentOutcomeUnknown || record.kind.is_x402() {
+                continue;
+            }
+            for attempt in &record.attempts {
+                if attempt.outcome != Some(OperationState::SentOutcomeUnknown) {
+                    continue;
+                }
+                let Some(WireExposure {
+                    identity:
+                        ExposureIdentity::Classic {
+                            tx_hash, max_time, ..
+                        },
+                    ..
+                }) = &attempt.exposure
+                else {
+                    continue;
+                };
+                let run = RecoveryRunSnapshot::of(
+                    record.id,
+                    attempt,
+                    attempt_account(&wire, attempt).as_deref(),
+                );
+                let view = super::normalize_recovery_run(
+                    run.as_ref(),
+                    *max_time,
+                    attempt.send_by_ms,
+                    attempt.decision.is_some(),
+                    now,
+                );
+                if view.earliest_retry_ms.is_some_and(|due| now >= due) {
+                    candidates.push((
+                        attempt.started_at_ms,
+                        record.id.to_hex(),
+                        attempt.index,
+                        *tx_hash,
+                    ));
+                }
+            }
+        }
+        candidates.sort();
+        let mut selected = Vec::new();
+        for (_, _, _, hash) in candidates.into_iter().take(4) {
+            selected.extend(self.outcome_snapshot(Some(&hash))?);
+        }
+        Ok(selected)
     }
 
     /// Reads selected release markers together, including terminal attempts.

@@ -575,17 +575,14 @@ pub fn normalize_recovery_run(
         stop.earliest_retry_ms
     } else {
         view.state = V::Running;
-        let Ok(due) = recovery_retry_time(run.run_deadline_ms, run.consecutive_stops) else {
-            view.state = V::Stopped(R::RecordUnusable);
-            view.class = Some(RecoveryClass::Explicit);
-            return view;
-        };
+        // validate_run guarantees a representable running retry time.
+        let due = recovery_retry_time(run.run_deadline_ms, run.consecutive_stops).ok();
         if now_ms >= run.run_deadline_ms {
             view.state = V::Stopped(R::Interrupted);
             view.class = Some(RecoveryClass::Automatic);
             view.effective_stops += 1;
         }
-        Some(due)
+        due
     };
     if now_ms < latest && view.class != Some(RecoveryClass::Explicit) {
         view.state = V::Stopped(R::ClockRegression);
