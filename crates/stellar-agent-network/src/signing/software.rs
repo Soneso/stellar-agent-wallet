@@ -173,9 +173,11 @@ impl Signer for SoftwareSigningKey {
     /// # Errors
     ///
     /// `network.mainnet_authorization_refused` when the mainnet binding
-    /// names another signer key.
+    /// names another signer key or its authorization is not valid
+    /// immediately before signing.
     async fn sign_tx_payload(&self, payload: &TxSigningPayload) -> Result<[u8; 64], WalletError> {
         payload.check_mainnet_binding(self).await?;
+        payload.check_mainnet_interval()?;
         Ok(self.sign_raw(payload.as_bytes()))
     }
 
@@ -340,6 +342,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn transaction_mainnet_binding_refuses_another_key() {
         let key = SoftwareSigningKey::new_from_bytes([7; 32]);
         let own_key = key.public_key().await.unwrap().0;
@@ -353,6 +356,45 @@ mod tests {
         ] {
             let signature = key.sign_tx_payload(&payload).await.unwrap();
             assert_eq!(signature, key.sign_raw(&bytes));
+        }
+    }
+
+    /// A mainnet transaction payload signs only while its authorization is
+    /// valid on the mainnet clock. Outside the interval the key derives its
+    /// public key once for the binding check and never reaches `sign_raw`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn transaction_signing_refuses_outside_the_authorization_interval() {
+        let key = SoftwareSigningKey::new_from_bytes([7; 32]);
+        let own_key = key.public_key().await.unwrap().0;
+        let bytes = [0x3c; 32];
+        let payload = TxSigningPayload::bound_between_for_test(bytes, own_key, 1_000, 2_000);
+        let clock = crate::mainnet::clock::set_now_ms_for_test(1_000);
+        for (now_ms, label) in [(999, "not_yet_valid"), (2_000, "expired")] {
+            clock.set(now_ms);
+            KEY_ADDRESSES.with_borrow_mut(Vec::clear);
+            let (warnings, _guard) =
+                stellar_agent_test_support::WarningCapture::capture(Some("stellar_agent_network"));
+            let code = key.sign_tx_payload(&payload).await.err().map(|e| e.code());
+            assert_eq!(
+                code,
+                Some("network.mainnet_authorization_refused"),
+                "at {now_ms}"
+            );
+            assert_eq!(
+                crate::signing::test_doubles::refused_preconditions(&warnings),
+                [label]
+            );
+            KEY_ADDRESSES.with_borrow(|addresses| assert_eq!(addresses.len(), 1, "at {now_ms}"));
+        }
+        for now_ms in [1_000, 1_999] {
+            clock.set(now_ms);
+            KEY_ADDRESSES.with_borrow_mut(Vec::clear);
+            assert_eq!(
+                key.sign_tx_payload(&payload).await.unwrap(),
+                key.sign_raw(&bytes)
+            );
+            KEY_ADDRESSES.with_borrow(|addresses| assert_eq!(addresses.len(), 3));
         }
     }
 

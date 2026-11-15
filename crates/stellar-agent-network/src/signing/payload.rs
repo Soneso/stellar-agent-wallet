@@ -79,7 +79,7 @@
 //!
 //! ```compile_fail,E0451
 //! use stellar_agent_network::signing::payload::TxSigningPayload;
-//! let _ = TxSigningPayload { bytes: [0u8; 32], mainnet_signer: None };
+//! let _ = TxSigningPayload { bytes: [0u8; 32], mainnet: None };
 //! ```
 //!
 //! ```compile_fail,E0451
@@ -215,6 +215,7 @@ use stellar_xdr::{
 
 use crate::mainnet::authorization::{
     MainnetSignedSorobanIntent, MainnetSorobanIntentAuthorization, MainnetTxSignAuthorization,
+    check_validity,
 };
 use crate::mainnet::refusal::{AuthorizedPathError, require};
 use crate::mainnet::soroban::check_preimage_against_authorization;
@@ -273,8 +274,17 @@ pub const SEP53_MESSAGE_PREFIX: &[u8] = b"Stellar Signed Message:\n";
 pub struct TxSigningPayload {
     /// The digest computed from the domain preimage.
     bytes: [u8; 32],
-    /// The authorized agent key for a mainnet payload.
-    mainnet_signer: Option<[u8; 32]>,
+    /// The authorized agent key and validity interval for a mainnet payload.
+    mainnet: Option<MainnetTxBinding>,
+}
+
+/// What a mainnet transaction payload keeps from its authorization: the
+/// agent key and the interval in which a signature may be produced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MainnetTxBinding {
+    signer: [u8; 32],
+    issued_at_ms: u64,
+    expires_at_ms: u64,
 }
 
 impl TxSigningPayload {
@@ -295,7 +305,7 @@ impl TxSigningPayload {
         refuse_mainnet_passphrase(network_passphrase)?;
         Ok(Self {
             bytes: envelope_hash(envelope, network_passphrase)?,
-            mainnet_signer: None,
+            mainnet: None,
         })
     }
 
@@ -315,7 +325,7 @@ impl TxSigningPayload {
         refuse_mainnet_passphrase(network_passphrase)?;
         Ok(Self {
             bytes: tagged_hash(tagged, network_passphrase)?,
-            mainnet_signer: None,
+            mainnet: None,
         })
     }
 
@@ -338,7 +348,11 @@ impl TxSigningPayload {
         authorization.check_tx_hash(&hash)?;
         Ok(Self {
             bytes: hash,
-            mainnet_signer: Some(authorization.signer_public_key()),
+            mainnet: Some(MainnetTxBinding {
+                signer: authorization.signer_public_key(),
+                issued_at_ms: authorization.issued_at_ms(),
+                expires_at_ms: authorization.expires_at_ms(),
+            }),
         })
     }
 
@@ -353,15 +367,61 @@ impl TxSigningPayload {
         &self,
         signer: &dyn Signer,
     ) -> Result<(), WalletError> {
-        check_mainnet_binding(self.mainnet_signer, signer, "sign_tx_payload").await
+        check_mainnet_binding(
+            self.mainnet.map(|binding| binding.signer),
+            signer,
+            "sign_tx_payload",
+        )
+        .await
     }
 
-    /// A payload bound to `signer`, for this crate's trusted-signer tests.
+    /// Requires a mainnet payload's authorization to be valid on a fresh
+    /// mainnet clock: issued at or before now and not yet expired.
+    ///
+    /// Each terminal signer calls it once its key or device is ready and
+    /// immediately before it produces the signature, so a slow key read or
+    /// device exchange cannot carry the signature past the authorization's
+    /// end. An unbound payload passes without reading the clock.
+    ///
+    /// # Errors
+    ///
+    /// `network.mainnet_authorization_refused` with the `not_yet_valid` or
+    /// `expired` precondition logged, or the clock's error.
+    pub(crate) fn check_mainnet_interval(&self) -> Result<(), WalletError> {
+        let Some(binding) = self.mainnet else {
+            return Ok(());
+        };
+        check_validity(
+            binding.issued_at_ms,
+            binding.expires_at_ms,
+            crate::mainnet::clock::now_ms()?,
+        )
+        .map_err(|error| error.report("sign_tx_payload"))
+    }
+
+    /// A payload bound to `signer` and valid at every instant, for this
+    /// crate's trusted-signer tests.
     #[cfg(test)]
     pub(crate) fn bound_for_test(bytes: [u8; 32], signer: [u8; 32]) -> Self {
+        Self::bound_between_for_test(bytes, signer, 0, u64::MAX)
+    }
+
+    /// A payload bound to `signer` and valid from `issued_at_ms` until
+    /// `expires_at_ms`, for this crate's signer-boundary tests.
+    #[cfg(test)]
+    pub(crate) fn bound_between_for_test(
+        bytes: [u8; 32],
+        signer: [u8; 32],
+        issued_at_ms: u64,
+        expires_at_ms: u64,
+    ) -> Self {
         Self {
             bytes,
-            mainnet_signer: Some(signer),
+            mainnet: Some(MainnetTxBinding {
+                signer,
+                issued_at_ms,
+                expires_at_ms,
+            }),
         }
     }
 
@@ -370,7 +430,7 @@ impl TxSigningPayload {
     pub(crate) fn from_bytes_for_test(bytes: [u8; 32]) -> Self {
         Self {
             bytes,
-            mainnet_signer: None,
+            mainnet: None,
         }
     }
 }

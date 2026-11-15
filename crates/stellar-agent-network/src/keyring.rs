@@ -1367,7 +1367,9 @@ impl KeyringSignHandle {
     ///   public key derived from the freshly-loaded seed does not match the
     ///   cached public key from handle construction (host-swap defence).
     ///
-    /// - `network.mainnet_authorization_refused` for a mainnet binding to another key.
+    /// - `network.mainnet_authorization_refused` for a mainnet binding to
+    ///   another key, or for a mainnet authorization that is not valid after
+    ///   the secret read, immediately before signing.
     ///
     /// # Panics
     ///
@@ -1397,7 +1399,8 @@ impl KeyringSignHandle {
         payload: &TxSigningPayload,
     ) -> Result<[u8; 64], WalletError> {
         payload.check_mainnet_binding(self).await?;
-        let result = self.sign_bytes(payload.as_bytes()).await;
+        let result =
+            self.sign_bytes_checked(payload.as_bytes(), || payload.check_mainnet_interval());
         let service = redact_keyring_coord(&self.entry_ref.service);
         let public_key = redact_strkey_first5_last5(self.public_key().to_string().as_ref());
         match &result {
@@ -1440,6 +1443,20 @@ impl KeyringSignHandle {
         // hook (test-hooks feature) is placed there to verify that Zeroizing::Drop
         // fires during unwind.
         sign_payload_verifying_pubkey(s_strkey, payload, &self.cached_pubkey_bytes).await
+    }
+
+    /// Loads the seed, verifies its public key, runs `check`, and signs
+    /// `payload` while the guard `check` returns lives.
+    fn sign_bytes_checked<G>(
+        &self,
+        payload: &[u8; 32],
+        check: impl FnOnce() -> Result<G, WalletError>,
+    ) -> Result<[u8; 64], WalletError> {
+        let entry = open_entry(&self.entry_ref)?;
+        let secret = Zeroizing::new(entry.get_password().map_err(|error| {
+            map_keyring_operation_error(&error, KeyringOperation::Read, &self.entry_ref.service)
+        })?);
+        sign_payload_verifying_pubkey_checked(secret, payload, &self.cached_pubkey_bytes, check)
     }
 
     /// Signs a smart-account auth digest using the keyring-stored seed.
@@ -1490,16 +1507,7 @@ impl KeyringSignHandle {
         check: impl FnOnce() -> Result<G, WalletError> + Send,
     ) -> Result<[u8; 64], WalletError> {
         payload.check_mainnet_binding(self).await?;
-        let entry = open_entry(&self.entry_ref)?;
-        let secret = Zeroizing::new(entry.get_password().map_err(|error| {
-            map_keyring_operation_error(&error, KeyringOperation::Read, &self.entry_ref.service)
-        })?);
-        sign_payload_verifying_pubkey_checked(
-            secret,
-            payload.as_bytes(),
-            &self.cached_pubkey_bytes,
-            check,
-        )
+        self.sign_bytes_checked(payload.as_bytes(), check)
     }
 
     /// Signs a SEP-53 message digest using the keyring-stored seed.
@@ -2135,7 +2143,7 @@ async fn sign_payload_verifying_pubkey(
 }
 
 /// Verifies the key, runs the caller check, and signs while retaining its guard.
-/// Called from `sign_bytes` with an accepting check and from `sign_soroban_address_auth_payload_checked`.
+/// Called from `sign_bytes` with an accepting check and from `sign_bytes_checked` with the caller's check.
 fn sign_payload_verifying_pubkey_checked<G>(
     s_strkey: Zeroizing<String>,
     payload: &[u8; 32],
@@ -2991,6 +2999,74 @@ mod tests {
             let signature = handle.sign_tx_payload(&payload).await.unwrap();
             assert_eq!(signature, key.sign_raw(&bytes));
         }
+    }
+
+    /// The handle checks a mainnet transaction payload's authorization on the
+    /// mainnet clock after the secret read, immediately before it signs. A
+    /// clock that leaves the interval during the read yields no signature and
+    /// no success event.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn transaction_signing_rechecks_the_authorization_after_the_secret_read() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let seed = [0xBE; 32];
+        let entry_ref = KeyringEntryRef::new("stellar-agent-keyring-interval", "default");
+        let clock = Arc::new(crate::mainnet::clock::set_now_ms_for_test(1_500));
+        let read_at_ms = Arc::new(AtomicU64::new(1_500));
+        // The installed store outlives the test; a weak reference lets the
+        // clock override end when the test drops `clock`.
+        let (hook_clock, hook_time) = (Arc::downgrade(&clock), Arc::clone(&read_at_ms));
+        keyring_mock::install_with_read_hooks(vec![keyring_mock::ReadHook::new(
+            &entry_ref.service,
+            &entry_ref.account,
+            Arc::new(move || {
+                if let Some(clock) = hook_clock.upgrade() {
+                    clock.set(hook_time.load(Ordering::SeqCst));
+                }
+            }),
+        )])
+        .unwrap();
+        store_sstrkey(&entry_ref, &sstrkey_for_seed(seed));
+        let handle = signer_from_keyring(&entry_ref, &gstrkey_for_seed(seed))
+            .await
+            .unwrap();
+        let bytes = [0x3c; 32];
+        let payload =
+            TxSigningPayload::bound_between_for_test(bytes, handle.public_key().0, 1_000, 2_000);
+        for (now_ms, label) in [(999, "not_yet_valid"), (2_000, "expired")] {
+            read_at_ms.store(now_ms, Ordering::SeqCst);
+            clock.set(1_500);
+            let inert = stellar_agent_test_support::inert_dispatcher();
+            let writer = CaptureWriter::new();
+            let dispatch = tracing::Dispatch::new(json_capture_subscriber(writer.clone()));
+            let guard = tracing::dispatcher::set_default(&dispatch);
+            tracing::callsite::rebuild_interest_cache();
+            let code = handle
+                .sign_tx_payload(&payload)
+                .await
+                .err()
+                .map(|e| e.code());
+            drop(guard);
+            drop(inert);
+            assert_eq!(
+                code,
+                Some("network.mainnet_authorization_refused"),
+                "read at {now_ms}"
+            );
+            let logs = writer.captured_str();
+            assert!(
+                logs.contains(&format!("\"precondition\":\"{label}\"")),
+                "{logs}"
+            );
+            assert!(logs.contains("keyring.sign.failure"), "{logs}");
+            assert!(!logs.contains("keyring.sign.success"), "{logs}");
+        }
+        read_at_ms.store(1_999, Ordering::SeqCst);
+        clock.set(1_500);
+        assert_eq!(
+            handle.sign_tx_payload(&payload).await.unwrap(),
+            SoftwareSigningKey::new_from_bytes(seed).sign_raw(&bytes)
+        );
     }
 
     /// Every typed method of the handle signs its payload's bytes with the
