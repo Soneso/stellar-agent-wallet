@@ -5226,18 +5226,6 @@ impl<'a> OperationStatus<'a> {
         Ok(Some(wire))
     }
 
-    /// Reads the four oldest exposed classic attempts with unknown outcomes
-    /// and no sequence release. A transaction hash selects only its matching attempt.
-    ///
-    /// # Errors
-    /// Returns every integrity, keyring and I/O error of the verified window read.
-    pub fn recovery_snapshot(
-        &self,
-        tx_hash: Option<&[u8; 32]>,
-    ) -> Result<Vec<RecoveryAttempt>, WindowStoreError> {
-        self.unknown_attempts(tx_hash, false)
-    }
-
     /// Reads the four oldest exposed classic attempts with unknown
     /// outcomes for the outcome stage, attempts with a recorded sequence
     /// release included. A transaction hash selects only its matching
@@ -5249,7 +5237,7 @@ impl<'a> OperationStatus<'a> {
         &self,
         tx_hash: Option<&[u8; 32]>,
     ) -> Result<Vec<RecoveryAttempt>, WindowStoreError> {
-        self.unknown_attempts(tx_hash, true)
+        self.unknown_attempts(tx_hash)
     }
 
     /// Filters authenticated scheduling views before the driver's oldest-four limit.
@@ -5344,7 +5332,6 @@ impl<'a> OperationStatus<'a> {
     fn unknown_attempts(
         &self,
         tx_hash: Option<&[u8; 32]>,
-        released: bool,
     ) -> Result<Vec<RecoveryAttempt>, WindowStoreError> {
         let Some(wire) = self.read()? else {
             return Ok(Vec::new());
@@ -5365,14 +5352,8 @@ impl<'a> OperationStatus<'a> {
                 else {
                     continue;
                 };
-                // A matched release never takes a sequence slot again; the
-                // outcome stage still selects it.
+                // A matched release stays selected until a decision resolves it.
                 if attempt.outcome != Some(OperationState::SentOutcomeUnknown)
-                    || (attempt
-                        .sequence_released
-                        .as_ref()
-                        .is_some_and(SequenceReleased::is_matched)
-                        && !released)
                     || tx_hash.is_some_and(|hash| hash != stored_hash)
                 {
                     continue;
@@ -6583,6 +6564,21 @@ pub(crate) mod tests {
         unknown_with(fx, n, 0, vec![])
     }
 
+    /// An untimed unknown attempt that is due for recovery at its send-by time `due_ms`.
+    pub(crate) fn unknown_due(fx: &mut Fx, n: u8, due_ms: u64) -> OperationHandle {
+        let handle = unknown_named(fx, n);
+        let id = handle.id();
+        fx.rewrite(|wire| {
+            let record = section_mut(wire)
+                .records
+                .iter_mut()
+                .find(|record| record.id == id)
+                .unwrap();
+            record.attempts[0].send_by_ms = due_ms;
+        });
+        handle
+    }
+
     /// An exposed classic attempt in `SentOutcomeUnknown` with `max_time` and `holds`.
     pub(crate) fn unknown_with(
         fx: &mut Fx,
@@ -6617,7 +6613,7 @@ pub(crate) mod tests {
 
     #[test]
     #[serial]
-    fn recovery_snapshot_selects_oldest_eligible_and_targets_by_hash() {
+    fn outcome_snapshot_selects_oldest_eligible_and_targets_by_hash() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
@@ -6629,7 +6625,7 @@ pub(crate) mod tests {
             ids.push(unknown_with(&mut fx, n, T0 / 1_000 - 10, holds).id());
         }
         let snapshot = OperationStatus::new(&fx.store, &fx.profile)
-            .recovery_snapshot(None)
+            .outcome_snapshot(None)
             .unwrap();
         assert_eq!(
             snapshot
@@ -6649,7 +6645,7 @@ pub(crate) mod tests {
             unreachable!()
         };
         let targeted = OperationStatus::new(&fx.store, &fx.profile)
-            .recovery_snapshot(Some(&tx_hash))
+            .outcome_snapshot(Some(&tx_hash))
             .unwrap();
         assert_eq!(targeted.len(), 1);
         assert_eq!(targeted[0].operation_id, ids[4]);
@@ -6658,7 +6654,7 @@ pub(crate) mod tests {
             first.kind = OperationKind::X402Payment;
         });
         let snapshot = OperationStatus::new(&fx.store, &fx.profile)
-            .recovery_snapshot(None)
+            .outcome_snapshot(None)
             .unwrap();
         assert_eq!(
             snapshot
@@ -6672,7 +6668,7 @@ pub(crate) mod tests {
                 unreachable!()
             };
             OperationStatus::new(&fx.store, &fx.profile)
-                .recovery_snapshot(Some(&tx_hash))
+                .outcome_snapshot(Some(&tx_hash))
                 .unwrap()
                 .len()
         };
@@ -6688,7 +6684,7 @@ pub(crate) mod tests {
         bytes[at + 6] = b'9';
         fs::write(fx.store.path(), bytes).unwrap();
         let error = OperationStatus::new(&fx.store, &fx.profile)
-            .recovery_snapshot(None)
+            .outcome_snapshot(None)
             .unwrap_err();
         // Mainnet builds report the authentication mismatch as an unverifiable state.
         let expected = if cfg!(feature = "mainnet-write") {

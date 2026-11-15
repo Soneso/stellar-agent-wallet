@@ -71,6 +71,10 @@ pub(crate) struct ClassicRpc {
     stall: Arc<Mutex<Option<(String, usize, std::time::Duration)>>>,
     /// How many seconds before the request the latest ledger closed.
     close_age_secs: Arc<Mutex<u64>>,
+    /// How many seconds after the request the latest ledger closed in the
+    /// `getHealth` answers, for a test clock ahead of the system clock;
+    /// `getLedgers` keeps the system clock.
+    health_lead_secs: Arc<Mutex<u64>>,
     /// The status `getHealth` reports.
     health_status: Arc<Mutex<String>>,
 }
@@ -100,6 +104,7 @@ impl ClassicRpc {
             counts: Arc::default(),
             stall: Arc::default(),
             close_age_secs: Arc::default(),
+            health_lead_secs: Arc::default(),
             health_status: Arc::new(Mutex::new("healthy".to_owned())),
             accounts: Arc::new(accounts.iter().map(|a| (*a).to_owned()).collect()),
             accepted_sends: Arc::default(),
@@ -163,6 +168,13 @@ impl ClassicRpc {
         *self.close_age_secs.lock().unwrap() = seconds;
     }
 
+    /// Reports from every later `getHealth` a latest ledger that closed
+    /// `seconds` after the request.
+    #[cfg(feature = "mainnet-write")]
+    pub(crate) fn close_health_ahead(&self, seconds: u64) {
+        *self.health_lead_secs.lock().unwrap() = seconds;
+    }
+
     /// Reports `status` from every later `getHealth`.
     pub(crate) fn report_health(&self, status: &str) {
         *self.health_status.lock().unwrap() = status.to_owned();
@@ -176,6 +188,11 @@ impl ClassicRpc {
             .mount(&server)
             .await;
         server
+    }
+
+    /// The close time of the latest ledger this endpoint reports now.
+    fn close_secs(&self) -> u64 {
+        now_secs() - *self.close_age_secs.lock().unwrap()
     }
 
     fn ledger_entries(&self, body: &Value) -> Value {
@@ -275,9 +292,9 @@ impl Respond for ClassicRpc {
             }),
             "getHealth" => health_result(
                 &self.health_status.lock().unwrap(),
-                now_secs() - *self.close_age_secs.lock().unwrap(),
+                self.close_secs() + *self.health_lead_secs.lock().unwrap(),
             ),
-            "getLedgers" => ledgers_result(now_secs() - *self.close_age_secs.lock().unwrap()),
+            "getLedgers" => ledgers_result(self.close_secs()),
             "getLatestLedger" => json!({
                 "id": "00".repeat(32),
                 "protocolVersion": 23,

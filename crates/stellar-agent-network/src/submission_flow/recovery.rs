@@ -645,13 +645,18 @@ pub(crate) mod tests {
         server.received_requests().await.unwrap().len()
     }
 
+    /// An untimed unknown attempt, due for recovery at its send-by time [`T0`].
+    fn unknown_due(fx: &mut Fx, n: u8) {
+        crate::policy_state::operations::tests::unknown_due(fx, n, T0);
+    }
+
     #[tokio::test]
     #[serial]
     async fn recovery_dispatch_keeps_both_refusals() {
         let guard_home = tempfile::tempdir().unwrap();
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut rig = Rig::new();
-        unknown_named(&mut rig.fx, 1);
+        unknown_due(&mut rig.fx, 1);
         let (_, missing_ledger) =
             historical_without(&mut rig.fx, 2, Checked::NotIncluded, "submission_ledger");
         let (_, repaired) = commit_checked(&mut rig.fx, 3, Checked::Succeeded);
@@ -1932,7 +1937,7 @@ pub(crate) mod tests {
         let mut rig = Rig::new();
         let (_, refused) =
             historical_without(&mut rig.fx, 1, Checked::NotIncluded, "submission_ledger");
-        unknown_named(&mut rig.fx, 2);
+        unknown_due(&mut rig.fx, 2);
         let (_server, client) = endpoint().await;
         let repair = rig.repair(None).unwrap_err().to_string();
         let pass = rig.dispatch(&client, Some(&rig.receipts), false).await;
@@ -1972,7 +1977,7 @@ pub(crate) mod tests {
         assert!(!rig.projected(1));
         assert_eq!(
             OperationStatus::new(&rig.fx.store, &rig.fx.profile)
-                .recovery_snapshot(None)
+                .outcome_snapshot(None)
                 .unwrap()
                 .len(),
             1
@@ -1989,7 +1994,7 @@ pub(crate) mod tests {
         };
 
         let mut rig = Rig::new();
-        unknown_named(&mut rig.fx, 1);
+        unknown_due(&mut rig.fx, 1);
         let (_server, client) = endpoint().await;
         let pass = rig.dispatch(&client, Some(&rig.receipts), false).await;
         assert!(

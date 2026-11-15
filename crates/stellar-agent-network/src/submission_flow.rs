@@ -438,8 +438,8 @@ const SEQUENCES_MISSING_EVIDENCE: &str = "sequence recovery evidence missing; ";
 /// window store maps to [`ReconcilePass::Failed`] and leaves every open
 /// reservation in place.
 ///
-/// After a completed legacy stage, the recovery stage runs the sequence
-/// stage, then repairs the receipt of every retained committed recovery
+/// After a completed legacy stage, the recovery stage runs the bounded
+/// recovery driver of [`crate::policy_state::recover_outcomes`] once, then repairs the receipt of every retained committed recovery
 /// decision when `receipts` and the writer are available. Idle passes repair
 /// too. Accounting obligations drain in [`finish_reconciliation`].
 pub async fn reconcile_pass(
@@ -548,8 +548,8 @@ async fn reconcile_stages(
     let (Some(writer), ReconcilePass::Completed(report)) = (writer, &legacy) else {
         return legacy;
     };
-    // The sequence stage runs first; a projection refusal never starves it.
-    let sequences = crate::policy_state::recover_sequences(
+    // The one recovery driver runs first; a projection refusal never starves it.
+    let sequences = crate::policy_state::recover_outcomes(
         window,
         profile,
         crate::policy_state::EndpointPair::from_clients(client, oracle),
@@ -723,8 +723,42 @@ pub(crate) fn warn_status_recovery_refusal(
     );
 }
 
+/// One audit-writer acquisition shared by the status steps after
+/// reconciliation. The first step that needs the writer acquires it, and a
+/// refusal is cached too, so no later step acquires again.
+struct OnceWriter<F> {
+    acquire: F,
+    state: Option<Result<Arc<Mutex<AuditWriter>>, Option<WalletError>>>,
+}
+
+impl<F: Fn() -> Result<Arc<Mutex<AuditWriter>>, WalletError>> OnceWriter<F> {
+    fn result(&mut self) -> &mut Result<Arc<Mutex<AuditWriter>>, Option<WalletError>> {
+        self.state
+            .get_or_insert_with(|| (self.acquire)().map_err(Some))
+    }
+
+    /// The acquired writer, or `None` after a refusal.
+    fn handle(&mut self) -> Option<Arc<Mutex<AuditWriter>>> {
+        self.result().as_ref().ok().cloned()
+    }
+
+    /// The acquired writer, or the cached refusal for the drain to report.
+    fn for_drain(&mut self) -> Result<Arc<Mutex<AuditWriter>>, WalletError> {
+        match self.result() {
+            Ok(writer) => Ok(Arc::clone(writer)),
+            Err(refusal) => Err(refusal.take().unwrap_or_else(|| {
+                WalletError::Submission(SubmissionError::RecordUnavailable {
+                    detail: "the audit writer acquisition refused".to_owned(),
+                })
+            })),
+        }
+    }
+}
+
 /// Reconciles one transaction and reads its resulting receipt and reservation.
 /// Mainnet recovery and accounting delivery use the caller's audit writer.
+/// After reconciliation, recovery, the drain and receipt repair share one
+/// writer acquisition, made by the first of them that needs it.
 ///
 /// On a mainnet profile, after accounting delivery, the lookup repairs the
 /// checked receipt of the transaction's committed recovery decision. A
@@ -798,14 +832,18 @@ pub async fn transaction_status(
             }
         }
     }
+    let mut writer = OnceWriter {
+        acquire: writer,
+        state: None,
+    };
     let mut sequences = "not run";
     if profile.chain_id.is_mainnet()
         && status_recovery_enabled()
         && let Ok(hash) = stellar_agent_core::hex::decode_hex32(tx_hash)
-        && let Ok(writer) = writer()
+        && let Some(writer) = writer.handle()
     {
         sequences = "completed";
-        if let Err(error) = crate::policy_state::recover_sequences(
+        if let Err(error) = crate::policy_state::recover_outcomes(
             window,
             profile,
             crate::policy_state::EndpointPair::from_clients(client, oracle),
@@ -827,10 +865,12 @@ pub async fn transaction_status(
     }
     // The status answer does not depend on the drain: a refusal is logged by
     // the drain and leaves the obligations owed for a later call.
-    let _ = drain_accounting_obligations(window, profile, profile_name, Some(&receipts), &writer);
+    let _ = drain_accounting_obligations(window, profile, profile_name, Some(&receipts), || {
+        writer.for_drain()
+    });
     if profile.chain_id.is_mainnet()
         && let Ok(hash) = stellar_agent_core::hex::decode_hex32(tx_hash)
-        && let Ok(writer) = writer()
+        && let Some(writer) = writer.handle()
         && let Err(refused) =
             recovery::repair_committed_receipts(window, profile, &receipts, &writer, Some(&hash))
     {

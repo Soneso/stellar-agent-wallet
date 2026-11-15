@@ -1554,7 +1554,7 @@ Linked receipt rows never enter total projections, final promotion, or folding; 
 Admission and binding compare total epochs with the pin under the exclusive window lock, including replay.
 The retirement threshold remains 12. Upgrading versions 12 through 15 creates no additional retirement marker.
 Stale policy evaluation requires reloading the pinned policy; retired history requires different signed authority through `profile sign-policy`.
-Checked recovery remains a library surface without CLI or MCP integration. Exposed unknown totals stay charged without proof of non-use.
+Checked recovery on CLI and MCP dispatch and status settles classic attempts only. No CLI or MCP path, including `tx status`, releases exposed signed intents' totals of unknown outcome without proof of non-use.
 
 A schedule charge closes when both endpoints, above every authorization expiration, report its operation done or unset.
 
