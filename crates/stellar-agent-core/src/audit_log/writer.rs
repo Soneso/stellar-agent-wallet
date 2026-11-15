@@ -1992,6 +1992,12 @@ impl AuditWriter {
             .ok_or(WriterError::TipAnchorUnavailable)?;
         self.check_carrier_guards(store.as_ref())?;
         let batch = self.read_outbox(store.as_ref())?;
+        batch.recover_evidence_fence(
+            &self.path,
+            store.as_ref(),
+            self.hmac_key.as_deref(),
+            false,
+        )?;
         #[cfg(test)]
         if let Some(hook) = self.drain_after_snapshot.take() {
             hook();
@@ -2419,12 +2425,7 @@ impl AuditWriter {
             return super::outbox::locked_owner_evidence(&self.path, store.as_ref(), key);
         }
         let batch = self.read_outbox(store.as_ref())?;
-        let evidence = super::outbox::read_owner_evidence(
-            &self.path,
-            store.as_ref(),
-            batch.generation(),
-            key,
-        )?;
+        let evidence = super::outbox::read_owner_evidence(&self.path, store.as_ref(), &batch, key)?;
         batch.check_generation(store.as_ref())?;
         Ok(evidence)
     }
@@ -3635,10 +3636,8 @@ impl AuditWriter {
     /// - [`WriterError::TipAnchorUnavailable`] without an attached store.
     /// - [`WriterError::OutboxUnusable`] with `queue not drained before a key
     ///   change` when the queue holds a row. Nothing is written.
-    /// - [`WriterError::OutboxEvidenceUnusable`] with `evidence re-tag
-    ///   unavailable` when the owner commits consent evidence, and with
-    ///   `evidence image without owner` when evidence files exist beside an
-    ///   owner without an evidence root. Nothing is written.
+    /// - [`WriterError::OutboxEvidenceUnusable`] for unusable evidence or
+    ///   `evidence-generation overflow`, before the fence or key changes.
     /// - Every error of reading the queue, of storing owner state, and of the
     ///   publication.
     pub fn fence_outbox_for_key_change(&mut self) -> Result<(), WriterError> {
@@ -3654,45 +3653,22 @@ impl AuditWriter {
                 "only a key-rotation writer fences the outbox",
             )));
         }
-        if self.hmac_key.is_none() {
-            return Ok(());
-        }
         let store = self
             .tip_anchor
             .clone()
             .ok_or(WriterError::TipAnchorUnavailable)?;
+        self.check_carrier_guards(store.as_ref())?;
         let batch = self.read_outbox(store.as_ref())?;
-        // Evidence images authenticate under the current key only, so an
-        // owner that commits evidence keeps its key until re-tagging exists.
-        // Evidence files beside an owner without a root, such as a restored
-        // v1 owner, keep the key too: the current owner may be restored.
-        if batch.owner_commits_evidence(store.as_ref())? {
-            return Err(WriterError::OutboxEvidenceUnusable {
-                reason: "evidence re-tag unavailable",
-            });
+        if self.hmac_key.is_none() {
+            super::outbox::read_owner_evidence(&self.path, store.as_ref(), &batch, None)?;
+            return batch.check_generation(store.as_ref());
         }
-        if super::consent_evidence::any_slot_exists(&self.path)? {
-            return Err(WriterError::OutboxEvidenceUnusable {
-                reason: "evidence image without owner",
-            });
+        if let Some(key) = self.hmac_key.as_deref() {
+            batch.fence_key_change(&self.path, store.as_ref(), key)?;
         }
-        let target =
-            batch
-                .key_change_target(store.as_ref())?
-                .ok_or(WriterError::OutboxUnusable {
-                    line: 1,
-                    column: 1,
-                    reason: "queue not drained before a key change",
-                })?;
-        if let Some(owner) = target.owner_value() {
-            store.store_outbox_owner_state(batch.generation(), &owner)?;
-            #[cfg(any(test, feature = "test-helpers"))]
-            super::outbox::test_seam::check_stop(
-                batch.path(),
-                super::outbox::test_seam::Stop::OwnerStored,
-            )?;
-        }
-        batch.publish_fence(target.generation, store.as_ref())
+        self.check_carrier_guards(store.as_ref())?;
+        self.read_outbox(store.as_ref())?
+            .check_generation(store.as_ref())
     }
 
     /// Switches the writer to the new audit key `key` for chain-root signing
@@ -3731,7 +3707,9 @@ impl AuditWriter {
         let replaces_key = self.hmac_key.is_some();
         self.entry_tag_key = Some(derive_entry_tag_key(&key));
         self.hmac_key = Some(key.clone());
+        self.check_carrier_guards(store.as_ref())?;
         let batch = self.read_outbox(store.as_ref())?;
+        batch.recover_evidence_fence(&self.path, store.as_ref(), Some(&key), true)?;
         #[cfg(test)]
         if let Some(hook) = self.before_generation_resign.take()
             && hook()
@@ -3745,12 +3723,16 @@ impl AuditWriter {
             // and a queue without owner state stays as it is.
             Some(target) if replaces_key || target.owner_value().is_none() => {
                 if let Some(owner) = target.owner_value() {
+                    batch.check_generation(store.as_ref())?;
                     store.store_outbox_owner_state(batch.generation(), &owner)?;
                 }
                 batch.publish(&key, target.generation, store.as_ref())?;
             }
             _ => drop(batch),
         }
+        self.check_carrier_guards(store.as_ref())?;
+        self.read_outbox(store.as_ref())?
+            .check_generation(store.as_ref())?;
         drop(key);
         if !self.entry_tags_in_force {
             return Ok(());
@@ -7165,7 +7147,7 @@ pub enum WriterError {
     ///
     /// `reason` is one of `missing image`, `length`, `tag`, `layout`,
     /// `scope`, `head`, `owner rollback`, `evidence image without owner`,
-    /// `queue not drained`, and `evidence re-tag unavailable`. It never
+    /// `queue not drained`, and `evidence-generation overflow`. It never
     /// carries file contents. Recovery is in
     /// `docs/maintainers/audit-log-recovery.md`.
     #[error(

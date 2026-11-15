@@ -134,6 +134,10 @@
 //! (`stellar-agent-cli::common::signer_ceremony`) when `Wallet::unlock`
 //! degrades under `MlockRequired::Warn`.
 
+//! Consent evidence uses a locked successor transaction with checked generation
+//! advancement. Key rotation fences the queue until the owner and both evidence
+//! copies are durable under the stored key. Records and the time floor survive.
+
 pub mod binding;
 mod carriers;
 pub mod chain;

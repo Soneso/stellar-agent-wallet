@@ -205,6 +205,14 @@ pub(crate) fn decode(slot: &[u8], key: &[u8; 32]) -> Result<EvidenceImage, &'sta
     if !tag_verifies(slot, key) {
         return Err("tag");
     }
+    decode_layout(slot)
+}
+
+/// Checks the complete layout of bytes authenticated by a committed head.
+pub(crate) fn decode_layout(slot: &[u8]) -> Result<EvidenceImage, &'static str> {
+    if slot.len() != SLOT_BYTES {
+        return Err("length");
+    }
     let layout = "layout";
     if &slot[..8] != MAGIC {
         return Err(layout);
@@ -537,6 +545,28 @@ pub(crate) mod tests {
                 <[u8; 32]>::from(scope.finalize())
             })
         );
+    }
+
+    #[test]
+    fn documented_domains_reproduce_snapshot_vector() {
+        const DOC: &str = include_str!("../../../../docs/maintainers/audit-log-recovery.md");
+        let tag_rule = "The tag is HMAC-SHA256 under the audit key over ASCII `stellar-agent-consent-evidence-tag:v1`, followed by the whole file with bytes 92 through 123 zeroed.";
+        let head_rule = "The head is SHA-256 over ASCII `stellar-agent-consent-evidence:v1`, followed by the whole tagged file.";
+        assert!(DOC.contains(tag_rule), "documented tag domain and order");
+        assert!(DOC.contains(head_rule), "documented head domain and order");
+        let mut records = vec![delivered(1), EvidenceRecord::legacy_pin([0xab; 32])];
+        records.sort_by_key(|record| record.identity);
+        let slot = image(3, records).seal(&KEY);
+        let mut zeroed = slot.clone();
+        zeroed[92..124].fill(0);
+        let mut mac = Hmac::<Sha256>::new_from_slice(&KEY).unwrap();
+        mac.update(tag_rule.split('`').nth(1).unwrap().as_bytes());
+        mac.update(&zeroed);
+        assert_eq!(&slot[92..124], mac.finalize().into_bytes().as_slice());
+        let mut hash = Sha256::new();
+        hash.update(head_rule.split('`').nth(1).unwrap().as_bytes());
+        hash.update(&slot);
+        assert_eq!(head(&slot), <[u8; 32]>::from(hash.finalize()));
     }
 
     #[test]
