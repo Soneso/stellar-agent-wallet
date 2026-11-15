@@ -38,6 +38,8 @@ pub(crate) struct PreparedEnvelope {
     /// The facts read from a stored envelope; `None` for the envelope the
     /// call just built, whose facts the call computed itself.
     pub stored: Option<EnvelopeFacts>,
+    /// The retained operation's waiting deadline, when an operation exists.
+    pub waiting_end: Option<u64>,
 }
 
 impl ClassicOperation {
@@ -222,18 +224,22 @@ impl WalletServer {
             return Ok(PreparedEnvelope {
                 xdr: candidate,
                 stored: None,
+                waiting_end: None,
             });
         };
-        let stored = |xdr: &str| {
+        let stored = |xdr: &str, end| {
             operation_entry::envelope_facts(xdr)
                 .map(|facts| PreparedEnvelope {
                     xdr: xdr.to_owned(),
                     stored: Some(facts),
+                    waiting_end: Some(end),
                 })
                 .map_err(|error| refusal(&error))
         };
-        if operation.stored_envelope() == Some(candidate.as_str()) {
-            return stored(&candidate);
+        if let Some(handle) = &operation.resume
+            && handle.envelope_xdr() == Some(candidate.as_str())
+        {
+            return stored(&candidate, handle.waiting_expires_at_ms());
         }
         let max_time =
             operation_entry::envelope_max_time(&candidate).map_err(|error| refusal(&error))?;
@@ -251,10 +257,13 @@ impl WalletServer {
         })?;
         match entry {
             OpenedEntry::Resume(handle) => match handle.envelope_xdr() {
-                Some(opened) if opened != candidate => stored(opened),
+                Some(opened) if opened != candidate => {
+                    stored(opened, handle.waiting_expires_at_ms())
+                }
                 _ => Ok(PreparedEnvelope {
                     xdr: candidate,
                     stored: None,
+                    waiting_end: Some(handle.waiting_expires_at_ms()),
                 }),
             },
             OpenedEntry::Replay(view) => Err(replay_result(&view)),

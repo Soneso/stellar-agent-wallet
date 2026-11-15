@@ -1375,12 +1375,7 @@ impl WalletServer {
             )
             .await
             {
-                Ok(verified) => {
-                    witness = verified;
-                    witness
-                        .as_ref()
-                        .map(stellar_agent_network::mainnet::authority::MainnetAuthority::Approval)
-                }
+                Ok(_) => None,
                 Err(result) => return Ok(result),
             }
         };

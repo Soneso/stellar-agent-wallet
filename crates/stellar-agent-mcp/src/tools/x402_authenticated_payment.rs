@@ -1404,7 +1404,7 @@ impl WalletServer {
             let terminal = self.x402_approval_store().and_then(|mut pending| {
                 pending
                     .consume(
-                        approval.nonce(),
+                        approval.witness().nonce(),
                         &final_digest,
                         stellar_agent_core::approval::ConsumedOutcome::Unknown,
                     )

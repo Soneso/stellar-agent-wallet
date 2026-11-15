@@ -1695,6 +1695,7 @@ async fn an_unavailable_anchor_at_the_transmit_gate_withholds_the_payment() {
 /// A mainnet server, the SEP-10 double, and the fixture payment's intent.
 struct Boundary {
     f: Fixture,
+    decision: stellar_agent_core::mainnet::decision::MainnetDecision,
     double: Sep10Double,
     requirements: stellar_agent_x402::wire::PaymentRequirements,
     root: stellar_xdr::SorobanAuthorizedInvocation,
@@ -1746,8 +1747,23 @@ impl Boundary {
             stellar_agent_x402::exact::payment_root(&requirements, f.envelope.source()).unwrap();
         let network_id = sha2::Sha256::digest(MAINNET_PASSPHRASE.as_bytes()).into();
         let _ = take_authorized_signings_for_test();
+        let outcome = f
+            .server
+            .dispatch_preparation(
+                TOOL,
+                &serde_json::json!({"chain_id":"stellar:mainnet", "home_domain":HOME}),
+                "stellar:mainnet",
+                ValueClass::single(x402_value_leg(&requirements, 10)),
+                stellar_agent_core::mainnet::decision::EvaluationScope::X402Authenticated {
+                    home_domain: HOME.to_owned(),
+                    tool: TOOL.to_owned(),
+                },
+            )
+            .await
+            .unwrap();
         Self {
             f,
+            decision: outcome.mainnet_decision().unwrap().clone(),
             double,
             requirements,
             root,
@@ -1836,7 +1852,11 @@ impl Boundary {
     fn receipt(&self, facts: &MessageFacts, approval: &ApprovalWitness) -> MessageUseReceipt {
         self.receipt_under(
             facts,
-            &stellar_agent_network::mainnet::authority::MainnetAuthority::Approval(approval),
+            &stellar_agent_network::mainnet::authority::MainnetAuthority::from_decision(
+                &self.decision,
+                Some(approval),
+            )
+            .unwrap(),
         )
     }
 
@@ -2143,9 +2163,11 @@ async fn the_identity_gate_refuses_a_future_created_approval() {
             intent: &intent,
             policy: guard.policy,
             enablement: guard.enablement,
-            authority: &stellar_agent_network::mainnet::authority::MainnetAuthority::Approval(
-                &approval,
-            ),
+            authority: &stellar_agent_network::mainnet::authority::MainnetAuthority::from_decision(
+                &b.decision,
+                Some(&approval),
+            )
+            .unwrap(),
             audit,
             store: &store,
         },
@@ -2235,9 +2257,11 @@ async fn the_identity_inputs_print_the_profile_only() {
         intent: &intent,
         policy: guard.policy,
         enablement: guard.enablement,
-        authority: &stellar_agent_network::mainnet::authority::MainnetAuthority::Approval(
-            &approval,
-        ),
+        authority: &stellar_agent_network::mainnet::authority::MainnetAuthority::from_decision(
+            &b.decision,
+            Some(&approval),
+        )
+        .unwrap(),
         audit,
         store: &store,
     };
@@ -2329,9 +2353,11 @@ async fn the_mainnet_session_prints_no_jwt_and_no_envelope() {
             intent: &intent,
             policy: guard.policy,
             enablement: guard.enablement,
-            authority: &stellar_agent_network::mainnet::authority::MainnetAuthority::Approval(
-                &approval,
-            ),
+            authority: &stellar_agent_network::mainnet::authority::MainnetAuthority::from_decision(
+                &b.decision,
+                Some(&approval),
+            )
+            .unwrap(),
             audit,
             store: &store,
         },

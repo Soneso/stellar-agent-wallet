@@ -507,6 +507,63 @@ claim = "approval.rebuild_from_intent"
 rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
 pending = "intent-commit"
 
+[[claim]]
+id = "approval.payment_envelope_facts"
+family = "approval"
+statement = "payment preparation displays and persists the retained envelope facts, including typed memo and sequence"
+applies = ["prepare"]
+
+[[cell]]
+claim = "approval.payment_envelope_facts"
+rows = ["mcp.pay"]
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "approval_cap_integration::payment_approval_facts_come_from_the_retained_envelope" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::common::tests::mainnet::resumed_payment_retains_envelope_facts_and_waiting_end", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "approval.payment_envelope_facts"
+rows = ["mcp.create_account", "mcp.claim", "mcp.trustline"]
+not_applicable = "This claim concerns payment envelope fields and payment memo variants."
+
+[[claim]]
+id = "approval.payment_captured_end"
+family = "approval"
+statement = "payment preparation retains its captured millisecond end through persistence delay and refuses an elapsed interval before nonce issuance"
+applies = ["prepare"]
+
+[[cell]]
+claim = "approval.payment_captured_end"
+rows = ["mcp.pay"]
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "approval_cap_integration::payment_approval_delay_keeps_the_captured_end" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::common::payment_interval_tests::staggered_payment_ends_preserve_selection_and_effects" },
+]
+
+[[cell]]
+claim = "approval.payment_captured_end"
+rows = ["mcp.create_account", "mcp.claim", "mcp.trustline"]
+not_applicable = "This claim covers payment queue intervals; other preparation paths keep their existing lifetime contracts."
+
+[[claim]]
+id = "approval.payment_authority_end"
+family = "approval"
+statement = "classic payment resolution preserves the captured decision end for policy and approval authority through delay and durable reopen"
+applies = ["commit", "verb"]
+builds = "feature-on"
+
+[[cell]]
+claim = "approval.payment_authority_end"
+rows = ["mcp.pay_commit", "cli.pay"]
+tests = [
+  { package = "stellar-agent-network", target = "lib", name = "mainnet::resolve::tests::captured_authority_ends_survive_resolution_and_reopen", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "approval.payment_authority_end"
+rows = ["mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "cli.claim", "cli.trustline", "cli.accounts_create"]
+not_applicable = "This claim is specific to classic payment consumers."
+
 # Cells: sizing.caps_refuse.
 
 [[cell]]

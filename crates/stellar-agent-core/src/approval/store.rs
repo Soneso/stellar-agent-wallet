@@ -3487,6 +3487,69 @@ impl PendingApproval {
 }
 
 impl PendingApproval {
+    /// Constructs a payment approval from its retained envelope and captured interval.
+    /// The exact memo remains in the envelope; the legacy summary memo is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApprovalError::Expired`] outside the supplied interval and
+    /// [`ApprovalError::InvalidEntry`] for an envelope that is not one payment.
+    pub fn new_payment_pending_until(
+        envelope_xdr_b64: String,
+        process_uid: String,
+        created_at_unix_ms: u64,
+        expires_at_unix_ms: u64,
+        now_ms: u64,
+        request: &crate::policy::ApprovalRequest,
+    ) -> Result<Self, ApprovalError> {
+        use crate::envelope_decode::{ClassicOperation, ClassicTransactionKind, classic_summary};
+        if now_ms < created_at_unix_ms || now_ms >= expires_at_unix_ms {
+            return Err(ApprovalError::Expired);
+        }
+        let summary = classic_summary(&envelope_xdr_b64, ClassicTransactionKind::Payment).map_err(
+            |error| ApprovalError::InvalidEntry {
+                detail: error.to_string(),
+            },
+        )?;
+        let ClassicOperation::Payment {
+            destination,
+            asset,
+            amount_stroops,
+        } = summary.operation
+        else {
+            return Err(ApprovalError::InvalidEntry {
+                detail: "the envelope must contain one payment".to_owned(),
+            });
+        };
+        let mut raw = [0u8; 16];
+        OsRng.fill_bytes(&mut raw);
+        let envelope_sha256_hex =
+            crate::hex::encode(&super::subject::approval_subject_classic(&envelope_xdr_b64));
+        Ok(Self {
+            approval_nonce: URL_SAFE_NO_PAD.encode(raw),
+            process_uid,
+            created_at_unix_ms,
+            expires_at_unix_ms,
+            reason: request.reason.clone(),
+            kind: ApprovalKind::PaymentSimulated {
+                envelope_xdr_b64,
+                envelope_sha256_hex,
+                summary_to: destination,
+                summary_amount_stroops: amount_stroops,
+                summary_asset: asset,
+                summary_memo: None,
+                summary_simulated_fee_stroops: summary.fee_stroops,
+                summary_simulated_seq_num: summary.seq_num,
+            },
+            attestation_blob_b64: None,
+            passkey_assertion: None,
+            attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
+            attested_approver: None,
+            mainnet_presence: None,
+            subject_kind: SubjectKind::EnvelopeText,
+        })
+    }
+
     /// Applies the policy rule's lifetime and explanation while retaining the wallet-issued nonce.
     #[must_use]
     pub fn with_policy_request(mut self, request: &crate::policy::ApprovalRequest) -> Self {
@@ -7364,6 +7427,82 @@ mod tests {
             DEFAULT_TTL_MS,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn payment_captured_interval_survives_store_reopen() {
+        let envelope = super::super::fixtures::payment_envelope(
+            &stellar_strkey::ed25519::PublicKey([3; 32]).to_string(),
+            &payment_destinations()[2],
+            "XLM",
+            1_000_000,
+            Some("é"),
+            177,
+            101,
+        );
+        let mut request = crate::policy::ApprovalRequest::new("request".to_owned(), 600);
+        request.reason = Some("review payment".to_owned());
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("approval.toml");
+        let start = TEST_NOW_MS;
+        let end = start + 2_000;
+        for remaining in [1, 999, 1_000, 1_001] {
+            let entry = PendingApproval::new_payment_pending_until(
+                envelope.clone(),
+                "1000".to_owned(),
+                start,
+                end,
+                end - remaining,
+                &request,
+            )
+            .unwrap();
+            assert_eq!(
+                (entry.created_at_unix_ms, entry.expires_at_unix_ms),
+                (start, end)
+            );
+            assert_eq!(entry.reason, request.reason);
+            let nonce = entry.approval_nonce.clone();
+            let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+            store.insert(entry, end - remaining).unwrap();
+            drop(store);
+            let store = PendingApprovalStore::open(path.clone()).unwrap();
+            let stored = store.get(&nonce).unwrap();
+            assert_eq!(
+                (stored.created_at_unix_ms, stored.expires_at_unix_ms),
+                (start, end)
+            );
+            let ApprovalKind::PaymentSimulated {
+                envelope_xdr_b64,
+                summary_simulated_seq_num,
+                summary_memo,
+                ..
+            } = &stored.kind
+            else {
+                panic!("payment")
+            };
+            assert_eq!(envelope_xdr_b64, &envelope);
+            assert_eq!(*summary_simulated_seq_num, 101);
+            assert_eq!(*summary_memo, None);
+        }
+        let before = std::fs::read(&path).unwrap();
+        for (created, expires, now) in [
+            (start, end, start - 1),
+            (start, end, end),
+            (start, start, start),
+        ] {
+            assert!(matches!(
+                PendingApproval::new_payment_pending_until(
+                    envelope.clone(),
+                    "1000".to_owned(),
+                    created,
+                    expires,
+                    now,
+                    &request,
+                ),
+                Err(ApprovalError::Expired)
+            ));
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
     /// Writes `entries` to `path` as the store serializes them.

@@ -2447,7 +2447,6 @@ mod tests {
         #[serial]
         async fn mainnet_authorization_rejects_receipt_from_another_policy() {
             use crate::mainnet::MainnetAuthorizationError;
-            use crate::mainnet::authority::MainnetAuthority;
             use crate::mainnet::fixtures::{
                 MESSAGE_HOME_DOMAIN, ResolverFixture, message_facts, x402_fixture, x402_intent,
                 x402_root,
@@ -2473,7 +2472,7 @@ mod tests {
             assert_eq!(other.mainnet(), f.policy.mainnet());
             assert_ne!(other.digest(), f.policy.digest());
             assert_eq!(approval.policy_digest(), f.policy.digest());
-            let authority = MainnetAuthority::Approval(&approval);
+            let authority = f.approval_authority(&approval);
             let request = |policy| TxSignRequest {
                 context: &context,
                 consumer: MainnetConsumer::CliPay,
@@ -2501,7 +2500,7 @@ mod tests {
             let message = message_facts([1; 32], [0xe1; 32]);
             let approval = f.x402_approval(&root, Some(MESSAGE_HOME_DOMAIN), f.now);
             let other = f.another_policy();
-            let authority = MainnetAuthority::Approval(&approval);
+            let authority = f.approval_authority(&approval);
             let mut req = f.message_request(&intent, &message, &authority);
             req.policy = &other;
             let before = f.wire();

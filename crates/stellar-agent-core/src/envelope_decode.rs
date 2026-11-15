@@ -289,10 +289,8 @@ fn xdr_asset_to_string(asset: &stellar_xdr::Asset) -> Result<String, EnvelopeDec
 ///
 /// # Rationale for `Memo::Id` / `Memo::Hash` / `Memo::Return` in `memo`
 ///
-/// Returning `Ok(None)` preserves the invariant that `memo` in the args JSON is
-/// either a UTF-8 string or `null`. Hash and return memos are surfaced by
-/// `decode_pay_args` as separate `memo_hash` / `memo_return` fields so existing
-/// text-memo consumers do not change shape.
+/// Returning `Ok(None)` keeps `memo` either a UTF-8 string or `null`.
+/// Payment decoding carries ID, hash and return memos in separate fields.
 fn memo_to_optional_string(
     memo: &stellar_xdr::Memo,
 ) -> Result<Option<String>, EnvelopeDecodeError> {
@@ -307,8 +305,7 @@ fn memo_to_optional_string(
                     detail: "memo text is not valid UTF-8".to_owned(),
                 })
         }
-        // Numeric memos: not forwarded through the policy path.
-        // The envelope divergence check is the integrity backstop.
+        // The decimal ID belongs to the structured payment facts.
         stellar_xdr::Memo::Id(_) => Ok(None),
         // Hash and Return memos remain absent from the legacy text `memo`
         // field. `decode_pay_args` surfaces their bytes separately.
@@ -318,6 +315,7 @@ fn memo_to_optional_string(
 
 fn structured_memo_field(memo: &stellar_xdr::Memo) -> Option<(&'static str, String)> {
     match memo {
+        stellar_xdr::Memo::Id(id) => Some(("memo_id", id.to_string())),
         stellar_xdr::Memo::Hash(hash) => Some(("memo_hash", crate::hex::encode(&hash.0))),
         stellar_xdr::Memo::Return(hash) => Some(("memo_return", crate::hex::encode(&hash.0))),
         _ => None,
@@ -525,10 +523,12 @@ fn decode_single_operation(
 ///   "chain_id": "<from caller — not encoded in XDR>",
 ///   "source": "G...",
 ///   "total_fee_stroops": <u32>,
+///   "sequence_number": <i64>,
 ///   "destination": "G..." | "M...",
 ///   "amount_stroops": "<decimal i64 stroops>",
 ///   "asset": "XLM" | "CODE:Gissuer",
 ///   "memo": "text" | null,
+///   "memo_id": "<decimal u64, only for Memo::Id>",
 ///   "memo_hash": "<64 lowercase hex chars, only for Memo::Hash>",
 ///   "memo_return": "<64 lowercase hex chars, only for Memo::Return>"
 /// }
@@ -622,7 +622,9 @@ pub fn decode_authoritative_args(
 
     // 6. Dispatch by tool.
     match tool {
-        "stellar_pay_commit" => decode_pay_args(&tx.memo, tx.fee, op, &source_strkey, tool),
+        "stellar_pay_commit" => {
+            decode_pay_args(&tx.memo, tx.fee, tx.seq_num.0, op, &source_strkey, tool)
+        }
         "stellar_create_account_commit" => {
             decode_create_account_args(tx.fee, op, &source_strkey, tool)
         }
@@ -658,6 +660,7 @@ pub fn decode_authoritative_args(
 fn decode_pay_args(
     memo: &stellar_xdr::Memo,
     total_fee_stroops: u32,
+    sequence_number: i64,
     op: &stellar_xdr::Operation,
     source_strkey: &str,
     tool: &'static str,
@@ -761,6 +764,7 @@ fn decode_pay_args(
             })
         }
     };
+    args["sequence_number"] = sequence_number.into();
     if let Some((field, value)) = structured_memo_field(memo)
         && let Some(obj) = args.as_object_mut()
     {
@@ -1737,7 +1741,7 @@ mod tests {
     }
 
     #[test]
-    fn memo_id_returns_null_without_structured_memo_fields() {
+    fn memo_id_retains_decimal_fact_with_null_legacy_memo() {
         let op = Operation {
             source_account: None,
             body: OperationBody::Payment(PaymentOp {
@@ -1746,14 +1750,15 @@ mod tests {
                 amount: 10_000_000,
             }),
         };
-        let env = build_envelope(SOURCE_G, op, Memo::Id(42));
-        let xdr_b64 = to_b64(&env);
-
-        let result = decode_authoritative_args(&xdr_b64, "stellar_pay_commit")
-            .expect("Memo::Id must not cause a decode error");
-        assert_eq!(result["memo"], serde_json::Value::Null);
-        assert!(result.get("memo_hash").is_none());
-        assert!(result.get("memo_return").is_none());
+        for (id, decimal) in [(0, "0"), (42, "42"), (u64::MAX, "18446744073709551615")] {
+            let env = build_envelope(SOURCE_G, op.clone(), Memo::Id(id));
+            let xdr_b64 = to_b64(&env);
+            let result = decode_authoritative_args(&xdr_b64, "stellar_pay_commit").unwrap();
+            assert_eq!(result["memo_id"], decimal);
+            assert_eq!(result["memo"], serde_json::Value::Null);
+            assert!(result.get("memo_hash").is_none());
+            assert!(result.get("memo_return").is_none());
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -2315,6 +2320,90 @@ mod tests {
     /// evaluates for the same envelope, plus the memo, fee and sequence.
     #[test]
     fn classic_summary_payment_agrees_with_the_policy_decoder() {
+        use stellar_xdr::ReadXdr as _;
+        const G: &str = "GCTKNJVGU2TKNJVGU2TKNJVGU2TKNJVGU2TKNJVGU2TKNJVGU2TKNG7S";
+        const M0: &str = "MCTKNJVGU2TKNJVGU2TKNJVGU2TKNJVGU2TKNJVGU2TKNJVGU2TKMAAAAAAAAAAAABA5O";
+        const MMAX: &str = "MCTKNJVGU2TKNJVGU2TKNJVGU2TKNJVGU2TKNJVGU2TKNJVGU2TKN7777777777776QHC";
+        for destination in [G, M0, MMAX] {
+            for (asset, asset_text) in [
+                (Asset::Native, "XLM".to_owned()),
+                (usdc(), format!("USDC:{USDC_ISSUER_G}")),
+            ] {
+                for sequence in [101, i64::MAX] {
+                    for (memo, expected_memo) in [
+                        (Memo::None, ClassicMemo::None),
+                        (
+                            Memo::Text(Vec::new().try_into().unwrap()),
+                            ClassicMemo::Text(String::new()),
+                        ),
+                        (
+                            Memo::Text("é".as_bytes().try_into().unwrap()),
+                            ClassicMemo::Text("é".to_owned()),
+                        ),
+                        (Memo::Id(0), ClassicMemo::Id(0)),
+                        (Memo::Id(u64::MAX), ClassicMemo::Id(u64::MAX)),
+                        (
+                            Memo::Hash(stellar_xdr::Hash([0xab; 32])),
+                            ClassicMemo::Hash([0xab; 32]),
+                        ),
+                        (
+                            Memo::Return(stellar_xdr::Hash([0xab; 32])),
+                            ClassicMemo::Return([0xab; 32]),
+                        ),
+                    ] {
+                        let op = Operation {
+                            source_account: Some(g_to_muxed(DEST_G)),
+                            body: OperationBody::Payment(PaymentOp {
+                                destination: crate::payment_accounts::PaymentAccount::parse(
+                                    destination,
+                                )
+                                .unwrap()
+                                .to_muxed_account(),
+                                asset: asset.clone(),
+                                amount: 123_456_789,
+                            }),
+                        };
+                        let mut env = build_envelope(SOURCE_G, op, memo);
+                        let TransactionEnvelope::Tx(ref mut v1) = env else {
+                            unreachable!()
+                        };
+                        v1.tx.seq_num = SequenceNumber(sequence);
+                        let retained = to_b64(&env);
+                        assert_eq!(
+                            to_b64(
+                                &TransactionEnvelope::from_xdr_base64(&retained, Limits::none())
+                                    .unwrap()
+                            ),
+                            retained
+                        );
+                        let summary =
+                            classic_summary(&retained, ClassicTransactionKind::Payment).unwrap();
+                        let policy =
+                            decode_authoritative_args(&retained, "stellar_pay_commit").unwrap();
+                        assert_eq!(policy["sequence_number"], sequence);
+                        assert_eq!(summary.seq_num, sequence);
+                        assert_eq!(policy["source"], DEST_G);
+                        assert_eq!(policy["destination"], destination);
+                        assert_eq!(policy["amount_stroops"], "123456789");
+                        assert_eq!(policy["asset"], asset_text);
+                        assert_eq!(summary.memo, expected_memo);
+                        match expected_memo {
+                            ClassicMemo::None => assert!(policy["memo"].is_null()),
+                            ClassicMemo::Text(text) => assert_eq!(policy["memo"], text),
+                            ClassicMemo::Id(id) => assert_eq!(policy["memo_id"], id.to_string()),
+                            ClassicMemo::Hash(_) => assert_eq!(
+                                policy["memo_hash"],
+                                "abababababababababababababababababababababababababababababababab"
+                            ),
+                            ClassicMemo::Return(_) => assert_eq!(
+                                policy["memo_return"],
+                                "abababababababababababababababababababababababababababababababab"
+                            ),
+                        }
+                    }
+                }
+            }
+        }
         let op = Operation {
             source_account: Some(g_to_muxed(DEST_G)),
             body: OperationBody::Payment(PaymentOp {

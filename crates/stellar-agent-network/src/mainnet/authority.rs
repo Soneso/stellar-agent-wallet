@@ -6,7 +6,7 @@
 //! witness becomes [`MainnetAuthority::Policy`]; a decision with a witness
 //! becomes [`MainnetAuthority::Approval`]; an approval requirement without a
 //! witness is [`AuthorityError::ApprovalRequired`] and never policy
-//! authority. The factory reads no clock: the policy authority governs from
+//! authority. The factory reads no clock: each authority governs from
 //! the decision's evaluation instant for the decision's governing lifetime.
 //!
 //! A [`PolicyAuthority`] has private fields and is neither copied nor
@@ -49,10 +49,33 @@ pub enum MainnetAuthority<'w> {
     /// The verified policy allowed the action without an approval.
     Policy(PolicyAuthority),
     /// The operator approved the action.
-    Approval(&'w ApprovalWitness),
+    Approval(ApprovalAuthority<'w>),
 }
 
-/// An `Allow` decision of the verified policy, as authority for one action.
+/// An operator witness bounded by the verified policy decision.
+#[derive(Debug)]
+pub struct ApprovalAuthority<'w> {
+    witness: &'w ApprovalWitness,
+    pub(crate) bound: PolicyAuthority,
+}
+
+impl ApprovalAuthority<'_> {
+    /// The operator's verified proof, with its original attested lifetime.
+    #[must_use]
+    pub fn witness(&self) -> &ApprovalWitness {
+        self.witness
+    }
+
+    /// The earlier of the witness expiry and the captured decision end.
+    #[must_use]
+    pub fn expires_at_ms(&self) -> u64 {
+        self.witness
+            .expires_at_ms()
+            .min(self.bound.governing_until_ms())
+    }
+}
+
+/// A permitting decision's provenance and captured lifetime.
 ///
 /// It records the decision's provenance and the end of the authority it
 /// grants, `governing_until_ms`: the evaluation instant plus the decision's
@@ -178,7 +201,7 @@ impl<'w> MainnetAuthority<'w> {
     /// | `RequireApproval` | none | [`AuthorityError::ApprovalRequired`] |
     /// | any other | either | [`AuthorityError::Internal`] |
     ///
-    /// The policy authority governs until the decision's evaluation instant
+    /// Each authority governs until the decision's evaluation instant
     /// plus its governing lifetime. The factory takes no time input.
     ///
     /// # Errors
@@ -191,14 +214,14 @@ impl<'w> MainnetAuthority<'w> {
         witness: Option<&'w ApprovalWitness>,
     ) -> Result<Self, AuthorityError> {
         match (decision.decision(), witness) {
-            (Decision::Allow, None) => {
+            (Decision::Allow, _) | (Decision::RequireApproval(_), Some(_)) => {
                 let governing_until_ms = decision
                     .evaluated_at_ms()
                     .checked_add(decision.governing_ttl_ms())
                     .ok_or_else(|| AuthorityError::Internal {
                         detail: "the governing end overflows".to_owned(),
                     })?;
-                Ok(Self::Policy(PolicyAuthority {
+                let bound = PolicyAuthority {
                     policy_digest: decision.policy_digest(),
                     policy_sequence: decision.policy_sequence(),
                     rule_index: decision.rule_index(),
@@ -207,10 +230,11 @@ impl<'w> MainnetAuthority<'w> {
                     evaluated_at_ms: decision.evaluated_at_ms(),
                     governing_until_ms,
                     scope: decision.scope().clone(),
-                }))
-            }
-            (Decision::Allow | Decision::RequireApproval(_), Some(witness)) => {
-                Ok(Self::Approval(witness))
+                };
+                Ok(match witness {
+                    Some(witness) => Self::Approval(ApprovalAuthority { witness, bound }),
+                    None => Self::Policy(bound),
+                })
             }
             (Decision::RequireApproval(_), None) => Err(AuthorityError::ApprovalRequired),
             _ => Err(AuthorityError::Internal {
@@ -267,13 +291,34 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_witness_gives_approval_authority() {
-        let fixture = crate::mainnet::fixtures::ResolverFixture::new();
-        let witness = fixture.approval(&fixture.envelope, fixture.now, 600_000);
-        for kind in [Decision::Allow, require_approval()] {
-            let decided = decision(kind, EVALUATED, 600_000);
+        for required in [false, true] {
+            let fixture = crate::mainnet::fixtures::ResolverFixture::configured(
+                |_| {},
+                |raw| {
+                    if required {
+                        raw.replace(
+                            "decision = \"allow\"",
+                            "decision = \"require_approval\"\nttl_secs = 600",
+                        )
+                    } else {
+                        raw.to_owned()
+                    }
+                },
+            );
+            let witness = fixture.approval(&fixture.envelope, fixture.now, 600_000);
+            let mut decided = fixture.captured_decision();
+            decided.bound_governing_ttl(30_001);
             match MainnetAuthority::from_decision(&decided, Some(&witness)).unwrap() {
                 MainnetAuthority::Approval(approval) => {
-                    assert!(std::ptr::eq(approval, &witness));
+                    assert!(std::ptr::eq(approval.witness(), &witness));
+                    assert_eq!(approval.expires_at_ms(), fixture.now + 30_001);
+                    assert_eq!(approval.bound.policy_digest(), fixture.policy.digest());
+                    assert_eq!(approval.bound.policy_sequence(), fixture.policy.sequence());
+                    assert_eq!(approval.bound.profile(), fixture.context.profile_name());
+                    assert_eq!(
+                        approval.bound.chain_id(),
+                        fixture.context.chain().caip2_str()
+                    );
                 }
                 MainnetAuthority::Policy(_) => panic!("a witness gives approval authority"),
             }

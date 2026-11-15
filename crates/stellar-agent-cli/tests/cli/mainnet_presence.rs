@@ -1487,6 +1487,41 @@ mod signed {
         let window = PersistedWindowStore::for_profile(NAME);
         let audit = audit_readiness(&profile, NAME).unwrap();
         let writer = audit.writer().clone();
+        use stellar_agent_core::mainnet::decision::{
+            EvaluationScope, MainnetEvaluationRequest, evaluate_mainnet,
+        };
+        use stellar_agent_core::policy::{McpToolRegistration, ToolDescriptor, ToolValueKind};
+        let mut descriptor = ToolDescriptor::from_registration(&McpToolRegistration {
+            name: "stellar_pay",
+            destructive_hint: true,
+            read_only_hint: false,
+            chain_id_required: true,
+            value_kind: ToolValueKind::MovesValue,
+        });
+        descriptor.chain_id = profile.chain_id.caip2_str().to_owned();
+        let args = stellar_agent_core::envelope_decode::decode_authoritative_args(
+            envelope.envelope_xdr(),
+            "stellar_pay_commit",
+        )
+        .unwrap();
+        let decision = evaluate_mainnet(
+            current.policy(),
+            EvaluationScope::Classic,
+            stellar_agent_network::mainnet::clock::now_ms().unwrap(),
+            MainnetEvaluationRequest {
+                chain_id: profile.chain_id.caip2_str(),
+                tool: &descriptor,
+                args: &args,
+                profile: &profile,
+                value: None,
+                account_view: None,
+                identity_view: None,
+                counterparty_cache: None,
+                sep10_sessions: None,
+                sep45_sessions: None,
+            },
+        )
+        .unwrap();
         tokio::time::pause();
         let authorization = stellar_agent_test_support::timing::drive_call(
             resolve_tx_sign(TxSignRequest {
@@ -1499,7 +1534,7 @@ mod signed {
                 signer: &signer,
                 policy: current.policy(),
                 enablement: &enablement,
-                authority: &MainnetAuthority::Approval(&approval),
+                authority: &MainnetAuthority::from_decision(&decision, Some(&approval)).unwrap(),
                 audit,
                 store: &window,
                 operation: None,
