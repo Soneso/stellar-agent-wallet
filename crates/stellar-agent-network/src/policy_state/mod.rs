@@ -205,6 +205,7 @@
 pub mod approvals;
 pub mod ledger;
 pub mod lock;
+pub mod notices;
 pub mod operations;
 pub mod recovery;
 mod recovery_run;
@@ -224,6 +225,7 @@ pub use ledger::{
     MAX_OPEN_AUTHORIZATIONS, MintAuthority, MintRequest, MintedRecord, NativeReservation,
     OpenAuthorization, PolicyAuthorityBinding, SubmissionBinding, WindowReservation,
 };
+pub use notices::{CommittedBatch, CommittedTransition, WatchClass, WatchedOperation};
 pub use operations::{
     AdmissibleFloors, AgreedOutcome, AttemptAuthorization, AttemptEnvelope, AttemptRequest,
     AttemptStarted, BoundedText, BusinessId, CapacityDetail, ClearForm, CommitBinding, CommitId,

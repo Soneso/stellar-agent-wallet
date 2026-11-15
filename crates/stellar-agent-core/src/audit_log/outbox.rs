@@ -1119,8 +1119,10 @@ fn load_state(store: &dyn TipAnchorStore, generation: u64) -> Result<OutboxState
         .map_err(WriterError::TipAnchorStore)
 }
 
-/// Checks the outbox's committed prefix under its lock, taken through the
-/// carrier record.
+/// Checks the outbox's committed prefix and the evidence image its owner
+/// commits, under the outbox lock taken through the carrier record.
+/// Evidence selection authenticates both slots with the one stored key this
+/// check reads.
 /// Generation lines and rows authenticate under the stored key when the store
 /// reads one. Without that key, verification checks layout, canonical bodies,
 /// coordinates, and kind. A recoverable publication passes with a warning and
@@ -1147,6 +1149,13 @@ fn load_state(store: &dyn TipAnchorStore, generation: u64) -> Result<OutboxState
 ///   must reproduce the closed batch.
 /// - Without owner state, [`WriterError::OutboxRowsMissing`] for a queue
 ///   that starts with a generation line.
+/// - The refusals of an evidence read: evidence files beside a missing owner
+///   or an owner that commits none,
+///   [`WriterError::KeyedLogNeedsKey`] for committed evidence without the
+///   stored key, [`WriterError::CarrierRecoveryRequired`] while a binding is
+///   incomplete, and [`WriterError::OutboxEvidenceUnusable`] with its
+///   selection reason, or `owner recommit required` for a newer image the
+///   owner does not commit yet. Verification never repairs the owner.
 pub fn check_outbox_commitment(
     log_path: &Path,
     store: &dyn TipAnchorStore,
@@ -1161,7 +1170,16 @@ pub fn check_outbox_commitment(
         .as_deref()
         .map_or(SuffixCheck::Keyless, |key| SuffixCheck::Keyed(Some(key)));
     let lines = parse_lines(&batch.bytes).lines;
-    match batch.owner(store)? {
+    let owner = batch.owner(store)?;
+    if owner.as_ref().is_some_and(|owner| owner.e.is_some()) {
+        check_no_incomplete_binding(log_path, store, batch.generation)?;
+    }
+    if select_owner_evidence(log_path, store, owner.clone(), key.as_deref(), false)?
+        .is_some_and(|loaded| loaded.recommit)
+    {
+        return Err(evidence_unusable("owner recommit required"));
+    }
+    match owner {
         Some(owner) => {
             let selection = batch.select_owner(&lines, owner, check, false)?;
             let pending = selection.publication_pending;
@@ -1489,8 +1507,7 @@ impl AuditOutbox {
                 },
             )
         })();
-        let loaded =
-            result.map_err(|error| super::writer::audit_writer_refusal("outbox", &error))?;
+        let loaded = result.map_err(|error| self.refusal(&error))?;
         if capacity {
             return Err(WalletError::Approval(ApprovalFailure::EvidenceCapacity));
         }
@@ -1499,6 +1516,82 @@ impl AuditOutbox {
             identity,
             expires_at_ms,
         ))
+    }
+
+    /// Adopts one migration pin as Delivered evidence of `identity`.
+    ///
+    /// The caller authenticates the identity, the full reference, the scope
+    /// association, and the conservative deadline before calling. The pin
+    /// whose digest equals the reference's full digest becomes a Delivered
+    /// record of the reference's coordinates and `expires_at_ms`, so
+    /// occupancy stays the same. An exact retry returns the same reservation.
+    /// Adoption reads no approval storage, samples no clock, drains nothing,
+    /// and removes no expired record.
+    ///
+    /// # Errors
+    /// Refuses unkeyed, uninitialized, fenced, or unusable evidence, an expiry
+    /// at or below the floor, and an identity that holds other facts. Without
+    /// a pin of the digest it refuses with `missing migration pin`. At the
+    /// last evidence generation an exact retry refuses with
+    /// `evidence-generation overflow`. Storage errors retain their codes.
+    pub fn adopt_evidence_pin(
+        &self,
+        identity: [u8; 32],
+        reference: &OutboxRowRef,
+        expires_at_ms: u64,
+    ) -> Result<EvidenceReservation, WalletError> {
+        let adopted = EvidenceRecord {
+            identity,
+            digest: reference.digest,
+            expires_at_ms,
+            generation: reference.generation,
+            sequence: reference.sequence,
+            state: RecordState::Delivered,
+        };
+        let result = (|| {
+            let (batch, key) = self.evidence_batch()?;
+            batch.commit_evidence_change(
+                &self.log_path,
+                self.state.as_ref(),
+                &key,
+                false,
+                |image, _| {
+                    if expires_at_ms <= image.floor_ms {
+                        return Err(evidence_unusable("expired reservation"));
+                    }
+                    let pin = image.records.iter().position(|record| {
+                        record.state == RecordState::LegacyPin && record.digest == reference.digest
+                    });
+                    // The replaced pin's derived identity may equal `identity`.
+                    if let Some(existing) =
+                        image.records.iter().enumerate().find(|(index, record)| {
+                            record.identity == identity && Some(*index) != pin
+                        })
+                    {
+                        return if *existing.1 == adopted {
+                            Ok(())
+                        } else {
+                            Err(evidence_unusable("conflicting reservation"))
+                        };
+                    }
+                    let pin = pin.ok_or_else(|| evidence_unusable("missing migration pin"))?;
+                    image.records[pin] = adopted.clone();
+                    image.records.sort_by_key(|record| record.identity);
+                    Ok(())
+                },
+            )
+        })();
+        let loaded = result.map_err(|error| self.refusal(&error))?;
+        Ok(EvidenceReservation::new(
+            loaded.image.scope,
+            identity,
+            expires_at_ms,
+        ))
+    }
+
+    /// Maps an evidence refusal with the log's file name as its profile field.
+    fn refusal(&self, error: &WriterError) -> WalletError {
+        super::writer::audit_writer_refusal(&basename(&self.log_path), error)
     }
 
     /// Carries this reservation into a reference-returning queued append.
@@ -1858,6 +1951,8 @@ impl PreparedOutboxAppend<'_> {
                 key,
                 false,
                 |image, _| {
+                    // A caller can hold a reservation past the expiry GC that
+                    // removed its record; the floor names that cause first.
                     if scope != image.scope || expires_at_ms <= image.floor_ms {
                         return Err(evidence_unusable("reservation scope or expiry"));
                     }
@@ -2369,6 +2464,41 @@ impl OutboxBatch {
             state: StageState::V1(self.state.clone()),
             watch: self.stored_state.clone(),
         })
+    }
+
+    /// Authenticates the evidence image of a binding's source generation, the
+    /// generation this batch read, and returns whether it recommitted one.
+    ///
+    /// A binding holds all three carriers, so the successor state it stages
+    /// does not refuse this read. Selection is the ordinary newest-image
+    /// selection under the stored key. With `recommit`, a newer image is
+    /// committed to the source owner while the record names the source, or
+    /// names a staged successor that retires it. Records, floor, and slots
+    /// stay unchanged.
+    ///
+    /// # Errors
+    ///
+    /// The refusals of an evidence read, and
+    /// [`WriterError::CarrierGenerationChanged`] outside those phases.
+    pub(crate) fn binding_evidence(
+        &self,
+        log_path: &Path,
+        store: &dyn TipAnchorStore,
+        key: Option<&[u8; 32]>,
+        recommit: bool,
+    ) -> Result<bool, WriterError> {
+        let Some(mut loaded) =
+            select_owner_evidence(log_path, store, self.owner(store)?, key, false)?
+        else {
+            return Ok(false);
+        };
+        if !(recommit && loaded.recommit) {
+            return Ok(false);
+        }
+        commit_owner_evidence(&mut loaded, log_path, store, self.generation, || {
+            check_binding_phase(log_path, store, self.generation)
+        })?;
+        Ok(true)
     }
 
     /// The path of the file the batch read.
@@ -3211,7 +3341,7 @@ impl OutboxBatch {
         key: &[u8; 32],
         retry: bool,
     ) -> Result<EvidenceInit, WriterError> {
-        check_no_successor_owner(store, self.generation)?;
+        check_no_incomplete_binding(log_path, store, self.generation)?;
         let (owner, publish) = match self.owner(store)? {
             Some(owner) if owner.e.is_some() => {
                 read_owner_evidence(log_path, store, &self, Some(key))?;
@@ -3302,19 +3432,51 @@ fn evidence_unusable(reason: &'static str) -> WriterError {
     WriterError::OutboxEvidenceUnusable { reason }
 }
 
-/// Refuses while a binding left owner state at the next carrier generation.
-fn check_no_successor_owner(
+/// Refuses while a binding is incomplete: a staged generation exists beside
+/// the log, or owner state waits at the next carrier generation.
+fn check_no_incomplete_binding(
+    log_path: &Path,
     store: &dyn TipAnchorStore,
     carrier_generation: u64,
 ) -> Result<(), WriterError> {
-    if let Some(next) = carrier_generation.checked_add(1)
-        && store.load_outbox_owner_state(next)?.is_some()
-    {
+    let staged = !super::carriers::staged_files(log_path)?.is_empty();
+    let successor = match carrier_generation.checked_add(1) {
+        Some(next) => store.load_outbox_owner_state(next)?.is_some(),
+        None => false,
+    };
+    if staged || successor {
         return Err(WriterError::CarrierRecoveryRequired {
             detail: WriterError::CarrierBindingIncomplete.to_string(),
         });
     }
     Ok(())
+}
+
+/// Checks that `source` is still a binding's source: the record names it, or
+/// names a staged successor whose retired entry is `source`.
+fn check_binding_phase(
+    log_path: &Path,
+    store: &dyn TipAnchorStore,
+    source: u64,
+) -> Result<(), WriterError> {
+    let record = store.load_carrier_record()?;
+    let current = record.as_ref().map_or(0, |record| record.generation);
+    if current == source {
+        return Ok(());
+    }
+    if let Some(record) = &record
+        && record
+            .retired
+            .as_ref()
+            .is_some_and(|retired| retired.generation == source)
+        && super::carriers::generation_path(log_path, current).try_exists()?
+    {
+        return Ok(());
+    }
+    Err(WriterError::CarrierGenerationChanged {
+        held: source,
+        current,
+    })
 }
 
 /// Stores `value` as the owner state of `carrier_generation`. A failed store
@@ -3390,7 +3552,8 @@ pub(super) struct LoadedEvidence {
     recommit: bool,
 }
 
-/// Loads the owner of `carrier_generation` and both slots, and selects.
+/// Loads the owner of `carrier_generation` and both slots, and selects,
+/// outside any binding.
 fn load_owner_evidence(
     log_path: &Path,
     store: &dyn TipAnchorStore,
@@ -3398,11 +3561,22 @@ fn load_owner_evidence(
     key: Option<&[u8; 32]>,
     fenced: bool,
 ) -> Result<Option<LoadedEvidence>, WriterError> {
-    check_no_successor_owner(store, carrier_generation)?;
+    check_no_incomplete_binding(log_path, store, carrier_generation)?;
     let owner = store
         .load_outbox_owner_state(carrier_generation)?
         .map(|raw| OutboxOwnerState::parse(&raw))
         .transpose()?;
+    select_owner_evidence(log_path, store, owner, key, fenced)
+}
+
+/// Reads both slots and selects the evidence `owner` commits.
+fn select_owner_evidence(
+    log_path: &Path,
+    store: &dyn TipAnchorStore,
+    owner: Option<OutboxOwnerState>,
+    key: Option<&[u8; 32]>,
+    fenced: bool,
+) -> Result<Option<LoadedEvidence>, WriterError> {
     let Some((owner, committed)) = owner.and_then(|owner| owner.e.map(|e| (owner, e))) else {
         if consent_evidence::any_slot_exists(log_path)? {
             return Err(evidence_unusable("evidence image without owner"));
@@ -3563,7 +3737,7 @@ impl OutboxBatch {
     ) -> Result<LoadedEvidence, WriterError> {
         let mut loaded = self
             .evidence_for_change(log_path, store, key, fenced, !fenced)?
-            .ok_or_else(|| evidence_unusable("missing image"))?;
+            .ok_or_else(|| evidence_unusable("evidence not initialized"))?;
         if fenced && consent_evidence::tag_verifies(&loaded.bytes, key) {
             return Ok(loaded);
         }
@@ -8297,7 +8471,29 @@ mod tests {
     /// Each verification reads the stored key once, only when the store
     /// reads keys.
     #[test]
+    #[serial_test::serial]
     fn owner_verify_reads_the_stored_key_once() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        // Version 2 evidence authenticates under the same single key read,
+        // and a store without that key refuses it.
+        let (_dir, path, store, writer) = initialized();
+        drop(writer);
+        store.set_reload(Ok(Some(ROW_KEY)));
+        let before = store.reload_count();
+        check_outbox_commitment(&path, store.as_ref()).unwrap();
+        assert_eq!(
+            store.reload_count() - before,
+            1,
+            "v2 evidence uses the one key read"
+        );
+        store.set_reload(Ok(None));
+        assert!(matches!(
+            check_outbox_commitment(&path, store.as_ref()),
+            Err(WriterError::KeyedLogNeedsKey { .. })
+        ));
         for scripted in [false, true] {
             let (_dir, path, store, writer) = cut_over_fixture();
             enqueue(&path, &store, &["one", "two"]);
@@ -9550,12 +9746,23 @@ mod tests {
             *first.digest()
         );
         assert_eq!(writer.drain_outbox().unwrap(), 1);
-        let queue = outbox_bytes(&path);
+        let delivered_state = (
+            outbox_bytes(&path),
+            slots(&path),
+            store.load_outbox_owner_state(1).unwrap(),
+        );
         assert!(
             outbox.append_queued(&row("again")).is_err(),
             "a Delivered record cannot be retargeted"
         );
-        assert_eq!(outbox_bytes(&path), queue);
+        assert_eq!(
+            (
+                outbox_bytes(&path),
+                slots(&path),
+                store.load_outbox_owner_state(1).unwrap()
+            ),
+            delivered_state
+        );
         let record = evidence_snapshot(&writer).records()[0].clone();
         assert_eq!(
             (record.state, record.digest),
@@ -9688,6 +9895,7 @@ mod tests {
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
 
+        assert_damaged_image_refuses_loss_classification();
         let (_dir, path, store, mut writer) = initialized();
         reserve_row(&keyed_outbox(&path, &store), [1; 32], "waiting");
         keyed_outbox(&path, &store)
@@ -9722,6 +9930,47 @@ mod tests {
             writer.outbox_loss().is_err(),
             "classification refuses before revocation"
         );
+    }
+
+    /// Loss classification beside queued consent refuses a missing or damaged
+    /// selected image with its integrity reason, writing nothing.
+    fn assert_damaged_image_refuses_loss_classification() {
+        for (damage, reason) in [("missing", "missing image"), ("corrupt", "head")] {
+            let (_dir, path, store, writer) = initialized();
+            reserve_row(&keyed_outbox(&path, &store), [1; 32], "waiting");
+            let active = active_slot(&path, &store);
+            let slot = &consent_evidence::slot_paths(&path)[active];
+            if damage == "missing" {
+                for slot in consent_evidence::slot_paths(&path) {
+                    fs::remove_file(slot).unwrap();
+                }
+            } else {
+                let mut bytes = fs::read(slot).unwrap();
+                bytes[200] ^= 1;
+                fs::write(slot, bytes).unwrap();
+            }
+            let before = (
+                slots(&path),
+                outbox_bytes(&path),
+                owner_state(&store),
+                store.outbox_item_writes(),
+            );
+            assert_eq!(
+                evidence_refusal(writer.outbox_loss().map(|_| None)),
+                reason,
+                "{damage}: loss classification refuses before revocation"
+            );
+            assert_eq!(
+                (
+                    slots(&path),
+                    outbox_bytes(&path),
+                    owner_state(&store),
+                    store.outbox_item_writes()
+                ),
+                before,
+                "{damage}"
+            );
+        }
     }
 
     #[test]
@@ -9998,11 +10247,37 @@ mod tests {
 
         let (_dir, path, store, writer) = initialized();
         let outbox = keyed_outbox(&path, &store);
-        outbox.reserve_evidence([1; 32], 100, 10).unwrap();
+        let reservation = outbox.reserve_evidence([1; 32], 100, 10).unwrap();
         assert_eq!(outbox.advance_evidence_floor(99).unwrap(), 99);
         assert_eq!(evidence_snapshot(&writer).records().len(), 1);
         assert_eq!(outbox.advance_evidence_floor(100).unwrap(), 100);
         assert!(evidence_snapshot(&writer).records().is_empty());
+        let before = (
+            outbox_bytes(&path),
+            slots(&path),
+            store.outbox_item_writes(),
+        );
+        let cached = outbox
+            .clone()
+            .with_evidence_reservation(reservation)
+            .append_queued(&row("revived"));
+        assert!(
+            matches!(
+                cached,
+                Err(WriterError::OutboxEvidenceUnusable {
+                    reason: "reservation scope or expiry"
+                })
+            ),
+            "a reservation held past its collection names the expiry: {cached:?}"
+        );
+        assert_eq!(
+            (
+                outbox_bytes(&path),
+                slots(&path),
+                store.outbox_item_writes()
+            ),
+            before
+        );
         assert_eq!(
             outbox.advance_evidence_floor(1).unwrap(),
             100,
@@ -10030,6 +10305,20 @@ mod tests {
             .unwrap();
         drop(batch);
         let outbox = keyed_outbox(&path, &store);
+        let owner = store.load_outbox_owner_state(1).unwrap();
+        assert_eq!(
+            outbox
+                .reserve_evidence(pin.identity, u64::MAX, 0)
+                .unwrap_err()
+                .to_string(),
+            evidence_wallet_error(&path, "conflicting reservation"),
+            "a pin's identity refuses a reservation with its own expiry"
+        );
+        assert_eq!(store.load_outbox_owner_state(1).unwrap(), owner);
+        assert_eq!(
+            evidence_snapshot(&writer).records(),
+            std::slice::from_ref(&pin)
+        );
         assert_eq!(outbox.advance_evidence_floor(u64::MAX).unwrap(), u64::MAX);
         assert_eq!(
             evidence_snapshot(&writer).records(),
@@ -10112,7 +10401,7 @@ mod tests {
         let refused = outbox.reserve_evidence([200; 32], 9_000, 0);
         assert_eq!(
             refused.map_err(|error| error.to_string()),
-            Err(super::super::writer::audit_writer_refusal("outbox", &fence).to_string()),
+            Err(super::super::writer::audit_writer_refusal(&basename(&path), &fence).to_string()),
             "a fence refuses admission"
         );
         for result in [
@@ -10268,9 +10557,801 @@ mod tests {
             "The 4,096 slots count Reserved, Queued, Delivered, and unresolved migration pins together.",
             "Only an anchored writer marks a matching Queued record Delivered.",
             "A read-only recommit is exempt from that overflow check.",
+            "The caller authenticates the approval identity, the full queue reference, the scope association, and the conservative deadline before it calls.",
+            "`audit verify` authenticates both evidence files under the one stored key it reads and changes no file or protected item.",
         ] {
             assert!(DOC.contains(sentence), "{sentence}");
         }
+    }
+
+    // Migration pin adoption.
+
+    /// A log whose v1 owner kept two queued references as recent evidence,
+    /// initialized so that each became a migration pin.
+    fn pinned() -> (
+        TempDir,
+        PathBuf,
+        Arc<InMemoryTipAnchorStore>,
+        AuditWriter,
+        [OutboxRowRef; 2],
+    ) {
+        let (dir, path, store, mut writer) = keyed_fixture();
+        let outbox = keyed_outbox(&path, &store);
+        let first = outbox.append_queued(&row("first")).unwrap();
+        let second = outbox.append_queued(&row("second")).unwrap();
+        assert_eq!(writer.drain_outbox().unwrap(), 2);
+        writer.initialize_consent_evidence().unwrap();
+        (dir, path, store, writer, [first, second])
+    }
+
+    type Durable = (
+        [Option<Vec<u8>>; 2],
+        Vec<u8>,
+        Option<String>,
+        Vec<(&'static str, u64)>,
+        usize,
+    );
+
+    /// Both slots, the queue, the active owner, and the item and record writes.
+    fn durable(path: &Path, store: &InMemoryTipAnchorStore) -> Durable {
+        let generation = store
+            .load_carrier_record()
+            .unwrap()
+            .map_or(0, |record| record.generation);
+        (
+            slots(path),
+            outbox_bytes(path),
+            store.load_outbox_owner_state(generation).unwrap(),
+            store.outbox_item_writes(),
+            store.carrier_record_writes(),
+        )
+    }
+
+    fn evidence_wallet_error(path: &Path, reason: &'static str) -> String {
+        super::super::writer::audit_writer_refusal(&basename(path), &evidence_unusable(reason))
+            .to_string()
+    }
+
+    /// The index of the slot whose head the owner commits.
+    fn active_slot(path: &Path, store: &InMemoryTipAnchorStore) -> usize {
+        let head = committed(store).unwrap().head;
+        slots(path)
+            .iter()
+            .position(|slot| slot.as_deref().map(consent_evidence::head) == Some(head))
+            .unwrap()
+    }
+
+    fn reserved_record(n: u32) -> EvidenceRecord {
+        EvidenceRecord {
+            digest: [0; 32],
+            generation: 0,
+            sequence: 0,
+            state: RecordState::Reserved,
+            ..evidence_record(n)
+        }
+    }
+
+    fn adopted(identity: [u8; 32], reference: &OutboxRowRef, expires_at_ms: u64) -> EvidenceRecord {
+        EvidenceRecord {
+            identity,
+            digest: reference.digest,
+            expires_at_ms,
+            generation: reference.generation,
+            sequence: reference.sequence,
+            state: RecordState::Delivered,
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn migration_adoption_checks_context() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let (_dir, path, store, writer, [first, _]) = pinned();
+        let identity = [0xa1; 32];
+        let before = durable(&path, &store);
+        let unkeyed = AuditOutbox::for_log(&path, store.clone())
+            .adopt_evidence_pin(identity, &first, 9_000)
+            .unwrap_err();
+        assert_eq!(
+            unkeyed.to_string(),
+            super::super::writer::audit_writer_refusal(&basename(&path), &queued_key_required())
+                .to_string()
+        );
+        assert_eq!(durable(&path, &store), before);
+        let outbox = keyed_outbox(&path, &store);
+        assert_eq!(outbox.advance_evidence_floor(500).unwrap(), 500);
+        let floored = durable(&path, &store);
+        assert_eq!(
+            outbox
+                .adopt_evidence_pin(identity, &first, 500)
+                .unwrap_err()
+                .to_string(),
+            evidence_wallet_error(&path, "expired reservation"),
+            "an expiry equal to the floor refuses"
+        );
+        assert_eq!(durable(&path, &store), floored);
+        let scope = store.outbox_evidence_scope().unwrap();
+        store.set_evidence_scope([0x99; 32]);
+        assert_eq!(
+            outbox
+                .adopt_evidence_pin(identity, &first, 501)
+                .unwrap_err()
+                .to_string(),
+            evidence_wallet_error(&path, "scope"),
+            "an image of another scope refuses"
+        );
+        assert_eq!(durable(&path, &store), floored);
+        store.set_evidence_scope(scope);
+        outbox.adopt_evidence_pin(identity, &first, 501).unwrap();
+        assert!(evidence_snapshot(&writer).contains_delivered(&identity, &first));
+        drop(writer);
+
+        let (_dir, path, store, writer, [first, _]) = pinned();
+        drop(writer);
+        rotation_writer(&path, &store)
+            .fence_outbox_for_key_change()
+            .unwrap();
+        let fenced = durable(&path, &store);
+        assert_eq!(
+            keyed_outbox(&path, &store)
+                .adopt_evidence_pin(identity, &first, 9_000)
+                .unwrap_err()
+                .to_string(),
+            super::super::writer::audit_writer_refusal(
+                &basename(&path),
+                &tagged_refusal(1, "tagged record whose tag does not verify")
+            )
+            .to_string(),
+            "a rotation fence refuses adoption"
+        );
+        assert_eq!(durable(&path, &store), fenced);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn migration_adopts_exact_verified_reference() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let (_dir, path, store, writer, [first, second]) = pinned();
+        let outbox = keyed_outbox(&path, &store);
+        let identity = [0xa1; 32];
+        let before = durable(&path, &store);
+        let mut wrong = first;
+        wrong.digest = [0xee; 32];
+        assert_eq!(
+            outbox
+                .adopt_evidence_pin(identity, &wrong, 9_000)
+                .unwrap_err()
+                .to_string(),
+            evidence_wallet_error(&path, "missing migration pin"),
+            "a different digest proves nothing"
+        );
+        let mut unsequenced = first;
+        unsequenced.sequence = 0;
+        assert_eq!(
+            outbox
+                .adopt_evidence_pin(identity, &unsequenced, 9_000)
+                .unwrap_err()
+                .to_string(),
+            evidence_wallet_error(&path, "layout"),
+            "a delivered record needs a positive sequence"
+        );
+        assert_eq!(durable(&path, &store), before);
+        let batch = OutboxBatch::read_locked(&path, store.as_ref()).unwrap();
+        batch
+            .commit_evidence_change(&path, store.as_ref(), &ROW_KEY, false, |image, _| {
+                image.records.extend((0..4094).map(reserved_record));
+                image.records.sort_by_key(|record| record.identity);
+                Ok(())
+            })
+            .unwrap();
+        drop(batch);
+        let full = evidence_snapshot(&writer).records().to_vec();
+        assert_eq!(full.len(), MAX_EVIDENCE_ENTRIES);
+        let second_pin = EvidenceRecord::legacy_pin(*second.digest());
+        outbox.adopt_evidence_pin(identity, &first, 9_000).unwrap();
+        let evidence = evidence_snapshot(&writer);
+        let mut expected: Vec<EvidenceRecord> = full
+            .iter()
+            .filter(|record| record.digest != *first.digest())
+            .cloned()
+            .chain([adopted(identity, &first, 9_000)])
+            .collect();
+        expected.sort_by_key(|record| record.identity);
+        assert_eq!(
+            evidence.records(),
+            expected.as_slice(),
+            "only the matching pin changes"
+        );
+        assert!(evidence.contains_delivered(&identity, &first));
+        assert!(evidence.records().contains(&second_pin));
+        outbox
+            .adopt_evidence_pin(second_pin.identity, &second, 9_000)
+            .unwrap();
+        let evidence = evidence_snapshot(&writer);
+        assert!(
+            evidence.contains_delivered(&second_pin.identity, &second),
+            "a verified identity may equal the replaced pin's identity"
+        );
+        assert_eq!(evidence.records().len(), MAX_EVIDENCE_ENTRIES);
+        assert!(
+            slots(&path)
+                .iter()
+                .all(|slot| slot.as_ref().map(Vec::len) == Some(consent_evidence::SLOT_BYTES))
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn migration_adoption_is_fact_bound() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let (_dir, path, store, mut writer, [first, second]) = pinned();
+        let outbox = keyed_outbox(&path, &store);
+        let identity = [0xa1; 32];
+        let reservation = outbox.adopt_evidence_pin(identity, &first, 9_000).unwrap();
+        let before = durable(&path, &store);
+        assert_eq!(
+            outbox.adopt_evidence_pin(identity, &first, 9_000).unwrap(),
+            reservation,
+            "an exact retry returns the same reservation"
+        );
+        assert_eq!(
+            durable(&path, &store),
+            before,
+            "an exact retry writes nothing"
+        );
+        let mut moved = first;
+        moved.sequence += 1;
+        for (name, reference, expires_at_ms) in [
+            ("expiry", &first, 9_001),
+            ("coordinates", &moved, 9_000),
+            ("digest", &second, 9_000),
+        ] {
+            assert_eq!(
+                outbox
+                    .adopt_evidence_pin(identity, reference, expires_at_ms)
+                    .unwrap_err()
+                    .to_string(),
+                evidence_wallet_error(&path, "conflicting reservation"),
+                "conflicting {name}"
+            );
+        }
+        assert_eq!(
+            outbox
+                .adopt_evidence_pin([0xa2; 32], &first, 9_000)
+                .unwrap_err()
+                .to_string(),
+            evidence_wallet_error(&path, "missing migration pin"),
+            "an adopted reference has no pin left"
+        );
+        assert_eq!(durable(&path, &store), before);
+        outbox.reserve_evidence([0xb1; 32], 9_000, 0).unwrap();
+        reserve_row(&outbox, [0xb3; 32], "delivered");
+        writer.drain_outbox().unwrap();
+        reserve_row(&outbox, [0xb2; 32], "queued");
+        let occupied = durable(&path, &store);
+        for (state, occupant) in [
+            (RecordState::Reserved, [0xb1; 32]),
+            (RecordState::Queued, [0xb2; 32]),
+            (RecordState::Delivered, [0xb3; 32]),
+        ] {
+            let evidence = evidence_snapshot(&writer);
+            assert!(
+                evidence
+                    .records()
+                    .iter()
+                    .any(|record| record.identity == occupant && record.state == state),
+                "{state:?}"
+            );
+            assert_eq!(
+                outbox
+                    .adopt_evidence_pin(occupant, &second, 9_000)
+                    .unwrap_err()
+                    .to_string(),
+                evidence_wallet_error(&path, "conflicting reservation"),
+                "an occupied {state:?} identity refuses"
+            );
+        }
+        assert_eq!(durable(&path, &store), occupied);
+
+        // At the last evidence generation an exact retry keeps the inherited
+        // overflow refusal; the image stays readable.
+        let active = active_slot(&path, &store);
+        let mut image =
+            consent_evidence::decode(slots(&path)[active].as_ref().unwrap(), &ROW_KEY).unwrap();
+        image.generation = u64::MAX;
+        plant(&path, 1 - active, &image.seal(&ROW_KEY));
+        outbox.evidence_time_floor().unwrap();
+        assert_eq!(committed(&store).unwrap().g, u64::MAX);
+        let last = durable(&path, &store);
+        assert_eq!(
+            outbox
+                .adopt_evidence_pin(identity, &first, 9_000)
+                .unwrap_err()
+                .to_string(),
+            evidence_wallet_error(&path, "evidence-generation overflow")
+        );
+        assert_eq!(durable(&path, &store), last);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn migration_adoption_survives_interruption() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let identity = [0xa1; 32];
+
+        // A partial candidate leaves the selected pin.
+        let (_dir, path, store, writer, [first, _]) = pinned();
+        let outbox = keyed_outbox(&path, &store);
+        let root = committed(&store);
+        let active = active_slot(&path, &store);
+        let pins = evidence_snapshot(&writer).records().to_vec();
+        arm_evidence_fault(&path, 1 - active, 1);
+        assert!(outbox.adopt_evidence_pin(identity, &first, 9_000).is_err());
+        assert_eq!(
+            committed(&store),
+            root,
+            "a partial candidate commits nothing"
+        );
+        assert_eq!(
+            consent_evidence::decode(slots(&path)[active].as_ref().unwrap(), &ROW_KEY)
+                .unwrap()
+                .records,
+            pins
+        );
+        assert_eq!(evidence_snapshot(&writer).records(), pins.as_slice());
+        outbox.adopt_evidence_pin(identity, &first, 9_000).unwrap();
+        assert!(evidence_snapshot(&writer).contains_delivered(&identity, &first));
+        drop(writer);
+
+        // A complete candidate is recommitted by the next keyed query.
+        let (_dir, path, store, writer, [first, _]) = pinned();
+        let outbox = keyed_outbox(&path, &store);
+        let root = committed(&store);
+        let active = active_slot(&path, &store);
+        test_seam::arm_stop(
+            &outbox_path(&path),
+            test_seam::Stop::EvidenceCandidateSynced,
+        );
+        assert!(outbox.adopt_evidence_pin(identity, &first, 9_000).is_err());
+        assert_eq!(committed(&store), root, "the owner still commits the pin");
+        let candidate = slots(&path)[1 - active].clone().unwrap();
+        assert!(
+            consent_evidence::decode(&candidate, &ROW_KEY)
+                .unwrap()
+                .records
+                .contains(&adopted(identity, &first, 9_000))
+        );
+        outbox.evidence_time_floor().unwrap();
+        assert_eq!(
+            committed(&store).unwrap().head,
+            consent_evidence::head(&candidate)
+        );
+        let writes = owner_writes(&store);
+        outbox.adopt_evidence_pin(identity, &first, 9_000).unwrap();
+        assert_eq!(owner_writes(&store), writes, "the exact retry is a no-op");
+        assert!(evidence_snapshot(&writer).contains_delivered(&identity, &first));
+        drop(writer);
+
+        // Persisted, rejected, and unreadable owner stores.
+        for outcome in 0..3 {
+            let (_dir, path, store, writer, [first, _]) = pinned();
+            let root = committed(&store);
+            store.set_owner_failing(false, outcome == 1);
+            let uncertain = Arc::new(UncertainStore {
+                inner: store.clone(),
+                reread_fails: outcome == 2,
+                stored: std::sync::atomic::AtomicBool::new(false),
+            });
+            let result = AuditOutbox::for_log_keyed(&path, uncertain, Zeroizing::new(ROW_KEY))
+                .adopt_evidence_pin(identity, &first, 9_000);
+            match outcome {
+                0 => assert!(
+                    result.is_ok(),
+                    "a persisted store confirms the uncertain write: {result:?}"
+                ),
+                1 => {
+                    assert_eq!(
+                        result.unwrap_err().to_string(),
+                        super::super::writer::audit_writer_refusal(
+                            &basename(&path),
+                            &WriterError::TipAnchorStore(TipAnchorStoreError::new(
+                                "owner write fault"
+                            ))
+                        )
+                        .to_string()
+                    );
+                    assert_eq!(committed(&store), root);
+                }
+                _ => assert_eq!(
+                    result.unwrap_err().to_string(),
+                    super::super::writer::audit_writer_refusal(
+                        &basename(&path),
+                        &WriterError::TipAnchorStore(TipAnchorStoreError::new(
+                            "owner reread fault"
+                        ))
+                    )
+                    .to_string()
+                ),
+            }
+            store.set_owner_failing(false, false);
+            keyed_outbox(&path, &store)
+                .adopt_evidence_pin(identity, &first, 9_000)
+                .unwrap();
+            let evidence = evidence_snapshot(&writer);
+            assert!(evidence.contains_delivered(&identity, &first), "{outcome}");
+            assert_eq!(
+                evidence
+                    .records()
+                    .iter()
+                    .filter(|record| record.state == RecordState::Delivered)
+                    .count(),
+                1,
+                "{outcome}: exactly one adopted record"
+            );
+            assert_eq!(evidence.records().len(), 2, "{outcome}");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn admission_distinguishes_uninitialized_evidence() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let (_dir, path, store, _writer) = keyed_fixture();
+        assert_eq!(
+            keyed_outbox(&path, &store)
+                .reserve_evidence([1; 32], 100, 0)
+                .unwrap_err()
+                .to_string(),
+            evidence_wallet_error(&path, "evidence not initialized")
+        );
+        assert_eq!(slots(&path), [None, None]);
+        assert!(owner_state(&store).is_none_or(|owner| owner.e.is_none()));
+
+        let (_dir, path, store, _writer) = initialized();
+        for slot in consent_evidence::slot_paths(&path) {
+            fs::remove_file(slot).unwrap();
+        }
+        assert_eq!(
+            keyed_outbox(&path, &store)
+                .reserve_evidence([1; 32], 100, 0)
+                .unwrap_err()
+                .to_string(),
+            evidence_wallet_error(&path, "missing image"),
+            "committed evidence without its files stays damaged"
+        );
+
+        let (_dir, path, store, _writer) = keyed_fixture();
+        plant(&path, 0, b"orphan");
+        assert_eq!(
+            keyed_outbox(&path, &store)
+                .reserve_evidence([1; 32], 100, 0)
+                .unwrap_err()
+                .to_string(),
+            evidence_wallet_error(&path, "evidence image without owner")
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn admission_errors_identify_the_log() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let (_dir, path, store, _writer, [first, _]) = pinned();
+        let outbox = keyed_outbox(&path, &store);
+        let parent = path.parent().unwrap().to_string_lossy().into_owned();
+        let owner_fault =
+            WriterError::TipAnchorStore(TipAnchorStoreError::new("owner write fault"));
+        let inactive = 1 - active_slot(&path, &store);
+        let io_fault = || {
+            test_seam::arm_sync_failure(
+                &consent_evidence::slot_paths(&path)[inactive],
+                test_seam::SyncStep::Create,
+            );
+        };
+        // The I/O faults precede any candidate write; the store faults leave
+        // candidates behind, so they run last.
+        for (name, fault) in [("io", Some(&io_fault)), ("store", None)] {
+            for adopt in [false, true] {
+                match fault {
+                    Some(arm) => arm(),
+                    None => store.set_owner_failing(false, true),
+                }
+                let error = if adopt {
+                    outbox.adopt_evidence_pin([0xa1; 32], &first, 9_000)
+                } else {
+                    outbox.reserve_evidence([1; 32], 9_000, 0)
+                }
+                .unwrap_err();
+                store.set_owner_failing(false, false);
+                let profile = match &error {
+                    WalletError::Validation(
+                        crate::error::ValidationError::AuditLogUnusable { profile, .. }
+                        | crate::error::ValidationError::AuditWriterOpenFailed { profile },
+                    ) => profile.clone(),
+                    other => panic!("{name}: a profile-bearing refusal, got {other:?}"),
+                };
+                assert_eq!(profile, basename(&path), "{name} adopt={adopt}");
+                assert!(!error.to_string().contains(&parent), "{name} adopt={adopt}");
+                if fault.is_none() {
+                    assert_eq!(
+                        error.code(),
+                        super::super::writer::audit_writer_refusal("log", &owner_fault).code(),
+                        "{name} adopt={adopt}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn migration_adoption_survives_binding_and_rotation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let (_dir, path, store, writer, [first, second]) = pinned();
+        let outbox = keyed_outbox(&path, &store);
+        outbox
+            .adopt_evidence_pin([0xa1; 32], &first, 9_000)
+            .unwrap();
+        assert_eq!(outbox.advance_evidence_floor(70).unwrap(), 70);
+        let expected = evidence_snapshot(&writer);
+        assert!(
+            expected
+                .records()
+                .contains(&EvidenceRecord::legacy_pin(*second.digest()))
+        );
+        drop(writer);
+        AuditWriter::open_for_carrier_binding(
+            path.clone(),
+            KeyedAuditAccess::new(Zeroizing::new(ROW_KEY), store.clone()),
+        )
+        .unwrap()
+        .bind_carriers()
+        .unwrap();
+        let mut rotation = rotation_writer(&path, &store);
+        rotation.fence_outbox_for_key_change().unwrap();
+        test_seam::arm_stop(
+            &outbox_path(&path),
+            test_seam::Stop::EvidenceCandidateSynced,
+        );
+        store.set_reload(Ok(Some(NEXT_KEY)));
+        assert!(
+            rotation
+                .switch_entry_tag_key(Zeroizing::new(NEXT_KEY), "rotation")
+                .is_err()
+        );
+        drop(rotation);
+        let rotated = restart_rotation(&path, &store, NEXT_KEY);
+        let evidence = rotated.outbox_evidence().unwrap().unwrap();
+        assert_eq!(
+            evidence, expected,
+            "adopted and unresolved records and the floor survive"
+        );
+        assert!(evidence.contains_delivered(&[0xa1; 32], &first));
+        for slot in slots(&path) {
+            consent_evidence::decode(slot.as_ref().unwrap(), &NEXT_KEY).unwrap();
+        }
+    }
+
+    // Locked verification of the evidence the owner commits.
+
+    #[test]
+    #[serial_test::serial]
+    fn verification_authenticates_evidence_without_repair() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let (_dir, path, store, writer) = initialized();
+        drop(writer);
+        store.set_reload(Ok(Some(ROW_KEY)));
+        check_outbox_commitment(&path, store.as_ref()).expect("an empty queue passes");
+        reserve_row(&keyed_outbox(&path, &store), [1; 32], "queued");
+        let before = durable(&path, &store);
+        check_outbox_commitment(&path, store.as_ref()).expect("queued consent passes");
+        assert_eq!(durable(&path, &store), before);
+
+        let active = active_slot(&path, &store);
+        let older = slots(&path)[1 - active].clone().unwrap();
+        plant(&path, 1 - active, b"invalid inactive candidate");
+        let candidate = durable(&path, &store);
+        check_outbox_commitment(&path, store.as_ref())
+            .expect("an invalid inactive candidate beside the current image passes");
+        assert_eq!(durable(&path, &store), candidate);
+
+        plant(&path, 1 - active, &older);
+        let mut damaged = slots(&path)[active].clone().unwrap();
+        damaged[200] ^= 1;
+        plant(&path, active, &damaged);
+        let corrupt = durable(&path, &store);
+        let refused = check_outbox_commitment(&path, store.as_ref());
+        assert!(
+            matches!(
+                refused,
+                Err(WriterError::OutboxEvidenceUnusable { reason: "head" })
+            ),
+            "a corrupt selected image refuses: {refused:?}"
+        );
+        assert_eq!(
+            durable(&path, &store),
+            corrupt,
+            "the refusal writes nothing"
+        );
+
+        for slot in consent_evidence::slot_paths(&path) {
+            fs::remove_file(slot).unwrap();
+        }
+        let missing = durable(&path, &store);
+        assert!(matches!(
+            check_outbox_commitment(&path, store.as_ref()),
+            Err(WriterError::OutboxEvidenceUnusable {
+                reason: "missing image"
+            })
+        ));
+        assert_eq!(durable(&path, &store), missing);
+
+        // Evidence files beside a missing or version 1 owner refuse, as an
+        // ordinary evidence read does; without them verification is unchanged.
+        for v1 in [false, true] {
+            let (_dir, path, store, mut writer) = keyed_fixture();
+            if v1 {
+                keyed_outbox(&path, &store)
+                    .append_queued(&row("v1"))
+                    .unwrap();
+                assert_eq!(writer.drain_outbox().unwrap(), 1);
+                assert!(owner_state(&store).unwrap().e.is_none());
+            }
+            drop(writer);
+            store.set_reload(Ok(Some(ROW_KEY)));
+            check_outbox_commitment(&path, store.as_ref()).unwrap();
+            plant(&path, 0, b"orphan");
+            let orphan = durable(&path, &store);
+            let refused = check_outbox_commitment(&path, store.as_ref());
+            assert!(
+                matches!(
+                    refused,
+                    Err(WriterError::OutboxEvidenceUnusable {
+                        reason: "evidence image without owner"
+                    })
+                ),
+                "v1 {v1}: {refused:?}"
+            );
+            assert_eq!(durable(&path, &store), orphan, "v1 {v1}");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn verification_refuses_a_pending_owner_recommit() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        for case in ["immediate", "gapped", "unlinked", "equal copies"] {
+            let (_dir, path, store, writer) = initialized();
+            drop(writer);
+            store.set_reload(Ok(Some(ROW_KEY)));
+            let current = slots(&path)[0].clone().unwrap();
+            let mut image = consent_evidence::decode(&current, &ROW_KEY).unwrap();
+            image.generation = if case == "gapped" { 6 } else { 2 };
+            image.predecessor = if case == "unlinked" {
+                [0x11; 32]
+            } else {
+                consent_evidence::head(&current)
+            };
+            image.records = vec![evidence_record(5)];
+            let newer = image.seal(&ROW_KEY);
+            plant(&path, 1, &newer);
+            if case == "equal copies" {
+                plant(&path, 0, &newer);
+            }
+            let before = durable(&path, &store);
+            let refused = check_outbox_commitment(&path, store.as_ref());
+            assert!(
+                matches!(
+                    refused,
+                    Err(WriterError::OutboxEvidenceUnusable {
+                        reason: "owner recommit required"
+                    })
+                ),
+                "{case}: {refused:?}"
+            );
+            assert_eq!(durable(&path, &store), before, "{case}: nothing repaired");
+            locked_owner_evidence(&path, store.as_ref(), Some(&ROW_KEY)).unwrap();
+            assert_eq!(
+                committed(&store).unwrap().head,
+                consent_evidence::head(&newer)
+            );
+            check_outbox_commitment(&path, store.as_ref())
+                .unwrap_or_else(|error| panic!("{case}: the keyed query repaired it: {error:?}"));
+        }
+
+        let (_dir, path, store, writer) = initialized();
+        drop(writer);
+        store.set_reload(Ok(Some(ROW_KEY)));
+        plant(&path, 0, &sealed(&store, 3, &[3]));
+        plant(&path, 1, &sealed(&store, 3, &[4]));
+        let before = durable(&path, &store);
+        assert!(matches!(
+            check_outbox_commitment(&path, store.as_ref()),
+            Err(WriterError::OutboxEvidenceUnusable {
+                reason: "owner rollback"
+            })
+        ));
+        assert_eq!(durable(&path, &store), before);
+
+        // A current image at the last generation verifies.
+        let mut image = consent_evidence::decode(&sealed(&store, 3, &[6]), &ROW_KEY).unwrap();
+        image.generation = u64::MAX;
+        let max = image.seal(&ROW_KEY);
+        plant(&path, 0, &max);
+        plant(&path, 1, &max);
+        let owner = owner_state(&store)
+            .unwrap()
+            .with_evidence(u64::MAX, consent_evidence::head(&max));
+        store
+            .store_outbox_owner_state(1, &owner.to_keyring_value())
+            .unwrap();
+        check_outbox_commitment(&path, store.as_ref()).unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn verification_and_binding_refuse_old_tag_evidence() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let (_dir, path, store, mut rotation, old) = rotation_fixture(storage_sandbox.path());
+        rotation.fence_outbox_for_key_change().unwrap();
+        drop(rotation);
+        let fenced = durable(&path, &store);
+        let current = check_outbox_commitment(&path, store.as_ref());
+        assert!(current.is_ok(), "{current:?}");
+        assert_eq!(
+            durable(&path, &store),
+            fenced,
+            "a lone fence stays read-only"
+        );
+
+        store.set_reload(Ok(Some(NEXT_KEY)));
+        let refused = check_outbox_commitment(&path, store.as_ref());
+        assert!(
+            matches!(
+                refused,
+                Err(WriterError::OutboxEvidenceUnusable { reason: "tag" })
+            ),
+            "old-key evidence refuses under the new stored key: {refused:?}"
+        );
+        let binding = AuditWriter::open_for_carrier_binding(
+            path.clone(),
+            KeyedAuditAccess::new(Zeroizing::new(NEXT_KEY), store.clone()),
+        );
+        assert!(binding.is_err(), "a binding never retags evidence");
+        assert_eq!(durable(&path, &store), fenced);
+
+        let rotated = restart_rotation(&path, &store, NEXT_KEY);
+        assert_rotated(&path, &store, &old, 8, &NEXT_KEY);
+        drop(rotated);
+        check_outbox_commitment(&path, store.as_ref()).unwrap();
     }
 
     // Consent evidence storage.
@@ -10564,7 +11645,12 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn evidence_refuses_an_incomplete_binding() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
         let (_dir, path, store, writer) = initialized();
         plant(&path, 1, &sealed(&store, 2, &[1]));
         let raw = store.load_outbox_owner_state(1).unwrap().unwrap();
@@ -10578,6 +11664,70 @@ mod tests {
         assert_eq!(owner_writes(&store), writes);
         assert_eq!(store.load_outbox_owner_state(1).unwrap().unwrap(), raw);
         assert_eq!(slots(&path), images);
+        drop(writer);
+
+        // Real binding stops before and after the record switch. The binding
+        // holder is gone, so direct callers meet only the evidence guard.
+        for stop in [2, 4] {
+            let (_dir, path, store, writer, [first, _]) = pinned();
+            let outbox = keyed_outbox(&path, &store);
+            let reservation = outbox.reserve_evidence([1; 32], 9_000, 0).unwrap();
+            drop(writer);
+            let mut binding = AuditWriter::open_for_carrier_binding(
+                path.clone(),
+                KeyedAuditAccess::new(Zeroizing::new(ROW_KEY), store.clone()),
+            )
+            .unwrap();
+            assert!(binding.bind_carriers_with_fault(stop).is_err());
+            drop(binding);
+            store.set_reload(Ok(Some(ROW_KEY)));
+            let before = durable(&path, &store);
+            let incomplete = super::super::writer::audit_writer_refusal(
+                &basename(&path),
+                &WriterError::CarrierRecoveryRequired {
+                    detail: WriterError::CarrierBindingIncomplete.to_string(),
+                },
+            )
+            .to_string();
+            for (call, result) in [
+                (
+                    "reserve",
+                    outbox
+                        .reserve_evidence([2; 32], 9_000, 0)
+                        .map(drop)
+                        .map_err(|error| error.to_string()),
+                ),
+                (
+                    "adopt",
+                    outbox
+                        .adopt_evidence_pin([3; 32], &first, 9_000)
+                        .map(drop)
+                        .map_err(|error| error.to_string()),
+                ),
+            ] {
+                assert_eq!(result, Err(incomplete.clone()), "stop {stop}: {call}");
+            }
+            for (call, result) in [
+                ("release", outbox.release_evidence([1; 32])),
+                ("advance", outbox.advance_evidence_floor(5).map(drop)),
+                ("floor", outbox.evidence_time_floor().map(drop)),
+                (
+                    "append",
+                    outbox
+                        .clone()
+                        .with_evidence_reservation(reservation.clone())
+                        .append_queued(&row("staged"))
+                        .map(drop),
+                ),
+                ("verify", check_outbox_commitment(&path, store.as_ref())),
+            ] {
+                assert!(
+                    matches!(result, Err(WriterError::CarrierRecoveryRequired { .. })),
+                    "stop {stop}: {call}: {result:?}"
+                );
+            }
+            assert_eq!(durable(&path, &store), before, "stop {stop}");
+        }
     }
 
     #[test]
@@ -11069,7 +12219,7 @@ mod tests {
                 assert_eq!(
                     result.unwrap_err().to_string(),
                     super::super::writer::audit_writer_refusal(
-                        "outbox",
+                        &basename(&path),
                         &WriterError::TipAnchorStore(TipAnchorStoreError::new(
                             "owner reread fault"
                         ))
@@ -11100,7 +12250,7 @@ mod tests {
         assert_eq!(
             error.to_string(),
             super::super::writer::audit_writer_refusal(
-                "outbox",
+                &basename(&path),
                 &WriterError::TipAnchorStore(TipAnchorStoreError::new("owner write fault"))
             )
             .to_string()
@@ -11750,7 +12900,7 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             super::super::writer::audit_writer_refusal(
-                "outbox",
+                &basename(&path),
                 &WriterError::CarrierGenerationChanged {
                     held: 1,
                     current: 2

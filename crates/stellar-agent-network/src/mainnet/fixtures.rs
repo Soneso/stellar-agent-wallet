@@ -53,8 +53,8 @@ use super::digest::{BindingFacts, approval_subject_classic};
 use super::{AuthorizationDomain, AuthorizationId, MainnetConsumer, SignerRole};
 use crate::operation_entry;
 use crate::policy_state::{
-    BusinessId, DomainBinding, IntentSlot, MintRequest, OpenOutcome, OpenRequest, OperationKind,
-    OperationLink, OperationRecorder, OperationTool, PersistedWindowStore,
+    BusinessId, DomainBinding, IntentSlot, MintRequest, OpenOutcome, OpenRequest, OperationHandle,
+    OperationKind, OperationLink, OperationRecorder, OperationTool, PersistedWindowStore,
 };
 use crate::submission_record::OperationAttempt;
 use crate::submission_record::{AuditWriterHandle, SubmissionIntent, WalletSubmissionRecorder};
@@ -518,6 +518,27 @@ impl LedgerFixture {
         holds: &[WindowEntry],
         business_id: &str,
     ) -> (OperationAttempt, MainnetTxSignAuthorization) {
+        let (handle, authorization) = self.linked_record(binding, holds, business_id);
+        let attempt = operation_entry::begin_classic_attempt(
+            &self.window,
+            &self.profile,
+            &self.writer,
+            "request",
+            &handle,
+            unsigned_envelope().envelope_xdr(),
+        )
+        .unwrap();
+        (attempt, authorization)
+    }
+
+    /// The `Prepared` record of [`Self::linked_attempt`] and the
+    /// authorization linked to its first attempt, before the attempt begins.
+    pub(crate) fn linked_record(
+        &self,
+        binding: DomainBinding,
+        holds: &[WindowEntry],
+        business_id: &str,
+    ) -> (OperationHandle, MainnetTxSignAuthorization) {
         let unsigned = unsigned_envelope();
         let xdr = unsigned.envelope_xdr();
         let handle = {
@@ -553,16 +574,7 @@ impl LedgerFixture {
             tip_facts(&self.writer),
             Some(operation_entry::next_attempt_link(&handle)),
         );
-        let attempt = operation_entry::begin_classic_attempt(
-            &self.window,
-            &self.profile,
-            &self.writer,
-            "request",
-            &handle,
-            xdr,
-        )
-        .unwrap();
-        (attempt, authorization)
+        (handle, authorization)
     }
 
     /// The operation record `attempt` belongs to, as the window file holds

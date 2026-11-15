@@ -248,7 +248,7 @@ fn approval_public_text_names_the_contract() {
     for (source, sentence) in [
         (
             include_str!("../../../stellar-agent-network/src/keyring.rs"),
-            "Called from `sign_bytes` with an accepting check and from `sign_soroban_address_auth_payload_checked`.",
+            "Called from `sign_bytes` with an accepting check and from `sign_bytes_checked` with the caller's check.",
         ),
         (
             include_str!("../../../stellar-agent-cli/src/commands/approve/list.rs"),

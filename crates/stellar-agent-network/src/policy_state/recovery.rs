@@ -14,6 +14,7 @@ use stellar_agent_core::profile::schema::Profile;
 use stellar_rpc_client::{GetLedgersResponse, LedgerStart};
 use tokio::time::Instant;
 
+use super::notices::CommittedBatch;
 use super::operations::{
     AgreedOutcome, EvidenceAnswer, EvidenceEndpoint, EvidenceInput, EvidenceRowInput,
     ExposureIdentity, NotIncludedProof, OperationId, OperationRecorder, OperationStatus,
@@ -1784,8 +1785,10 @@ impl Driver<'_> {
             })
     }
 
+    /// Commits one run write and appends its transitions to `committed`.
     fn write(
         &self,
+        committed: &mut CommittedBatch,
         attempt: &RecoveryAttempt,
         input: &EvidenceInput,
         run: &WireRecoveryRun,
@@ -1796,13 +1799,15 @@ impl Driver<'_> {
         let mut writer = self.writer.lock().map_err(|_| WindowStoreError::Invalid {
             detail: "audit writer mutex is poisoned".into(),
         })?;
-        OperationRecorder::new(
+        let mut recorder = OperationRecorder::new(
             self.store,
             self.profile,
             &mut *writer,
             uuid::Uuid::new_v4().to_string(),
-        )
-        .write_recovery_run(attempt, input, run, decision)
+        );
+        let written = recorder.write_recovery_run(attempt, input, run, decision);
+        committed.append(recorder.take_committed());
+        written
     }
 }
 
@@ -1826,6 +1831,7 @@ async fn collect_outcomes(
     pair: &EndpointPair<'_>,
     attempts: &[RecoveryAttempt],
     now_ms: u64,
+    committed: &mut CommittedBatch,
 ) -> Result<Collected, RecoveryError> {
     let mut budget = Budget::new();
     let call_deadline = budget.deadline;
@@ -1932,6 +1938,7 @@ async fn collect_outcomes(
         };
         recovery_retry_time(run.run_deadline_ms, run.consecutive_stops)?;
         driver.write(
+            committed,
             attempt,
             &EvidenceInput {
                 observation,
@@ -2037,7 +2044,7 @@ async fn collect_outcomes(
                         Some(oracle.report.latest_ledger),
                     ),
                 )?);
-                driver.write(&owned, &release, &run, None)?;
+                driver.write(committed, &owned, &release, &run, None)?;
                 owned = driver.fresh(&owned, &run)?;
                 seeded = owned.clone();
             }
@@ -2288,7 +2295,13 @@ async fn collect_outcomes(
             run.stop = Some(stop.clone());
             evaluation.stop = Some(stop);
         }
-        driver.write(&fresh, &evaluation.input, &run, decision.as_ref())?;
+        driver.write(
+            committed,
+            &fresh,
+            &evaluation.input,
+            &run,
+            decision.as_ref(),
+        )?;
         evaluation.attempt = fresh;
         #[cfg(test)]
         tests::capture_evaluation(&evaluation);
@@ -2344,6 +2357,27 @@ pub async fn recover_outcomes(
     writer: &Arc<Mutex<AuditWriter>>,
     tx_hash: Option<&[u8; 32]>,
 ) -> Result<RecoveryReport, RecoveryError> {
+    recover_outcomes_committed(
+        store,
+        profile,
+        pair,
+        writer,
+        tx_hash,
+        &mut CommittedBatch::default(),
+    )
+    .await
+}
+
+/// [`recover_outcomes`], appending every transition its writes commit to
+/// `committed`. Transitions committed before a later refusal stay there.
+pub(crate) async fn recover_outcomes_committed(
+    store: &PersistedWindowStore,
+    profile: &Profile,
+    pair: EndpointPair<'_>,
+    writer: &Arc<Mutex<AuditWriter>>,
+    tx_hash: Option<&[u8; 32]>,
+    committed: &mut CommittedBatch,
+) -> Result<RecoveryReport, RecoveryError> {
     let status = OperationStatus::new(store, profile);
     let now_ms = super::store::now_ms()?;
     let attempts = status.runnable_snapshot(tx_hash, now_ms)?;
@@ -2372,7 +2406,7 @@ pub async fn recover_outcomes(
             profile,
             writer,
         };
-        let collected = collect_outcomes(&driver, &pair, &runnable, now_ms)
+        let collected = collect_outcomes(&driver, &pair, &runnable, now_ms, committed)
             .await
             .map_err(|error| progress_context(&status, &runnable, now_ms, error))?;
         report.requests = collected.requests;
@@ -5689,7 +5723,8 @@ mod tests {
         let home = receipt_sandbox.path();
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home);
         let calls = std::cell::Cell::new(0);
-        let result = crate::submission_flow::transaction_status(
+        let mut committed = CommittedBatch::default();
+        let result = crate::submission_flow::transaction_status_committed(
             crate::submission_flow::StatusRequest {
                 profile: &fx.profile,
                 profile_name: "ops",
@@ -5703,6 +5738,7 @@ mod tests {
                 calls.set(calls.get() + 1);
                 Ok(Arc::clone(&writer))
             },
+            &mut committed,
         )
         .await;
         assert!(
@@ -5713,6 +5749,12 @@ mod tests {
             "{result:?}"
         );
         assert_eq!(calls.get(), 1);
+        // The decision committed before the refused lookup reaches the batch.
+        let edges: Vec<_> = committed
+            .into_iter()
+            .map(|edge| (edge.operation_id(), edge.state(), edge.attempt_index()))
+            .collect();
+        assert_eq!(edges, vec![(id, OperationState::NotIncluded, Some(1))]);
         // The drain delivered its owed row through the same writer.
         assert!(
             std::fs::read_to_string(&fx.profile.audit_log_path)
@@ -5741,6 +5783,52 @@ mod tests {
                 .state,
             RecoveryRunState::Resolved
         );
+    }
+
+    /// The full dispatch pass hands the checked decision its driver commits
+    /// to the caller's batch.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn flow_batches_keep_dispatch_decisions() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let mut fx = Fx::new();
+        let id = unknown_with(&mut fx, 1, NOW / 1_000 - 10, vec![]).id();
+        bind_source(&mut fx);
+        fx.rewrite(|wire| {
+            wire.operations.as_mut().unwrap().records[0].attempts[0].send_by_ms = NOW;
+        });
+        let primary = endpoint(7, NOW / 1_000).await;
+        let oracle = endpoint(8, NOW / 1_000).await;
+        serve_absence(&primary, 7).await;
+        serve_absence(&oracle, 8).await;
+        let primary_client = StellarRpcClient::new(&primary.uri()).unwrap();
+        let oracle_client = StellarRpcClient::new(&oracle.uri()).unwrap();
+        let (writer, _) = crate::mainnet::fixtures::keyed_writer(&fx.profile.audit_log_path);
+        let mut committed = CommittedBatch::default();
+        let pass = crate::submission_flow::reconcile_pass_committed(
+            &fx.profile,
+            &fx.store,
+            &primary_client,
+            Some(&oracle_client),
+            None,
+            NOW,
+            || Ok(Arc::clone(&writer)),
+            &mut committed,
+        )
+        .await;
+        assert!(
+            matches!(pass, crate::submission_flow::ReconcilePass::Completed(_)),
+            "{pass:?}"
+        );
+        assert_eq!(fx.record(id).state, OperationState::NotIncluded);
+        let edges: Vec<_> = committed
+            .into_iter()
+            .map(|edge| (edge.operation_id(), edge.state(), edge.attempt_index()))
+            .collect();
+        assert_eq!(edges, vec![(id, OperationState::NotIncluded, Some(1))]);
     }
 
     /// A release write refusal on the status path logs the root code and the

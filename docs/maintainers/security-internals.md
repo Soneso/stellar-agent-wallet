@@ -822,8 +822,14 @@ sealed authority before signing. Endpoint identity binds the originating client,
 network, and protocol. Transaction authority binds the envelope and signer.
 Signing checks authority before key access. After checking the signer key,
 it durably claims the authorization under the window-state lock before asking
-for a signature. The lock is released before the signer runs. Signing checks
-freshness again after the signer returns and discards a late signature.
+for a signature. The lock is released before the signer runs. The transaction
+payload carries the authorization's issue time and expiry. The keyring,
+software, and hardware signers check them on a fresh mainnet clock after the
+secret read or the device's key answer and immediately before signing. An
+authorization that ends during that key access produces no signature and
+refuses with `network.mainnet_authorization_refused` (`expired` or
+`not_yet_valid`). Signing checks freshness again after the signer returns and
+discards a late signature.
 The signature must verify before it is returned. A refusal after the claim keeps
 its spend counted, because a local record cannot withdraw a produced signature.
 

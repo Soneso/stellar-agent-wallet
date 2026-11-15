@@ -571,8 +571,25 @@ Admission can reclaim expired slots before refusing capacity.
 Every authorization use and mint uses the greater of wall time and the evidence floor, refreshed before a mint after collection.
 Recoverable storage and publication errors retry the existing grant without another ceremony.
 Production activation requires authenticated sink provenance, retained references, publication and lifecycle adapters, and a complete live-grant inventory.
-Unresolved pins and incomplete binding and verifier integration block activation; initialization remains explicit.
+Unresolved pins and incomplete producer integration block activation; initialization remains explicit.
 Populations exceeding capacity require an authenticated migration before activation.
+
+**Pin adoption.** Adoption turns one migration pin into Delivered evidence and never manufactures a missing proof.
+The caller authenticates the approval identity, the full queue reference, the scope association, and the conservative deadline before it calls.
+The pin whose digest equals the reference's full digest becomes a Delivered record with the reference's coordinates and the deadline, so occupancy stays the same.
+A missing pin refuses with `missing migration pin`, and a deadline at or below the floor refuses with `expired reservation`.
+An identity that holds other facts refuses with `conflicting reservation`, and an exact retry returns the same reservation.
+At evidence generation `u64::MAX` an exact retry refuses with `evidence-generation overflow`, as every mutation does.
+Adoption uses the evidence transaction below; it reads no approval storage, samples no clock, and drains nothing.
+
+**Binding and verification.** A carrier binding authenticates the source generation's evidence image with its queue before it stages anything.
+A newer authenticated source image is committed to the source owner first, while the record names the source or a staged successor that retires it.
+The successor then receives the complete source owner, so records, floor, slot paths, and scope carry over unchanged.
+Ordinary evidence reads and mutations refuse with `audit.carrier_recovery_required` while a stage exists or successor owner state waits.
+`audit verify` authenticates both evidence files under the one stored key it reads and changes no file or protected item.
+Verification reports a newer authenticated image with `owner recommit required`; the next keyed evidence query or drain recommits it.
+Neither binding nor verification uses the old-key exception of the rotation fence.
+An uninitialized log refuses evidence mutations with `evidence not initialized`.
 
 **Evidence transactions.** The active outbox carrier covers the owner reload, authenticated selection, transformation, candidate sync, owner store, and outcome reread.
 The selected generation is checked before a successor write and before a mutation's recommit.

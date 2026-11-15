@@ -18,8 +18,8 @@ use stellar_agent_core::wallet::WalletLifecycleError;
 
 use crate::mainnet::consumed::AuthorizationConsumed;
 use crate::policy_state::{
-    DeliveryReport, OperationRecorder, PersistedWindowStore, RECONCILE_BUDGET, ReconcileReport,
-    SubmissionHold, WindowStoreError, drain_accounting_obligations,
+    CommittedBatch, DeliveryReport, OperationRecorder, PersistedWindowStore, RECONCILE_BUDGET,
+    ReconcileReport, SubmissionHold, WindowStoreError, drain_accounting_obligations,
 };
 use crate::submission_record::repair_approval_consumption;
 use crate::{
@@ -164,6 +164,12 @@ impl<'a> StageMarkedRecorder<'a> {
         if !self.pre_send_entered() {
             self.inner.end_unsent_attempt(code);
         }
+    }
+
+    /// Moves out the transitions the wrapped recorder committed; see
+    /// [`WalletSubmissionRecorder::take_committed`].
+    pub fn take_committed(&self) -> CommittedBatch {
+        self.inner.take_committed()
     }
 }
 
@@ -451,6 +457,35 @@ pub async fn reconcile_pass(
     now_ms: u64,
     operations_writer: impl FnOnce() -> Result<Arc<Mutex<AuditWriter>>, WalletError>,
 ) -> ReconcilePass {
+    reconcile_pass_committed(
+        profile,
+        window,
+        client,
+        oracle,
+        receipts,
+        now_ms,
+        operations_writer,
+        &mut CommittedBatch::default(),
+    )
+    .await
+}
+
+/// [`reconcile_pass`], appending the transitions its expiry edges and its
+/// recovery driver commit to `committed`, also when a later stage refuses.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the pass arguments plus the caller's batch"
+)]
+pub async fn reconcile_pass_committed(
+    profile: &Profile,
+    window: &PersistedWindowStore,
+    client: &StellarRpcClient,
+    oracle: Option<&StellarRpcClient>,
+    receipts: Option<&ReceiptStore>,
+    now_ms: u64,
+    operations_writer: impl FnOnce() -> Result<Arc<Mutex<AuditWriter>>, WalletError>,
+    committed: &mut CommittedBatch,
+) -> ReconcilePass {
     reconcile_stages(
         profile,
         window,
@@ -460,6 +495,7 @@ pub async fn reconcile_pass(
         now_ms,
         operations_writer,
         true,
+        committed,
     )
     .await
 }
@@ -479,6 +515,35 @@ pub async fn reconcile_legacy_pass(
     now_ms: u64,
     operations_writer: impl FnOnce() -> Result<Arc<Mutex<AuditWriter>>, WalletError>,
 ) -> ReconcilePass {
+    reconcile_legacy_pass_committed(
+        profile,
+        window,
+        client,
+        oracle,
+        receipts,
+        now_ms,
+        operations_writer,
+        &mut CommittedBatch::default(),
+    )
+    .await
+}
+
+/// [`reconcile_legacy_pass`], appending the transitions its expiry edges
+/// commit to `committed`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the pass arguments plus the caller's batch"
+)]
+pub async fn reconcile_legacy_pass_committed(
+    profile: &Profile,
+    window: &PersistedWindowStore,
+    client: &StellarRpcClient,
+    oracle: Option<&StellarRpcClient>,
+    receipts: Option<&ReceiptStore>,
+    now_ms: u64,
+    operations_writer: impl FnOnce() -> Result<Arc<Mutex<AuditWriter>>, WalletError>,
+    committed: &mut CommittedBatch,
+) -> ReconcilePass {
     reconcile_stages(
         profile,
         window,
@@ -488,6 +553,7 @@ pub async fn reconcile_legacy_pass(
         now_ms,
         operations_writer,
         false,
+        committed,
     )
     .await
 }
@@ -512,7 +578,7 @@ pub fn business_id_is_stored(
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "the pass arguments plus the stage selection"
+    reason = "the pass arguments plus the stage selection and the caller's batch"
 )]
 async fn reconcile_stages(
     profile: &Profile,
@@ -523,11 +589,12 @@ async fn reconcile_stages(
     now_ms: u64,
     operations_writer: impl FnOnce() -> Result<Arc<Mutex<AuditWriter>>, WalletError>,
     recovery: bool,
+    committed: &mut CommittedBatch,
 ) -> ReconcilePass {
     #[cfg(test)]
     RECOVERY_STAGE_TRACE.with_borrow_mut(|trace| trace.push("expire"));
     let writer = if profile.chain_id.is_mainnet() {
-        expire_due_operations(profile, window, now_ms, operations_writer)
+        expire_due_operations(profile, window, now_ms, operations_writer, committed)
     } else {
         None
     };
@@ -549,12 +616,13 @@ async fn reconcile_stages(
         return legacy;
     };
     // The one recovery driver runs first; a projection refusal never starves it.
-    let sequences = crate::policy_state::recover_outcomes(
+    let sequences = crate::policy_state::recovery::recover_outcomes_committed(
         window,
         profile,
         crate::policy_state::EndpointPair::from_clients(client, oracle),
         &writer,
         None,
+        committed,
     )
     .await
     .and_then(crate::policy_state::RecoveryReport::require_evidence);
@@ -615,7 +683,8 @@ fn status_recovery_enabled() -> bool {
     }
 }
 
-/// Applies the operation store's expiry edges at `now_ms`.
+/// Applies the operation store's expiry edges at `now_ms` and appends the
+/// transitions they commit to `committed`.
 ///
 /// The writer is acquired before the window lock, the order every operation
 /// step takes. Every refusal is logged: the records stay as they are, and the
@@ -625,6 +694,7 @@ fn expire_due_operations(
     window: &PersistedWindowStore,
     now_ms: u64,
     writer: impl FnOnce() -> Result<Arc<Mutex<AuditWriter>>, WalletError>,
+    committed: &mut CommittedBatch,
 ) -> Option<Arc<Mutex<AuditWriter>>> {
     let writer = match writer() {
         Ok(writer) => writer,
@@ -641,7 +711,10 @@ fn expire_due_operations(
         return None;
     };
     let request_id = uuid::Uuid::new_v4().to_string();
-    match OperationRecorder::new(window, profile, &mut *guard, request_id).expire_due(now_ms) {
+    let mut recorder = OperationRecorder::new(window, profile, &mut *guard, request_id);
+    let expired = recorder.expire_due(now_ms);
+    committed.append(recorder.take_committed());
+    match expired {
         Ok(0) => {}
         Ok(ended) => tracing::debug!(ended, "operation expiry: records ended"),
         Err(error) => tracing::warn!(
@@ -772,6 +845,26 @@ pub async fn transaction_status(
     approval_dir: impl FnOnce() -> Result<PathBuf, StateDirError>,
     writer: impl Fn() -> Result<Arc<Mutex<AuditWriter>>, WalletError>,
 ) -> Result<StatusOutcome, StatusFailure> {
+    transaction_status_committed(
+        request,
+        approval_dir,
+        writer,
+        &mut CommittedBatch::default(),
+    )
+    .await
+}
+
+/// [`transaction_status`], appending the transitions its recovery driver
+/// commits to `committed`, also when a later step refuses the lookup.
+///
+/// # Errors
+/// The errors of [`transaction_status`].
+pub async fn transaction_status_committed(
+    request: StatusRequest<'_>,
+    approval_dir: impl FnOnce() -> Result<PathBuf, StateDirError>,
+    writer: impl Fn() -> Result<Arc<Mutex<AuditWriter>>, WalletError>,
+    committed: &mut CommittedBatch,
+) -> Result<StatusOutcome, StatusFailure> {
     let StatusRequest {
         profile,
         profile_name,
@@ -843,12 +936,13 @@ pub async fn transaction_status(
         && let Some(writer) = writer.handle()
     {
         sequences = "completed";
-        if let Err(error) = crate::policy_state::recover_outcomes(
+        if let Err(error) = crate::policy_state::recovery::recover_outcomes_committed(
             window,
             profile,
             crate::policy_state::EndpointPair::from_clients(client, oracle),
             &writer,
             Some(&hash),
+            committed,
         )
         .await
         .and_then(crate::policy_state::RecoveryReport::require_evidence)
@@ -980,6 +1074,125 @@ mod tests {
             fx.authorization_record(authorization.id())["state"],
             "expired"
         );
+    }
+
+    /// Without `mainnet-write` the full and the legacy dispatch pass both
+    /// hand their expiry edge to the caller's batch.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn flow_batches_keep_expiry_edges_without_the_mainnet_feature() {
+        use crate::operation_entry::tests::{StoreLinked, batch_edges};
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        for legacy in [false, true] {
+            let linked = StoreLinked::new();
+            let attempt = linked.begin(&mut CommittedBatch::default()).unwrap();
+            let later = crate::mainnet::clock::now_ms().unwrap() + 120_001;
+            linked.fx.clock.set(later);
+            let client = StellarRpcClient::new("http://127.0.0.1:1").unwrap();
+            let writer = || Ok(Arc::clone(&linked.writer));
+            let mut committed = CommittedBatch::default();
+            let fx = &linked.fx;
+            let pass = if legacy {
+                reconcile_legacy_pass_committed(
+                    &fx.profile,
+                    &fx.store,
+                    &client,
+                    None,
+                    None,
+                    later,
+                    writer,
+                    &mut committed,
+                )
+                .await
+            } else {
+                reconcile_pass_committed(
+                    &fx.profile,
+                    &fx.store,
+                    &client,
+                    None,
+                    None,
+                    later,
+                    writer,
+                    &mut committed,
+                )
+                .await
+            };
+            assert!(matches!(pass, ReconcilePass::Completed(_)), "{pass:?}");
+            assert_eq!(
+                batch_edges(&committed),
+                vec![(
+                    attempt.operation_id,
+                    crate::policy_state::OperationState::NotSent,
+                    Some(attempt.attempt_index)
+                )],
+                "legacy: {legacy}"
+            );
+        }
+    }
+
+    /// The full and the legacy dispatch pass both hand their expiry edge to
+    /// the caller's batch.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn flow_batches_keep_expiry_edges() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use crate::mainnet::fixtures::{self, LedgerFixture, TTL_MS};
+        const NOW: u64 = 1_800_000_000_000;
+        for legacy in [false, true] {
+            let fx = LedgerFixture::new("reconcile-expire-committed", NOW);
+            let unsigned = fixtures::unsigned_envelope();
+            let binding = fixtures::tx_binding(unsigned.envelope_xdr(), unsigned.tx_hash_hex());
+            let (attempt, _) = fx.linked_attempt(binding, &[], "order-1");
+            let later = NOW + TTL_MS + 1;
+            fx.clock.set(later);
+            let client = StellarRpcClient::new("http://127.0.0.1:1").unwrap();
+            let writer = || Ok(Arc::clone(&fx.writer));
+            let mut committed = CommittedBatch::default();
+            let pass = if legacy {
+                reconcile_legacy_pass_committed(
+                    &fx.profile,
+                    &fx.window,
+                    &client,
+                    None,
+                    None,
+                    later,
+                    writer,
+                    &mut committed,
+                )
+                .await
+            } else {
+                reconcile_pass_committed(
+                    &fx.profile,
+                    &fx.window,
+                    &client,
+                    None,
+                    None,
+                    later,
+                    writer,
+                    &mut committed,
+                )
+                .await
+            };
+            assert!(matches!(pass, ReconcilePass::Completed(_)), "{pass:?}");
+            let edges: Vec<_> = committed
+                .into_iter()
+                .map(|edge| (edge.operation_id(), edge.state(), edge.attempt_index()))
+                .collect();
+            assert_eq!(
+                edges,
+                vec![(
+                    attempt.operation_id,
+                    crate::policy_state::OperationState::NotSent,
+                    Some(attempt.attempt_index)
+                )],
+                "legacy: {legacy}"
+            );
+        }
     }
 
     #[test]
