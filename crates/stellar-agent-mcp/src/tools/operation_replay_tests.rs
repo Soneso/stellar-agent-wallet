@@ -572,7 +572,9 @@ async fn a_claim_retry_after_its_balance_left_replays_the_stored_claim() {
 /// A retained claim of unknown outcome answers with its stored state once its
 /// predicate expired, and does no new work. The lookup precedes the balance
 /// read and the predicate check, whose answer changed once the claim ran. A
-/// preparation under an unknown id keeps the predicate refusal.
+/// preparation under an unknown id keeps the predicate refusal. Its dispatch
+/// runs once the stored attempt is due, so the recovery driver reserves one
+/// automatic run for it and stores a stop with an automatic retry time.
 #[tokio::test]
 #[serial_test::serial(keyring)]
 #[serial_test::serial]
@@ -609,14 +611,27 @@ async fn a_retained_claim_replays_after_its_predicate_expires() {
     );
     assert_eq!(Effects::of(&run.f), before);
 
+    // The stored attempt is due at (max_time + 6) * 1000. Health reads,
+    // which recovery checks against the moved clock, report a close at that
+    // clock; ledger pages, which the readiness check holds against the host
+    // clock, keep the host clock.
+    let max_time = stored["attempts"][0]["exposure"]["identity"]["classic"]["max_time"]
+        .as_u64()
+        .unwrap();
+    let due_ms = (max_time + 6) * 1_000;
+    let system_secs = stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1_000;
+    let _clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(due_ms + 1_000);
+    for control in [&run.control, &run.oracle_control] {
+        control
+            .health_lead_secs
+            .store(due_ms / 1_000 + 1 - system_secs, Ordering::SeqCst);
+    }
     let fresh = fresh_business_id();
-    let pass_from = stellar_agent_network::mainnet::clock::now_ms().unwrap();
     let other = wire(
         &Tool::Claim
             .prepare(&run.f.server, &prepare_args(&run, &fresh))
             .await,
     );
-    let pass_to = stellar_agent_network::mainnet::clock::now_ms().unwrap();
     assert_eq!(
         other["error"]["code"], "claim.predicate_not_satisfied",
         "{other}"
@@ -624,39 +639,51 @@ async fn a_retained_claim_replays_after_its_predicate_expires() {
     let after = Effects::of(&run.f);
     assert_eq!(after.seed_reads, before.seed_reads);
     assert_eq!(after.authorizations, before.authorizations);
+    // The stop commits the stored attempt's evidence; no other row appends.
+    assert!(
+        after.audit.starts_with(&before.audit),
+        "the audit log only grows"
+    );
+    let appended: Vec<Value> = after.audit[before.audit.len()..]
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        appended
+            .iter()
+            .all(|row| row["kind"] == "operation_evidence"),
+        "{appended:?}"
+    );
+    let count = |operations: &Value| operations["records"].as_array().map(Vec::len);
     assert_eq!(
-        after.audit, before.audit,
-        "the recovery state appends no row"
+        count(&after.operations),
+        count(&before.operations),
+        "the record count stays"
     );
-    assert_only_recovery_state_changes(
-        &after.operations,
-        &before.operations,
-        &fresh,
-        pass_from..=pass_to,
+    assert!(
+        records(&run.f)
+            .iter()
+            .all(|entry| entry["business_id"] != fresh.as_str()),
+        "nothing opens under {fresh}"
+    );
+    // Dispatch reached the driver: one automatic run and its stop.
+    let recovery_run = &record(&run.f, &id)["attempts"][0]["recovery_run"];
+    assert_eq!(
+        recovery_run["automatic_runs"],
+        1,
+        "{recovery_run} after {:?}",
+        run.control.methods()
+    );
+    assert_eq!(recovery_run["phase"], "stopped", "{recovery_run}");
+    assert_eq!(recovery_run["stop"]["class"], "automatic", "{recovery_run}");
+    assert!(
+        recovery_run["stop"]["earliest_retry_ms"].as_u64().is_some(),
+        "{recovery_run}"
     );
 }
 
-/// A call under the fresh id `fresh` refuses after the reconciliation pass.
-/// That pass evaluates the stored attempt, which waits in
-/// `sent_outcome_unknown` with no sequence release.
-///
-/// No record or tombstone opens and the record count stays. The whole
-/// operations object keeps its earlier value apart from the stored attempt's
-/// recovery state, which is its first. The fixture's ledger pages hold no
-/// entries, so the state is `evidence_pending` with detail
-/// `malformed_history`. Both cursors stay at the attempt's lower bound,
-/// ledger 100, and the pass time falls inside `pass_ms`.
-fn assert_only_recovery_state_changes(
-    after: &Value,
-    before: &Value,
-    fresh: &str,
-    pass_ms: std::ops::RangeInclusive<u64>,
-) {
-    assert_only_stored_recovery_changes(after, before, fresh, pass_ms, 100);
-}
-
-/// The check of [`assert_only_recovery_state_changes`] with the attempt's
-/// lower bound `cursor`.
+/// The check that only the stored attempt's first recovery state changes,
+/// with the attempt's lower bound `cursor`.
 fn assert_only_stored_recovery_changes(
     after: &Value,
     before: &Value,

@@ -238,6 +238,10 @@ async fn endpoint(ledger: u32, close: u64, history: Arc<AtomicBool>) -> MockServ
             "getHealth",
             json!({"status":"healthy","latestLedger":ledger,"oldestLedger":1,"ledgerRetentionWindow":ledger,"latestLedgerCloseTime":close,"oldestLedgerCloseTime":1}),
         ),
+        (
+            "getTransaction",
+            json!({"status":"NOT_FOUND","oldestLedger":1,"latestLedger":ledger,"oldestLedgerCloseTime":1,"latestLedgerCloseTime":close}),
+        ),
     ] {
         Mock::given(method("POST"))
             .and(body_partial_json(json!({"method":name})))
@@ -280,15 +284,17 @@ async fn recovery_two_post_expiry_ledgers_release_only_the_sequence() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let _storage_home =
         stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-    let fx = Fixture::new(NOW / 1_000 - 1);
+    // Due at (max_time + 6) * 1000 = NOW - 4000.
+    let fx = Fixture::new(NOW / 1_000 - 10);
     let endpoints = Endpoints::new(NOW / 1_000).await;
     let before = fx.wire();
     let receipt = fx.receipts.all().unwrap();
     let report = fx.run(&endpoints).await;
+    // Two hashes, two singleton ledgers, then two unanswered account reads.
     assert_eq!(
         report.requests,
         RecoveryRequests {
-            attempt: 2,
+            attempt: 6,
             shared: 4
         }
     );
@@ -353,7 +359,7 @@ async fn recovery_single_endpoint_refuses() {
     let _storage_home =
         stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     for primary_fails in [false, true] {
-        let fx = Fixture::new(NOW / 1_000 - 1);
+        let fx = Fixture::new(NOW / 1_000 - 10);
         let endpoints = Endpoints::new(NOW / 1_000).await;
         if primary_fails {
             endpoints.primary_history.store(false, Ordering::SeqCst);
@@ -394,16 +400,19 @@ async fn recovery_fresh_concurrence_ignores_saved_bounds() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let _storage_home =
         stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-    let fx = Fixture::new(NOW / 1_000 - 1);
+    let fx = Fixture::new(NOW / 1_000 - 10);
     let endpoints = Endpoints::new(NOW / 1_000).await;
     endpoints.oracle_history.store(false, Ordering::SeqCst);
     fx.run(&endpoints).await;
     assert_eq!(fx.record()["attempts"][0]["recovery"]["primary_upper"], 12);
+    // Each later run is due at the stop's automatic retry time.
+    fx._clock.set(NOW + 30_000);
+    let endpoints = Endpoints::new(NOW / 1_000 + 30).await;
     endpoints.primary_history.store(false, Ordering::SeqCst);
-    endpoints.oracle_history.store(true, Ordering::SeqCst);
     fx.run(&endpoints).await;
     assert!(fx.record()["attempts"][0]["sequence_released"].is_null());
-    endpoints.primary_history.store(true, Ordering::SeqCst);
+    fx._clock.set(NOW + 90_000);
+    let endpoints = Endpoints::new(NOW / 1_000 + 90).await;
     fx.run(&endpoints).await;
     assert!(fx.record()["attempts"][0]["sequence_released"].is_object());
 }
@@ -414,7 +423,7 @@ async fn recovery_receipt_claim_honors_sequence_release() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let _storage_home =
         stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-    let fx = Fixture::new(NOW / 1_000 - 1);
+    let fx = Fixture::new(NOW / 1_000 - 10);
     fx.run(&Endpoints::new(NOW / 1_000).await).await;
     let _lock =
         WindowStoreLock::acquire_for(fx.window.path(), &fx.profile.policy_window_state_key_id)

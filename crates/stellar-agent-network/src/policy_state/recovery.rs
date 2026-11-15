@@ -30,7 +30,7 @@ use crate::operational::OperationalReport;
 use crate::{MainnetOracle, StellarRpcClient};
 
 const ATTEMPT_REQUESTS: usize = 24;
-const SHARED_REQUESTS: usize = 9;
+const SHARED_REQUESTS: usize = 4;
 const PASS_DURATION: Duration = Duration::from_secs(20);
 const OBSERVATION_AGE: Duration = Duration::from_secs(5);
 const PAGE_SIZE: usize = 1;
@@ -180,7 +180,7 @@ impl<'a> EndpointPair<'a> {
         let oracle = self.oracle.ok_or_else(|| {
             budget.context(RecoveryEndpoint::Oracle, RecoveryMethod::GetNetwork, None);
             budget.failed(RecoveryReason::MissingField);
-            IdentityFailure::Read(ReadFailure::Pending)
+            IdentityFailure::Read
         })?;
         budget.context(RecoveryEndpoint::Primary, RecoveryMethod::GetNetwork, None);
         budget.identity(self.primary.recovery_identity()).await?;
@@ -241,7 +241,8 @@ impl RecoveryError {
 
 #[derive(Debug)]
 enum IdentityFailure {
-    Read(ReadFailure),
+    /// A read failure; the budget records its cause.
+    Read,
     Refused(WalletError),
 }
 
@@ -267,7 +268,7 @@ fn identity_refusal(error: &WalletError) -> bool {
 pub struct RecoveryRequests {
     /// Requests for attempt history, accounts and outcomes.
     pub attempt: usize,
-    /// Identity, readiness and refresh requests shared across attempts.
+    /// Identity and readiness requests shared across attempts, at most four.
     pub shared: usize,
 }
 
@@ -283,7 +284,6 @@ struct Budget {
     deadline: Instant,
     context: (RecoveryEndpoint, RecoveryMethod, Option<u32>),
     failure: Option<RecoveryFailure>,
-    driver: bool,
     attempt_limit: usize,
 }
 
@@ -294,7 +294,6 @@ impl Budget {
             deadline: Instant::now() + PASS_DURATION,
             context: (RecoveryEndpoint::Primary, RecoveryMethod::GetNetwork, None),
             failure: None,
-            driver: false,
             attempt_limit: ATTEMPT_REQUESTS,
         }
     }
@@ -319,10 +318,7 @@ impl Budget {
             return Err(ReadFailure::Deadline);
         }
         let (used, capacity) = if shared {
-            (
-                &mut self.used.shared,
-                if self.driver { 4 } else { SHARED_REQUESTS },
-            )
+            (&mut self.used.shared, SHARED_REQUESTS)
         } else {
             (&mut self.used.attempt, self.attempt_limit)
         };
@@ -358,11 +354,11 @@ impl Budget {
         &mut self,
         request: impl Future<Output = Result<T, crate::client::RecoveryReadError>>,
     ) -> Result<T, IdentityFailure> {
-        self.charge(true).map_err(IdentityFailure::Read)?;
+        self.charge(true).map_err(|_| IdentityFailure::Read)?;
         match tokio::time::timeout_at(self.deadline, request).await {
             Err(_) => {
                 self.failed(RecoveryReason::Deadline);
-                Err(IdentityFailure::Read(ReadFailure::Deadline))
+                Err(IdentityFailure::Read)
             }
             Ok(Ok(value)) => Ok(value),
             Ok(Err(crate::client::RecoveryReadError::Validation(error)))
@@ -372,7 +368,7 @@ impl Budget {
             }
             Ok(Err(error)) => {
                 self.failed(read_failure(&error));
-                Err(IdentityFailure::Read(ReadFailure::Pending))
+                Err(IdentityFailure::Read)
             }
         }
     }
@@ -625,7 +621,7 @@ async fn shared_observation(
     let read_at = Instant::now();
     budget.context(budget.context.0, RecoveryMethod::GetHealth, None);
     let observed = budget.read(true, client.recovery_health()).await?;
-    if budget.driver && observed.latest_close.checked_mul(1_000).is_none() {
+    if observed.latest_close.checked_mul(1_000).is_none() {
         budget.failed(RecoveryReason::MissingField);
         return Err(ReadFailure::Pending);
     }
@@ -704,12 +700,6 @@ async fn history(
     primary: bool,
     target: u32,
 ) -> Result<Option<Scan>, ReadFailure> {
-    let saved = &attempt.recovery;
-    let upper = if primary {
-        saved.primary_upper
-    } else {
-        saved.witness_upper
-    };
     let ExposureIdentity::Classic { max_time, .. } = attempt.exposure else {
         return Ok(None);
     };
@@ -722,12 +712,10 @@ async fn history(
         RecoveryMethod::GetLedgers,
         Some(target),
     );
-    let retention = if budget.driver {
-        RecoveryReason::Lagging
-    } else {
-        RecoveryReason::CoverageRequired
-    };
-    if target < shared.oldest || (!budget.driver && upper.is_some_and(|ledger| ledger > target)) {
+    // Retention shorter than the tip gap is a lagging answer; a saved upper
+    // bound neither selects nor vetoes the target.
+    let retention = RecoveryReason::Lagging;
+    if target < shared.oldest {
         budget.failed(retention);
         return Err(ReadFailure::Failed(retention));
     }
@@ -750,13 +738,11 @@ async fn history(
         return Err(ReadFailure::Failed(retention));
     }
     let scan = scan_page(&page, target, max_time, PAGE_SIZE);
-    if budget.driver
-        && scan.as_ref().is_some_and(|scan| {
-            scan.answer
-                .close_time
-                .is_some_and(|close| close.checked_mul(1_000).is_none())
-        })
-    {
+    if scan.as_ref().is_some_and(|scan| {
+        scan.answer
+            .close_time
+            .is_some_and(|close| close.checked_mul(1_000).is_none())
+    }) {
         budget.failed(RecoveryReason::MissingField);
         return Ok(None);
     }
@@ -1309,166 +1295,12 @@ impl RecoveryReport {
     }
 }
 
-#[derive(Default)]
-struct Batch {
-    inputs: Vec<(OperationId, u32, EvidenceInput)>,
-    observation: Option<WindowObservation>,
-    requests: RecoveryRequests,
-    missing: Option<RecoveryFailure>,
-}
-
-async fn collect(
-    pair: &EndpointPair<'_>,
-    attempts: &[RecoveryAttempt],
-    now_ms: u64,
-) -> Result<Batch, RecoveryError> {
-    let mut budget = Budget::new();
-    let mut batch = Batch::default();
-    let verified = match pair.verify(&mut budget).await {
-        Ok(()) => true,
-        Err(IdentityFailure::Refused(error)) => return Err(RecoveryError::EndpointIdentity(error)),
-        Err(IdentityFailure::Read(ReadFailure::Deadline)) => {
-            batch.requests = budget.used;
-            batch.missing = budget.failure;
-            return Ok(batch);
-        }
-        Err(IdentityFailure::Read(ReadFailure::Pending | ReadFailure::Failed(_))) => false,
-    };
-    let mut primary = None;
-    let mut oracle = None;
-    if verified {
-        budget.context(RecoveryEndpoint::Primary, RecoveryMethod::GetHealth, None);
-        match shared_observation(pair.primary, &mut budget, now_ms).await {
-            Ok(observation) => {
-                batch.observation = Some(observation.window(now_ms));
-                primary = Some(observation);
-            }
-            Err(ReadFailure::Deadline) => {
-                batch.requests = budget.used;
-                batch.missing = budget.failure;
-                return Ok(batch);
-            }
-            Err(ReadFailure::Pending | ReadFailure::Failed(_)) => {}
-        }
-        if let Some(client) = pair.oracle.filter(|_| primary.is_some()) {
-            budget.context(RecoveryEndpoint::Oracle, RecoveryMethod::GetHealth, None);
-            match shared_observation(client, &mut budget, now_ms).await {
-                Ok(observation) => oracle = Some(observation),
-                Err(ReadFailure::Deadline) => {
-                    batch.requests = budget.used;
-                    batch.missing = budget.failure;
-                    return Ok(batch);
-                }
-                Err(ReadFailure::Pending | ReadFailure::Failed(_)) => {}
-            }
-        }
-    }
-    let mut refreshed = false;
-    for attempt in attempts.iter().take(4) {
-        if Instant::now() >= budget.deadline {
-            budget.failed(RecoveryReason::Deadline);
-            break;
-        }
-        let mut seeded = attempt.clone();
-        for (shared, cursor) in [
-            (&primary, &mut seeded.recovery.primary_cursor),
-            (&oracle, &mut seeded.recovery.witness_cursor),
-        ] {
-            if let Some(shared) = shared {
-                let start = *cursor.get_or_insert(
-                    attempt
-                        .pre_exposure_ledger
-                        .unwrap_or(shared.report.latest_ledger),
-                );
-                seeded.recovery.history_incomplete |=
-                    shared.oldest > start || attempt.pre_exposure_ledger.is_none();
-            }
-        }
-        let expected_attempt = attempt.clone();
-        let attempt = &seeded;
-        let mut detail = "endpoint_unreachable";
-        let mut scans = (None, None);
-        if let (Some(left), Some(right), Some(client)) = (&primary, &oracle, pair.oracle)
-            && (left.stale() || right.stale())
-            && !refreshed
-        {
-            refreshed = true;
-            budget.context(RecoveryEndpoint::Primary, RecoveryMethod::GetHealth, None);
-            match shared_observation(pair.primary, &mut budget, now_ms).await {
-                Ok(observation) => {
-                    batch.observation = Some(observation.window(now_ms));
-                    primary = Some(observation);
-                }
-                Err(ReadFailure::Deadline) => break,
-                Err(ReadFailure::Pending | ReadFailure::Failed(_)) => primary = None,
-            }
-            budget.context(RecoveryEndpoint::Oracle, RecoveryMethod::GetHealth, None);
-            match shared_observation(client, &mut budget, now_ms).await {
-                Ok(observation) => oracle = Some(observation),
-                Err(ReadFailure::Deadline) => break,
-                Err(ReadFailure::Pending | ReadFailure::Failed(_)) => oracle = None,
-            }
-        }
-        if let (Some(left), Some(right), Some(client)) = (&primary, &oracle, pair.oracle) {
-            if left.stale() || right.stale() {
-                budget.context(
-                    if left.stale() {
-                        RecoveryEndpoint::Primary
-                    } else {
-                        RecoveryEndpoint::Oracle
-                    },
-                    RecoveryMethod::GetHealth,
-                    None,
-                );
-                budget.failed(RecoveryReason::Lagging);
-                detail = "stale_observation";
-            } else {
-                let target = left.report.latest_ledger.min(right.report.latest_ledger);
-                let left = history(pair.primary, left, &mut budget, attempt, true, target).await;
-                if matches!(left, Err(ReadFailure::Deadline)) {
-                    break;
-                }
-                let right = history(client, right, &mut budget, attempt, false, target).await;
-                if matches!(right, Err(ReadFailure::Deadline)) {
-                    break;
-                }
-                detail = if matches!(left, Ok(None)) || matches!(right, Ok(None)) {
-                    "malformed_history"
-                } else if left.is_err() || right.is_err() {
-                    "endpoint_unreachable"
-                } else {
-                    "expiry_boundary_pending"
-                };
-                scans = (left.ok().flatten(), right.ok().flatten());
-            }
-        }
-        let mut input = if pair.oracle.is_none() {
-            pending(
-                attempt,
-                now_ms,
-                "witness_unconfigured",
-                "witness_unconfigured",
-            )
-        } else {
-            evaluate(attempt, scans.0.as_ref(), scans.1.as_ref(), now_ms, detail)?
-        };
-        input.expected_attempt = Some(expected_attempt);
-        input.observation = batch.observation;
-        batch
-            .inputs
-            .push((attempt.operation_id, attempt.attempt_index, input));
-    }
-    batch.requests = budget.used;
-    batch.missing = budget.failure;
-    Ok(batch)
-}
-
-/// Runs recovery from a verified snapshot and commits through the operation facade.
-/// A hash limits evaluation to its matching classic attempt.
+/// Runs the one bounded recovery driver of [`recover_outcomes`] and returns
+/// its report, with per-attempt results, evaluated counts and matched-release
+/// selection. A hash limits evaluation to its matching classic attempt.
 ///
 /// # Errors
-/// Returns snapshot, audit and commit errors without releasing any unsupported sequence.
-/// An endpoint on another network or protocol refuses the pass before any commit.
+/// Returns the errors of [`recover_outcomes`].
 pub async fn recover_sequences(
     store: &PersistedWindowStore,
     profile: &Profile,
@@ -1476,44 +1308,11 @@ pub async fn recover_sequences(
     writer: &Arc<Mutex<AuditWriter>>,
     tx_hash: Option<&[u8; 32]>,
 ) -> Result<RecoveryReport, RecoveryError> {
-    let attempts = OperationStatus::new(store, profile).recovery_snapshot(tx_hash)?;
-    // An idle stage sends no request and records no observation: the legacy
-    // stage before it hands over none.
-    if !profile.chain_id.is_mainnet() || attempts.is_empty() {
-        return Ok(RecoveryReport::default());
-    }
-    let now_ms = super::store::now_ms()?;
-    let batch = collect(&pair, &attempts, now_ms).await?;
-    let mut writer = writer.lock().map_err(|_| WindowStoreError::Invalid {
-        detail: "audit writer mutex is poisoned".to_owned(),
-    })?;
-    let mut recorder = OperationRecorder::new(
-        store,
-        profile,
-        &mut *writer,
-        uuid::Uuid::new_v4().to_string(),
-    );
-    commit_sequence_batch(
-        &mut recorder,
-        batch,
-        &OperationStatus::new(store, profile),
-        &attempts,
-    )
+    recover_outcomes(store, profile, pair, writer, tx_hash).await
 }
 
 /// A failed commit can select either durable image. One verified read
-/// describes all selected sequences while the caller still holds the writer.
-fn commit_sequence_batch(
-    recorder: &mut OperationRecorder<'_>,
-    batch: Batch,
-    status: &OperationStatus<'_>,
-    attempts: &[RecoveryAttempt],
-) -> Result<RecoveryReport, RecoveryError> {
-    commit_batch(recorder, batch).map_err(|error| {
-        RecoveryError::from(error).with_context(sequence_failure_detail(status, attempts))
-    })
-}
-
+/// after the refusal describes all selected sequences.
 fn sequence_failure_detail(status: &OperationStatus<'_>, attempts: &[RecoveryAttempt]) -> String {
     let (states, refusal) = match status.sequence_release_states(attempts) {
         Ok(states) => (states, String::new()),
@@ -1528,6 +1327,38 @@ fn sequence_failure_detail(status: &OperationStatus<'_>, attempts: &[RecoveryAtt
     format!(
         "selected sequences: {released} released, {held} held, {unavailable} unavailable{refusal}"
     )
+}
+
+/// Wraps a store refusal of the reservation, the release or stop, or the
+/// decision write in the verified progress of `selected`, with
+/// `; decided: N` when N of them hold a committed decision.
+/// Every other refusal returns unchanged.
+fn progress_context(
+    status: &OperationStatus<'_>,
+    selected: &[RecoveryAttempt],
+    now_ms: u64,
+    error: RecoveryError,
+) -> RecoveryError {
+    if !matches!(error, RecoveryError::Store(_)) {
+        return error;
+    }
+    let mut detail = sequence_failure_detail(status, selected);
+    let decided = selected
+        .iter()
+        .filter(|a| {
+            matches!(
+                status.recovery_run_view(a.operation_id, a.attempt_index, now_ms),
+                Ok(Some(RecoveryRunView {
+                    state: RecoveryRunState::Resolved,
+                    ..
+                }))
+            )
+        })
+        .count();
+    if decided > 0 {
+        detail.push_str(&format!("; decided: {decided}"));
+    }
+    error.with_context(detail)
 }
 
 /// One attempt's evaluated pass: its evidence commit and, when the evidence
@@ -1580,13 +1411,12 @@ async fn account_read(
         }
         Ok(Err(error)) => {
             let reason = read_failure(&error);
-            budget.failed(
-                if budget.driver && reason == RecoveryReason::CoverageRequired {
-                    RecoveryReason::AccountUnavailable
-                } else {
-                    reason
-                },
-            );
+            // An absent account is an availability answer, never coverage.
+            budget.failed(if reason == RecoveryReason::CoverageRequired {
+                RecoveryReason::AccountUnavailable
+            } else {
+                reason
+            });
             Ok(Err("endpoint_unreachable"))
         }
     }
@@ -1919,58 +1749,55 @@ impl Driver<'_> {
     }
 }
 
-/// Collects the outcome-capable pass over `attempts`, at most four, within
-/// the attempt and shared allowances and the pass deadline.
+/// What one driver call returns besides its durable writes.
+struct Collected {
+    /// The reached attempts, each reserved and then stopped or decided.
+    evaluated: Vec<Evaluated>,
+    /// Requests issued under each allowance.
+    requests: RecoveryRequests,
+    /// The first evidence the call could not obtain or use.
+    missing: Option<RecoveryFailure>,
+    /// The ephemeral cause that left the remaining attempts unreached.
+    unreached: Option<RecoveryFailure>,
+}
+
+/// Runs the shared prefix, then reserves, stops or decides each reached
+/// attempt of `attempts`, at most four, within the attempt and shared
+/// allowances and the call deadline.
 async fn collect_outcomes(
     driver: &Driver<'_>,
     pair: &EndpointPair<'_>,
     attempts: &[RecoveryAttempt],
     now_ms: u64,
-) -> Result<
-    (
-        Vec<Evaluated>,
-        Option<WindowObservation>,
-        RecoveryRequests,
-        Option<RecoveryFailure>,
-        Option<RecoveryFailure>,
-    ),
-    RecoveryError,
-> {
+) -> Result<Collected, RecoveryError> {
     let mut budget = Budget::new();
-    budget.driver = true;
     let call_deadline = budget.deadline;
     let mut first_missing = None;
     let mut evaluated = Vec::new();
-    let mut observation = None;
-    let prefix = |evaluated, observation, budget: Budget| {
-        (
-            evaluated,
-            observation,
-            budget.used,
-            budget.failure,
-            budget.failure,
-        )
+    let prefix = |budget: Budget| Collected {
+        evaluated: Vec::new(),
+        requests: budget.used,
+        missing: budget.failure,
+        unreached: budget.failure,
     };
     match pair.verify(&mut budget).await {
         Ok(()) => {}
         Err(IdentityFailure::Refused(error)) => return Err(RecoveryError::EndpointIdentity(error)),
-        Err(IdentityFailure::Read(_)) => {
-            return Ok(prefix(evaluated, observation, budget));
-        }
+        Err(IdentityFailure::Read) => return Ok(prefix(budget)),
     }
     let Some(oracle_client) = pair.oracle else {
-        return Ok(prefix(evaluated, observation, budget));
+        return Ok(prefix(budget));
     };
     budget.context(RecoveryEndpoint::Primary, RecoveryMethod::GetHealth, None);
     let primary = match shared_observation(pair.primary, &mut budget, now_ms).await {
         Ok(shared) => shared,
-        Err(_) => return Ok(prefix(evaluated, observation, budget)),
+        Err(_) => return Ok(prefix(budget)),
     };
-    observation = Some(primary.window(now_ms));
+    let observation = Some(primary.window(now_ms));
     budget.context(RecoveryEndpoint::Oracle, RecoveryMethod::GetHealth, None);
     let oracle = match shared_observation(oracle_client, &mut budget, now_ms).await {
         Ok(shared) => shared,
-        Err(_) => return Ok(prefix(evaluated, observation, budget)),
+        Err(_) => return Ok(prefix(budget)),
     };
     for attempt in attempts {
         budget.deadline = call_deadline;
@@ -2086,15 +1913,10 @@ async fn collect_outcomes(
             );
             match budget.read(false, client.recovery_transaction(&hash)).await {
                 Ok(observed) => {
-                    if observed.status.as_deref() == Some("NOT_FOUND") {
-                        let closes = (
-                            canonical_time(observed.oldest_ledger_close_time.as_ref()),
-                            canonical_time(observed.latest_ledger_close_time.as_ref()),
-                        );
-                        if !matches!((observed.oldest_ledger, observed.latest_ledger, closes), (Some(oldest), Some(latest), (Ok(Some(first)), Ok(Some(last)))) if oldest > 0 && oldest <= latest && first > 0 && first <= last && target.is_none_or(|t| latest >= t))
-                        {
-                            budget.failed(RecoveryReason::MissingField);
-                        }
+                    if observed.status.as_deref() == Some("NOT_FOUND")
+                        && !not_found_covers(&observed, target)
+                    {
+                        budget.failed(RecoveryReason::MissingField);
                     }
                     *slot = OutcomeAnswer::from_observed(&observed);
                     *done = true;
@@ -2298,6 +2120,7 @@ async fn collect_outcomes(
             .input
             .rows
             .truncate(super::operations::MAX_EVIDENCE_ROWS);
+        // No decision follows a recorded failure.
         if budget.failure.is_some() {
             evaluation.decision = None;
         }
@@ -2384,24 +2207,46 @@ async fn collect_outcomes(
         #[cfg(test)]
         driver_tests::after_attempt().await;
     }
-    Ok((
+    Ok(Collected {
         evaluated,
-        observation,
-        budget.used,
-        first_missing.or(budget.failure),
-        budget.failure,
-    ))
+        requests: budget.used,
+        missing: first_missing.or(budget.failure),
+        unreached: budget.failure,
+    })
+}
+
+/// Whether a `NOT_FOUND` answer has positive ordered oldest and latest
+/// ledgers and close times, with the latest ledger at or above `target`.
+fn not_found_covers(observed: &crate::ObservedTransaction, target: Option<u32>) -> bool {
+    let closes = (
+        canonical_time(observed.oldest_ledger_close_time.as_ref()),
+        canonical_time(observed.latest_ledger_close_time.as_ref()),
+    );
+    matches!(
+        (observed.oldest_ledger, observed.latest_ledger, closes),
+        (Some(oldest), Some(latest), (Ok(Some(first)), Ok(Some(last))))
+            if oldest > 0
+                && oldest <= latest
+                && first > 0
+                && first <= last
+                && target.is_none_or(|t| latest >= t)
+    )
 }
 
 /// Runs bounded recovery over the four oldest runnable classic attempts.
 /// A hash selects one attempt, including its non-runnable scheduling result.
 /// Each reached attempt reserves a lease and can release and decide in this call.
-/// The shared prefix writes nothing; production dispatch and status still use
-/// [`recover_sequences`]. Receipt replacement and acknowledgement remain separate.
+/// The shared prefix writes nothing. Production dispatch and targeted status
+/// recovery each call this driver once. Receipt replacement and
+/// acknowledgement remain separate.
 ///
 /// # Errors
 /// Returns snapshot, audit and commit errors. An endpoint on another network
-/// or protocol refuses the pass before any commit.
+/// or protocol refuses the pass before any commit. A store refusal of the
+/// reservation, the release or stop, or the decision write returns
+/// [`RecoveryError::Context`] around the store root, with the verified
+/// progress of the selected attempts and `; decided: N` when N of them hold
+/// a committed decision.
 pub async fn recover_outcomes(
     store: &PersistedWindowStore,
     profile: &Profile,
@@ -2434,36 +2279,14 @@ pub async fn recover_outcomes(
             profile,
             writer,
         };
-        let (evaluated, _, requests, missing, skipped) =
-            collect_outcomes(&driver, &pair, &runnable, now_ms)
-                .await
-                .map_err(|error| {
-                    if !matches!(error, RecoveryError::Store(_)) {
-                        return error;
-                    }
-                    let mut detail = sequence_failure_detail(&status, &runnable);
-                    let decided = runnable
-                        .iter()
-                        .filter(|a| {
-                            matches!(
-                                status.recovery_run_view(a.operation_id, a.attempt_index, now_ms),
-                                Ok(Some(RecoveryRunView {
-                                    state: RecoveryRunState::Resolved,
-                                    ..
-                                }))
-                            )
-                        })
-                        .count();
-                    if decided > 0 {
-                        detail.push_str(&format!("; decided: {decided}"));
-                    }
-                    error.with_context(detail)
-                })?;
-        report.requests = requests;
-        unreached = skipped;
-        report.missing = missing;
-        report.evaluated = evaluated.len();
-        evaluated
+        let collected = collect_outcomes(&driver, &pair, &runnable, now_ms)
+            .await
+            .map_err(|error| progress_context(&status, &runnable, now_ms, error))?;
+        report.requests = collected.requests;
+        unreached = collected.unreached;
+        report.missing = collected.missing;
+        report.evaluated = collected.evaluated.len();
+        collected.evaluated
     };
     let now_ms = super::store::now_ms()?;
     for attempt in &attempts {
@@ -2517,31 +2340,6 @@ pub async fn recover_outcomes(
             view,
             stop,
         });
-    }
-    Ok(report)
-}
-
-fn commit_batch(
-    recorder: &mut OperationRecorder<'_>,
-    mut batch: Batch,
-) -> Result<RecoveryReport, WindowStoreError> {
-    if let Some((_, _, input)) = batch.inputs.last_mut() {
-        input.observation = batch.observation;
-    }
-    let report = RecoveryReport {
-        requests: batch.requests,
-        evaluated: batch.inputs.len(),
-        missing: batch.missing,
-        attempts: Vec::new(),
-    };
-    if batch.inputs.is_empty() {
-        if let Some(observation) = batch.observation {
-            recorder.record_observation(observation)?;
-        }
-    } else {
-        for (id, index, input) in batch.inputs {
-            recorder.record_evidence(id, index, &input)?;
-        }
     }
     Ok(report)
 }
@@ -4282,7 +4080,7 @@ mod tests {
     fn stored_attempt(fx: &mut Fx) -> RecoveryAttempt {
         unknown_named(fx, 1);
         OperationStatus::new(&fx.store, &fx.profile)
-            .recovery_snapshot(None)
+            .outcome_snapshot(None)
             .unwrap()
             .remove(0)
     }
@@ -4298,18 +4096,44 @@ mod tests {
         .unwrap()
     }
 
-    fn selected_batch(attempts: &[RecoveryAttempt]) -> Batch {
-        Batch {
-            inputs: attempts
-                .iter()
-                .map(|attempt| {
-                    let mut input = release_input(attempt);
-                    input.expected_attempt = Some(attempt.clone());
-                    (attempt.operation_id, attempt.attempt_index, input)
-                })
-                .collect(),
-            ..Batch::default()
-        }
+    /// Commits a release with its owned running run for each selected
+    /// attempt through the driver's writer, and maps a refusal through the
+    /// driver's verified-progress context.
+    fn driver_releases(
+        recorder: &mut OperationRecorder<'_>,
+        status: &OperationStatus<'_>,
+        attempts: &[RecoveryAttempt],
+    ) -> Result<(), RecoveryError> {
+        attempts
+            .iter()
+            .try_for_each(|attempt| {
+                let run = WireRecoveryRun {
+                    version: 1,
+                    exposure: recovery_exposure_digest(
+                        attempt.operation_id,
+                        attempt.attempt_index,
+                        &attempt.exposure,
+                    )?,
+                    phase: RecoveryRunPhase::Running,
+                    run_started_ms: NOW,
+                    run_deadline_ms: recovery_deadline(NOW)?,
+                    automatic_runs: 1,
+                    consecutive_stops: 0,
+                    stop: None,
+                };
+                recorder.write_recovery_run(attempt, &release_input(attempt), &run, None)
+            })
+            .map_err(|error| progress_context(status, attempts, NOW, error.into()))
+    }
+
+    /// The selected attempts that hold no matched release yet.
+    fn held(status: &OperationStatus<'_>) -> Vec<RecoveryAttempt> {
+        status
+            .outcome_snapshot(None)
+            .unwrap()
+            .into_iter()
+            .filter(|attempt| matched_sequence_release(attempt).is_none())
+            .collect()
     }
 
     #[test]
@@ -4324,7 +4148,7 @@ mod tests {
         let store = fx.store.clone();
         let profile = fx.profile.clone();
         let status = OperationStatus::new(&store, &profile);
-        let attempts = status.recovery_snapshot(None).unwrap();
+        let attempts = status.outcome_snapshot(None).unwrap();
         assert_eq!(attempts.len(), 2);
         // A separate recorder commits from the same initial view.
         let other_store = PersistedWindowStore::at_path(store.path().to_owned());
@@ -4342,13 +4166,7 @@ mod tests {
             )
             .unwrap();
         let other_record = fx.record(attempts[1].operation_id);
-        let error = commit_sequence_batch(
-            &mut fx.recorder(),
-            selected_batch(&attempts),
-            &status,
-            &attempts,
-        )
-        .unwrap_err();
+        let error = driver_releases(&mut fx.recorder(), &status, &attempts).unwrap_err();
         assert_eq!(error.code(), "submission.record_unavailable");
         assert!(
             error
@@ -4393,9 +4211,9 @@ mod tests {
             );
         }
         fx.clock.set(NOW);
-        let fresh = status.recovery_snapshot(None).unwrap();
+        let fresh = held(&status);
         assert_eq!(fresh.len(), 1);
-        commit_sequence_batch(&mut fx.recorder(), selected_batch(&fresh), &status, &fresh).unwrap();
+        driver_releases(&mut fx.recorder(), &status, &fresh).unwrap();
         assert_eq!(
             sequence_failure_detail(&status, &attempts),
             "selected sequences: 2 released, 0 held, 0 unavailable"
@@ -4405,13 +4223,7 @@ mod tests {
             release
         );
         let before = (std::fs::read(store.path()).unwrap(), fx.sink.entries.len());
-        let stale = commit_sequence_batch(
-            &mut fx.recorder(),
-            selected_batch(&attempts),
-            &status,
-            &attempts,
-        )
-        .unwrap_err();
+        let stale = driver_releases(&mut fx.recorder(), &status, &attempts).unwrap_err();
         assert!(
             stale
                 .to_string()
@@ -4450,10 +4262,7 @@ mod tests {
         let mut bytes = std::fs::read(fx.store.path()).unwrap();
         bytes[0] ^= 1;
         std::fs::write(fx.store.path(), &bytes).unwrap();
-        let read_code = status
-            .recovery_snapshot(None)
-            .unwrap_err()
-            .submission_code();
+        let read_code = status.outcome_snapshot(None).unwrap_err().submission_code();
         let detail = sequence_failure_detail(&status, &[attempt]);
         assert_eq!(
             detail,
@@ -4486,9 +4295,8 @@ mod tests {
             let attempts = [attempt];
             let error = {
                 let _armed = arm_accounting_fault(seam);
-                commit_sequence_batch(
+                driver_releases(
                     &mut fx.recorder(),
-                    selected_batch(&attempts),
                     &OperationStatus::new(&store, &profile),
                     &attempts,
                 )
@@ -4525,9 +4333,8 @@ mod tests {
             let reopened = PersistedWindowStore::at_path(store.path().to_owned());
             let status = OperationStatus::new(&reopened, &profile);
             assert_eq!(sequence_failure_detail(&status, &attempts), expected);
-            let fresh = status.recovery_snapshot(None).unwrap();
-            commit_sequence_batch(&mut fx.recorder(), selected_batch(&fresh), &status, &fresh)
-                .unwrap();
+            let fresh = held(&status);
+            driver_releases(&mut fx.recorder(), &status, &fresh).unwrap();
             assert_eq!(
                 sequence_failure_detail(&status, &attempts),
                 "selected sequences: 1 released, 0 held, 0 unavailable"
@@ -4538,21 +4345,26 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn recovery_entry_reports_progress_after_counter_commit() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use super::super::operations::tests::unknown_with;
-        use super::super::store::{COMMIT_FAULT_AFTER_COUNTER, arm_accounting_fault};
+        use super::super::store::COMMIT_FAULT_AFTER_COUNTER;
         use crate::submission_flow::{ReconcilePass, finish_reconciliation};
 
         let mut fx = Fx::new();
         let id = unknown_with(&mut fx, 1, NOW / 1_000 - 10, vec![]).id();
+        bind_source(&mut fx);
         let primary = endpoint(7, NOW / 1_000).await;
         let oracle = endpoint(8, NOW / 1_000).await;
+        serve_absence(&primary, 7).await;
+        serve_absence(&oracle, 8).await;
         let primary_client = StellarRpcClient::new(&primary.uri()).unwrap();
         let oracle_client = StellarRpcClient::new(&oracle.uri()).unwrap();
         let writer = crate::submission_flow::recovery::tests::writer_at(&fx.profile.audit_log_path);
         let error = {
-            let _armed = arm_accounting_fault(COMMIT_FAULT_AFTER_COUNTER);
+            // The fault hits the release write, after the reservation commits.
+            let _armed = super::driver_tests::arm_write_fault(2, COMMIT_FAULT_AFTER_COUNTER);
             recover_sequences(
                 &fx.store,
                 &fx.profile,
@@ -4600,22 +4412,26 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn recovery_dispatch_store_context_precedes_repair_refusal() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use super::super::operations::tests::{Checked, historical_without, unknown_with};
-        use super::super::store::{COMMIT_FAULT_AFTER_COUNTER, arm_accounting_fault};
+        use super::super::store::COMMIT_FAULT_AFTER_COUNTER;
 
         let mut fx = Fx::new();
         unknown_with(&mut fx, 1, NOW / 1_000 - 10, vec![]);
+        bind_source(&mut fx);
         let (_, refused) = historical_without(&mut fx, 2, Checked::NotIncluded, "source");
         let primary = endpoint(7, NOW / 1_000).await;
+        serve_absence(&primary, 7).await;
         let client = StellarRpcClient::new(&primary.uri()).unwrap();
         let writer = crate::submission_flow::recovery::tests::writer_at(&fx.profile.audit_log_path);
-        let home = tempfile::tempdir().unwrap();
-        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let receipt_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(receipt_sandbox.path());
         let receipts = crate::submission_flow::open_receipts("ops").unwrap();
         let pass = {
-            let _armed = arm_accounting_fault(COMMIT_FAULT_AFTER_COUNTER);
+            // The fault hits the release write, after the reservation commits.
+            let _armed = super::driver_tests::arm_write_fault(2, COMMIT_FAULT_AFTER_COUNTER);
             crate::submission_flow::reconcile_pass(
                 &fx.profile,
                 &fx.store,
@@ -4653,7 +4469,7 @@ mod tests {
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let (mut fx, id, _) = unmatched_release_fixture();
         let attempts = OperationStatus::new(&fx.store, &fx.profile)
-            .recovery_snapshot(None)
+            .outcome_snapshot(None)
             .unwrap();
         assert_eq!(
             sequence_failure_detail(&OperationStatus::new(&fx.store, &fx.profile), &attempts),
@@ -4692,7 +4508,7 @@ mod tests {
             .record_evidence(original.operation_id, 1, &diagnostic)
             .unwrap();
         let original = OperationStatus::new(&fx.store, &fx.profile)
-            .recovery_snapshot(None)
+            .outcome_snapshot(None)
             .unwrap()
             .remove(0);
         assert!(original.recovery.diagnostic.as_ref().unwrap().len() < 1_000);
@@ -4718,7 +4534,7 @@ mod tests {
         assert_eq!(std::fs::read(fx.store.path()).unwrap(), after);
         assert_eq!(fx.sink.entries.len(), rows);
         let fresh = OperationStatus::new(&fx.store, &fx.profile)
-            .recovery_snapshot(None)
+            .outcome_snapshot(None)
             .unwrap()
             .remove(0);
         assert_eq!(fresh.recovery.disagreements, 1);
@@ -4760,16 +4576,38 @@ mod tests {
         let mut input = pending(&attempt, NOW, "evidence_pending", "expiry_boundary_pending");
         input.observation = Some(old);
         input.expected_attempt = Some(attempt.clone());
+        fx.recorder()
+            .record_evidence(attempt.operation_id, 1, &input)
+            .unwrap();
+        assert_eq!(fx.wire().last_observation, Some(old));
+        let attempt = OperationStatus::new(&fx.store, &fx.profile)
+            .outcome_snapshot(None)
+            .unwrap()
+            .remove(0);
         fx.sink.entries.clear();
-        let batch = Batch {
-            inputs: vec![(attempt.operation_id, 1, input)],
-            observation: Some(latest),
-            ..Batch::default()
+        // The reached attempt's reservation carries the prefix's latest observation.
+        let run = WireRecoveryRun {
+            version: 1,
+            exposure: recovery_exposure_digest(
+                attempt.operation_id,
+                attempt.attempt_index,
+                &attempt.exposure,
+            )
+            .unwrap(),
+            phase: RecoveryRunPhase::Running,
+            run_started_ms: NOW,
+            run_deadline_ms: recovery_deadline(NOW).unwrap(),
+            automatic_runs: 1,
+            consecutive_stops: 0,
+            stop: None,
         };
-        assert_eq!(
-            commit_batch(&mut fx.recorder(), batch).unwrap().evaluated,
-            1
-        );
+        let w1 = EvidenceInput {
+            observation: Some(latest),
+            ..EvidenceInput::default()
+        };
+        fx.recorder()
+            .write_recovery_run(&attempt, &w1, &run, None)
+            .unwrap();
         assert_eq!(fx.wire().last_observation, Some(latest));
         assert!(fx.sink.entries.is_empty());
     }
@@ -4872,7 +4710,7 @@ mod tests {
         assert!(fx.sink.entries.is_empty());
         assert_eq!(fx.wire().last_observation, Some(observation));
         let snapshot = OperationStatus::new(&fx.store, &fx.profile)
-            .recovery_snapshot(None)
+            .outcome_snapshot(None)
             .unwrap();
         assert_eq!(snapshot[0].recovery, input.recovery.unwrap());
     }
@@ -4920,7 +4758,7 @@ mod tests {
                 .unwrap();
             let reopened = PersistedWindowStore::at_path(fx.store.path().to_owned());
             let snapshot = OperationStatus::new(&reopened, &fx.profile)
-                .recovery_snapshot(None)
+                .outcome_snapshot(None)
                 .unwrap();
             assert_eq!(snapshot[0].recovery.last_outcome.as_deref(), Some(class));
             assert_eq!(snapshot[0].recovery.last_pass_at_ms, Some(now));
@@ -4931,7 +4769,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn recovery_pass_respects_call_budget_and_deadline() {
         let mut budget = Budget::new();
-        for _ in 0..9 {
+        for _ in 0..4 {
             budget.read(true, async { Ok::<_, ()>(()) }).await.unwrap();
         }
         assert_eq!(
@@ -4948,7 +4786,7 @@ mod tests {
         assert_eq!(
             budget.used,
             RecoveryRequests {
-                shared: 9,
+                shared: 4,
                 attempt: 24
             }
         );
@@ -5282,17 +5120,32 @@ mod tests {
         assert_eq!(pass!(fx).await.unwrap(), RecoveryReport::default());
         assert!(methods(&primary).await.is_empty() && methods(&oracle).await.is_empty());
         assert!(!fx.store.path().exists());
-        // An evaluated pass persists the primary observation.
-        unknown_named(&mut fx, 1);
+        // A reached attempt's reservation persists the primary observation.
+        unknown_with(&mut fx, 1, NOW / 1_000 - 10, vec![]);
         assert_eq!(pass!(fx).await.unwrap().evaluated, 1);
         let stored = fx
             .wire()
             .last_observation
             .expect("the pass observes the primary");
         assert_eq!(stored.ledger, 7);
-        // A failure before any observation keeps the stored value.
-        primary.reset().await;
-        pass!(fx).await.unwrap();
+        // A prefix failure reaches no attempt and writes nothing, even after
+        // the primary health read succeeds.
+        fx.clock.set(NOW + 30_000);
+        let before = std::fs::read(fx.store.path()).unwrap();
+        oracle.reset().await;
+        mount(
+            &oracle,
+            "getNetwork",
+            stellar_agent_test_support::signed_envelope::get_network_result(
+                stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE,
+            ),
+        )
+        .await;
+        let report = pass!(fx).await.unwrap();
+        assert_eq!(report.evaluated, 0);
+        assert_eq!(report.requests.attempt, 0);
+        assert_eq!(rpc_request_count(&primary, "getHealth").await, 2);
+        assert_eq!(std::fs::read(fx.store.path()).unwrap(), before);
         assert_eq!(fx.wire().last_observation, Some(stored));
     }
 
@@ -5425,7 +5278,7 @@ mod tests {
         let fx = crate::mainnet::fixtures::LedgerFixture::new("recovery-idle", NOW);
         assert!(
             OperationStatus::new(&fx.window, &fx.profile)
-                .recovery_snapshot(None)
+                .outcome_snapshot(None)
                 .unwrap()
                 .is_empty()
         );
@@ -5645,10 +5498,11 @@ mod tests {
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
-        unknown_named(&mut fx, 1);
-        unknown_named(&mut fx, 2);
+        unknown_with(&mut fx, 1, NOW / 1_000 - 10, vec![]);
+        bind_source(&mut fx);
+        unknown_with(&mut fx, 2, NOW / 1_000 - 10, vec![]);
         let snapshots = OperationStatus::new(&fx.store, &fx.profile)
-            .recovery_snapshot(None)
+            .outcome_snapshot(None)
             .unwrap();
         let untouched = fx.record(snapshots[1].operation_id);
         let ExposureIdentity::Classic { tx_hash, .. } = snapshots[0].exposure else {
@@ -5656,12 +5510,14 @@ mod tests {
         };
         let primary = endpoint(7, NOW / 1_000).await;
         let oracle = endpoint(8, NOW / 1_000).await;
-        mount(&primary, "getTransaction", json!({"status":"NOT_FOUND","latestLedger":7,"oldestLedger":1,"latestLedgerCloseTime":(NOW/1000).to_string(),"oldestLedgerCloseTime":"1"})).await;
+        serve_absence(&primary, 7).await;
+        serve_absence(&oracle, 8).await;
         let primary_client = StellarRpcClient::new(&primary.uri()).unwrap();
         let oracle_client = StellarRpcClient::new(&oracle.uri()).unwrap();
         let (writer, _) = crate::mainnet::fixtures::keyed_writer(&fx.profile.audit_log_path);
-        let home = tempfile::tempdir().unwrap();
-        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let receipt_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let home = receipt_sandbox.path();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home);
         let result = crate::submission_flow::transaction_status(
             crate::submission_flow::StatusRequest {
                 profile: &fx.profile,
@@ -5671,7 +5527,7 @@ mod tests {
                 client: &primary_client,
                 oracle: Some(&oracle_client),
             },
-            || Ok(home.path().join("approvals")),
+            || Ok(home.join("approvals")),
             || Ok(Arc::clone(&writer)),
         )
         .await
@@ -5694,6 +5550,299 @@ mod tests {
         );
         assert_eq!(rpc_request_count(&primary, "getLedgers").await, 1);
         assert_eq!(rpc_request_count(&oracle, "getLedgers").await, 1);
+    }
+
+    /// Records one owed accounting expiry, so the drain needs the audit
+    /// writer, and returns its decision id.
+    #[cfg(feature = "mainnet-write")]
+    fn owe_one_accounting_expiry(fx: &Fx) -> String {
+        let expired = super::super::SubmissionHold {
+            destinations: Default::default(),
+            chain_scope: super::super::ChainScope::for_chain(fx.profile.chain_id),
+            id: "e1".repeat(32),
+            tx_hash: "e2".repeat(32),
+            source: crate::mainnet::fixtures::account([1; 32]),
+            sequence: 9,
+            max_time: NOW / 1_000 - 120,
+            pending_since_ms: NOW - 200_000,
+            submission_ledger: 1,
+            submission_anchor: None,
+            operator_required: false,
+        };
+        fx.store
+            .record_pending(
+                &fx.profile,
+                &[stellar_agent_core::policy::v1::criteria::state_store::WindowEntry::new(
+                    stellar_agent_core::policy::v1::criteria::state_store::StateKey::new(
+                        "ops", 1, "native", 60,
+                    ),
+                    NOW - 200_000,
+                    300,
+                    stellar_agent_core::policy::v1::criteria::state_store::WindowLimit::Amount {
+                        asset: "native".to_owned(),
+                        window: "1d".to_owned(),
+                        max_stroops: 1_000_000,
+                    },
+                )],
+                &expired,
+            )
+            .unwrap();
+        fx.store
+            .expire_accounting(&fx.profile, None, &expired, NOW)
+            .unwrap();
+        let owed = fx.store.owed_accounting_expiries(&fx.profile).unwrap();
+        let [decision_id] = owed.unacknowledged.as_slice() else {
+            panic!("one owed decision required: {owed:?}")
+        };
+        decision_id.as_str().to_owned()
+    }
+
+    /// Targeted status acquires one writer after reconciliation, runs the
+    /// driver once, and makes its diagnostic lookup outside recovery. A
+    /// failed lookup returns `ChainQueryFailed` while the committed recovery
+    /// result stays durable.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn recovery_status_shares_one_writer_and_keeps_committed_recovery() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let mut fx = Fx::new();
+        let id = unknown_with(&mut fx, 1, NOW / 1_000 - 10, vec![]).id();
+        bind_source(&mut fx);
+        // The drain owes one row, so it needs the shared writer too.
+        let decision_id = owe_one_accounting_expiry(&fx);
+        let snapshot = OperationStatus::new(&fx.store, &fx.profile)
+            .outcome_snapshot(None)
+            .unwrap();
+        let ExposureIdentity::Classic { tx_hash, .. } = snapshot[0].exposure else {
+            panic!("classic attempt required")
+        };
+        let primary = endpoint(7, NOW / 1_000).await;
+        let oracle = endpoint(8, NOW / 1_000).await;
+        serve_absence(&oracle, 8).await;
+        let lookups = std::sync::atomic::AtomicUsize::new(0);
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method":"getTransaction"})))
+            .respond_with(move |request: &wiremock::Request| {
+                if lookups.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    wiremock::Respond::respond(
+                        &EchoIdResponder::new(json!({"status":"NOT_FOUND", "oldestLedger":1,
+                            "latestLedger":7, "oldestLedgerCloseTime":1,
+                            "latestLedgerCloseTime":NOW/1000})),
+                        request,
+                    )
+                } else {
+                    wiremock::ResponseTemplate::new(500)
+                }
+            })
+            .with_priority(1)
+            .mount(&primary)
+            .await;
+        serve_absence(&primary, 7).await;
+        let primary_client = StellarRpcClient::new(&primary.uri()).unwrap();
+        let oracle_client = StellarRpcClient::new(&oracle.uri()).unwrap();
+        let (writer, _) = crate::mainnet::fixtures::keyed_writer(&fx.profile.audit_log_path);
+        let receipt_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let home = receipt_sandbox.path();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home);
+        let calls = std::cell::Cell::new(0);
+        let result = crate::submission_flow::transaction_status(
+            crate::submission_flow::StatusRequest {
+                profile: &fx.profile,
+                profile_name: "ops",
+                tx_hash: &stellar_agent_core::hex::encode(&tx_hash),
+                window: &fx.store,
+                client: &primary_client,
+                oracle: Some(&oracle_client),
+            },
+            || Ok(home.join("approvals")),
+            || {
+                calls.set(calls.get() + 1);
+                Ok(Arc::clone(&writer))
+            },
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(crate::submission_flow::StatusFailure::ChainQueryFailed(_))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(calls.get(), 1);
+        // The drain delivered its owed row through the same writer.
+        assert!(
+            std::fs::read_to_string(&fx.profile.audit_log_path)
+                .unwrap()
+                .contains(decision_id.as_str())
+        );
+        assert!(
+            fx.store
+                .owed_accounting_expiries(&fx.profile)
+                .unwrap()
+                .unacknowledged
+                .is_empty()
+        );
+        // Recovery's two hashes, ledgers and accounts, then one diagnostic lookup.
+        assert_eq!(rpc_request_count(&primary, "getTransaction").await, 2);
+        assert_eq!(rpc_request_count(&oracle, "getTransaction").await, 1);
+        assert_eq!(rpc_request_count(&primary, "getLedgers").await, 1);
+        let record = fx.record(id);
+        assert_eq!(record.state, OperationState::NotIncluded);
+        assert!(record.attempts[0].sequence_released.is_some());
+        assert_eq!(
+            OperationStatus::new(&fx.store, &fx.profile)
+                .recovery_run_view(id, 1, NOW)
+                .unwrap()
+                .unwrap()
+                .state,
+            RecoveryRunState::Resolved
+        );
+    }
+
+    /// A release write refusal on the status path logs the root code and the
+    /// verified progress, and the status lookup still answers.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn recovery_status_logs_a_driver_refusal_and_answers() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use super::super::store::COMMIT_FAULT_AFTER_COUNTER;
+        let mut fx = Fx::new();
+        let id = unknown_with(&mut fx, 1, NOW / 1_000 - 10, vec![]).id();
+        bind_source(&mut fx);
+        let snapshot = OperationStatus::new(&fx.store, &fx.profile)
+            .outcome_snapshot(None)
+            .unwrap();
+        let ExposureIdentity::Classic { tx_hash, .. } = snapshot[0].exposure else {
+            panic!("classic attempt required")
+        };
+        let primary = endpoint(7, NOW / 1_000).await;
+        let oracle = endpoint(8, NOW / 1_000).await;
+        serve_absence(&primary, 7).await;
+        serve_absence(&oracle, 8).await;
+        let primary_client = StellarRpcClient::new(&primary.uri()).unwrap();
+        let oracle_client = StellarRpcClient::new(&oracle.uri()).unwrap();
+        let (writer, _) = crate::mainnet::fixtures::keyed_writer(&fx.profile.audit_log_path);
+        let receipt_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let home = receipt_sandbox.path();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home);
+        let (warnings, guard) = stellar_agent_test_support::WarningCapture::capture(None);
+        let result = {
+            let _armed = super::driver_tests::arm_write_fault(2, COMMIT_FAULT_AFTER_COUNTER);
+            crate::submission_flow::transaction_status(
+                crate::submission_flow::StatusRequest {
+                    profile: &fx.profile,
+                    profile_name: "ops",
+                    tx_hash: &stellar_agent_core::hex::encode(&tx_hash),
+                    window: &fx.store,
+                    client: &primary_client,
+                    oracle: Some(&oracle_client),
+                },
+                || Ok(home.join("approvals")),
+                || Ok(Arc::clone(&writer)),
+            )
+            .await
+        };
+        drop(guard);
+        assert_eq!(result.unwrap().chain_status, "NOT_FOUND");
+        let seen = warnings.seen();
+        let logged = seen
+            .iter()
+            .find(|fields| {
+                fields.get("message").map(String::as_str)
+                    == Some(
+                        "transaction status: recovery refused; completed work remains committed",
+                    )
+            })
+            .unwrap_or_else(|| panic!("the status warning is logged: {seen:?}"));
+        assert!(
+            logged
+                .get("code")
+                .is_some_and(|code| code.contains("submission.record_unavailable")),
+            "{logged:?}"
+        );
+        assert!(
+            logged.get("error").is_some_and(|error| {
+                error.contains("selected sequences: 1 released, 0 held, 0 unavailable")
+            }),
+            "{logged:?}"
+        );
+        assert!(fx.record(id).attempts[0].sequence_released.is_some());
+    }
+
+    /// A refused writer acquisition is cached: no later status step acquires
+    /// again, recovery sends nothing, and the status lookup still answers.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn recovery_status_caches_a_writer_refusal() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let mut fx = Fx::new();
+        let id = unknown_with(&mut fx, 1, NOW / 1_000 - 10, vec![]).id();
+        bind_source(&mut fx);
+        let snapshot = OperationStatus::new(&fx.store, &fx.profile)
+            .outcome_snapshot(None)
+            .unwrap();
+        let ExposureIdentity::Classic { tx_hash, .. } = snapshot[0].exposure else {
+            panic!("classic attempt required")
+        };
+        let primary = endpoint(7, NOW / 1_000).await;
+        let oracle = endpoint(8, NOW / 1_000).await;
+        serve_absence(&primary, 7).await;
+        serve_absence(&oracle, 8).await;
+        let primary_client = StellarRpcClient::new(&primary.uri()).unwrap();
+        let oracle_client = StellarRpcClient::new(&oracle.uri()).unwrap();
+        let receipt_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let home = receipt_sandbox.path();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home);
+        // The drain owes one row, so it asks for the writer and gets the
+        // cached refusal.
+        let decision_id = owe_one_accounting_expiry(&fx);
+        let before = std::fs::read(fx.store.path()).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let result = crate::submission_flow::transaction_status(
+            crate::submission_flow::StatusRequest {
+                profile: &fx.profile,
+                profile_name: "ops",
+                tx_hash: &stellar_agent_core::hex::encode(&tx_hash),
+                window: &fx.store,
+                client: &primary_client,
+                oracle: Some(&oracle_client),
+            },
+            || Ok(home.join("approvals")),
+            || {
+                calls.set(calls.get() + 1);
+                Err(WalletError::Submission(
+                    stellar_agent_core::error::SubmissionError::RecordUnavailable {
+                        detail: "writer refused".to_owned(),
+                    },
+                ))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.chain_status, "NOT_FOUND");
+        assert_eq!(calls.get(), 1);
+        assert_eq!(rpc_request_count(&oracle, "getTransaction").await, 0);
+        assert_eq!(std::fs::read(fx.store.path()).unwrap(), before);
+        assert!(fx.record(id).attempts[0].recovery_run.is_none());
+        assert_eq!(
+            fx.store
+                .owed_accounting_expiries(&fx.profile)
+                .unwrap()
+                .unacknowledged
+                .iter()
+                .map(|owed| owed.as_str().to_owned())
+                .collect::<Vec<_>>(),
+            [decision_id]
+        );
     }
 
     #[tokio::test]
@@ -5721,10 +5870,12 @@ mod tests {
                 panic!("classic attempt required");
             };
             *tx_hash = hash;
+            // The untimed attempt is due at its send-by time.
+            record.attempts[0].send_by_ms = NOW;
         });
         assert_eq!(
             OperationStatus::new(&fx.store, &fx.profile)
-                .recovery_snapshot(Some(&hash))
+                .outcome_snapshot(Some(&hash))
                 .unwrap()
                 .len(),
             1
@@ -5837,10 +5988,11 @@ mod tests {
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
-        let attempt = stored_attempt(&mut fx);
+        let id = unknown_with(&mut fx, 1, NOW / 1_000 - 10, vec![]).id();
+        bind_source(&mut fx);
         fx.recorder()
             .record_evidence(
-                attempt.operation_id,
+                id,
                 1,
                 &EvidenceInput {
                     recovery: Some(RecoveryUpdate {
@@ -5851,9 +6003,12 @@ mod tests {
                 },
             )
             .unwrap();
-        let before = serde_json::to_value(fx.record(attempt.operation_id)).unwrap();
+        let before = fx.record(id);
+        let authorizations = serde_json::to_value(&fx.wire().authorizations).unwrap();
         let primary = endpoint(7, NOW / 1_000).await;
         let oracle = endpoint(8, NOW / 1_000).await;
+        serve_absence(&primary, 7).await;
+        serve_absence(&oracle, 8).await;
         Mock::given(method("POST"))
             .and(body_partial_json(
                 json!({"method":"getLedgers", "params":{"pagination":{"limit":1}}}),
@@ -5880,17 +6035,38 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(report.evaluated, 0);
+        // The slow ledger read spends one reservation and stores a durable
+        // Deadline stop with backoff at the absolute call deadline.
+        assert_eq!(report.evaluated, 1);
         assert_eq!(
             report.requests,
             RecoveryRequests {
-                attempt: 1,
+                attempt: 3,
                 shared: 4
             }
         );
+        let stop = report.attempts[0].stop.clone().unwrap();
         assert_eq!(
-            serde_json::to_value(fx.record(attempt.operation_id)).unwrap(),
-            before
+            (stop.reason, stop.stage, stop.roles, stop.class),
+            (
+                RecoveryStopReason::Deadline,
+                RecoveryStage::Target,
+                vec![RecoveryRole::Primary],
+                RecoveryClass::Automatic
+            )
+        );
+        assert_eq!(stop.earliest_retry_ms, Some(NOW + 30_000));
+        let after = fx.record(id);
+        assert_eq!(after.state, before.state);
+        assert!(after.attempts[0].sequence_released.is_none());
+        assert!(after.attempts[0].decision.is_none());
+        assert_eq!(
+            after.attempts[0].recovery.as_ref().unwrap().disagreements,
+            9
+        );
+        assert_eq!(
+            serde_json::to_value(&fx.wire().authorizations).unwrap(),
+            authorizations
         );
     }
 
@@ -5938,7 +6114,7 @@ mod tests {
             let mut fx = Fx::new();
             let id = unknown_with(&mut fx, 1, NOW / 1000 - 10, vec![]).id();
             let selected = OperationStatus::new(&fx.store, &fx.profile)
-                .recovery_snapshot(None)
+                .outcome_snapshot(None)
                 .unwrap()
                 .remove(0);
             let mut run = json!({"version":1,
@@ -5966,8 +6142,17 @@ mod tests {
                         Some(serde_json::from_str(&raw).unwrap())
                 });
             }
+            bind_source(&mut fx);
+            // The stopped run is due at its automatic retry time.
+            let driven = matches!(shape, "absent" | "stopped");
+            if shape == "stopped" {
+                fx.clock.set(NOW + 30_000);
+            }
+            let before = std::fs::read(fx.store.path()).unwrap();
             let primary = endpoint(7, NOW / 1000).await;
             let oracle = endpoint(8, NOW / 1000).await;
+            serve_absence(&primary, 7).await;
+            serve_absence(&oracle, 8).await;
             let left = StellarRpcClient::new(&primary.uri()).unwrap();
             let right = StellarRpcClient::new(&oracle.uri()).unwrap();
             let writer =
@@ -5981,39 +6166,57 @@ mod tests {
             )
             .await
             .unwrap();
-            assert_eq!(
-                report.requests,
-                RecoveryRequests {
-                    attempt: 2,
-                    shared: 4
-                },
-                "{shape}"
-            );
-            assert_eq!(report.evaluated, 1, "{shape}");
-            assert!(
-                fx.record(id).attempts[0].sequence_released.is_some(),
-                "{shape}"
-            );
-            let after = fx.record(id).attempts[0].recovery_run.clone();
-            if shape == "absent" {
-                assert!(after.is_none());
-            } else {
+            if driven {
                 assert_eq!(
-                    serde_json::to_string(&after.unwrap()).unwrap(),
+                    report.requests,
+                    RecoveryRequests {
+                        attempt: 6,
+                        shared: 4
+                    },
+                    "{shape}"
+                );
+                assert_eq!(report.evaluated, 1, "{shape}");
+                assert!(
+                    fx.record(id).attempts[0].sequence_released.is_some(),
+                    "{shape}"
+                );
+                let after = fx.record(id).attempts[0].recovery_run.clone().unwrap();
+                let after = serde_json::to_value(after).unwrap();
+                assert_eq!(
+                    after["automatic_runs"],
+                    if shape == "absent" { 1 } else { 2 },
+                    "{shape}"
+                );
+                for server in [&primary, &oracle] {
+                    assert_eq!(
+                        methods(server).await,
+                        [
+                            "getNetwork",
+                            "getHealth",
+                            "getTransaction",
+                            "getLedgers",
+                            "getLedgerEntries"
+                        ],
+                        "{shape}"
+                    );
+                }
+            } else {
+                // Opaque, live running and exhausted runs are not runnable.
+                assert_eq!(report.requests, RecoveryRequests::default(), "{shape}");
+                assert_eq!(report.evaluated, 0, "{shape}");
+                assert!(
+                    fx.record(id).attempts[0].sequence_released.is_none(),
+                    "{shape}"
+                );
+                assert_eq!(
+                    serde_json::to_string(&fx.record(id).attempts[0].recovery_run.clone()).unwrap(),
                     raw,
                     "{shape}"
                 );
+                assert_eq!(std::fs::read(fx.store.path()).unwrap(), before, "{shape}");
+                assert!(methods(&primary).await.is_empty(), "{shape}");
+                assert!(methods(&oracle).await.is_empty(), "{shape}");
             }
-            assert_eq!(
-                methods(&primary).await,
-                ["getNetwork", "getHealth", "getLedgers"],
-                "{shape}"
-            );
-            assert_eq!(
-                methods(&oracle).await,
-                ["getNetwork", "getHealth", "getLedgers"],
-                "{shape}"
-            );
         }
     }
 
@@ -6123,15 +6326,18 @@ mod tests {
             })
             .mount(&oracle)
             .await;
-        let batch = collect(&pair, &[attempt(10)], NOW).await.unwrap();
+        let (evaluations, _, requests, _) = public_outcomes_fixture(&pair, &[attempt(10)], NOW)
+            .await
+            .unwrap();
         assert_eq!(
-            batch.requests,
+            requests,
             RecoveryRequests {
                 attempt: 0,
                 shared: 2
             }
         );
-        assert!(batch.inputs[0].2.sequence_released.is_none());
+        // A failed identity read reserves and releases nothing.
+        assert!(evaluations.is_empty());
         assert_eq!(rpc_request_count(&oracle, "getNetwork").await, 1);
     }
 
@@ -6265,19 +6471,24 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn recovery_unadmissible_health_reports_lagging() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = endpoint(7, NOW / 1000 - 61).await;
         let client = StellarRpcClient::new(&server.uri()).unwrap();
-        let batch = collect(
+        let (evaluations, _, _, missing) = public_outcomes_fixture(
             &EndpointPair::from_clients(&client, Some(&client)),
             &[attempt(10)],
             NOW,
         )
         .await
         .unwrap();
-        assert!(batch.inputs[0].2.sequence_released.is_none());
+        // The prefix refusal reserves and releases nothing.
+        assert!(evaluations.is_empty());
         assert_eq!(
-            batch.missing,
+            missing,
             Some(RecoveryFailure {
                 reason: RecoveryReason::Lagging,
                 endpoint: RecoveryEndpoint::Primary,
@@ -6289,248 +6500,6 @@ mod tests {
             methods(&server).await,
             ["getNetwork", "getNetwork", "getHealth"]
         );
-    }
-
-    #[tokio::test]
-    async fn recovery_tip_sequence_releases_in_one_pass() {
-        for oracle_tip in [7, 8] {
-            {
-                let primary = endpoint(7, 140).await;
-                let oracle = endpoint(oracle_tip, u64::from(oracle_tip) * 20).await;
-                for (server, tip) in [(&primary, 7), (&oracle, oracle_tip)] {
-                    Mock::given(method("POST"))
-                        .and(body_partial_json(json!({"method":"getLedgers"})))
-                        .respond_with(move |request: &wiremock::Request| {
-                            let body: serde_json::Value =
-                                serde_json::from_slice(&request.body).unwrap();
-                            let start =
-                                u32::try_from(body["params"]["startLedger"].as_u64().unwrap())
-                                    .unwrap();
-                            wiremock::Respond::respond(
-                                &EchoIdResponder::new(page_json(
-                                    start,
-                                    1,
-                                    tip,
-                                    u64::from(start) * 20,
-                                )),
-                                request,
-                            )
-                        })
-                        .with_priority(1)
-                        .mount(server)
-                        .await;
-                    mount(
-                        server,
-                        "getTransaction",
-                        json!({"status":"NOT_FOUND", "oldestLedger":1, "latestLedger":tip}),
-                    )
-                    .await;
-                }
-                let left = StellarRpcClient::new(&primary.uri()).unwrap();
-                let right = StellarRpcClient::new(&oracle.uri()).unwrap();
-                let pair = EndpointPair::from_clients(&left, Some(&right));
-                let mut attempt = attempt(100);
-                let mut passes = 0;
-                let mut requests = RecoveryRequests::default();
-                let release = loop {
-                    passes += 1;
-                    let mut batch = collect(&pair, &[attempt.clone()], 140_000).await.unwrap();
-                    assert!(batch.missing.is_none());
-                    let (input, used) = (batch.inputs.remove(0).2, batch.requests);
-                    requests.attempt += used.attempt;
-                    requests.shared += used.shared;
-                    if let Some(release) = input.sequence_released {
-                        break release;
-                    }
-                    assert!(passes < 7, "the expired sequence must release");
-                    attempt.recovery = input.recovery.unwrap();
-                };
-                assert_eq!(passes, 1);
-                assert_eq!(
-                    requests,
-                    RecoveryRequests {
-                        attempt: 2,
-                        shared: 4
-                    }
-                );
-                assert_eq!((release.primary_ledger, release.witness_ledger), (7, 7));
-                assert_eq!(release.min_close_time_ms, 140_000);
-                assert_eq!(requested_starts(&primary).await, [7]);
-                assert_eq!(requested_starts(&oracle).await, [7]);
-                assert_eq!(
-                    primary.received_requests().await.unwrap().len()
-                        + oracle.received_requests().await.unwrap().len(),
-                    6
-                );
-            }
-        }
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn recovery_target_coverage_waits_for_equal_tips() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
-        for primary_ahead in [true, false] {
-            for saved_upper in [false, true] {
-                {
-                    let mut fx = Fx::new();
-                    let id = super::super::operations::tests::unknown_with(
-                        &mut fx,
-                        1,
-                        NOW / 1000 - 1,
-                        vec![],
-                    )
-                    .id();
-                    let account =
-                        stellar_agent_test_support::signed_envelope::account_id_for_seed([1; 32]);
-                    fx.rewrite(|wire| {
-                        let auth = &mut wire.authorizations[0];
-                        let super::super::DomainBinding::Transaction { source, .. } =
-                            &mut auth.binding
-                        else {
-                            panic!("classic binding required");
-                        };
-                        *source = account.clone();
-                        auth.native_reservation = Some(super::super::NativeReservation {
-                            debit_stroops: 25,
-                            fee_stroops: 100,
-                        });
-                    });
-                    if saved_upper {
-                        fx.recorder()
-                            .record_evidence(
-                                id,
-                                1,
-                                &EvidenceInput {
-                                    recovery: Some(RecoveryUpdate {
-                                        primary_upper: primary_ahead.then_some(9),
-                                        witness_upper: (!primary_ahead).then_some(9),
-                                        ..RecoveryUpdate::default()
-                                    }),
-                                    ..EvidenceInput::default()
-                                },
-                            )
-                            .unwrap();
-                    }
-                    let held = OperationStatus::new(&fx.store, &fx.profile)
-                        .native_reserved_stroops(None)
-                        .unwrap();
-                    assert_eq!(held, 125);
-                    for pass in 0..3 {
-                        let tips = if pass > 0 {
-                            [9, 9]
-                        } else if primary_ahead {
-                            [9, 7]
-                        } else {
-                            [7, 9]
-                        };
-                        let primary = endpoint(tips[0], NOW / 1000).await;
-                        let oracle = endpoint(tips[1], NOW / 1000).await;
-                        for (index, server) in [&primary, &oracle].into_iter().enumerate() {
-                            let oldest = if !saved_upper && (index == 0) == primary_ahead {
-                                9
-                            } else {
-                                1
-                            };
-                            Mock::given(method("POST"))
-                                .and(body_partial_json(json!({"method":"getHealth"})))
-                                .respond_with(EchoIdResponder::new(json!({
-                                    "status":"healthy", "latestLedger":tips[index], "oldestLedger":oldest,
-                                    "ledgerRetentionWindow":tips[index] - oldest + 1,
-                                    "latestLedgerCloseTime":NOW/1000, "oldestLedgerCloseTime":1
-                                })))
-                                .with_priority(1).mount(server).await;
-                            mount(server, "getTransaction", json!({
-                                "status":"NOT_FOUND", "latestLedger":tips[index], "oldestLedger":1
-                            })).await;
-                        }
-                        let left = StellarRpcClient::new(&primary.uri()).unwrap();
-                        let right = StellarRpcClient::new(&oracle.uri()).unwrap();
-                        let pair = EndpointPair::from_clients(&left, Some(&right));
-                        let attempts = OperationStatus::new(&fx.store, &fx.profile)
-                            .outcome_snapshot(None)
-                            .unwrap();
-                        for (server, tip) in [(&primary, tips[0]), (&oracle, tips[1])] {
-                            let mut answer = stellar_agent_test_support::signed_envelope::ledger_entries_result_for(&[&account]);
-                            answer["latestLedger"] = json!(tip);
-                            mount(server, "getLedgerEntries", answer).await;
-                        }
-                        let batch = collect(&pair, &attempts, NOW).await.unwrap();
-                        if pass == 0 {
-                            assert!(batch.inputs[0].2.sequence_released.is_none());
-                            assert_eq!(
-                                batch.missing,
-                                Some(RecoveryFailure {
-                                    reason: RecoveryReason::CoverageRequired,
-                                    endpoint: if primary_ahead {
-                                        RecoveryEndpoint::Primary
-                                    } else {
-                                        RecoveryEndpoint::Oracle
-                                    },
-                                    method: RecoveryMethod::GetLedgers,
-                                    ledger: Some(7),
-                                })
-                            );
-                            assert_eq!(
-                                requested_starts(if primary_ahead { &primary } else { &oracle })
-                                    .await,
-                                Vec::<u64>::new()
-                            );
-                            assert_eq!(
-                                requested_starts(if primary_ahead { &oracle } else { &primary })
-                                    .await,
-                                [7]
-                            );
-                        } else {
-                            assert!(batch.missing.is_none());
-                            if pass == 1 {
-                                let release = batch.inputs[0].2.sequence_released.unwrap();
-                                assert_eq!(
-                                    (release.primary_ledger, release.witness_ledger),
-                                    (9, 9)
-                                );
-                                assert_eq!(requested_starts(&primary).await, [9]);
-                                assert_eq!(requested_starts(&oracle).await, [9]);
-                            }
-                        }
-                        let report = commit_batch(&mut fx.recorder(), batch).unwrap();
-                        if pass == 0 {
-                            assert!(matches!(
-                                report.require_evidence(),
-                                Err(RecoveryError::NeedsEvidence(RecoveryFailure {
-                                    reason: RecoveryReason::CoverageRequired,
-                                    ..
-                                }))
-                            ));
-                        }
-                        let record = fx.record(id);
-                        assert_eq!(record.attempts[0].sequence_released.is_some(), pass > 0);
-                        assert_eq!(record.state, OperationState::SentOutcomeUnknown);
-                        assert_eq!(
-                            OperationStatus::new(&fx.store, &fx.profile)
-                                .native_reserved_stroops(None)
-                                .unwrap(),
-                            held
-                        );
-                        assert_eq!(
-                            fx.sink
-                                .entries
-                                .iter()
-                                .filter(|entry| matches!(
-                                    entry.event_kind,
-                                    EventKind::OperationEvidence {
-                                        sequence_released: true,
-                                        ..
-                                    }
-                                ))
-                                .count(),
-                            usize::from(pass > 0)
-                        );
-                    }
-                }
-            }
-        }
     }
 
     fn unmatched_release_fixture() -> (Fx, OperationId, String) {
@@ -6619,7 +6588,7 @@ mod tests {
         );
         assert_eq!(
             OperationStatus::new(&fx.store, &fx.profile)
-                .recovery_snapshot(None)
+                .outcome_snapshot(None)
                 .unwrap()
                 .len(),
             1
@@ -6772,97 +6741,6 @@ mod tests {
             )
             .unwrap();
             assert!(input.sequence_released.is_none());
-        }
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn recovery_history_failures_keep_each_reads_reason() {
-        let guard_home = tempfile::tempdir().unwrap();
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
-        for parse_first in [true, false] {
-            let mut fx = Fx::new();
-            let ids = [
-                unknown_named(&mut fx, 1).id(),
-                unknown_named(&mut fx, 2).id(),
-            ];
-            for (id, ledger) in ids.iter().zip([1, 2]) {
-                fx.recorder()
-                    .record_evidence(
-                        *id,
-                        1,
-                        &EvidenceInput {
-                            recovery: Some(RecoveryUpdate {
-                                primary_cursor: Some(ledger),
-                                witness_cursor: Some(ledger),
-                                primary_upper: Some(ledger),
-                                witness_upper: Some(ledger),
-                                ..RecoveryUpdate::default()
-                            }),
-                            ..EvidenceInput::default()
-                        },
-                    )
-                    .unwrap();
-            }
-            let mut attempts = OperationStatus::new(&fx.store, &fx.profile)
-                .recovery_snapshot(None)
-                .unwrap();
-            attempts.sort_by_key(|attempt| attempt.recovery.primary_upper);
-            let primary = endpoint(7, NOW / 1000).await;
-            let oracle = endpoint(7, NOW / 1000).await;
-            let calls = std::sync::atomic::AtomicUsize::new(0);
-            Mock::given(method("POST"))
-                .and(body_partial_json(json!({"method":"getLedgers"})))
-                .respond_with(move |request: &wiremock::Request| {
-                    let first = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
-                    if first == parse_first {
-                        wiremock::Respond::respond(
-                            &EchoIdResponder::new(json!({"ledgers":"invalid"})),
-                            request,
-                        )
-                    } else {
-                        wiremock::ResponseTemplate::new(500)
-                    }
-                })
-                .with_priority(1)
-                .mount(&primary)
-                .await;
-            let left = StellarRpcClient::new(&primary.uri()).unwrap();
-            let right = StellarRpcClient::new(&oracle.uri()).unwrap();
-            let batch = collect(
-                &EndpointPair::from_clients(&left, Some(&right)),
-                &attempts,
-                NOW,
-            )
-            .await
-            .unwrap();
-            assert_eq!(
-                batch.requests,
-                RecoveryRequests {
-                    attempt: 4,
-                    shared: 4
-                }
-            );
-            assert!(
-                batch
-                    .inputs
-                    .iter()
-                    .all(|(_, _, input)| input.sequence_released.is_none())
-            );
-            commit_batch(&mut fx.recorder(), batch).unwrap();
-            for (id, ledger) in ids.iter().zip([1, 2]) {
-                let record = fx.record(*id);
-                let recovery = record.attempts[0].recovery.as_ref().unwrap();
-                assert_eq!(
-                    recovery.diagnostic.as_ref().map(|reason| reason.text()),
-                    Some(if (ledger == 1) == parse_first {
-                        "malformed_history"
-                    } else {
-                        "endpoint_unreachable"
-                    })
-                );
-            }
-            assert_eq!(requested_starts(&primary).await, [7, 7]);
         }
     }
 
@@ -7141,7 +7019,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn recovery_reads_one_measured_ledger() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = endpoint(7, NOW / 1000).await;
         Mock::given(method("POST"))
             .and(body_partial_json(json!({"method":"getLedgers"})))
@@ -7167,19 +7049,19 @@ mod tests {
             .mount(&server)
             .await;
         let client = StellarRpcClient::new(&server.uri()).unwrap();
-        let batch = collect(
+        let (evaluations, _, requests, missing) = public_outcomes_fixture(
             &EndpointPair::from_clients(&client, Some(&client)),
-            &[attempt(NOW / 1000 - 1)],
+            &[serve_absence(&server, 7).await],
             NOW,
         )
         .await
         .unwrap();
-        assert!(batch.inputs[0].2.sequence_released.is_some());
-        assert!(batch.missing.is_none());
+        assert!(evaluations[0].attempt.sequence_release.is_some());
+        assert!(missing.is_none());
         assert_eq!(
-            batch.requests,
+            requests,
             RecoveryRequests {
-                attempt: 2,
+                attempt: 6,
                 shared: 4
             }
         );
@@ -7301,105 +7183,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn recovery_four_attempts_use_eight_history_requests() {
-        let primary = endpoint(7, NOW / 1_000).await;
-        let oracle = endpoint(8, NOW / 1_000).await;
-        let calls = std::sync::atomic::AtomicUsize::new(0);
-        Mock::given(method("POST"))
-            .and(body_partial_json(
-                json!({"method":"getLedgers", "params":{"pagination":{"limit":1}}}),
-            ))
-            .respond_with(move |request: &wiremock::Request| {
-                let delay = if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-                    6
-                } else {
-                    0
-                };
-                wiremock::Respond::respond(
-                    &EchoIdResponder::new(page_json(7, 1, 7, NOW / 1_000)),
-                    request,
-                )
-                .set_delay(Duration::from_secs(delay))
-            })
-            .with_priority(1)
-            .mount(&primary)
-            .await;
-        let primary_client = StellarRpcClient::new(&primary.uri()).unwrap();
-        let oracle_client = StellarRpcClient::new(&oracle.uri()).unwrap();
-        let mut attempts = vec![attempt(NOW / 1_000 - 1); 5];
-        for attempt in &mut attempts {
-            attempt.pre_exposure_ledger = None;
-        }
-        let start = Instant::now();
-        let batch = collect(
-            &EndpointPair::from_clients(&primary_client, Some(&oracle_client)),
-            &attempts,
-            NOW,
-        )
-        .await
-        .unwrap();
-        assert_eq!(batch.inputs.len(), 4);
-        assert_eq!(
-            batch.requests,
-            RecoveryRequests {
-                attempt: 8,
-                shared: 6
-            }
-        );
-        assert_eq!(
-            primary.received_requests().await.unwrap().len()
-                + oracle.received_requests().await.unwrap().len(),
-            14
-        );
-        assert!(start.elapsed() < PASS_DURATION);
-    }
-
-    #[tokio::test]
-    async fn recovery_stale_after_refresh_is_pending() {
-        let primary = endpoint(7, NOW / 1_000).await;
-        let oracle = endpoint(8, NOW / 1_000).await;
-        for (server, ledger) in [(&primary, 7), (&oracle, 8)] {
-            Mock::given(method("POST"))
-                .and(body_partial_json(
-                    json!({"method":"getLedgers", "params":{"pagination":{"limit":1}}}),
-                ))
-                .respond_with(move |request: &wiremock::Request| {
-                    wiremock::Respond::respond(
-                        &EchoIdResponder::new(page_json(ledger, 1, ledger, NOW / 1_000)),
-                        request,
-                    )
-                    .set_delay(Duration::from_secs(3))
-                })
-                .with_priority(1)
-                .mount(server)
-                .await;
-        }
-        let primary_client = StellarRpcClient::new(&primary.uri()).unwrap();
-        let oracle_client = StellarRpcClient::new(&oracle.uri()).unwrap();
-        let pair = EndpointPair::from_clients(&primary_client, Some(&oracle_client));
-        let mut attempts = vec![attempt(NOW / 1_000 - 1); 4];
-        for attempt in &mut attempts {
-            attempt.pre_exposure_ledger = None;
-        }
-        let batch = collect(&pair, &attempts, NOW).await.unwrap();
-        assert_eq!(
-            batch.requests,
-            RecoveryRequests {
-                attempt: 4,
-                shared: 6
-            }
-        );
-        assert_eq!(batch.inputs.len(), 4);
-        for (_, _, input) in &batch.inputs[2..] {
-            assert!(input.sequence_released.is_none());
-            assert_eq!(
-                input.recovery.as_ref().unwrap().diagnostic.as_deref(),
-                Some("stale_observation")
-            );
-        }
-    }
-
     /// The release proof of `id`'s first attempt, as the window holds it.
     #[cfg(feature = "mainnet-write")]
     fn proof_of(fx: &Fx, id: OperationId) -> Option<serde_json::Value> {
@@ -7416,46 +7199,122 @@ mod tests {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        let mut fx = Fx::new();
-        let mut ids = Vec::new();
-        for n in 1..=5 {
-            fx.clock.set(NOW + u64::from(n));
-            ids.push(unknown_with(&mut fx, n, NOW / 1_000 - 10, vec![]).id());
-        }
-        for id in &ids[..4] {
-            fx.recorder()
-                .record_evidence(
-                    *id,
-                    1,
-                    &EvidenceInput {
-                        sequence_released: Some(SequenceReleaseInput {
-                            primary_ledger: 7,
-                            witness_ledger: 7,
-                            min_close_time_ms: NOW,
-                        }),
-                        ..EvidenceInput::default()
-                    },
+        // Non-runnable released attempts are filtered before the four oldest;
+        // due matched-release attempts are selected and decided first.
+        for filtered in [true, false] {
+            let mut fx = Fx::new();
+            let mut ids = Vec::new();
+            for n in 1..=5 {
+                fx.clock.set(NOW + u64::from(n));
+                ids.push(unknown_with(&mut fx, n, NOW / 1_000 - 10, vec![]).id());
+            }
+            fx.clock.set(NOW);
+            let account = stellar_agent_test_support::signed_envelope::account_id_for_seed([1; 32]);
+            fx.rewrite(|wire| {
+                for auth in &mut wire.authorizations {
+                    let super::super::DomainBinding::Transaction { source, .. } = &mut auth.binding
+                    else {
+                        panic!("classic binding required");
+                    };
+                    *source = account.clone();
+                }
+            });
+            for id in &ids[..4] {
+                fx.recorder()
+                    .record_evidence(
+                        *id,
+                        1,
+                        &EvidenceInput {
+                            sequence_released: Some(SequenceReleaseInput {
+                                primary_ledger: 7,
+                                witness_ledger: 7,
+                                min_close_time_ms: NOW,
+                            }),
+                            ..EvidenceInput::default()
+                        },
+                    )
+                    .unwrap();
+            }
+            if filtered {
+                let snapshot = OperationStatus::new(&fx.store, &fx.profile)
+                    .outcome_snapshot(None)
+                    .unwrap();
+                let runs: Vec<_> = snapshot
+                    .iter()
+                    .map(|attempt| {
+                        json!({"version":1,
+                            "exposure":super::super::recovery_exposure_digest(
+                                attempt.operation_id, 1, &attempt.exposure).unwrap(),
+                            "phase":"stopped", "run_started_ms":NOW - 1_000,
+                            "run_deadline_ms":NOW + 19_000, "automatic_runs":16,
+                            "consecutive_stops":16,
+                            "stop":{"reason":"missing_field","stage":"hash",
+                                "method":"get_transaction","roles":["primary"],"ledger":null,
+                                "target":null,"stopped_at_ms":NOW - 1_000,"class":"automatic",
+                                "earliest_retry_ms":NOW + 3_599_000}})
+                    })
+                    .collect();
+                fx.rewrite(|wire| {
+                    for (record, run) in wire.operations.as_mut().unwrap().records[..4]
+                        .iter_mut()
+                        .zip(&runs)
+                    {
+                        record.attempts[0].recovery_run =
+                            Some(serde_json::from_value(run.clone()).unwrap());
+                    }
+                });
+            }
+            let held: Vec<_> = ids[..4]
+                .iter()
+                .map(|id| serde_json::to_value(fx.record(*id)).unwrap())
+                .collect();
+            let fifth = serde_json::to_value(fx.record(ids[4])).unwrap();
+            let primary = endpoint(7, NOW / 1_000).await;
+            let oracle = endpoint(8, NOW / 1_000).await;
+            serve_absence(&primary, 7).await;
+            serve_absence(&oracle, 8).await;
+            let primary_client = StellarRpcClient::new(&primary.uri()).unwrap();
+            let oracle_client = StellarRpcClient::new(&oracle.uri()).unwrap();
+            let (writer, _) = crate::mainnet::fixtures::keyed_writer(&fx.profile.audit_log_path);
+            let pass = || {
+                recover_sequences(
+                    &fx.store,
+                    &fx.profile,
+                    EndpointPair::from_clients(&primary_client, Some(&oracle_client)),
+                    &writer,
+                    None,
                 )
-                .unwrap();
+            };
+            if filtered {
+                assert_eq!(pass().await.unwrap().evaluated, 1);
+                for (id, before) in ids[..4].iter().zip(&held) {
+                    assert_eq!(&serde_json::to_value(fx.record(*id)).unwrap(), before);
+                }
+            } else {
+                let report = pass().await.unwrap();
+                assert_eq!(report.evaluated, 4);
+                // Fresh hashes and accounts decide each matched release
+                // without another ledger read.
+                assert_eq!(
+                    report.requests,
+                    RecoveryRequests {
+                        shared: 4,
+                        attempt: 16
+                    }
+                );
+                for server in [&primary, &oracle] {
+                    assert_eq!(rpc_request_count(server, "getLedgers").await, 0);
+                }
+                for id in &ids[..4] {
+                    assert_eq!(fx.record(*id).state, OperationState::NotIncluded);
+                }
+                assert_eq!(serde_json::to_value(fx.record(ids[4])).unwrap(), fifth);
+                assert_eq!(pass().await.unwrap().evaluated, 1);
+            }
+            let proof = proof_of(&fx, ids[4]).expect("the fifth attempt releases");
+            assert_eq!(proof["primary_ledger"], 7);
+            assert_eq!(proof["witness_ledger"], 7);
         }
-        let primary = endpoint(7, NOW / 1_000).await;
-        let oracle = endpoint(8, NOW / 1_000).await;
-        let primary_client = StellarRpcClient::new(&primary.uri()).unwrap();
-        let oracle_client = StellarRpcClient::new(&oracle.uri()).unwrap();
-        let (writer, _) = crate::mainnet::fixtures::keyed_writer(&fx.profile.audit_log_path);
-        let report = recover_sequences(
-            &fx.store,
-            &fx.profile,
-            EndpointPair::from_clients(&primary_client, Some(&oracle_client)),
-            &writer,
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(report.evaluated, 1);
-        let proof = proof_of(&fx, ids[4]).expect("the fifth attempt releases");
-        assert_eq!(proof["primary_ledger"], 7);
-        assert_eq!(proof["witness_ledger"], 7);
     }
 
     #[cfg(feature = "mainnet-write")]
@@ -7504,7 +7363,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn recovery_oracle_behind_the_primary_keeps_its_bound() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let primary = endpoint(8, NOW / 1_000).await;
         let oracle = endpoint(7, NOW / 1_000).await;
         let primary_client = StellarRpcClient::new(&primary.uri()).unwrap();
@@ -7523,18 +7386,53 @@ mod tests {
         .await;
         assert_eq!(observation.pre_exposure_ledger, Some(7));
         assert_eq!(requested_starts(&oracle).await, [7]);
-        let mut attempt = attempt(NOW / 1_000 - 1);
+        let mut attempt = serve_absence(&primary, 8).await;
+        serve_absence(&oracle, 7).await;
         attempt.pre_exposure_ledger = observation.pre_exposure_ledger;
-        let batch = collect(
+        let (evaluations, _, _, _) = public_outcomes_fixture(
             &EndpointPair::from_clients(&primary_client, Some(&oracle_client)),
             &[attempt],
             NOW,
         )
         .await
         .unwrap();
-        let input = &batch.inputs[0].2;
-        assert!(!input.recovery.as_ref().unwrap().history_incomplete);
-        assert!(input.sequence_released.is_some());
+        let committed = &evaluations[0].attempt;
+        assert!(!committed.recovery.history_incomplete);
+        assert!(committed.sequence_release.is_some());
+    }
+
+    /// Binds the first authorization of `fx` to the seed-1 G account.
+    fn bind_source(fx: &mut Fx) {
+        let account = stellar_agent_test_support::signed_envelope::account_id_for_seed([1; 32]);
+        fx.rewrite(|wire| {
+            let super::super::DomainBinding::Transaction { source, .. } =
+                &mut wire.authorizations[0].binding
+            else {
+                panic!("classic binding required");
+            };
+            *source = account.clone();
+        });
+    }
+
+    /// Serves `server`'s `NOT_FOUND` answer and source account at `tip`, and
+    /// returns a due timed attempt template with that authenticated source.
+    async fn serve_absence(server: &MockServer, tip: u32) -> RecoveryAttempt {
+        let account = stellar_agent_test_support::signed_envelope::account_id_for_seed([1; 32]);
+        mount(
+            server,
+            "getTransaction",
+            json!({"status":"NOT_FOUND", "oldestLedger":1, "latestLedger":tip,
+                "oldestLedgerCloseTime":1, "latestLedgerCloseTime":NOW/1000}),
+        )
+        .await;
+        let mut entries =
+            stellar_agent_test_support::signed_envelope::ledger_entries_result_for(&[&account]);
+        entries["latestLedger"] = json!(tip);
+        mount(server, "getLedgerEntries", entries).await;
+        // Due at (max_time + 6) * 1000 = NOW - 4000.
+        let mut template = attempt(NOW / 1_000 - 10);
+        template.account = Some(account);
+        template
     }
 
     #[cfg(feature = "mainnet-write")]
@@ -7598,6 +7496,8 @@ mod tests {
         );
         let primary = endpoint(9, later / 1_000).await;
         let oracle = endpoint(10, later / 1_000).await;
+        serve_absence(&primary, 9).await;
+        serve_absence(&oracle, 10).await;
         let primary_client = StellarRpcClient::new(&primary.uri()).unwrap();
         let oracle_client = StellarRpcClient::new(&oracle.uri()).unwrap();
         recover_sequences(
@@ -7628,7 +7528,7 @@ mod tests {
         let mut fx = Fx::new();
         let id = unknown_with(&mut fx, 1, NOW / 1_000 - 10, vec![]).id();
         let snapshot = OperationStatus::new(&fx.store, &fx.profile)
-            .recovery_snapshot(None)
+            .outcome_snapshot(None)
             .unwrap();
         let ExposureIdentity::Classic {
             tx_hash,

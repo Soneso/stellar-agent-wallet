@@ -65,7 +65,7 @@ fn install(wire: &mut WireFile, id: OperationId, raw: &str) {
 
 fn selected(fx: &Fx) -> RecoveryAttempt {
     OperationStatus::new(&fx.store, &fx.profile)
-        .recovery_snapshot(None)
+        .outcome_snapshot(None)
         .unwrap()
         .remove(0)
 }
@@ -283,7 +283,7 @@ fn run_record_validation() {
     assert!(selected(&fx).recovery_run.unwrap().record().is_none());
     assert_eq!(
         OperationStatus::new(&fx.store, &fx.profile)
-            .recovery_snapshot(None)
+            .outcome_snapshot(None)
             .unwrap()
             .len(),
         1
@@ -758,7 +758,7 @@ fn opaque_generation_and_stale_snapshot() {
         let reopened =
             crate::policy_state::PersistedWindowStore::at_path(fx.store.path().to_owned());
         let reopened_attempt = OperationStatus::new(&reopened, &fx.profile)
-            .recovery_snapshot(None)
+            .outcome_snapshot(None)
             .unwrap()
             .into_iter()
             .find(|row| row.operation_id == id)
@@ -795,7 +795,7 @@ fn opaque_generation_and_stale_snapshot() {
         assert!(read(id, &attempt, expected).record().is_none());
         assert_eq!(
             OperationStatus::new(&fx.store, &fx.profile)
-                .recovery_snapshot(None)
+                .outcome_snapshot(None)
                 .unwrap()
                 .len(),
             2
@@ -823,7 +823,7 @@ fn opaque_generation_and_stale_snapshot() {
     std::thread::scope(|scope| {
         let writer = scope.spawn(|| {
             let snapshot = OperationStatus::new(store, profile)
-                .recovery_snapshot(None)
+                .outcome_snapshot(None)
                 .unwrap();
             assert_eq!(snapshot.len(), 1);
             barrier.wait();
@@ -842,7 +842,7 @@ fn opaque_generation_and_stale_snapshot() {
             sent.send(()).unwrap();
         });
         let reader=scope.spawn(move || {
-            let snapshot=OperationStatus::new(store,profile).recovery_snapshot(None).unwrap().remove(0);
+            let snapshot=OperationStatus::new(store,profile).outcome_snapshot(None).unwrap().remove(0);
             barrier.wait();
             received.recv().unwrap();
             let mut sink=crate::policy_state::operations::tests::Sink::default();
@@ -1141,7 +1141,7 @@ fn valid_run_generation_seams() {
             let reopened =
                 crate::policy_state::PersistedWindowStore::at_path(fx.store.path().to_owned());
             let snapshot = OperationStatus::new(&reopened, &fx.profile)
-                .recovery_snapshot(None)
+                .outcome_snapshot(None)
                 .unwrap()
                 .remove(0)
                 .recovery_run
