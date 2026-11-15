@@ -24,8 +24,10 @@ fn usage_state(f: &Fx) -> (Option<Vec<u8>>, Option<String>, Option<String>) {
 }
 
 /// A settled sum of 3, a row of 2, a persisted hold of 1, and a closed
-/// intent of 2 give 8. A later clock keeps the unswept expired hold; only the
-/// committed sweep removes it, giving 7. Another scope and digest stay apart.
+/// intent of 2 give 8 for native. A later clock keeps the unswept expired
+/// hold; only the committed sweep removes it, giving 7. An issued asset's
+/// settled sum of 4 reports under its own contract bucket. Another scope and
+/// digest stay apart.
 #[test]
 #[serial]
 fn total_usage_counts_every_persisted_source() {
@@ -34,12 +36,27 @@ fn total_usage_counts_every_persisted_source() {
         stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let f = fx("usage-sources");
     f.pin(D1);
+    let issuer = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
+    let issued_contract = stellar_agent_core::asset_id::CanonicalAsset::Classic {
+        code: "USDC".to_owned(),
+        issuer: issuer.to_owned(),
+    }
+    .sac_contract_id(&f.profile.network_passphrase)
+    .unwrap();
+    let issued = format!("total:{issued_contract}");
     let mut wire = usage_wire();
     wire.total_sums.push(WireTotalSum {
         scope_specificity: 1,
         bucket: "total:native".to_owned(),
         epoch: D1,
         amount: 3,
+        settled_until_ms: T - 10,
+    });
+    wire.total_sums.push(WireTotalSum {
+        scope_specificity: 1,
+        bucket: format!("total:USDC:{issuer}"),
+        epoch: D1,
+        amount: 4,
         settled_until_ms: T - 10,
     });
     f.push_row(&mut wire, 2, Some(D1));
@@ -53,13 +70,16 @@ fn total_usage_counts_every_persisted_source() {
     wire.holds.push(total_hold(1, 1, Some(D1)));
     total_intent_test_helpers::append_closed_intent(&mut wire, D1, 2, T - 5);
     f.store.seal_unchecked_for_test(&f.profile, &wire);
-    let scope_nine = TotalUsage {
-        scope_specificity: 9,
-        bucket: "total:native".to_owned(),
-        used_stroops: 9,
+    let usage = |scope_specificity: u8, bucket: &str, used_stroops: i128| TotalUsage {
+        scope_specificity,
+        bucket: bucket.to_owned(),
+        used_stroops,
     };
-    let mut expected = native_usage(8);
-    expected.push(scope_nine.clone());
+    let expected = vec![
+        usage(1, &issued, 4),
+        usage(1, "total:native", 8),
+        usage(9, "total:native", 9),
+    ];
     assert_eq!(f.store.total_usage(&f.profile, D1).unwrap(), expected);
     let before = usage_state(&f);
     f.clock.set(T + 1_000_000);
@@ -73,8 +93,11 @@ fn total_usage_counts_every_persisted_source() {
     assert!(ledger::sweep_expired(&mut swept, T + 1_000_000));
     swept.generation += 1;
     f.store.seal_unchecked_for_test(&f.profile, &swept);
-    let mut expected = native_usage(7);
-    expected.push(scope_nine);
+    let expected = vec![
+        usage(1, &issued, 4),
+        usage(1, "total:native", 7),
+        usage(9, "total:native", 9),
+    ];
     assert_eq!(f.store.total_usage(&f.profile, D1).unwrap(), expected);
 }
 
@@ -197,4 +220,48 @@ fn total_usage_refuses_unknown_history() {
         f.store.total_usage(&f.profile, D1),
         Err(TotalUsageError::State(_))
     ));
+}
+
+/// Each failure class keeps its own code: the chain codes, the pin and lock
+/// codes, and `policy.window_state_unverifiable` for a keyring or I/O failure
+/// of the authenticated read.
+#[test]
+fn total_usage_codes_name_each_failure_class() {
+    use stellar_agent_core::policy::PolicyError;
+    for (error, code) in [
+        (
+            TotalUsageError::State(WindowStoreError::ChainMismatch),
+            "policy.window_chain_mismatch",
+        ),
+        (
+            TotalUsageError::State(WindowStoreError::ChainUnverifiable),
+            "policy.window_chain_unverifiable",
+        ),
+        (
+            TotalUsageError::Policy(PolicyError::PinUnusable {
+                detail: "unreadable".to_owned(),
+            }),
+            "policy.pin_unusable",
+        ),
+        (
+            TotalUsageError::Policy(PolicyError::StateLockIo {
+                kind: std::io::ErrorKind::PermissionDenied,
+            }),
+            "policy.state_lock_io",
+        ),
+        (
+            TotalUsageError::State(WindowStoreError::Keyring {
+                detail: "unavailable".to_owned(),
+            }),
+            "policy.window_state_unverifiable",
+        ),
+        (
+            TotalUsageError::State(WindowStoreError::Io {
+                kind: std::io::ErrorKind::PermissionDenied,
+            }),
+            "policy.window_state_unverifiable",
+        ),
+    ] {
+        assert_eq!(error.code(), code, "{error:?}");
+    }
 }

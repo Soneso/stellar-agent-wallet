@@ -1371,7 +1371,7 @@ mod tests {
     }
 
     #[test]
-    fn intent_total_account_spellings_keep_the_base_identity() {
+    fn intent_account_spellings_keep_the_base_identity() {
         let source = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
         let plan = SignedIntentPlan::new(
             TESTNET_PASSPHRASE,
