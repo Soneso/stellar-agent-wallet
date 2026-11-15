@@ -237,8 +237,8 @@ pub use operations::{
 };
 pub use recovery::{
     AccountAnswer, CheckedRecoveryDecision, DecidedTransition, EndpointPair, LedgerAnswer,
-    OutcomeAnswer, RecoveryError, RecoveryReport, RecoveryRequests, SubmissionObservation,
-    recover_outcomes, recover_sequences, submission_observation,
+    OutcomeAnswer, RecoveryAttemptResult, RecoveryError, RecoveryReport, RecoveryRequests,
+    SubmissionObservation, recover_outcomes, recover_sequences, submission_observation,
 };
 pub use recovery_run::{
     RECOVERY_RUN_MAX, RecoveryClass, RecoveryRole, RecoveryRunMethod, RecoveryRunPhase,

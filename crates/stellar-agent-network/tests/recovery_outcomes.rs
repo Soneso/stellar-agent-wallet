@@ -32,6 +32,7 @@ use wiremock::matchers::{body_partial_json, method};
 use wiremock::{Mock, MockServer};
 
 const NOW: u64 = 1_800_000_000_000;
+const DUE: u64 = NOW + 3_606_000;
 
 /// A classic envelope with fee cap `fee`, as base64 XDR.
 fn envelope_text(fee: u32) -> String {
@@ -221,6 +222,7 @@ impl Fixture {
                 .unwrap();
             clock.set(NOW + u64::from(n));
         }
+        clock.set(DUE);
         Self {
             _dir: dir,
             _clock: clock,
@@ -260,7 +262,7 @@ impl Fixture {
 /// An endpoint at `ledger` whose `getTransaction` answers `transaction`.
 async fn endpoint(ledger: u32, transaction: Value) -> MockServer {
     let server = MockServer::start().await;
-    let close = (NOW / 1_000).to_string();
+    let close = (DUE / 1_000).to_string();
     for (name, answer) in [
         ("getNetwork", get_network_result(MAINNET_PASSPHRASE)),
         (
@@ -307,7 +309,7 @@ impl wiremock::Respond for Inclusion {
 /// `delay`.
 async fn including(ledger: u32, delay: std::time::Duration) -> MockServer {
     let server = MockServer::start().await;
-    let close = (NOW / 1_000).to_string();
+    let close = (DUE / 1_000).to_string();
     for (name, answer) in [
         ("getNetwork", get_network_result(MAINNET_PASSPHRASE)),
         (
@@ -341,7 +343,7 @@ async fn including(ledger: u32, delay: std::time::Duration) -> MockServer {
 async fn transaction_unreachable(ledger: u32) -> MockServer {
     let server = including(ledger, std::time::Duration::ZERO).await;
     server.reset().await;
-    let close = (NOW / 1_000).to_string();
+    let close = (DUE / 1_000).to_string();
     for (name, answer) in [
         ("getNetwork", get_network_result(MAINNET_PASSPHRASE)),
         (
@@ -426,7 +428,7 @@ async fn recovery_decisions_of_one_pass_bind_fresh_generations() {
 }
 
 /// An oracle whose transaction answer arrives after the pass deadline ends
-/// the pass at the deadline, and the interrupted attempt keeps its state.
+/// the pass at the deadline and durably stops the spent reservation.
 #[tokio::test]
 #[serial]
 async fn recovery_pass_ends_at_its_deadline_and_leaves_the_interrupted_attempt() {
@@ -444,8 +446,19 @@ async fn recovery_pass_ends_at_its_deadline_and_leaves_the_interrupted_attempt()
         elapsed < std::time::Duration::from_secs(25),
         "the pass ends at its 20-second deadline: {elapsed:?}"
     );
-    assert_eq!(report.evaluated, 0, "{report:?}");
-    assert_eq!(fx.records(), before, "the interrupted attempt is unchanged");
+    assert_eq!(report.evaluated, 1, "{report:?}");
+    let after = fx.records();
+    assert_eq!(after[0]["state"], before[0]["state"]);
+    assert!(after[0]["attempts"][0]["decision"].is_null());
+    assert!(after[0]["attempts"][0]["sequence_released"].is_null());
+    let run = &after[0]["attempts"][0]["recovery_run"];
+    assert_eq!(run["automatic_runs"], 1);
+    assert_eq!(run["stop"]["reason"], "deadline");
+    assert_eq!(run["stop"]["earliest_retry_ms"], DUE + 30_000);
+    assert_eq!(
+        report.missing.unwrap().reason,
+        recovery::RecoveryReason::Deadline
+    );
 }
 
 fn included(status: &str, envelope: impl Into<Value>, result: impl Into<Value>) -> Value {
@@ -484,6 +497,7 @@ async fn recovery_outcome_requires_the_configured_pair_in_one_pass() {
     assert!(fx.records()[0]["attempts"][0]["decision"].is_null());
 
     let oracle = endpoint(61, success).await;
+    fx._clock.set(DUE + 30_000);
     let before = rpc_request_count(&primary, "getNetwork").await;
     let report = fx.run(&primary, Some(&oracle)).await;
     assert_eq!(report.evaluated, 1, "{report:?}");
@@ -528,7 +542,7 @@ async fn recovery_consumed_sequence_without_original_envelope_stays_unknown() {
 }
 
 /// Five eligible attempts take four slots; the pass stays within its
-/// separate 24 attempt and nine shared requests and sends no transaction
+/// separate 24 attempt and four shared requests and sends no transaction
 /// read twice.
 #[tokio::test]
 #[serial]
@@ -545,8 +559,8 @@ async fn recovery_combined_pass_limits_attempts_requests_refresh_and_deadline() 
     assert!(started.elapsed() < std::time::Duration::from_secs(20));
     assert_eq!(report.evaluated, 4);
     assert!(report.requests.attempt <= 24, "{report:?}");
-    assert!(report.requests.shared <= 9, "{report:?}");
-    assert!(report.requests.attempt + report.requests.shared <= 33);
+    assert!(report.requests.shared <= 4, "{report:?}");
+    assert!(report.requests.attempt + report.requests.shared <= 28);
     for server in [&primary, &oracle] {
         assert_eq!(rpc_request_count(server, "getTransaction").await, 4);
         assert_eq!(rpc_request_count(server, "getNetwork").await, 1);

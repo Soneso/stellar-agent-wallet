@@ -19,6 +19,12 @@ use super::operations::{
     ExposureIdentity, NotIncludedProof, OperationId, OperationRecorder, OperationStatus,
     RecoveryAttempt, RecoveryUpdate, SequenceReleaseInput, WindowObservation,
 };
+use super::recovery_run::{
+    RecoveryClass, RecoveryRole, RecoveryRunMethod, RecoveryRunPhase, RecoveryRunState,
+    RecoveryRunView, RecoveryStage, RecoveryStop, RecoveryStopReason, WireRecoveryRun,
+    classify_recovery_stop, normalize_recovery_run, recovery_deadline, recovery_expiry,
+    recovery_exposure_digest, recovery_retry_time,
+};
 use super::{PersistedWindowStore, WindowStoreError};
 use crate::operational::OperationalReport;
 use crate::{MainnetOracle, StellarRpcClient};
@@ -188,6 +194,7 @@ impl<'a> EndpointPair<'a> {
 
 /// Why recovery cannot supply all requested evidence, including durable partial progress.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum RecoveryError {
     /// The window store refuses the snapshot or a commit.
     #[error(transparent)]
@@ -276,6 +283,8 @@ struct Budget {
     deadline: Instant,
     context: (RecoveryEndpoint, RecoveryMethod, Option<u32>),
     failure: Option<RecoveryFailure>,
+    driver: bool,
+    attempt_limit: usize,
 }
 
 impl Budget {
@@ -285,6 +294,8 @@ impl Budget {
             deadline: Instant::now() + PASS_DURATION,
             context: (RecoveryEndpoint::Primary, RecoveryMethod::GetNetwork, None),
             failure: None,
+            driver: false,
+            attempt_limit: ATTEMPT_REQUESTS,
         }
     }
 
@@ -308,9 +319,12 @@ impl Budget {
             return Err(ReadFailure::Deadline);
         }
         let (used, capacity) = if shared {
-            (&mut self.used.shared, SHARED_REQUESTS)
+            (
+                &mut self.used.shared,
+                if self.driver { 4 } else { SHARED_REQUESTS },
+            )
         } else {
-            (&mut self.used.attempt, ATTEMPT_REQUESTS)
+            (&mut self.used.attempt, self.attempt_limit)
         };
         if *used >= capacity {
             self.failed(RecoveryReason::RequestBudget);
@@ -611,6 +625,10 @@ async fn shared_observation(
     let read_at = Instant::now();
     budget.context(budget.context.0, RecoveryMethod::GetHealth, None);
     let observed = budget.read(true, client.recovery_health()).await?;
+    if budget.driver && observed.latest_close.checked_mul(1_000).is_none() {
+        budget.failed(RecoveryReason::MissingField);
+        return Err(ReadFailure::Pending);
+    }
     let report =
         OperationalReport::from_health_observation(&observed, now_ms / 1_000).map_err(|_| {
             budget.failed(RecoveryReason::Lagging);
@@ -704,9 +722,14 @@ async fn history(
         RecoveryMethod::GetLedgers,
         Some(target),
     );
-    if target < shared.oldest || upper.is_some_and(|ledger| ledger > target) {
-        budget.failed(RecoveryReason::CoverageRequired);
-        return Err(ReadFailure::Failed(RecoveryReason::CoverageRequired));
+    let retention = if budget.driver {
+        RecoveryReason::Lagging
+    } else {
+        RecoveryReason::CoverageRequired
+    };
+    if target < shared.oldest || (!budget.driver && upper.is_some_and(|ledger| ledger > target)) {
+        budget.failed(retention);
+        return Err(ReadFailure::Failed(retention));
     }
     let page = budget
         .read(
@@ -723,10 +746,20 @@ async fn history(
         other => other?,
     };
     if target < page.oldest_ledger {
-        budget.failed(RecoveryReason::CoverageRequired);
-        return Err(ReadFailure::Failed(RecoveryReason::CoverageRequired));
+        budget.failed(retention);
+        return Err(ReadFailure::Failed(retention));
     }
     let scan = scan_page(&page, target, max_time, PAGE_SIZE);
+    if budget.driver
+        && scan.as_ref().is_some_and(|scan| {
+            scan.answer
+                .close_time
+                .is_some_and(|close| close.checked_mul(1_000).is_none())
+        })
+    {
+        budget.failed(RecoveryReason::MissingField);
+        return Ok(None);
+    }
     if scan.is_none() {
         budget.failed(RecoveryReason::MissingField);
     }
@@ -1238,7 +1271,8 @@ fn observe(
 }
 
 /// Results of a bounded recovery pass, separate from legacy reconciliation counts.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RecoveryReport {
     /// Requests issued under each allowance.
     pub requests: RecoveryRequests,
@@ -1246,6 +1280,24 @@ pub struct RecoveryReport {
     pub evaluated: usize,
     /// The first evidence this pass could not obtain or use.
     pub missing: Option<RecoveryFailure>,
+    /// Per-attempt scheduling results from the public outcome driver.
+    pub attempts: Vec<RecoveryAttemptResult>,
+}
+
+/// An attempt's verified state or an ephemeral refusal before reservation.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryAttemptResult {
+    /// The owning operation.
+    pub operation_id: OperationId,
+    /// The attempt index.
+    pub attempt_index: u32,
+    /// The authenticated lower bound needed by a future complete-history proof.
+    pub history_start: Option<u32>,
+    /// Normalized scheduling state, including resolved decisions.
+    pub view: RecoveryRunView,
+    /// The contextual stop; prefix stops are advice and are not persisted.
+    pub stop: Option<RecoveryStop>,
 }
 
 impl RecoveryReport {
@@ -1484,6 +1536,7 @@ struct Evaluated {
     attempt: RecoveryAttempt,
     input: EvidenceInput,
     decision: Option<(DecidedTransition, [u8; 32], (u32, u32))>,
+    stop: Option<RecoveryStop>,
 }
 
 /// Reads one account through the attempt allowance. The inner error is
@@ -1526,7 +1579,14 @@ async fn account_read(
             Ok(Err(ACCOUNT_LEDGER_REGRESSED))
         }
         Ok(Err(error)) => {
-            budget.failed(read_failure(&error));
+            let reason = read_failure(&error);
+            budget.failed(
+                if budget.driver && reason == RecoveryReason::CoverageRequired {
+                    RecoveryReason::AccountUnavailable
+                } else {
+                    reason
+                },
+            );
             Ok(Err("endpoint_unreachable"))
         }
     }
@@ -1699,12 +1759,170 @@ fn evaluate_outcome(
         attempt: attempt.clone(),
         input,
         decision,
+        stop: None,
     })
+}
+
+fn run_view(attempt: &RecoveryAttempt, now: u64) -> RecoveryRunView {
+    let ExposureIdentity::Classic { max_time, .. } = attempt.exposure else {
+        unreachable!()
+    };
+    normalize_recovery_run(
+        attempt.recovery_run.as_ref(),
+        max_time,
+        attempt.send_by_ms,
+        false,
+        now,
+    )
+}
+
+fn contextual_stop(
+    failure: Option<RecoveryFailure>,
+    reason: RecoveryStopReason,
+    stage: RecoveryStage,
+    target: Option<u32>,
+    now: u64,
+    count: u8,
+    max_time: u64,
+) -> Result<RecoveryStop, WindowStoreError> {
+    use RecoveryStage as S;
+    use RecoveryStopReason as R;
+    let (reason, stage, roles, ledger) = failure.map_or(
+        (
+            reason,
+            stage,
+            vec![RecoveryRole::Primary, RecoveryRole::Oracle],
+            None,
+        ),
+        |f| {
+            let reason = match f.reason {
+                RecoveryReason::ResponseTooLarge => R::ResponseTooLarge,
+                RecoveryReason::RateLimited => R::RateLimited,
+                RecoveryReason::Transport => R::Transport,
+                RecoveryReason::MissingField => R::MissingField,
+                RecoveryReason::Lagging => R::Lagging,
+                RecoveryReason::Deadline => R::Deadline,
+                RecoveryReason::RequestBudget => R::RequestBudget,
+                RecoveryReason::AccountUnavailable => R::AccountUnavailable,
+                RecoveryReason::CoverageRequired => R::CoverageRequired,
+            };
+            let stage = match f.method {
+                RecoveryMethod::GetNetwork => S::Identity,
+                RecoveryMethod::GetHealth => S::Health,
+                RecoveryMethod::GetTransaction => S::Hash,
+                RecoveryMethod::GetLedgers => S::Target,
+                RecoveryMethod::GetLedgerEntries => S::Account,
+            };
+            (
+                reason,
+                stage,
+                vec![if f.endpoint == RecoveryEndpoint::Primary {
+                    RecoveryRole::Primary
+                } else {
+                    RecoveryRole::Oracle
+                }],
+                f.ledger,
+            )
+        },
+    );
+    let stage = if matches!(reason, R::RequestBudget | R::ClockRegression) {
+        S::Lease
+    } else {
+        stage
+    };
+    let method = match stage {
+        S::Hash => Some(RecoveryRunMethod::GetTransaction),
+        S::Target => Some(RecoveryRunMethod::GetLedgers),
+        S::Account if reason != R::RecordUnusable => Some(RecoveryRunMethod::GetLedgerEntries),
+        _ => None,
+    };
+    let roles = if stage == S::Lease || reason == R::RecordUnusable {
+        Vec::new()
+    } else {
+        roles
+    };
+    let class = classify_recovery_stop(reason, stage, method, &roles);
+    let earliest_retry_ms = if class == RecoveryClass::Automatic {
+        Some(
+            recovery_retry_time(now, count)?.max(if reason == R::AwaitingExpiry {
+                recovery_expiry(max_time).unwrap_or(0)
+            } else {
+                0
+            }),
+        )
+    } else {
+        None
+    };
+    Ok(RecoveryStop {
+        reason,
+        stage,
+        method,
+        roles,
+        ledger,
+        target,
+        stopped_at_ms: now,
+        class,
+        earliest_retry_ms,
+    })
+}
+
+struct Driver<'a> {
+    store: &'a PersistedWindowStore,
+    profile: &'a Profile,
+    writer: &'a Arc<Mutex<AuditWriter>>,
+}
+
+impl Driver<'_> {
+    fn fresh(
+        &self,
+        attempt: &RecoveryAttempt,
+        owner: &WireRecoveryRun,
+    ) -> Result<RecoveryAttempt, WindowStoreError> {
+        #[cfg(test)]
+        driver_tests::before_fresh();
+        let ExposureIdentity::Classic { tx_hash, .. } = attempt.exposure else {
+            unreachable!()
+        };
+        OperationStatus::new(self.store, self.profile)
+            .outcome_snapshot(Some(&tx_hash))?
+            .into_iter()
+            .find(|fresh| {
+                fresh.operation_id == attempt.operation_id
+                    && fresh.attempt_index == attempt.attempt_index
+                    && fresh.exposure == attempt.exposure
+                    && fresh.recovery_run.as_ref().and_then(|r| r.record()) == Some(owner)
+            })
+            .ok_or_else(|| WindowStoreError::Invalid {
+                detail: "recovery snapshot is stale".into(),
+            })
+    }
+
+    fn write(
+        &self,
+        attempt: &RecoveryAttempt,
+        input: &EvidenceInput,
+        run: &WireRecoveryRun,
+        decision: Option<&CheckedRecoveryDecision>,
+    ) -> Result<(), WindowStoreError> {
+        #[cfg(test)]
+        let _fault = driver_tests::before_write(input, run, decision.is_some());
+        let mut writer = self.writer.lock().map_err(|_| WindowStoreError::Invalid {
+            detail: "audit writer mutex is poisoned".into(),
+        })?;
+        OperationRecorder::new(
+            self.store,
+            self.profile,
+            &mut *writer,
+            uuid::Uuid::new_v4().to_string(),
+        )
+        .write_recovery_run(attempt, input, run, decision)
+    }
 }
 
 /// Collects the outcome-capable pass over `attempts`, at most four, within
 /// the attempt and shared allowances and the pass deadline.
 async fn collect_outcomes(
+    driver: &Driver<'_>,
     pair: &EndpointPair<'_>,
     attempts: &[RecoveryAttempt],
     now_ms: u64,
@@ -1714,54 +1932,51 @@ async fn collect_outcomes(
         Option<WindowObservation>,
         RecoveryRequests,
         Option<RecoveryFailure>,
+        Option<RecoveryFailure>,
     ),
     RecoveryError,
 > {
     let mut budget = Budget::new();
+    budget.driver = true;
+    let call_deadline = budget.deadline;
+    let mut first_missing = None;
     let mut evaluated = Vec::new();
     let mut observation = None;
+    let prefix = |evaluated, observation, budget: Budget| {
+        (
+            evaluated,
+            observation,
+            budget.used,
+            budget.failure,
+            budget.failure,
+        )
+    };
     match pair.verify(&mut budget).await {
         Ok(()) => {}
         Err(IdentityFailure::Refused(error)) => return Err(RecoveryError::EndpointIdentity(error)),
         Err(IdentityFailure::Read(_)) => {
-            return Ok((evaluated, observation, budget.used, budget.failure));
+            return Ok(prefix(evaluated, observation, budget));
         }
     }
     let Some(oracle_client) = pair.oracle else {
-        return Ok((evaluated, observation, budget.used, budget.failure));
+        return Ok(prefix(evaluated, observation, budget));
     };
     budget.context(RecoveryEndpoint::Primary, RecoveryMethod::GetHealth, None);
-    let mut primary = match shared_observation(pair.primary, &mut budget, now_ms).await {
+    let primary = match shared_observation(pair.primary, &mut budget, now_ms).await {
         Ok(shared) => shared,
-        Err(_) => return Ok((evaluated, observation, budget.used, budget.failure)),
+        Err(_) => return Ok(prefix(evaluated, observation, budget)),
     };
     observation = Some(primary.window(now_ms));
     budget.context(RecoveryEndpoint::Oracle, RecoveryMethod::GetHealth, None);
-    let mut oracle = match shared_observation(oracle_client, &mut budget, now_ms).await {
+    let oracle = match shared_observation(oracle_client, &mut budget, now_ms).await {
         Ok(shared) => shared,
-        Err(_) => return Ok((evaluated, observation, budget.used, budget.failure)),
+        Err(_) => return Ok(prefix(evaluated, observation, budget)),
     };
-    let mut refreshed = false;
-    for attempt in attempts.iter().take(4) {
+    for attempt in attempts {
+        budget.deadline = call_deadline;
         if Instant::now() >= budget.deadline {
             budget.failed(RecoveryReason::Deadline);
             break;
-        }
-        if (primary.stale() || oracle.stale()) && !refreshed {
-            refreshed = true;
-            budget.context(RecoveryEndpoint::Primary, RecoveryMethod::GetHealth, None);
-            match shared_observation(pair.primary, &mut budget, now_ms).await {
-                Ok(shared) => {
-                    observation = Some(shared.window(now_ms));
-                    primary = shared;
-                }
-                Err(_) => break,
-            }
-            budget.context(RecoveryEndpoint::Oracle, RecoveryMethod::GetHealth, None);
-            match shared_observation(oracle_client, &mut budget, now_ms).await {
-                Ok(shared) => oracle = shared,
-                Err(_) => break,
-            }
         }
         if primary.stale() || oracle.stale() {
             budget.context(
@@ -1776,9 +1991,80 @@ async fn collect_outcomes(
             budget.failed(RecoveryReason::Lagging);
             break;
         }
-        let ExposureIdentity::Classic { tx_hash, .. } = attempt.exposure else {
+        let ExposureIdentity::Classic {
+            tx_hash,
+            max_time,
+            sequence,
+            ..
+        } = attempt.exposure
+        else {
             continue;
         };
+        let started = super::store::now_ms()?;
+        let view = run_view(attempt, started);
+        if !view.earliest_retry_ms.is_some_and(|due| started >= due) {
+            continue;
+        }
+        let mut run = WireRecoveryRun {
+            version: 1,
+            exposure: recovery_exposure_digest(
+                attempt.operation_id,
+                attempt.attempt_index,
+                &attempt.exposure,
+            )?,
+            phase: RecoveryRunPhase::Running,
+            run_started_ms: started,
+            run_deadline_ms: recovery_deadline(started)?,
+            automatic_runs: attempt
+                .recovery_run
+                .as_ref()
+                .and_then(|r| r.record())
+                .map_or(0, |r| r.automatic_runs)
+                .checked_add(1)
+                .filter(|n| *n <= 16)
+                .ok_or_else(|| WindowStoreError::Invalid {
+                    detail: "recovery_schedule_overflow".into(),
+                })?,
+            consecutive_stops: view.effective_stops,
+            stop: None,
+        };
+        recovery_retry_time(run.run_deadline_ms, run.consecutive_stops)?;
+        driver.write(
+            attempt,
+            &EvidenceInput {
+                observation,
+                ..EvidenceInput::default()
+            },
+            &run,
+            None,
+        )?;
+        let mut owned = driver.fresh(attempt, &run)?;
+        let lease_deadline = run
+            .run_deadline_ms
+            .checked_sub(super::store::now_ms()?)
+            .and_then(|remaining| Instant::now().checked_add(Duration::from_millis(remaining)))
+            .unwrap_or_else(Instant::now);
+        budget.deadline = call_deadline.min(lease_deadline);
+        let timed = recovery_expiry(max_time).is_some();
+        budget.attempt_limit = budget
+            .used
+            .attempt
+            .checked_add(if timed { 6 } else { 2 })
+            .ok_or_else(|| WindowStoreError::Invalid {
+                detail: "recovery_schedule_overflow".into(),
+            })?;
+        #[cfg(test)]
+        driver_tests::configure_budget(&mut budget);
+        let target = timed.then_some(
+            primary
+                .report
+                .latest_ledger
+                .min(oracle.report.latest_ledger),
+        );
+        let source_usable = owned
+            .account
+            .as_deref()
+            .is_some_and(|a| a.starts_with('G') && super::operations::account_id_shaped(a));
         let hash = stellar_xdr::Hash(tx_hash);
         let mut answers = [OutcomeAnswer::default(), OutcomeAnswer::default()];
         let mut interrupted = false;
@@ -1800,6 +2086,16 @@ async fn collect_outcomes(
             );
             match budget.read(false, client.recovery_transaction(&hash)).await {
                 Ok(observed) => {
+                    if observed.status.as_deref() == Some("NOT_FOUND") {
+                        let closes = (
+                            canonical_time(observed.oldest_ledger_close_time.as_ref()),
+                            canonical_time(observed.latest_ledger_close_time.as_ref()),
+                        );
+                        if !matches!((observed.oldest_ledger, observed.latest_ledger, closes), (Some(oldest), Some(latest), (Ok(Some(first)), Ok(Some(last)))) if oldest > 0 && oldest <= latest && first > 0 && first <= last && target.is_none_or(|t| latest >= t))
+                        {
+                            budget.failed(RecoveryReason::MissingField);
+                        }
+                    }
                     *slot = OutcomeAnswer::from_observed(&observed);
                     *done = true;
                 }
@@ -1811,12 +2107,16 @@ async fn collect_outcomes(
             }
         }
         let read_all = read == [true, true];
-        if interrupted {
-            break;
-        }
-        let mut seeded = attempt.clone();
+        let mut seeded = owned.clone();
         let mut scans = (None, None);
-        if matched_sequence_release(attempt).is_none() {
+        let class = classify_outcome(&owned, &answers);
+        if timed
+            && source_usable
+            && read_all
+            && budget.failure.is_none()
+            && class == OutcomeClass::Absent
+            && matched_sequence_release(&owned).is_none()
+        {
             seeded.recovery.primary_cursor.get_or_insert(
                 attempt
                     .pre_exposure_ledger
@@ -1833,12 +2133,27 @@ async fn collect_outcomes(
                 .min(oracle.report.latest_ledger);
             let left = history(pair.primary, &primary, &mut budget, &seeded, true, target).await;
             let right = history(oracle_client, &oracle, &mut budget, &seeded, false, target).await;
-            if matches!(left, Err(ReadFailure::Deadline))
-                || matches!(right, Err(ReadFailure::Deadline))
-            {
-                break;
-            }
             scans = (left.ok().flatten(), right.ok().flatten());
+            let mut release = evaluate(
+                &seeded,
+                scans.0.as_ref(),
+                scans.1.as_ref(),
+                now_ms,
+                "expiry_boundary_pending",
+            )?;
+            if release.sequence_released.is_some() {
+                release.rows.extend(partial_rows(
+                    &answers,
+                    read,
+                    (
+                        Some(primary.report.latest_ledger),
+                        Some(oracle.report.latest_ledger),
+                    ),
+                )?);
+                driver.write(&owned, &release, &run, None)?;
+                owned = driver.fresh(&owned, &run)?;
+                seeded = owned.clone();
+            }
         }
         let absent = answers
             .iter()
@@ -1847,8 +2162,11 @@ async fn collect_outcomes(
         let mut account_partial = Vec::new();
         if read_all
             && absent
-            && matched_sequence_release(attempt).is_some()
-            && let Some(account) = &attempt.account
+            && timed
+            && source_usable
+            && budget.failure.is_none()
+            && let Some(release) = matched_sequence_release(&owned)
+            && let Some(account) = &owned.account
         {
             budget.context(
                 RecoveryEndpoint::Primary,
@@ -1862,9 +2180,26 @@ async fn collect_outcomes(
                 None,
             );
             let right = account_read(oracle_client, account, &oracle, &mut budget).await;
-            let (Ok(left), Ok(right)) = (left, right) else {
-                break;
-            };
+            let (left, right) = (
+                left.unwrap_or(Err("deadline")),
+                right.unwrap_or(Err("deadline")),
+            );
+            let mut reads = [left, right];
+            for ((read, bound), role) in reads
+                .iter_mut()
+                .zip([release.primary_ledger, release.witness_ledger])
+                .zip([RecoveryEndpoint::Primary, RecoveryEndpoint::Oracle])
+            {
+                if read
+                    .as_ref()
+                    .is_ok_and(|answer| answer.latest_ledger.is_none_or(|latest| latest < bound))
+                {
+                    budget.context(role, RecoveryMethod::GetLedgerEntries, None);
+                    budget.failed(RecoveryReason::AccountUnavailable);
+                    *read = Err(ACCOUNT_LEDGER_REGRESSED);
+                }
+            }
+            let [left, right] = reads;
             account_partial = partial_account_rows(
                 [left, right],
                 (
@@ -1902,6 +2237,18 @@ async fn collect_outcomes(
                     .find(|(answer, _)| answer.defect() == Some(MISSING_FIELD))
                     .map(|(_, endpoint)| endpoint)
             });
+        let (mut high_roles, mut high_ledger) = (Vec::new(), None);
+        if let Some(Ok(answers)) = &accounts {
+            for (answer, role) in answers
+                .iter()
+                .zip([RecoveryRole::Primary, RecoveryRole::Oracle])
+            {
+                if answer.sequence.is_some_and(|s| s >= sequence) {
+                    high_roles.push(role);
+                    high_ledger = high_ledger.or(answer.latest_ledger);
+                }
+            }
+        }
         let mut evaluation = evaluate_outcome(
             &seeded,
             read_all.then_some(answers),
@@ -1935,7 +2282,15 @@ async fn collect_outcomes(
                 recovery.last_outcome = Some("evidence_pending".to_owned());
                 recovery.diagnostic = Some("coverage_required".to_owned());
             }
-            budget.failed(RecoveryReason::CoverageRequired);
+            // A legacy release does not change an untimed run's hash-only stop.
+            if timed {
+                budget.context(
+                    RecoveryEndpoint::Primary,
+                    RecoveryMethod::GetLedgerEntries,
+                    None,
+                );
+                budget.failed(RecoveryReason::CoverageRequired);
+            }
         }
         evaluation.input.rows.extend(partial);
         evaluation.input.rows.extend(account_partial);
@@ -1943,22 +2298,106 @@ async fn collect_outcomes(
             .input
             .rows
             .truncate(super::operations::MAX_EVIDENCE_ROWS);
-        evaluation.input.expected_attempt = Some(attempt.clone());
-        evaluation.input.observation = observation;
-        evaluation.attempt = attempt.clone();
+        if budget.failure.is_some() {
+            evaluation.decision = None;
+        }
+        let fresh = driver.fresh(&owned, &run)?;
+        let decision = evaluation
+            .decision
+            .clone()
+            .and_then(|(transition, digest, ledgers)| {
+                CheckedRecoveryDecision::new(
+                    &fresh,
+                    digest,
+                    ledgers,
+                    transition,
+                    evaluation.input.recovery.clone().unwrap_or_default(),
+                )
+            });
+        if decision.is_some() {
+            run.phase = RecoveryRunPhase::Resolved;
+            run.consecutive_stops = 0;
+        } else {
+            use RecoveryStage as S;
+            use RecoveryStopReason as R;
+            let (reason, stage) = if !source_usable {
+                (R::RecordUnusable, S::Account)
+            } else if matches!(class, OutcomeClass::Disagreement(_)) {
+                (R::Disagreement, S::Hash)
+            } else if !read_all || !matches!(class, OutcomeClass::Absent) {
+                (R::MissingField, S::Hash)
+            } else if !timed {
+                (R::Untimed, S::Hash)
+            } else if matched_sequence_release(&owned).is_some() {
+                (R::CoverageRequired, S::Account)
+            } else if evaluation
+                .input
+                .recovery
+                .as_ref()
+                .is_some_and(|r| r.last_outcome.as_deref() == Some("disagreement"))
+            {
+                (R::Disagreement, S::Target)
+            } else {
+                (R::AwaitingExpiry, S::Target)
+            };
+            let now = super::store::now_ms()?;
+            let mut stop = contextual_stop(
+                if source_usable { budget.failure } else { None },
+                reason,
+                stage,
+                target,
+                now.max(started),
+                run.consecutive_stops,
+                max_time,
+            )?;
+            if now < started {
+                stop = contextual_stop(
+                    None,
+                    R::ClockRegression,
+                    S::Lease,
+                    target,
+                    started,
+                    run.consecutive_stops,
+                    max_time,
+                )?;
+            }
+            if stop.reason == R::CoverageRequired && !high_roles.is_empty() {
+                stop.roles = high_roles;
+                stop.ledger = high_ledger;
+            }
+            run.phase = RecoveryRunPhase::Stopped;
+            run.consecutive_stops =
+                run.consecutive_stops
+                    .checked_add(1)
+                    .ok_or_else(|| WindowStoreError::Invalid {
+                        detail: "recovery_schedule_overflow".into(),
+                    })?;
+            run.stop = Some(stop.clone());
+            evaluation.stop = Some(stop);
+        }
+        driver.write(&fresh, &evaluation.input, &run, decision.as_ref())?;
+        evaluation.attempt = fresh;
+        #[cfg(test)]
+        tests::capture_evaluation(&evaluation);
         evaluated.push(evaluation);
+        first_missing = first_missing.or(budget.failure.take());
+        #[cfg(test)]
+        driver_tests::after_attempt().await;
     }
-    Ok((evaluated, observation, budget.used, budget.failure))
+    Ok((
+        evaluated,
+        observation,
+        budget.used,
+        first_missing.or(budget.failure),
+        budget.failure,
+    ))
 }
 
-/// Runs the outcome-capable recovery pass: one bounded two-endpoint pass
-/// over the four oldest unknown classic attempts, released ones included,
-/// or the attempt `tx_hash` names. Each attempt commits its evidence and at
-/// most one transition: an agreed outcome, its first sequence release, or a
-/// proven non-inclusion, through checked decisions.
-///
-/// The submission flow can call this pass from dispatch and targeted status,
-/// after the sequence stage of [`recover_sequences`].
+/// Runs bounded recovery over the four oldest runnable classic attempts.
+/// A hash selects one attempt, including its non-runnable scheduling result.
+/// Each reached attempt reserves a lease and can release and decide in this call.
+/// The shared prefix writes nothing; production dispatch and status still use
+/// [`recover_sequences`]. Receipt replacement and acknowledgement remain separate.
 ///
 /// # Errors
 /// Returns snapshot, audit and commit errors. An endpoint on another network
@@ -1971,65 +2410,113 @@ pub async fn recover_outcomes(
     tx_hash: Option<&[u8; 32]>,
 ) -> Result<RecoveryReport, RecoveryError> {
     let status = OperationStatus::new(store, profile);
-    let attempts = status.outcome_snapshot(tx_hash)?;
+    let now_ms = super::store::now_ms()?;
+    let attempts = status.runnable_snapshot(tx_hash, now_ms)?;
     if !profile.chain_id.is_mainnet() || attempts.is_empty() {
         return Ok(RecoveryReport::default());
     }
-    let now_ms = super::store::now_ms()?;
-    let (evaluated, observation, requests, missing) =
-        collect_outcomes(&pair, &attempts, now_ms).await?;
-    let mut writer = writer.lock().map_err(|_| WindowStoreError::Invalid {
-        detail: "audit writer mutex is poisoned".to_owned(),
-    })?;
-    let mut recorder = OperationRecorder::new(
-        store,
-        profile,
-        &mut *writer,
-        uuid::Uuid::new_v4().to_string(),
-    );
-    let report = RecoveryReport {
-        requests,
-        evaluated: evaluated.len(),
-        missing,
+    let runnable: Vec<_> = attempts
+        .iter()
+        .filter(|a| {
+            run_view(a, now_ms)
+                .earliest_retry_ms
+                .is_some_and(|due| now_ms >= due)
+        })
+        .cloned()
+        .collect();
+    let mut report = RecoveryReport::default();
+    let mut unreached = None;
+    let evaluated = if runnable.is_empty() {
+        Vec::new()
+    } else {
+        let driver = Driver {
+            store,
+            profile,
+            writer,
+        };
+        let (evaluated, _, requests, missing, skipped) =
+            collect_outcomes(&driver, &pair, &runnable, now_ms)
+                .await
+                .map_err(|error| {
+                    if !matches!(error, RecoveryError::Store(_)) {
+                        return error;
+                    }
+                    let mut detail = sequence_failure_detail(&status, &runnable);
+                    let decided = runnable
+                        .iter()
+                        .filter(|a| {
+                            matches!(
+                                status.recovery_run_view(a.operation_id, a.attempt_index, now_ms),
+                                Ok(Some(RecoveryRunView {
+                                    state: RecoveryRunState::Resolved,
+                                    ..
+                                }))
+                            )
+                        })
+                        .count();
+                    if decided > 0 {
+                        detail.push_str(&format!("; decided: {decided}"));
+                    }
+                    error.with_context(detail)
+                })?;
+        report.requests = requests;
+        unreached = skipped;
+        report.missing = missing;
+        report.evaluated = evaluated.len();
+        evaluated
     };
-    if evaluated.is_empty() {
-        if let Some(observation) = observation {
-            recorder.record_observation(observation)?;
-        }
-        return Ok(report);
-    }
-    for Evaluated {
-        attempt,
-        input,
-        decision,
-    } in evaluated
-    {
-        recorder.record_evidence(attempt.operation_id, attempt.attempt_index, &input)?;
-        let Some((transition, digest, ledgers)) = decision else {
-            continue;
-        };
-        // Each decision binds the generation of a fresh verified read, so
-        // no snapshot generation serves two commits.
-        let ExposureIdentity::Classic { tx_hash, .. } = attempt.exposure else {
-            continue;
-        };
-        let fresh = OperationStatus::new(store, profile)
-            .outcome_snapshot(Some(&tx_hash))?
-            .into_iter()
-            .find(|fresh| {
-                fresh.operation_id == attempt.operation_id
-                    && fresh.attempt_index == attempt.attempt_index
-                    && fresh.exposure == attempt.exposure
-            });
-        let Some(fresh) = fresh else {
-            continue;
-        };
-        let recovery = input.recovery.clone().unwrap_or_default();
-        if let Some(decision) =
-            CheckedRecoveryDecision::new(&fresh, digest, ledgers, transition, recovery)
+    let now_ms = super::store::now_ms()?;
+    for attempt in &attempts {
+        let mut view = status
+            .recovery_run_view(attempt.operation_id, attempt.attempt_index, now_ms)?
+            .unwrap_or_else(|| run_view(attempt, now_ms));
+        let done = evaluated.iter().find(|e| {
+            e.attempt.operation_id == attempt.operation_id
+                && e.attempt.attempt_index == attempt.attempt_index
+        });
+        let mut stop = done.map_or_else(
+            || attempt.recovery_run.as_ref()?.record()?.stop.clone(),
+            |e| e.stop.clone(),
+        );
+        if done.is_none()
+            && runnable.contains(attempt)
+            && let Some(failure) = unreached
         {
-            recorder.commit_decision(&decision)?;
+            let ExposureIdentity::Classic { max_time, .. } = attempt.exposure else {
+                unreachable!()
+            };
+            let mut advice = contextual_stop(
+                pair.oracle.map(|_| failure),
+                if pair.oracle.is_none() {
+                    RecoveryStopReason::ConfigurationRequired
+                } else {
+                    RecoveryStopReason::MissingField
+                },
+                if pair.oracle.is_none() {
+                    RecoveryStage::Configuration
+                } else {
+                    RecoveryStage::Selection
+                },
+                None,
+                now_ms,
+                0,
+                max_time,
+            )?;
+            if pair.oracle.is_none() {
+                advice.roles = vec![RecoveryRole::Oracle];
+            }
+            view.state = RecoveryRunState::Stopped(advice.reason);
+            view.class = Some(advice.class);
+            view.earliest_retry_ms = advice.earliest_retry_ms;
+            stop = Some(advice);
         }
+        report.attempts.push(RecoveryAttemptResult {
+            operation_id: attempt.operation_id,
+            attempt_index: attempt.attempt_index,
+            history_start: attempt.pre_exposure_ledger,
+            view,
+            stop,
+        });
     }
     Ok(report)
 }
@@ -2045,6 +2532,7 @@ fn commit_batch(
         requests: batch.requests,
         evaluated: batch.inputs.len(),
         missing: batch.missing,
+        attempts: Vec::new(),
     };
     if batch.inputs.is_empty() {
         if let Some(observation) = batch.observation {
@@ -2192,6 +2680,9 @@ pub fn claim_fixture_authorization(
 }
 
 #[cfg(test)]
+mod driver_tests;
+
+#[cfg(test)]
 mod tests {
     #![allow(
         clippy::unwrap_used,
@@ -2212,6 +2703,134 @@ mod tests {
     use wiremock::{Mock, MockServer};
 
     const NOW: u64 = 1_800_000_000_000;
+
+    thread_local! {
+        static EVALUATIONS: std::cell::RefCell<Option<Vec<Evaluated>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn capture_evaluation(e: &Evaluated) {
+        EVALUATIONS.with_borrow_mut(|slot| {
+            if let Some(rows) = slot {
+                rows.push(Evaluated {
+                    attempt: e.attempt.clone(),
+                    input: e.input.clone(),
+                    decision: e.decision.clone(),
+                    stop: e.stop.clone(),
+                });
+            }
+        });
+    }
+
+    async fn public_outcomes_on(
+        fx: &Fx,
+        pair: &EndpointPair<'_>,
+    ) -> Result<
+        (
+            Vec<Evaluated>,
+            Option<WindowObservation>,
+            RecoveryRequests,
+            Option<RecoveryFailure>,
+        ),
+        RecoveryError,
+    > {
+        let writer = crate::submission_flow::recovery::tests::writer_at(&fx.profile.audit_log_path);
+        public_outcomes_with_writer(fx, pair, &writer).await
+    }
+
+    async fn public_outcomes_with_writer(
+        fx: &Fx,
+        pair: &EndpointPair<'_>,
+        writer: &Arc<Mutex<AuditWriter>>,
+    ) -> Result<
+        (
+            Vec<Evaluated>,
+            Option<WindowObservation>,
+            RecoveryRequests,
+            Option<RecoveryFailure>,
+        ),
+        RecoveryError,
+    > {
+        EVALUATIONS.with_borrow_mut(|slot| *slot = Some(Vec::new()));
+        let result = recover_outcomes(
+            &fx.store,
+            &fx.profile,
+            EndpointPair::from_clients(pair.primary, pair.oracle),
+            writer,
+            None,
+        )
+        .await;
+        let rows = EVALUATIONS.with_borrow_mut(|slot| slot.take().unwrap());
+        let report = result?;
+        Ok((rows, None, report.requests, report.missing))
+    }
+
+    async fn public_outcomes_fixture(
+        pair: &EndpointPair<'_>,
+        attempts: &[RecoveryAttempt],
+        now: u64,
+    ) -> Result<
+        (
+            Vec<Evaluated>,
+            Option<WindowObservation>,
+            RecoveryRequests,
+            Option<RecoveryFailure>,
+        ),
+        RecoveryError,
+    > {
+        let mut fx = Fx::new();
+        fx.clock.set(now);
+        for (n, template) in attempts.iter().enumerate() {
+            let ExposureIdentity::Classic { max_time, .. } = template.exposure else {
+                panic!("classic")
+            };
+            let id = super::super::operations::tests::unknown_with(
+                &mut fx,
+                u8::try_from(n + 1).unwrap(),
+                max_time,
+                vec![],
+            )
+            .id();
+            fx.recorder().record_evidence(
+                id,
+                1,
+                &EvidenceInput {
+                    recovery: Some(template.recovery.clone()),
+                    sequence_released: template.sequence_release,
+                    ..EvidenceInput::default()
+                },
+            )?;
+            fx.rewrite(|wire| {
+                let record = wire
+                    .operations
+                    .as_mut()
+                    .unwrap()
+                    .records
+                    .iter_mut()
+                    .find(|r| r.id == id)
+                    .unwrap();
+                let attempt = &mut record.attempts[0];
+                attempt.exposure.as_mut().unwrap().identity = template.exposure.clone();
+                attempt.pre_exposure_ledger = template.pre_exposure_ledger;
+                let auth_id = attempt.authorization_id;
+                if let Some(source) = &template.account {
+                    let auth = wire
+                        .authorizations
+                        .iter_mut()
+                        .find(|a| a.id == auth_id)
+                        .unwrap();
+                    let super::super::DomainBinding::Transaction { source: stored, .. } =
+                        &mut auth.binding
+                    else {
+                        panic!("classic")
+                    };
+                    *stored = source.clone();
+                } else {
+                    wire.authorizations.retain(|a| a.id != auth_id);
+                }
+            });
+        }
+        public_outcomes_on(&fx, pair).await
+    }
 
     fn attempt(max_time: u64) -> RecoveryAttempt {
         RecoveryAttempt {
@@ -2412,7 +3031,7 @@ mod tests {
     }
 
     /// A classic envelope with fee cap `fee`, as base64 XDR.
-    fn envelope_text(fee: u32) -> String {
+    pub(super) fn envelope_text(fee: u32) -> String {
         use stellar_xdr::WriteXdr;
         stellar_xdr::TransactionEnvelope::Tx(stellar_xdr::TransactionV1Envelope {
             tx: stellar_xdr::Transaction {
@@ -2431,7 +3050,7 @@ mod tests {
     }
 
     /// A transaction result charging `fee`, successful or failed.
-    fn result_text(success: bool, fee: i64) -> String {
+    pub(super) fn result_text(success: bool, fee: i64) -> String {
         use stellar_xdr::WriteXdr;
         stellar_xdr::TransactionResult {
             fee_charged: fee,
@@ -4351,7 +4970,7 @@ mod tests {
     }
 
     #[cfg(feature = "mainnet-write")]
-    async fn exposed_fixture(
+    pub(super) async fn exposed_fixture(
         label: &str,
     ) -> (
         crate::mainnet::fixtures::LedgerFixture,
@@ -5275,7 +5894,7 @@ mod tests {
         );
     }
 
-    async fn mount(server: &MockServer, name: &str, answer: serde_json::Value) {
+    pub(super) async fn mount(server: &MockServer, name: &str, answer: serde_json::Value) {
         Mock::given(method("POST"))
             .and(body_partial_json(json!({"method": name})))
             .respond_with(EchoIdResponder::new(answer))
@@ -5283,7 +5902,7 @@ mod tests {
             .await;
     }
 
-    async fn endpoint(ledger: u32, close: u64) -> MockServer {
+    pub(super) async fn endpoint(ledger: u32, close: u64) -> MockServer {
         let server = MockServer::start().await;
         mount(
             &server,
@@ -5560,7 +6179,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn singleton_history_cannot_grant_complete_history_proof() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let primary = endpoint(60, NOW / 1000).await;
         let oracle = endpoint(61, NOW / 1000).await;
         for (server, ledger) in [(&primary, 60), (&oracle, 61)] {
@@ -5571,7 +6194,7 @@ mod tests {
         let right = StellarRpcClient::new(&oracle.uri()).unwrap();
         let mut attempt = exposed(true);
         attempt.account = None;
-        let (evaluations, _, _, failure) = collect_outcomes(
+        let (evaluations, _, _, failure) = public_outcomes_fixture(
             &EndpointPair::from_clients(&left, Some(&right)),
             &[attempt],
             NOW,
@@ -5671,7 +6294,7 @@ mod tests {
     #[tokio::test]
     async fn recovery_tip_sequence_releases_in_one_pass() {
         for oracle_tip in [7, 8] {
-            for outcomes in [false, true] {
+            {
                 let primary = endpoint(7, 140).await;
                 let oracle = endpoint(oracle_tip, u64::from(oracle_tip) * 20).await;
                 for (server, tip) in [(&primary, 7), (&oracle, oracle_tip)] {
@@ -5711,18 +6334,9 @@ mod tests {
                 let mut requests = RecoveryRequests::default();
                 let release = loop {
                     passes += 1;
-                    let (input, used) = if outcomes {
-                        let (mut evaluations, _, used, missing) =
-                            collect_outcomes(&pair, &[attempt.clone()], 140_000)
-                                .await
-                                .unwrap();
-                        assert!(missing.is_none());
-                        (evaluations.remove(0).input, used)
-                    } else {
-                        let mut batch = collect(&pair, &[attempt.clone()], 140_000).await.unwrap();
-                        assert!(batch.missing.is_none());
-                        (batch.inputs.remove(0).2, batch.requests)
-                    };
+                    let mut batch = collect(&pair, &[attempt.clone()], 140_000).await.unwrap();
+                    assert!(batch.missing.is_none());
+                    let (input, used) = (batch.inputs.remove(0).2, batch.requests);
                     requests.attempt += used.attempt;
                     requests.shared += used.shared;
                     if let Some(release) = input.sequence_released {
@@ -5735,7 +6349,7 @@ mod tests {
                 assert_eq!(
                     requests,
                     RecoveryRequests {
-                        attempt: if outcomes { 4 } else { 2 },
+                        attempt: 2,
                         shared: 4
                     }
                 );
@@ -5746,7 +6360,7 @@ mod tests {
                 assert_eq!(
                     primary.received_requests().await.unwrap().len()
                         + oracle.received_requests().await.unwrap().len(),
-                    if outcomes { 8 } else { 6 }
+                    6
                 );
             }
         }
@@ -5759,7 +6373,7 @@ mod tests {
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         for primary_ahead in [true, false] {
             for saved_upper in [false, true] {
-                for outcomes in [false, true] {
+                {
                     let mut fx = Fx::new();
                     let id = super::super::operations::tests::unknown_with(
                         &mut fx,
@@ -5842,38 +6456,7 @@ mod tests {
                             answer["latestLedger"] = json!(tip);
                             mount(server, "getLedgerEntries", answer).await;
                         }
-                        let batch = if outcomes {
-                            let (evaluations, observation, requests, missing) =
-                                collect_outcomes(&pair, &attempts, NOW).await.unwrap();
-                            assert_eq!(evaluations.len(), 1);
-                            if pass < 2 {
-                                assert!(evaluations[0].decision.is_none());
-                            } else {
-                                assert!(matches!(
-                                    evaluations[0].decision,
-                                    Some((
-                                        DecidedTransition::NotIncluded(
-                                            NotIncludedProof::AccountSequence { .. }
-                                        ),
-                                        _,
-                                        _
-                                    ))
-                                ));
-                            }
-                            Batch {
-                                inputs: evaluations
-                                    .into_iter()
-                                    .map(|e| {
-                                        (e.attempt.operation_id, e.attempt.attempt_index, e.input)
-                                    })
-                                    .collect(),
-                                observation,
-                                requests,
-                                missing,
-                            }
-                        } else {
-                            collect(&pair, &attempts, NOW).await.unwrap()
-                        };
+                        let batch = collect(&pair, &attempts, NOW).await.unwrap();
                         if pass == 0 {
                             assert!(batch.inputs[0].2.sequence_released.is_none());
                             assert_eq!(
@@ -5981,6 +6564,7 @@ mod tests {
                 },
             )
             .unwrap();
+        fx.clock.set(NOW + 5_000);
         (fx, id, account)
     }
 
@@ -6004,7 +6588,7 @@ mod tests {
                 server,
                 "getTransaction",
                 json!({
-                    "status":"NOT_FOUND", "oldestLedger":1, "latestLedger":tip
+                    "status":"NOT_FOUND", "oldestLedger":1, "latestLedger":tip, "oldestLedgerCloseTime":1, "latestLedgerCloseTime":NOW/1000
                 }),
             )
             .await;
@@ -6021,7 +6605,7 @@ mod tests {
     async fn recovery_unmatched_stored_release_keeps_debit_when_target_unreadable() {
         let guard_home = tempfile::tempdir().unwrap();
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
-        let (mut fx, id, account) = unmatched_release_fixture();
+        let (fx, id, account) = unmatched_release_fixture();
         let attempts = OperationStatus::new(&fx.store, &fx.profile)
             .outcome_snapshot(None)
             .unwrap();
@@ -6058,20 +6642,17 @@ mod tests {
         let [primary, oracle] = unmatched_release_endpoints(&account, [60, 59]).await;
         let left = StellarRpcClient::new(&primary.uri()).unwrap();
         let right = StellarRpcClient::new(&oracle.uri()).unwrap();
-        let (evaluations, _, _, missing) = collect_outcomes(
-            &EndpointPair::from_clients(&left, Some(&right)),
-            &attempts,
-            NOW,
-        )
-        .await
-        .unwrap();
+        let (evaluations, _, _, missing) =
+            public_outcomes_on(&fx, &EndpointPair::from_clients(&left, Some(&right)))
+                .await
+                .unwrap();
         assert_eq!(evaluations.len(), 1);
         assert!(evaluations[0].decision.is_none());
         assert!(evaluations[0].input.sequence_released.is_none());
         assert_eq!(
             missing,
             Some(RecoveryFailure {
-                reason: RecoveryReason::CoverageRequired,
+                reason: RecoveryReason::Lagging,
                 endpoint: RecoveryEndpoint::Primary,
                 method: RecoveryMethod::GetLedgers,
                 ledger: Some(59),
@@ -6079,9 +6660,10 @@ mod tests {
         );
         assert_eq!(requested_starts(&primary).await, Vec::<u64>::new());
         assert_eq!(requested_starts(&oracle).await, [59]);
-        fx.recorder()
-            .record_evidence(id, 1, &evaluations[0].input)
-            .unwrap();
+        assert_eq!(
+            evaluations[0].stop.as_ref().unwrap().class,
+            RecoveryClass::Automatic
+        );
         assert_eq!(fx.record(id).state, OperationState::SentOutcomeUnknown);
         let release = fx.record(id).attempts[0].sequence_released.clone().unwrap();
         assert_eq!((release.primary_ledger, release.witness_ledger), (50, 51));
@@ -6098,71 +6680,55 @@ mod tests {
     async fn recovery_unmatched_stored_release_reads_target_once_then_decides() {
         let guard_home = tempfile::tempdir().unwrap();
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
-        let (mut fx, id, account) = unmatched_release_fixture();
+        let (fx, id, account) = unmatched_release_fixture();
+        let writer = crate::submission_flow::recovery::tests::writer_at(&fx.profile.audit_log_path);
         for pass in 0..3 {
             let [primary, oracle] = unmatched_release_endpoints(&account, [60, 60]).await;
             let left = StellarRpcClient::new(&primary.uri()).unwrap();
             let right = StellarRpcClient::new(&oracle.uri()).unwrap();
-            let attempts = OperationStatus::new(&fx.store, &fx.profile)
-                .outcome_snapshot(None)
-                .unwrap();
-            let (evaluations, _, _, missing) = collect_outcomes(
+            let (evaluations, _, requests, missing) = public_outcomes_with_writer(
+                &fx,
                 &EndpointPair::from_clients(&left, Some(&right)),
-                &attempts,
-                NOW,
+                &writer,
             )
             .await
             .unwrap();
             assert!(missing.is_none());
-            assert_eq!(evaluations.len(), usize::from(pass < 2));
+            assert_eq!(evaluations.len(), usize::from(pass == 0));
+            assert_eq!(
+                requests,
+                if pass == 0 {
+                    RecoveryRequests {
+                        shared: 4,
+                        attempt: 6,
+                    }
+                } else {
+                    RecoveryRequests::default()
+                }
+            );
             let starts: Vec<u64> = if pass == 0 { vec![60] } else { vec![] };
             assert_eq!(requested_starts(&primary).await, starts);
             assert_eq!(requested_starts(&oracle).await, starts);
-            if let Some(evaluation) = evaluations.into_iter().next() {
-                if pass == 0 {
-                    assert!(evaluation.decision.is_none());
-                    let release = evaluation.input.sequence_released.unwrap();
-                    assert_eq!((release.primary_ledger, release.witness_ledger), (60, 60));
-                } else {
-                    assert!(evaluation.input.sequence_released.is_none());
-                    assert!(matches!(
-                        evaluation.decision,
-                        Some((
-                            DecidedTransition::NotIncluded(
-                                NotIncludedProof::AccountSequence { .. }
-                            ),
-                            _,
-                            _
-                        ))
-                    ));
-                }
-                fx.recorder()
-                    .record_evidence(id, 1, &evaluation.input)
-                    .unwrap();
-                assert_eq!(
-                    OperationStatus::new(&fx.store, &fx.profile)
-                        .native_reserved_stroops(None)
-                        .unwrap(),
-                    125
-                );
-                if let Some((transition, digest, ledgers)) = evaluation.decision {
-                    let fresh = OperationStatus::new(&fx.store, &fx.profile)
-                        .outcome_snapshot(None)
-                        .unwrap()
-                        .remove(0);
-                    let decision = CheckedRecoveryDecision::new(
-                        &fresh,
-                        digest,
-                        ledgers,
-                        transition,
-                        evaluation.input.recovery.unwrap(),
-                    )
-                    .unwrap();
-                    fx.recorder().commit_decision(&decision).unwrap();
-                }
+            if let Some(evaluation) = evaluations.first() {
+                assert!(matches!(
+                    evaluation.decision,
+                    Some((
+                        DecidedTransition::NotIncluded(NotIncludedProof::AccountSequence { .. }),
+                        _,
+                        _
+                    ))
+                ));
             }
-            let release = fx.record(id).attempts[0].sequence_released.clone().unwrap();
+            let record = fx.record(id);
+            let release = record.attempts[0].sequence_released.as_ref().unwrap();
             assert_eq!((release.primary_ledger, release.witness_ledger), (60, 60));
+            assert_eq!(record.state, OperationState::NotIncluded);
+            assert_eq!(
+                OperationStatus::new(&fx.store, &fx.profile)
+                    .native_reserved_stroops(None)
+                    .unwrap(),
+                0
+            );
             assert_eq!(
                 fx.sink
                     .entries
@@ -6175,22 +6741,22 @@ mod tests {
                         }
                     ))
                     .count(),
-                2
+                1
             );
+            let audit = std::fs::read_to_string(&fx.profile.audit_log_path).unwrap();
             assert_eq!(
-                fx.record(id).state,
-                if pass == 0 {
-                    OperationState::SentOutcomeUnknown
-                } else {
-                    OperationState::NotIncluded
-                }
+                audit
+                    .lines()
+                    .filter(|line| line.contains("\"sequence_released\":true"))
+                    .count(),
+                1
             );
-            assert_eq!(
-                OperationStatus::new(&fx.store, &fx.profile)
-                    .native_reserved_stroops(None)
-                    .unwrap(),
-                if pass == 0 { 125 } else { 0 }
-            );
+            let view = OperationStatus::new(&fx.store, &fx.profile)
+                .recovery_run_view(id, 1, NOW + 5_000)
+                .unwrap()
+                .unwrap();
+            assert_eq!(view.state, RecoveryRunState::Resolved);
+            assert_eq!(view.effective_stops, 0);
         }
     }
 
@@ -6301,12 +6867,16 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn recovery_not_found_without_latest_records_missing_field() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for missing_primary in [false, true] {
             let primary = endpoint(60, NOW / 1000).await;
             let oracle = endpoint(60, NOW / 1000).await;
             for (server, missing) in [(&primary, missing_primary), (&oracle, !missing_primary)] {
-                let mut answer = json!({"status":"NOT_FOUND", "oldestLedger":1, "latestLedger":60});
+                let mut answer = json!({"status":"NOT_FOUND", "oldestLedger":1, "latestLedger":60, "oldestLedgerCloseTime":1, "latestLedgerCloseTime":NOW/1000});
                 if missing {
                     answer.as_object_mut().unwrap().remove("latestLedger");
                 }
@@ -6314,7 +6884,7 @@ mod tests {
             }
             let left = StellarRpcClient::new(&primary.uri()).unwrap();
             let right = StellarRpcClient::new(&oracle.uri()).unwrap();
-            let (evaluations, _, requests, missing) = collect_outcomes(
+            let (evaluations, _, requests, missing) = public_outcomes_fixture(
                 &EndpointPair::from_clients(&left, Some(&right)),
                 &[exposed(true)],
                 NOW,
@@ -6349,6 +6919,7 @@ mod tests {
                 requests,
                 evaluated: evaluations.len(),
                 missing,
+                attempts: Vec::new(),
             };
             assert!(
                 matches!(report.require_evidence(), Err(RecoveryError::NeedsEvidence(failure)) if failure == expected)
@@ -6366,7 +6937,7 @@ mod tests {
             mount(
                 server,
                 "getTransaction",
-                json!({"status":"NOT_FOUND", "oldestLedger":1, "latestLedger":60}),
+                json!({"status":"NOT_FOUND", "oldestLedger":1, "latestLedger":60, "oldestLedgerCloseTime":1, "latestLedgerCloseTime":NOW/1000}),
             )
             .await;
         }
@@ -6379,7 +6950,7 @@ mod tests {
         let right = StellarRpcClient::new(&oracle.uri()).unwrap();
         let mut attempt = exposed(true);
         attempt.account = Some(account);
-        let (evaluations, _, _, failure) = collect_outcomes(
+        let (evaluations, _, _, failure) = public_outcomes_fixture(
             &EndpointPair::from_clients(&left, Some(&right)),
             &[attempt],
             NOW,
@@ -6391,7 +6962,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn recovery_account_read_below_its_health_tip_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let account = stellar_agent_test_support::signed_envelope::account_id_for_seed([1; 32]);
         for latest in [60, 55] {
             let mut answer =
@@ -6425,7 +7000,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn recovery_missing_and_undecodable_accounts_keep_their_reasons() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let account = stellar_agent_test_support::signed_envelope::account_id_for_seed([1; 32]);
         for missing in [true, false] {
             let mut answer =
@@ -6433,7 +7012,7 @@ mod tests {
             answer["latestLedger"] = json!(60);
             let reason = if missing {
                 answer["entries"] = json!([]);
-                RecoveryReason::CoverageRequired
+                RecoveryReason::AccountUnavailable
             } else {
                 answer["entries"][0]["xdr"] = json!("invalid");
                 RecoveryReason::MissingField
@@ -6714,6 +7293,7 @@ mod tests {
                 requests: budget.used,
                 evaluated: 0,
                 missing: Some(failure),
+                attempts: Vec::new(),
             };
             assert!(
                 matches!(report.require_evidence(), Err(RecoveryError::NeedsEvidence(seen)) if seen == failure)
