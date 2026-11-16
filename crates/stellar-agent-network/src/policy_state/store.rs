@@ -1964,6 +1964,23 @@ impl PersistedWindowStore {
         profile: &Profile,
         dest: &PolicyStateStore,
     ) -> Result<(), WindowStoreError> {
+        self.load_into_at(profile_name, profile, dest, now_ms()?)
+    }
+
+    /// Hydrates an image at the supplied policy instant, including live holds.
+    ///
+    /// Preserves authenticated reads and earlier-version retirement. Callers
+    /// must discard the destination on error rather than evaluate partial state.
+    ///
+    /// # Errors
+    /// The integrity, migration and append errors of [`Self::load_into`].
+    pub fn load_into_at(
+        &self,
+        profile_name: &str,
+        profile: &Profile,
+        dest: &PolicyStateStore,
+        now: u64,
+    ) -> Result<(), WindowStoreError> {
         let Some(mut wire) = self.read_verified_unlocked(profile_name, profile)? else {
             return Ok(());
         };
@@ -1974,7 +1991,6 @@ impl PersistedWindowStore {
         if earlier_build(&wire) {
             wire = self.retire_on_load(profile)?;
         }
-        let now = now_ms()?;
         let in_memory = |result: Result<(), StateStoreError>| {
             result.map_err(|e| WindowStoreError::Invalid {
                 detail: format!("in-memory store append failed: {e}"),
@@ -20712,6 +20728,55 @@ mod tests {
         }
 
         // ── the projection ───────────────────────────────────────────────
+
+        #[test]
+        #[serial]
+        fn snapshot_hydration_uses_capture_time_and_keeps_its_image() {
+            let guard_home = tempfile::tempdir().unwrap();
+            let _guard_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+            let f = fx("snapshot-time");
+            f.pin(D1);
+            f.store
+                .record_and_persist(&f.profile, &[f.windowed(2)])
+                .unwrap();
+            let mut wire = f.wire();
+            let mut authorization = open_authorization(1, T + 10);
+            authorization.chain = f.profile.chain_id;
+            authorization.profile = f.name.clone();
+            authorization.reservation = Some(authorization.id);
+            wire.authorizations.push(authorization);
+            wire.holds.push(total_hold(1, 6, Some(D1)));
+            f.store.seal_unchecked_for_test(&f.profile, &wire);
+            f.clock.set(T + 10);
+            let captured = PolicyStateStore::new();
+            f.store
+                .load_into_at(&f.name, &f.profile, &captured, T + 9)
+                .unwrap();
+            assert_eq!(captured.query_epoch(&f.total_key(), D1).unwrap(), (6, 1));
+            assert_eq!(captured.query_epoch(&f.total_key(), D2).unwrap(), (0, 0));
+            let fresh = PolicyStateStore::new();
+            f.store
+                .load_into_at(&f.name, &f.profile, &fresh, T + 10)
+                .unwrap();
+            assert_eq!(fresh.query_epoch(&f.total_key(), D1).unwrap(), (0, 0));
+            f.store
+                .record_and_persist(&f.profile, &[f.windowed(3)])
+                .unwrap();
+            assert_eq!(
+                captured.query_window(f.windowed(0).key(), T + 9).unwrap(),
+                (2, 1)
+            );
+            let fresh = PolicyStateStore::new();
+            f.store
+                .load_into_at(&f.name, &f.profile, &fresh, T + 11)
+                .unwrap();
+            assert_eq!(
+                fresh.query_window(f.windowed(0).key(), T + 11).unwrap(),
+                (5, 2)
+            );
+            assert_eq!(captured.query_epoch(&f.total_key(), D1).unwrap(), (6, 1));
+        }
 
         /// The hydrated gate drops an unswept expired unused hold at the
         /// ordinary sweep's boundary, while durable admission counts the hold

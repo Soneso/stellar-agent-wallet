@@ -1046,6 +1046,15 @@ async fn toolset_forced_approval_keeps_allow_effects_and_reservation() {
         "stellar:testnet",
     )
     .await;
+    let cache = Arc::new(crate::common::CountingCounterpartyCache::default());
+    h.server.set_counterparty_resolver_for_test(cache.clone());
+    let carried = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = Arc::clone(&carried);
+    h.server
+        .set_forced_snapshot_observer_for_test(Arc::new(move |same| {
+            assert!(same, "forced approval retains the live gate frame");
+            observed.fetch_add(1, Ordering::SeqCst);
+        }));
     let tools = tempfile::tempdir().unwrap();
     stellar_agent_toolsets_install::write_toolset_for_test(
         tools.path(),
@@ -1085,6 +1094,11 @@ async fn toolset_forced_approval_keeps_allow_effects_and_reservation() {
         .set_toolset_pin_key_for_test(crate::common::toolset_pin_key());
     h.server.set_grant_store_path_for_test(grant_path.clone());
     let sim = h.simulate_pay(AMOUNT).await;
+    assert_eq!(
+        cache.reads(),
+        1,
+        "preparation and paired commit share the cache"
+    );
     assert!(sim["data"]["approval"].is_null());
     let args = h.pay_args(&sim["data"], AMOUNT, None);
     let invoke = |params| StellarToolsetInvokeArgs {
@@ -1185,6 +1199,11 @@ async fn toolset_forced_approval_keeps_allow_effects_and_reservation() {
             entries: 1,
             pending: 1
         }
+    );
+    assert_eq!(
+        carried.load(Ordering::SeqCst),
+        2,
+        "matching nonce reaches the forced branch for invalid attestation and successful commit"
     );
     h.assert_legs("value_action_pending", "payment", Some(AMOUNT));
 }

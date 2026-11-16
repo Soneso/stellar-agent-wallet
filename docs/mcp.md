@@ -422,6 +422,14 @@ contributes 600 seconds; RequireApproval supplies its configured lifetime.
 Authorization defaults to 120 seconds and cannot outlive the governing
 decision.
 
+Paired gates retain one private window image, one local counterparty-cache
+image and one policy instant. Each stage keeps its own validated argument
+projection and reuses the handler's account observations. Concurrent requests
+cannot clear or replace that image. A failed authenticated state load refuses
+the call. The gate evaluates its captured frame, final resolution reads the
+shared store refreshed at each gate, and mint rechecks durable headroom under
+the window lock.
+
 On an admitted mainnet server, an x402 payment under Allow returns the payment
 in one call. Under RequireApproval it takes two calls. [x402](#x402) describes
 both.

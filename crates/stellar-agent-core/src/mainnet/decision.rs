@@ -23,7 +23,10 @@ use crate::policy::v1::{
     AccountIdentityView, AccountReservesView, CounterpartyCacheView, Sep10SessionView,
     Sep45SessionView, ValueClass, ValueEffects,
 };
-use crate::policy::{Decision, DenyReason, PolicyEngine, PolicyError, ToolDescriptor};
+use crate::policy::{
+    Decision, DenyReason, Evaluation, PolicyEngine, PolicyError, PolicyEvaluationInputs,
+    PolicyEvaluationSnapshot, ToolDescriptor,
+};
 use crate::profile::schema::Profile;
 use crate::wallet::WalletLifecycleError;
 
@@ -293,7 +296,6 @@ pub fn evaluate_mainnet(
     request: MainnetEvaluationRequest<'_>,
 ) -> Result<MainnetDecision, MainnetRefusal> {
     let engine_arc = policy.engine();
-    let profile = engine_arc.profile_name().to_owned();
     let engine: &dyn PolicyEngine = engine_arc.as_ref();
     let evaluation = match request.value {
         Some(value) => engine.evaluate_with_value_full(
@@ -321,6 +323,56 @@ pub fn evaluate_mainnet(
         ),
     }
     .map_err(MainnetRefusal::Engine)?;
+    evaluated_decision(policy, scope, now_ms, request.chain_id, evaluation)
+}
+
+/// Evaluates the original verified engine against a private window image.
+///
+/// Provenance and the deciding ordinal come from that engine; the image fixes
+/// the policy instant without changing the document, scope, digest or sequence.
+///
+/// # Errors
+/// The same denial and engine errors as [`evaluate_mainnet`].
+pub fn evaluate_mainnet_in_snapshot(
+    policy: &VerifiedPolicy,
+    scope: EvaluationScope,
+    snapshot: &PolicyEvaluationSnapshot,
+    request: MainnetEvaluationRequest<'_>,
+) -> Result<MainnetDecision, MainnetRefusal> {
+    let evaluation = policy
+        .engine()
+        .evaluate_in_snapshot(
+            PolicyEvaluationInputs {
+                tool: request.tool,
+                args: request.args,
+                profile: request.profile,
+                value: request.value,
+                account_view: request.account_view,
+                identity_view: request.identity_view,
+                counterparty_cache: request.counterparty_cache,
+                sep10_sessions: request.sep10_sessions,
+                sep45_sessions: request.sep45_sessions,
+                provisional: false,
+            },
+            snapshot,
+        )
+        .map_err(MainnetRefusal::Engine)?;
+    evaluated_decision(
+        policy,
+        scope,
+        snapshot.now_ms(),
+        request.chain_id,
+        evaluation,
+    )
+}
+
+fn evaluated_decision(
+    policy: &VerifiedPolicy,
+    scope: EvaluationScope,
+    now_ms: u64,
+    chain_id: &str,
+    evaluation: Evaluation,
+) -> Result<MainnetDecision, MainnetRefusal> {
     let rule_index = evaluation
         .rule_ordinal
         .map(|ordinal| {
@@ -346,8 +398,8 @@ pub fn evaluate_mainnet(
         policy_digest: policy.digest(),
         policy_sequence: policy.sequence(),
         rule_index,
-        profile,
-        chain_id: request.chain_id.to_owned(),
+        profile: policy.engine().profile_name().to_owned(),
+        chain_id: chain_id.to_owned(),
         evaluated_at_ms: now_ms,
         governing_ttl_ms,
         scope: scope.into(),

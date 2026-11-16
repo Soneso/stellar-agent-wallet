@@ -21,13 +21,14 @@ use serde_json::Value;
 use stellar_agent_core::classic_address::require_account_id;
 use stellar_agent_core::error::{WalletError, WalletStateError};
 use stellar_agent_core::mainnet::decision::{
-    EvaluationScope, MainnetDecision, MainnetEvaluationRequest, MainnetRefusal, evaluate_mainnet,
+    EvaluationScope, MainnetDecision, MainnetEvaluationRequest, MainnetRefusal,
+    evaluate_mainnet_in_snapshot,
 };
 use stellar_agent_core::observability::redact_strkey_first5_last5 as redact_account_id_value;
 use stellar_agent_core::payment_accounts::PaymentAccount;
 use stellar_agent_core::policy::{
-    ApprovalRequest, BuildRegistryError, Decision, DenyReason, McpToolRegistration, ToolDescriptor,
-    policy_now_ms,
+    ApprovalRequest, BuildRegistryError, Decision, DenyReason, McpToolRegistration,
+    PolicyEvaluationInputs, PolicyEvaluationSnapshot, ToolDescriptor, policy_now_ms,
 };
 use stellar_agent_core::profile::caip2::validate_chain_id_matches_profile;
 use stellar_agent_core::profile::schema::Profile;
@@ -76,6 +77,19 @@ pub(crate) enum DispatchOutcome {
 }
 
 impl DispatchOutcome {
+    pub(crate) fn snapshot(&self) -> Result<&Arc<GateSnapshot>, ToolError> {
+        match self {
+            Self::Allow(outcome) => outcome.snapshot.as_ref(),
+            Self::RequireApproval(outcome) => outcome.snapshot.as_ref(),
+        }
+        .ok_or_else(|| {
+            ToolError::Business(business_error_result(
+                "policy.engine_required",
+                "paired evaluation has no captured frame",
+            ))
+        })
+    }
+
     pub(crate) fn captured_interval(&self) -> Result<(u64, u64), ToolError> {
         let start = self.now_ms().ok_or_else(invalid_policy_interval)?;
         let end = start
@@ -161,6 +175,13 @@ impl DispatchOutcome {
     }
 }
 
+/// State, cache and policy time retained by every side of a paired gate.
+#[derive(Debug)]
+pub(crate) struct GateSnapshot {
+    policy: PolicyEvaluationSnapshot,
+    cache: Option<stellar_agent_network::CounterpartyCacheSnapshot>,
+}
+
 /// Effects and governing lifetime captured from one allowed evaluation.
 ///
 /// `now_ms` is the instant the evaluation read and `decision` the
@@ -172,6 +193,7 @@ pub(crate) struct AllowOutcome {
     pub governing_ttl_ms: u64,
     pub now_ms: Option<u64>,
     pub decision: Option<MainnetDecision>,
+    pub snapshot: Option<Arc<GateSnapshot>>,
 }
 
 /// An approval request together with the effects its policy criteria sized,
@@ -184,6 +206,7 @@ pub(crate) struct ApprovalOutcome {
     pub value_effects: Option<stellar_agent_core::policy::v1::ValueEffects>,
     pub now_ms: Option<u64>,
     pub decision: Option<MainnetDecision>,
+    pub snapshot: Option<Arc<GateSnapshot>>,
 }
 
 impl From<ApprovalRequest> for ApprovalOutcome {
@@ -196,6 +219,7 @@ impl From<ApprovalRequest> for ApprovalOutcome {
             value_effects: None,
             now_ms: None,
             decision: None,
+            snapshot: None,
         }
     }
 }
@@ -1829,22 +1853,38 @@ impl WalletServer {
         Ok(descriptor)
     }
 
-    /// Evaluates `tool_name` against the engine's current window state without
-    /// reconciling, refreshing, or writing anything.
-    ///
-    /// The gate runs the same evaluation after its refresh, and a simulate step
-    /// calls this for its paired commit tool. Every verdict, `Deny` included,
-    /// returns to the caller for inspection. The evaluation reads `now_ms`
-    /// and covers the classic scope.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ToolError`] for a descriptor, chain, or engine failure.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the gate's evaluation inputs plus the instant the caller sampled"
-    )]
-    pub(crate) async fn evaluate_policy_only(
+    /// Captures an independent frame without reconciliation and evaluates it.
+    #[allow(clippy::too_many_arguments)]
+    async fn evaluate_policy_only(
+        &self,
+        descriptor: &ToolDescriptor,
+        args_value: &Value,
+        value: Option<stellar_agent_core::policy::v1::ValueClass>,
+        account_view: Option<&dyn stellar_agent_core::policy::v1::AccountReservesView>,
+        identity_view: Option<&dyn stellar_agent_core::policy::v1::AccountIdentityView>,
+        scope: EvaluationScope,
+        now_ms: u64,
+        mode: GateMode,
+    ) -> Result<(GateEvaluation, Arc<GateSnapshot>), ToolError> {
+        let snapshot = self.capture_gate_snapshot(now_ms).await?;
+        let evaluation = self
+            .evaluate_with_descriptor(
+                descriptor,
+                args_value,
+                value,
+                account_view,
+                identity_view,
+                scope,
+                &snapshot,
+                mode,
+            )
+            .await?;
+        Ok((evaluation, snapshot))
+    }
+
+    /// Evaluates another descriptor against an existing gate's frame.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn evaluate_policy_in_snapshot(
         &self,
         tool_name: &'static str,
         args_value: &Value,
@@ -1852,7 +1892,7 @@ impl WalletServer {
         value: Option<stellar_agent_core::policy::v1::ValueClass>,
         account_view: Option<&dyn stellar_agent_core::policy::v1::AccountReservesView>,
         identity_view: Option<&dyn stellar_agent_core::policy::v1::AccountIdentityView>,
-        now_ms: u64,
+        snapshot: &GateSnapshot,
     ) -> Result<GateEvaluation, ToolError> {
         let descriptor = self.checked_policy_descriptor(tool_name, args_value, chain_id)?;
         self.evaluate_with_descriptor(
@@ -1862,7 +1902,7 @@ impl WalletServer {
             account_view,
             identity_view,
             EvaluationScope::Classic,
-            now_ms,
+            snapshot,
             GateMode::Strict,
         )
         .await
@@ -1889,7 +1929,7 @@ impl WalletServer {
     ///
     /// Every criterion reads `now_ms`. A server dispatching on its mainnet
     /// context's chain under a verified mainnet policy evaluates through
-    /// [`evaluate_mainnet`] for `scope`, and the result carries the
+    /// [`evaluate_mainnet_in_snapshot`] for `scope`, and the result carries the
     /// provenance-bearing decision; every other server evaluates through its
     /// engine.
     ///
@@ -1908,32 +1948,16 @@ impl WalletServer {
         account_view: Option<&dyn stellar_agent_core::policy::v1::AccountReservesView>,
         identity_view: Option<&dyn stellar_agent_core::policy::v1::AccountIdentityView>,
         scope: EvaluationScope,
-        now_ms: u64,
+        snapshot: &GateSnapshot,
         mode: GateMode,
     ) -> Result<GateEvaluation, ToolError> {
-        let counterparty_cache =
-            match stellar_agent_network::CounterpartyCacheSnapshot::from_resolver(
-                &*self.counterparty_resolver,
-            )
-            .await
-            {
-                Ok(snapshot) => Some(snapshot),
-                Err(err) => {
-                    tracing::debug!(
-                        tool = descriptor.name.as_str(),
-                        error = %err,
-                        "evaluate_with_descriptor: counterparty cache snapshot unavailable"
-                    );
-                    None
-                }
-            };
-
         // Evaluate policy with the profile-bound descriptor.
         //
         // The value-carrying path (`value = Some`) sizes the exact effect the
         // handler decoded; the args-derived path (`value = None`) lets the engine
         // derive the descriptor from `args_value` (pay/create/opaque-sign tools).
-        let counterparty_view = counterparty_cache
+        let counterparty_view = snapshot
+            .cache
             .as_ref()
             .map(|snapshot| snapshot as &dyn stellar_agent_core::policy::v1::CounterpartyCacheView);
         // Engine error → fail closed as `policy.engine_required` (fires for
@@ -1945,12 +1969,10 @@ impl WalletServer {
             ))
         };
         if let Some(policy) = self.mainnet_evaluation_policy() {
-            // The verified policy's engine is the server's engine, so the
-            // window state the gate refreshed is the state it evaluates.
-            return match evaluate_mainnet(
+            return match evaluate_mainnet_in_snapshot(
                 policy,
                 scope,
-                now_ms,
+                &snapshot.policy,
                 MainnetEvaluationRequest {
                     chain_id: &descriptor.chain_id,
                     tool: descriptor,
@@ -1973,48 +1995,76 @@ impl WalletServer {
         // The `_full` evaluation additionally surfaces the value descriptor the
         // gate sized on the allow path, threaded into `DispatchOutcome::Allow` so
         // the value-verb handlers record exactly what the gate evaluated.
-        let evaluation = match value {
-            Some(value) if mode == GateMode::Provisional => {
-                self.policy_engine.evaluate_provisional(
-                    descriptor,
-                    args_value,
-                    self.security_profile(),
-                    value,
-                    None,
-                    None,
-                    counterparty_view,
-                    None,
-                    None,
-                    now_ms,
-                )
-            }
-            Some(value) => self.policy_engine.evaluate_with_value_full(
-                descriptor,
-                args_value,
-                self.security_profile(),
+        let evaluation = self.policy_engine.evaluate_in_snapshot(
+            PolicyEvaluationInputs {
+                tool: descriptor,
+                args: args_value,
+                profile: self.security_profile(),
                 value,
-                account_view,
-                identity_view,
-                counterparty_view,
-                None,
-                None,
-                now_ms,
-            ),
-            None => self.policy_engine.evaluate_full(
-                descriptor,
-                args_value,
-                self.security_profile(),
-                account_view,
-                identity_view,
-                counterparty_view,
-                None,
-                None, // sep45_sessions: wired at dispatch site when sep45_session_active criterion active
-                now_ms,
-            ),
-        };
+                account_view: if mode == GateMode::Provisional {
+                    None
+                } else {
+                    account_view
+                },
+                identity_view: if mode == GateMode::Provisional {
+                    None
+                } else {
+                    identity_view
+                },
+                counterparty_cache: counterparty_view,
+                sep10_sessions: None,
+                sep45_sessions: None,
+                provisional: mode == GateMode::Provisional,
+            },
+            &snapshot.policy,
+        );
         evaluation
             .map(GateEvaluation::engine)
             .map_err(engine_required)
+    }
+
+    async fn capture_gate_snapshot(&self, now_ms: u64) -> Result<Arc<GateSnapshot>, ToolError> {
+        let store = stellar_agent_core::policy::v1::PolicyStateStore::new();
+        if self.policy_engine.window_state_store().is_some() {
+            let profile_name = self.profile_name_for_approval();
+            let window_store = self.window_store.clone();
+            if let Err(e) =
+                window_store.load_into_at(&profile_name, self.security_profile(), &store, now_ms)
+            {
+                if e.chain_validation_error().is_some() || e.operation_error().is_some() {
+                    return Err(ToolError::Business(business_error_result(
+                        e.submission_code(),
+                        e.to_string(),
+                    )));
+                }
+                return Err(ToolError::Business(business_error_result(
+                    "policy.engine_required",
+                    e.with_recovery_notice(format!(
+                        "policy window-state store failed to refresh ({e})"
+                    )),
+                )));
+            }
+        }
+
+        let cache = match stellar_agent_network::CounterpartyCacheSnapshot::from_resolver(
+            &*self.counterparty_resolver,
+        )
+        .await
+        {
+            Ok(snapshot) => Some(snapshot),
+            Err(err) => {
+                tracing::debug!(
+                    error = %err,
+                    "evaluate_with_descriptor: counterparty cache snapshot unavailable"
+                );
+                None
+            }
+        };
+
+        Ok(Arc::new(GateSnapshot {
+            policy: PolicyEvaluationSnapshot::new(store, now_ms),
+            cache,
+        }))
     }
 
     /// Evaluates the paired commit before an admitted preparation persists approval.
@@ -2054,19 +2104,17 @@ impl WalletServer {
             }
         };
         commit_args["chain_id"] = Value::String(chain_id.to_owned());
-        let now_ms = match outcome.now_ms() {
-            Some(now_ms) => now_ms,
-            None => policy_now_ms().map_err(|error| policy_clock_refusal(&error))?,
-        };
+        let snapshot = outcome.snapshot()?;
+        let now_ms = snapshot.policy.now_ms();
         let evaluation = match self
-            .evaluate_policy_only(
+            .evaluate_policy_in_snapshot(
                 commit_tool,
                 &commit_args,
                 chain_id,
                 None,
                 account_view,
                 identity_view,
-                now_ms,
+                snapshot,
             )
             .await
         {
@@ -2112,19 +2160,17 @@ impl WalletServer {
         if self.mainnet_context.is_none() {
             return Ok(outcome);
         }
-        let now_ms = match outcome.now_ms() {
-            Some(now_ms) => now_ms,
-            None => policy_now_ms().map_err(|error| policy_clock_refusal(&error))?,
-        };
+        let snapshot = outcome.snapshot()?;
+        let now_ms = snapshot.policy.now_ms();
         let evaluation = self
-            .evaluate_policy_only(
+            .evaluate_policy_in_snapshot(
                 prepare_tool,
                 authoritative_args,
                 chain_id,
                 None,
                 account_view,
                 identity_view,
-                now_ms,
+                snapshot,
             )
             .await?;
         stricter_outcome(
@@ -2189,10 +2235,8 @@ impl WalletServer {
         // Settle the reservations that have stood long enough to be
         // settleable, before the refresh below reads them.
         //
-        // The order is deliberate: this pass writes the window FILE, and the
-        // refresh below replaces the engine's in-memory view from that file.
-        // Running it the other way round would leave the engine holding a view
-        // the pass had just invalidated for the rest of the dispatch.
+        // The pass writes the window file before this gate captures its private
+        // image, so the evaluation includes the reconciled reservations.
         //
         // A reservation counts against the operator's caps while it stands, so
         // the oldest few are asked about first. This pass is not a gate: a
@@ -2224,24 +2268,9 @@ impl WalletServer {
                 .await;
         }
 
-        // Refresh window state before evaluation.
-        //
-        // The MCP server is a long-lived process: `self.policy_engine` is
-        // constructed once and evaluates every dispatch for the life of the
-        // server. Without this step, its in-memory window-state store would
-        // be a startup-frozen snapshot, invisible to entries the CLI (or a
-        // sibling request) has since recorded on disk. This is a REPLACE,
-        // not a merge: `clear()` first, then `load_into` re-populates from
-        // the CURRENT on-disk file — see `stellar_agent_network::policy_state`'s
-        // module docs for the full rationale, the known intra-process race
-        // this does NOT close, and why construction-time hydration is kept
-        // in addition to this per-dispatch refresh.
-        //
-        // `window_state_store()` returns `None` for `NoopPolicyEngine` (no
-        // window state to refresh) — this step is then a no-op. A refresh
-        // failure (tampered/rolled-back/deleted store) is fail-closed: the
-        // dispatch refuses rather than evaluating stateful criteria against
-        // a store this process could not verify.
+        // Each gate owns a private hydrated image; paired checks retain it.
+        let now_ms = policy_now_ms().map_err(|error| policy_clock_refusal(&error))?;
+        // Final resolvers read the shared engine store at this gate's instant.
         if let Some(store) = self.policy_engine.window_state_store() {
             store.clear().map_err(|e| {
                 ToolError::Business(business_error_result(
@@ -2251,7 +2280,9 @@ impl WalletServer {
             })?;
             let profile_name = self.profile_name_for_approval();
             let window_store = self.window_store.clone();
-            if let Err(e) = window_store.load_into(&profile_name, self.security_profile(), store) {
+            if let Err(e) =
+                window_store.load_into_at(&profile_name, self.security_profile(), store, now_ms)
+            {
                 if e.chain_validation_error().is_some() || e.operation_error().is_some() {
                     return Err(ToolError::Business(business_error_result(
                         e.submission_code(),
@@ -2266,15 +2297,8 @@ impl WalletServer {
                 )));
             }
         }
-
-        let now_ms = policy_now_ms().map_err(|error| policy_clock_refusal(&error))?;
-        let GateEvaluation {
-            decision,
-            value_effects,
-            governing_ttl_ms,
-            mainnet,
-        } = self
-            .evaluate_with_descriptor(
+        let (evaluation, snapshot) = self
+            .evaluate_policy_only(
                 &descriptor,
                 args_value,
                 value,
@@ -2285,12 +2309,19 @@ impl WalletServer {
                 mode,
             )
             .await?;
+        let GateEvaluation {
+            decision,
+            value_effects,
+            governing_ttl_ms,
+            mainnet,
+        } = evaluation;
         let outcome = match decision {
             Decision::Allow => DispatchOutcome::Allow(AllowOutcome {
                 value_effects,
                 governing_ttl_ms,
                 now_ms: Some(now_ms),
                 decision: mainnet,
+                snapshot: Some(snapshot),
             }),
 
             Decision::Deny(reason) => {
@@ -2316,6 +2347,7 @@ impl WalletServer {
                     value_effects,
                     now_ms: Some(now_ms),
                     decision: mainnet,
+                    snapshot: Some(snapshot),
                 })
             }
 
@@ -2436,6 +2468,7 @@ fn stricter_outcome(
                 governing_ttl_ms: evaluated_ttl_ms,
                 now_ms: Some(now_ms),
                 decision: evaluation.mainnet,
+                snapshot: outcome.snapshot().ok().cloned(),
             })
         }
         _ => outcome,
@@ -3330,6 +3363,13 @@ mod payment_interval_tests {
 
     fn outcome(required: bool, start: u64, ttl: u64) -> DispatchOutcome {
         let evaluated = evaluation(required, start, ttl, 0);
+        let snapshot = Some(Arc::new(GateSnapshot {
+            policy: PolicyEvaluationSnapshot::new(
+                stellar_agent_core::policy::v1::PolicyStateStore::new(),
+                start,
+            ),
+            cache: None,
+        }));
         match evaluated.decision {
             Decision::RequireApproval(request) => {
                 DispatchOutcome::RequireApproval(ApprovalOutcome {
@@ -3338,6 +3378,7 @@ mod payment_interval_tests {
                     now_ms: Some(start),
                     value_effects: evaluated.value_effects,
                     decision: evaluated.mainnet,
+                    snapshot,
                 })
             }
             _ => DispatchOutcome::Allow(AllowOutcome {
@@ -3345,6 +3386,7 @@ mod payment_interval_tests {
                 now_ms: Some(start),
                 value_effects: evaluated.value_effects,
                 decision: evaluated.mainnet,
+                snapshot,
             }),
         }
     }
@@ -3454,6 +3496,24 @@ mod signed_intent_observation_tests {
     }
 
     impl PolicyEngine for EvaluatingEngine {
+        fn evaluate_in_snapshot(
+            &self,
+            inputs: PolicyEvaluationInputs<'_>,
+            snapshot: &PolicyEvaluationSnapshot,
+        ) -> Result<stellar_agent_core::policy::Evaluation, PolicyError> {
+            self.evaluate_full(
+                inputs.tool,
+                inputs.args,
+                inputs.profile,
+                inputs.account_view,
+                inputs.identity_view,
+                inputs.counterparty_cache,
+                inputs.sep10_sessions,
+                inputs.sep45_sessions,
+                snapshot.now_ms(),
+            )
+        }
+
         fn evaluate(
             &self,
             _: &ToolDescriptor,
@@ -4124,6 +4184,36 @@ pub(crate) mod tests {
     }
 
     struct StubCounterpartyResolver;
+
+    #[cfg(feature = "mainnet-write")]
+    struct ChangingCounterpartyResolver(std::sync::atomic::AtomicUsize);
+
+    #[cfg(feature = "mainnet-write")]
+    #[async_trait::async_trait]
+    impl stellar_agent_network::CounterpartyResolver for ChangingCounterpartyResolver {
+        async fn refresh(
+            &self,
+            domain: &str,
+        ) -> Result<
+            stellar_agent_network::StellarTomlBinding,
+            stellar_agent_network::CounterpartyError,
+        > {
+            StubCounterpartyResolver.refresh(domain).await
+        }
+
+        async fn list_cached(
+            &self,
+        ) -> Result<
+            Vec<stellar_agent_network::StellarTomlBinding>,
+            stellar_agent_network::CounterpartyError,
+        > {
+            if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                StubCounterpartyResolver.list_cached().await
+            } else {
+                Ok(Vec::new())
+            }
+        }
+    }
 
     #[async_trait::async_trait]
     impl stellar_agent_network::CounterpartyResolver for StubCounterpartyResolver {
@@ -5024,6 +5114,7 @@ pub(crate) mod tests {
                     governing_ttl_ms: 600_000,
                     now_ms: Some(captured_ms),
                     decision: None,
+                    snapshot: Some(server.capture_gate_snapshot(captured_ms).await.unwrap()),
                 }),
                 envelope.envelope_xdr(),
                 "stellar_pay_commit",
@@ -5048,6 +5139,7 @@ pub(crate) mod tests {
                     governing_ttl_ms: 600_000,
                     now_ms: None,
                     decision: None,
+                    snapshot: None,
                 }),
                 "not-an-envelope",
                 "stellar_pay_commit",
@@ -5064,6 +5156,7 @@ pub(crate) mod tests {
                     governing_ttl_ms: 600_000,
                     now_ms: None,
                     decision: None,
+                    snapshot: None,
                 }))
             ),
             "an undecodable envelope leaves the outcome unchanged, got {undecodable:?}"
@@ -6290,6 +6383,7 @@ pub(crate) mod tests {
                     governing_ttl_ms: 600_000,
                     now_ms: None,
                     decision: None,
+                    snapshot: None,
                 }),
                 GatedApprovalKind::Trustline,
                 "AAAA",
@@ -7442,7 +7536,7 @@ pub(crate) mod tests {
                 (Some(120), Some(120), 120),
                 (None, None, 600),
             ] {
-                let f = Fixture::new(|raw| {
+                let mut f = Fixture::new(|raw| {
                     let mut doc: toml_edit::DocumentMut = raw.parse().unwrap();
                     for (index, ttl) in [(0, prepare), (1, commit)] {
                         let rule = doc["rules"]
@@ -7462,6 +7556,10 @@ pub(crate) mod tests {
                     }
                     doc.to_string()
                 });
+                let cache = Arc::new(ChangingCounterpartyResolver(
+                    std::sync::atomic::AtomicUsize::new(0),
+                ));
+                f.server.counterparty_resolver = cache.clone();
                 let server = &f.server;
                 let outcome = server
                     .dispatch_gate("stellar_pay", &f.args(), "stellar:mainnet")
@@ -7472,6 +7570,47 @@ pub(crate) mod tests {
                     u64::from(prepare.unwrap_or(600)) * 1000
                 );
                 let initial_now = outcome.now_ms().expect("the gate's instant");
+                let snapshot = Arc::clone(outcome.snapshot().unwrap());
+                let next_time =
+                    stellar_agent_core::policy::v1::criteria::state_store::set_query_time_for_test(
+                        initial_now + 2_000,
+                    );
+                let key = stellar_agent_core::policy::v1::criteria::state_store::StateKey::new(
+                    "operator", 1, "native", 86_400,
+                );
+                let entry = stellar_agent_core::policy::v1::criteria::state_store::WindowEntry::new(
+                    key.clone(),
+                    initial_now,
+                    1_000_000,
+                    stellar_agent_core::policy::v1::criteria::state_store::WindowLimit::Amount {
+                        asset: "native".into(),
+                        window: "1d".into(),
+                        max_stroops: 2_000_000,
+                    },
+                );
+                let barrier = std::sync::Barrier::new(2);
+                std::thread::scope(|scope| {
+                    let barrier = &barrier;
+                    scope.spawn(|| {
+                        server
+                            .window_store
+                            .record_and_persist(server.security_profile(), &[entry])
+                            .unwrap();
+                        server
+                            .policy_engine
+                            .window_state_store()
+                            .unwrap()
+                            .append(&key, initial_now, 1_000_000)
+                            .unwrap();
+                        barrier.wait();
+                    });
+                    barrier.wait();
+                });
+                let key_reads = Arc::new(AtomicU32::new(0));
+                let reads = Arc::clone(&key_reads);
+                observe(&f.on_window_key_read, move || {
+                    reads.fetch_add(1, Ordering::SeqCst);
+                });
                 let paired = server
                     .paired_commit_outcome(
                         outcome,
@@ -7481,8 +7620,25 @@ pub(crate) mod tests {
                         None,
                         None,
                     )
-                    .await
-                    .unwrap();
+                    .await;
+                assert!(
+                    paired.is_ok(),
+                    "captured state must still permit the pair: {paired:?}"
+                );
+                let paired = paired.unwrap();
+                *f.on_window_key_read.lock().unwrap() = None;
+                drop(next_time);
+                assert!(Arc::ptr_eq(paired.snapshot().unwrap(), &snapshot));
+                assert_eq!(
+                    cache.0.load(std::sync::atomic::Ordering::SeqCst),
+                    1,
+                    "one cache acquisition per pair"
+                );
+                assert_eq!(
+                    key_reads.load(Ordering::SeqCst),
+                    0,
+                    "the second side never hydrates again"
+                );
                 if prepare.is_none() && commit.is_none() {
                     // An `Allow` paired with an `Allow` stays `Allow` with
                     // its 600,000 ms, and asks for no approval.
@@ -7561,6 +7717,111 @@ pub(crate) mod tests {
             let decision = paired.mainnet_decision().expect("the decision is carried");
             assert_eq!(decision.decision(), &Decision::Allow);
             assert_eq!(decision.governing_ttl_ms(), 600_000);
+        }
+
+        /// Every public classic pair acquires its frame once.
+        #[tokio::test]
+        #[serial_test::serial(keyring)]
+        #[serial_test::serial]
+        async fn classic_public_pairs_acquire_one_frame_per_handler() {
+            async fn account_reads(rpc: &wiremock::MockServer, account: &str) -> usize {
+                use stellar_xdr::WriteXdr as _;
+                let key = stellar_xdr::LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
+                    account_id: account_id(account),
+                })
+                .to_xdr_base64(stellar_xdr::Limits::none())
+                .unwrap();
+                rpc.received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .filter(|request| {
+                        let body: Value = serde_json::from_slice(&request.body).unwrap();
+                        body["method"] == "getLedgerEntries"
+                            && body["params"]["keys"]
+                                .as_array()
+                                .is_some_and(|keys| keys.iter().any(|candidate| candidate == &key))
+                    })
+                    .count()
+            }
+
+            for tool in Tool::ALL {
+                let primary = wiremock::MockServer::start().await;
+                let oracle = wiremock::MockServer::start().await;
+                let mut f =
+                    routed_fixture_with(|raw| classic_policy(&raw), |_| {}, &primary, &oracle);
+                let control = mount_rpc(&f, &primary).await;
+                let oracle_control = mount_rpc(&f, &oracle).await;
+                let cache = Arc::new(ChangingCounterpartyResolver(
+                    std::sync::atomic::AtomicUsize::new(0),
+                ));
+                f.server.counterparty_resolver = cache.clone();
+                let preparation = tool.prepare_args(&f);
+                let (args, entry, prepared) =
+                    ClassicRun::prepared_allowed(&f, tool, preparation.clone()).await;
+                if matches!(tool, Tool::Pay) {
+                    assert_eq!(
+                        preparation,
+                        serde_json::json!({
+                            "source": f.envelope.source(), "destination": f.envelope.destination(),
+                            "amount_in_stroops": "10", "asset": "native", "fee": "100",
+                            "chain_id": "stellar:mainnet", "business_id": preparation["business_id"],
+                        })
+                    );
+                    let decoded = stellar_agent_core::envelope_decode::decode_authoritative_args(
+                        prepared["envelope_xdr"].as_str().unwrap(),
+                        "stellar_pay_commit",
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        decoded,
+                        serde_json::json!({
+                            "source": preparation["source"], "destination": preparation["destination"],
+                            "amount_stroops": "10", "asset": "XLM", "total_fee_stroops": 100,
+                            "sequence_number": 2, "memo_kind": "none", "memo": null,
+                        })
+                    );
+                    assert_eq!(account_reads(&primary, f.envelope.source()).await, 1);
+                    assert_eq!(account_reads(&primary, f.envelope.destination()).await, 1);
+                }
+                assert_eq!(
+                    cache.0.load(std::sync::atomic::Ordering::SeqCst),
+                    1,
+                    "{tool:?}: preparation pair"
+                );
+                let run = ClassicRun {
+                    f,
+                    _primary: primary,
+                    _oracle: oracle,
+                    control,
+                    oracle_control,
+                    tool,
+                    args,
+                    entry,
+                    prepared,
+                };
+                let result = run.commit().await;
+                assert_eq!(result["ok"], true, "{tool:?}: {result}");
+                assert_eq!(
+                    cache.0.load(std::sync::atomic::Ordering::SeqCst),
+                    2,
+                    "{tool:?}: one frame for each handler pair"
+                );
+                assert_eq!(run.control.count("sendTransaction"), 1, "{tool:?}");
+                if matches!(tool, Tool::Pay) {
+                    // Each handler reads its gate observations once. Final
+                    // resolution and signer-binding verification each add one
+                    // source read. Other RPC methods and the oracle are separate.
+                    assert_eq!(
+                        account_reads(&run._primary, run.f.envelope.source()).await,
+                        4
+                    );
+                    assert_eq!(
+                        account_reads(&run._primary, run.f.envelope.destination()).await,
+                        2
+                    );
+                }
+            }
         }
 
         /// The variant name of a wrapper result, with the gate's code.
@@ -7685,6 +7946,7 @@ pub(crate) mod tests {
                         governing_ttl_ms: 600_000,
                         now_ms: None,
                         decision,
+                        snapshot: None,
                     });
                     let before = approval_store_bytes(&f);
                     let mut witness = None;
@@ -13261,6 +13523,127 @@ pub(crate) mod tests {
                 "the payment requires the witness"
             );
             outcome
+        }
+
+        /// A long-lived server refreshes reset history before final resolution.
+        #[tokio::test]
+        #[serial_test::serial(keyring)]
+        #[serial_test::serial]
+        async fn mainnet_commit_refreshes_shared_state_after_durable_reset() {
+            use stellar_agent_core::policy::v1::criteria::state_store::{
+                StateKey, WindowEntry, WindowLimit,
+            };
+            use stellar_agent_network::mainnet::MainnetConsumer;
+            use stellar_agent_network::mainnet::authority::MainnetAuthority;
+            use stellar_agent_network::mainnet::resolve::{TxSignRequest, resolve_tx_sign};
+            use stellar_agent_network::policy_state::{OwnerResetSignature, ResetConsent};
+
+            let rpc = wiremock::MockServer::start().await;
+            let f = routed_fixture(|raw| raw, &rpc);
+            let _control = mount_rpc(&f, &rpc).await;
+            let server = &f.server;
+            let profile = server.security_profile();
+            let now = policy_now_ms().unwrap();
+            let key = StateKey::new("operator", 1, "rate_limit", 86_400);
+            let entry = WindowEntry::new(
+                key.clone(),
+                now,
+                1,
+                WindowLimit::Count {
+                    window: "1d".to_owned(),
+                    max_calls: 10,
+                },
+            );
+            let shared = server.policy_engine.window_state_store().unwrap();
+            server
+                .window_store
+                .record_and_persist(profile, &vec![entry.clone(); 10])
+                .unwrap();
+            server
+                .window_store
+                .load_into_at("operator", profile, shared, now)
+                .unwrap();
+            assert_eq!(shared.query_window(&key, now).unwrap(), (10, 10));
+
+            // A separate store handle resets durable history while this server
+            // retains its full image. No server reconstruction follows.
+            let writer = server.window_store.clone();
+            let reset = |request_id| {
+                writer
+                    .reset(
+                        profile,
+                        "operator",
+                        now,
+                        "reset window history",
+                        request_id,
+                        |row| {
+                            let owner = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
+                            Ok::<_, ()>(ResetConsent {
+                                owner_signature: Some(OwnerResetSignature {
+                                    owner: owner.verifying_key().to_bytes(),
+                                    signature: stellar_agent_core::policy::v1::signature::sign(
+                                        &row.statement_digest(),
+                                        &owner,
+                                    ),
+                                }),
+                            })
+                        },
+                        |_, _| Ok(()),
+                    )
+                    .unwrap();
+            };
+            reset("before-commit-gate");
+            assert_eq!(shared.query_window(&key, now).unwrap(), (10, 10));
+            let outcome = server
+                .dispatch_gate("stellar_pay_commit", &f.args(), "stellar:mainnet")
+                .await
+                .unwrap();
+            assert!(matches!(outcome, DispatchOutcome::Allow(_)));
+
+            // A second durable reset falls between the commit gate and final
+            // resolution. The captured decision remains usable after it.
+            writer.record_and_persist(profile, &[entry]).unwrap();
+            reset("after-commit-gate");
+            let durable = stellar_agent_core::policy::v1::PolicyStateStore::new();
+            writer
+                .load_into_at("operator", profile, &durable, now)
+                .unwrap();
+            assert_eq!(durable.query_window(&key, now).unwrap(), (0, 0));
+
+            let guard = server
+                .mainnet_write_admission(MainnetConsumer::McpPay)
+                .unwrap();
+            let signer = server.mainnet_enrolled_signer(&guard).unwrap();
+            let client = guard.context.primary_client().unwrap();
+            let audit = stellar_agent_network::mainnet::audit_readiness::audit_readiness(
+                guard.context.profile(),
+                "operator",
+            )
+            .unwrap();
+            let witness = bound_payment_witness(&f, &client).await;
+            let authority =
+                MainnetAuthority::from_decision(outcome.mainnet_decision().unwrap(), None).unwrap();
+            let resolved = resolve_tx_sign(TxSignRequest {
+                context: guard.context,
+                consumer: MainnetConsumer::McpPay,
+                unsigned_envelope_xdr: f.envelope.envelope_xdr(),
+                client: &client,
+                probe_deadline: std::time::Duration::from_secs(5),
+                witness: witness.witness(),
+                signer: &signer,
+                policy: guard.policy,
+                enablement: guard.enablement,
+                authority: &authority,
+                audit,
+                store: &server.window_store,
+                operation: None,
+            })
+            .await;
+            assert!(
+                resolved.is_ok(),
+                "durable reset lets the long-lived server commit through final resolution: {resolved:?}"
+            );
+            assert_eq!(authorizations(&f).len(), 1);
         }
 
         #[tokio::test]

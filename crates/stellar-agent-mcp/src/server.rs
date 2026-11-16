@@ -752,6 +752,8 @@ pub struct WalletServer {
     /// Gated on `test-helpers` feature or `#[cfg(test)]`.
     #[cfg(any(test, feature = "test-helpers"))]
     pub(crate) approval_dir_override: Option<std::path::PathBuf>,
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub(crate) forced_snapshot_observer: Option<Arc<dyn Fn(bool) + Send + Sync>>,
     /// Test-only protected spent record backend.
     #[cfg(any(test, feature = "test-helpers"))]
     pub(crate) rule_approval_spent_store_override:
@@ -1027,6 +1029,8 @@ impl WalletServer {
             clock,
             #[cfg(any(test, feature = "test-helpers"))]
             approval_dir_override: None,
+            #[cfg(any(test, feature = "test-helpers"))]
+            forced_snapshot_observer: None,
             #[cfg(any(test, feature = "test-helpers"))]
             rule_approval_spent_store_override: None,
             #[cfg(any(test, feature = "test-helpers"))]
@@ -1322,6 +1326,20 @@ impl WalletServer {
         self.verified_policy = None;
         self.enablement = None;
         self.policy_engine = engine;
+    }
+
+    /// Replaces the local cache provider for acquisition-count fixtures.
+    #[doc(hidden)]
+    pub fn set_counterparty_resolver_for_test(&mut self, resolver: Arc<dyn CounterpartyResolver>) {
+        self.counterparty_resolver = resolver;
+    }
+
+    /// Observes whether a forced approval retains the evaluated gate's frame.
+    pub fn set_forced_snapshot_observer_for_test(
+        &mut self,
+        observer: Arc<dyn Fn(bool) + Send + Sync>,
+    ) {
+        self.forced_snapshot_observer = Some(observer);
     }
 
     /// Constructs a [`WalletServer`] with a test-local policy directory.
