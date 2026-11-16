@@ -339,7 +339,14 @@ async fn retried_prepare_returns_the_stored_envelope() {
         let id = fresh_business_id();
         let run = classic_run(tool, &id).await;
         let stored = record(&run.f, &id);
-        assert_eq!(stored["state"], "prepared", "{tool:?}: {stored}");
+        let expected_state = match tool {
+            Tool::Pay => "prepared",
+            Tool::Claim | Tool::Trustline | Tool::CreateAccount => "awaiting_approval",
+        };
+        assert_eq!(
+            stored["state"], expected_state,
+            "{tool:?}: the producer's waiting state is retained"
+        );
         assert_eq!(
             stored["envelope_xdr"], run.args["envelope_xdr"],
             "{tool:?}: the record binds the prepared envelope"

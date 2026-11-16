@@ -47,6 +47,551 @@ use super::x402_authenticated_mainnet_tests::{
 /// The profile every fixture consents for.
 const PROFILE: &str = "operator";
 
+mod producers {
+    use super::*;
+    use stellar_agent_core::approval::witness::ApprovedKind;
+    use stellar_agent_core::audit_log::PolicyDecision;
+    use stellar_agent_network::operation_entry::{self, ClassicEntry};
+    use stellar_agent_network::policy_state::store::commit_faults::{
+        COMMIT_FAULT_AFTER_COUNTER, COMMIT_FAULT_AFTER_PREPARED, arm_accounting_fault,
+        observe_commit,
+    };
+    use stellar_agent_network::policy_state::{
+        ApprovalStatus, BusinessId, OperationHandle, OperationState, OperationStatus,
+    };
+
+    const TOOLS: [Tool; 3] = [Tool::CreateAccount, Tool::Trustline, Tool::Claim];
+
+    fn status(run: &ClassicRun) -> ApprovalStatus<'_> {
+        ApprovalStatus::new(&run.f.server.window_store, run.f.server.security_profile())
+    }
+
+    fn fresh(run: &ClassicRun) -> (serde_json::Value, OperationHandle) {
+        let mut args = run.args.clone();
+        args["business_id"] = serde_json::json!(run.bind_new_business_id());
+        let id = BusinessId::parse(args["business_id"].as_str().unwrap()).unwrap();
+        let digest =
+            OperationStatus::new(&run.f.server.window_store, run.f.server.security_profile())
+                .view(&id)
+                .unwrap()
+                .unwrap()
+                .intent_digest;
+        let ClassicEntry::Resume(handle) = run
+            .f
+            .server
+            .operation_step(|recorder| operation_entry::lookup_classic(recorder, &id, &digest))
+            .unwrap()
+        else {
+            panic!("a fresh operation is resumable")
+        };
+        (args, handle)
+    }
+
+    fn kind(tool: Tool) -> ApprovedKind {
+        match tool {
+            Tool::Pay | Tool::CreateAccount => ApprovedKind::Payment,
+            Tool::Trustline => ApprovedKind::Trustline,
+            Tool::Claim => ApprovedKind::Claim,
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn mcp_simulate_opens_one_durable_record_per_tool() {
+        use super::super::common::tests::mainnet::{ledger, require_approval_rules};
+        for tool in TOOLS {
+            for ttl in [300, 3600] {
+                let run = ClassicRun::with(
+                    tool,
+                    |raw| {
+                        require_approval_rules(
+                            &raw,
+                            &[tool.prepare_name(), tool.commit_name()],
+                            ttl,
+                        )
+                    },
+                    |_| {},
+                    |_| {},
+                )
+                .await;
+                let record = status(&run)
+                    .find_by_nonce(&run.entry.approval_nonce)
+                    .unwrap();
+                assert!(
+                    record.is_some(),
+                    "each producer opens a durable record: {tool:?}"
+                );
+                let record = record.unwrap().record;
+                assert_eq!(
+                    record.kind,
+                    kind(tool),
+                    "the record keeps the approval kind"
+                );
+                assert_eq!(
+                    record.subject,
+                    mainnet_consent_subject(&run.entry, &binding()).unwrap()
+                );
+                assert_eq!(record.created_at_ms, run.entry.created_at_unix_ms);
+                assert_eq!(record.waiting_expires_at_ms, run.entry.expires_at_unix_ms);
+                assert_eq!(
+                    record.rule_ttl_ms,
+                    u64::try_from(ttl).unwrap() * 1000,
+                    "the signed interval governs"
+                );
+                assert!(
+                    record.consent.is_some(),
+                    "fixture consent reaches the durable record"
+                );
+                let operation = OperationStatus::new(
+                    &run.f.server.window_store,
+                    run.f.server.security_profile(),
+                )
+                .view(&BusinessId::parse(run.args["business_id"].as_str().unwrap()).unwrap())
+                .unwrap()
+                .unwrap();
+                assert_eq!(record.operation_id, operation.operation_id);
+                assert_eq!(record.intent_digest, operation.intent_digest);
+                assert_eq!(operation.state, OperationState::AwaitingApproval);
+                let end =
+                    operation_entry::envelope_max_time(run.args["envelope_xdr"].as_str().unwrap())
+                        .unwrap()
+                        * 1000;
+                assert_eq!(
+                    operation.waiting_expires_at_ms,
+                    Some(end.min(record.waiting_expires_at_ms))
+                );
+                let window = ledger(&run.f).unwrap();
+                let operations = window["operations"]["records"].as_array().unwrap();
+                assert_eq!(operations.len(), 1);
+                assert_eq!(
+                    operations[0]["prepared_decision"], "require_approval",
+                    "the prepare decision is retained"
+                );
+                assert_eq!(window["approvals"]["records"].as_array().unwrap().len(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn retried_preparation_reuses_the_linked_entry() {
+        for tool in TOOLS {
+            let mut run = ClassicRun::new(tool).await;
+            let original = run.prepared["approval"].clone();
+            let before = std::fs::read(store_path(&run.f)).unwrap();
+            for restart in [false, true] {
+                if restart {
+                    run.restart().unwrap();
+                }
+                let clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(
+                    run.entry.created_at_unix_ms - 1,
+                );
+                let response = wire(&tool.prepare(&run.f.server, &run.args).await);
+                drop(clock);
+                assert_eq!(
+                    response["ok"], true,
+                    "a retry reuses its handle: {response}"
+                );
+                assert_eq!(
+                    response["data"]["approval"], original,
+                    "the linked approval block is reused"
+                );
+                assert_eq!(
+                    std::fs::read(store_path(&run.f)).unwrap(),
+                    before,
+                    "reuse writes no inbox entry"
+                );
+            }
+            PendingApprovalStore::open(store_path(&run.f))
+                .unwrap()
+                .remove(&run.entry.approval_nonce)
+                .unwrap();
+            let response = wire(&tool.prepare(&run.f.server, &run.args).await);
+            assert_eq!(
+                response["error"]["code"], "approval.not_found",
+                "a missing linked entry is not replaced"
+            );
+            let clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(
+                run.entry.expires_at_unix_ms + 86_400_000,
+            );
+            let expired = wire(&tool.prepare(&run.f.server, &run.args).await);
+            assert_eq!(
+                expired["data"]["operation"]["state"], "expired",
+                "a far-later restart expires the operation"
+            );
+            clock.set(run.entry.created_at_unix_ms - 1);
+            let rolled_back = wire(&tool.prepare(&run.f.server, &run.args).await);
+            assert_eq!(
+                rolled_back["data"]["operation"]["state"], "expired",
+                "clock rollback cannot revive an expired operation"
+            );
+            drop(clock);
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn rerun_removes_the_orphan_and_keeps_one_nonce() {
+        for tool in TOOLS {
+            let run = ClassicRun::new(tool).await;
+            let (args, handle) = fresh(&run);
+            let orphan = approval_for(tool, &run.f, handle.envelope_xdr().unwrap(), 300_000);
+            let attested = approval_for(tool, &run.f, handle.envelope_xdr().unwrap(), 300_000);
+            run.f.attest(&attested);
+            let attested = stored_approval(&run.f, &attested.approval_nonce).unwrap();
+            let other_envelope = {
+                use stellar_xdr::{Limits, ReadXdr as _, TransactionEnvelope, WriteXdr as _};
+                let TransactionEnvelope::Tx(mut envelope) = TransactionEnvelope::from_xdr_base64(
+                    handle.envelope_xdr().unwrap(),
+                    Limits::none(),
+                )
+                .unwrap() else {
+                    panic!("classic envelope expected")
+                };
+                envelope.tx.fee += 1;
+                TransactionEnvelope::Tx(envelope)
+                    .to_xdr_base64(Limits::none())
+                    .unwrap()
+            };
+            let unrelated = approval_for(tool, &run.f, &other_envelope, 300_000);
+            let mut inbox = PendingApprovalStore::open(store_path(&run.f)).unwrap();
+            inbox.insert(orphan.clone(), now_ms()).unwrap();
+            inbox.insert(unrelated.clone(), now_ms()).unwrap();
+            assert!(
+                status(&run)
+                    .find_by_nonce(&attested.approval_nonce)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                status(&run)
+                    .find_by_nonce(&unrelated.approval_nonce)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(attested.attestation_blob_b64.is_some());
+            assert!(unrelated.attestation_blob_b64.is_none());
+            drop(inbox);
+            let response = wire(&tool.prepare(&run.f.server, &args).await);
+            assert_eq!(response["ok"], true, "{response}");
+            let nonce = response["data"]["approval"]["approval_nonce"]
+                .as_str()
+                .unwrap();
+            let inbox = PendingApprovalStore::open(store_path(&run.f)).unwrap();
+            assert!(
+                inbox.get(&orphan.approval_nonce).is_none(),
+                "a crashed insert is removed before replacement"
+            );
+            assert!(inbox.get(nonce).is_some());
+            assert!(
+                inbox.get(&run.entry.approval_nonce).is_some(),
+                "the attested linked entry is retained"
+            );
+            assert!(
+                inbox.get(&attested.approval_nonce).is_some(),
+                "the attested orphan of the same envelope is retained"
+            );
+            assert!(
+                inbox.get(&unrelated.approval_nonce).is_some(),
+                "the unattested entry of another envelope is retained"
+            );
+            assert_eq!(
+                inbox.snapshot(now_ms()).len(),
+                4,
+                "the linked entry, new winner and both protected entries remain"
+            );
+            assert_eq!(
+                status(&run)
+                    .find_by_operation(handle.id())
+                    .unwrap()
+                    .unwrap()
+                    .record
+                    .nonce,
+                nonce
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn open_error_cleanup_follows_the_read_by_operation() {
+        for tool in TOOLS {
+            let mut run = ClassicRun::new(tool).await;
+            for seam in [COMMIT_FAULT_AFTER_PREPARED, COMMIT_FAULT_AFTER_COUNTER] {
+                let (args, handle) = fresh(&run);
+                let path = store_path(&run.f);
+                let observed = std::rc::Rc::new(std::cell::RefCell::new(None));
+                let capture = observed.clone();
+                let original = run.entry.approval_nonce.clone();
+                let observer = observe_commit(move |_| {
+                    let inbox = PendingApprovalStore::open(path.clone());
+                    assert!(
+                        inbox.is_ok(),
+                        "producers hold no inbox lock across a window commit"
+                    );
+                    *capture.borrow_mut() = inbox
+                        .unwrap()
+                        .snapshot(now_ms())
+                        .into_iter()
+                        .find(|entry| entry.approval_nonce != original)
+                        .map(|entry| entry.approval_nonce);
+                });
+                let armed = arm_accounting_fault(seam);
+                let response = wire(&tool.prepare(&run.f.server, &args).await);
+                drop(armed);
+                drop(observer);
+                assert_eq!(
+                    response["error"]["code"], "submission.record_unavailable",
+                    "open errors retain the store code"
+                );
+                let nonce = observed.borrow().clone().unwrap();
+                let committed = seam == COMMIT_FAULT_AFTER_COUNTER;
+                assert_eq!(
+                    stored_approval(&run.f, &nonce).is_some(),
+                    committed,
+                    "cleanup follows the authenticated outcome"
+                );
+                assert_eq!(
+                    status(&run)
+                        .find_by_operation(handle.id())
+                        .unwrap()
+                        .is_some(),
+                    committed
+                );
+                run.restart().unwrap();
+                let retried = wire(&tool.prepare(&run.f.server, &args).await);
+                assert_eq!(
+                    retried["ok"], true,
+                    "a restart resumes the preparation: {retried}"
+                );
+                if committed {
+                    assert_eq!(
+                        retried["data"]["approval"]["approval_nonce"], nonce,
+                        "committed errors retain their nonce"
+                    );
+                }
+                // Each fault case has a distinct operation; its completed entry
+                // is removed so the next observer identifies its own insert.
+                let retried_nonce = retried["data"]["approval"]["approval_nonce"]
+                    .as_str()
+                    .unwrap();
+                PendingApprovalStore::open(store_path(&run.f))
+                    .unwrap()
+                    .remove(retried_nonce)
+                    .unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn concurrent_preparations_converge_on_the_winner() {
+        const CHILD: &str = "MCP_PRODUCER_LOCK_PROBE";
+        if let Some(path) = std::env::var_os(CHILD) {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .unwrap();
+            assert!(
+                matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+                "the other process cannot cross the producer lock"
+            );
+            return;
+        }
+        let run = ClassicRun::new(Tool::Claim).await;
+        let (args, handle) = fresh(&run);
+        let path = store_path(&run.f).with_file_name("operator.producer.lock");
+        let observer = observe_commit(move |_| {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tools::mainnet_presence_tests::producers::concurrent_preparations_converge_on_the_winner", "--nocapture"])
+                .env(CHILD, &path).output().unwrap();
+            assert!(
+                child.status.success(),
+                "an independent producer is excluded until open completes"
+            );
+        });
+        let first = wire(&run.tool.prepare(&run.f.server, &args).await);
+        drop(observer);
+        let second = wire(&run.tool.prepare(&run.f.server, &args).await);
+        assert_eq!(
+            second["data"]["approval"], first["data"]["approval"],
+            "the stale reader returns the winner"
+        );
+        assert_eq!(
+            status(&run)
+                .find_by_operation(handle.id())
+                .unwrap()
+                .unwrap()
+                .record
+                .nonce,
+            first["data"]["approval"]["approval_nonce"]
+                .as_str()
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn producer_lock_exhaustion_keeps_its_code() {
+        use stellar_agent_core::file_lock::HeldFileLock;
+        for tool in TOOLS {
+            let run = ClassicRun::new(tool).await;
+            let (args, _) = fresh(&run);
+            let path = store_path(&run.f).with_file_name("operator.producer.lock");
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .unwrap();
+            let held = HeldFileLock::try_lock(file).unwrap();
+            let response = wire(&tool.prepare(&run.f.server, &args).await);
+            assert_eq!(
+                response["error"]["code"], "approval.writer_locked",
+                "{tool:?}: exhausted producer retries retain the refusal code"
+            );
+            drop(held);
+            let response = wire(&tool.prepare(&run.f.server, &args).await);
+            assert_eq!(
+                response["ok"], true,
+                "{tool:?}: preparation resumes after lock release"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn producer_preconditions_and_competing_open_keep_their_codes() {
+        let run = ClassicRun::new(Tool::Claim).await;
+        let server = &run.f.server;
+        let result = server.classic_pending_approval(
+            None,
+            ApprovedKind::Claim,
+            PolicyDecision::RequireApproval,
+            || panic!("missing handle must refuse before insertion"),
+        );
+        assert_eq!(
+            result.unwrap_err().code(),
+            "internal.unexpected_state",
+            "mainnet requires an operation handle"
+        );
+        let (_, handle) = fresh(&run);
+        let result = server.classic_pending_approval(
+            Some(&handle),
+            ApprovedKind::Claim,
+            PolicyDecision::RequireApproval,
+            || Err("fixture insertion failure".to_owned()),
+        );
+        let super::super::common::ToolError::Protocol(error) = result.unwrap_err() else {
+            panic!("insertion keeps its protocol channel")
+        };
+        assert_eq!(
+            error.message,
+            "approval.store_error: fixture insertion failure"
+        );
+        let winner = approval_for(Tool::Claim, &run.f, handle.envelope_xdr().unwrap(), 300_000);
+        let loser = approval_for(Tool::Claim, &run.f, handle.envelope_xdr().unwrap(), 300_000);
+        let result = server
+            .classic_pending_approval(
+                Some(&handle),
+                ApprovedKind::Claim,
+                PolicyDecision::RequireApproval,
+                || {
+                    let mut inbox = PendingApprovalStore::open(store_path(&run.f)).unwrap();
+                    inbox.insert(winner.clone(), now_ms()).unwrap();
+                    inbox.insert(loser.clone(), now_ms()).unwrap();
+                    drop(inbox);
+                    let facts = operation_entry::pending_approval_facts(
+                        &winner,
+                        &handle,
+                        ApprovedKind::Claim,
+                        mainnet_consent_subject(&winner, &binding()).unwrap(),
+                        300_000,
+                    );
+                    server
+                        .approval_step(|recorder| {
+                            recorder
+                                .open_pending(handle.id(), &facts, PolicyDecision::RequireApproval)
+                                .map_err(operation_entry::operation_refusal)
+                        })
+                        .unwrap();
+                    Ok(loser.clone())
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            result.approval_nonce, winner.approval_nonce,
+            "an open conflict returns the concurrent winner"
+        );
+        assert!(
+            stored_approval(&run.f, &loser.approval_nonce).is_none(),
+            "the loser is removed only after the winner is read"
+        );
+        let (_, invalid_handle) = fresh(&run);
+        let mut invalid = loser.clone();
+        invalid.expires_at_unix_ms = invalid.created_at_unix_ms - 1;
+        let error = server
+            .classic_pending_approval(
+                Some(&invalid_handle),
+                ApprovedKind::Claim,
+                PolicyDecision::RequireApproval,
+                || Ok(invalid),
+            )
+            .unwrap_err();
+        let result = wire(&error.into_result().unwrap());
+        assert!(
+            result["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("the signed approval interval ends before it starts"),
+            "a backwards signed interval refuses before subtraction wraps"
+        );
+
+        let testnet = crate::server::WalletServer::new(
+            stellar_agent_core::profile::Profile::builder_testnet_named(
+                "producer-testnet",
+                "producer-signer",
+                "default",
+                "producer-nonce",
+                "default",
+            )
+            .with_noop_engine()
+            .build(),
+        )
+        .unwrap();
+        let before = stellar_agent_network::policy_state::approvals::facade_calls::count(
+            testnet.window_store.path(),
+        );
+        let returned = testnet
+            .classic_pending_approval(
+                None,
+                ApprovedKind::Claim,
+                PolicyDecision::RequireApproval,
+                || Ok(loser.clone()),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(returned).unwrap(),
+            serde_json::to_value(loser).unwrap(),
+            "testnet keeps the insertion's bytes"
+        );
+        assert_eq!(
+            stellar_agent_network::policy_state::approvals::facade_calls::count(
+                testnet.window_store.path()
+            ),
+            before,
+            "testnet calls no approval facade"
+        );
+    }
+}
+
 fn binding() -> AttestationBinding<'static> {
     AttestationBinding::new(PROFILE, "stellar:mainnet")
 }

@@ -115,6 +115,72 @@ fn revoke_record(f: &ResolverFixture, witness: &ApprovalWitness) {
 
 #[tokio::test]
 #[serial_test::serial]
+async fn consumed_resolver_refusals_precede_expiry_for_another_operation() {
+    use crate::policy_state::{OperationRecorder, OperationState, TransitionEvidence};
+    for case in ["expired", "released", "early"] {
+        let f = current_record_fixture(false);
+        let witness = f.approval(&f.envelope, f.now, 600_000);
+        let link = durable_record(&f, &witness, true);
+        f.clock.set(witness.consent_at_ms());
+        let server = f.server().await;
+        let rpc_url = url::Url::parse(&f.profile.rpc_url).unwrap();
+        let context = f.context_with_routes(&[(rpc_url.host_str().unwrap(), &server.uri())]);
+        let client = context.primary_client().unwrap();
+        let authority = f.approval_authority(&witness);
+        let mut req = request(&f, &context, &client, &authority);
+        req.operation = Some(link);
+        resolve_tx_sign(req).await.unwrap();
+        match case {
+            "expired" => f.clock.set(witness.expires_at_ms()),
+            "early" => f.clock.set(witness.consent_at_ms() - 1),
+            _ => {
+                OperationRecorder::new(&f.window, &f.profile, &mut ApprovalRows, "close")
+                    .transition(
+                        link.operation_id,
+                        None,
+                        OperationState::Expired,
+                        &TransitionEvidence::default(),
+                    )
+                    .unwrap();
+                assert!(
+                    record_facts(&f, &witness)
+                        .record()
+                        .consent
+                        .as_ref()
+                        .unwrap()
+                        .payload
+                        .is_none()
+                );
+            }
+        }
+        let facts = record_facts(&f, &witness);
+        let now = super::super::clock::now_ms().unwrap();
+        assert_eq!(
+            enabled::check_approval_facts(Some(&facts), &witness, None, now),
+            Err(MainnetAuthorizationError::Refused(P::ApprovalNonceReused)),
+            "consumed nonce reuse precedes expiry: {case}"
+        );
+        assert_eq!(
+            enabled::check_approval_facts(Some(&facts), &witness, Some(link), now),
+            Err(MainnetAuthorizationError::Refused(P::ApprovalExpired)),
+            "the same operation keeps its expiry refusal: {case}"
+        );
+        let envelope = changed_envelope(&f, |tx| {
+            tx.tx.cond = Preconditions::Time(stellar_xdr::TimeBounds {
+                min_time: stellar_xdr::TimePoint(0),
+                max_time: stellar_xdr::TimePoint(now / 1000 + 120),
+            })
+        });
+        let mut req = request(&f, &context, &client, &authority);
+        req.operation = None;
+        req.unsigned_envelope_xdr = &envelope;
+        let before = f.wire();
+        assert_refused(resolve_tx_sign(req).await, P::ApprovalNonceReused, &f, &before);
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn resolver_state_matrix() {
     for soroban in [false, true] {
         for case in [
