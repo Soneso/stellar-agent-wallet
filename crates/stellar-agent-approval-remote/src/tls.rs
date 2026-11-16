@@ -388,7 +388,10 @@ pub async fn select_tls(
         )),
         (_, None) => Err(file_problem(TlsFileField::KeyPath, TlsFileProblem::Missing)),
     }?;
-    let server = server_config(&tls).await?;
+    let server = match pin {
+        Some(_) => signed_server_config(&tls)?,
+        None => server_config(&tls).await?,
+    };
     Ok((tls, server))
 }
 
@@ -398,6 +401,49 @@ pub(crate) async fn server_config(
     axum_server::tls_rustls::RustlsConfig::from_pem(tls.cert_pem.clone(), tls.key_pem.clone())
         .await
         .map_err(|_| file_problem(TlsFileField::KeyPath, TlsFileProblem::InvalidPair))
+}
+
+/// The ALPN list of a signed-origin listener.
+///
+/// The signed `Host` check reads the HTTP/1.1 `Host` header, and an HTTP/2
+/// request carries its authority in `:authority` instead. A signed listener
+/// therefore offers only HTTP/1.1; a client that offers only `h2` fails the
+/// handshake.
+const SIGNED_ALPN: &[&[u8]] = &[b"http/1.1"];
+
+/// The TLS configuration of a signed-origin listener: the PEM pair of `tls`
+/// with [`SIGNED_ALPN`]. `RustlsConfig::from_pem` always offers `h2`, so this
+/// builds the `rustls` configuration itself.
+pub(crate) fn signed_server_config(
+    tls: &ProvisionedTls,
+) -> Result<axum_server::tls_rustls::RustlsConfig, TlsProvisionError> {
+    use rustls_pki_types::pem::PemObject as _;
+    let invalid = || file_problem(TlsFileField::KeyPath, TlsFileProblem::InvalidPair);
+    let chain = rustls_pki_types::CertificateDer::pem_slice_iter(&tls.cert_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| invalid())?;
+    let mut keys = rustls_pki_types::PrivateKeyDer::pem_slice_iter(&tls.key_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| invalid())?;
+    let key = match keys.pop() {
+        Some(key) if keys.is_empty() => key,
+        _ => return Err(invalid()),
+    };
+    let mut config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|_| invalid())?
+    .with_no_client_auth()
+    .with_single_cert(chain, key)
+    .map_err(|_| invalid())?;
+    config.alpn_protocols = SIGNED_ALPN
+        .iter()
+        .map(|protocol| protocol.to_vec())
+        .collect();
+    Ok(axum_server::tls_rustls::RustlsConfig::from_config(
+        std::sync::Arc::new(config),
+    ))
 }
 
 /// The bytes of the configured file at `path`, refusing with `field`.

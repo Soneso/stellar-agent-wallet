@@ -21,6 +21,13 @@
 #     fresh key and a preset backend; platform leaves both keyring variables
 #     unset; any other value fails the run before the first suite, with a
 #     message that names the variable.
+# (k) browser trust: the trusted suites are the suites that compile the
+#     trusted browser fixture; each attempt of one gets a fresh private
+#     directory with a trusted and an untrusted chain, their openssl pins,
+#     and two NSS databases holding only the trusted authority; cargo alone
+#     receives the directory, with HOME unchanged, and the remote crate
+#     builds with mainnet-write under MAINNET_WRITE=on; a failed setup
+#     returns 3 before cargo; any other suite prepares nothing.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
@@ -100,6 +107,7 @@ expect_features() {
   local mainnet_write="$1" crate="$2" want="$3" got
   local target=claim_testnet_acceptance
   [ "$crate" != stellar-agent-pool ] || target=pool_testnet_init
+  [ "$crate" != stellar-agent-approval-remote ] || target=mainnet_presence_browser_acceptance
   got=$(MAINNET_WRITE="$mainnet_write" suite_features "$crate" testnet-acceptance "$target")
   if [ "$got" = "$want" ]; then
     pass "(c) MAINNET_WRITE=$mainnet_write $crate builds with $want"
@@ -158,6 +166,19 @@ printf '%s\n' "$*" >> "$(dirname "$0")/args"
 echo "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out"
 STUB_EOF
 chmod +x "$STUB/cargo"
+# Every driver run below prepares browser trust for the trusted browser
+# suites. A stub certutil records its arguments, and fails when
+# STUB_CERTUTIL is fail; a stub uname keeps the Linux path on any host.
+cat > "$STUB/certutil" <<'STUB_EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$(dirname "$0")/certutil-args"
+[ "${STUB_CERTUTIL:-}" != fail ]
+STUB_EOF
+cat > "$STUB/uname" <<'STUB_EOF'
+#!/usr/bin/env bash
+echo Linux
+STUB_EOF
+chmod +x "$STUB/certutil" "$STUB/uname"
 expect_cargo() {
   local mainnet_write="$1" want="$2" args rc
   : > "$STUB/args"
@@ -583,8 +604,120 @@ selection_count=$(grep -cF "STELLAR_AGENT_TEST_KEYRING: \${{ inputs.keyring || '
 if [ "$selection_count" -eq 2 ] && grep -q 'default: headless' .github/workflows/testnet.yml; then
   pass 'workflow shares forward the same storage selection and default to headless'
 else fail 'workflow storage selection differs between shares or default'; fi
+# (k) Browser trust. The trusted suites are exactly the suites that compile
+# the shared trusted browser fixture, and each is a browser suite.
+expected_trusted=$(grep -lE '^mod trusted_browser;' crates/*/tests/*_browser_acceptance.rs \
+  | xargs -n1 basename | sed 's/\.rs$//' | sort | tr '\n' ' ')
+listed_trusted=$(printf '%s\n' "${TRUSTED_BROWSER_SUITES[@]}" | sort | tr '\n' ' ')
+if [ -n "$expected_trusted" ] && [ "$listed_trusted" = "$expected_trusted" ]; then
+  pass "(k) TRUSTED_BROWSER_SUITES lists the suites that compile the trusted browser fixture: $listed_trusted"
+else
+  fail "(k) TRUSTED_BROWSER_SUITES is '$listed_trusted', the fixture's suites are '$expected_trusted'"
+fi
+for target in "${TRUSTED_BROWSER_SUITES[@]}"; do
+  if is_browser_suite "$target"; then
+    pass "(k) trusted suite $target is a browser suite"
+  else
+    fail "(k) trusted suite $target is not in BROWSER_SUITE_TARGETS"
+  fi
+done
+# The remote approval crate forwards mainnet-write, so its suites build
+# with the feature under MAINNET_WRITE=on.
+if ! grep -qE '^mainnet-write *=' crates/stellar-agent-approval-remote/Cargo.toml; then
+  fail "(k) premise: crates/stellar-agent-approval-remote/Cargo.toml declares no mainnet-write feature"
+fi
+expect_features on stellar-agent-approval-remote mainnet-write,testnet-acceptance
+expect_features off stellar-agent-approval-remote testnet-acceptance
+# A stub cargo records its arguments and the trust variable and HOME it sees.
+cat > "$STUB/cargo" <<'STUB_EOF'
+#!/usr/bin/env bash
+root=$(dirname "$0")
+printf '%s\n' "$*" >> "$root/args"
+printf '%s|%s\n' "${STELLAR_AGENT_BROWSER_TRUST_DIR-unset}" "$HOME" >> "$root/env"
+echo "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out"
+STUB_EOF
+# run_suite runs in this shell, so a variable it leaked would remain here.
+trust_case() {
+  local mainnet_write="$1" target="$2"
+  : > "$STUB/args"; : > "$STUB/env"; : > "$STUB/certutil-args"
+  MAINNET_WRITE="$mainnet_write" PATH="$STUB:$PATH" \
+    run_suite stellar-agent-approval-remote operator-enroll-browser-acceptance "$target" > /dev/null 2>&1
+}
+trust_dirs=''
+for mainnet_write in on off; do
+  want=operator-enroll-browser-acceptance
+  [ "$mainnet_write" = on ] && want="mainnet-write,$want"
+  trust_case "$mainnet_write" mainnet_presence_browser_acceptance
+  rc=$?
+  IFS='|' read -r dir home < "$STUB/env"
+  trust_dirs="$trust_dirs $dir"
+  problems=''
+  [ "$rc" -eq 0 ] || problems="$problems exit $rc;"
+  [[ "$(cat "$STUB/args")" == *"--no-default-features --features $want --test mainnet_presence_browser_acceptance "* ]] \
+    || problems="$problems features '$(cat "$STUB/args")';"
+  [ "$home" = "$HOME" ] || problems="$problems cargo HOME '$home';"
+  [ -z "${STELLAR_AGENT_BROWSER_TRUST_DIR+set}" ] || problems="$problems the trust variable leaked;"
+  case "$dir" in
+    "$ROOT"/target/tmp/browser-trust/attempt.*) ;;
+    *) problems="$problems trust directory '$dir';" ;;
+  esac
+  for name in trusted-chain.pem trusted-key.pem untrusted-chain.pem untrusted-key.pem trusted.pin untrusted.pin; do
+    [ -s "$dir/$name" ] || problems="$problems $name missing;"
+  done
+  for name in trusted-key.pem untrusted-key.pem trusted-ca-key.pem untrusted-ca-key.pem; do
+    [ "$(stat -c %a "$dir/$name" 2> /dev/null || stat -f %Lp "$dir/$name")" = 600 ] \
+      || problems="$problems $name is not 0600;"
+  done
+  pin=$(openssl x509 -in "$dir/trusted-leaf.pem" -pubkey -noout | openssl pkey -pubin -outform DER \
+    | openssl dgst -sha256 -r | cut -c1-64)
+  [ "$(cat "$dir/trusted.pin")" = "$pin" ] || problems="$problems trusted.pin differs from the leaf;"
+  openssl verify -CAfile "$dir/trusted-ca.pem" "$dir/trusted-leaf.pem" > /dev/null 2>&1 \
+    || problems="$problems the trusted leaf does not verify;"
+  ! openssl verify -CAfile "$dir/trusted-ca.pem" "$dir/untrusted-leaf.pem" > /dev/null 2>&1 \
+    || problems="$problems the untrusted leaf verifies against the trusted authority;"
+  openssl x509 -in "$dir/trusted-leaf.pem" -noout -ext subjectAltName 2> /dev/null \
+    | grep -qF "DNS:$BROWSER_TRUST_HOST, DNS:$BROWSER_TRUST_FOREIGN_HOST" \
+    || problems="$problems the leaf lacks DNS:$BROWSER_TRUST_HOST and DNS:$BROWSER_TRUST_FOREIGN_HOST;"
+  expected_certutil=''
+  for db in "$dir/home/.pki/nssdb" "$dir/home/.local/share/pki/nssdb"; do
+    expected_certutil="${expected_certutil}-N --empty-password -d sql:$db
+-A -d sql:$db -n stellar-agent-test-ca -t C,, -i $dir/trusted-ca.pem
+"
+  done
+  [ "$(cat "$STUB/certutil-args")" = "${expected_certutil%$'\n'}" ] \
+    || problems="$problems certutil calls '$(cat "$STUB/certutil-args")';"
+  if [ -z "$problems" ]; then
+    pass "(k) MAINNET_WRITE=$mainnet_write the presence browser suite gets fresh private trust and --features $want"
+  else
+    fail "(k) MAINNET_WRITE=$mainnet_write trust setup:$problems"
+  fi
+done
+read -r first_dir second_dir <<< "$trust_dirs"
+if [ -n "$first_dir" ] && [ "$first_dir" != "$second_dir" ]; then
+  pass '(k) each attempt gets its own trust directory'
+else
+  fail "(k) attempts share the trust directory '$first_dir'"
+fi
+# A failed setup stops the suite before cargo, with the deterministic status.
+STUB_CERTUTIL=fail trust_case off operator_enroll_browser_acceptance
+rc=$?
+if [ "$rc" -eq 3 ] && [ ! -s "$STUB/args" ] && [ -s "$STUB/certutil-args" ]; then
+  pass '(k) a failed trust setup returns 3 before any cargo call'
+else
+  fail "(k) failed trust setup: exit $rc, cargo calls '$(cat "$STUB/args")'"
+fi
+# Another suite never prepares trust and never sees the variable.
+: > "$STUB/args"; : > "$STUB/env"; : > "$STUB/certutil-args"
+(MAINNET_WRITE=off PATH="$STUB:$PATH" run_suite stellar-agent-cli testnet-acceptance claim_testnet_acceptance \
+  > /dev/null 2>&1)
+rc=$?
+if [ "$rc" -eq 0 ] && [ ! -s "$STUB/certutil-args" ] && [ "$(cut -d'|' -f1 "$STUB/env")" = unset ]; then
+  pass '(k) a suite outside TRUSTED_BROWSER_SUITES runs without trust setup'
+else
+  fail "(k) claim_testnet_acceptance: exit $rc, certutil '$(cat "$STUB/certutil-args")', env '$(cat "$STUB/env")'"
+fi
 rm -f "$STUB/sleep" "$STUB/sleeps" "$STUB/summary"
-rm -f "$STUB/cargo" "$STUB/args"
+rm -f "$STUB/cargo" "$STUB/args" "$STUB/env" "$STUB/certutil" "$STUB/certutil-args" "$STUB/uname"
 rmdir "$STUB"
 
 if [ "$test_failures" -gt 0 ]; then
