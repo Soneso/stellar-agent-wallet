@@ -17,10 +17,6 @@
 //! Testnet enrollment writes remain local; its remote helper only displays registration data.
 //! Signed consent mounts no enrollment helper; [`enroll_listener`] serves signed-origin enrollment.
 
-// `deny` (not `forbid`): the test-only `STELLAR_AGENT_HOME` env-var override
-// helper in `tls.rs` needs a narrowly-scoped `#[allow(unsafe_code)]` for
-// `std::env::set_var` (Rust 2024 marks process-env mutation unsafe). No
-// production code path uses `unsafe`.
 #![deny(unsafe_code)]
 
 pub mod challenge_store;
