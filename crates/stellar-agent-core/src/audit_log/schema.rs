@@ -868,17 +868,18 @@ pub struct ValueLegRecord {
 }
 
 impl ValueLegRecord {
-    /// Builds the audit form of a classic payment leg with its destination
-    /// hash.
+    /// Builds the audit form of a payment leg with its destination hash.
     ///
     /// The action, amount, and asset come from `leg` as in the [`From`]
     /// conversion. The redaction and the hash come from the complete
-    /// canonical destination.
+    /// canonical destination: a G account, an M address, or the C recipient
+    /// of a contract payment.
     ///
     /// # Errors
     ///
     /// Returns `validation.address_invalid` when the leg has no destination
-    /// or its destination is not a canonical G account or M address.
+    /// or its destination is not a canonical G account, M address, or C
+    /// contract.
     ///
     /// # Examples
     ///
@@ -905,8 +906,14 @@ impl ValueLegRecord {
         let destination = leg.destination.as_deref().ok_or_else(|| {
             crate::error::ValidationError::address_argument("payment destination")
         })?;
-        let account = crate::payment_accounts::PaymentAccount::parse(destination)?;
-        let canonical = account.canonical();
+        let canonical = match crate::payment_accounts::PaymentAccount::parse(destination) {
+            Ok(account) => account.canonical().to_owned(),
+            Err(_) if crate::sac_payment::is_canonical_contract(destination) => {
+                destination.to_owned()
+            }
+            Err(error) => return Err(error),
+        };
+        let canonical = canonical.as_str();
         Ok(Self {
             destination_redacted: Some(crate::observability::redact_strkey_first5_last5(canonical)),
             destination_sha256: Some(crate::hex::encode(&sha2::Sha256::digest(
@@ -7499,15 +7506,59 @@ mod tests {
         let (g, _) = PAYMENT_DESTINATIONS[0];
         let corrupted = format!("{}A", &g[..55]);
         let contract = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+        let lowercase = contract.to_lowercase();
+        let w = format!(
+            "{}",
+            stellar_strkey::MuxedContract {
+                contract_id: [0; 32],
+                id: 7
+            }
+        );
         for destination in [
             None,
-            Some(contract),
+            Some(lowercase.as_str()),
+            Some(w.as_str()),
             Some(corrupted.as_str()),
             Some("example.com"),
         ] {
             let err = ValueLegRecord::from_payment_leg(&payment_leg(destination)).unwrap_err();
             assert_eq!(err.code(), "validation.address_invalid", "{destination:?}");
         }
+    }
+
+    /// A contract payment leg records the redacted C and the SHA-256 of the
+    /// full C, which never appears in the audit form.
+    #[test]
+    fn b1_c_payment_audit_hash() {
+        let mut hashes = std::collections::BTreeSet::new();
+        for (contract, expected) in [
+            (
+                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+                "f36ca94889cb4ccf6e7e78cd299d1524e85f2c86efa8e2998babd83afa8faf7a",
+            ),
+            (
+                "CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ",
+                "141bc40836f98ac606b04502c74283d06d6b427ed329bac4686a38b6d5c108d8",
+            ),
+        ] {
+            let leg = payment_leg(Some(contract));
+            let record = ValueLegRecord::from_payment_leg(&leg).unwrap();
+            assert_eq!(
+                record.destination_sha256.as_deref(),
+                Some(expected),
+                "C hash"
+            );
+            assert_eq!(
+                record.destination_redacted,
+                Some(crate::observability::redact_strkey_first5_last5(contract))
+            );
+            assert_eq!(record.action, ValueActionKind::Payment);
+            let wire = serde_json::to_string(&record).unwrap();
+            assert!(!wire.contains(contract), "{wire}");
+            assert_eq!(ValueLegRecord::from(&leg).destination_sha256, None);
+            hashes.insert(expected);
+        }
+        assert_eq!(hashes.len(), 2, "another C changes the hash");
     }
 
     /// A row without the field reads as `None` and writes the same bytes.

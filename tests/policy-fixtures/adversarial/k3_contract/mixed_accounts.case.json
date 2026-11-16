@@ -1,0 +1,21 @@
+{
+  "test_kind": "evaluate",
+  "name": "mixed_accounts",
+  "category": "k3_contract",
+  "description": "Policy evaluates facts decoded from a verified contract transfer.",
+  "tool": {
+    "name": "stellar_pay_commit",
+    "destructive_hint": true,
+    "read_only_hint": false,
+    "chain_id_required": true,
+    "chain_id": "stellar:testnet"
+  },
+  "profile_name": "contract",
+  "sac_payment_context": {
+    "chain": "stellar:testnet",
+    "asset": "native"
+  },
+  "expected": {
+    "kind": "Allow"
+  }
+}

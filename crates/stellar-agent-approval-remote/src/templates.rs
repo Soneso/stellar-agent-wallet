@@ -1739,6 +1739,36 @@ mod tests {
         );
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn contract_remote_consent_shows_full_destination_and_fees() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let entry = fixtures::sac_payment_pending(
+            stellar_agent_core::profile::caip2::Caip2::Testnet,
+            stellar_agent_core::approval::IntentAsset::Native,
+        );
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut store = stellar_agent_core::approval::PendingApprovalStore::open(
+            dir.path().join("contract.toml"),
+        )
+        .unwrap();
+        store
+            .insert(entry.clone(), entry.created_at_unix_ms)
+            .unwrap();
+        let view = store.snapshot(entry.created_at_unix_ms).remove(0);
+        let html = render_detail_page(&view, &test_context(), "csrf", None, None, &neutral());
+        for fact in [
+            "CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ",
+            "<dt>Simulated fee (stroops)</dt><dd>500100</dd>",
+            "<dt>Inclusion fee (stroops)</dt><dd>100</dd>",
+            "<dt>Resource fee (stroops)</dt><dd>500000</dd>",
+        ] {
+            assert!(html.contains(fact), "missing {fact}");
+        }
+    }
+
     fn trustline_view(dir: &TempDir) -> PendingApprovalView {
         let mut store = PendingApprovalStore::open(dir.path().join("trustline.toml")).unwrap();
         store

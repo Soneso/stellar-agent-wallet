@@ -248,6 +248,99 @@ pub fn claim_envelope(source: &str, balance_hash: [u8; 32], fee: u32, seq_num: i
     )
 }
 
+/// A transfer of one stroop of `context`'s asset through its asset contract,
+/// from the G account of key `[1; 32]` to the C contract of key `[2; 32]`.
+///
+/// The transfer has one SourceAccount authorization, sequence 77, and a
+/// 500,100 stroop fee of which 500,000 is the resource fee.
+///
+/// # Panics
+///
+/// Panics when the context's asset has no contract identifier.
+#[must_use]
+pub fn sac_transfer(context: &crate::sac_payment::SacPaymentContext) -> TransactionV1Envelope {
+    use stellar_xdr::{
+        ContractId, HostFunction, InvokeContractArgs, InvokeHostFunctionOp, ScAddress, ScSymbol,
+        ScVal, SorobanAuthorizationEntry, SorobanAuthorizedFunction, SorobanAuthorizedInvocation,
+        SorobanCredentials, SorobanTransactionData,
+    };
+    let asset = match context.asset() {
+        super::IntentAsset::Native => crate::asset_id::CanonicalAsset::Native,
+        super::IntentAsset::Issued { code, issuer } => {
+            crate::asset_id::CanonicalAsset::classic(code, issuer).expect("validated asset")
+        }
+    };
+    let contract = stellar_strkey::Contract::from_string(
+        &asset
+            .sac_contract_id(context.chain().network_passphrase())
+            .expect("asset contract identifier"),
+    )
+    .expect("C strkey");
+    let invoke = InvokeContractArgs {
+        contract_address: ScAddress::Contract(ContractId(Hash(contract.0))),
+        function_name: ScSymbol("transfer".try_into().expect("symbol")),
+        args: vec![
+            ScVal::Address(ScAddress::Account(AccountId(
+                PublicKey::PublicKeyTypeEd25519(Uint256([1; 32])),
+            ))),
+            ScVal::Address(ScAddress::Contract(ContractId(Hash([2; 32])))),
+            ScVal::from(1_i128),
+        ]
+        .try_into()
+        .expect("three arguments"),
+    };
+    let auth = SorobanAuthorizationEntry {
+        credentials: SorobanCredentials::SourceAccount,
+        root_invocation: SorobanAuthorizedInvocation {
+            function: SorobanAuthorizedFunction::ContractFn(invoke.clone()),
+            sub_invocations: VecM::default(),
+        },
+    };
+    TransactionV1Envelope {
+        tx: Transaction {
+            source_account: MuxedAccount::Ed25519(Uint256([1; 32])),
+            fee: 500_100,
+            seq_num: SequenceNumber(77),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![Operation {
+                source_account: None,
+                body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                    host_function: HostFunction::InvokeContract(invoke),
+                    auth: vec![auth].try_into().expect("one authorization"),
+                }),
+            }]
+            .try_into()
+            .expect("one operation"),
+            ext: TransactionExt::V1(SorobanTransactionData {
+                resource_fee: 500_000,
+                ..Default::default()
+            }),
+        },
+        signatures: VecM::default(),
+    }
+}
+
+/// A contract payment entry over [`sac_transfer`] for `asset` on `chain`,
+/// created now with a one hour lifetime.
+///
+/// # Panics
+///
+/// Panics when the asset is not a valid classic asset.
+#[must_use]
+pub fn sac_payment_pending(
+    chain: crate::profile::caip2::Caip2,
+    asset: super::IntentAsset,
+) -> PendingApproval {
+    let context =
+        crate::sac_payment::SacPaymentContext::new(chain, asset).expect("valid fixture context");
+    let envelope = TransactionEnvelope::Tx(sac_transfer(&context))
+        .to_xdr_base64(Limits::none())
+        .expect("fixture envelope encodes");
+    PendingApproval::new_sac_payment_pending(envelope, context, "1000".to_owned(), 3_600_000)
+        .expect("fixture contract payment")
+}
+
 /// The canonical 72-hex id and the `B...` strkey of the balance whose hash is
 /// `balance_hash`.
 #[must_use]

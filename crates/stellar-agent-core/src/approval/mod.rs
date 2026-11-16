@@ -180,8 +180,10 @@ pub fn verify_entry_terms(kind: &ApprovalKind) -> Result<(), crate::error::Walle
 
 /// Checks the stored payment destination before a use reads it.
 ///
-/// A stored payment summary or `sign-payment` request must name a canonical
-/// G account or M address. Every other kind passes.
+/// A stored payment summary must name a canonical G account or M address,
+/// or a canonical C contract when it records a contract payment context. A
+/// `sign-payment` request must name a canonical G account or M address.
+/// Every other kind passes.
 ///
 /// # Errors
 ///
@@ -189,7 +191,7 @@ pub fn verify_entry_terms(kind: &ApprovalKind) -> Result<(), crate::error::Walle
 pub fn verify_stored_destination(kind: &ApprovalKind) -> Result<(), crate::error::WalletError> {
     if store::holds_refused_destination(kind) {
         return Err(inconsistent(
-            "its payment destination is not a canonical G account or M address",
+            "its payment destination is not the canonical form its record admits",
         ));
     }
     Ok(())

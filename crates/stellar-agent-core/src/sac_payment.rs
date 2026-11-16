@@ -203,6 +203,7 @@ pub struct VerifiedSacPayment {
     invoke: InvokeContractArgs,
     payer: AccountId,
     recipient: ContractId,
+    amount: i64,
 }
 
 impl VerifiedSacPayment {
@@ -223,6 +224,148 @@ impl VerifiedSacPayment {
     pub fn invoke(&self) -> &InvokeContractArgs {
         &self.invoke
     }
+
+    /// Authoritative facts of the `stellar_pay_commit` policy schema.
+    ///
+    /// The destination is the full C recipient, `total_fee_stroops` is the
+    /// whole transaction fee and `sequence_number` is numeric. The memo is
+    /// always absent because verification refuses any other memo.
+    #[must_use]
+    pub fn policy_args(&self) -> serde_json::Value {
+        let mut args = serde_json::json!({
+            "source": self.source(),
+            "total_fee_stroops": self.transaction.fee,
+            "destination": self.destination(),
+            "amount_stroops": self.amount.to_string(),
+            "asset": self.asset_text(),
+            "sequence_number": self.transaction.seq_num.0,
+        });
+        for (key, value) in crate::envelope_decode::ClassicMemo::None.policy_fields() {
+            args[key] = value;
+        }
+        args
+    }
+
+    /// The approval summary of the verified transfer.
+    ///
+    /// The inclusion and resource fees are present when the Soroban
+    /// resource fee fits in `u32` and does not exceed the transaction fee.
+    #[must_use]
+    pub fn summary(&self) -> crate::envelope_decode::ClassicSummary {
+        use crate::envelope_decode::{ClassicMemo, ClassicOperation, ClassicSummary};
+        let tx = &self.transaction;
+        let split = match &tx.ext {
+            TransactionExt::V1(data) => u32::try_from(data.resource_fee)
+                .ok()
+                .and_then(|resource| Some((tx.fee.checked_sub(resource)?, resource))),
+            TransactionExt::V0 => None,
+        };
+        ClassicSummary {
+            source: self.source(),
+            fee_stroops: tx.fee,
+            seq_num: tx.seq_num.0,
+            memo: ClassicMemo::None,
+            operation: ClassicOperation::SacTransfer {
+                destination: self.destination(),
+                asset: self.asset_text(),
+                amount_stroops: self.amount,
+                inclusion_fee_stroops: split.map(|(inclusion, _)| inclusion),
+                resource_fee_stroops: split.map(|(_, resource)| resource),
+            },
+        }
+    }
+
+    /// The canonical intent payload of the verified transfer.
+    ///
+    /// `explicit_inclusion_bid_stroops` records whether the caller chose the
+    /// inclusion bid; `None` and `Some(0)` encode differently.
+    #[must_use]
+    pub fn intent_payload(
+        &self,
+        explicit_inclusion_bid_stroops: Option<u32>,
+    ) -> crate::approval::IntentPayload {
+        crate::approval::IntentPayload::ContractPay {
+            destination: self.destination(),
+            asset: self.context.asset.clone(),
+            amount_stroops: self.amount,
+            explicit_inclusion_bid_stroops,
+        }
+    }
+
+    /// The G payer, which is also the transaction source.
+    fn source(&self) -> String {
+        let AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(payer))) = &self.payer;
+        format!("{}", stellar_strkey::ed25519::PublicKey(*payer))
+    }
+
+    /// The full C recipient.
+    pub(crate) fn destination(&self) -> String {
+        format!("{}", stellar_strkey::Contract(self.recipient.0.0))
+    }
+
+    /// The transfer amount in stroops.
+    pub(crate) fn amount_stroops(&self) -> i64 {
+        self.amount
+    }
+
+    /// `"XLM"` or `"CODE:ISSUER"`, the classic payment asset text.
+    pub(crate) fn asset_text(&self) -> String {
+        match &self.context.asset {
+            IntentAsset::Native => "XLM".to_owned(),
+            IntentAsset::Issued { code, issuer } => format!("{code}:{issuer}"),
+        }
+    }
+}
+
+/// Whether `text` is a canonical C contract strkey.
+pub(crate) fn is_canonical_contract(text: &str) -> bool {
+    stellar_strkey::Contract::from_string(text).is_ok_and(|key| format!("{key}") == text)
+}
+
+/// The transfer operation and its arguments when `tx` holds exactly one
+/// `transfer(Account, Contract, I128)` contract invocation.
+type TransferParts<'a> = (
+    &'a Operation,
+    &'a InvokeHostFunctionOp,
+    &'a InvokeContractArgs,
+    &'a AccountId,
+    &'a ContractId,
+    &'a Int128Parts,
+);
+
+fn transfer_parts(tx: &Transaction) -> Option<TransferParts<'_>> {
+    let [op] = tx.operations.as_slice() else {
+        return None;
+    };
+    let OperationBody::InvokeHostFunction(host) = &op.body else {
+        return None;
+    };
+    let HostFunction::InvokeContract(invoke) = &host.host_function else {
+        return None;
+    };
+    if invoke.function_name.0.as_slice() != b"transfer" {
+        return None;
+    }
+    let [
+        ScVal::Address(ScAddress::Account(payer)),
+        ScVal::Address(ScAddress::Contract(recipient)),
+        ScVal::I128(amount),
+    ] = invoke.args.as_slice()
+    else {
+        return None;
+    };
+    Some((op, host, invoke, payer, recipient, amount))
+}
+
+/// Whether the envelope is a v1 transaction with exactly one
+/// `transfer(Account, Contract, I128)` invocation of any contract.
+///
+/// A payment surface evaluates every such envelope as a payment.
+pub(crate) fn is_transfer_shaped(envelope_xdr: &str) -> bool {
+    matches!(
+        crate::envelope_decode::read_envelope(envelope_xdr),
+        Ok(TransactionEnvelope::Tx(envelope)) if transfer_parts(&envelope.tx).is_some()
+    )
 }
 
 /// Proves a single classic-asset transfer from a G payer to a C recipient.
@@ -246,27 +389,8 @@ pub fn verify_sac_payment(
     if tx.memo != Memo::None {
         return Err(SacPaymentError::MemoUnsupported.into());
     }
-    if tx.operations.len() != 1 {
-        return Err(SacPaymentError::Invalid.into());
-    }
-    let op = tx.operations.first().ok_or(SacPaymentError::Invalid)?;
-    let OperationBody::InvokeHostFunction(host) = &op.body else {
-        return Err(SacPaymentError::Invalid.into());
-    };
-    let HostFunction::InvokeContract(invoke) = &host.host_function else {
-        return Err(SacPaymentError::Invalid.into());
-    };
-    if invoke.function_name.0.as_slice() != b"transfer" {
-        return Err(SacPaymentError::Invalid.into());
-    }
-    let [
-        ScVal::Address(ScAddress::Account(payer)),
-        ScVal::Address(ScAddress::Contract(recipient)),
-        ScVal::I128(amount),
-    ] = invoke.args.as_slice()
-    else {
-        return Err(SacPaymentError::Invalid.into());
-    };
+    let (op, host, invoke, payer, recipient, amount) =
+        transfer_parts(&tx).ok_or(SacPaymentError::Invalid)?;
     let AccountId(PublicKey::PublicKeyTypeEd25519(payer_key)) = payer;
     if tx.source_account != MuxedAccount::Ed25519(payer_key.clone()) {
         return Err(SacPaymentError::Invalid.into());
@@ -305,6 +429,7 @@ pub fn verify_sac_payment(
         invoke: invoke.clone(),
         payer: payer.clone(),
         recipient: recipient.clone(),
+        amount,
         transaction: tx,
     })
 }
