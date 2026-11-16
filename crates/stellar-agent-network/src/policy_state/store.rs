@@ -2007,6 +2007,15 @@ impl PersistedWindowStore {
         if earlier_build(&wire) {
             wire = self.retire_on_load(profile)?;
         }
+        Self::hydrate_inspected(&wire, profile_name, dest, now)
+    }
+
+    pub(super) fn hydrate_inspected(
+        wire: &WireFile,
+        profile_name: &str,
+        dest: &PolicyStateStore,
+        now: u64,
+    ) -> Result<(), WindowStoreError> {
         let in_memory = |result: Result<(), StateStoreError>| {
             result.map_err(|e| WindowStoreError::Invalid {
                 detail: format!("in-memory store append failed: {e}"),
@@ -2015,17 +2024,17 @@ impl PersistedWindowStore {
         // A total-budget hold enters the in-memory store as an ordinary
         // writer's admission counts it after its sweep, at the one clock
         // value this hydration reads.
-        let exposed = operations::exposed_authorizations(&wire);
-        let live = operations::live_operations(&wire);
+        let exposed = operations::exposed_authorizations(wire);
+        let live = operations::live_operations(wire);
         for hold in &wire.holds {
             if let Some(epoch) = hold.epoch
                 && is_total_hold(hold)
-                && total_hold_counts(&wire, hold, &exposed, &live, now)
+                && total_hold_counts(wire, hold, &exposed, &live, now)
             {
                 let key = StateKey::new(
                     profile_name,
                     hold.scope_specificity,
-                    &canonical_total_bucket(&hold.bucket, &wire),
+                    &canonical_total_bucket(&hold.bucket, wire),
                     0,
                 );
                 in_memory(dest.append_epoch(&key, hold.ts_ms, hold.amount, epoch))?;
@@ -2036,7 +2045,7 @@ impl PersistedWindowStore {
             let key = StateKey::new(
                 profile_name,
                 sum.scope_specificity,
-                &canonical_total_bucket(&sum.bucket, &wire),
+                &canonical_total_bucket(&sum.bucket, wire),
                 0,
             );
             in_memory(dest.append_epoch(&key, sum.settled_until_ms, sum.amount, sum.epoch))?;
@@ -2047,7 +2056,7 @@ impl PersistedWindowStore {
                     let key = StateKey::new(
                         profile_name,
                         leg.scope_specificity,
-                        &canonical_total_bucket(&leg.bucket, &wire),
+                        &canonical_total_bucket(&leg.bucket, wire),
                         0,
                     );
                     in_memory(dest.append_epoch(&key, leg.ts_ms, leg.amount, epoch))?;
@@ -2073,7 +2082,7 @@ impl PersistedWindowStore {
             }
         }
         let scope = wire.chain_scope;
-        for entry in wire.entries {
+        for entry in &wire.entries {
             let key = StateKey::new(
                 profile_name,
                 entry.scope_specificity,
@@ -2084,7 +2093,7 @@ impl PersistedWindowStore {
             // proof releases it. A row without an epoch matches no epoch. A
             // negative stored row never lowers the use; durable admission
             // refuses its bucket instead.
-            if is_total_budget_bucket(&entry) {
+            if is_total_budget_bucket(entry) {
                 let key = StateKey::new(
                     profile_name,
                     entry.scope_specificity,
@@ -2102,12 +2111,12 @@ impl PersistedWindowStore {
                 }
                 continue;
             }
-            for record in entry.records {
+            for record in &entry.records {
                 if record.signed_intent.is_some() {
                     continue;
                 }
-                let appended = if is_exposure(&record) {
-                    let accounting_at = execution_bound(&record)
+                let appended = if is_exposure(record) {
+                    let accounting_at = execution_bound(record)
                         .map(|bound| bound.max(record.observed_at_ms.unwrap_or(0)));
                     dest.append_exposure(
                         &key,
@@ -2115,7 +2124,7 @@ impl PersistedWindowStore {
                         record.amount,
                         &record.id,
                         accounting_at,
-                        exposure_horizon(&record, entry.window_secs),
+                        exposure_horizon(record, entry.window_secs),
                     )
                 } else if record.status == RecordStatus::Confirmed {
                     dest.append(&key, record.ts_ms, record.amount)
@@ -4350,6 +4359,45 @@ impl PersistedWindowStore {
         Ok(self
             .accounting_expiry(profile, decision_id)?
             .map(|record| record.event()))
+    }
+
+    /// Rewrites the committed window as an earlier build's version 11
+    /// snapshot under its key and generation. A `total` amount adds one
+    /// epoch-less native total-budget row, as those builds stored it.
+    ///
+    /// # Errors
+    ///
+    /// See [`WindowStoreError`]; an absent window is
+    /// [`WindowStoreError::Invalid`].
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn seal_earlier_build_for_test(
+        &self,
+        profile: &Profile,
+        total: Option<i128>,
+    ) -> Result<(), WindowStoreError> {
+        let mut wire =
+            self.read_for_inspection(profile)?
+                .ok_or_else(|| WindowStoreError::Invalid {
+                    detail: "no committed window to seal".to_owned(),
+                })?;
+        wire.version = WIRE_VERSION_OPERATIONS;
+        wire.retired_total_epoch = None;
+        if let Some(amount) = total {
+            wire.entries.push(WireBucket {
+                scope_specificity: 1,
+                bucket: "total:native".to_owned(),
+                window_secs: 0,
+                records: vec![WireRecord {
+                    ts_ms: 1,
+                    amount,
+                    epoch: None,
+                    ..WireRecord::confirmed_defaults()
+                }],
+            });
+        }
+        let (key, _) = self.load_or_mint_key(profile)?;
+        self.write_atomic(&key, &wire)?;
+        write_generation(&generation_entry_ref(profile), &wire)
     }
 
     /// The decision identifier the verified window state holds for the

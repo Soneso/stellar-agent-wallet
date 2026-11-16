@@ -1295,6 +1295,49 @@ For an enforced kind, recoverable delivery and evidence errors retry the existin
 {"ok":true,"data":{"approval_nonce":"ABCxyzNonce","attested":true,"process_uid":"501","expires_at_unix_ms":1717000000000,"approval_attestation":"q83vEjRWeJq83v...","audit":"written"},"request_id":"..."}
 ```
 
+### `approve status`
+
+```sh
+stellar-agent approve status <approval-id> --profile <name>
+```
+
+Inspects the existing public approval nonce and prints the same JSON data as
+MCP `stellar_approval_status {"approval_id":"<nonce>"}`. The chain comes from
+the selected profile. Internal durable record IDs are not accepted as nonces.
+
+The view requires `state` and `kind`. States are `pending`, `attested`,
+`consumed`, `rejected`, `expired`, and `revoked`. Stored tombstones take precedence
+over expiry and retain the original kind. Rejection reports `rejected_at_ms`
+instead of `created_at_ms`; consumed entries include available `tx_hash` and
+`outcome`. Consumed and rejected entries omit `subject_digest`.
+
+Available timestamps include `created_at_ms`, `expires_at_ms`, and the stored
+mainnet consent time as `attested_at_ms`. Durable records can supply
+`waiting_expires_at_ms`, `execution_expires_at_ms`, an operation-linked
+`business_id`, and `open_attempt`. Missing optional facts are omitted.
+Current preparation paths populate the inbox; durable facts appear only for
+existing authenticated durable records, including after inbox cleanup.
+
+Payment, claim, trustline, and x402 approvals expose `verification` with
+`supported`, `valid`, and `reason`. Consent presence determines `attested`;
+only cryptographic verification determines validity. Other pending kinds report
+`verification: {"supported":false}` and top-level `valid:null`.
+Key or policy unavailability reports `verification_unavailable`.
+Proof bytes, assertions, credential IDs, and link tokens are excluded.
+
+Envelope approvals use `binding: "legacy-envelope"`; durable intent approvals
+use `binding: "canonical-intent"`. Status grants no signing or retry authority
+and reports `reusable:false` with `reuse_kind:"none"`.
+It consumes, repairs, collects, and extends nothing.
+Expiry is a read-only view at the supplied time, so clock rollback can revive
+observational expiry because no durable watermark is stored.
+
+Unknown and collected nonces return `approval.unknown`. Every inbox opening
+failure returns `approval.store_open_failed` with a safe cause class.
+Unreadable authenticated state refuses before inbox fallback.
+For pending consent, use `approve --id <nonce> --profile <name>`.
+Ended or invalid consent requires fresh preparation and consent.
+
 ### `approve revoke`
 
 ```sh

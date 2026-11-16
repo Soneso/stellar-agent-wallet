@@ -1648,6 +1648,30 @@ impl WalletServer {
         .await
     }
 
+    /// Evaluates approval status using the same verified image as its view,
+    /// at `now_ms`, the instant the facade read that image.
+    pub(crate) async fn dispatch_approval_status(
+        &self,
+        args: &Value,
+        snapshot: &Result<
+            stellar_agent_network::policy_state::approvals::status::ApprovalStatusSnapshot<'_>,
+            stellar_agent_network::policy_state::WindowStoreError,
+        >,
+        now_ms: u64,
+    ) -> Result<DispatchOutcome, ToolError> {
+        self.dispatch_gate_inner(
+            "stellar_approval_status",
+            args,
+            self.security_profile().chain_id.caip2_str(),
+            None,
+            None,
+            None,
+            EvaluationScope::Classic,
+            GateMode::ApprovalStatus(snapshot, now_ms),
+        )
+        .await
+    }
+
     /// Evaluates a toolset payment's effects before the routed account read.
     /// Account reserve and balance floor checks run strictly at the routed
     /// gate. This gate records no spending and supplies no account views.
@@ -1891,9 +1915,15 @@ impl WalletServer {
         identity_view: Option<&dyn stellar_agent_core::policy::v1::AccountIdentityView>,
         scope: EvaluationScope,
         now_ms: u64,
-        mode: GateMode,
+        mode: GateMode<'_>,
     ) -> Result<(GateEvaluation, Arc<GateSnapshot>), ToolError> {
-        let snapshot = self.capture_gate_snapshot(&descriptor.name, now_ms).await?;
+        let snapshot = match mode {
+            GateMode::ApprovalStatus(image, read_ms) => {
+                self.capture_status_snapshot(&descriptor.name, image, read_ms)
+                    .await?
+            }
+            _ => self.capture_gate_snapshot(&descriptor.name, now_ms).await?,
+        };
         let evaluation = self
             .evaluate_with_descriptor(
                 descriptor,
@@ -1979,7 +2009,7 @@ impl WalletServer {
         identity_view: Option<&dyn stellar_agent_core::policy::v1::AccountIdentityView>,
         scope: EvaluationScope,
         snapshot: &GateSnapshot,
-        mode: GateMode,
+        mode: GateMode<'_>,
     ) -> Result<GateEvaluation, ToolError> {
         // Evaluate policy with the profile-bound descriptor.
         //
@@ -2031,12 +2061,12 @@ impl WalletServer {
                 args: args_value,
                 profile: self.security_profile(),
                 value,
-                account_view: if mode == GateMode::Provisional {
+                account_view: if matches!(mode, GateMode::Provisional) {
                     None
                 } else {
                     account_view
                 },
-                identity_view: if mode == GateMode::Provisional {
+                identity_view: if matches!(mode, GateMode::Provisional) {
                     None
                 } else {
                     identity_view
@@ -2044,7 +2074,7 @@ impl WalletServer {
                 counterparty_cache: counterparty_view,
                 sep10_sessions: None,
                 sep45_sessions: None,
-                provisional: mode == GateMode::Provisional,
+                provisional: matches!(mode, GateMode::Provisional),
             },
             &snapshot.policy,
         );
@@ -2079,7 +2109,39 @@ impl WalletServer {
                 )));
             }
         }
+        self.gate_frame(tool, store, now_ms).await
+    }
 
+    /// Captures an approval status frame from the facade's verified image at
+    /// `read_ms`, the instant the facade read it, with no second window read.
+    async fn capture_status_snapshot(
+        &self,
+        tool: &str,
+        image: &Result<
+            stellar_agent_network::policy_state::approvals::status::ApprovalStatusSnapshot<'_>,
+            stellar_agent_network::policy_state::WindowStoreError,
+        >,
+        read_ms: u64,
+    ) -> Result<Arc<GateSnapshot>, ToolError> {
+        let store = stellar_agent_core::policy::v1::PolicyStateStore::new();
+        if self.policy_engine.window_state_store().is_some() {
+            match image {
+                Ok(image) => image
+                    .hydrate_into(&store)
+                    .map_err(|e| window_refresh_error(&e))?,
+                Err(error) => return Err(window_refresh_error(error)),
+            }
+        }
+        self.gate_frame(tool, store, read_ms).await
+    }
+
+    /// Completes a frame with the counterparty cache and its policy instant.
+    async fn gate_frame(
+        &self,
+        tool: &str,
+        store: stellar_agent_core::policy::v1::PolicyStateStore,
+        now_ms: u64,
+    ) -> Result<Arc<GateSnapshot>, ToolError> {
         let cache = match stellar_agent_network::CounterpartyCacheSnapshot::from_resolver(
             &*self.counterparty_resolver,
         )
@@ -2263,7 +2325,7 @@ impl WalletServer {
         account_view: Option<&dyn stellar_agent_core::policy::v1::AccountReservesView>,
         identity_view: Option<&dyn stellar_agent_core::policy::v1::AccountIdentityView>,
         scope: EvaluationScope,
-        mode: GateMode,
+        mode: GateMode<'_>,
     ) -> Result<DispatchOutcome, ToolError> {
         let descriptor = self.checked_policy_descriptor(tool_name, args_value, chain_id)?;
 
@@ -2288,7 +2350,7 @@ impl WalletServer {
         // A read-only tool spends none, so settling before it would buy two
         // keyring reads, an HMAC verify and a receipt-store read per call for
         // an answer nothing in that call uses.
-        if mode != GateMode::Preparation
+        if !matches!(mode, GateMode::Preparation)
             && descriptor.value_kind != stellar_agent_core::policy::ToolValueKind::ReadOnly
             && self.policy_engine.window_state_store().is_some()
         {
@@ -2315,22 +2377,18 @@ impl WalletServer {
             })?;
             let profile_name = self.profile_name_for_approval();
             let window_store = self.window_store.clone();
-            if let Err(e) =
-                window_store.load_into_at(&profile_name, self.security_profile(), store, now_ms)
-            {
-                if e.chain_validation_error().is_some() || e.operation_error().is_some() {
-                    return Err(ToolError::Business(business_error_result(
-                        e.submission_code(),
-                        e.to_string(),
-                    )));
-                }
-                return Err(ToolError::Business(business_error_result(
-                    "policy.engine_required",
-                    e.with_recovery_notice(format!(
-                        "policy window-state store failed to refresh ({e})"
-                    )),
-                )));
-            }
+            let loaded = match mode {
+                GateMode::ApprovalStatus(snapshot, _) => match snapshot {
+                    Ok(snapshot) => snapshot
+                        .hydrate_into(store)
+                        .map_err(|e| window_refresh_error(&e)),
+                    Err(error) => Err(window_refresh_error(error)),
+                },
+                _ => window_store
+                    .load_into_at(&profile_name, self.security_profile(), store, now_ms)
+                    .map_err(|e| window_refresh_error(&e)),
+            };
+            loaded?;
         }
         let (evaluation, snapshot) = self
             .capture_and_evaluate(
@@ -2402,16 +2460,39 @@ impl WalletServer {
 }
 
 /// How the shared gate core settles reservations and evaluates a dispatch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GateMode {
+#[derive(Clone, Copy)]
+enum GateMode<'a> {
     /// Settles reservations before a value-moving dispatch and evaluates
     /// every criterion.
     Strict,
     /// Skips the reservation pass and evaluates every criterion.
+    #[cfg_attr(
+        not(feature = "mainnet-write"),
+        allow(dead_code, reason = "preparation requires mainnet-write")
+    )]
     Preparation,
     /// Settles reservations like `Strict` and defers `minimum_reserve` and
     /// `balance_floor` to a later strict gate with a live account read.
     Provisional,
+    /// Hydrates from the approval facade's verified image. The frame
+    /// evaluates at the instant the facade read that image.
+    ApprovalStatus(
+        &'a Result<
+            stellar_agent_network::policy_state::approvals::status::ApprovalStatusSnapshot<'a>,
+            stellar_agent_network::policy_state::WindowStoreError,
+        >,
+        u64,
+    ),
+}
+
+fn window_refresh_error(e: &stellar_agent_network::policy_state::WindowStoreError) -> ToolError {
+    if e.chain_validation_error().is_some() || e.operation_error().is_some() {
+        return ToolError::Business(business_error_result(e.submission_code(), e.to_string()));
+    }
+    ToolError::Business(business_error_result(
+        "policy.engine_required",
+        e.with_recovery_notice(format!("policy window-state store failed to refresh ({e})")),
+    ))
 }
 
 /// Which side of a pair is the commit name's. Its approval requirement

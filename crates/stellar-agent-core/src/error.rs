@@ -415,6 +415,9 @@ impl WalletError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ApprovalFailure {
+    /// No retained approval has the requested public nonce.
+    #[error("No retained approval has this approval ID.")]
+    Unknown,
     /// The pending approval does not exist.
     ///
     /// # Wire code
@@ -885,6 +888,7 @@ impl ApprovalFailure {
     #[must_use]
     pub const fn code(&self) -> &'static str {
         match self {
+            Self::Unknown => "approval.unknown",
             Self::NotFound { .. } => "approval.not_found",
             Self::Revoked { .. } => "approval.revoked",
             Self::Expired { .. } => "approval.expired",

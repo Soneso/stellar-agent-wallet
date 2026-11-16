@@ -10,7 +10,7 @@ use zeroize::Zeroizing;
 use super::attestation::{AttestationScope, AttestedApprover, AttestedLifetime};
 use super::presence::{MainnetPresenceReceipt, approval_view_subject};
 use super::subject::SubjectKind;
-use super::witness::{ApprovalDisposition, ApprovalFacts, ApprovedKind};
+use super::witness::{ApprovalDisposition, ApprovalFacts, ApprovedKind, intent_clocks};
 use super::{ApprovalError, ApprovalKind, AttestationBinding, PendingApproval};
 use crate::error::{ApprovalFailure, WalletError};
 use crate::mainnet::verified_policy::VerifiedPolicy;
@@ -151,7 +151,7 @@ fn load_policy(name: &str, profile: &Profile) -> Option<VerifiedPolicy> {
         .ok()?
         .join(format!("{name}.toml"));
     let window_path = crate::profile::schema::default_policy_window_state_path_for(name);
-    verified::inspect_verified_policy(
+    let policy = verified::inspect_verified_policy(
         &verified::PolicyLoad {
             path: &path,
             profile,
@@ -163,7 +163,17 @@ fn load_policy(name: &str, profile: &Profile) -> Option<VerifiedPolicy> {
         PolicyStateStore::new(),
     )
     .verified
-    .ok()
+    .ok()?;
+    let profile_dir = crate::profile::schema::default_profile_dir().ok()?;
+    crate::mainnet::enablement::verify_enablement_bindings(
+        &policy,
+        name,
+        profile,
+        &profile_dir,
+        &crate::mainnet::enablement::read_enablement_nonce,
+    )
+    .ok()?;
+    Some(policy)
 }
 
 /// Inspects stored evidence using a freshly loaded context. Unsupported inbox
@@ -185,6 +195,8 @@ pub fn inspect_stored_approval(
 
 /// Verifies stored proof without loading, consuming, repairing or auditing.
 /// The context supplies no independent commit expectation or spend permission.
+/// An unsupported inbox kind reports unavailable here; identify it through
+/// [`inspect_stored_approval`] or [`InspectionContext::for_entry`].
 #[must_use]
 pub fn inspect_approval(
     entry: InspectionEntry<'_>,
@@ -346,6 +358,7 @@ fn inspect_proof(
         return R::Expired;
     }
     if ctx.chain.is_mainnet() {
+        // `InspectionContext::for_entry` loads a policy for every mainnet context.
         let Some(policy) = &ctx.policy else {
             return R::VerificationUnavailable;
         };
@@ -391,8 +404,14 @@ fn inspect_proof(
     }
     if canonical
         && consent.is_some_and(|at| {
-            at.checked_add(900_000.min(proof.expires - proof.created))
-                .is_none_or(|end| now >= end)
+            intent_clocks(
+                proof.created,
+                proof.expires,
+                at,
+                proof.expires - proof.created,
+                now,
+            )
+            .is_err()
         })
     {
         return R::WindowClosed;
