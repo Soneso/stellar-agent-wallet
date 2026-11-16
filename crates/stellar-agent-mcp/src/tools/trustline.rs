@@ -1005,16 +1005,23 @@ impl WalletServer {
         let approval_block =
             if let DispatchOutcome::RequireApproval(ref approval) = dispatch_outcome {
                 let profile_name = self.profile_name_for_approval();
-                match self.persist_trustline_pending_approval(
-                    &envelope_xdr,
-                    &args.from,
-                    &resolved.code,
-                    &resolved.issuer,
-                    limit_stroops,
-                    total_fee_stroops,
-                    source_sequence.saturating_add(1),
-                    &profile_name,
-                    &approval.request,
+                match self.classic_pending_approval(
+                    prepared.handle.as_ref(),
+                    stellar_agent_core::approval::witness::ApprovedKind::Trustline,
+                    dispatch_outcome.audit_decision(),
+                    || {
+                        self.persist_trustline_pending_approval(
+                            &envelope_xdr,
+                            &args.from,
+                            &resolved.code,
+                            &resolved.issuer,
+                            limit_stroops,
+                            total_fee_stroops,
+                            source_sequence.saturating_add(1),
+                            &profile_name,
+                            &approval.request,
+                        )
+                    },
                 ) {
                     Ok(entry) => {
                         let approval_expires = entry.expires_at_unix_ms;
@@ -1034,12 +1041,7 @@ impl WalletServer {
                             }
                         }))
                     }
-                    Err(e) => {
-                        return Err(rmcp::ErrorData::internal_error(
-                            format!("approval.store_error: {e}"),
-                            None,
-                        ));
-                    }
+                    Err(error) => return error.into_result(),
                 }
             } else {
                 None

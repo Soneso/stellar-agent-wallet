@@ -7865,12 +7865,8 @@ mod tests {
                 matches!(
                     result,
                     Err(WindowStoreError::AuthorizationRefused {
-                        precondition
-                    }) if precondition == if at > expiry {
-                        MainnetPrecondition::ApprovalExpired
-                    } else {
-                        MainnetPrecondition::ApprovalNonceReused
-                    }
+                        precondition: MainnetPrecondition::ApprovalNonceReused
+                    })
                 ),
                 "mint at {at}, execution expiry {expiry}: {result:?}"
             );

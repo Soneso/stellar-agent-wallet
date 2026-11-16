@@ -7313,7 +7313,34 @@ pub(crate) mod tests {
                     |_, _| Err("unexpected grant".to_owned()),
                 )
                 .unwrap();
-                let stored = store.get(&entry.approval_nonce).unwrap();
+                let completion = stellar_agent_network::policy_state::ApprovalStatus::new(
+                    &server.window_store,
+                    profile,
+                )
+                .find_by_nonce(&entry.approval_nonce)
+                .unwrap()
+                .map(|_| {
+                    stellar_agent_network::operation_entry::consent_completion(
+                        &store,
+                        &server.window_store,
+                        profile,
+                        "operator",
+                        &entry.approval_nonce,
+                        &policy,
+                        stellar_agent_network::policy_state::ConsentRow::Written,
+                    )
+                    .unwrap()
+                });
+                let stored = store.get(&entry.approval_nonce).unwrap().clone();
+                drop(store);
+                if let Some(completion) = completion {
+                    stellar_agent_network::operation_entry::commit_consent(
+                        &server.window_store,
+                        profile,
+                        &completion,
+                    )
+                    .unwrap();
+                }
                 if profile_name == "operator" {
                     return stored.attestation_blob_b64.clone().unwrap();
                 }
@@ -7327,7 +7354,7 @@ pub(crate) mod tests {
                     &<[u8; 32]>::try_from(key.as_slice()).unwrap(),
                     &other,
                     &stored.approval_nonce,
-                    &mainnet_consent_subject(stored, &other).unwrap(),
+                    &mainnet_consent_subject(&stored, &other).unwrap(),
                     &stored.process_uid,
                     &lifetime,
                     approver,

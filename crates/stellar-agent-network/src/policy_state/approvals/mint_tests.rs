@@ -90,6 +90,43 @@ fn mint_refusals_follow_the_record_order() {
 
 #[test]
 #[serial]
+fn consumed_mint_refusals_precede_expiry_for_another_operation() {
+    for case in ["expired", "released", "early"] {
+        let mut fx = Fx::new(300_000);
+        fx.open();
+        fx.consent();
+        fx.store
+            .mint_authorization(fx.fixture.profile(), &fx.mint_request())
+            .unwrap();
+        let at = fx.payload.receipt.verified_at_unix_ms();
+        match case {
+            "expired" => fx.clock.set(at + 400_000),
+            "early" => fx.clock.set(at - 1),
+            _ => {
+                OperationRecorder::new(&fx.store, fx.fixture.profile(), &mut fx.rows, "close")
+                    .transition(
+                        fx.operation,
+                        None,
+                        OperationState::Expired,
+                        &super::super::operations::TransitionEvidence::default(),
+                    )
+                    .unwrap();
+                assert!(fx.view().record.consent.unwrap().payload.is_none());
+            }
+        }
+        let mut request = fx.mint_request();
+        request.operation = None;
+        let before = fx.bytes();
+        mint_refusal(
+            &fx.store.mint_authorization(fx.fixture.profile(), &request),
+            MainnetPrecondition::ApprovalNonceReused,
+        );
+        assert_eq!(fx.bytes(), before, "refused reuse writes nothing: {case}");
+    }
+}
+
+#[test]
+#[serial]
 fn mint_caps_at_the_record_execution_expiry() {
     for offset in [0, 899_999, 900_000, 900_001] {
         let mut fx = Fx::new(86_400_000);
