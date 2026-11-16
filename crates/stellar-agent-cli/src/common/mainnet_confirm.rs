@@ -20,7 +20,7 @@ use stellar_agent_core::{
         ApprovalContext, ApprovalKind, AttestationBinding, ConsentAudit, DEFAULT_RETRY_ATTEMPTS,
         DEFAULT_RETRY_BACKOFF, MainnetApprovalAuthority, PendingApproval, PendingApprovalStore,
         VerifiedMainnetPresence,
-        attest::{attest_mainnet_confirmation, attest_mainnet_confirmation_with_row, record_error},
+        attest::{attest_mainnet_confirmation_with_row, record_error},
         error::ApprovalError,
         load_attestation_key, open_with_retry, process_uid_for_attestation,
         store::MAINNET_POLICY_AUTHORITY_TTL_SECONDS,
@@ -742,7 +742,7 @@ fn persist_confirmation(
                     profile: name.to_owned(),
                 })
             })?;
-            attest_mainnet_confirmation(
+            attest_mainnet_confirmation_with_row(
                 &mut pending,
                 entry,
                 &key,
@@ -771,7 +771,7 @@ fn persist_confirmation(
             })
         })?,
         OperatorRowSink::Outbox(outbox) => {
-            attest_mainnet_confirmation(
+            attest_mainnet_confirmation_with_row(
                 &mut pending,
                 entry,
                 &key,

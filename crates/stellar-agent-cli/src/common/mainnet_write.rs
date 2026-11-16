@@ -75,6 +75,79 @@ const AUTHORIZATION_REFUSED: &str = "network.mainnet_authorization_refused";
 const LEDGER_ENROLLMENT_SENTENCE: &str = "A Ledger key cannot be enrolled as the mainnet signer: \
                                           profile enroll-signer takes --secret-env only.";
 
+/// Checks retained provenance and delivery before readiness or signing.
+fn consent_delivered(
+    profile: &Profile,
+    name: &str,
+    witness: Option<&ApprovalWitness>,
+) -> Result<(), WalletError> {
+    use stellar_agent_network::policy_state::approvals::{
+        ApprovalStatus, VerifiedConsentDelivery, require_consent_evidence_time,
+    };
+    let Some(witness) = witness else {
+        return Ok(());
+    };
+    #[cfg(all(test, feature = "mainnet-write"))]
+    consent_test::run(profile, name, witness);
+    let store = PersistedWindowStore::for_profile(name);
+    let delivery = ApprovalStatus::new(&store, profile)
+        .consent_delivery(witness)
+        .map_err(stellar_agent_network::operation_entry::operation_refusal)?;
+    let (identity, reference) = match &delivery {
+        VerifiedConsentDelivery::Unenforced => return Ok(()),
+        VerifiedConsentDelivery::Queued {
+            identity,
+            reference,
+        } => (identity, Some(reference)),
+        VerifiedConsentDelivery::DirectAnchored { identity }
+        | VerifiedConsentDelivery::Ended { identity } => (identity, None),
+    };
+    let writer = crate::commands::value_audit::require_value_audit_writer(profile, name)?;
+    let mut writer = writer
+        .lock()
+        .map_err(|_| crate::commands::value_audit::audit_writer_open_failed(name))?;
+    let floor = stellar_agent_core::audit_log::require_consent_delivered(
+        &mut writer,
+        identity,
+        reference,
+        name,
+    )?;
+    require_consent_evidence_time(witness, floor)
+}
+
+#[cfg(all(test, feature = "mainnet-write"))]
+pub(crate) mod consent_test {
+    use super::*;
+    use std::cell::RefCell;
+    type Hook = Box<dyn FnOnce(&Profile, &ApprovalWitness)>;
+    thread_local! { static HOOK: RefCell<Option<(String, Hook)>> = const { RefCell::new(None) }; }
+    pub(crate) struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            HOOK.with_borrow_mut(|hook| *hook = None);
+        }
+    }
+    pub(crate) fn on_witness(
+        name: &str,
+        hook: impl FnOnce(&Profile, &ApprovalWitness) + 'static,
+    ) -> Guard {
+        HOOK.with_borrow_mut(|slot| *slot = Some((name.to_owned(), Box::new(hook))));
+        Guard
+    }
+    pub(super) fn run(profile: &Profile, name: &str, witness: &ApprovalWitness) {
+        let hook = HOOK.with_borrow_mut(|slot| {
+            if slot.as_ref().is_some_and(|(armed, _)| armed == name) {
+                slot.take()
+            } else {
+                None
+            }
+        });
+        if let Some((_, hook)) = hook {
+            hook(profile, witness);
+        }
+    }
+}
+
 /// The directory holding the stored profile files.
 ///
 /// # Errors
@@ -470,6 +543,17 @@ pub(crate) async fn authorize_and_submit(
 
     drain_consent_rows_before_signing(profile, name)
         .map_err(|e| refused(PipelineStep::ConsentDrain, &e, "", verb, None))?;
+    consent_delivered(
+        profile,
+        name,
+        match &authority {
+            stellar_agent_network::mainnet::authority::MainnetAuthority::Approval(approval) => {
+                Some(approval.witness())
+            }
+            stellar_agent_network::mainnet::authority::MainnetAuthority::Policy(_) => None,
+        },
+    )
+    .map_err(|e| refused(PipelineStep::ConsentDrain, &e, "", verb, None))?;
     let readiness = audit_readiness(profile, name)
         .map_err(|e| refused(PipelineStep::Readiness, &e, "", verb, None))?;
     let prepared = prepare_mainnet_recorder(

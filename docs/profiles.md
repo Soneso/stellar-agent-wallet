@@ -1301,6 +1301,10 @@ Other build failures use `policy.engine_unavailable` or `trustline.policy_engine
 | `policy.window_chain_mismatch` | The profile network disagrees with authenticated spending state. Restore the profile's network, or create a profile under a new name. |
 | `policy.window_chain_unverifiable` | Spending state lacks complete authenticated network provenance. No verb recovers such state in this release; create a profile under a new name. |
 | `profile.reset_window_state_open_authorizations` | Effective open authorizations prevent reset. |
+| `approval.consent_undelivered` | Exact Delivered evidence is missing for this approval's queued row. Preserve the grant and evidence; repair delivery, then retry the existing grant within its lifetime. |
+| `approval.evidence_capacity` | All 4,096 evidence slots are occupied. Retry after an existing approval ends; capacity refusal evicts no live grant. |
+| `audit.outbox_evidence_unusable` | The authenticated evidence image cannot be selected or used. Preserve both images and keyring state; repair the named condition, then retry the existing grant. |
+| `audit.outbox_queued` | Consent succeeded and its audit row is queued. Exit status is zero; consumers establish delivery before use when the kind enforces it. |
 | `approval.presence_required` | Mainnet consent requires a verified assertion from an approval credential in the owner-signed policy; use the local passkey approval page. |
 | `approval.presence_policy_unavailable` | The current owner-signed mainnet policy cannot be verified, lists no approval credential, or changed since the consent was recorded. |
 | `approval.presence_policy_busy` | The required policy-state lock stays busy through the retries. Freshness cannot be checked; retry the operation. A writer causes it, and so does a reader when the load must advance the pin. The signature and body checks may already have passed. The approval listener returns HTTP 503 `store_busy`. No busy answer grants a session, a consent, or a pin change. |

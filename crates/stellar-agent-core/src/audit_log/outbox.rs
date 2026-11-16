@@ -3911,6 +3911,38 @@ pub(crate) fn locked_owner_evidence(
     Ok(Some(loaded.image.into()))
 }
 
+/// Drains consent rows, then requires exact Delivered membership in the committed image.
+/// Callers hold their writer mutex across this call. A missing reference requires
+/// authenticated direct or ended provenance and still requires an evidence owner.
+///
+/// # Errors
+/// Returns the drain or evidence refusal unchanged through `audit_writer_refusal`.
+/// A membership miss returns `approval.consent_undelivered` with the supplied coordinates.
+pub fn require_consent_delivered(
+    writer: &mut super::AuditWriter,
+    identity: &[u8; 32],
+    reference: Option<&OutboxRowRef>,
+    profile: &str,
+) -> Result<u64, WalletError> {
+    let refusal = |error| super::writer::audit_writer_refusal(profile, &error);
+    writer.drain_outbox().map_err(refusal)?;
+    #[cfg(any(test, feature = "test-helpers"))]
+    test_seam::before_delivery_query(writer.path());
+    let evidence = writer
+        .outbox_evidence()
+        .map_err(refusal)?
+        .ok_or_else(|| refusal(evidence_unusable("evidence owner is absent")))?;
+    if let Some(reference) = reference
+        && !evidence.contains_delivered(identity, reference)
+    {
+        return Err(WalletError::Approval(ApprovalFailure::ConsentUndelivered {
+            generation: reference.generation(),
+            sequence: reference.sequence(),
+        }));
+    }
+    Ok(evidence.time_floor_ms())
+}
+
 /// Returns `<outbox>.next`, the replacement a publication writes.
 fn replacement_path(outbox: &Path) -> PathBuf {
     let mut name = outbox.as_os_str().to_os_string();
@@ -4117,6 +4149,69 @@ pub mod test_seam {
     }
 
     static PARTIAL_WRITES: Mutex<Vec<(PathBuf, usize)>> = Mutex::new(Vec::new());
+
+    type DeliveryHook = Box<dyn FnOnce() + Send>;
+    static DELIVERY_QUERY: Mutex<Vec<(PathBuf, DeliveryHook)>> = Mutex::new(Vec::new());
+
+    /// Removes an unused path-scoped query hook on drop.
+    #[derive(Debug)]
+    pub struct DeliveryQueryGuard(PathBuf);
+
+    impl Drop for DeliveryQueryGuard {
+        fn drop(&mut self) {
+            DELIVERY_QUERY
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|(path, _)| path != &self.0);
+        }
+    }
+
+    /// Writes two distinct authenticated candidates at the same newer generation.
+    ///
+    /// # Errors
+    /// Returns slot I/O, decoding or generation overflow failures.
+    pub fn conflicting_evidence(log_path: &Path, key: &[u8; 32]) -> Result<(), super::WriterError> {
+        let paths = super::consent_evidence::slot_paths(log_path);
+        let bytes = std::fs::read(&paths[0])?;
+        let mut image =
+            super::consent_evidence::decode(&bytes, key).map_err(super::evidence_unusable)?;
+        image.generation = image
+            .generation
+            .checked_add(10)
+            .ok_or_else(|| super::evidence_unusable("evidence-generation overflow"))?;
+        std::fs::write(&paths[0], image.seal(key))?;
+        image.floor_ms = image.floor_ms.saturating_add(1);
+        std::fs::write(&paths[1], image.seal(key))?;
+        Ok(())
+    }
+
+    /// Runs once between a successful consumer drain and its evidence query.
+    #[must_use]
+    pub fn on_delivery_query(
+        path: &Path,
+        hook: impl FnOnce() + Send + 'static,
+    ) -> DeliveryQueryGuard {
+        DELIVERY_QUERY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((path.to_owned(), Box::new(hook)));
+        DeliveryQueryGuard(path.to_owned())
+    }
+
+    pub(super) fn before_delivery_query(path: &Path) {
+        let hook = {
+            let mut hooks = DELIVERY_QUERY
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            hooks
+                .iter()
+                .position(|(p, _)| p == path)
+                .map(|index| hooks.remove(index).1)
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
 
     /// The file operation whose next call refuses.
     ///
@@ -9602,6 +9697,188 @@ mod tests {
             .with_evidence_reservation(reservation)
             .append_queued(&row(name))
             .unwrap()
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn require_delivery_drains_then_checks_exact_membership() {
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let (_dir, path, store, mut writer) = initialized();
+        let outbox = keyed_outbox(&path, &store);
+        let reference = reserve_row(&outbox, [1; 32], "late");
+        assert_eq!(delivered(&path, "late"), 0);
+        assert_eq!(
+            require_consent_delivered(&mut writer, &[1; 32], Some(&reference), "delivery").unwrap(),
+            0,
+            "a late append is drained"
+        );
+        assert_eq!(delivered(&path, "late"), 1);
+        let mut different = reference;
+        different.digest[0] ^= 1;
+        for (id, row) in [([1; 32], different), ([2; 32], reference)] {
+            let error =
+                require_consent_delivered(&mut writer, &id, Some(&row), "delivery").unwrap_err();
+            assert!(
+                matches!(error, WalletError::Approval(ApprovalFailure::ConsentUndelivered { generation, sequence }) if generation == row.generation() && sequence == row.sequence()),
+                "exact identity and full digest: {error}"
+            );
+        }
+        let dropped = reserve_row(&outbox, [3; 32], "dropped");
+        fs::write(
+            outbox.path(),
+            encode_generation_line(&ROW_KEY, dropped.generation()),
+        )
+        .unwrap();
+        let error = require_consent_delivered(&mut writer, &[3; 32], Some(&dropped), "delivery")
+            .expect_err("a dropped Queued row is not Delivered");
+        assert_eq!(error.code(), "approval.consent_undelivered");
+        assert!(
+            matches!(error, WalletError::Approval(ApprovalFailure::ConsentUndelivered { generation, sequence }) if generation == dropped.generation() && sequence == dropped.sequence()),
+            "dropped row retains g/s"
+        );
+        outbox.advance_evidence_floor(80).unwrap();
+        assert_eq!(
+            require_consent_delivered(&mut writer, &[1; 32], None, "delivery").unwrap(),
+            80
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn require_delivery_needs_an_owner_even_for_direct() {
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        for legacy in [false, true] {
+            let (_dir, path, store, mut writer) = keyed_fixture();
+            if legacy {
+                keyed_outbox(&path, &store).append(&row("legacy")).unwrap();
+                writer.drain_outbox().unwrap();
+            }
+            let error = require_consent_delivered(&mut writer, &[1; 32], None, "delivery")
+                .expect_err("direct requires v2 evidence");
+            assert_eq!(error.code(), "audit.outbox_evidence_unusable");
+            assert!(error.to_string().contains("evidence owner is absent"));
+        }
+    }
+
+    #[test]
+    fn maintainer_protocol_states_the_boundary() {
+        let doc = include_str!("../../../../docs/maintainers/audit-log-recovery.md");
+        for sentence in [
+            "An actor with file access and without the MAC key cannot forge, reorder or replay a queued row unnoticed, and cannot drop a consent row without the consumption refusing.",
+            "An actor that holds the MAC key is inside the trust boundary of the audit log.",
+            "It can append authentic rows by design, and the protocol claims nothing against it.",
+            "A dropped tail of rows that carry no reference, such as halt and resume, is not detected before delivery.",
+            "The CLI reports such a row as `queued`, never as `written`.",
+        ] {
+            assert_eq!(
+                doc.matches(sentence).count(),
+                1,
+                "one exact boundary sentence: {sentence}"
+            );
+            assert!(sentence.split_whitespace().count() < 30);
+        }
+        assert_eq!(doc.matches("**Legacy state only.**").count(), 4);
+        for rule in [
+            "These rules hold while the log has no owner item.",
+            "across generation gaps",
+            "max(wall_time, evidence_floor)",
+            "reserve before ceremony",
+            "retry the existing grant without another ceremony",
+            "All four production kind capabilities are disabled",
+        ] {
+            assert!(doc.contains(rule), "protocol rule: {rule}");
+        }
+    }
+
+    #[test]
+    fn consent_delivery_user_contract() {
+        let profiles = include_str!("../../../../docs/profiles.md");
+        let troubleshooting =
+            include_str!("../../../../skills/stellar-agent-wallet/references/troubleshooting.md");
+        for (code, meaning) in [
+            (
+                "approval.consent_undelivered",
+                "Exact Delivered evidence is missing for this approval's queued row.",
+            ),
+            (
+                "approval.evidence_capacity",
+                "All 4,096 evidence slots are occupied.",
+            ),
+            (
+                "audit.outbox_evidence_unusable",
+                "The authenticated evidence image cannot be selected or used.",
+            ),
+            (
+                "audit.outbox_queued",
+                "Consent succeeded and its audit row is queued.",
+            ),
+        ] {
+            for doc in [profiles, troubleshooting] {
+                let row = doc
+                    .lines()
+                    .find(|line| line.starts_with(&format!("| `{code}` |")))
+                    .unwrap();
+                assert!(row.contains(meaning), "meaning of {code}");
+            }
+        }
+        for doc in [
+            include_str!("../../../../docs/cli-reference/profile-and-governance.md"),
+            include_str!("../../../../skills/stellar-agent-wallet/references/cli-reference.md"),
+            include_str!(
+                "../../../../skills/stellar-agent-wallet/references/approvals-and-audit.md"
+            ),
+        ] {
+            for sentence in [
+                "Queued success exits zero and includes `audit_code: audit.outbox_queued`; Written omits `audit_code`.",
+                "It returns immediately after persistence, without waiting for delivery.",
+                "Legacy queues commit a count and chain head; owner queues authenticate tagged rows and commit delivered batches.",
+                "For an enforced kind, recoverable delivery and evidence errors retry the existing grant without another ceremony.",
+            ] {
+                assert!(doc.contains(sentence), "user contract: {sentence}");
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn require_delivery_preserves_drain_and_query_refusals() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let (_dir, path, store, mut writer) = initialized();
+        let queries = Arc::new(AtomicUsize::new(0));
+        let count = queries.clone();
+        let _query_hook = test_seam::on_delivery_query(&path, move || {
+            count.fetch_add(1, Ordering::SeqCst);
+        });
+        let held = lock_outbox(&outbox_lock_path(&path), store.as_ref()).unwrap();
+        let error = require_consent_delivered(&mut writer, &[1; 32], None, "delivery").unwrap_err();
+        assert_eq!(error.code(), "audit.chain_key_unavailable");
+        assert!(error.to_string().contains("audit.outbox_busy"));
+        assert_eq!(
+            queries.load(Ordering::SeqCst),
+            0,
+            "a refused drain performs no query"
+        );
+        drop(held);
+        require_consent_delivered(&mut writer, &[1; 32], None, "delivery").unwrap();
+        assert_eq!(queries.load(Ordering::SeqCst), 1);
+        let fault = store.clone();
+        let _fault_hook =
+            test_seam::on_delivery_query(&path, move || fault.set_owner_failing(true, false));
+        let error = require_consent_delivered(&mut writer, &[1; 32], None, "delivery").unwrap_err();
+        let expected = super::super::writer::audit_writer_refusal(
+            "delivery",
+            &WriterError::TipAnchorStore(TipAnchorStoreError::new("owner read fault")),
+        );
+        assert_eq!(
+            error.code(),
+            expected.code(),
+            "query storage errors keep their code"
+        );
+        assert_eq!(error.to_string(), expected.to_string());
     }
 
     #[test]

@@ -772,6 +772,10 @@ These failures carry `approval.*` codes:
 | `approval.denied` | The operator declines the CLI prompt or closes its input. | Stop the requested action. Proceed only after fresh operator consent. |
 | `approval.user_mismatch` | The approving identity is not authorized for the pending entry. | Have the authorized operator approve through the trusted local or enrolled remote surface. |
 | `approval.already_attested` | Consent is already recorded for this entry. | Use the recorded consent for the pending action. |
+| `approval.consent_undelivered` | Exact Delivered evidence is missing for this approval's queued row. | Preserve the grant and evidence; repair delivery, then retry the existing grant within its lifetime. |
+| `approval.evidence_capacity` | All 4,096 evidence slots are occupied. | Retry after an existing approval ends; capacity refusal evicts no live grant. |
+| `audit.outbox_evidence_unusable` | The authenticated evidence image cannot be selected or used. | Preserve both images and keyring state; repair the named condition, then retry the existing grant. |
+| `audit.outbox_queued` | Consent succeeded and its audit row is queued. | Exit status is zero; consumers establish delivery before use when the kind enforces it. |
 | `approval.rejected` | The operator refused this approval. | Stop the requested action. |
 | `approval.consumed` | This approval has already been used. | Request a new simulation before seeking another approval. |
 | `approval.operator_credential_revoked` | The remote operator credential that approved the entry is missing from the profile's `allowed_credentials` list or from the operator-credential store, so its approvals do not count. | Stop. Ask the operator to approve the action again through a surface they still authorize. |
