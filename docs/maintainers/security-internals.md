@@ -10,6 +10,113 @@ This document describes the cryptographic primitives behind the Stellar Agent Wa
 
 The CLI and MCP server share attestation, audit, nonce, policy, and auth-digest primitives. The unlock window protects CLI `--secret-env` seeds. MCP signs through keyring handles without `Wallet::unlock`. Testnet is the default. Mainnet operation admission depends on build configuration and installation setup. Policy evaluation, sealed authorization, signing checks, and submit checks are independent boundaries. The wallet's own signing paths sign mainnet payloads only under mainnet authorization. The library signers enforce it too: every `Signer`, the public keyring handle included, signs a mainnet transaction or Soroban authorization payload only under a mainnet authorization. Code running as the same OS user with access to a keyring entry can read its seed directly. The keyring entry is the custody boundary. Ordinary submission refuses the declared mainnet passphrase or known mainnet host before RPC. Authorized consumers bind each action to its endpoint, signer, policy, authority, audit state, and window reservation. CLI Allow uses policy authority without a passkey ceremony. CLI RequireApproval uses verified passkey consent. Both retain setup, signed policy minimums, and sealed authorization.
 
+## Offline contract payment API
+
+`stellar_agent_core::sac_payment` provides offline inspection of a classic
+asset transfer from an unmuxed G source to a C recipient. These primitives
+grant no execution or signing authority. CLI and MCP payment routes retain
+their current admission rules. The complete contextual payment, intent and
+approval API is not available from this module.
+
+| Interface | Contract |
+|---|---|
+| `SacPaymentContext::new(chain: Caip2, asset: IntentAsset) -> Result<SacPaymentContext, WalletError>` | Owns validated native or issued asset facts. Deserialization repeats validation; fields are private. `chain()` and `asset()` expose immutable facts. |
+| `verify_sac_payment(envelope_xdr: &str, context: &SacPaymentContext) -> Result<VerifiedSacPayment, WalletError>` | Uses the bounded envelope reader and proves the transfer shape, source, amount, SAC identity and authorization. |
+| `VerifiedSacPayment::context(&self) -> &SacPaymentContext` | Returns the validated context. |
+| `VerifiedSacPayment::transaction(&self) -> &Transaction` | Returns the exact inspected transaction. |
+| `VerifiedSacPayment::invoke(&self) -> &InvokeContractArgs` | Returns the exact transfer invocation. |
+| `ContractTransferFeeCap { stroops: u32, signed: bool }` | Supplies one total bound. The flag describes provenance and cannot establish signed-policy authority. |
+| `ContractTransferFeeLimits { total: ContractTransferFeeCap }` | Holds the single supplied bound. |
+| `validate_sac_payment_data(payment: &VerifiedSacPayment, explicit_inclusion_bid_stroops: Option<u32>, limits: ContractTransferFeeLimits) -> Result<SacTransferFee, WalletError>` | Checks forward key allowances, restoration indices and fee arithmetic without simulation evidence. |
+| `SacTransferFee { total_stroops: u32, inclusion_bid_stroops: u32, resource_stroops: u32 }` | Returns the checked decomposition of the envelope fee. |
+
+`VerifiedSacPayment` has private construction and no deserializer. It accepts
+signed envelopes for inspection without authenticating their signatures.
+The envelope must be v1, contain one `InvokeContract` operation named
+`transfer`, and carry exactly Account, Contract and I128 arguments. Amounts
+are in `1..=i64::MAX`. The payer equals the unmuxed transaction source; an
+operation source is absent or identical. Forward asset and network derivation
+must produce the invoked SAC. Exactly one SourceAccount authorization must
+have the identical invocation root and no children.
+
+The validator treats footprint keys as optional allowances:
+
+| Asset and payer | Read-only | Read-write |
+|---|---|---|
+| Native | SAC instance | Payer account, persistent recipient balance |
+| Issued, payer differs from issuer | SAC instance, issuer account | Payer account, payer trustline for that asset, persistent recipient balance |
+| Issued, payer is issuer | SAC instance, issuer account | Issuer account, persistent recipient balance |
+
+Every key may occur at most once across both lists. An issuer payer has no
+trustline allowance. A balance is never read-only. The instance may instead
+be read-write only when indexed for restoration. Restoration indices preserve
+supplied order, strictly increase, stay within the read-write list, and name
+only the persistent instance or recipient balance. No supplied key or index
+is sorted, repaired or promoted.
+
+Resource fees must be nonnegative and representable as u32. Checked subtraction
+of resources from the full transaction fee yields the inclusion bid. A supplied
+explicit bid must equal it. The full fee, including restoration, must fit the
+supplied cap. There is no separate resource ceiling and this validator selects
+no default or policy consent.
+
+`SacPaymentError` is carried by `ValidationError::SacPayment` through
+`WalletError`. Its closed wire codes are:
+
+| Reason | Code |
+|---|---|
+| `Unavailable` | `validation.contract_payment_unavailable` |
+| `WitnessUnavailable` | `validation.contract_payment_witness_unavailable` |
+| `AssetContractNotDeployed { context }` | `validation.asset_contract_not_deployed` |
+| `ArchivedEntry { key_sha256 }` | `validation.contract_payment_archived_entry` |
+| `MemoUnsupported` | `validation.contract_payment_memo_unsupported` |
+| `FeeConsentRequired` | `validation.contract_transfer_fee_cap_required` |
+| `FeeExceeded` | `validation.contract_transfer_fee_exceeded` |
+| `Footprint` | `validation.contract_payment_footprint` |
+| `Invalid` | `validation.contract_payment_invalid` |
+| `SimulationInvalid` | `validation.contract_payment_simulation_invalid` |
+
+The instance-unavailable reason carries validated context so its text safely
+names the asset and network. It states both possible causes, never deployed
+or not restorable, and explicitly makes no diagnosis. An empty instance read
+alone cannot distinguish those causes. This module performs no instance reads
+or simulations and produces neither simulation nor archived-entry diagnoses.
+
+Every non-None memo receives this fixed refusal:
+
+> The network rejects a memo on a contract invocation. Use a W address to carry an id on a network at protocol 30 or later. W payments are not available in this implementation.
+
+The memo rule follows supplied protocol facts identifying `stellar-core`
+v29.0.0 and v30.0.0, `src/transactions/TransactionFrame.cpp`,
+`validateSorobanMemo` and `commonValidPreSeqNum`. Atomic same-transaction
+restoration follows supplied protocol 29/30 facts identifying
+`InvokeHostFunctionOpFrame.cpp`, and the protocol 30 host's
+`src/e2e_invoke.rs` restoration processing and `src/host/data_helper.rs`
+persistent instance definition. These are source references for supplied
+facts, not a claim of independent local source verification. The local XDR
+30.0.0 definition establishes the V1 extension and read-write index encoding.
+Offline fixtures prove the wallet checks; they do not measure live restoration.
+
+Supplied measurements were taken on 2026-11-12, testnet protocol 30, ledgers
+5698460 to 5698955. All fees below are stroops. Each row contains three
+successful runs with deployed asset contracts and checked balance presence.
+The source was G and authorization was SourceAccount.
+
+| Case | Ledgers | Resource minimum/submitted | Inclusion bids | Submitted totals | Charged |
+|---|---|---|---|---|---|
+| Native existing balance | 5698461 / 5698708 / 5698952 | 11,085 | 100 / 200 / 100 | 11,185 / 11,285 / 11,185 | 6,276 |
+| Native missing balance | 5698462 / 5698709 / 5698953 | 119,874 | 100 / 200 / 100 | 119,974 / 120,074 / 119,974 | 100,874 |
+| Issued existing balance | 5698463 / 5698710 / 5698954 | 11,328 | 100 / 200 / 100 | 11,428 / 11,528 / 11,428 | 6,499 |
+| Issued missing balance | 5698464 / 5698711 / 5698955 | 121,022 | 100 / 200 / 100 | 121,122 / 121,222 / 121,122 | 102,002 |
+
+Charged inclusion was 100 throughout. Supplied mainnet rent and TTL calculations
+give 374,605 stroops for a new balance entry alone. Applying the measured
+testnet reservation ratio of approximately 1.28 gives an estimated 480,000
+stroops. Twice that estimate, rounded to one significant digit, motivates
+1,000,000 stroops (0.1 XLM) as the total cap that later policy work supplies by
+default; this module applies only a supplied cap. These mainnet figures are
+computed or estimated, not measured. Restoration was not measured.
+
 ## Two sessions on one profile
 
 Here, a host means one data root and one OS keyring user.

@@ -200,6 +200,8 @@ pub mod wallet;
 /// args at the commit step.
 pub mod envelope_decode;
 
+pub mod sac_payment;
+
 pub use amount::{
     ANCHOR_AMOUNT_MAX_DECIMAL_PLACES, ANCHOR_AMOUNT_MAX_LEN, AnchorAmount, AnchorAmountError,
     McpAmountArgument, McpMemoTextArgument, STELLAR_DECIMALS, StellarAmount,

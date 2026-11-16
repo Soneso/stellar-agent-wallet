@@ -1045,6 +1045,10 @@ impl std::fmt::Display for AddressField {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ValidationError {
+    /// A closed refusal from offline contract payment validation.
+    #[error(transparent)]
+    SacPayment(#[from] crate::sac_payment::SacPaymentError),
+
     /// The verified policy's installation bindings do not match the selected profile.
     #[error("profile.mainnet_enablement_invalid: {binding}")]
     MainnetEnablementInvalid {
@@ -2431,6 +2435,7 @@ impl ValidationError {
     #[must_use]
     pub fn code(&self) -> &'static str {
         match self {
+            Self::SacPayment(reason) => reason.code(),
             Self::AmountUnitsRequired => "validation.amount_units_required",
             Self::AmountPrecisionExceeded { .. } => "validation.amount_precision_exceeded",
             Self::MemoRequired { .. } => "validation.memo_required",
@@ -4311,6 +4316,10 @@ mod tests {
         // Construct every variant; ensure the match is exhaustive.
         let cases: &[(ValidationError, &'static str)] = &[
             (
+                ValidationError::SacPayment(crate::sac_payment::SacPaymentError::FeeExceeded),
+                "validation.contract_transfer_fee_exceeded",
+            ),
+            (
                 ValidationError::MainnetEnablementInvalid { binding: "profile" },
                 "profile.mainnet_enablement_invalid",
             ),
@@ -4776,6 +4785,7 @@ mod tests {
 
         for (variant, expected_code) in cases {
             let wallet_err = WalletError::Validation(match variant {
+                ValidationError::SacPayment(reason) => ValidationError::SacPayment(reason.clone()),
                 ValidationError::WindowChainMismatch => ValidationError::WindowChainMismatch,
                 ValidationError::WindowChainUnverifiable => {
                     ValidationError::WindowChainUnverifiable
