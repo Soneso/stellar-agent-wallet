@@ -2238,6 +2238,17 @@ store none. The integrated completion takes the sink only from a verified
 handoff and commits it as the record's delivery facts. Integrated admission
 refuses while no authenticated owner-scope inventory exists.
 
+The CLI confirmation and existing-record `approve --id` routes select integrated
+publication through the same kind capability as consumption. All capabilities
+remain disabled. Enabled confirmations reserve before inserting or showing a
+request; existing-record approval reacquires through the keyed outbox before
+presence. Strict consent carries its reservation into a queued append.
+Verification uses the held policy admission, then releases writer, inbox, and
+admission before committing the authenticated delivery. Recovery preserves the
+original sink and receipt time. A missing handoff refuses instead of supplying
+direct provenance. The compatibility recovery described above still uses
+`recovered` provenance. Inbox and MCP integration remain separate prerequisites.
+
 Consent retains the attestation, receipt and signed process identifier for
 reconstruction. The record supplies the signed nonce, kind, subject and
 lifetime; the authenticated file supplies the profile and chain.

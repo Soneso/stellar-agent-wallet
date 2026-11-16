@@ -317,7 +317,9 @@ impl WireApproval {
         }
     }
 
-    pub(crate) fn facts(&self) -> PendingApprovalFacts {
+    /// The immutable pending facts authenticated by this record's store.
+    #[must_use]
+    pub fn facts(&self) -> PendingApprovalFacts {
         PendingApprovalFacts {
             nonce: self.nonce.clone(),
             kind: self.kind,
@@ -936,12 +938,10 @@ impl<'a> ApprovalRecorder<'a> {
             let Some(expected) = expected else {
                 return Err(error);
             };
+            #[cfg(test)]
+            admission_tests::after_failed_commit(self.store.path());
             match ApprovalStatus::new(self.store, self.profile).view(id) {
-                Ok(Some(view))
-                    if view.record.state != ApprovalState::Revoked && view.record == expected =>
-                {
-                    Ok(view)
-                }
+                Ok(Some(view)) if view.record == expected => Ok(view),
                 _ => Err(error),
             }
         })
@@ -1232,7 +1232,10 @@ mod inventory_test_override {
 #[cfg(any(test, feature = "test-helpers"))]
 pub use inventory_test_override::ConsentEvidenceInventoryGuard;
 
-fn delivery_enforced(profile: &str, kind: ApprovedKind) -> bool {
+/// Whether this profile's producers and consumers use integrated consent
+/// for `kind`. Production capabilities remain closed until every route is ready.
+#[must_use]
+pub fn delivery_enforced(profile: &str, kind: ApprovedKind) -> bool {
     #[cfg(any(test, feature = "test-helpers"))]
     if delivery_test_override::enabled(profile, kind) {
         return true;
@@ -3198,7 +3201,7 @@ pub(in crate::policy_state) mod tests {
         record.revoked_at_ms = Some(u64::MAX);
         record.closed_at_ms = Some(u64::MAX);
         let c = record.consent.as_mut().unwrap();
-        c.delivery = Some(ConsentDeliveryV1::direct_anchored([255; 32]));
+        c.delivery = Some(ConsentDeliveryV1::queued(record.id));
         c.consent_at_ms = u64::MAX;
         c.execution_expires_at_ms = u64::MAX;
         let payload = c.payload.as_mut().unwrap();
@@ -3237,12 +3240,28 @@ pub(in crate::policy_state) mod tests {
         receipt["assertion"]["client_data_json"] = serde_json::json!(vec![255u8; 1024]);
         receipt["assertion"]["signature_compact"] = serde_json::json!(vec![127u8; 64]);
         payload.receipt = serde_json::from_value(receipt).unwrap();
-        let bytes = serde_json::to_vec(&record).unwrap();
-        assert!(bytes.len() <= APPROVAL_RECORD_MAX, "{}", bytes.len());
-        assert_eq!(
-            serde_json::from_slice::<WireApproval>(&bytes).unwrap(),
-            record
-        );
+        for queued in [true, false] {
+            let consent = record.consent.as_mut().unwrap();
+            if !queued {
+                consent.delivery = Some(ConsentDeliveryV1::direct_anchored(record.id));
+                let payload = consent.payload.as_mut().unwrap();
+                payload.outbox_row = None;
+                payload.row_provenance = Some(RowProvenance::Written);
+            }
+            assert!(
+                consent.delivery.as_ref().unwrap().matches(
+                    record.id,
+                    consent.payload.as_ref().unwrap().outbox_row.as_ref()
+                ),
+                "size fixtures use consistent delivery"
+            );
+            let bytes = serde_json::to_vec(&record).unwrap();
+            assert!(bytes.len() <= APPROVAL_RECORD_MAX, "{}", bytes.len());
+            assert_eq!(
+                serde_json::from_slice::<WireApproval>(&bytes).unwrap(),
+                record
+            );
+        }
     }
 
     fn queued_reference(sequence: u64) -> OutboxRowRef {

@@ -81,7 +81,7 @@ fn admit<T>(
     .admit(
         operation,
         facts,
-        |facts| {
+        |_, facts| {
             ApprovalRecorder::new(&fx.store, fx.fixture.profile(), &mut rows, "open")
                 .open_pending(operation, facts, PolicyDecision::RequireApproval)
                 .map_err(operation_refusal)
@@ -90,13 +90,389 @@ fn admit<T>(
     )
 }
 
-/// Whether the outbox still holds the fixture identity at its deadline: a
-/// reservation at another deadline then conflicts.
+/// Reacquires the exact authenticated deadline and rejects another deadline.
 fn retained(fx: &Fx, evidence: &Evidence) -> bool {
     evidence
         .outbox
-        .reserve_evidence(fx.id(), deadline(fx) + 1, fx.witness.consent_at_ms())
-        .is_err()
+        .reserve_evidence(fx.id(), deadline(fx), fx.witness.consent_at_ms())
+        .is_ok()
+        && evidence
+            .outbox
+            .reserve_evidence(fx.id(), deadline(fx) + 1, fx.witness.consent_at_ms())
+            .is_err()
+}
+
+type FailedCommitHook = (PathBuf, Box<dyn FnOnce()>);
+thread_local! {
+    static FAILED_COMMIT: std::cell::RefCell<Option<FailedCommitHook>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn after_failed_commit(path: &std::path::Path) {
+    let hook = FAILED_COMMIT.with_borrow_mut(|hook| {
+        if hook.as_ref().is_some_and(|(expected, _)| expected == path) {
+            hook.take()
+        } else {
+            None
+        }
+    });
+    if let Some((_, call)) = hook {
+        call();
+    }
+}
+
+struct FailedCommitGuard;
+impl Drop for FailedCommitGuard {
+    fn drop(&mut self) {
+        FAILED_COMMIT.with_borrow_mut(|hook| *hook = None);
+    }
+}
+
+#[test]
+#[serial]
+fn failed_publication_reread_requires_complete_match() {
+    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+    let mut fx = Fx::new(300_000);
+    fx.open();
+    let profile = fx.fixture.profile().clone();
+    let path = fx.store.path().to_owned();
+    let first = PendingApprovalStore::open(fx.fixture.home().join("first.toml")).unwrap();
+    let witness = consent_completion(
+        &first,
+        &fx.store,
+        fx.fixture.profile(),
+        fx.fixture.name(),
+        &fx.facts.nonce,
+        &fx.fixture.current_policy(),
+        ConsentRow::Written,
+    )
+    .unwrap()
+    .into_witness();
+    drop(first);
+    let payload = fx.payload.clone();
+    let id = fx.id();
+    FAILED_COMMIT.with_borrow_mut(|hook| {
+        *hook = Some((
+            path.clone(),
+            Box::new(move || {
+                let window = PersistedWindowStore::at_path(path);
+                let mut rows = Rows::default();
+                ApprovalRecorder::new(&window, &profile, &mut rows, "competitor")
+                    .record_consent(id, &witness, &payload)
+                    .unwrap();
+            }),
+        ))
+    });
+    let _hook = FailedCommitGuard;
+    let _fault = arm_accounting_fault(COMMIT_FAULT_AFTER_PREPARED);
+    let result =
+        ApprovalRecorder::new(&fx.store, fx.fixture.profile(), &mut fx.rows, "publication")
+            .record_consent_with_delivery(
+                id,
+                &fx.witness,
+                &fx.payload,
+                ConsentDeliveryV1::direct_anchored(id),
+            );
+    assert!(
+        result.is_err(),
+        "a same-receipt legacy competitor is not the attempted publication"
+    );
+    assert!(matches!(
+        result.unwrap_err(),
+        WindowStoreError::Io {
+            kind: std::io::ErrorKind::Interrupted
+        }
+    ));
+    let committed = fx.view().record.consent.unwrap();
+    assert_eq!(
+        committed.receipt_sha256,
+        fx.witness.presence_receipt_digest()
+    );
+    assert_eq!(committed.delivery, None);
+}
+
+#[test]
+#[serial]
+fn admission_retains_the_exact_execution_allowance() {
+    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+    for ttl in [300_000, 3_600_000] {
+        let fx = Fx::new(ttl);
+        let _ready = ConsentEvidenceInventoryGuard::new(fx.fixture.name());
+        let mut evidence = evidence(&fx, "deadline.log");
+        admit(&fx, &mut evidence, &fx.facts, |_, _| Ok(())).unwrap();
+        assert!(
+            evidence
+                .outbox
+                .reserve_evidence(fx.id(), deadline(&fx), fx.witness.consent_at_ms())
+                .is_ok(),
+            "the exact authenticated conservative deadline must reacquire"
+        );
+        let others: Vec<_> = (0..MAX_EVIDENCE_ENTRIES - 1)
+            .map(|i| {
+                let mut id = [0xee; 32];
+                id[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                id
+            })
+            .collect();
+        seed_reserved_evidence(
+            &evidence.path,
+            evidence.anchors.as_ref(),
+            &KEY,
+            &others,
+            u64::MAX,
+        )
+        .unwrap();
+        for at in [
+            fx.facts.waiting_expires_at_ms,
+            fx.facts.waiting_expires_at_ms + 1,
+            deadline(&fx) - 1,
+        ] {
+            evidence.outbox.advance_evidence_floor(at).unwrap();
+            assert_eq!(
+                evidence
+                    .outbox
+                    .reserve_evidence([0xaa; 32], u64::MAX, at)
+                    .unwrap_err()
+                    .code(),
+                "approval.evidence_capacity",
+                "the slot survives the waiting window"
+            );
+            assert!(
+                evidence
+                    .outbox
+                    .reserve_evidence(fx.id(), deadline(&fx), 0)
+                    .is_ok(),
+                "a reversed clock keeps the conservative slot"
+            );
+        }
+        evidence
+            .outbox
+            .advance_evidence_floor(deadline(&fx))
+            .unwrap();
+        assert!(
+            evidence
+                .outbox
+                .reserve_evidence([0xaa; 32], u64::MAX, 0)
+                .is_ok(),
+            "the exclusive deadline frees the slot"
+        );
+        assert!(
+            evidence
+                .outbox
+                .reserve_evidence(fx.id(), deadline(&fx), 0)
+                .is_err(),
+            "expired evidence cannot return"
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn publication_survives_compaction_failure() {
+    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+    for queued in [false, true] {
+        let mut fx = Fx::new(300_000);
+        fx.open();
+        let mut evidence = evidence(&fx, "compaction.log");
+        let (inbox, reference) = strict_inbox(&fx, &mut evidence, "strict.toml", queued);
+        let before = std::fs::read(&evidence.path).unwrap();
+        let fault =
+            super::super::store::arm_accounting_fault(super::super::store::COMMIT_FAULT_COMPACTION);
+        let published = publish(&fx, &inbox).unwrap();
+        drop(fault);
+        let bytes = fx.bytes();
+        assert!(String::from_utf8_lossy(&bytes).contains("\"prepared\""));
+        let reopened = PersistedWindowStore::at_path(fx.store.path().to_owned());
+        let selected = ApprovalStatus::new(&reopened, fx.fixture.profile())
+            .view(fx.id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            selected, published,
+            "the counter selects the exact committed publication"
+        );
+        assert_eq!(
+            selected.record.consent.unwrap().payload.unwrap().outbox_row,
+            reference
+        );
+        assert_eq!(
+            std::fs::read(&evidence.path).unwrap(),
+            before,
+            "recovery appends no row"
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn publication_has_capacity_headroom() {
+    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+    for queued in [false, true] {
+        let mut fx = Fx::new(300_000);
+        fx.open();
+        let _ready = ConsentEvidenceInventoryGuard::new(fx.fixture.name());
+        let mut evidence = evidence(&fx, "headroom.log");
+        let (inbox, reference) = strict_inbox(&fx, &mut evidence, "strict.toml", queued);
+        let others: Vec<_> = (0..MAX_EVIDENCE_ENTRIES - 1)
+            .map(|i| {
+                let mut id = [0xee; 32];
+                id[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                id
+            })
+            .collect();
+        seed_reserved_evidence(
+            &evidence.path,
+            evidence.anchors.as_ref(),
+            &KEY,
+            &others,
+            u64::MAX,
+        )
+        .unwrap();
+        let now = fx.witness.consent_at_ms();
+        let chain = fx.fixture.profile().chain_id;
+        fx.edit(|wire| {
+            use super::super::store::{WireBucket, WireRecord};
+            wire.entries.push(WireBucket {
+                scope_specificity: 0,
+                bucket: String::new(),
+                window_secs: 60,
+                records: vec![WireRecord {
+                    ts_ms: now,
+                    amount: 1,
+                    chain_scope: Some(super::super::ChainScope::for_chain(chain)),
+                    ..WireRecord::confirmed_defaults()
+                }],
+            });
+            let padding = FILE_THRESHOLD - serialized_len(wire);
+            wire.entries.last_mut().unwrap().bucket = "p".repeat(padding);
+        });
+        let retained_accounting = serde_json::to_value(&fx.wire().entries).unwrap();
+        assert!(serialized_len(&fx.wire()) >= FILE_THRESHOLD);
+        assert!(
+            ConsentAdmission::reacquire(
+                &fx.store,
+                fx.fixture.profile(),
+                fx.operation,
+                &fx.facts,
+                &evidence.outbox
+            )
+            .is_ok(),
+            "existing admission succeeds at capacity"
+        );
+        let retained = evidence.outbox.evidence().unwrap();
+        let published = publish(&fx, &inbox).unwrap();
+        assert_eq!(
+            serde_json::to_value(&fx.wire().entries).unwrap(),
+            retained_accounting,
+            "completion at the admission threshold retains accounting"
+        );
+        assert_eq!(
+            published
+                .record
+                .consent
+                .unwrap()
+                .payload
+                .unwrap()
+                .outbox_row,
+            reference
+        );
+        assert_eq!(
+            evidence
+                .outbox
+                .reserve_evidence([0xaa; 32], u64::MAX, 0)
+                .unwrap_err()
+                .code(),
+            "approval.evidence_capacity"
+        );
+        assert_eq!(
+            evidence.outbox.evidence().unwrap(),
+            retained,
+            "completion preserves every other slot"
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn routed_admission_refuses_pins_and_orphans() {
+    use stellar_agent_core::audit_log::TipAnchorStore;
+    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+    for mode in ["pin", "v1", "missing"] {
+        let mut fx = Fx::new(300_000);
+        fx.open();
+        let _ready = ConsentEvidenceInventoryGuard::new(fx.fixture.name());
+        let mut evidence = evidence(&fx, "unready.log");
+        evidence
+            .outbox
+            .append_queued(&AuditEntry::new_approval_attested(
+                "PaymentSimulated",
+                "stellar_pay_commit",
+                None,
+                "legacy",
+                "cli",
+                "legacy",
+            ))
+            .unwrap();
+        evidence.writer.drain_outbox().unwrap();
+        let v1 = evidence
+            .anchors
+            .load_outbox_owner_state(1)
+            .unwrap()
+            .unwrap();
+        evidence.writer.initialize_consent_evidence().unwrap();
+        assert!(
+            evidence
+                .writer
+                .outbox_evidence()
+                .unwrap()
+                .unwrap()
+                .holds_migration_pins()
+        );
+        if mode == "v1" {
+            evidence.anchors.store_outbox_owner_state(1, &v1).unwrap();
+        }
+        if mode == "missing" {
+            let missing = Arc::new(InMemoryTipAnchorStore::new());
+            missing
+                .store_carrier_record(&evidence.anchors.load_carrier_record().unwrap().unwrap())
+                .unwrap();
+            evidence.anchors = missing;
+            evidence.outbox = AuditOutbox::for_log_keyed(
+                &evidence.path,
+                evidence.anchors.clone(),
+                Zeroizing::new(KEY),
+            );
+        }
+        let slots = || {
+            [".evidence.0", ".evidence.1"].map(|suffix| {
+                let mut path = evidence.outbox.path().as_os_str().to_owned();
+                path.push(suffix);
+                std::fs::read(PathBuf::from(path)).unwrap()
+            })
+        };
+        let before = slots();
+        let owner = evidence.anchors.load_outbox_owner_state(1).unwrap();
+        let error = ConsentAdmission::reacquire(
+            &fx.store,
+            fx.fixture.profile(),
+            fx.operation,
+            &fx.facts,
+            &evidence.outbox,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.code(),
+            "audit.outbox_evidence_unusable",
+            "{mode} admission refuses"
+        );
+        assert_eq!(slots(), before, "a refusal preserves selected image bytes");
+        assert_eq!(evidence.anchors.load_outbox_owner_state(1).unwrap(), owner);
+        assert!(fx.view().record.consent.is_none());
+    }
 }
 
 /// A queued append under `reservation`, standing in for a request that
@@ -319,7 +695,7 @@ fn producer_linkage_and_retry_are_fact_bound() {
     .admit(
         fx.operation,
         &retry,
-        |candidate| {
+        |_, candidate| {
             opens += 1;
             let mut recorder = ApprovalRecorder::new(&fx.store, profile, &mut rows, "race");
             recorder
@@ -593,6 +969,10 @@ fn publication_protocol_documents_commit_points() {
         "Integrated consent succeeds only after the window commit holds the receipt, the authenticated sink, and the exact queued reference.",
         "Recovery takes the sink only from a verified handoff, and a `written` or `recovered` row never becomes direct anchoring.",
         "Queued success reports `audit.outbox_queued` at once and never waits for delivery.",
+        "When enabled, they reserve before inbox insertion, summary display, and presence.",
+        "It releases the writer, inbox, and admission before the window commit, and returns a witness or success only after that commit.",
+        "A crash after the consent row but before inbox persistence leaves no authenticated grant.",
+        "A present Queued row and a Delivered row cannot be retargeted to a different consent digest.",
     ] {
         assert_eq!(recovery.matches(sentence).count(), 1, "{sentence}");
         assert!(sentence.split_whitespace().count() < 35, "{sentence}");
