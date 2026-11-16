@@ -265,7 +265,7 @@ mod tests {
             value_kind: ToolValueKind::ReadOnly,
         });
         let snapshot = PolicyEvaluationSnapshot::new(PolicyStateStore::new(), 123);
-        let run = |engine: &Engine| {
+        let run = |engine: &Engine, provisional| {
             engine.evaluate_in_snapshot(
                 PolicyEvaluationInputs {
                     tool: &tool,
@@ -277,15 +277,20 @@ mod tests {
                     counterparty_cache: None,
                     sep10_sessions: None,
                     sep45_sessions: None,
-                    provisional: false,
+                    provisional,
                 },
                 &snapshot,
             )
         };
-        assert_eq!(run(&Engine(None)).unwrap().decision, Decision::Allow);
+        assert_eq!(run(&Engine(None), false).unwrap().decision, Decision::Allow);
         assert!(matches!(
-            run(&Engine(Some(PolicyStateStore::new()))),
+            run(&Engine(Some(PolicyStateStore::new())), false),
             Err(PolicyError::Internal { .. })
+        ));
+        assert!(matches!(
+            run(&Engine(None), true),
+            Err(PolicyError::Internal { detail })
+                if detail == "provisional snapshot evaluation requires an explicit value"
         ));
     }
 }

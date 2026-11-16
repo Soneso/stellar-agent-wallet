@@ -33,6 +33,7 @@ pub mod consumed;
 pub mod digest;
 #[cfg(all(feature = "mainnet-write", any(test, feature = "test-helpers")))]
 pub(crate) mod fixtures;
+pub mod holds;
 pub mod message;
 #[cfg(feature = "mainnet-write")]
 pub(crate) mod mint;

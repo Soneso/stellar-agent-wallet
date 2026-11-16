@@ -1878,8 +1878,11 @@ impl WalletServer {
     }
 
     /// Captures an independent frame without reconciliation and evaluates it.
-    #[allow(clippy::too_many_arguments)]
-    async fn evaluate_policy_only(
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "descriptor observations and evaluation mode share one captured frame"
+    )]
+    async fn capture_and_evaluate(
         &self,
         descriptor: &ToolDescriptor,
         args_value: &Value,
@@ -1890,7 +1893,7 @@ impl WalletServer {
         now_ms: u64,
         mode: GateMode,
     ) -> Result<(GateEvaluation, Arc<GateSnapshot>), ToolError> {
-        let snapshot = self.capture_gate_snapshot(now_ms).await?;
+        let snapshot = self.capture_gate_snapshot(&descriptor.name, now_ms).await?;
         let evaluation = self
             .evaluate_with_descriptor(
                 descriptor,
@@ -1907,7 +1910,10 @@ impl WalletServer {
     }
 
     /// Evaluates another descriptor against an existing gate's frame.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "paired evaluation retains descriptor-specific arguments and account views"
+    )]
     pub(crate) async fn evaluate_policy_in_snapshot(
         &self,
         tool_name: &'static str,
@@ -2047,7 +2053,11 @@ impl WalletServer {
             .map_err(engine_required)
     }
 
-    async fn capture_gate_snapshot(&self, now_ms: u64) -> Result<Arc<GateSnapshot>, ToolError> {
+    async fn capture_gate_snapshot(
+        &self,
+        tool: &str,
+        now_ms: u64,
+    ) -> Result<Arc<GateSnapshot>, ToolError> {
         let store = stellar_agent_core::policy::v1::PolicyStateStore::new();
         if self.policy_engine.window_state_store().is_some() {
             let profile_name = self.profile_name_for_approval();
@@ -2078,8 +2088,9 @@ impl WalletServer {
             Ok(snapshot) => Some(snapshot),
             Err(err) => {
                 tracing::debug!(
+                    tool,
                     error = %err,
-                    "evaluate_with_descriptor: counterparty cache snapshot unavailable"
+                    "capture_gate_snapshot: counterparty cache snapshot unavailable"
                 );
                 None
             }
@@ -2322,7 +2333,7 @@ impl WalletServer {
             }
         }
         let (evaluation, snapshot) = self
-            .evaluate_policy_only(
+            .capture_and_evaluate(
                 &descriptor,
                 args_value,
                 value,
@@ -5145,7 +5156,12 @@ pub(crate) mod tests {
                     governing_ttl_ms: 600_000,
                     now_ms: Some(captured_ms),
                     decision: None,
-                    snapshot: Some(server.capture_gate_snapshot(captured_ms).await.unwrap()),
+                    snapshot: Some(
+                        server
+                            .capture_gate_snapshot("stellar_pay", captured_ms)
+                            .await
+                            .unwrap(),
+                    ),
                 }),
                 envelope.envelope_xdr(),
                 "stellar_pay_commit",
@@ -14091,6 +14107,80 @@ pub(crate) mod tests {
                 "the payment requires the witness"
             );
             outcome
+        }
+
+        #[tokio::test]
+        #[serial_test::serial(keyring)]
+        #[serial_test::serial]
+        async fn gate_capture_retires_an_earlier_build_once_and_evaluates_successor() {
+            use stellar_agent_core::policy::v1::criteria::state_store::{
+                StateKey, WindowEntry, WindowLimit,
+            };
+            let f = Fixture::new(|raw| raw);
+            let server = &f.server;
+            let now = policy_now_ms().unwrap();
+            let entry = WindowEntry::new(
+                StateKey::new("operator", 1, "rate_limit", 86_400),
+                now,
+                1,
+                WindowLimit::Count {
+                    window: "1d".to_owned(),
+                    max_calls: 10,
+                },
+            );
+            server
+                .window_store
+                .record_and_persist(server.security_profile(), &vec![entry; 10])
+                .unwrap();
+            server
+                .window_store
+                .write_earlier_build_for_test(server.security_profile())
+                .unwrap();
+            let before = ledger_state(&f);
+            assert_eq!(before["version"], 11, "capture meets an earlier-build file");
+            let descriptor = server
+                .checked_policy_descriptor("stellar_pay_commit", &f.args(), "stellar:mainnet")
+                .unwrap();
+            for _ in 0..2 {
+                let (evaluation, _) = server
+                    .capture_and_evaluate(
+                        &descriptor,
+                        &f.args(),
+                        None,
+                        None,
+                        None,
+                        EvaluationScope::Classic,
+                        now,
+                        GateMode::Strict,
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    matches!(
+                        evaluation.decision,
+                        Decision::Deny(
+                            stellar_agent_core::policy::DenyReason::RateLimitExceeded { .. }
+                        )
+                    ),
+                    "capture evaluates the successor's retained history"
+                );
+                let after = ledger_state(&f);
+                assert_eq!(
+                    after["generation"].as_u64().unwrap(),
+                    before["generation"].as_u64().unwrap() + 1,
+                    "capture writes retirement exactly once"
+                );
+                assert_eq!(
+                    after["retired_total_epoch"],
+                    stellar_agent_core::hex::encode(
+                        &server.verified_policy.as_ref().unwrap().digest()
+                    )
+                );
+                assert_eq!(
+                    after["entries"], before["entries"],
+                    "retirement preserves unrelated rolling history"
+                );
+            }
         }
 
         /// A long-lived server refreshes reset history before final resolution.

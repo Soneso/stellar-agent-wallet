@@ -1335,6 +1335,7 @@ impl WalletServer {
     }
 
     /// Observes whether a forced approval retains the evaluated gate's frame.
+    #[doc(hidden)]
     pub fn set_forced_snapshot_observer_for_test(
         &mut self,
         observer: Arc<dyn Fn(bool) + Send + Sync>,

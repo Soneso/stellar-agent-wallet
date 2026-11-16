@@ -44,7 +44,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
-use crate::policy::{DenyReason, UnlistedBound};
+use crate::policy::{DenyReason, PolicyError, UnlistedBound};
 use crate::wallet::WalletLifecycleError;
 
 /// Maximum tolerated future clock skew for host-dated pending entries, in milliseconds.
@@ -375,6 +375,67 @@ impl WindowEntry {
                 }),
         }
     }
+}
+
+/// Composes the holds of two evaluations of the same payment.
+///
+/// `None` preserves the routed entries exactly, including repeated criteria.
+/// `Some` coalesces complete keys and epochs, retaining one debit and the
+/// tighter compatible limit. Routed keys keep their first position; new outer
+/// keys follow in outer order. Equal caps retain the first entry's labels.
+/// Each descriptor must be sized with its own evaluated recipient class.
+///
+/// # Errors
+/// Returns [`PolicyError::Internal`] for inconsistent amounts, timestamps,
+/// limit variants, or count entries that do not represent one call.
+pub fn compose_window_entries(
+    routed: &[WindowEntry],
+    outer: Option<&[WindowEntry]>,
+) -> Result<Vec<WindowEntry>, PolicyError> {
+    let Some(outer) = outer else {
+        return Ok(routed.to_vec());
+    };
+    let inconsistent = || PolicyError::Internal {
+        detail: "inconsistent holds for one payment".to_owned(),
+    };
+    let mut composed: Vec<WindowEntry> = Vec::new();
+    for entry in routed.iter().chain(outer) {
+        if matches!(entry.limit, WindowLimit::Count { .. }) && entry.amount != 1 {
+            return Err(inconsistent());
+        }
+        let Some(current) = composed
+            .iter_mut()
+            .find(|current| current.key == entry.key && current.epoch == entry.epoch)
+        else {
+            composed.push(entry.clone());
+            continue;
+        };
+        if current.amount != entry.amount || current.timestamp_ms != entry.timestamp_ms {
+            return Err(inconsistent());
+        }
+        let tighter = match (&current.limit, &entry.limit) {
+            (
+                WindowLimit::Amount { max_stroops: a, .. },
+                WindowLimit::Amount { max_stroops: b, .. },
+            ) => b < a,
+            (WindowLimit::Count { max_calls: a, .. }, WindowLimit::Count { max_calls: b, .. }) => {
+                b < a
+            }
+            (
+                WindowLimit::Unlisted { max_stroops: a, .. },
+                WindowLimit::Unlisted { max_stroops: b, .. },
+            ) => b < a,
+            (
+                WindowLimit::Total { max_stroops: a, .. },
+                WindowLimit::Total { max_stroops: b, .. },
+            ) => b < a,
+            _ => return Err(inconsistent()),
+        };
+        if tighter {
+            current.limit = entry.limit.clone();
+        }
+    }
+    Ok(composed)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -884,6 +945,10 @@ impl Default for PolicyStateStore {
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+#[path = "state_store_composition_tests.rs"]
+mod composition_tests;
 
 #[cfg(test)]
 mod tests {
