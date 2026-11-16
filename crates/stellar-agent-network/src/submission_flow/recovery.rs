@@ -258,8 +258,9 @@ pub(crate) mod tests {
         CONSUMED_LEDGER, Checked, FAILED_CODE, Fx, PROJECTED_LEDGER, accounting_state,
         checked_transition, commit_approved, commit_checked, commit_on, consumed_ledger,
         consumed_zero_entry, decided_attempt, envelope_id, expire_reservation, exposure_facts,
-        exposure_keys, failed_result_xdr, forget_failure_code, historical_without, retained_result,
-        successor_attempt, successor_refusal, unknown_named, zero_entry_committed,
+        exposure_keys, failed_result_xdr, forget_failure_code, historical_without,
+        invalidated_sending, retained_result, successor_attempt, successor_refusal, unknown_named,
+        zero_entry_committed,
     };
     use crate::policy_state::{
         CommitId, RECONCILE_BUDGET, RecoveryError, store::arm_accounting_fault,
@@ -2060,7 +2061,7 @@ pub(crate) mod tests {
         let held = hold_receipt_lock(&rig.receipts);
         let pass = rig.dispatch(&client, Some(&rig.receipts), false).await;
         drop(held);
-        let ReconcilePass::RecoveryFailed { legacy, error } = &pass else {
+        let ReconcilePass::RecoveryFailed { legacy, error, .. } = &pass else {
             panic!("the repair refusal maps to a recovery failure: {pass:?}");
         };
         assert_eq!(legacy, &expected_report);
@@ -2192,6 +2193,52 @@ pub(crate) mod tests {
                 }
             ),
             "missing sequence evidence refuses a pass with successful repair: {pass:?}"
+        );
+    }
+
+    /// A store refusal of the expiry step is logged with its code, and the
+    /// pass still runs the recovery driver and checked receipt repair.
+    #[tokio::test]
+    #[serial]
+    async fn recovery_dispatch_continues_after_expiry_refusal() {
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        let mut rig = Rig::new();
+        let (_, commit) = commit_checked(&mut rig.fx, 1, Checked::NotIncluded);
+        invalidated_sending(&mut rig.fx, 2);
+        let (_server, client) = endpoint().await;
+        take_trace();
+        let (warnings, guard) = stellar_agent_test_support::WarningCapture::capture(None);
+        let fault = arm_accounting_fault(crate::policy_state::store::COMMIT_FAULT_AFTER_PREPARED);
+        let pass = rig.dispatch(&client, Some(&rig.receipts), false).await;
+        drop(fault);
+        drop(guard);
+        let seen = warnings.seen();
+        let refused = "operation expiry: the expiry edges could not be applied; records stand";
+        assert!(
+            seen.iter()
+                .any(|event| event.get("message").map(String::as_str) == Some(refused)),
+            "the expiry step refused: {seen:?}"
+        );
+        assert_eq!(
+            take_trace(),
+            ["sequences", "repair", "proof"],
+            "recovery and receipt repair run after the expiry refusal: {pass:?}"
+        );
+        assert!(matches!(pass, ReconcilePass::Recovered { .. }), "{pass:?}");
+        assert!(rig.projected(1));
+        let receipt = rig.receipt(1).unwrap();
+        assert_eq!(outcome(&receipt), expected(Checked::NotIncluded));
+        assert_eq!(
+            receipt.settlement_decision_id.as_deref(),
+            Some(commit.to_hex().as_str())
         );
     }
 
@@ -2335,7 +2382,7 @@ pub(crate) mod tests {
         let (server, client) = endpoint().await;
         take_trace();
         let pass = rig.dispatch(&client, None, false).await;
-        assert!(matches!(pass, ReconcilePass::Completed(_)), "{pass:?}");
+        assert!(matches!(pass, ReconcilePass::Recovered { .. }), "{pass:?}");
         assert!(!rig.projected(1), "no receipt store, no repair");
         let pass = reconcile_pass(
             &rig.fx.profile,
@@ -2347,7 +2394,10 @@ pub(crate) mod tests {
             || Err(record_unavailable("no writer")),
         )
         .await;
-        assert!(matches!(pass, ReconcilePass::Completed(_)), "{pass:?}");
+        assert!(
+            matches!(pass, ReconcilePass::RecoveryFailed { .. }),
+            "{pass:?}"
+        );
         assert!(!rig.projected(1), "no writer, no repair");
         let pass = rig.dispatch(&client, Some(&rig.receipts), true).await;
         assert!(matches!(pass, ReconcilePass::Completed(_)), "{pass:?}");
@@ -2356,7 +2406,7 @@ pub(crate) mod tests {
         assert!(!take_trace().contains(&"repair"));
 
         let pass = rig.dispatch(&client, Some(&rig.receipts), false).await;
-        assert!(matches!(pass, ReconcilePass::Completed(_)), "{pass:?}");
+        assert!(matches!(pass, ReconcilePass::Recovered { .. }), "{pass:?}");
         assert!(rig.projected(1), "an idle dispatch repairs");
         assert_linked(&rig.receipt(1).unwrap(), 1, 101, commit);
         assert_eq!(requests(&server).await, 0);

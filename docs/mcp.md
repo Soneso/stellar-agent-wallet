@@ -811,6 +811,12 @@ On every network, a `memo_text` holding a control character (U+0000 to U+001F, U
 The format characters include the zero-width non-joiner (U+200C) and joiner (U+200D), so a memo cannot carry them.
 Other non-ASCII text is accepted.
 
+For an authenticated classic mainnet attempt, transaction status uses cached
+recovery evidence or `UNKNOWN` and sends no additional transaction lookup.
+An unmanaged record keeps its primary lookup. Unknown-submission errors carry
+the shared [recovery guidance](agents.md), including a checked retry
+time or the typed reason that the time is unavailable.
+
 `stellar_transaction_status` refuses with `submission.record_unavailable` when the spending-window file cannot be read.
 
 A v1 rule set that names tools explicitly must include `stellar_transaction_status` to reconcile timed-out submissions through that server; the server logs `policy.transaction_status_unmatched` at startup when neither that tool nor `*` appears.
