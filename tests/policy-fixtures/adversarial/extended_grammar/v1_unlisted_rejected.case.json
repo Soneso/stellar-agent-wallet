@@ -1,0 +1,11 @@
+{
+  "test_kind": "load_failure",
+  "name": "v1_unlisted_rejected",
+  "category": "extended_grammar",
+  "description": "A version 1 document refuses a nested unlisted table.",
+  "load_signing_strategy": "grammar_refused",
+  "expected_load_ok": false,
+  "expected_load_error": "policy_file_parse_failed",
+  "expected_load_wire_code": "policy.policy_file_parse_failed",
+  "expected_load_detail": "rule[0].criteria[0]: counterparty_allowlist.unlisted requires policy version 2"
+}

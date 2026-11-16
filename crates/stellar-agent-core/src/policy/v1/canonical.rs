@@ -1400,6 +1400,198 @@ rules = [
         );
     }
 
+    // ── version 2 companions of the golden inputs ─────────────────────────────
+
+    /// Each golden input above as a version 2 document with `sequence = 1`.
+    /// Version 2 also signs `sequence` and sorts the keys of match and
+    /// criterion tables; array order and the rule key order stay. The
+    /// expected literals and their BLAKE3 digests are written by hand.
+    const V2_GOLDEN_ARRAY_OF_TABLES_FIXTURE: &str = r#"# Owner policy for alice.
+version = 2 # schema version
+sequence = 1
+scope = "profile:alice"
+
+[[rules]]
+# Dotted-key match.
+match.tool = "stellar_pay"
+match.chain = "stellar:testnet"
+criteria = [
+  # Per-transaction cap of 100 XLM.
+  { kind = "per_tx_cap", asset = "native", max_stroops = 1_000_000_000 },
+  { kind = "counterparty_allowlist", kinds = [ "G_ACCOUNT", "C_ACCOUNT" ], allowlist = ["GAAAA", "CBBBB"], gate_inflows = false },
+]
+decision = "allow"
+
+[[rules]]
+decision = "require_approval"
+criteria = [{ kind = "rate_limit", window = "1h", max_calls = 1_0 }]   # hourly
+match = { tool = "*", chain = "*" }
+
+[[rules]]
+criteria = []
+decision = "deny"
+
+[rules.match]
+tool = "stellar_create_account"
+chain = "*"
+
+[signature]
+owner_id = "GOWNER"
+sig = "00"
+"#;
+
+    const V2_GOLDEN_INLINE_RULES_FIXTURE: &str = r#"# Inline rules.
+version = 2
+sequence = 1
+scope = "profile:*"
+rules = [
+  # Daily cap.
+  { match = { tool = "stellar_pay", chain = "*" }, criteria = [{ kind = "per_period_cap", asset = "native", window = "1d", max_stroops = 50_000_000 }], decision = "allow" },
+  { decision = "require_approval", criteria = [], match = { chain = "*", tool = "*" } }, # catch-all
+]
+"#;
+
+    const V2_OPTIONAL_KEYS_ARRAY_OF_TABLES: &str = r#"version = 2
+scope = "profile:alice"
+sequence = 1
+
+[[rules]]
+allow_opaque_signing = true
+ttl_secs = 3_600 # one hour
+reason = "manual review"
+decision = "require_approval"
+criteria = []
+match = { tool = "stellar_sep43_sign_transaction", chain = "*" }
+
+[[rules]]
+match = { tool = "stellar_pay", chain = "*" }
+criteria = []
+decision = "require_approval"
+allow_opaque_signing = false
+reason = ""
+
+[[rules]]
+match = { tool = "*", chain = "*" }
+criteria = []
+decision = "require_approval"
+ttl_secs = 86400
+
+[[rules]]
+match = { tool = "*", chain = "*" }
+criteria = []
+decision = "deny"
+"#;
+
+    const V2_OPTIONAL_KEYS_INLINE_RULES: &str = r#"version = 2
+scope = "profile:alice"
+sequence = 1
+rules = [
+  { allow_opaque_signing = true, ttl_secs = 0xe10, reason = 'manual review', decision = "require_approval", criteria = [], match = { tool = "stellar_sep43_sign_transaction", chain = "*" } },
+  { match = { tool = "stellar_pay", chain = "*" }, criteria = [], decision = "require_approval", allow_opaque_signing = false, reason = '' },
+  { match = { tool = "*", chain = "*" }, criteria = [], decision = "require_approval", ttl_secs = 86400 },
+  { match = { tool = "*", chain = "*" }, criteria = [], decision = "deny" },
+]
+"#;
+
+    const V2_EXPECTED_ARRAY_OF_TABLES: &str = r#"version = 2
+scope = "profile:alice"
+sequence = 1
+
+[[rules]]
+match = { chain = "stellar:testnet", tool = "stellar_pay" }
+criteria = [{ asset = "native", kind = "per_tx_cap", max_stroops = 1000000000 }, { allowlist = ["GAAAA", "CBBBB"], gate_inflows = false, kind = "counterparty_allowlist", kinds = ["G_ACCOUNT", "C_ACCOUNT"] }]
+decision = "allow"
+
+[[rules]]
+match = { chain = "*", tool = "*" }
+criteria = [{ kind = "rate_limit", max_calls = 10, window = "1h" }]
+decision = "require_approval"
+
+[[rules]]
+match = { chain = "*", tool = "stellar_create_account" }
+criteria = []
+decision = "deny"
+"#;
+
+    const V2_EXPECTED_INLINE_RULES: &str = r#"version = 2
+scope = "profile:*"
+sequence = 1
+
+[[rules]]
+match = { chain = "*", tool = "stellar_pay" }
+criteria = [{ asset = "native", kind = "per_period_cap", max_stroops = 50000000, window = "1d" }]
+decision = "allow"
+
+[[rules]]
+match = { chain = "*", tool = "*" }
+criteria = []
+decision = "require_approval"
+"#;
+
+    const V2_EXPECTED_WITH_OPTIONAL_KEYS: &str = r#"version = 2
+scope = "profile:alice"
+sequence = 1
+
+[[rules]]
+match = { chain = "*", tool = "stellar_sep43_sign_transaction" }
+criteria = []
+decision = "require_approval"
+reason = "manual review"
+ttl_secs = 3600
+allow_opaque_signing = true
+
+[[rules]]
+match = { chain = "*", tool = "stellar_pay" }
+criteria = []
+decision = "require_approval"
+reason = ""
+allow_opaque_signing = false
+
+[[rules]]
+match = { chain = "*", tool = "*" }
+criteria = []
+decision = "require_approval"
+ttl_secs = 86400
+
+[[rules]]
+match = { chain = "*", tool = "*" }
+criteria = []
+decision = "deny"
+"#;
+
+    #[test]
+    fn v2_legacy_canonical_companions_match_literals() {
+        for (input, expected, digest_hex) in [
+            (
+                V2_GOLDEN_ARRAY_OF_TABLES_FIXTURE,
+                V2_EXPECTED_ARRAY_OF_TABLES,
+                "b4cfca0beb8293f05d999c48ee44e20a984f3cf3f678881e0ae249ba9cfb1fc4",
+            ),
+            (
+                V2_GOLDEN_INLINE_RULES_FIXTURE,
+                V2_EXPECTED_INLINE_RULES,
+                "c619bb2e53d6c5063b2ab5aa7f14b49ccaae09c9d23b59fe0ef46b46270cc4b8",
+            ),
+            (
+                V2_OPTIONAL_KEYS_ARRAY_OF_TABLES,
+                V2_EXPECTED_WITH_OPTIONAL_KEYS,
+                "873e01622dfade431b672e6faa36b7dccf5b4a8c33c568d0b7af3fca9fbeab5a",
+            ),
+            (
+                V2_OPTIONAL_KEYS_INLINE_RULES,
+                V2_EXPECTED_WITH_OPTIONAL_KEYS,
+                "873e01622dfade431b672e6faa36b7dccf5b4a8c33c568d0b7af3fca9fbeab5a",
+            ),
+        ] {
+            let bytes = canonical_bytes(input).unwrap();
+            assert_eq!(String::from_utf8(bytes.clone()).unwrap(), expected);
+            assert_eq!(
+                crate::hex::encode(blake3::hash(&bytes).as_bytes()),
+                digest_hex
+            );
+        }
+    }
+
     proptest! {
         /// (a) Tab vs space indentation around `=` signs.
         ///

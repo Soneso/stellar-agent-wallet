@@ -46,8 +46,8 @@ the planned work per release.
 - Builds from this repository and releases from v0.1.0-alpha.14 on carry
   `mainnet-write`. Configured CLI actions sign `Allow` without a passkey
   ceremony; `RequireApproval` runs one. Setup, policy minimums, and sealed
-  authorization remain required. Configured MCP operations require approval
-  for each action.
+  authorization remain required. Configured MCP operations sign under
+  `Allow` and need a verified approval under `RequireApproval`.
   [Mainnet configurations and scope](docs/getting-started.md#mainnet-configurations-and-scope)
   lists the commands, the layers, and the wire codes.
 - Mainnet writes move real funds. The wallet is alpha software and comes

@@ -537,6 +537,10 @@ For the full profile schema, every field, and the key-rotation ceremony, see
 
 ### Create the V1 policy file
 
+This testnet example is a version 1 document. Unlisted budgets, total
+budgets, balance floors, and memo bindings need `version = 2`; see
+[V1 engine](concepts.md#v1-engine).
+
 Before `profile sign-policy`, create `policies/<name>.toml` in the wallet's
 state directory. The default paths are:
 
@@ -641,9 +645,11 @@ Review it before you sign it with `profile sign-policy`:
 - Caps: every payment rule allows the preset's asset alone, with a
   per-payment cap, 1d and 1w caps, and rate limits. A chosen
   `total_budget` bounds all spending under the signed policy's digest.
-  Signing the same policy body again keeps the allocation; a different
-  digest starts another.
-- Floor: `stellar_pay` and `stellar_pay_commit` keep a native balance floor.
+  `profile sign-policy` assigns the next sequence, so each signing starts
+  another allocation; only identical canonical bytes keep it.
+- Floor: `stellar_pay` and `stellar_pay_commit` carry a native balance floor.
+  It needs an observed account read that the shipped payment paths do not
+  supply, so a matched floor refuses with `account.unread`.
 - Approval: shop and business presets request approval for a payment above
   their threshold.
 

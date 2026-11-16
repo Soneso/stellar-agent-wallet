@@ -25,8 +25,13 @@ lives only in the keyring.
 ## Actions
 
 `stellar_pay` (build) — arguments: `chain_id`, `source`, `destination`,
-`amount` (e.g. `"10 XLM"`), `asset` (`"native"` for XLM). Returns an unsigned
-`envelope_xdr`, a single-use `nonce`, and `expires_at_unix_ms`.
+`amount` (e.g. `"10 XLM"`), `asset` (`"native"` for XLM), and optionally one
+of `memo_text`, `memo_id`, `memo_hash_hex`, or `memo_return_hex`. Returns an
+unsigned `envelope_xdr`, a single-use `nonce`, and `expires_at_unix_ms`. When
+the owner policy binds the destination's memo, the wallet evaluates the
+parsed memo argument and refuses a missing or different memo with
+`policy.deny.memo_binding_mismatch`; the commit evaluates the memo encoded in
+the envelope.
 
 `stellar_pay_commit` (sign and submit) — arguments: the same
 `chain_id`/`source`/`destination`/`amount`/`asset`, plus the `nonce`,

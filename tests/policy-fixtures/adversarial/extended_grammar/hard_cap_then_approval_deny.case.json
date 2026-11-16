@@ -1,0 +1,33 @@
+{
+  "test_kind": "sequence",
+  "name": "hard_cap_then_approval_deny",
+  "category": "extended_grammar",
+  "description": "The first matching rule decides: its hard cap refuses an unlisted payment over the cap, and a later require_approval rule for the same tool cannot rescue it. Within the cap the first rule escalates with its own reason.",
+  "tool": {
+    "name": "stellar_pay",
+    "destructive_hint": true,
+    "read_only_hint": false,
+    "chain_id_required": true,
+    "chain_id": "stellar:testnet"
+  },
+  "profile_name": "default",
+  "steps": [
+    {
+      "args": { "amount_stroops": "101", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+      "expected": {
+        "kind": "Deny",
+        "deny_reason": "per_tx_cap_exceeded",
+        "wire_code": "policy.deny.per_tx_cap_exceeded",
+        "reason": { "PerTxCapExceeded": { "asset": "native", "max_stroops": "100", "attempted_stroops": "101" } }
+      }
+    },
+    {
+      "args": { "amount_stroops": "100", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+      "expected": {
+        "kind": "RequireApproval",
+        "approval_reason": "counterparty_allowlist: an unlisted recipient requires approval",
+        "approval_ttl_secs": 86400
+      }
+    }
+  ]
+}

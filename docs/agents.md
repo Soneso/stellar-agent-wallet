@@ -179,8 +179,9 @@ and never as a transient error to retry blindly.
 Builds from this repository and releases from v0.1.0-alpha.14 on carry
 `mainnet-write`. The server admits
 `stellar_pay_commit`, `stellar_claim_commit`, `stellar_create_account_commit`,
-and `stellar_trustline_commit` after operator setup. Every action needs approval,
-even under an Allow rule. Both prepare and commit names need policy rules.
+and `stellar_trustline_commit` after operator setup. An Allow rule signs
+without an approval, and a RequireApproval rule needs a verified approval;
+neither overrides a denial. Both prepare and commit names need policy rules.
 
 The operator enrolls identities, runs `profile enable-mainnet`, completes the
 v2 policy, and runs `profile sign-policy`. Restart the MCP server afterward.

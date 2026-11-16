@@ -102,6 +102,8 @@ When either family cannot be held, the ceremony does not start.
 
 CLI Allow grants policy authority for 600 seconds from evaluation, without a
 passkey ceremony. RequireApproval runs a ceremony with its rule lifetime.
+A mainnet RequireApproval rule sets `ttl_secs` from 1 through 86,400 seconds;
+an unlisted approval escalation uses the default one-day lifetime.
 The presence challenge retains its separate 120-second bound.
 Classic MCP approvals expire at the shorter prepare/commit
 lifetime, with Allow contributing 600 seconds. Both names need matching rules.
@@ -259,7 +261,64 @@ same window reads one shared count, whichever rule carries it.
 Each criterion compares that shared count against its own `max_calls`.
 `bundle_rate_limit` counts each inner call of a multicall bundle.
 
-MCP pay/create-account/trustline/claim commits and CLI `pay` and `claim` with `--sign-only` or `--submit-only` include envelope fees in `minimum_reserve`. A debit leaving only reserve plus margin refuses `policy.deny.minimum_reserve_breached`. Full CLI pipelines, `--build-only`, and MCP simulations count no fee.
+`minimum_reserve` counts the envelope fee with the debit. MCP pay/create-account/trustline/claim commits supply it, as do CLI `pay`, `claim`, sponsored `accounts create`, and `trustline` for the envelope they build. A post-payment balance below reserve plus margin refuses with `policy.deny.minimum_reserve_breached`; equality passes. The initial MCP preparation check has no fee argument; its paired commit check uses the encoded envelope fee and can refuse preparation on mainnet.
+
+### Version 2 additions
+
+Four additions require a `version = 2` document; a version 1 document refuses
+each with `<feature> requires policy version 2`. The engine keeps the name V1
+and evaluates both versions. Every nested value is signed.
+
+- `counterparty_allowlist.unlisted` decides a debit to an unlisted recipient.
+  `mode = "deny"` is the default. `mode = "approval"` returns
+  `RequireApproval` with the reason `counterparty_allowlist: an unlisted
+  recipient requires approval` and the default one-day lifetime.
+  `mode = "budget"` allows within `per_tx_stroops` and `per_period_stroops`
+  over `window`, in `asset` (default `native`). Both bounds are inclusive;
+  excess refuses `policy.deny.unlisted_budget_exceeded`. A debit in another
+  asset keeps the counterparty denial.
+- Approval and budget need `decision = "allow"`, and budget bounds must be
+  strictly below the rule's matching hard caps. A rule carries one table.
+  Tables in several rules must be equal, and then share one counter per asset
+  and window. Listed payments add nothing to it.
+- Only a verified unlisted debit reaches the mode. A missing destination, an
+  unverified domain, or a gated inflow keeps the counterparty denial. First
+  match still decides, and a later failing criterion of the same rule still
+  denies.
+- `total_budget` (`asset`, `max_stroops`, allow rules only) is an allocation
+  that never renews. It is bound to the canonical asset and to the digest of
+  the signed canonical bytes. `profile reset-window-state` keeps its usage. Excess
+  refuses `policy.deny.total_budget_exhausted`, and approval adds no capacity.
+- `balance_floor` (`min_stroops`) refuses unless balance minus reservations,
+  debit, and fee stays at or above the floor. It needs an observation at most
+  120,000 ms old and refuses `account.unread` or `account.stale` without one.
+  Provisional evaluation skips it; strict evaluation does not. Shipped CLI and
+  MCP payment paths supply no observed account, so a matched floor refuses
+  `account.unread` there.
+- `memo_binding` (`bindings`, 1 to 64 distinct G destinations) requires the
+  exact memo `kind` and `value` (`text`, `id`, `hash`, `return`, or `any`) on
+  every debit to a bound destination or an M address over it. `any` refuses no
+  memo. Missing or malformed memo facts refuse `policy.deny.memo_binding_mismatch`.
+
+```toml
+version = 2
+scope = "profile:alice"
+sequence = 1
+
+[[rules]]
+match = { tool = "stellar_pay", chain = "stellar:testnet" }
+criteria = [
+  { kind = "counterparty_allowlist", kinds = ["G_ACCOUNT"], allowlist = ["GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"], unlisted = { mode = "budget", per_tx_stroops = 10_0000000, per_period_stroops = 50_0000000, window = "1d" } },
+  { kind = "per_tx_cap", asset = "native", max_stroops = 100_0000000 },
+  { kind = "total_budget", asset = "native", max_stroops = 1000_0000000 },
+  { kind = "memo_binding", bindings = [{ destination = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN", kind = "id", value = "7" }] },
+]
+decision = "allow"
+```
+
+`profile sign-policy` assigns the next sequence, so each signing starts a new
+total allocation. Reproducing identical canonical bytes keeps the digest and
+its usage.
 
 A `HOME_DOMAIN` binding is evidence for one hour from its fetch. An entry
 whose fetch time lies more than five minutes in the future counts as expired.

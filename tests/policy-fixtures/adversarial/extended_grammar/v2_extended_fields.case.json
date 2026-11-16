@@ -1,0 +1,8 @@
+{
+  "test_kind": "load_failure",
+  "name": "v2_extended_fields",
+  "category": "extended_grammar",
+  "description": "A signed version 2 document with all four additions loads: an unlisted budget, a total budget, a balance floor, and a memo binding.",
+  "load_signing_strategy": "correct_key",
+  "expected_load_ok": true
+}

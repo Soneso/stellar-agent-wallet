@@ -1,0 +1,36 @@
+{
+  "test_kind": "sequence",
+  "name": "memo_malformed_fact_refused",
+  "category": "extended_grammar",
+  "description": "Malformed or contradictory memo facts carry no memo, so a bound payment refuses: a non-canonical ID, an ID memo that also claims text, an ID memo without its value, and an unknown kind. Well-formed facts for the bound ID allow.",
+  "tool": {
+    "name": "stellar_pay",
+    "destructive_hint": true,
+    "read_only_hint": false,
+    "chain_id_required": true,
+    "chain_id": "stellar:testnet"
+  },
+  "profile_name": "default",
+  "steps": [
+    {
+      "args": { "amount_stroops": "10", "asset": "native", "destination": "GAKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRL26G", "memo_kind": "id", "memo": null, "memo_id": "07" },
+      "expected": { "kind": "Deny", "wire_code": "policy.deny.memo_binding_mismatch", "reason": { "MemoBindingMismatch": { "kind": "id" } } }
+    },
+    {
+      "args": { "amount_stroops": "10", "asset": "native", "destination": "GAKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRL26G", "memo_kind": "id", "memo": "x", "memo_id": "7" },
+      "expected": { "kind": "Deny", "wire_code": "policy.deny.memo_binding_mismatch", "reason": { "MemoBindingMismatch": { "kind": "id" } } }
+    },
+    {
+      "args": { "amount_stroops": "10", "asset": "native", "destination": "GAKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRL26G", "memo_kind": "id", "memo": null },
+      "expected": { "kind": "Deny", "wire_code": "policy.deny.memo_binding_mismatch", "reason": { "MemoBindingMismatch": { "kind": "id" } } }
+    },
+    {
+      "args": { "amount_stroops": "10", "asset": "native", "destination": "GAKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRL26G", "memo_kind": "binary", "memo": null, "memo_id": "7" },
+      "expected": { "kind": "Deny", "wire_code": "policy.deny.memo_binding_mismatch", "reason": { "MemoBindingMismatch": { "kind": "id" } } }
+    },
+    {
+      "args": { "amount_stroops": "10", "asset": "native", "destination": "GAKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRL26G", "memo_kind": "id", "memo": null, "memo_id": "7" },
+      "expected": { "kind": "Allow" }
+    }
+  ]
+}

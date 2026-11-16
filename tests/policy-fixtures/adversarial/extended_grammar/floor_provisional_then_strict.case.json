@@ -1,0 +1,30 @@
+{
+  "test_kind": "sequence",
+  "name": "floor_provisional_then_strict",
+  "category": "extended_grammar",
+  "description": "Provisional evaluation defers the floor and allows without an account view; the strict evaluation of the same call still checks it and refuses as account.unread until fresh facts arrive.",
+  "tool": {
+    "name": "stellar_pay",
+    "destructive_hint": true,
+    "read_only_hint": false,
+    "chain_id_required": true,
+    "chain_id": "stellar:testnet"
+  },
+  "profile_name": "default",
+  "steps": [
+    {
+      "provisional": true,
+      "args": { "amount_stroops": "1", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+      "expected": { "kind": "Allow" }
+    },
+    {
+      "args": { "amount_stroops": "1", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+      "expected": { "kind": "Deny", "deny_reason": "account.unread", "wire_code": "account.unread", "reason": "AccountUnread" }
+    },
+    {
+      "args": { "amount_stroops": "1", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+      "account": { "balance_stroops": 10000, "observed_age_ms": 5000, "reservations_stroops": 0 },
+      "expected": { "kind": "Allow" }
+    }
+  ]
+}

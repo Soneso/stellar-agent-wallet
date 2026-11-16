@@ -1,0 +1,9 @@
+version = 1
+scope = "profile:*"
+
+[[rules]]
+match = { tool = "stellar_pay", chain = "*" }
+criteria = [
+    { kind = "counterparty_allowlist", kinds = ["G_ACCOUNT"], allowlist = ["GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"], unlisted = { mode = "approval" } },
+]
+decision = "allow"

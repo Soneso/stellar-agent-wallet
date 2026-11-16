@@ -1,0 +1,32 @@
+{
+  "test_kind": "sequence",
+  "name": "memo_none_refused",
+  "category": "extended_grammar",
+  "description": "kind = \"any\" admits every memo except none: a payment whose facts say none, and a payment with no memo facts at all, refuse; text and ID memos allow.",
+  "tool": {
+    "name": "stellar_pay",
+    "destructive_hint": true,
+    "read_only_hint": false,
+    "chain_id_required": true,
+    "chain_id": "stellar:testnet"
+  },
+  "profile_name": "default",
+  "steps": [
+    {
+      "args": { "amount_stroops": "10", "asset": "native", "destination": "GAKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRL26G", "memo_kind": "none", "memo": null },
+      "expected": { "kind": "Deny", "deny_reason": "memo_binding_mismatch", "wire_code": "policy.deny.memo_binding_mismatch", "reason": { "MemoBindingMismatch": { "kind": "any" } } }
+    },
+    {
+      "args": { "amount_stroops": "10", "asset": "native", "destination": "GAKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRL26G" },
+      "expected": { "kind": "Deny", "deny_reason": "memo_binding_mismatch", "wire_code": "policy.deny.memo_binding_mismatch", "reason": { "MemoBindingMismatch": { "kind": "any" } } }
+    },
+    {
+      "args": { "amount_stroops": "10", "asset": "native", "destination": "GAKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRL26G", "memo_kind": "text", "memo": "x" },
+      "expected": { "kind": "Allow" }
+    },
+    {
+      "args": { "amount_stroops": "10", "asset": "native", "destination": "GAKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRL26G", "memo_kind": "id", "memo": null, "memo_id": "5" },
+      "expected": { "kind": "Allow" }
+    }
+  ]
+}
