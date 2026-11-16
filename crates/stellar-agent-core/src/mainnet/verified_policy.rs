@@ -201,6 +201,20 @@ impl VerifiedPolicy {
         }
     }
 
+    /// A fixture policy of `engine` whose digest is `digest`, with sequence
+    /// 1, an all-zero owner, and no mainnet section.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[must_use]
+    pub fn for_test(digest: [u8; 32], engine: Arc<PolicyEngineV1>) -> Self {
+        Self {
+            sequence: 1,
+            digest,
+            owner: [0; 32],
+            engine,
+            mainnet: None,
+        }
+    }
+
     /// The signed policy sequence; `0` for a version 1 document.
     #[must_use]
     pub fn sequence(&self) -> i64 {

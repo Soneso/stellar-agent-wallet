@@ -312,6 +312,15 @@ pub struct PolicyRule {
 }
 
 impl PolicyRule {
+    /// The amount limits of this rule's criteria, in criterion order.
+    #[must_use]
+    pub fn descriptors(&self) -> Vec<crate::policy::v1::criteria::descriptor::BucketDescriptor> {
+        self.criteria
+            .iter()
+            .flat_map(|criterion| criterion.descriptors())
+            .collect()
+    }
+
     /// Returns `true` if this rule's [`RuleMatch`] clause matches `tool`.
     ///
     /// # Examples

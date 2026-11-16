@@ -24,6 +24,7 @@ use crate::policy::v1::EvalContext;
 use crate::policy::v1::asset_equivalence::{assets_equivalent, total_budget_identity};
 use crate::policy::v1::bundle::{BundleStateOverlay, InnerOpDescriptor};
 use crate::policy::v1::criteria::Criterion;
+use crate::policy::v1::criteria::descriptor::{BucketDescriptor, BucketKind};
 use crate::policy::v1::criteria::per_tx_cap::{AssetDebitSum, checked_asset_debit_sum};
 use crate::policy::v1::criteria::state_store::{StateKey, WindowEntry, WindowLimit};
 use crate::policy::v1::value::{ValueClass, asset_normalise};
@@ -105,6 +106,20 @@ fn epoch(ctx: &EvalContext<'_>) -> Result<[u8; 32], PolicyError> {
 impl Criterion for TotalBudgetCriterion {
     fn kind(&self) -> &'static str {
         "total_budget"
+    }
+
+    fn descriptors(&self) -> Vec<BucketDescriptor> {
+        vec![BucketDescriptor::accumulating(
+            BucketKind::Total,
+            &self.asset,
+            self.max_stroops,
+            &StateKey::new(
+                "",
+                TOTAL_BUDGET_SCOPE_SPECIFICITY,
+                &format!("total:{}", self.asset),
+                0,
+            ),
+        )]
     }
 
     fn windowed(&self) -> bool {

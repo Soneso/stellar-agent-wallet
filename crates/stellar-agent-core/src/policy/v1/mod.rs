@@ -1384,6 +1384,13 @@ impl PolicyEngineV1 {
         }
     }
 
+    /// The rules selected by admission, using the profile and project cached
+    /// when this engine was constructed.
+    #[must_use]
+    pub fn effective_rules(&self) -> Vec<&PolicyRule> {
+        self.matching_rules(&self.profile_name, self.project_id.as_deref())
+    }
+
     /// Kept for back-compat during parallel-track merging.
     ///
     /// Delegates to [`PolicyEngineV1::matching_rules`].  Callers in existing
@@ -1764,8 +1771,7 @@ impl PolicyEngineV1 {
         provisional: bool,
         now_ms: u64,
     ) -> Result<(Decision, Option<RecipientClass>, Option<usize>), PolicyError> {
-        // project_id is cached at engine construction time from STELLAR_AGENT_PROJECT.
-        let rules = self.matching_rules(&self.profile_name, self.project_id.as_deref());
+        let rules = self.effective_rules();
 
         // First-match stop-semantics. The ordinal is taken before the tool
         // filter so it names the rule's position in the document.
