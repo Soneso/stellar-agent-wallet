@@ -1,0 +1,9 @@
+version = 1
+scope = "profile:*"
+
+[[rules]]
+match = { tool = "stellar_pay", chain = "*" }
+criteria = [
+    { kind = "balance_floor", min_stroops = 20000000 },
+]
+decision = "allow"

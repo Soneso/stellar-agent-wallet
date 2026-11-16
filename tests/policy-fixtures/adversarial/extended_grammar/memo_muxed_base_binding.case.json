@@ -1,0 +1,28 @@
+{
+  "test_kind": "sequence",
+  "name": "memo_muxed_base_binding",
+  "category": "extended_grammar",
+  "description": "A binding of a G address also governs every M address over that base: a muxed payment to it needs the bound ID memo.",
+  "tool": {
+    "name": "stellar_pay",
+    "destructive_hint": true,
+    "read_only_hint": false,
+    "chain_id_required": true,
+    "chain_id": "stellar:testnet"
+  },
+  "profile_name": "default",
+  "steps": [
+    {
+      "args": { "amount_stroops": "10", "asset": "native", "destination": "MAKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKAAAAAAAAAAAALJTU", "memo_kind": "id", "memo": null, "memo_id": "7" },
+      "expected": { "kind": "Allow" }
+    },
+    {
+      "args": { "amount_stroops": "10", "asset": "native", "destination": "MAKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKAAAAAAAAAAAALJTU" },
+      "expected": { "kind": "Deny", "deny_reason": "memo_binding_mismatch", "wire_code": "policy.deny.memo_binding_mismatch", "reason": { "MemoBindingMismatch": { "kind": "id" } } }
+    },
+    {
+      "args": { "amount_stroops": "10", "asset": "native", "destination": "MAKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKAAAAAAAAAAAALJTU", "memo_kind": "id", "memo": null, "memo_id": "8" },
+      "expected": { "kind": "Deny", "deny_reason": "memo_binding_mismatch", "wire_code": "policy.deny.memo_binding_mismatch", "reason": { "MemoBindingMismatch": { "kind": "id" } } }
+    }
+  ]
+}

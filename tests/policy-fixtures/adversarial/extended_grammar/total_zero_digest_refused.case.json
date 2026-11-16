@@ -1,0 +1,24 @@
+{
+  "test_kind": "sequence",
+  "name": "total_zero_digest_refused",
+  "category": "extended_grammar",
+  "description": "An engine built outside the verified loader carries an all-zero digest; a total budget refuses to evaluate against it.",
+  "tool": {
+    "name": "stellar_pay",
+    "destructive_hint": true,
+    "read_only_hint": false,
+    "chain_id_required": true,
+    "chain_id": "stellar:testnet"
+  },
+  "profile_name": "default",
+  "unverified_engine": true,
+  "steps": [
+    {
+      "args": { "amount_stroops": "1", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+      "expected": {
+        "kind": "Error",
+        "error_contains": "total_budget requires a verified policy digest"
+      }
+    }
+  ]
+}

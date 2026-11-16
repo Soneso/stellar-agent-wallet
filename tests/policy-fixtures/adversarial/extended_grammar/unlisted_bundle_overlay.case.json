@@ -1,0 +1,38 @@
+{
+  "test_kind": "sequence",
+  "name": "unlisted_bundle_overlay",
+  "category": "extended_grammar",
+  "description": "Within a bundle, earlier unlisted transfers consume the period budget of later ones; a listed transfer consumes none. 60 + 40 unlisted fits a 100-stroop period, 60 + 41 refuses at inner 2.",
+  "tool": {
+    "name": "stellar_pay",
+    "destructive_hint": true,
+    "read_only_hint": false,
+    "chain_id_required": true,
+    "chain_id": "stellar:testnet"
+  },
+  "profile_name": "default",
+  "steps": [
+    {
+      "args": {},
+      "bundle": [
+        { "to": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF", "asset": "native", "amount_stroops": 500 },
+        { "to": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN", "asset": "native", "amount_stroops": 60 },
+        { "to": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN", "asset": "native", "amount_stroops": 40 }
+      ],
+      "expected": { "kind": "Allow" }
+    },
+    {
+      "args": {},
+      "bundle": [
+        { "to": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN", "asset": "native", "amount_stroops": 60 },
+        { "to": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF", "asset": "native", "amount_stroops": 500 },
+        { "to": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN", "asset": "native", "amount_stroops": 41 }
+      ],
+      "expected": {
+        "kind": "Deny",
+        "deny_reason": "bundle_denied",
+        "reason": { "BundleDenied": { "inner_index": 2, "deny_reason": { "UnlistedBudgetExceeded": { "asset": "native", "bound": "per_period", "max_stroops": "100", "attempted_stroops": "41" } } } }
+      }
+    }
+  ]
+}

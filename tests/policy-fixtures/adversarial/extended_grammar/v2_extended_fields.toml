@@ -1,0 +1,13 @@
+version = 2
+scope = "profile:*"
+sequence = 1
+
+[[rules]]
+match = { tool = "stellar_pay", chain = "*" }
+criteria = [
+    { kind = "counterparty_allowlist", kinds = ["G_ACCOUNT"], allowlist = ["GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"], unlisted = { mode = "budget", per_tx_stroops = 100, per_period_stroops = 250, asset = "native", window = "1d" } },
+    { kind = "total_budget", asset = "native", max_stroops = 1000 },
+    { kind = "balance_floor", min_stroops = 50 },
+    { kind = "memo_binding", bindings = [{ destination = "GAKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRL26G", kind = "id", value = "7" }] },
+]
+decision = "allow"

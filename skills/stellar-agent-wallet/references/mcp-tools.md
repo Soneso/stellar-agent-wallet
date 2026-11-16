@@ -240,7 +240,8 @@ in one call. Under RequireApproval it takes two calls. [x402](#x402) describes
 both.
 
 Paired preparation refuses an undecodable envelope with `simulation.divergence`.
-A denied rule retains `policy.deny.*`; an unknown decision uses
+A denied rule retains its wire code, `policy.deny.*` or a balance floor's
+`account.*`; an unknown decision uses
 `policy.unexpected_decision`. None of these refusals persists an approval.
 Each commit evaluates both names before attestation validation. A proof
 supplied under Allow is verified and spent like a required one.
@@ -455,6 +456,11 @@ id is validated and echoed, and no record exists.
 | `memo_return_hex` | string | no | 64 hex chars (32 bytes); mutually exclusive. |
 | `fee` | string | no | Classic fee selector: `<stroops>`, `auto`, `auto:pNN`. |
 | `business_id` | string | on mainnet | Names the operation; see [Business ids](#business-ids). |
+
+A version 2 policy's `memo_binding` criterion can require an exact memo kind
+and value for a destination and its muxed addresses. Preparation evaluates the
+parsed memo field; commit evaluates the memo encoded in the envelope. A missing
+or different memo refuses `policy.deny.memo_binding_mismatch`.
 
 Returns `{ envelope_xdr, nonce, expires_at_unix_ms, simulation, operational }`.
 `operational` is `{ latest_ledger, close_time_unix, close_lag_seconds }`, the

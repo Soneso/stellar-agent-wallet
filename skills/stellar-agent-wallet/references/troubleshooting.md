@@ -129,6 +129,12 @@ engine is first-match, default-deny over signed, typed criteria.
 |---|---|---|
 | `policy.deny.<reason>` | A V1 criterion denied the call (`<reason>` is the typed reason: `per_tx_cap_exceeded`, `per_period_cap_exceeded`, `rate_limit_exceeded`, `counterparty_denied`, `minimum_reserve_breached`, `no_matching_rule`). The payload carries the redacted reason. | Do not retry as-is; the policy forbids this operation. Report the reason to the operator. Only the operator can change policy. |
 | `policy.deny.unsizable_value_effect` | A value rule matched a tool whose value cannot be sized, including the raw signing tools. | Size the call through a supported verb, or ask the operator to set `allow_opaque_signing = true` on the matched rule if raw signing is intended. |
+| `policy.deny.unlisted_budget_exceeded` | A payment to an unlisted recipient exceeds the `unlisted` budget's per-payment or per-period bound; the payload names the bound, its maximum, and the attempted amount. | Do not retry unchanged. A smaller payment fits the per-payment bound; the period bound frees as earlier unlisted payments leave the window. Listing the recipient is an operator policy change. |
+| `policy.deny.total_budget_exhausted` | The payment would exceed a `total_budget` allocation, which never renews; the payload names the maximum and the remaining amount. | Do not retry; waiting frees nothing. Only the operator can sign a new policy, which starts a new allocation. |
+| `policy.deny.memo_binding_mismatch` | A bound destination needs a memo of the named kind and its exact value. | Re-prepare with the exact memo the destination requires. Do not guess a value. |
+| `account.unread` | A `balance_floor` needs an observed account read with its reservation sum and got none. Shipped CLI and MCP payment paths do not supply one. | Report to the operator; retrying does not help. A floor on this path refuses until its caller supplies the read. |
+| `account.stale` | The floor's account read is older than 120,000 ms. | A caller that supplies the read reads the account again before retrying. |
+| `account.floor_refused` | The payment would leave the native balance, after reservations, debit, and fee, below the floor. | Do not retry unchanged; pay less or ask the operator to fund the account. |
 | `trustline.clawback_opt_in_required` | Trusting a clawback-enabled issuer requires a recorded operator opt-in. | Ask the operator to run the printed `stellar-agent approve --id <nonce> --profile <name>` opt-in, then re-invoke. |
 | `policy.approval_required` | A two-phase signing verb reached its commit step without a valid operator approval, or the attestation was absent, invalid, or expired. This single code intentionally covers every approval-path failure mode (missing, expired, wrong-kind, hash mismatch, HMAC mismatch) so callers cannot probe which. | Ask the operator to run `stellar-agent approve --id <nonce> --profile <name>`, then re-submit the commit with the returned `approval_nonce` and `approval_attestation`. Use the approval nonce from simulation, which checks both tool names. If the request expires or no request exists, simulate again and review the new response. |
 | `policy.approval_required_unsupported` | The policy requires approval for a tool without an approval flow: SEP-43 sign verbs, `stellar_sep43_sign_and_submit_transaction`, or SEP-53 `sign_message`. An x402 address mismatch without proof under RequireApproval also uses this refusal. The wallet refuses fail-closed rather than sign without approval. | Cannot proceed via the agent. Ask the operator to either adjust policy so this operation does not require approval, or perform it through a two-phase tool (`stellar_pay`, `stellar_create_account`, `stellar_trustline`, `stellar_claim`, `stellar_rule_create` and their `*_commit`). On mainnet, Allow without proof pays in one call. RequireApproval without proof queues. After owner approval, repeat with both approval arguments. The operator approves with `stellar-agent approve --id <nonce> --profile <name>`. Testnet x402 approvals use the terminal command. |
@@ -390,6 +396,12 @@ Other build failures use `policy.engine_unavailable` or `trustline.policy_engine
 | `policy.deny.home_domain_not_resolved` | Required home domain unresolved. |
 | `policy.deny.sep10.session_missing` | Required SEP-10 session absent. |
 | `policy.deny.sep45.session_missing` | Required SEP-45 session absent. |
+| `policy.deny.unlisted_budget_exceeded` | Unlisted-recipient budget exceeded. |
+| `policy.deny.total_budget_exhausted` | Total allocation exhausted. |
+| `policy.deny.memo_binding_mismatch` | Bound memo missing or different. |
+| `account.unread` | Floor account read absent. |
+| `account.stale` | Floor account read too old. |
+| `account.floor_refused` | Native balance floor would be breached. |
 
 ## Network-binding codes (submit layer)
 

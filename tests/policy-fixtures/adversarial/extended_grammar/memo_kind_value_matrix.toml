@@ -1,0 +1,15 @@
+version = 2
+scope = "profile:*"
+sequence = 1
+
+[[rules]]
+match = { tool = "stellar_pay", chain = "*" }
+criteria = [
+    { kind = "memo_binding", bindings = [
+        { destination = "GAKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRL26G", kind = "text", value = "invoice-7" },
+        { destination = "GALBMFQWCYLBMFQWCYLBMFQWCYLBMFQWCYLBMFQWCYLBMFQWCYLBMKWB", kind = "text", value = "" },
+        { destination = "GALROFYXC4LROFYXC4LROFYXC4LROFYXC4LROFYXC4LROFYXC4LRPFOD", kind = "hash", value = "1111111111111111111111111111111111111111111111111111111111111111" },
+        { destination = "GAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQUG3", kind = "return", value = "2222222222222222222222222222222222222222222222222222222222222222" },
+    ] },
+]
+decision = "allow"

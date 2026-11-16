@@ -766,6 +766,99 @@ fn new_policy_fields_are_signed() {
     .unwrap();
 }
 
+/// A version 2 policy with all four additions, nested keys out of order. The
+/// second rule's `unlisted` table equals the first in another key order.
+const EXTENDED_POLICY: &str = r#"version = 2
+scope = "profile:operator"
+sequence = 3
+
+[[rules]]
+match = { tool = "stellar_pay", chain = "*" }
+criteria = [
+    { kind = "counterparty_allowlist", kinds = ["G_ACCOUNT", "C_ACCOUNT"], allowlist = ["GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"], gate_inflows = false, unlisted = { window = "1h", per_period_stroops = 250, asset = "native", per_tx_stroops = 100, mode = "budget" } },
+    { max_stroops = 1000, asset = "native", kind = "total_budget" },
+    { min_stroops = 50, kind = "balance_floor" },
+    { kind = "memo_binding", bindings = [{ value = "7", kind = "id", destination = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" }, { kind = "any", destination = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF" }] },
+]
+decision = "allow"
+
+[[rules]]
+match = { tool = "stellar_create_account", chain = "stellar:testnet" }
+criteria = [{ kind = "counterparty_allowlist", kinds = ["G_ACCOUNT"], allowlist = [], unlisted = { mode = "budget", per_tx_stroops = 100, per_period_stroops = 250, asset = "native", window = "1h" } }]
+decision = "allow"
+"#;
+
+/// The canonical bytes of [`EXTENDED_POLICY`], written by hand: nested tables
+/// sort by key, arrays keep their order.
+const EXTENDED_CANONICAL: &str = r#"version = 2
+scope = "profile:operator"
+sequence = 3
+
+[[rules]]
+match = { chain = "*", tool = "stellar_pay" }
+criteria = [{ allowlist = ["GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"], gate_inflows = false, kind = "counterparty_allowlist", kinds = ["G_ACCOUNT", "C_ACCOUNT"], unlisted = { asset = "native", mode = "budget", per_period_stroops = 250, per_tx_stroops = 100, window = "1h" } }, { asset = "native", kind = "total_budget", max_stroops = 1000 }, { kind = "balance_floor", min_stroops = 50 }, { bindings = [{ destination = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN", kind = "id", value = "7" }, { destination = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF", kind = "any" }], kind = "memo_binding" }]
+decision = "allow"
+
+[[rules]]
+match = { chain = "stellar:testnet", tool = "stellar_create_account" }
+criteria = [{ allowlist = [], kind = "counterparty_allowlist", kinds = ["G_ACCOUNT"], unlisted = { asset = "native", mode = "budget", per_period_stroops = 250, per_tx_stroops = 100, window = "1h" } }]
+decision = "allow"
+"#;
+
+/// The BLAKE3 digest of [`EXTENDED_CANONICAL`], in lowercase hex.
+const EXTENDED_DIGEST_HEX: &str =
+    "40a875c424a330d70617362a58c62099317aba9d1e74ba95b32388619bbfecde";
+
+/// The signature pre-image of a policy with every addition is the literal
+/// above, so each nested value and its sorted key order is signed.
+/// The skill's fenced example also loads through owner-signature verification.
+#[test]
+fn extended_policy_canonical_bytes_match_literal() {
+    let canonical = canonical_bytes(EXTENDED_POLICY).unwrap();
+    assert_eq!(
+        String::from_utf8(canonical.clone()).unwrap(),
+        EXTENDED_CANONICAL
+    );
+    assert_eq!(
+        stellar_agent_core::hex::encode(blake3::hash(&canonical).as_bytes()),
+        EXTENDED_DIGEST_HEX
+    );
+    load_text(&signed(EXTENDED_POLICY)).unwrap();
+
+    let skill =
+        include_str!("../../../../skills/stellar-agent-wallet/references/approvals-and-audit.md");
+    let section = skill.split_once("### Version 2 additions\n").unwrap().1;
+    let example = section
+        .split_once("```toml\n")
+        .unwrap()
+        .1
+        .split_once("\n```")
+        .unwrap()
+        .0;
+    let parsed = example.parse::<DocumentMut>().unwrap();
+    let profile = parsed["scope"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("profile:")
+        .unwrap();
+    let document = load_signed_policy_text(
+        &signed(example),
+        profile,
+        &owner_key().verifying_key().to_bytes(),
+        TESTNET_PASSPHRASE,
+    )
+    .unwrap();
+    let Some(UnlistedMode::Budget(budget)) =
+        loaded_criterion::<CounterpartyAllowlistCriterion>(&document, 0, 0).unlisted()
+    else {
+        panic!("the skill example requires an unlisted budget");
+    };
+    assert_eq!(budget.asset(), "native");
+    assert_eq!(budget.per_tx_stroops(), 10_0000000);
+    assert_eq!(budget.per_period_stroops(), 50_0000000);
+    assert_eq!(budget.window().label(), "1d");
+}
+
 /// Adds `addition` as the last criterion of the fixture's rule.
 fn fixture_with_criterion(addition: &str) -> String {
     FIXTURE.replacen(

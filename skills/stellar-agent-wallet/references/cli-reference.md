@@ -131,8 +131,9 @@ unset WALLET_SK
 
 Builds from this repository and releases from v0.1.0-alpha.14 on carry
 `mainnet-write`. These builds admit full-mode `pay`, `claim`, sponsored
-`accounts create`, and `trustline` after installation setup and consent for
-each action. Build-only, sign-only, submit-only,
+`accounts create`, and `trustline` after installation setup. `Allow` grants
+policy authority without a passkey ceremony; `RequireApproval` runs passkey
+consent for the action. Build-only, sign-only, submit-only,
 Friendbot creation, generated-account creation, and relayer paths remain excluded.
 
 Select an explicit nondefault mainnet profile with matching stored configuration.
@@ -324,6 +325,8 @@ unset DEPLOYER_SK
 `pay <DESTINATION> <AMOUNT> [ASSET] [flags]`: sends a classic payment, enforcing SEP-29 memo-required before signing. By default builds, signs, and submits atomically. Configured mainnet full mode requires feature-enabled authorization. Staged modes remain excluded. `--use-oz-relayer` is not implemented and declines.
 
 Staged pipeline (mutually exclusive): `--build-only` emits unsigned envelope XDR and exits; `--sign-only <XDR>` signs a prebuilt envelope and emits signed XDR; `--submit-only <XDR>` submits a pre-signed envelope.
+
+A version 2 policy's `memo_binding` criterion can require an exact memo kind and value for a destination and its muxed addresses. Built envelopes are evaluated with the parsed memo flag, staged envelopes with their encoded memo. A missing or different memo refuses `policy.deny.memo_binding_mismatch`.
 
 | Flag / arg | Meaning | Default |
 |---|---|---|

@@ -1,0 +1,39 @@
+{
+  "test_kind": "sequence",
+  "name": "listed_not_charged",
+  "category": "extended_grammar",
+  "description": "A recorded listed payment adds nothing to the unlisted budget; recorded unlisted payments do. After 1000 listed and 100 unlisted stroops, 50 more unlisted allows (period equality) and 51 refuses.",
+  "tool": {
+    "name": "stellar_pay",
+    "destructive_hint": true,
+    "read_only_hint": false,
+    "chain_id_required": true,
+    "chain_id": "stellar:testnet"
+  },
+  "profile_name": "default",
+  "steps": [
+    {
+      "args": { "amount_stroops": "1000", "asset": "native", "destination": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF" },
+      "record": true,
+      "expected": { "kind": "Allow" }
+    },
+    {
+      "args": { "amount_stroops": "100", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+      "record": true,
+      "expected": { "kind": "Allow" }
+    },
+    {
+      "args": { "amount_stroops": "50", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+      "expected": { "kind": "Allow" }
+    },
+    {
+      "args": { "amount_stroops": "51", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+      "expected": {
+        "kind": "Deny",
+        "deny_reason": "unlisted_budget_exceeded",
+        "wire_code": "policy.deny.unlisted_budget_exceeded",
+        "reason": { "UnlistedBudgetExceeded": { "asset": "native", "bound": "per_period", "max_stroops": "150", "attempted_stroops": "51" } }
+      }
+    }
+  ]
+}

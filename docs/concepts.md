@@ -275,6 +275,10 @@ native debit, and the fee from a live account read.
 A result below `min_stroops` refuses with `account.floor_refused`.
 A missing read refuses with `account.unread`, and a read older than 120 seconds
 refuses with `account.stale`. Any decision may carry the criterion.
+Provisional evaluation skips the floor; the strict evaluation before signing
+runs it. The criterion is enforceable only where a caller supplies an observed
+read with its reservation sum. The shipped CLI and MCP payment paths supply a
+plain account view, so a matched floor refuses there with `account.unread`.
 
 `memo_binding` requires the memo a destination expects, such as an exchange
 deposit's customer memo:
@@ -381,7 +385,7 @@ same window reads one shared count, whichever rule carries it.
 Each criterion compares that shared count against its own `max_calls`.
 `bundle_rate_limit` counts each inner call of a multicall bundle.
 
-Value criteria size a call through a typed value descriptor derived at the dispatch gate. A rule matching a value-moving tool constrains every debit leg, and per-asset caps aggregate across legs. A matched call whose value cannot be sized (including raw signing tools) denies fail-closed with `policy.deny.unsizable_value_effect` unless the rule sets `allow_opaque_signing = true`. `minimum_reserve` counts only native-XLM outflow legs. MCP pay/create-account/trustline/claim commits and CLI `pay` and `claim` with `--sign-only` or `--submit-only` include envelope fees in `minimum_reserve`. A debit leaving only reserve plus margin refuses `policy.deny.minimum_reserve_breached`. Full CLI pipelines, `--build-only`, and MCP simulations count no fee. Cap amounts are i128 and cross the wire as decimal strings.
+Value criteria size a call through a typed value descriptor derived at the dispatch gate. A rule matching a value-moving tool constrains every debit leg, and per-asset caps aggregate across legs. A matched call whose value cannot be sized (including raw signing tools) denies fail-closed with `policy.deny.unsizable_value_effect` unless the rule sets `allow_opaque_signing = true`. `minimum_reserve` counts only native-XLM outflow legs. MCP pay/create-account/trustline/claim commits include envelope fees in `minimum_reserve`, as do CLI `pay`, `claim`, sponsored `accounts create`, and `trustline` for the envelope they build. A post-payment balance below reserve plus margin refuses with `policy.deny.minimum_reserve_breached`; equality passes. The initial MCP preparation check has no fee argument; its paired commit check uses the encoded envelope fee and can refuse preparation on mainnet. Cap amounts are i128 and cross the wire as decimal strings.
 
 In a multicall bundle, every call other than a typed transfer from the smart account has an unsizable value effect.
 
@@ -632,7 +636,7 @@ states. See [Agent payments with MPP](agent-payments.md).
 | Keyring entry reference | A `service` + `account` pair naming a platform-keyring secret; never the secret itself. |
 | Unlock window | The clock-checked period when a wallet permits seed access or transfer. Seed residency lasts until its wallet or signer drops. See [Key custody and the unlock window](#key-custody-and-the-unlock-window). |
 | Policy engine | Evaluates each tool/command to Allow, Deny, or RequireApproval. Noop and V1 are the two engines. |
-| Criterion | One typed check inside a V1 policy rule, such as a cap, rate limit, allowlist, or minimum-reserve guard. Quorum and session-active criteria refuse in shipped dispatch paths because their required views are absent. |
+| Criterion | One typed check inside a rule of a version 1 or version 2 policy that the V1 engine evaluates, such as a cap, rate limit, allowlist, or minimum-reserve guard. The `unlisted` table, `total_budget`, `balance_floor`, and `memo_binding` require version 2. Quorum and session-active criteria refuse in shipped dispatch paths because their required views are absent. |
 | Approval spine | The storage and cryptographic substrate recording out-of-band operator approvals: a per-profile pending-approval store plus an HMAC attestation minted at approve time. |
 | Attestation | An HMAC-SHA256 tag, keyed by the profile attestation key, over a length-prefixed input binding the profile name, chain id, approval nonce, envelope SHA-256, and process uid. Proves the keyring holder ran `approve`. Constant-time verified. |
 | Audit log | A per-profile append-only hash-chained JSONL record of transaction submissions, signed authorizations, approvals, and explicit key-management and lifecycle events; raw argument values are never logged, while typed value legs keep amounts and assets. Verified with `audit verify`. |
