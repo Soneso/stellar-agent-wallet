@@ -461,6 +461,8 @@ pub(crate) async fn authorize_and_submit(
         context,
         &policy.verified,
         &store_path,
+        operation,
+        evaluation.verdict.audit_decision(),
         &mut witness,
     )
     .await

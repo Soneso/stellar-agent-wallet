@@ -1044,6 +1044,8 @@ mod tests {
                     &context,
                     &fixture.current_policy(),
                     &fixture.store_path(),
+                    None,
+                    stellar_agent_core::audit_log::PolicyDecision::Allow,
                 ),
             )
             .await

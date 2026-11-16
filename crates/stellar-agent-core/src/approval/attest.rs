@@ -1449,7 +1449,7 @@ fn attest_mainnet_presence<const STRICT: bool>(
         );
         audit_writer_refusal(binding.profile_name, &e)
     })?;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-helpers"))]
     consent_test_seam::run(store.path());
     store
         .record_mainnet_attestation_at(
@@ -1622,22 +1622,28 @@ fn emit_attested_audit<const STRICT: bool>(
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
-pub(super) mod consent_test_seam {
+/// The consent boundary between the written consent row and the persisted
+/// attestation, which a test arms to stop a ceremony there.
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod consent_test_seam {
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
+    #[cfg(test)]
     use std::time::Instant;
 
     type Hook = Box<dyn FnOnce() + Send>;
     static HOOKS: Mutex<Vec<(PathBuf, Hook)>> = Mutex::new(Vec::new());
+    #[cfg(test)]
     static CLOCKS: Mutex<Vec<(String, Instant)>> = Mutex::new(Vec::new());
 
+    #[cfg(test)]
     pub(in crate::approval) fn advance_clock(nonce: &str, now: Instant) {
         if let Ok(mut clocks) = CLOCKS.lock() {
             clocks.push((nonce.to_owned(), now));
         }
     }
 
+    #[cfg(test)]
     pub(super) fn row_instant(nonce: &str, now: Instant) -> Instant {
         CLOCKS
             .lock()
@@ -1659,7 +1665,9 @@ pub(super) mod consent_test_seam {
         }
     }
 
-    pub(in crate::approval) fn on_written(path: &Path, hook: impl FnOnce() + Send + 'static) {
+    /// Runs `hook` once, in the next attestation into the inbox at `path`,
+    /// after its consent row is written and before the attestation persists.
+    pub fn on_written(path: &Path, hook: impl FnOnce() + Send + 'static) {
         if let Ok(mut hooks) = HOOKS.lock() {
             hooks.push((path.to_path_buf(), Box::new(hook)));
         }

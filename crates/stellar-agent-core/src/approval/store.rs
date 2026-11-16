@@ -5356,7 +5356,7 @@ impl std::fmt::Debug for PendingApprovalStore {
 
 impl PendingApprovalStore {
     /// The path that scopes test-only persistence faults.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-helpers"))]
     pub(super) fn path(&self) -> &Path {
         &self.path
     }

@@ -1592,6 +1592,11 @@ mod tests {
                 AuthorityScope::Classic,
             );
             let mut slot = None;
+            let operation = crate::common::mainnet_confirm::tests::prepared_operation(
+                &context,
+                if approval { "approval" } else { "allow" },
+                envelope.envelope_xdr(),
+            );
             let authority = cli_mainnet_authority(
                 &decision,
                 ConfirmDecision::RequireApproval { ttl_ms: 300_000 },
@@ -1599,6 +1604,8 @@ mod tests {
                 &context,
                 &policy,
                 &fixture.store_path(),
+                Some(&operation),
+                stellar_agent_core::audit_log::PolicyDecision::RequireApproval,
                 &mut slot,
             )
             .await
@@ -1771,6 +1778,8 @@ mod tests {
             &context,
             &policy,
             &fixture.store_path(),
+            None,
+            stellar_agent_core::audit_log::PolicyDecision::Allow,
             &mut slot,
         )
         .await

@@ -448,6 +448,7 @@ pub(super) mod tests {
                     waiting_expires_at_ms: entry.expires_at_unix_ms,
                     rule_ttl_ms: 300_000,
                 },
+                stellar_agent_core::audit_log::PolicyDecision::RequireApproval,
             )
             .unwrap();
         handle
@@ -537,13 +538,12 @@ pub(super) mod tests {
             .unwrap();
             let attestation = B64.decode(blob).unwrap().try_into().unwrap();
             let entry = store.get(&self.entry.approval_nonce).unwrap();
-            let payload = ConsentPayload {
+            let payload = ConsentPayload::new(
                 attestation,
-                receipt: entry.mainnet_presence.clone().unwrap(),
-                process_uid: entry.process_uid.clone(),
-                outbox_row: None,
-                challenge_subject: None,
-            };
+                entry.mainnet_presence.clone().unwrap(),
+                entry.process_uid.clone(),
+                stellar_agent_network::policy_state::ConsentRow::Written,
+            );
             self.clock.set(payload.receipt.verified_at_unix_ms());
             let view = self.view();
             let witness = verify_approval(

@@ -8,18 +8,19 @@
 //! and both challenge deadlines again under the store lock. No terminal input
 //! is consent.
 
+use super::business_entry::approval_step;
 use super::consent::{OperatorRowSink, acquire_operator_row_sink};
 use super::mainnet_presence::acquire_mainnet_presence;
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use std::io::Write;
 use std::path::Path;
+use stellar_agent_core::audit_log::PolicyDecision;
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::{
     approval::{
-        ApprovalContext, AttestationBinding, ConsentAudit, DEFAULT_RETRY_ATTEMPTS,
+        ApprovalContext, ApprovalKind, AttestationBinding, ConsentAudit, DEFAULT_RETRY_ATTEMPTS,
         DEFAULT_RETRY_BACKOFF, MainnetApprovalAuthority, PendingApproval, PendingApprovalStore,
         VerifiedMainnetPresence,
-        attest::{attest_mainnet_confirmation, record_error},
+        attest::{attest_mainnet_confirmation, attest_mainnet_confirmation_with_row, record_error},
         error::ApprovalError,
         load_attestation_key, open_with_retry, process_uid_for_attestation,
         store::MAINNET_POLICY_AUTHORITY_TTL_SECONDS,
@@ -39,6 +40,14 @@ use stellar_agent_core::{
     profile::owner_key::OwnerKeyContext,
 };
 use stellar_agent_network::mainnet::authority::{AuthorityRefusal, MainnetAuthority};
+use stellar_agent_network::operation_entry::{
+    approval_requires_prepared, commit_consent, consent_completion, operation_refusal,
+    pending_approval_facts, persisted_attestation,
+};
+use stellar_agent_network::policy_state::{
+    ApprovalStatus, ConsentRow, OperationHandle, OperationState, PendingApprovalFacts,
+    PersistedWindowStore,
+};
 use stellar_agent_network::{
     MainnetWriteContext,
     mainnet::{MainnetConsumer, resolve::classic_consumer_tools},
@@ -98,13 +107,6 @@ fn wrong_kind(detail: &str) -> WalletError {
 fn envelope_error(detail: impl ToString) -> WalletError {
     WalletError::Protocol(ProtocolError::XdrCodecFailed {
         detail: detail.to_string(),
-    })
-}
-/// `approval.attestation_invalid`: the attestation the confirmation just
-/// persisted cannot be read back.
-fn attestation_invalid(detail: &str) -> WalletError {
-    WalletError::Approval(ApprovalFailure::AttestationInvalid {
-        detail: detail.to_owned(),
     })
 }
 #[expect(
@@ -311,7 +313,8 @@ impl MainnetWriteSummary {
 /// Ceremony refusals retain their gate errors. Factory errors remain internal.
 #[allow(
     clippy::result_large_err,
-    reason = "the shared authority refusal preserves typed gate errors"
+    clippy::too_many_arguments,
+    reason = "the shared authority refusal preserves typed gate errors; the ceremony takes each input explicitly"
 )]
 pub(crate) async fn cli_mainnet_authority<'w>(
     decision: &MainnetDecision,
@@ -320,13 +323,23 @@ pub(crate) async fn cli_mainnet_authority<'w>(
     context: &MainnetWriteContext,
     policy: &VerifiedPolicy,
     store_path: &Path,
+    operation: Option<&OperationHandle>,
+    prepared: PolicyDecision,
     witness: &'w mut Option<ApprovalWitness>,
 ) -> Result<MainnetAuthority<'w>, AuthorityRefusal<WalletError>> {
     match decision.decision() {
         Decision::RequireApproval(_) => {
-            let w = confirm_mainnet_write(summary, confirmation, context, policy, store_path)
-                .await
-                .map_err(AuthorityRefusal::Gate)?;
+            let w = confirm_mainnet_write(
+                summary,
+                confirmation,
+                context,
+                policy,
+                store_path,
+                operation,
+                prepared,
+            )
+            .await
+            .map_err(AuthorityRefusal::Gate)?;
             let slot = witness.insert(w);
             MainnetAuthority::from_decision(decision, Some(&*slot))
                 .map_err(AuthorityRefusal::Internal)
@@ -372,22 +385,42 @@ pub(crate) fn render_authority_refusal(
 ///
 /// The summary goes to stderr for orientation. The pending entry is parked in
 /// the store at `store_path` and the store is released before the presence
-/// wait, so other handles can use it meanwhile. A refusal after the entry was
-/// parked removes it while it is still the unattested record parked here.
+/// wait, so other handles can use it meanwhile.
+///
+/// Under `operation`, the durable approval record of the operation governs.
+/// A record that links an unattested entry runs the ceremony on that entry,
+/// and one that links an attested entry completes its consent without a
+/// ceremony. Without a record, the entries a crash left for the operation go,
+/// the new entry is parked, and the record opens with `prepared` before the
+/// presence wait. Every refusal after the open keeps entry and record, and the
+/// witness returns only after the record's consent commits.
+///
+/// Without `operation`, a refusal after the entry was parked removes it while
+/// it is still the unattested record parked here.
 ///
 /// # Errors
 ///
+/// `internal.unexpected_state` for an approval rule without `operation`, or
+/// an operation outside `Prepared` without a record;
 /// `approval.presence_unavailable` when the summary cannot be shown; the
 /// summary's, the attestation key's and the consent sink's refusals before
-/// anything is parked; the presence refusals of [`acquire_mainnet_presence`];
-/// and the attester's, the store's and the witness's refusals.
+/// anything is parked; the store refusals of the record's read, open and
+/// consent; the presence refusals of [`acquire_mainnet_presence`]; and the
+/// attester's, the store's and the witness's refusals.
 pub(crate) async fn confirm_mainnet_write(
     summary: &MainnetWriteSummary,
     decision: ConfirmDecision,
     context: &MainnetWriteContext,
     policy: &VerifiedPolicy,
     store_path: &Path,
+    operation: Option<&OperationHandle>,
+    prepared: PolicyDecision,
 ) -> Result<ApprovalWitness, WalletError> {
+    if matches!(decision, ConfirmDecision::RequireApproval { .. }) && operation.is_none() {
+        return Err(WalletError::Internal(InternalError::UnexpectedState {
+            detail: "a mainnet approval requires its operation record".to_owned(),
+        }));
+    }
     let profile = context.profile();
     let name = context.profile_name();
     let authority = MainnetApprovalAuthority::for_profile(name)?;
@@ -403,7 +436,8 @@ pub(crate) async fn confirm_mainnet_write(
     }
     show_summary(&rendered)?;
     let uid = process_uid_for_attestation().map_err(store_error)?;
-    let entry = summary.pending(uid, decision.ttl_ms())?;
+    let ttl_ms = decision.ttl_ms();
+    let entry = summary.pending(uid, ttl_ms)?;
     // The key and the sink are checked before the entry is parked, so a
     // profile that cannot record consent parks nothing; both are acquired
     // again after the wait.
@@ -412,24 +446,202 @@ pub(crate) async fn confirm_mainnet_write(
         &OwnerKeyContext::for_profile(name, profile),
     )?;
     drop(acquire_operator_row_sink(profile, name)?);
+    let entry = match operation {
+        None => {
+            open_store(store_path)?
+                .insert(entry.clone(), entry.created_at_unix_ms)
+                .map_err(store_error)?;
+            entry
+        }
+        Some(handle) => {
+            let facts = pending_approval_facts(
+                &entry,
+                handle,
+                summary.kind,
+                approval_subject_classic(&summary.envelope),
+                ttl_ms,
+            );
+            match start_durable(context, store_path, handle, entry, &facts, prepared)? {
+                DurableStart::Ceremony(entry) => *entry,
+                DurableStart::Recover(nonce) => {
+                    return commit_durable(
+                        open_store(store_path)?,
+                        context,
+                        policy,
+                        &nonce,
+                        ConsentRow::Recovered,
+                    );
+                }
+            }
+        }
+    };
+    let approval_context = ApprovalContext::from_profile(name, profile);
+    let result =
+        match acquire_mainnet_presence(&entry, &approval_context, &authority, store_path).await {
+            Ok(presence) => persist_confirmation(
+                summary,
+                context,
+                policy,
+                store_path,
+                &entry,
+                presence,
+                operation.is_some(),
+            ),
+            Err(error) => Err(error),
+        };
+    if result.is_err() && operation.is_none() {
+        discard_parked(store_path, &entry);
+    }
+    result
+}
+
+/// How a ceremony under an operation proceeds after reading its record.
+enum DurableStart {
+    /// Run the ceremony on this entry, which the record names.
+    Ceremony(Box<PendingApproval>),
+    /// The record names this attested entry: complete its consent.
+    Recover(String),
+}
+
+/// Reads the durable record of `handle`'s operation and, without one, parks
+/// `entry` and opens the record with `facts` and `prepared`.
+///
+/// A refused open removes the entry unless a read by operation shows a
+/// record naming it, so a record never names a removed entry.
+fn start_durable(
+    context: &MainnetWriteContext,
+    store_path: &Path,
+    handle: &OperationHandle,
+    entry: PendingApproval,
+    facts: &PendingApprovalFacts,
+    prepared: PolicyDecision,
+) -> Result<DurableStart, WalletError> {
+    let window = PersistedWindowStore::for_profile(context.profile_name());
+    let status = ApprovalStatus::new(&window, context.profile());
+    if let Some(view) = status
+        .find_by_operation(handle.id())
+        .map_err(operation_refusal)?
+    {
+        let linked = open_store(store_path)?
+            .get(&view.record.nonce)
+            .cloned()
+            .ok_or_else(|| {
+                WalletError::Approval(ApprovalFailure::NotFound {
+                    detail: "the operation's approval entry is gone; prepare the operation again"
+                        .to_owned(),
+                })
+            })?;
+        return Ok(if linked.attestation_blob_b64.is_some() {
+            DurableStart::Recover(linked.approval_nonce)
+        } else {
+            DurableStart::Ceremony(Box::new(linked))
+        });
+    }
+    if handle.state() != OperationState::Prepared {
+        return Err(approval_requires_prepared());
+    }
     {
         let mut store = open_store(store_path)?;
+        remove_orphans(&mut store, &status, handle)?;
         store
             .insert(entry.clone(), entry.created_at_unix_ms)
             .map_err(store_error)?;
     }
-    let approval_context = ApprovalContext::from_profile(name, profile);
-    let result =
-        match acquire_mainnet_presence(&entry, &approval_context, &authority, store_path).await {
-            Ok(presence) => {
-                persist_confirmation(summary, context, policy, store_path, &entry, presence)
-            }
-            Err(error) => Err(error),
-        };
-    if result.is_err() {
-        discard_parked(store_path, &entry);
+    let opened = approval_step(context, |recorder| {
+        recorder
+            .open_pending(handle.id(), facts, prepared)
+            .map_err(operation_refusal)
+    });
+    if let Err(error) = opened {
+        let linked = status.find_by_operation(handle.id());
+        if matches!(&linked, Ok(view) if view.as_ref().is_none_or(|v| v.record.nonce != entry.approval_nonce))
+        {
+            discard_parked(store_path, &entry);
+        }
+        return Err(error);
     }
-    result
+    Ok(DurableStart::Ceremony(Box::new(entry)))
+}
+
+/// Removes the unattested live value entries of `handle`'s envelope that no
+/// durable record names: the entries a crash between their insert and the
+/// record's open leaves.
+fn remove_orphans(
+    store: &mut PendingApprovalStore,
+    status: &ApprovalStatus<'_>,
+    handle: &OperationHandle,
+) -> Result<(), WalletError> {
+    let Some(envelope) = handle.unsigned_envelope_sha256() else {
+        return Ok(());
+    };
+    let envelope = stellar_agent_core::hex::encode(&envelope);
+    for view in store.snapshot(clock_now()?) {
+        let Some(stored) = store.get(&view.approval_nonce) else {
+            continue;
+        };
+        let (ApprovalKind::PaymentSimulated {
+            envelope_sha256_hex,
+            ..
+        }
+        | ApprovalKind::ClaimSimulated {
+            envelope_sha256_hex,
+            ..
+        }
+        | ApprovalKind::TrustlineSimulated {
+            envelope_sha256_hex,
+            ..
+        }) = &stored.kind
+        else {
+            continue;
+        };
+        if view.expired
+            || stored.attestation_blob_b64.is_some()
+            || *envelope_sha256_hex != envelope
+            || status
+                .find_by_nonce(&view.approval_nonce)
+                .map_err(operation_refusal)?
+                .is_some()
+        {
+            continue;
+        }
+        store.remove(&view.approval_nonce).map_err(store_error)?;
+    }
+    Ok(())
+}
+
+/// Verifies the attested entry `nonce` in `pending` against its durable
+/// record, releases the inbox, then commits the consent and returns its
+/// witness. `row` states where the consent row went.
+fn commit_durable(
+    pending: PendingApprovalStore,
+    context: &MainnetWriteContext,
+    policy: &VerifiedPolicy,
+    nonce: &str,
+    row: ConsentRow,
+) -> Result<ApprovalWitness, WalletError> {
+    let profile = context.profile();
+    let window = PersistedWindowStore::for_profile(context.profile_name());
+    let completion = consent_completion(
+        &pending,
+        &window,
+        profile,
+        context.profile_name(),
+        nonce,
+        policy,
+        row,
+    )?;
+    drop(pending);
+    commit_consent(&window, profile, &completion)?;
+    Ok(completion.into_witness())
+}
+
+/// The wall clock in Unix milliseconds, refused as `approval.clock_error`.
+fn clock_now() -> Result<u64, WalletError> {
+    stellar_agent_core::timefmt::now_unix_ms().map_err(|error| {
+        WalletError::Approval(ApprovalFailure::ClockError {
+            detail: error.to_string(),
+        })
+    })
 }
 
 /// Writes the rendered summary to stderr.
@@ -498,6 +710,13 @@ fn discard_parked(store_path: &Path, entry: &PendingApproval) {
     }
 }
 
+/// Attests `entry` under `presence` and returns its witness. A `durable`
+/// confirmation then commits the consent to the operation's record, retaining
+/// the queued row's reference, and returns the witness only after that commit.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the ceremony's inputs and its durable choice are each explicit"
+)]
 fn persist_confirmation(
     summary: &MainnetWriteSummary,
     context: &MainnetWriteContext,
@@ -505,6 +724,7 @@ fn persist_confirmation(
     store_path: &Path,
     entry: &PendingApproval,
     presence: VerifiedMainnetPresence,
+    durable: bool,
 ) -> Result<ApprovalWitness, WalletError> {
     let profile = context.profile();
     let name = context.profile_name();
@@ -515,7 +735,7 @@ fn persist_confirmation(
     )?;
     let sink = acquire_operator_row_sink(profile, name)?;
     let binding = AttestationBinding::new(name, context.chain().caip2_str());
-    match sink {
+    let row = match sink {
         OperatorRowSink::Writer(writer) => {
             let mut guard = writer.lock().map_err(|_| {
                 WalletError::from(ValidationError::AuditWriterOpenFailed {
@@ -532,8 +752,9 @@ fn persist_confirmation(
                 policy,
                 presence,
             )?;
+            ConsentRow::Written
         }
-        OperatorRowSink::Outbox(outbox) => attest_mainnet_confirmation(
+        OperatorRowSink::Outbox(outbox) if durable => attest_mainnet_confirmation_with_row(
             &mut pending,
             entry,
             &key,
@@ -542,14 +763,32 @@ fn persist_confirmation(
             summary.policy_tool,
             policy,
             presence,
-        )?,
+        )?
+        .map(ConsentRow::Queued)
+        .ok_or_else(|| {
+            WalletError::Internal(InternalError::UnexpectedState {
+                detail: "the queued consent row has no reference".to_owned(),
+            })
+        })?,
+        OperatorRowSink::Outbox(outbox) => {
+            attest_mainnet_confirmation(
+                &mut pending,
+                entry,
+                &key,
+                &binding,
+                ConsentAudit::Outbox(&outbox),
+                summary.policy_tool,
+                policy,
+                presence,
+            )?;
+            ConsentRow::Written
+        }
+    };
+    if durable {
+        return commit_durable(pending, context, policy, &entry.approval_nonce, row);
     }
     let attestation = persisted_attestation(&pending, &entry.approval_nonce)?;
-    let now = stellar_agent_core::timefmt::now_unix_ms().map_err(|error| {
-        WalletError::Approval(ApprovalFailure::ClockError {
-            detail: error.to_string(),
-        })
-    })?;
+    let now = clock_now()?;
     verify_approval(
         &pending,
         profile,
@@ -565,30 +804,13 @@ fn persist_confirmation(
     )
 }
 
-/// The attestation persisted for `nonce`, refused with
-/// `approval.attestation_invalid` when it is absent, not base64url, or not
-/// 32 bytes.
-fn persisted_attestation(
-    pending: &PendingApprovalStore,
-    nonce: &str,
-) -> Result<[u8; 32], WalletError> {
-    let encoded = pending
-        .get(nonce)
-        .and_then(|entry| entry.attestation_blob_b64.as_deref())
-        .ok_or_else(|| attestation_invalid("the persisted attestation is missing"))?;
-    URL_SAFE_NO_PAD
-        .decode(encoded)
-        .map_err(|_| attestation_invalid("the persisted attestation is not base64url"))?
-        .try_into()
-        .map_err(|_| attestation_invalid("the persisted attestation has the wrong length"))
-}
-
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, reason = "test assertions")]
     use super::*;
     #[cfg(feature = "mainnet-write")]
     use crate::common::mainnet_presence::driver;
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     #[cfg(feature = "mainnet-write")]
     use stellar_agent_core::approval::mainnet_fixtures::MainnetConsentFixture;
     #[test]
@@ -934,8 +1156,53 @@ mod tests {
             context,
             &fixture.current_policy(),
             &fixture.store_path(),
+            None,
+            PolicyDecision::Allow,
         )
         .await
+    }
+
+    /// The audit sink of fixture operation opens, which keeps no rows.
+    #[cfg(feature = "mainnet-write")]
+    struct NoRows;
+
+    #[cfg(feature = "mainnet-write")]
+    impl stellar_agent_network::policy_state::OperationAudit for NoRows {
+        fn append(
+            &mut self,
+            _entry: stellar_agent_core::audit_log::AuditEntry,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// A `Prepared` operation under `business_id` whose slot binds `envelope`.
+    #[cfg(feature = "mainnet-write")]
+    pub(crate) fn prepared_operation(
+        context: &MainnetWriteContext,
+        business_id: &str,
+        envelope: &str,
+    ) -> OperationHandle {
+        use stellar_agent_network::operation_entry::{envelope_max_time, envelope_slot};
+        use stellar_agent_network::policy_state::{
+            BusinessId, OpenOutcome, OpenRequest, OperationKind, OperationRecorder, OperationTool,
+        };
+        let store = PersistedWindowStore::for_profile(context.profile_name());
+        let opened = OperationRecorder::new(&store, context.profile(), &mut NoRows, "fixture")
+            .open(&OpenRequest {
+                business_id: BusinessId::parse(business_id).unwrap(),
+                tool: OperationTool::CliPay,
+                kind: OperationKind::Pay,
+                intent: envelope_slot(&[7; 32], envelope, envelope_max_time(envelope).unwrap()),
+                envelope_xdr: Some(envelope.to_owned()),
+                prepared_decision: None,
+                rule_ttl_ms: None,
+            })
+            .unwrap();
+        let OpenOutcome::New(handle) = opened else {
+            panic!("a new operation")
+        };
+        handle
     }
 
     /// Authority keeps the governing facts and borrows the caller's consent slot.
@@ -971,6 +1238,8 @@ mod tests {
             &context,
             &policy,
             &fixture.store_path(),
+            None,
+            PolicyDecision::Allow,
             &mut witness,
         )
         .await
@@ -1007,6 +1276,7 @@ mod tests {
             300_000,
             AuthorityScope::Classic,
         );
+        let approved = prepared_operation(&context, "authority-approval", &envelope);
         let authority = cli_mainnet_authority(
             &decision,
             ConfirmDecision::RequireApproval { ttl_ms: 300_000 },
@@ -1014,6 +1284,8 @@ mod tests {
             &context,
             &policy,
             &fixture.store_path(),
+            Some(&approved),
+            PolicyDecision::RequireApproval,
             &mut witness,
         )
         .await
@@ -1038,6 +1310,7 @@ mod tests {
             ))
         }));
         let mut slot = None;
+        let refused = prepared_operation(&context, "authority-refused", &envelope);
         let refusal = cli_mainnet_authority(
             &decision,
             ConfirmDecision::RequireApproval { ttl_ms: 300_000 },
@@ -1045,6 +1318,8 @@ mod tests {
             &context,
             &policy,
             &fixture.store_path(),
+            Some(&refused),
+            PolicyDecision::RequireApproval,
             &mut slot,
         )
         .await
@@ -1399,6 +1674,7 @@ mod tests {
             stellar_agent_core::mainnet::decision::AuthorityScope::Classic,
         );
         let mut slot = None;
+        let operation = prepared_operation(&context, "claim-authority", &encoded);
         let authority = cli_mainnet_authority(
             &decision,
             ConfirmDecision::RequireApproval { ttl_ms: 300_000 },
@@ -1406,6 +1682,8 @@ mod tests {
             &context,
             &policy,
             &fixture.store_path(),
+            Some(&operation),
+            PolicyDecision::RequireApproval,
             &mut slot,
         )
         .await
@@ -1521,7 +1799,9 @@ mod tests {
             authority: &authority,
             audit: audit_readiness(context.profile(), context.profile_name()).unwrap(),
             store: &store,
-            operation: None,
+            operation: Some(stellar_agent_network::operation_entry::next_attempt_link(
+                &operation,
+            )),
         };
         assert_eq!(
             resolve_tx_sign(request(None))
@@ -1718,6 +1998,8 @@ mod tests {
             &context,
             &policy,
             &fixture.store_path(),
+            None,
+            PolicyDecision::Allow,
         )
         .await
         .unwrap_err();
@@ -1866,5 +2148,765 @@ mod tests {
             );
         }
         assert_eq!(stored_with(Some(&five)).unwrap(), [5; 32]);
+    }
+
+    /// The durable ceremony of a payment summary of `envelope` under
+    /// `handle` and an approval rule of `ttl_ms`.
+    #[cfg(feature = "mainnet-write")]
+    async fn durable(
+        fixture: &MainnetConsentFixture,
+        context: &MainnetWriteContext,
+        envelope: &str,
+        handle: &OperationHandle,
+        ttl_ms: u64,
+    ) -> Result<ApprovalWitness, WalletError> {
+        let summary =
+            MainnetWriteSummary::from_envelope(envelope, MainnetConsumer::CliPay, 500).unwrap();
+        confirm_mainnet_write(
+            &summary,
+            ConfirmDecision::RequireApproval { ttl_ms },
+            context,
+            &fixture.current_policy(),
+            &fixture.store_path(),
+            Some(handle),
+            PolicyDecision::RequireApproval,
+        )
+        .await
+    }
+
+    /// The authenticated record linked to `handle`'s operation.
+    #[cfg(feature = "mainnet-write")]
+    fn durable_record(
+        context: &MainnetWriteContext,
+        handle: &OperationHandle,
+    ) -> Option<stellar_agent_network::policy_state::WireApproval> {
+        let store = PersistedWindowStore::for_profile(context.profile_name());
+        ApprovalStatus::new(&store, context.profile())
+            .find_by_operation(handle.id())
+            .unwrap()
+            .map(|view| view.record)
+    }
+
+    /// The stored window record of `handle`'s operation.
+    #[cfg(feature = "mainnet-write")]
+    fn stored_operation(
+        context: &MainnetWriteContext,
+        handle: &OperationHandle,
+    ) -> serde_json::Value {
+        let path = stellar_agent_core::profile::schema::default_policy_window_state_path_for(
+            context.profile_name(),
+        );
+        let bytes = std::fs::read(path).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            &bytes[crate::common::mainnet_write_fixture::WINDOW_HMAC_TAG_BYTES..],
+        )
+        .unwrap();
+        let id = serde_json::to_value(handle.id()).unwrap();
+        body["operations"]["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["id"] == id)
+            .unwrap()
+            .clone()
+    }
+
+    /// The inbox entries of the fixture profile.
+    #[cfg(feature = "mainnet-write")]
+    fn inbox(fixture: &MainnetConsentFixture) -> Vec<PendingApproval> {
+        let store = pending_store(fixture);
+        store
+            .snapshot(0)
+            .iter()
+            .map(|view| store.get(&view.approval_nonce).unwrap().clone())
+            .collect()
+    }
+
+    /// A ceremony under an operation opens one record whose facts are the
+    /// entry's kind, subject, nonce and signed clocks, the operation's intent
+    /// digest and identity, and moves the operation to `AwaitingApproval`.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ceremony_opens_one_durable_record() {
+        let (fixture, context, envelope) = confirmation_fixture("durable-open");
+        let _presence = driver::install(driver::fixture_credential());
+        let handle = prepared_operation(&context, "durable-open", &envelope);
+        let witness = durable(&fixture, &context, &envelope, &handle, 300_000)
+            .await
+            .unwrap();
+        let record = durable_record(&context, &handle).unwrap();
+        let entries = inbox(&fixture);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(record.nonce, witness.nonce());
+        assert_eq!(record.nonce, entries[0].approval_nonce);
+        assert_eq!(record.kind, ApprovedKind::Payment);
+        assert_eq!(
+            record.subject_kind,
+            stellar_agent_core::approval::subject::SubjectKind::EnvelopeText
+        );
+        assert_eq!(record.subject, approval_subject_classic(&envelope));
+        assert_eq!(record.intent_digest, handle.intent().intent_digest());
+        assert_eq!(record.operation_id, handle.id());
+        assert_eq!(
+            stored_operation(&context, &handle)["state"],
+            "awaiting_approval"
+        );
+        assert_eq!(driver::ceremonies().len(), 1);
+        assert_eq!(consent_rows(&context), 1);
+    }
+
+    /// The record keeps the entry's signed creation and waiting times under
+    /// rule lifetimes shorter and longer than the 600-second default, and the
+    /// open commit stores the prepare decision and the entry's waiting expiry
+    /// on the operation.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn producer_clocks_keep_signed_times_under_distinct_lifetimes() {
+        for ttl in [300_000, 3_600_000] {
+            let name = format!("durable-clocks-{ttl}");
+            let (fixture, context, envelope) = confirmation_fixture(&name);
+            let _presence = driver::install(driver::fixture_credential());
+            let handle = prepared_operation(&context, "durable-clocks", &envelope);
+            let before = stored_operation(&context, &handle);
+            assert!(before["prepared_decision"].is_null());
+            durable(&fixture, &context, &envelope, &handle, ttl)
+                .await
+                .unwrap();
+            let entry = inbox(&fixture).remove(0);
+            let record = durable_record(&context, &handle).unwrap();
+            assert_eq!(record.created_at_ms, entry.created_at_unix_ms);
+            assert_eq!(record.waiting_expires_at_ms, entry.expires_at_unix_ms);
+            assert_eq!(record.waiting_expires_at_ms - record.created_at_ms, ttl);
+            assert_eq!(record.rule_ttl_ms, ttl);
+            let consent = record.consent.unwrap();
+            assert_eq!(
+                consent.execution_expires_at_ms,
+                consent.consent_at_ms + ttl.min(900_000)
+            );
+            let operation = stored_operation(&context, &handle);
+            assert_eq!(operation["prepared_decision"], "require_approval");
+            assert_eq!(
+                operation["waiting_expires_at_ms"],
+                serde_json::json!(entry.expires_at_unix_ms)
+            );
+        }
+    }
+
+    /// An envelope whose `max_time` ends before the entry's waiting expiry
+    /// caps the operation's waiting window at the envelope's end.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn open_sets_the_waiting_expiry_to_the_earlier_end() {
+        let (fixture, context, _) = confirmation_fixture("durable-cap");
+        let _presence = driver::install(driver::fixture_credential());
+        let max_time = stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1_000 + 1_200;
+        let built = stellar_agent_test_support::SignedTestEnvelope::builder([8; 32])
+            .unsigned()
+            .sequence(2)
+            .amount_stroops(17)
+            .time_bounds(0, max_time)
+            .build();
+        let envelope = built.envelope_xdr().to_owned();
+        let handle = prepared_operation(&context, "durable-cap", &envelope);
+        durable(&fixture, &context, &envelope, &handle, 3_600_000)
+            .await
+            .unwrap();
+        let entry = inbox(&fixture).remove(0);
+        let waiting = stored_operation(&context, &handle)["waiting_expires_at_ms"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(waiting, max_time * 1_000);
+        assert!(waiting < entry.expires_at_unix_ms);
+    }
+
+    /// The durable consent is the attested entry's: its blob, receipt and
+    /// process identifier, with the directly written row named.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ceremony_records_consent_from_the_attested_entry() {
+        let (fixture, context, envelope) = confirmation_fixture("durable-consent");
+        let _presence = driver::install(driver::fixture_credential());
+        let handle = prepared_operation(&context, "durable-consent", &envelope);
+        durable(&fixture, &context, &envelope, &handle, 300_000)
+            .await
+            .unwrap();
+        let entry = inbox(&fixture).remove(0);
+        let receipt = entry.mainnet_presence.clone().unwrap();
+        let consent = durable_record(&context, &handle).unwrap().consent.unwrap();
+        assert_eq!(consent.consent_at_ms, receipt.verified_at_unix_ms());
+        assert_eq!(
+            consent.payload,
+            Some(stellar_agent_network::policy_state::ConsentPayload::new(
+                persisted_attestation(&pending_store(&fixture), &entry.approval_nonce).unwrap(),
+                receipt,
+                entry.process_uid.clone(),
+                ConsentRow::Written,
+            ))
+        );
+    }
+
+    /// With another process holding the audit writer from the presence wait
+    /// on, the consent row queues and the record retains its reference; the
+    /// durable commit needs no writer.
+    #[cfg(all(feature = "mainnet-write", feature = "test-helpers"))]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn queued_consent_stores_its_reference() {
+        let (fixture, context, envelope) = confirmation_fixture("durable-queued");
+        let held = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let mut answer = driver::fixture_credential();
+        let profile = context.profile().clone();
+        let name = context.profile_name().to_owned();
+        let slot = std::rc::Rc::clone(&held);
+        let _presence = driver::install(Box::new(move |ceremony| {
+            use stellar_agent_core::audit_log::writer::AuditWriterRegistry;
+            // The open released this process's writer; another process takes
+            // it during the presence wait.
+            AuditWriterRegistry::remove_for_test(&name);
+            *slot.borrow_mut() = Some(
+                AuditWriterRegistry::get_or_open_keyed(
+                    "durable-server",
+                    &profile.audit_log_path,
+                    stellar_agent_network::keyring::keyed_audit_access(
+                        &profile,
+                        &name,
+                        stellar_agent_core::audit_log::BindingCheck::Enforce,
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            );
+            answer(ceremony)
+        }));
+        let handle = prepared_operation(&context, "durable-queued", &envelope);
+        durable(&fixture, &context, &envelope, &handle, 300_000)
+            .await
+            .unwrap();
+        assert!(held.borrow().is_some());
+        let payload = durable_record(&context, &handle)
+            .unwrap()
+            .consent
+            .unwrap()
+            .payload
+            .unwrap();
+        assert!(payload.outbox_row.is_some());
+        assert_eq!(payload.row_provenance, None);
+        assert_eq!(consent_rows(&context), 0, "the row waits in the outbox");
+    }
+
+    /// An approval rule without an operation refuses before anything is
+    /// shown or parked.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mainnet_producer_without_a_handle_refuses() {
+        let (fixture, context, envelope) = confirmation_fixture("durable-no-handle");
+        clear_shown_summaries();
+        let _presence = driver::install(driver::fixture_credential());
+        let summary =
+            MainnetWriteSummary::from_envelope(&envelope, MainnetConsumer::CliPay, 500).unwrap();
+        let error = confirm_mainnet_write(
+            &summary,
+            ConfirmDecision::RequireApproval { ttl_ms: 300_000 },
+            &context,
+            &fixture.current_policy(),
+            &fixture.store_path(),
+            None,
+            PolicyDecision::RequireApproval,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), "internal.unexpected_state");
+        assert_eq!(
+            error.to_string(),
+            "unexpected internal state: a mainnet approval requires its operation record"
+        );
+        assert!(shown_summaries().is_empty());
+        assert!(driver::ceremonies().is_empty());
+        assert!(inbox(&fixture).is_empty());
+    }
+
+    /// A refused open removes the entry when no record names it. An error
+    /// after the generation commit keeps entry and record, and the rerun
+    /// completes on the same nonce.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn open_error_cleanup_follows_the_read_by_operation() {
+        use stellar_agent_network::policy_state::store::commit_faults::{
+            COMMIT_FAULT_AFTER_COUNTER, COMMIT_FAULT_AFTER_PREPARED, arm_accounting_fault,
+        };
+        let (fixture, context, envelope) = confirmation_fixture("durable-open-error");
+        let _presence = driver::install(driver::fixture_credential());
+        let before = prepared_operation(&context, "before-commit", &envelope);
+        let armed = arm_accounting_fault(COMMIT_FAULT_AFTER_PREPARED);
+        durable(&fixture, &context, &envelope, &before, 300_000)
+            .await
+            .unwrap_err();
+        drop(armed);
+        assert!(inbox(&fixture).is_empty());
+        assert_eq!(durable_record(&context, &before), None);
+        assert!(driver::ceremonies().is_empty());
+
+        let after = prepared_operation(&context, "after-commit", &envelope);
+        let armed = arm_accounting_fault(COMMIT_FAULT_AFTER_COUNTER);
+        durable(&fixture, &context, &envelope, &after, 300_000)
+            .await
+            .unwrap_err();
+        drop(armed);
+        let entries = inbox(&fixture);
+        assert_eq!(entries.len(), 1);
+        let record = durable_record(&context, &after).unwrap();
+        assert_eq!(record.nonce, entries[0].approval_nonce);
+        assert!(driver::ceremonies().is_empty());
+        let witness = durable(&fixture, &context, &envelope, &after, 300_000)
+            .await
+            .unwrap();
+        assert_eq!(witness.nonce(), record.nonce);
+        assert_eq!(inbox(&fixture).len(), 1);
+        assert_eq!(driver::ceremonies().len(), 1);
+    }
+
+    /// A refused open reaches the CLI boundary with the store's code and
+    /// text.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn open_errors_keep_store_codes() {
+        use stellar_agent_core::mainnet::decision::AuthorityScope;
+        use stellar_agent_core::policy::ApprovalRequest;
+        use stellar_agent_network::policy_state::store::commit_faults::{
+            COMMIT_FAULT_AFTER_PREPARED, arm_accounting_fault,
+        };
+        let (fixture, context, envelope) = confirmation_fixture("durable-codes");
+        let _presence = driver::install(driver::fixture_credential());
+        let summary =
+            MainnetWriteSummary::from_envelope(&envelope, MainnetConsumer::CliPay, 500).unwrap();
+        let policy = fixture.current_policy();
+        let decision = MainnetDecision::for_test(
+            Decision::RequireApproval(ApprovalRequest::new("fixture".to_owned(), 300)),
+            None,
+            policy.digest(),
+            policy.sequence(),
+            7,
+            context.profile_name(),
+            context.chain().caip2_str(),
+            1_900_000_000_000,
+            300_000,
+            AuthorityScope::Classic,
+        );
+        let handle = prepared_operation(&context, "durable-codes", &envelope);
+        let mut slot = None;
+        let armed = arm_accounting_fault(COMMIT_FAULT_AFTER_PREPARED);
+        let refusal = cli_mainnet_authority(
+            &decision,
+            ConfirmDecision::RequireApproval { ttl_ms: 300_000 },
+            &summary,
+            &context,
+            &policy,
+            &fixture.store_path(),
+            Some(&handle),
+            PolicyDecision::RequireApproval,
+            &mut slot,
+        )
+        .await
+        .unwrap_err();
+        drop(armed);
+        let rendered = serde_json::to_value(render_authority_refusal("pay", refusal)).unwrap();
+        assert_eq!(rendered["error"]["code"], "submission.record_unavailable");
+        assert_eq!(
+            rendered["error"]["message"],
+            "the submission could not be durably recorded, so nothing was sent: \
+             the operation record could not be read or written: \
+             policy window-state store I/O error: Interrupted"
+        );
+    }
+
+    /// A browser refusal after the open keeps entry and record, and the
+    /// retry runs the ceremony on the same entry with no insert and no open.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn presence_failure_after_open_keeps_entry_and_record() {
+        let (fixture, context, envelope) = confirmation_fixture("durable-presence");
+        let handle = prepared_operation(&context, "durable-presence", &envelope);
+        let browser = driver::install(Box::new(|_| {
+            Err(WalletError::Approval(
+                ApprovalFailure::PresenceBrowserRequired,
+            ))
+        }));
+        let error = durable(&fixture, &context, &envelope, &handle, 300_000)
+            .await
+            .unwrap_err();
+        drop(browser);
+        assert_eq!(error.code(), "approval.presence_browser_required");
+        let entries = inbox(&fixture);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].attestation_blob_b64.is_none());
+        let record = durable_record(&context, &handle).unwrap();
+        assert_eq!(record.nonce, entries[0].approval_nonce);
+        assert_eq!(record.consent, None);
+
+        let _presence = driver::install(driver::fixture_credential());
+        let witness = durable(&fixture, &context, &envelope, &handle, 300_000)
+            .await
+            .unwrap();
+        assert_eq!(witness.nonce(), record.nonce);
+        assert_eq!(inbox(&fixture).len(), 1);
+        assert_eq!(driver::ceremonies().len(), 1);
+        let record = durable_record(&context, &handle).unwrap();
+        assert!(record.consent.is_some());
+        assert_eq!(record.created_at_ms, entries[0].created_at_unix_ms);
+    }
+
+    /// Runs a durable ceremony whose consent commit stops after its prepared
+    /// image, which leaves an attested entry and a record without consent.
+    #[cfg(feature = "mainnet-write")]
+    async fn crash_after_attestation(
+        fixture: &MainnetConsentFixture,
+        context: &MainnetWriteContext,
+        envelope: &str,
+        handle: &OperationHandle,
+    ) -> WalletError {
+        use stellar_agent_network::policy_state::store::commit_faults::{
+            COMMIT_FAULT_AFTER_PREPARED, arm_accounting_fault, observe_commit,
+        };
+        let mut commits = 0;
+        let observed = observe_commit(move |point| {
+            if point == COMMIT_FAULT_AFTER_PREPARED {
+                commits += 1;
+                if commits == 2 {
+                    std::mem::forget(arm_accounting_fault(point));
+                }
+            }
+        });
+        let error = durable(fixture, context, envelope, handle, 300_000)
+            .await
+            .unwrap_err();
+        drop(observed);
+        error
+    }
+
+    /// A consent commit that fails returns no witness: the entry is attested
+    /// and the record holds no consent.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ceremony_witness_follows_the_durable_commit() {
+        let (fixture, context, envelope) = confirmation_fixture("durable-commit");
+        let _presence = driver::install(driver::fixture_credential());
+        let handle = prepared_operation(&context, "durable-commit", &envelope);
+        let error = crash_after_attestation(&fixture, &context, &envelope, &handle).await;
+        assert_eq!(error.code(), "submission.record_unavailable");
+        assert!(inbox(&fixture)[0].attestation_blob_b64.is_some());
+        assert_eq!(durable_record(&context, &handle).unwrap().consent, None);
+        assert_eq!(consent_rows(&context), 1);
+    }
+
+    /// After an attestation without durable consent, the rerun records the
+    /// original receipt as recovered consent with no ceremony and no row. A
+    /// rerun after the consent returns the witness and writes nothing.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ceremony_rerun_recovers_without_a_second_ceremony() {
+        let (fixture, context, envelope) = confirmation_fixture("durable-recover");
+        let _presence = driver::install(driver::fixture_credential());
+        let handle = prepared_operation(&context, "durable-recover", &envelope);
+        crash_after_attestation(&fixture, &context, &envelope, &handle).await;
+        let entry = inbox(&fixture).remove(0);
+        let witness = durable(&fixture, &context, &envelope, &handle, 300_000)
+            .await
+            .unwrap();
+        assert_eq!(witness.nonce(), entry.approval_nonce);
+        assert_eq!(driver::ceremonies().len(), 1);
+        assert_eq!(consent_rows(&context), 1);
+        let consent = durable_record(&context, &handle).unwrap().consent.unwrap();
+        let receipt = entry.mainnet_presence.unwrap();
+        assert_eq!(consent.consent_at_ms, receipt.verified_at_unix_ms());
+        let payload = consent.payload.unwrap();
+        assert_eq!(payload.receipt, receipt);
+        assert_eq!(
+            payload.row_provenance,
+            Some(stellar_agent_network::policy_state::RowProvenance::Recovered)
+        );
+        let window = std::fs::read(
+            stellar_agent_core::profile::schema::default_policy_window_state_path_for(
+                context.profile_name(),
+            ),
+        )
+        .unwrap();
+        let again = durable(&fixture, &context, &envelope, &handle, 300_000)
+            .await
+            .unwrap();
+        assert_eq!(again.nonce(), entry.approval_nonce);
+        assert_eq!(driver::ceremonies().len(), 1);
+        assert_eq!(
+            std::fs::read(
+                stellar_agent_core::profile::schema::default_policy_window_state_path_for(
+                    context.profile_name(),
+                ),
+            )
+            .unwrap(),
+            window
+        );
+    }
+
+    /// Polls `future` and returns `Err` when one of its polls panics.
+    #[cfg(feature = "mainnet-write")]
+    async fn until_crash<F: std::future::Future>(future: F) -> Result<F::Output, ()> {
+        let mut future = std::pin::pin!(future);
+        std::future::poll_fn(|cx| {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                future.as_mut().poll(cx)
+            })) {
+                Ok(std::task::Poll::Ready(output)) => std::task::Poll::Ready(Ok(output)),
+                Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+                Err(_) => std::task::Poll::Ready(Err(())),
+            }
+        })
+        .await
+    }
+
+    /// The nonce prefixes of the consent rows in the profile's audit log.
+    #[cfg(feature = "mainnet-write")]
+    fn consent_row_nonces(context: &MainnetWriteContext) -> Vec<String> {
+        std::fs::read_to_string(&context.profile().audit_log_path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|row| row["kind"] == "approval_attested")
+            .map(|row| row["nonce_prefix"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// A ceremony that stops after its consent row and before the inbox
+    /// attestation leaves a linked unattested entry. The rerun runs a fresh
+    /// ceremony on that entry: two rows for one nonce, one entry, and one
+    /// record that holds the second receipt's consent.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ceremony_rerun_after_a_row_only_crash_writes_a_second_row() {
+        use stellar_agent_core::approval::attest::consent_test_seam;
+        let (fixture, context, envelope) = confirmation_fixture("durable-row-only");
+        let _presence = driver::install(driver::fixture_credential());
+        let handle = prepared_operation(&context, "durable-row-only", &envelope);
+        consent_test_seam::on_written(&fixture.store_path(), || {
+            panic!("test crash: after the consent row")
+        });
+        let crashed = until_crash(durable(&fixture, &context, &envelope, &handle, 300_000)).await;
+        assert!(crashed.is_err(), "the ceremony stops at the seam");
+        // A restarted process opens the audit log afresh.
+        stellar_agent_core::audit_log::writer::AuditWriterRegistry::remove_for_test(
+            context.profile_name(),
+        );
+        let entries = inbox(&fixture);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].attestation_blob_b64.is_none());
+        let nonce = entries[0].approval_nonce.clone();
+        let record = durable_record(&context, &handle).unwrap();
+        assert_eq!(record.nonce, nonce);
+        assert_eq!(record.consent, None);
+        assert_eq!(consent_row_nonces(&context).len(), 1);
+
+        let witness = durable(&fixture, &context, &envelope, &handle, 300_000)
+            .await
+            .unwrap();
+        assert_eq!(witness.nonce(), nonce);
+        assert_eq!(driver::ceremonies().len(), 2);
+        let rows = consent_row_nonces(&context);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|prefix| nonce.starts_with(prefix.as_str())));
+        let entries = inbox(&fixture);
+        assert_eq!(entries.len(), 1);
+        let receipt = entries[0].mainnet_presence.clone().unwrap();
+        let record = durable_record(&context, &handle).unwrap();
+        assert_eq!(record.nonce, nonce);
+        assert!(record.consent.is_some(), "the rerun records consent");
+        let consent = record.consent.unwrap();
+        assert_eq!(consent.consent_at_ms, receipt.verified_at_unix_ms());
+        assert_eq!(consent.payload.unwrap().receipt, receipt);
+        let window = std::fs::read(
+            stellar_agent_core::profile::schema::default_policy_window_state_path_for(
+                context.profile_name(),
+            ),
+        )
+        .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            &window[crate::common::mainnet_write_fixture::WINDOW_HMAC_TAG_BYTES..],
+        )
+        .unwrap();
+        assert_eq!(body["approvals"]["records"].as_array().unwrap().len(), 1);
+    }
+
+    /// Without a record, the ceremony first removes the unattested live
+    /// entry of its envelope that a crash left, and keeps other entries.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rerun_removes_the_orphan_and_keeps_one_nonce() {
+        let (fixture, context, envelope) = confirmation_fixture("durable-orphan");
+        let _presence = driver::install(driver::fixture_credential());
+        let other = stellar_agent_test_support::SignedTestEnvelope::builder([8; 32])
+            .unsigned()
+            .sequence(3)
+            .amount_stroops(17)
+            .build();
+        for parked in [envelope.as_str(), other.envelope_xdr()] {
+            let entry = MainnetWriteSummary::from_envelope(parked, MainnetConsumer::CliPay, 500)
+                .unwrap()
+                .pending("1000".into(), 300_000)
+                .unwrap();
+            pending_store(&fixture)
+                .insert(entry.clone(), entry.created_at_unix_ms)
+                .unwrap();
+        }
+        let handle = prepared_operation(&context, "durable-orphan", &envelope);
+        let witness = durable(&fixture, &context, &envelope, &handle, 300_000)
+            .await
+            .unwrap();
+        let entries = inbox(&fixture);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].approval_nonce, witness.nonce());
+        let ApprovalKind::PaymentSimulated {
+            envelope_xdr_b64, ..
+        } = &entries[0].kind
+        else {
+            panic!("payment")
+        };
+        assert_eq!(envelope_xdr_b64, other.envelope_xdr());
+    }
+
+    /// A handle outside `Prepared` without a record refuses with
+    /// the open's code before the inbox changes.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn resumed_handle_without_a_record_refuses() {
+        use stellar_agent_network::policy_state::{
+            BusinessId, LookupOutcome, OperationRecorder, TransitionEvidence,
+        };
+        let (fixture, context, envelope) = confirmation_fixture("durable-resumed");
+        let _presence = driver::install(driver::fixture_credential());
+        let orphan = MainnetWriteSummary::from_envelope(&envelope, MainnetConsumer::CliPay, 500)
+            .unwrap()
+            .pending("1000".into(), 300_000)
+            .unwrap();
+        pending_store(&fixture)
+            .insert(orphan.clone(), orphan.created_at_unix_ms)
+            .unwrap();
+        let prepared = prepared_operation(&context, "durable-resumed", &envelope);
+        let store = PersistedWindowStore::for_profile(context.profile_name());
+        let mut rows = NoRows;
+        let mut recorder = OperationRecorder::new(&store, context.profile(), &mut rows, "fixture");
+        recorder
+            .transition(
+                prepared.id(),
+                None,
+                OperationState::AwaitingApproval,
+                &TransitionEvidence::default(),
+            )
+            .unwrap();
+        let Some(LookupOutcome::Resumable(handle)) = recorder
+            .lookup(&BusinessId::parse("durable-resumed").unwrap())
+            .unwrap()
+        else {
+            panic!("a resumable operation")
+        };
+        assert_eq!(handle.state(), OperationState::AwaitingApproval);
+        let error = durable(&fixture, &context, &envelope, &handle, 300_000)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "internal.unexpected_state");
+        assert_eq!(
+            error.to_string(),
+            "unexpected internal state: the approval requires a matching prepared operation"
+        );
+        let entries = inbox(&fixture);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].approval_nonce, orphan.approval_nonce);
+        assert!(driver::ceremonies().is_empty());
+    }
+
+    /// Proof-free `Allow` under an operation runs no ceremony and opens no
+    /// record.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn allow_opens_no_durable_record() {
+        use stellar_agent_core::mainnet::decision::AuthorityScope;
+        let (fixture, context, envelope) = confirmation_fixture("durable-allow");
+        let _presence = driver::install(driver::fixture_credential());
+        let summary =
+            MainnetWriteSummary::from_envelope(&envelope, MainnetConsumer::CliPay, 500).unwrap();
+        let policy = fixture.current_policy();
+        let decision = MainnetDecision::for_test(
+            Decision::Allow,
+            None,
+            policy.digest(),
+            policy.sequence(),
+            7,
+            context.profile_name(),
+            context.chain().caip2_str(),
+            1_900_000_000_000,
+            600_000,
+            AuthorityScope::Classic,
+        );
+        let handle = prepared_operation(&context, "durable-allow", &envelope);
+        let mut slot = None;
+        let authority = cli_mainnet_authority(
+            &decision,
+            ConfirmDecision::Allow,
+            &summary,
+            &context,
+            &policy,
+            &fixture.store_path(),
+            Some(&handle),
+            PolicyDecision::Allow,
+            &mut slot,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(authority, MainnetAuthority::Policy(_)));
+        assert_eq!(durable_record(&context, &handle), None);
+        let operation = stored_operation(&context, &handle);
+        assert_eq!(operation["state"], "prepared");
+        assert!(operation["prepared_decision"].is_null());
+        assert!(driver::ceremonies().is_empty());
+        assert!(inbox(&fixture).is_empty());
+    }
+
+    /// Inside each window commit of the ceremony, the open and the consent,
+    /// another handle opens the inbox store without waiting.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn producers_hold_no_inbox_lock_across_a_window_commit() {
+        use stellar_agent_network::policy_state::store::commit_faults::{
+            COMMIT_FAULT_AFTER_PREPARED, observe_commit,
+        };
+        let (fixture, context, envelope) = confirmation_fixture("durable-locks");
+        let _presence = driver::install(driver::fixture_credential());
+        let handle = prepared_operation(&context, "durable-locks", &envelope);
+        let opened = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = std::rc::Rc::clone(&opened);
+        let path = fixture.store_path();
+        let observed = observe_commit(move |point| {
+            if point == COMMIT_FAULT_AFTER_PREPARED {
+                seen.borrow_mut()
+                    .push(PendingApprovalStore::open(path.clone()).is_ok());
+            }
+        });
+        durable(&fixture, &context, &envelope, &handle, 300_000)
+            .await
+            .unwrap();
+        drop(observed);
+        assert_eq!(*opened.borrow(), vec![true, true]);
     }
 }

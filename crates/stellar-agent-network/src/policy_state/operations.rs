@@ -51,8 +51,8 @@
 use rand_core::{OsRng, RngCore as _};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use stellar_agent_core::audit_log::AuditEntry;
 use stellar_agent_core::audit_log::schema::{EvidenceKind, OperationEvidenceRow};
+use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision};
 use stellar_agent_core::policy::pin::{self, PinScope};
 use stellar_agent_core::policy::state_lock::WindowStoreLock;
 use stellar_agent_core::profile::caip2::Caip2;
@@ -475,6 +475,12 @@ fn unexpected(detail: impl Into<String>) -> WindowStoreError {
     WindowStoreError::UnexpectedState {
         detail: detail.into(),
     }
+}
+
+/// The refusal of an approval open for an operation that is not a matching
+/// `Prepared` record.
+pub(crate) fn approval_requires_prepared() -> WindowStoreError {
+    unexpected("the approval requires a matching prepared operation")
 }
 
 fn invalid(detail: impl Into<String>) -> WindowStoreError {
@@ -3075,11 +3081,15 @@ pub(super) struct Session<'s> {
 
 impl Session<'_> {
     /// Links the approval and records its waiting edge in this session.
+    ///
+    /// The waiting window ends at the earlier of the signed waiting expiry
+    /// and the envelope's end, and `decision` becomes the prepare decision.
     pub(super) fn await_approval(
         &mut self,
         id: OperationId,
         approval_id: [u8; 32],
-        intent_digest: [u8; 32],
+        facts: &super::approvals::PendingApprovalFacts,
+        decision: PolicyDecision,
     ) -> Result<(), WindowStoreError> {
         let index = record_index(&self.wire, id)?;
         let record = &mut section_mut(&mut self.wire).records[index];
@@ -3087,13 +3097,20 @@ impl Session<'_> {
             || record
                 .approval_record_id
                 .is_some_and(|linked| linked != approval_id)
-            || record.intent.intent_digest() != intent_digest
+            || record.intent.intent_digest() != facts.intent_digest
         {
-            return Err(unexpected(
-                "the approval requires a matching prepared operation",
-            ));
+            return Err(approval_requires_prepared());
         }
+        let decision = serde_json::to_value(decision)
+            .map_err(|_| unexpected("the prepare decision does not serialize"))?;
         record.approval_record_id = Some(approval_id);
+        record.prepared_decision = Some(decision);
+        record.waiting_expires_at_ms = record
+            .intent
+            .envelope_end_ms()
+            .map_or(facts.waiting_expires_at_ms, |end| {
+                end.min(facts.waiting_expires_at_ms)
+            });
         record.step(
             OperationState::AwaitingApproval,
             self.now,
@@ -9060,7 +9077,22 @@ pub(crate) mod tests {
         fx.clock.set(T0 + 1);
         let (waited, committed) = drained(&mut fx, |r| {
             r.run(None, |session| {
-                session.await_approval(handle.id(), [9; 32], [1; 32])
+                session.await_approval(
+                    handle.id(),
+                    [9; 32],
+                    &super::super::approvals::PendingApprovalFacts {
+                        nonce: "approval".to_owned(),
+                        kind: stellar_agent_core::approval::witness::ApprovedKind::Payment,
+                        subject_kind:
+                            stellar_agent_core::approval::subject::SubjectKind::EnvelopeText,
+                        subject: [1; 32],
+                        intent_digest: [1; 32],
+                        created_at_ms: T0,
+                        waiting_expires_at_ms: T0 + 600_000,
+                        rule_ttl_ms: 600_000,
+                    },
+                    PolicyDecision::RequireApproval,
+                )
             })
         });
         waited.unwrap();

@@ -52,6 +52,7 @@ enum Row {
     Conflict,
     Required,
     Testnet,
+    Facade,
     Ceremony,
     Delayed,
 }
@@ -100,6 +101,10 @@ impl Verb {
             (Row::Testnet, Self::Claim) => "testnet-echo-claim",
             (Row::Testnet, Self::CreateAccount) => "testnet-echo-create",
             (Row::Testnet, Self::Trustline) => "testnet-echo-trustline",
+            (Row::Facade, Self::Pay) => "testnet-facade-pay",
+            (Row::Facade, Self::Claim) => "testnet-facade-claim",
+            (Row::Facade, Self::CreateAccount) => "testnet-facade-create",
+            (Row::Facade, Self::Trustline) => "testnet-facade-trustline",
             (Row::Ceremony, Self::Pay) => "ceremony-pay",
             (Row::Ceremony, Self::Claim) => "ceremony-claim",
             (Row::Ceremony, Self::CreateAccount) => "ceremony-create",
@@ -123,10 +128,11 @@ impl Verb {
         .await
     }
 
-    /// The testnet fixture of the verb, its rules on `stellar:testnet`.
-    async fn testnet(self) -> MainnetFixture {
+    /// The testnet fixture of the verb for `row`, its rules on
+    /// `stellar:testnet`.
+    async fn testnet(self, row: Row) -> MainnetFixture {
         let agent = stellar_agent_test_support::signed_envelope::account_id_for_seed(AGENT_SEED);
-        let spec = Spec::new(self.name(Row::Testnet)).testnet().rules(vec![
+        let spec = Spec::new(self.name(row)).testnet().rules(vec![
             pay_rule("allow", ""),
             create_rule("allow", ""),
             claim_rule("allow", ""),
@@ -389,9 +395,10 @@ fn stored_state(path: &std::path::Path, business_id: &str) -> Option<String> {
         .and_then(|record| record["state"].as_str().map(str::to_owned))
 }
 
-/// Each value verb opens its operation record before the confirmation ceremony.
-/// A probe inside the ceremony reads the window file and finds the record under
-/// the run's business id `prepared` before the ceremony answers.
+/// Each value verb opens its operation record and its durable approval record
+/// before the confirmation ceremony. A probe inside the ceremony reads the
+/// window file and finds the record under the run's business id
+/// `awaiting_approval` before the ceremony answers.
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial]
 async fn every_value_verb_opens_the_record_before_the_ceremony() {
@@ -415,7 +422,7 @@ async fn every_value_verb_opens_the_record_before_the_ceremony() {
         assert_eq!(run.code, 0, "{verb:?}: {}", run.envelope);
         assert_eq!(
             *seen.lock().unwrap(),
-            vec![Some("prepared".to_owned())],
+            vec![Some("awaiting_approval".to_owned())],
             "{verb:?}: the record is open when the ceremony runs"
         );
         assert_eq!(record(&fixture, &id)["state"], "sent_outcome_unknown");
@@ -742,7 +749,7 @@ async fn every_value_verb_refuses_mainnet_without_a_business_id() {
 #[serial_test::serial]
 async fn testnet_verbs_echo_the_business_id() {
     for verb in Verb::ALL {
-        let fixture = verb.testnet().await;
+        let fixture = verb.testnet(Row::Testnet).await;
         let run = verb
             .run(&fixture, Some("order-7"), Intent::Default, true)
             .await;
@@ -766,6 +773,38 @@ async fn testnet_verbs_echo_the_business_id() {
             refused.envelope
         );
         assert_eq!(fixture.sent_envelopes().await.len(), 1, "{verb:?}");
+    }
+}
+
+/// On testnet each value verb, with a business id, without one, and with a
+/// malformed one, makes no approval facade call, reads included. A read
+/// through the facade afterward counts one, so the count observes the
+/// fixture's window-state file.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn off_mainnet_producers_call_no_facade() {
+    use stellar_agent_network::policy_state::{
+        ApprovalStatus, PersistedWindowStore, approvals::facade_calls,
+    };
+    for verb in Verb::ALL {
+        let fixture = verb.testnet(Row::Facade).await;
+        let store = PersistedWindowStore::for_profile(verb.name(Row::Facade));
+        let before = facade_calls::count(store.path());
+        for (business_id, code) in [(Some("order-7"), 0), (None, 0), (Some("two words"), 1)] {
+            let run = verb.run(&fixture, business_id, Intent::Default, true).await;
+            assert_eq!(run.code, code, "{verb:?} {business_id:?}: {}", run.envelope);
+        }
+        assert_eq!(fixture.sent_envelopes().await.len(), 2, "{verb:?}");
+        assert_eq!(
+            facade_calls::count(store.path()),
+            before,
+            "{verb:?}: off mainnet makes no facade call"
+        );
+        let profile = fixture.profile();
+        ApprovalStatus::new(&store, &profile)
+            .find_by_operation(OperationId::from_bytes([0x5a; 16]))
+            .unwrap();
+        assert_eq!(facade_calls::count(store.path()), before + 1, "{verb:?}");
     }
 }
 

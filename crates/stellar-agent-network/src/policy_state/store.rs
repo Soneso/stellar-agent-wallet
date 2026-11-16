@@ -3867,16 +3867,16 @@ impl PersistedWindowStore {
         }
         original.prepared = Some(Box::new(next.clone()));
         self.write_atomic(key, &original)?;
-        #[cfg(test)]
-        tests::accounting_fault(tests::COMMIT_FAULT_AFTER_PREPARED)?;
+        #[cfg(any(test, feature = "test-helpers"))]
+        commit_faults::accounting_fault(commit_faults::COMMIT_FAULT_AFTER_PREPARED)?;
         if !still_valid() {
             original.prepared = None;
             self.write_atomic(key, &original)?;
             return Ok(false);
         }
         write_generation(gen_entry, &next)?;
-        #[cfg(test)]
-        tests::accounting_fault(tests::COMMIT_FAULT_AFTER_COUNTER)?;
+        #[cfg(any(test, feature = "test-helpers"))]
+        commit_faults::accounting_fault(commit_faults::COMMIT_FAULT_AFTER_COUNTER)?;
         // The committed candidate is already durable. Compaction is optional:
         // readers use it directly if replacing the prepared image fails.
         #[cfg(test)]
@@ -7536,6 +7536,69 @@ pub(crate) use tests::{
     COMMIT_FAULT_AFTER_COUNTER, COMMIT_FAULT_AFTER_PREPARED, COMMIT_FAULT_COMPACTION,
     arm_accounting_fault,
 };
+
+/// Crash seams of a generation commit, for tests of the store's callers.
+///
+/// A test arms one seam on its thread. The next commit on that thread that
+/// reaches the seam stops there with an interrupted I/O error, as a crash at
+/// that point would. One seam is armed at a time.
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod commit_faults {
+    use super::WindowStoreError;
+
+    /// The seam after the prepared image is durable, before the counter moves.
+    pub const COMMIT_FAULT_AFTER_PREPARED: u8 = 4;
+    /// The seam after the generation counter commits, before compaction.
+    pub const COMMIT_FAULT_AFTER_COUNTER: u8 = 5;
+
+    type CommitObserver = Box<dyn FnMut(u8)>;
+
+    thread_local! {
+        static ACCOUNTING_FAULT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+        static OBSERVER: std::cell::RefCell<Option<CommitObserver>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Runs the observer at `point`, then stops the operation there once
+    /// when a test armed that point.
+    pub(crate) fn accounting_fault(point: u8) -> Result<(), WindowStoreError> {
+        OBSERVER.with_borrow_mut(|observer| {
+            if let Some(observer) = observer.as_mut() {
+                observer(point);
+            }
+        });
+        if ACCOUNTING_FAULT.get() == point {
+            ACCOUNTING_FAULT.set(0);
+            return Err(WindowStoreError::Io {
+                kind: std::io::ErrorKind::Interrupted,
+            });
+        }
+        Ok(())
+    }
+
+    /// Disarms the seam or the observer on this thread when dropped.
+    #[must_use = "the seam disarms when the guard drops"]
+    pub struct ArmedFault;
+    impl Drop for ArmedFault {
+        fn drop(&mut self) {
+            ACCOUNTING_FAULT.set(0);
+            OBSERVER.with_borrow_mut(|observer| *observer = None);
+        }
+    }
+
+    /// Stops the next operation that reaches `point` on this thread.
+    pub fn arm_accounting_fault(point: u8) -> ArmedFault {
+        ACCOUNTING_FAULT.set(point);
+        ArmedFault
+    }
+
+    /// Runs `observer` at every seam a commit on this thread reaches, inside
+    /// the window lock, until the returned guard drops.
+    pub fn observe_commit(observer: impl FnMut(u8) + 'static) -> ArmedFault {
+        OBSERVER.with_borrow_mut(|slot| *slot = Some(Box::new(observer)));
+        ArmedFault
+    }
+}
 
 #[cfg(test)]
 thread_local! {
@@ -22779,8 +22842,10 @@ mod tests {
     /// The crash seam right after an accounting expiry commits, before its
     /// receipt projection.
     pub(super) const ACCOUNTING_FAULT_AFTER_COMMIT: u8 = 1;
-    pub(crate) const COMMIT_FAULT_AFTER_PREPARED: u8 = 4;
-    pub(crate) const COMMIT_FAULT_AFTER_COUNTER: u8 = 5;
+    pub(crate) use super::commit_faults::{
+        COMMIT_FAULT_AFTER_COUNTER, COMMIT_FAULT_AFTER_PREPARED, accounting_fault,
+        arm_accounting_fault,
+    };
     pub(crate) const COMMIT_FAULT_COMPACTION: u8 = 6;
     /// The crash seam right after an expiry event is appended, before its
     /// acknowledgement commits.
@@ -22788,21 +22853,6 @@ mod tests {
     /// The crash seam right after an acknowledgement commits, before the
     /// receipt projection.
     pub(super) const ACCOUNTING_FAULT_AFTER_ACKNOWLEDGE: u8 = 3;
-
-    thread_local! {
-        static ACCOUNTING_FAULT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
-    }
-
-    /// Stops the operation at `point` once, when a test armed that point.
-    pub(super) fn accounting_fault(point: u8) -> Result<(), WindowStoreError> {
-        if ACCOUNTING_FAULT.get() == point {
-            ACCOUNTING_FAULT.set(0);
-            return Err(WindowStoreError::Io {
-                kind: std::io::ErrorKind::Interrupted,
-            });
-        }
-        Ok(())
-    }
 
     /// The expiry projection step after its verified read routes it.
     pub(super) const EXPIRY_AFTER_ROUTING: u8 = 1;
@@ -22847,20 +22897,6 @@ mod tests {
     ) -> ArmedExpiryStep {
         EXPIRY_STEP_HOOK.with_borrow_mut(|slot| *slot = Some(Box::new(hook)));
         ArmedExpiryStep
-    }
-
-    /// Disarms the accounting seam on this thread when dropped.
-    pub(crate) struct ArmedFault;
-    impl Drop for ArmedFault {
-        fn drop(&mut self) {
-            ACCOUNTING_FAULT.set(0);
-        }
-    }
-
-    /// Stops the next operation that reaches `point` on this thread.
-    pub(crate) fn arm_accounting_fault(point: u8) -> ArmedFault {
-        ACCOUNTING_FAULT.set(point);
-        ArmedFault
     }
 
     type StoreWriteHook = Box<dyn FnMut() -> Result<(), WindowStoreError>>;

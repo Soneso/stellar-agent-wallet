@@ -199,7 +199,11 @@ async fn every_value_verb_follows_the_decision() {
                 assert_eq!(envelope["error"]["code"], "approval.presence_invalid");
                 assert_eq!(signer_resolutions_on_this_thread(), before);
                 assert!(fixture.sent_envelopes().await.is_empty());
-                assert!(fixture.pending_entries().is_empty());
+                assert_eq!(
+                    fixture.pending_entries().len(),
+                    1,
+                    "the parked entry stays with its durable record"
+                );
                 assert!(fixture.audit_rows("approval_attested").is_empty());
             } else {
                 assert_eq!(code, 0, "{envelope}");
