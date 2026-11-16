@@ -66,6 +66,20 @@ pub enum ApprovalError {
     #[error("approval entry has expired")]
     Expired,
 
+    /// The operator rejected the retained payment approval.
+    #[error("approval was rejected")]
+    Rejected,
+
+    /// The retained payment approval was already spent.
+    #[error("approval was consumed")]
+    Consumed,
+
+    /// A payment recovery binding does not match its stored approval entry.
+    ///
+    /// Only the payment that uses this binding is refused.
+    #[error("the payment recovery binding is inconsistent")]
+    RecoveryInconsistent,
+
     /// The attestation blob has already been set on this entry.
     ///
     /// `record_attestation` is one-shot; calling it again returns this error.

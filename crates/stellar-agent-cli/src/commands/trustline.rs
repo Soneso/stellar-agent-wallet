@@ -3562,29 +3562,41 @@ pub(crate) mod tests {
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
         async fn a_submit_refusal_renders_the_after_signing_text() {
+            let started_at = now();
             let clock = Arc::new(stellar_agent_network::mainnet::clock::set_now_ms_for_test(
-                now() + 5_000,
+                started_at,
+            ));
+            let _wall_clock = stellar_agent_core::timefmt::test_clock::install(Arc::new(
+                stellar_agent_core::timefmt::MockClock::new(|| {
+                    Ok(stellar_agent_network::mainnet::clock::now_ms().unwrap())
+                }),
             ));
             // The script lives on in the pooled mock server after the test,
             // so it holds the clock weakly: the override ends with `clock`.
             let advance = Arc::downgrade(&clock);
+            let endpoint = || {
+                ledger(true, 0).with_close_clock(|| {
+                    stellar_agent_network::mainnet::clock::now_ms().unwrap() / 1000
+                })
+            };
             let fixture = Spec::new("mainnet-trustline-submit")
-                .primary(ledger(true, 0).with_script(move |method, index, _| {
+                .primary(endpoint().with_script(move |method, index, _| {
                     if method == "getNetwork"
                         && index == 2
                         && let Some(clock) = advance.upgrade()
                     {
-                        clock.set(now() + 3_600_000);
+                        clock.set(started_at + 3_600_000);
                     }
                     None
                 }))
-                .oracle(ledger(true, 0))
+                .oracle(endpoint())
                 .build()
                 .await;
 
+            // Issuance and authorization share the clock after a delayed setup.
+            clock.set(started_at + 6_000);
             let run = run(&fixture, &mainnet_args(&fixture)).await;
 
-            drop(clock);
             assert_eq!(
                 run.code(),
                 "network.mainnet_authorization_refused",

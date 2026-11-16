@@ -71,9 +71,9 @@ pub(crate) struct ClassicRpc {
     stall: Arc<Mutex<Option<(String, usize, std::time::Duration)>>>,
     /// How many seconds before the request the latest ledger closed.
     close_age_secs: Arc<Mutex<u64>>,
+    close_clock: fn() -> u64,
     /// How many seconds after the request the latest ledger closed in the
-    /// `getHealth` answers, for a test clock ahead of the system clock;
-    /// `getLedgers` keeps the system clock.
+    /// `getHealth` answers; `getLedgers` keeps the unshifted clock.
     health_lead_secs: Arc<Mutex<u64>>,
     /// The status `getHealth` reports.
     health_status: Arc<Mutex<String>>,
@@ -104,6 +104,7 @@ impl ClassicRpc {
             counts: Arc::default(),
             stall: Arc::default(),
             close_age_secs: Arc::default(),
+            close_clock: now_secs,
             health_lead_secs: Arc::default(),
             health_status: Arc::new(Mutex::new("healthy".to_owned())),
             accounts: Arc::new(accounts.iter().map(|a| (*a).to_owned()).collect()),
@@ -190,9 +191,16 @@ impl ClassicRpc {
         server
     }
 
+    /// Uses the test's clock for readiness ledger close times.
+    #[cfg(feature = "mainnet-write")]
+    pub(crate) fn with_close_clock(mut self, clock: fn() -> u64) -> Self {
+        self.close_clock = clock;
+        self
+    }
+
     /// The close time of the latest ledger this endpoint reports now.
     fn close_secs(&self) -> u64 {
-        now_secs() - *self.close_age_secs.lock().unwrap()
+        (self.close_clock)() - *self.close_age_secs.lock().unwrap()
     }
 
     fn ledger_entries(&self, body: &Value) -> Value {

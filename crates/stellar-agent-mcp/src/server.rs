@@ -1342,6 +1342,15 @@ impl WalletServer {
         self.forced_snapshot_observer = Some(observer);
     }
 
+    /// Supplies signed fixture provenance when a synthetic engine queues payment consent.
+    #[doc(hidden)]
+    pub fn set_payment_recovery_policy_for_test(
+        &mut self,
+        policy: stellar_agent_core::mainnet::verified_policy::VerifiedPolicy,
+    ) {
+        self.verified_policy = Some(Arc::new(policy));
+    }
+
     /// Constructs a [`WalletServer`] with a test-local policy directory.
     ///
     /// Production construction passes `None` to [`build_policy_engine`], which

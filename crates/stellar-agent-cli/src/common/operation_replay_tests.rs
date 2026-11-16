@@ -72,6 +72,156 @@ struct VerbRun {
     envelope: Value,
 }
 
+/// A child loses its payment response after durable exposure; a fresh process replays it.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn payment_process_lost_response_replays_without_effects() {
+    use crate::common::mainnet_write_fixture::{ORACLE_HOST, PRIMARY_HOST};
+    use stellar_agent_core::approval::fixtures::{restore_process_keyring, save_process_keyring};
+    const NAME: &str = "process-replay-pay";
+    const DEST: &str = "MBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMX77777777777752TU";
+    if let Ok(root) = std::env::var("CLI_PAYMENT_PROCESS_ROOT") {
+        use clap::Parser as _;
+        let root = std::path::PathBuf::from(root);
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(&root);
+        let changes = restore_process_keyring(&root.join("keys.json"));
+        let _routes = crate::common::mainnet_write::set_test_routes(&[
+            (PRIMARY_HOST, &std::env::var("CLI_PAYMENT_PRIMARY").unwrap()),
+            (ORACLE_HOST, &std::env::var("CLI_PAYMENT_ORACLE").unwrap()),
+        ]);
+        let _tty = crate::common::tty::tests::test_tty(true, true);
+        let _presence = crate::common::mainnet_presence::driver::install(
+            crate::common::mainnet_presence::driver::fixture_credential(),
+        );
+        let now: u64 = std::env::var("CLI_PAYMENT_TIME").unwrap().parse().unwrap();
+        let _clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(now);
+        #[derive(clap::Parser)]
+        struct Payment {
+            #[command(flatten)]
+            args: crate::commands::pay::PayArgs,
+        }
+        let source = stellar_agent_test_support::signed_envelope::account_id_for_seed(AGENT_SEED);
+        let args = Payment::parse_from([
+            "payment",
+            "--profile",
+            NAME,
+            "--source",
+            &source,
+            "--business-id",
+            "lost-response",
+            DEST,
+            "1 XLM",
+            "native",
+        ]);
+        if std::env::var("CLI_PAYMENT_MODE").unwrap() == "lost" {
+            let snapshot = root.join("keys.json");
+            crate::common::render::before_render_for_test(move || {
+                save_process_keyring(&snapshot, &changes);
+                std::process::exit(81);
+            });
+        }
+        let code = crate::commands::pay::run(&args.args).await;
+        assert_eq!(code, 1, "retained unknown outcome asks the caller to wait");
+        let result = crate::common::render::take_rendered_for_test()
+            .pop()
+            .unwrap();
+        std::fs::write(
+            root.join("retry.json"),
+            serde_json::to_vec(&result).unwrap(),
+        )
+        .unwrap();
+        return;
+    }
+    let source = stellar_agent_test_support::signed_envelope::account_id_for_seed(AGENT_SEED);
+    let fixture = Spec::new(NAME)
+        .record_process_keys()
+        .submit_timeout_seconds(1)
+        .primary(
+            ClassicRpc::mainnet(&[&source, DESTINATION, ISSUER]).with_script(|method, _, _| {
+                (method == "getTransaction")
+                    .then(|| json!({"status":"NOT_FOUND", "latestLedger":1002, "oldestLedger":1}))
+            }),
+        )
+        .build()
+        .await;
+    let profile = fixture.profile();
+    let root = profile.audit_log_path.parent().unwrap().to_owned();
+    fixture.save_process_keyring(&root.join("keys.json"));
+    stellar_agent_core::audit_log::AuditWriterRegistry::remove_for_test(NAME);
+    let now = stellar_agent_core::timefmt::now_unix_ms().unwrap() + 30_000;
+    let run_child = |mode: &str| {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.arg("--exact").arg("common::operation_replay_tests::payment_process_lost_response_replays_without_effects")
+            .env("CLI_PAYMENT_PROCESS_ROOT", &root).env("CLI_PAYMENT_PRIMARY", fixture.primary.uri())
+            .env("CLI_PAYMENT_ORACLE", fixture.oracle.uri()).env("CLI_PAYMENT_TIME", now.to_string()).env("CLI_PAYMENT_MODE", mode);
+        tokio::task::spawn_blocking(move || cmd.output().unwrap())
+    };
+    let lost = run_child("lost").await.unwrap();
+    assert_eq!(
+        lost.status.code(),
+        Some(81),
+        "child exits before rendering: {} {}",
+        String::from_utf8_lossy(&lost.stdout),
+        String::from_utf8_lossy(&lost.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&lost.stdout).contains("\"ok\":true"));
+    restore_process_keyring(&root.join("keys.json"));
+    let id = BusinessId::parse("lost-response").unwrap();
+    let window = stellar_agent_network::policy_state::PersistedWindowStore::for_profile(NAME);
+    let view = stellar_agent_network::policy_state::OperationStatus::new(&window, &profile)
+        .view(&id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(view.state.wire_name(), "sent_outcome_unknown");
+    let state = std::fs::read(fixture.window_path()).unwrap();
+    let approvals = std::fs::read(fixture.approval_store_path()).unwrap();
+    let receipts = stellar_agent_core::profile::receipt::ReceiptStore::open(NAME).unwrap();
+    let before_receipts = serde_json::to_value(receipts.all().unwrap()).unwrap();
+    let audit = std::fs::read(&profile.audit_log_path).unwrap();
+    let retried = run_child("retry").await.unwrap();
+    assert!(
+        retried.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&retried.stdout),
+        String::from_utf8_lossy(&retried.stderr)
+    );
+    let result: Value =
+        serde_json::from_slice(&std::fs::read(root.join("retry.json")).unwrap()).unwrap();
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(result["data"]["status"], "replayed");
+    assert_eq!(result["data"]["next"], "wait");
+    assert_eq!(
+        result["data"]["operation"]["id"],
+        view.operation_id.to_hex()
+    );
+    assert_eq!(
+        result["data"]["operation"]["tx_hash"],
+        stellar_agent_core::hex::encode(&view.result.unwrap().tx_hash.unwrap())
+    );
+    assert_eq!(
+        crate::test_rpc::methods(&fixture.primary)
+            .await
+            .iter()
+            .filter(|m| *m == "sendTransaction")
+            .count(),
+        1
+    );
+    assert_eq!(std::fs::read(fixture.window_path()).unwrap(), state);
+    assert_eq!(
+        std::fs::read(fixture.approval_store_path()).unwrap(),
+        approvals
+    );
+    assert_eq!(
+        serde_json::to_value(receipts.all().unwrap()).unwrap(),
+        before_receipts
+    );
+    assert_eq!(std::fs::read(profile.audit_log_path).unwrap(), audit);
+    assert_eq!(
+        result["data"]["destination"], DEST,
+        "retained replay carries the literal stored destination"
+    );
+}
+
 impl VerbRun {
     fn error_code(&self) -> &str {
         self.envelope["error"]["code"].as_str().unwrap_or("")

@@ -313,9 +313,9 @@ async fn split_pay_approval_through_operator_cli() {
 }
 
 /// `approve gc --include-consumed` removes a spent approval's row, and the
-/// receipt still refuses the spent nonce. A restarted server prepares the
-/// payment afresh and commits with the spent nonce and attestation. The
-/// commit refuses with `policy.approval_consumed`, and nothing is sent again.
+/// receipt still refuses the spent nonce. A restarted server refuses the
+/// retained payment at preparation and at commit with its original proof.
+/// Both return `policy.approval_consumed`, and nothing is sent again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn gc_include_consumed_keeps_receipt_replay_protection() {
@@ -387,8 +387,11 @@ async fn gc_include_consumed_keeps_receipt_replay_protection() {
         .await
         .unwrap();
     let fresh: Value = serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap();
-    assert_eq!(fresh["ok"], true, "{fresh}");
-    let replay = payment.commit_args(&fresh, &payment.nonce, &payment.attestation);
+    assert_eq!(
+        fresh["error"]["code"], "policy.approval_consumed",
+        "collected consent cannot be requeued: {fresh}"
+    );
+    let replay = payment.commit_args(&payment.sim, &payment.nonce, &payment.attestation);
     let result = restarted
         .call_stellar_pay_commit(serde_json::from_value(replay).unwrap())
         .await
