@@ -31,7 +31,7 @@ use super::render;
 pub(crate) const SPENDING_PREVIEW_UNWRITABLE: &str = "profile.spending_preview_unwritable";
 
 /// The top-level keys of [`SpendingSummary`], in declaration order.
-const SUMMARY_KEYS: [&str; 15] = [
+const SUMMARY_KEYS: [&str; 16] = [
     "authority_status",
     "policy_version",
     "sequence",
@@ -42,6 +42,7 @@ const SUMMARY_KEYS: [&str; 15] = [
     "classic_max_fee_per_op_stroops",
     "fee_cap_status",
     "max_fee_per_classic_operation_xlm",
+    "contract_transfer_fee_cap",
     "balance_floor_xlm",
     "balance_floors",
     "recipients",
@@ -398,6 +399,9 @@ mod tests {
         let asset = format!("USDC:{ISSUER}");
         for expected in [
             "authority_status: draft".to_owned(),
+            "contract_transfer_fee_cap.configured_stroops: 1000000".to_owned(),
+            "contract_transfer_fee_cap.effective_stroops: none".to_owned(),
+            "contract_transfer_fee_cap.status: requires_signature".to_owned(),
             "policy_version: 2".to_owned(),
             format!("limits[{asset}].per_tx_cap: 0.2"),
             format!("limits[{asset}].unlisted_mode: budget"),

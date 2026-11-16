@@ -11,6 +11,8 @@
 //!    `[[rules]]` array (in original declaration order). Version 2 also signs
 //!    `sequence` and the optional mainnet binding before the rules. A present
 //!    `owner_rotation` table is signed in either version.
+//!    Both versions include a present root `contract_transfer_max_fee_stroops`
+//!    after `scope`, without inserting a default when it is absent.
 //! 3. Field order within each rule is fixed: `match`, `criteria`, `decision`,
 //!    then `reason`, `ttl_secs` and `allow_opaque_signing`. The last three are
 //!    emitted only when the rule carries them, so the canonical bytes of a rule
@@ -69,6 +71,8 @@ use crate::policy::PolicyError;
 /// carries `match`, `criteria` and `decision`, then whichever of `reason`,
 /// `ttl_secs` and `allow_opaque_signing` it holds, in that order.  All
 /// comments are stripped and whitespace is normalised.
+/// Both versions sign a present root `contract_transfer_max_fee_stroops` after
+/// `scope`. An absent cap adds no canonical field.
 ///
 /// # Errors
 ///
@@ -158,6 +162,13 @@ fn build_canonical_document(doc: &DocumentMut) -> Result<String, PolicyError> {
         })?;
     let scope_val = canonical_scalar(scope_item)?;
     out.insert("scope", Item::Value(scope_val));
+
+    if let Some(cap) = super::schema::contract_transfer_max_fee_stroops(doc)? {
+        out.insert(
+            "contract_transfer_max_fee_stroops",
+            toml_edit::value(i64::from(cap)),
+        );
+    }
 
     let v2 = version_item.as_integer() == Some(2);
     if v2 {

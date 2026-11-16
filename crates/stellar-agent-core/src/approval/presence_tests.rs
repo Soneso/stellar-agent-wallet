@@ -91,6 +91,7 @@ fn policy_at(
             approval_origin: None,
             approval_cert_spki_sha256: None,
         }),
+        None,
     )
 }
 
@@ -388,7 +389,8 @@ fn issue_refuses_unusable_inputs_and_bounds_the_challenge() {
         )),
         "approval.binding_mismatch"
     );
-    let no_mainnet = VerifiedPolicy::from_verified(7, b"", [9; 32], engine(), None);
+    let no_mainnet = VerifiedPolicy::from_verified(7, b"", [9; 32], engine(), None, None);
+    assert_eq!(no_mainnet.contract_transfer_max_fee_stroops(), None);
     let no_credentials = policy_with(&[]);
     for refused in [&no_mainnet, &no_credentials] {
         assert_eq!(
@@ -3454,6 +3456,7 @@ fn signed_policy_at(
             approval_origin: Some(approval_origin(origin)),
             approval_cert_spki_sha256: Some(pin),
         }),
+        None,
     )
 }
 
@@ -3663,6 +3666,7 @@ fn intent_challenge_binds_every_consent_field() {
             owner,
             engine(),
             signed_policy().mainnet().cloned(),
+            None,
         )
     };
     let canonical = signed_canonical(7, SIGNED_ORIGIN, &SIGNED_CERT_SPKI_SHA256);
@@ -3825,6 +3829,7 @@ fn policy_with_site(origin: Option<ApprovalOrigin>, pin: Option<[u8; 32]>) -> Ve
             approval_origin: origin,
             approval_cert_spki_sha256: pin,
         }),
+        None,
     )
 }
 

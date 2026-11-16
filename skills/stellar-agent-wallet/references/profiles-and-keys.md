@@ -848,6 +848,21 @@ Every MCP mainnet write requires approval.
 
 ### Mainnet policy body
 
+Policy versions 1 and 2 accept optional root `contract_transfer_max_fee_stroops`
+as an integer from 0 through 4294967295. Zero permits no positive transaction fee.
+Presets and enablement insert 1,000,000 stroops when absent; rotation preserves
+explicit values. The rewritten policy requires renewed owner signing.
+The cap covers inclusion, resources, and restoration as one total.
+It does not enable contract payments or add a G/M-only policy minimum.
+
+Spending summaries and unsigned `profile policy-check` return
+`contract_transfer_fee_cap` with `configured_stroops`, `effective_stroops`, and
+`status`. An absent configured value is `null`. Status is `verified`,
+`requires_signature`, `testnet_default`, `required`, or `unavailable`.
+Only a verified policy supplies mainnet consent. Testnet lookup defaults to
+1,000,000 when verified metadata omits the field. A profile classic cap cannot
+supply contract fee consent. The resource-fee criterion remains unknown.
+
 The first enablement requires a signed v2 policy and pins its sequence, digest,
 and owner before storing the nonce. A v1 or unsigned policy is refused and
 nothing is written. Prepare this policy without `[mainnet]`, sign it, run

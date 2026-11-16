@@ -6,7 +6,9 @@ use clap::Args;
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::policy::PolicyError;
 use stellar_agent_core::policy::v1::{
-    approval_origin::validate_bootstrap, validate_unsigned_policy,
+    approval_origin::validate_bootstrap,
+    presets::{AuthorityStatus, contract_transfer_fee_report},
+    validate_unsigned_policy,
 };
 use stellar_agent_core::profile::{loader::default_policy_dir, schema::Profile};
 
@@ -80,8 +82,16 @@ fn report(body: &str, args: &PolicyCheckArgs, profile: &Profile) -> i32 {
         }
         classification => {
             let signed_origin = classification == Classification::SignedOrigin;
+            let contract_transfer_fee_cap =
+                body.parse::<toml_edit::DocumentMut>().ok().map(|doc| {
+                    contract_transfer_fee_report(
+                        &doc,
+                        &profile.network_passphrase,
+                        AuthorityStatus::Draft,
+                    )
+                });
             render_json(&Envelope::ok(
-                serde_json::json!({"valid": true, "signed_origin": signed_origin}),
+                serde_json::json!({"valid": true, "signed_origin": signed_origin, "contract_transfer_fee_cap": contract_transfer_fee_cap}),
             ));
             if args.origin && signed_origin { 3 } else { 0 }
         }
@@ -162,6 +172,51 @@ pub(crate) mod tests {
             .unwrap()
             .remove("approval_credentials");
         doc.to_string()
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn contract_fee_policy_check_reports_unsigned_input() {
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let profile = Profile::builder_testnet_named("fee-test", "s", "a", "n", "b").build();
+        for version in [1, 2] {
+            let sequence = if version == 2 { "sequence = 1\n" } else { "" };
+            let base = format!("version = {version}\nscope = \"profile:fee-test\"\n{sequence}");
+            for cap in [None, Some(0), Some(1_000_000), Some(u32::MAX)] {
+                let body = cap.map_or_else(
+                    || base.clone(),
+                    |value| format!("contract_transfer_max_fee_stroops = {value}\n{base}"),
+                );
+                for text in [
+                    body.clone(),
+                    format!("{body}\n[signature]\nsig = \"altered\"\n"),
+                ] {
+                    take_rendered_for_test();
+                    assert_eq!(
+                        report(
+                            &text,
+                            &PolicyCheckArgs {
+                                profile: "fee-test".into(),
+                                origin: false
+                            },
+                            &profile
+                        ),
+                        0
+                    );
+                    let rendered = take_rendered_for_test();
+                    assert_eq!(
+                        rendered[0]["data"]["contract_transfer_fee_cap"],
+                        match cap {
+                            Some(value) =>
+                                serde_json::json!({"configured_stroops": value, "effective_stroops": null, "status": "requires_signature"}),
+                            None =>
+                                serde_json::json!({"configured_stroops": null, "effective_stroops": 1_000_000, "status": "testnet_default"}),
+                        }
+                    );
+                }
+            }
+        }
     }
 
     #[test]

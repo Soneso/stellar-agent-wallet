@@ -1021,8 +1021,8 @@ fn usage_rows(bounds: &[TotalBound], usage: &[TotalUsage]) -> Option<serde_json:
 /// bind in full: version 2, the profile, the endpoint host, and the nonce
 /// digest. A full binding also writes the preset fee cap,
 /// `classic_max_fee_per_op_stroops = 10000`, when the body states none, and
-/// keeps an authored cap. A rotation of a bound body replaces only the nonce
-/// digest.
+/// keeps an authored cap. Every rewrite inserts an absent contract total fee
+/// bound and preserves an explicit value, including zero.
 fn rewrite_policy(
     body: &toml_edit::DocumentMut,
     name: &str,
@@ -1036,6 +1036,16 @@ fn rewrite_policy(
         Some(1 | 2)
     ) {
         return Err(precondition("body_version"));
+    }
+    use stellar_agent_core::policy::v1::schema::{
+        DEFAULT_CONTRACT_TRANSFER_MAX_FEE_STROOPS, contract_transfer_max_fee_stroops,
+    };
+    if contract_transfer_max_fee_stroops(&body)
+        .map_err(|_| precondition("contract_transfer_max_fee_stroops"))?
+        .is_none()
+    {
+        body["contract_transfer_max_fee_stroops"] =
+            toml_edit::value(i64::from(DEFAULT_CONTRACT_TRANSFER_MAX_FEE_STROOPS));
     }
     let bound = body
         .get("mainnet")
@@ -2492,7 +2502,7 @@ mod tests {
     }
     #[test]
     #[serial]
-    fn rotate_replaces_only_digest_and_invalidates_old_nonce() {
+    fn rotate_adds_absent_contract_cap_and_invalidates_old_nonce() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
@@ -2515,6 +2525,7 @@ mod tests {
         assert_eq!(output["rotated"], true);
         assert_ne!(get(&fixture.nonce_ref()).unwrap(), old_nonce);
         let mut old = before.parse::<toml_edit::DocumentMut>().unwrap();
+        old["contract_transfer_max_fee_stroops"] = toml_edit::value(1_000_000);
         old["mainnet"]["installation_nonce_sha256"] =
             toml_edit::value(output["installation_nonce_sha256"].as_str().unwrap());
         assert_eq!(
@@ -2848,8 +2859,16 @@ mod tests {
             false,
         )
         .unwrap();
+        let mut parsed = rewritten.parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(
+            parsed
+                .get("contract_transfer_max_fee_stroops")
+                .and_then(toml_edit::Item::as_integer),
+            Some(1_000_000)
+        );
+        parsed.remove("contract_transfer_max_fee_stroops");
         let unchanged = raw.split_once("scope").unwrap().1;
-        assert!(rewritten.contains(&format!("scope{unchanged}")));
+        assert!(parsed.to_string().contains(&format!("scope{unchanged}")));
     }
 
     /// Enablement refuses a reserved window-key service before opening keys.
@@ -2958,6 +2977,13 @@ mod tests {
         assert_eq!(summary["authority_status"], "verified");
         assert_eq!(summary["sequence"], 7);
         assert_eq!(summary["fee_cap_status"], "signed");
+        assert_eq!(
+            summary["contract_transfer_fee_cap"],
+            serde_json::json!({
+                "configured_stroops": null, "effective_stroops": null, "status": "required"
+            })
+        );
+        assert_eq!(check_of(&output, "fee_cap").0, "passed");
         assert!(fixture.preview.borrow().is_empty());
         assert_eq!(persisted(&fixture), before);
         assert_eq!(fixture.pin(), pin);
@@ -3020,6 +3046,10 @@ mod tests {
             "unavailable"
         );
         assert_eq!(output["spending_summary"]["sequence"], 7);
+        assert_eq!(
+            output["spending_summary"]["contract_transfer_fee_cap"]["status"],
+            "unavailable"
+        );
 
         let raw = std::fs::read_to_string(fixture.path()).unwrap();
         let unsigned = raw.split("\n[signature]").next().unwrap().to_owned();
@@ -3265,6 +3295,149 @@ mod tests {
         assert_eq!(
             fee(&std::fs::read_to_string(fixture.path()).unwrap()),
             Some(10_000)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn contract_fee_rewrite_preserves_values_on_every_path() {
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let fixture = Fixture::new();
+        fixture.run().unwrap();
+        let installed = std::fs::read_to_string(fixture.path()).unwrap();
+        let installed = installed.parse::<toml_edit::DocumentMut>().unwrap();
+        let host = installed["mainnet"]["endpoint_host"].as_str().unwrap();
+        for bound in [false, true] {
+            for rotate in [false, true] {
+                for cap in [None, Some(0), Some(17), Some(i64::from(u32::MAX))] {
+                    let mut body = installed.clone();
+                    if !bound {
+                        body.remove("mainnet");
+                    }
+                    body.remove("contract_transfer_max_fee_stroops");
+                    if let Some(value) = cap {
+                        body["contract_transfer_max_fee_stroops"] = toml_edit::value(value);
+                    }
+                    let rewritten =
+                        rewrite_policy(&body, "operator", host, &"2".repeat(64), rotate).unwrap();
+                    let parsed = rewritten.parse::<toml_edit::DocumentMut>().unwrap();
+                    assert_eq!(
+                        parsed
+                            .get("contract_transfer_max_fee_stroops")
+                            .and_then(toml_edit::Item::as_integer),
+                        cap.or(Some(1_000_000)),
+                        "bound={bound}, rotate={rotate}"
+                    );
+                    assert_eq!(
+                        rewrite_policy(&parsed, "operator", host, &"2".repeat(64), rotate).unwrap(),
+                        rewritten
+                    );
+                }
+                for invalid in ["-1", "4294967296", "\"100\"", "1.5"] {
+                    let mut body = installed.clone();
+                    if !bound {
+                        body.remove("mainnet");
+                    }
+                    body.remove("contract_transfer_max_fee_stroops");
+                    let body = format!("contract_transfer_max_fee_stroops = {invalid}\n{body}");
+                    assert_eq!(
+                        rewrite_policy(
+                            &body.parse().unwrap(),
+                            "operator",
+                            host,
+                            &"2".repeat(64),
+                            rotate
+                        )
+                        .unwrap_err()
+                        .0,
+                        "profile.enable_mainnet_precondition"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn contract_fee_rewrite_requires_signing_after_restart() {
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let mut fixture = Fixture::new();
+        fixture.run().unwrap();
+        let verified = fixture.sign_rewritten_and_verify(2);
+        assert_eq!(
+            verified.contract_transfer_max_fee_stroops(),
+            Some(1_000_000)
+        );
+        fixture.args.rotate = true;
+        fixture.run().unwrap();
+        let public = fixture.owner.verifying_key().to_bytes();
+        let load = PolicyLoad {
+            path: &fixture.path(),
+            profile: &fixture.profile,
+            profile_name: "operator",
+            owner_pubkey: &public,
+            owner_source: OwnerKeySource::Keyring,
+            window_path: &fixture.window,
+        };
+        for _ in 0..2 {
+            assert!(matches!(
+                load_verified_policy(&load, PolicyStateStore::new(), PinMode::CompareOnly),
+                Err(PolicyError::OwnerSignatureInvalid { .. })
+            ));
+        }
+        assert_eq!(
+            fixture
+                .sign_rewritten_and_verify(3)
+                .contract_transfer_max_fee_stroops(),
+            Some(1_000_000)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn contract_fee_mainnet_report_tracks_verified_bytes() {
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let mut fixture = Fixture::new();
+        let rewritten = fixture.run().unwrap();
+        assert_eq!(
+            rewritten["spending_summary"]["contract_transfer_fee_cap"],
+            serde_json::json!({
+                "configured_stroops": 1_000_000, "effective_stroops": null, "status": "requires_signature"
+            })
+        );
+        fixture.sign_rewritten_and_verify(2);
+        fixture.args.check = true;
+        let before = persisted(&fixture);
+        let output = fixture.run().unwrap();
+        assert_eq!(
+            output["spending_summary"]["contract_transfer_fee_cap"],
+            serde_json::json!({
+                "configured_stroops": 1_000_000, "effective_stroops": 1_000_000, "status": "verified"
+            })
+        );
+        assert_eq!(persisted(&fixture), before);
+        let signed = std::fs::read_to_string(fixture.path()).unwrap();
+        std::fs::write(
+            fixture.path(),
+            signed.replace(
+                "contract_transfer_max_fee_stroops = 1000000",
+                "contract_transfer_max_fee_stroops = 0",
+            ),
+        )
+        .unwrap();
+        let altered = fixture.run().unwrap();
+        assert_eq!(check_of(&altered, "verified_policy").0, "failed");
+        assert!(altered["spending_summary"].is_null());
+        fixture.sign_rewritten_and_verify(3);
+        let output = fixture.run().unwrap();
+        assert_eq!(
+            output["spending_summary"]["contract_transfer_fee_cap"],
+            serde_json::json!({
+                "configured_stroops": 0, "effective_stroops": 0, "status": "verified"
+            })
         );
     }
 

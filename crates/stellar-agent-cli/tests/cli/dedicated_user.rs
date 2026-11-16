@@ -347,7 +347,9 @@ fn policy_check_stdin_codes_and_tree() {
             assert_eq!(envelope["ok"], true);
             assert_eq!(
                 envelope["data"],
-                serde_json::json!({"valid": true, "signed_origin": signed})
+                serde_json::json!({"valid": true, "signed_origin": signed,
+                    "contract_transfer_fee_cap": {"configured_stroops": null,
+                        "effective_stroops": null, "status": "required"}})
             );
         }
         assert_eq!(

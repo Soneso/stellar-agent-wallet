@@ -12,6 +12,12 @@ The CLI and MCP server share attestation, audit, nonce, policy, and auth-digest 
 
 ## Offline contract payment API
 
+The network crate's `contract_transfer_fee_cap` selects a full transaction
+bound from verified signed metadata, with a testnet default.
+`check_contract_transfer_fee_cap` compares the full u64 total against that cap.
+See [contract fee bounds](contract-payment-fees.md) for signatures, authority,
+reporting, and the default's measurement basis.
+
 `stellar_agent_core::sac_payment` provides offline inspection of a classic
 asset transfer from an unmuxed G source to a C recipient. These primitives
 grant no execution or signing authority. CLI and MCP payment routes retain

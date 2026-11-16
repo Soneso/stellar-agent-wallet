@@ -1411,8 +1411,6 @@ fn parse_criterion(
             }
             Ok(Box::new(MinimumReserveCriterion::new(margin_stroops)))
         }
-        // A future contract-invoke tool should get a descriptor-based resource
-        // criterion designed against `ContractInvoke` value legs.
         "inner_invocation_count_cap" => {
             let max_count_raw = require_i64(table, "max_count", &loc)?;
             let max_count =
@@ -1996,6 +1994,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn contract_fee_root_accepts_only_optional_u32_in_both_versions() {
+        let (key, public) = make_keypair();
+        let owner = stellar_strkey::ed25519::PublicKey(public).to_string();
+        for version in [1, 2] {
+            let sequence = if version == 2 { "sequence = 1\n" } else { "" };
+            let base = format!("version = {version}\nscope = \"profile:fee-test\"\n{sequence}");
+            for field in [
+                "",
+                "contract_transfer_max_fee_stroops = 0\n",
+                "contract_transfer_max_fee_stroops = 4294967295\n",
+            ] {
+                let body = format!("{field}{base}");
+                assert!(validate_unsigned_policy(&body, "fee-test", TESTNET_PASSPHRASE).is_ok());
+                let signed = make_signed_toml(&body, &key, &owner);
+                assert!(
+                    load_signed_policy_text(&signed, "fee-test", &public, TESTNET_PASSPHRASE)
+                        .is_ok()
+                );
+            }
+            let signed = make_signed_toml(&base, &key, &owner);
+            for value in ["-1", "4294967296", "\"100\"", "1.5", "true", "{}", "[]"] {
+                for body in [&base, &signed] {
+                    let invalid = format!("contract_transfer_max_fee_stroops = {value}\n{body}");
+                    let error = if body == &base {
+                        validate_unsigned_policy(&invalid, "fee-test", TESTNET_PASSPHRASE)
+                            .unwrap_err()
+                    } else {
+                        load_signed_policy_text(&invalid, "fee-test", &public, TESTNET_PASSPHRASE)
+                            .unwrap_err()
+                    };
+                    assert!(
+                        matches!(error, PolicyError::PolicyFileParseFailed { ref detail }
+                        if detail == "contract_transfer_max_fee_stroops must be an integer in the u32 range"),
+                        "{version}: {value}: {error:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn policy_semantic_numeric_inputs_are_not_echoed() {
         use stellar_agent_test_support::rejected_value::assert_no_marker;
         let mut cases = Vec::new();
@@ -2112,7 +2151,7 @@ mod tests {
             let cases = [
                 (
                     format!("version = 1\nscope = \"profile:alice\"\n\"{marker}\" = 1\n"),
-                    "unknown key; the policy file accepts version, scope, rules, signature, \
+                    "unknown key; the policy file accepts version, scope, contract_transfer_max_fee_stroops, rules, signature, \
                      owner_rotation"
                         .to_owned(),
                 ),
@@ -3797,7 +3836,7 @@ decision = "require_approval"
         let err = validate_unsigned_policy(&unknown_key, "alice", TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { ref detail }
-                if detail == "unknown key; the policy file accepts version, scope, rules, \
+                if detail == "unknown key; the policy file accepts version, scope, contract_transfer_max_fee_stroops, rules, \
                               signature, owner_rotation"),
             "an unknown top-level key is refused with the accepted keys: {err:?}"
         );
@@ -3998,7 +4037,7 @@ decision = "deny"
         assert_ne!(body, BODY_WITH_RULES);
         assert_parse_failure(
             load_signed_body_after(&body, |signed| signed),
-            "unknown key; the policy file accepts version, scope, rules, \
+            "unknown key; the policy file accepts version, scope, contract_transfer_max_fee_stroops, rules, \
              signature, owner_rotation",
         );
     }
