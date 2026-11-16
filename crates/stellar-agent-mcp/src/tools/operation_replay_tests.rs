@@ -1659,3 +1659,116 @@ async fn testnet_echoes_the_business_id_and_creates_no_record() {
         "testnet keeps no operation record"
     );
 }
+
+/// The real `stellar_transaction_status` handler on a managed attempt that
+/// recovery stopped: the default replays the stop with no request, the gate
+/// refuses another chain, and `retry_recovery` starts one bounded evidence
+/// run that sends no transaction.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn transaction_status_forwards_retry_on_a_managed_attempt() {
+    let id = fresh_business_id();
+    let business_id = id.clone();
+    let run = ClassicRun::with(
+        Tool::Pay,
+        |raw| {
+            raw + "\n[[rules]]\nmatch = { tool = \"stellar_transaction_status\", \
+                   chain = \"stellar:mainnet\" }\ncriteria = []\ndecision = \"allow\"\n"
+        },
+        |_| {},
+        move |args| {
+            args["business_id"] = json!(business_id);
+        },
+    )
+    .await;
+    let committed = run.commit().await;
+    assert_eq!(committed["ok"], true, "{committed}");
+    let tx_hash = committed["data"]["tx_hash"].as_str().unwrap().to_owned();
+    let stored = record(&run.f, &id);
+    assert_eq!(stored["state"], "sent_outcome_unknown", "{stored}");
+    let max_time = stored["attempts"][0]["exposure"]["identity"]["classic"]["max_time"]
+        .as_u64()
+        .unwrap();
+    let due_ms = (max_time + 6) * 1_000;
+    let system_secs = stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1_000;
+    let _clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(due_ms + 1_000);
+    for control in [&run.control, &run.oracle_control] {
+        control
+            .health_lead_secs
+            .store(due_ms / 1_000 + 1 - system_secs, Ordering::SeqCst);
+    }
+    let status = |chain_id: &str, retry_recovery| {
+        let args = crate::server::StellarTransactionStatusArgs {
+            chain_id: chain_id.to_owned(),
+            tx_hash: tx_hash.clone(),
+            retry_recovery,
+        };
+        let server = &run.f.server;
+        async move {
+            server
+                .call_stellar_transaction_status(args)
+                .await
+                .map(|result| wire(&result))
+        }
+    };
+    let recovery_run =
+        |run: &ClassicRun| record(&run.f, &id)["attempts"][0]["recovery_run"].clone();
+
+    let first = status("stellar:mainnet", false).await.unwrap();
+    assert_eq!(first["ok"], true, "{first}");
+    let stopped = recovery_run(&run);
+    assert_eq!(stopped["phase"], "stopped", "{stopped}");
+    assert_eq!(stopped["automatic_runs"], 1, "{stopped}");
+    run.control.clear();
+    run.oracle_control.clear();
+
+    let replay = status("stellar:mainnet", false).await.unwrap();
+    assert_eq!(replay["ok"], true, "{replay}");
+    assert!(
+        run.control.methods().is_empty(),
+        "{:?}",
+        run.control.methods()
+    );
+    assert_eq!(recovery_run(&run), stopped);
+    let recovery = &replay["data"]["recovery"];
+    assert_eq!(
+        recovery["attempts"][0]["tx_hash"],
+        tx_hash.as_str(),
+        "{recovery}"
+    );
+    assert_eq!(recovery["attempts"][0]["next_action"], "Wait", "{recovery}");
+    assert_eq!(replay["data"]["chain_status"], "UNKNOWN", "{replay}");
+
+    let gated = status("stellar:testnet", true).await.unwrap_err();
+    assert!(gated.message.contains("chain_id mismatch"), "{gated:?}");
+    assert!(
+        run.control.methods().is_empty(),
+        "{:?}",
+        run.control.methods()
+    );
+    assert_eq!(recovery_run(&run), stopped);
+
+    let explicit = status("stellar:mainnet", true).await.unwrap();
+    assert_eq!(explicit["ok"], true, "{explicit}");
+    let methods = run.control.methods();
+    assert_eq!(run.control.count("getTransaction"), 1, "{methods:?}");
+    assert!(methods.len() <= 2 + 24, "{methods:?}");
+    let after = recovery_run(&run);
+    assert_eq!(
+        (&after["automatic_runs"], &after["consecutive_stops"]),
+        (&json!(1), &json!(1)),
+        "{after}"
+    );
+    let recovery = &explicit["data"]["recovery"];
+    assert_eq!(recovery["attempts"][0]["reservations"], 1, "{recovery}");
+    assert_eq!(
+        recovery["refusal"]["code"], "recovery.needs_evidence",
+        "{recovery}"
+    );
+    assert!(run.control.sent().is_empty(), "no transaction is sent");
+    assert!(
+        run.oracle_control.sent().is_empty(),
+        "no transaction is sent"
+    );
+}

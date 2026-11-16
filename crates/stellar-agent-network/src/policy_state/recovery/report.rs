@@ -4,7 +4,7 @@ use super::*;
 use crate::policy_state::{CommittedDecision, OperationState};
 
 /// An included transaction's authenticated outcome.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum RecoveryInclusion {
     /// The transaction succeeded.
     Success,
@@ -13,7 +13,7 @@ pub enum RecoveryInclusion {
 }
 
 /// Evidence collection advice; none of these actions authorizes a submission.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum RecoveryAction {
     /// Inspect the transaction through targeted status.
     TargetedStatus,
@@ -21,10 +21,14 @@ pub enum RecoveryAction {
     Wait,
     /// The reported configuration, record or evidence requires attention.
     EvidenceRequired,
+    /// Every run is spent; targeted status with the explicit retry request
+    /// starts one new bounded evidence run.
+    RetryRecovery,
 }
 
 /// The chain result, independent of accounting expiry and receipt display data.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "result")]
 pub enum RecoveryResult {
     /// An authenticated included decision.
     Included {
@@ -50,7 +54,7 @@ pub enum RecoveryResult {
 }
 
 /// A safe refusal, without provider text, URLs or credentials.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RecoveryRefusal {
     /// The original stable wire code.
     pub code: &'static str,
@@ -87,6 +91,7 @@ impl From<RecoveryStopReason> for RecoveryReason {
 impl RecoveryAttemptResult {
     pub(super) fn project(
         attempt: &RecoveryAttempt,
+        selectable: bool,
         decision: Option<CommittedDecision>,
         now: u64,
     ) -> Self {
@@ -124,6 +129,7 @@ impl RecoveryAttemptResult {
                 missing: None,
                 next_action: RecoveryAction::TargetedStatus,
             },
+            selectable,
         };
         entry.refresh_result();
         entry
@@ -179,9 +185,21 @@ impl RecoveryAttemptResult {
                         ledger: s.ledger,
                     })
                 }),
+                // Only a selectable attempt gets a status action: the driver
+                // never evaluates a cancelled or expired record's attempt.
                 next_action: match self.view.class {
+                    _ if !self.selectable => RecoveryAction::EvidenceRequired,
                     _ if self.view.state == RecoveryRunState::RecoveryRequired => {
                         RecoveryAction::TargetedStatus
+                    }
+                    _ if matches!(self.view.state, RecoveryRunState::RetriesExhausted { last_reason }
+                        if last_reason != RecoveryStopReason::RecordUnusable)
+                        && self
+                            .stop
+                            .as_ref()
+                            .is_none_or(|s| s.class == RecoveryClass::Automatic) =>
+                    {
+                        RecoveryAction::RetryRecovery
                     }
                     Some(RecoveryClass::Explicit) => RecoveryAction::EvidenceRequired,
                     Some(RecoveryClass::Automatic) if self.view.earliest_retry_ms.is_some() => {
@@ -248,7 +266,7 @@ impl RecoveryReport {
         Ok(Self {
             attempts: attempts
                 .iter()
-                .map(|a| {
+                .map(|(a, selectable)| {
                     let decision = decisions
                         .iter()
                         .find(|d| {
@@ -260,7 +278,7 @@ impl RecoveryReport {
                                 )
                         })
                         .cloned();
-                    RecoveryAttemptResult::project(a, decision, now)
+                    RecoveryAttemptResult::project(a, *selectable, decision, now)
                 })
                 .collect(),
             ..Self::default()
@@ -280,5 +298,53 @@ impl RecoveryReport {
             state_unavailable: unavailable,
         });
         report
+    }
+
+    /// The recovery object that both status adapters render, absent when
+    /// the report has no attempt and no refusal. Each attempt carries its
+    /// typed result, its settlement commit identifier when a decision settles
+    /// it, an exhausted attempt's underlying reason, retry class and earliest
+    /// retry time; no field authorizes a submission or a successor.
+    #[must_use]
+    pub fn status_json(&self) -> Option<serde_json::Value> {
+        #[derive(Serialize)]
+        struct Attempt<'a> {
+            operation_id: String,
+            attempt_index: u32,
+            tx_hash: String,
+            #[serde(flatten)]
+            result: &'a RecoveryResult,
+            /// The commit identifier of the authenticated decision that settles it.
+            settlement_commit_id: Option<String>,
+            /// The underlying cause of an exhausted attempt.
+            last_reason: Option<RecoveryReason>,
+            class: Option<RecoveryClass>,
+            earliest_retry_ms: Option<u64>,
+            reservations: Option<u8>,
+            next_unread: Option<u32>,
+        }
+        if self.attempts.is_empty() && self.refusal.is_none() {
+            return None;
+        }
+        let attempts: Vec<_> = self
+            .attempts
+            .iter()
+            .map(|a| Attempt {
+                operation_id: a.operation_id.to_hex(),
+                attempt_index: a.attempt_index,
+                tx_hash: stellar_agent_core::hex::encode(&a.tx_hash),
+                result: &a.result,
+                settlement_commit_id: a.settlement.as_ref().map(|d| d.commit_id.to_hex()),
+                last_reason: match a.view.state {
+                    RecoveryRunState::RetriesExhausted { last_reason } => Some(last_reason.into()),
+                    _ => None,
+                },
+                class: a.view.class,
+                earliest_retry_ms: a.view.earliest_retry_ms,
+                reservations: a.reservations,
+                next_unread: a.next_unread,
+            })
+            .collect();
+        Some(serde_json::json!({ "attempts": attempts, "refusal": self.refusal }))
     }
 }

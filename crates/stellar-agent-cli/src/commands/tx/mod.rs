@@ -42,6 +42,11 @@ pub enum TxSubcommand {
     /// unknown once its accounting horizon has passed, which owes one
     /// `submission_accounting_expired` audit event.
     ///
+    /// For a managed mainnet attempt, `recovery` reports the typed recovery
+    /// result, retry class, earliest retry time and next action. The
+    /// default-off `--retry-recovery` flag starts one new bounded evidence run
+    /// for a stopped attempt; it never resubmits.
+    ///
     /// Exits 0 when the lookup completes, whatever the chain reported; exits 1
     /// when the record or the endpoint could not be reached.
     Status(status::StatusArgs),

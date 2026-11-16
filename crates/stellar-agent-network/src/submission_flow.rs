@@ -446,12 +446,13 @@ pub fn finish_reconciliation(
             )
         }
         ReconcilePass::RecoveryFailed {
-            error: error @ crate::policy_state::RecoveryError::Context { source, .. },
+            error: error @ crate::policy_state::RecoveryError::Context { source, detail, .. },
             ..
-        } if !matches!(
-            source.as_ref(),
-            crate::policy_state::RecoveryError::EndpointIdentity(_)
-        ) =>
+        } if !detail.is_empty()
+            && !matches!(
+                source.as_ref(),
+                crate::policy_state::RecoveryError::EndpointIdentity(_)
+            ) =>
         {
             tracing::warn!(
                 profile = %profile_name,
@@ -701,6 +702,7 @@ async fn reconcile_stages(
         crate::policy_state::EndpointPair::from_clients(client, oracle),
         &writer,
         None,
+        false,
         committed,
     )
     .await;
@@ -859,6 +861,11 @@ pub struct StatusRequest<'a> {
     pub client: &'a StellarRpcClient,
     /// The mainnet settlement oracle, when available.
     pub oracle: Option<&'a StellarRpcClient>,
+    /// Starts one fresh bounded evidence run for this hash's stopped attempt,
+    /// before its retry time or after its runs are exhausted. The run resets
+    /// the attempt's run count to one, signs and sends nothing, and refuses a
+    /// live lease, an earlier clock and unusable metadata. Defaults to false.
+    pub retry_recovery: bool,
 }
 
 /// The chain observation and the records after reconciliation and delivery.
@@ -1013,6 +1020,7 @@ pub async fn transaction_status_committed(
         window,
         client,
         oracle,
+        retry_recovery,
     } = request;
     let held = window
         .pending_reservations(profile)
@@ -1090,6 +1098,7 @@ pub async fn transaction_status_committed(
                 crate::policy_state::EndpointPair::from_clients(client, oracle),
                 &handle,
                 Some(&hash),
+                retry_recovery,
                 committed,
             )
             .await

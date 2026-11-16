@@ -706,6 +706,7 @@ reservation. The reservation ends at its accounting horizon, which owes one
 | `<HASH>` (positional) | Transaction hash, 64 lowercase hex characters: the `error.details.tx_hash` a timed-out submission reports | yes | none |
 | `--profile <NAME>` | Profile whose submission records and spending window are reconciled | optional | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--output <FORMAT>` | `json` or `table` | optional | `json` |
+| `--retry-recovery` | Start one new bounded evidence run for a stopped mainnet recovery attempt | optional | off |
 
 What it changes:
 
@@ -722,6 +723,18 @@ supplies `NOT_FOUND`. Without validated cached evidence it shows `UNKNOWN`.
 This path sends no additional transaction lookup. A record without a managed
 attempt keeps the primary lookup. Only a checked recovery decision settles
 the chain outcome.
+
+A managed attempt also returns `recovery`: each attempt's typed `result`
+(`Included`, `NeverApplicable` or `NeedsEvidence`), `reason`, `class`,
+`earliest_retry_ms`, `next_action` and spent `reservations`, plus any
+`refusal` code. Ordinary status replays a stop without requests until its
+retry time. `--retry-recovery` starts one new bounded run for a stopped
+attempt, also early or after `RetriesExhausted`, whose `next_action` is
+`RetryRecovery`. The run takes reservation one, so at most 15 automatic runs
+follow. It continues a saved ledger scan only after a request budget,
+deadline or interruption stop. It refuses a live lease, an earlier clock and
+unusable metadata with the `recovery.retry_refused` refusal code. It reads
+evidence only and never resubmits.
 
 Once the accounting horizon passes, the verb commits the accounting expiry and
 projects it onto the receipt. A `pending` or `ambiguous` receipt becomes

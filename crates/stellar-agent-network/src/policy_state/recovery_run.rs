@@ -412,6 +412,65 @@ pub(super) fn recovery_runnable(
         || configuration_reopens(snapshot, configuration)
 }
 
+/// Whether an explicit request may reserve a new run for a stopped attempt.
+/// It needs interpreted metadata, a clock at or after every stored time, and
+/// no live lease, so it never repairs unusable state or steals ownership.
+/// A running lease before its deadline refuses even at the sixteenth
+/// reservation, which normalization reports as exhausted.
+pub(super) fn explicit_retry_eligible(
+    view: &RecoveryRunView,
+    snapshot: Option<&RecoveryRunSnapshot>,
+    now: u64,
+) -> bool {
+    snapshot
+        .and_then(RecoveryRunSnapshot::record)
+        .is_some_and(|run| {
+            let live = run.phase == RecoveryRunPhase::Running && now < run.run_deadline_ms;
+            !live
+                && now
+                    >= run
+                        .stop
+                        .as_ref()
+                        .map_or(run.run_started_ms, |s| s.stopped_at_ms)
+                && match view.state {
+                    RecoveryRunState::Stopped(reason) => {
+                        reason != RecoveryStopReason::ClockRegression
+                    }
+                    RecoveryRunState::RetriesExhausted { .. } => true,
+                    _ => false,
+                }
+        })
+}
+
+/// Whether an explicit request meets a stored run it may not reserve:
+/// unusable metadata, a live lease, or a clock before a stored time.
+pub(super) fn explicit_retry_refused(snapshot: Option<&RecoveryRunSnapshot>, now: u64) -> bool {
+    snapshot.is_some_and(|snapshot| {
+        snapshot.record().is_none_or(|run| {
+            (run.phase == RecoveryRunPhase::Running && now < run.run_deadline_ms)
+                || now
+                    < run
+                        .stop
+                        .as_ref()
+                        .map_or(run.run_started_ms, |s| s.stopped_at_ms)
+        })
+    })
+}
+
+/// Whether an explicit run continues the saved scan. Only a spent allowance,
+/// deadline or interruption leaves the matched prefix compatible; every other
+/// stop restarts the scan from the authenticated pre-exposure ledger.
+pub(super) fn explicit_retry_keeps_scan(view: &RecoveryRunView) -> bool {
+    use RecoveryStopReason as R;
+    matches!(
+        view.state,
+        RecoveryRunState::Stopped(R::RequestBudget | R::Deadline | R::Interrupted)
+            | RecoveryRunState::RetriesExhausted {
+                last_reason: R::RequestBudget | R::Deadline | R::Interrupted
+            }
+    )
+}
+
 /// Binds a classic exposure using length-prefixed fields and big-endian integers.
 ///
 /// # Errors

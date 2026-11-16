@@ -7,7 +7,7 @@ use std::time::Duration;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use stellar_agent_core::audit_log::AuditWriter;
-use stellar_agent_core::error::WalletError;
+use stellar_agent_core::error::{SubmissionError, WalletError};
 use stellar_agent_core::policy::state_lock::WindowStoreLock;
 use stellar_agent_core::profile::receipt::SequenceReleases;
 use stellar_agent_core::profile::schema::Profile;
@@ -23,7 +23,8 @@ use super::operations::{
 use super::recovery_run::{
     RecoveryClass, RecoveryRole, RecoveryRunMethod, RecoveryRunPhase, RecoveryRunState,
     RecoveryRunView, RecoveryStage, RecoveryStop, RecoveryStopReason, WireRecoveryRun,
-    classify_recovery_stop, normalize_recovery_run, recovery_configuration_digest,
+    classify_recovery_stop, explicit_retry_eligible, explicit_retry_keeps_scan,
+    explicit_retry_refused, normalize_recovery_run, recovery_configuration_digest,
     recovery_deadline, recovery_expiry, recovery_exposure_digest, recovery_retry_time,
     recovery_runnable,
 };
@@ -232,7 +233,7 @@ pub enum RecoveryError {
     #[error("recovery needs evidence: {0:?}")]
     NeedsEvidence(RecoveryFailure),
     /// A refusal with diagnostic context from the remaining recovery work.
-    #[error("{source}; {detail}")]
+    #[error("{source}{}", context_suffix(.detail))]
     Context {
         /// The refusal whose stable code remains authoritative.
         #[source]
@@ -241,6 +242,7 @@ pub enum RecoveryError {
         /// Repair counts include every decision. Entries name the first
         /// `REPAIR_DECISION_DETAIL_LIMIT` (16) decisions in stored order,
         /// followed by one item stating how many more decisions exist.
+        /// Empty when the context only attaches `report`.
         detail: String,
         /// Readable authenticated results after the refusal.
         report: Option<Box<RecoveryReport>>,
@@ -285,10 +287,18 @@ impl RecoveryError {
             },
             source => Self::Context {
                 source: Box::new(source),
-                detail: "recovery results attached".into(),
+                detail: String::new(),
                 report: Some(Box::new(value)),
             },
         }
+    }
+}
+
+fn context_suffix(detail: &str) -> String {
+    if detail.is_empty() {
+        String::new()
+    } else {
+        format!("; {detail}")
     }
 }
 
@@ -1402,6 +1412,9 @@ pub struct RecoveryAttemptResult {
     pub view: RecoveryRunView,
     /// The contextual stop; prefix stops are advice and are not persisted.
     pub stop: Option<RecoveryStop>,
+    // Whether the driver can select the attempt: its record and attempt both
+    // have an unknown outcome. Otherwise no status call makes progress.
+    selectable: bool,
 }
 
 impl RecoveryReport {
@@ -1767,7 +1780,15 @@ fn contextual_stop(
                 RecoveryReason::HistoryLost => R::HistoryLost,
                 RecoveryReason::MissingProvenance => R::MissingProvenance,
                 RecoveryReason::Disagreement => R::Disagreement,
-                _ => reason,
+                RecoveryReason::RecoveryRequired
+                | RecoveryReason::Running
+                | RecoveryReason::RetriesExhausted
+                | RecoveryReason::AwaitingExpiry
+                | RecoveryReason::Untimed
+                | RecoveryReason::ClockRegression
+                | RecoveryReason::RecordUnusable
+                | RecoveryReason::Interrupted
+                | RecoveryReason::ConfigurationRequired => reason,
             };
             let stage = match f.method {
                 RecoveryMethod::GetNetwork => S::Identity,
@@ -1835,6 +1856,8 @@ struct Driver<'a> {
     store: &'a PersistedWindowStore,
     profile: &'a Profile,
     writer: &'a Arc<Mutex<AuditWriter>>,
+    /// An explicit request may reserve an eligible stopped attempt early.
+    retry: bool,
 }
 
 impl Driver<'_> {
@@ -1902,7 +1925,8 @@ struct Collected {
 
 /// Runs the shared prefix, then reserves, stops or decides each reached
 /// attempt of `attempts`, at most four, within the attempt and shared
-/// allowances and the call deadline.
+/// allowances and the call deadline. With `driver.retry`, an eligible
+/// stopped attempt reserves a fresh explicit run even before its retry time.
 async fn collect_outcomes(
     driver: &Driver<'_>,
     pair: &EndpointPair<'_>,
@@ -1979,19 +2003,35 @@ async fn collect_outcomes(
         };
         let started = super::store::now_ms()?;
         let view = run_view(attempt, started);
-        if !recovery_runnable(
-            &view,
-            attempt.recovery_run.as_ref(),
-            started,
-            &configuration,
-        ) {
+        let explicit =
+            driver.retry && explicit_retry_eligible(&view, attempt.recovery_run.as_ref(), started);
+        if !explicit
+            && !recovery_runnable(
+                &view,
+                attempt.recovery_run.as_ref(),
+                started,
+                &configuration,
+            )
+        {
             continue;
         }
         let saved_scan = attempt
             .recovery_run
             .as_ref()
             .and_then(|r| r.record())
-            .and_then(|r| r.scan.clone());
+            .and_then(|r| r.scan.clone())
+            .filter(|_| !explicit || explicit_retry_keeps_scan(&view));
+        // An explicit run takes reservation slot one; this reservation write
+        // replaces the previous usage, so no separate counter write exists.
+        let spent = if explicit {
+            0
+        } else {
+            attempt
+                .recovery_run
+                .as_ref()
+                .and_then(|r| r.record())
+                .map_or(0, |r| r.automatic_runs)
+        };
         let mut run = WireRecoveryRun {
             version: if saved_scan.is_some() { 2 } else { 1 },
             exposure: recovery_exposure_digest(
@@ -2002,17 +2042,12 @@ async fn collect_outcomes(
             phase: RecoveryRunPhase::Running,
             run_started_ms: started,
             run_deadline_ms: recovery_deadline(started)?,
-            automatic_runs: attempt
-                .recovery_run
-                .as_ref()
-                .and_then(|r| r.record())
-                .map_or(0, |r| r.automatic_runs)
-                .checked_add(1)
-                .filter(|n| *n <= 16)
-                .ok_or_else(|| WindowStoreError::Invalid {
+            automatic_runs: spent.checked_add(1).filter(|n| *n <= 16).ok_or_else(|| {
+                WindowStoreError::Invalid {
                     detail: "recovery_schedule_overflow".into(),
-                })?,
-            consecutive_stops: view.effective_stops,
+                }
+            })?,
+            consecutive_stops: if explicit { 0 } else { view.effective_stops },
             stop: None,
             scan: saved_scan,
         };
@@ -2462,6 +2497,7 @@ pub async fn recover_outcomes(
         pair,
         writer,
         tx_hash,
+        false,
         &mut CommittedBatch::default(),
     )
     .await
@@ -2469,15 +2505,18 @@ pub async fn recover_outcomes(
 
 /// [`recover_outcomes`], appending every transition its writes commit to
 /// `committed`. Transitions committed before a later refusal stay there.
+/// With `retry`, the hash-selected attempt may start an explicit run; the
+/// untargeted selection reads only runnable attempts and ignores it.
 pub(crate) async fn recover_outcomes_committed(
     store: &PersistedWindowStore,
     profile: &Profile,
     pair: EndpointPair<'_>,
     writer: &Arc<Mutex<AuditWriter>>,
     tx_hash: Option<&[u8; 32]>,
+    retry: bool,
     committed: &mut CommittedBatch,
 ) -> Result<RecoveryReport, RecoveryError> {
-    match recover_reported(store, profile, pair, writer, tx_hash, committed).await {
+    match recover_reported(store, profile, pair, writer, tx_hash, retry, committed).await {
         Err(error) if error.report().is_none() => {
             let report = RecoveryReport::refused(
                 &OperationStatus::new(store, profile),
@@ -2496,6 +2535,7 @@ async fn recover_reported(
     pair: EndpointPair<'_>,
     writer: &Arc<Mutex<AuditWriter>>,
     tx_hash: Option<&[u8; 32]>,
+    retry: bool,
     committed: &mut CommittedBatch,
 ) -> Result<RecoveryReport, RecoveryError> {
     let status = OperationStatus::new(store, profile);
@@ -2508,16 +2548,20 @@ async fn recover_reported(
             Ok(RecoveryReport::default())
         };
     }
+    // A refused explicit request selects no attempt, so neither the due
+    // advice nor a configuration reopening reaches a hash read or a write.
+    let refused = retry
+        && attempts
+            .iter()
+            .any(|a| explicit_retry_refused(a.recovery_run.as_ref(), now_ms));
     let configuration = recovery_configuration_digest(profile);
     let runnable: Vec<_> = attempts
         .iter()
         .filter(|a| {
-            recovery_runnable(
-                &run_view(a, now_ms),
-                a.recovery_run.as_ref(),
-                now_ms,
-                &configuration,
-            )
+            let view = run_view(a, now_ms);
+            !refused
+                && ((retry && explicit_retry_eligible(&view, a.recovery_run.as_ref(), now_ms))
+                    || recovery_runnable(&view, a.recovery_run.as_ref(), now_ms, &configuration))
         })
         .cloned()
         .collect();
@@ -2530,6 +2574,7 @@ async fn recover_reported(
             store,
             profile,
             writer,
+            retry,
         };
         let mut budget = Budget::new();
         let collected = collect_outcomes(&driver, &pair, &runnable, now_ms, committed, &mut budget)
@@ -2571,6 +2616,11 @@ async fn recover_reported(
     if report.missing.is_some() {
         report.refusal = Some(RecoveryRefusal {
             code: "recovery.needs_evidence",
+            state_unavailable: false,
+        });
+    } else if refused {
+        report.refusal = Some(RecoveryRefusal {
+            code: SubmissionError::RecoveryRetryRefused.code(),
             state_unavailable: false,
         });
     }
@@ -5808,7 +5858,7 @@ mod tests {
         let mut snapshots = OperationStatus::new(&fx.store, &fx.profile)
             .outcome_snapshot(None)
             .unwrap();
-        // The request names order-2, whose source account no endpoint serves,
+        // The request names order-2, whose fixture source fails StrKey validation,
         // so its absence stays unvalidated. Both attempts start at the fixed
         // clock, and the snapshot order between them follows random ids.
         snapshots.sort_by_key(|snapshot| {
@@ -5837,6 +5887,7 @@ mod tests {
                 window: &fx.store,
                 client: &primary_client,
                 oracle: Some(&oracle_client),
+                retry_recovery: false,
             },
             || Ok(home.join("approvals")),
             || Ok(Arc::clone(&writer)),
@@ -5971,6 +6022,7 @@ mod tests {
                 window: &fx.store,
                 client: &primary_client,
                 oracle: Some(&oracle_client),
+                retry_recovery: false,
             },
             || Ok(home.join("approvals")),
             || {
@@ -6113,6 +6165,7 @@ mod tests {
                     window: &fx.store,
                     client: &primary_client,
                     oracle: Some(&oracle_client),
+                    retry_recovery: false,
                 },
                 || Ok(home.join("approvals")),
                 || Ok(Arc::clone(&writer)),
@@ -6191,6 +6244,7 @@ mod tests {
                 window: &fx.store,
                 client: &primary_client,
                 oracle: Some(&oracle_client),
+                retry_recovery: false,
             },
             || Ok(home.join("approvals")),
             || {
@@ -6290,6 +6344,7 @@ mod tests {
                 window: &fx.store,
                 client: &client,
                 oracle: None,
+                retry_recovery: false,
             },
             || Ok(home.path().join("approvals")),
             || Ok(Arc::clone(&writer)),
@@ -8011,6 +8066,7 @@ mod tests {
                     window: &fx.store,
                     client: &primary_client,
                     oracle: Some(&oracle_client),
+                    retry_recovery: false,
                 },
                 || Ok(home.path().join("approvals")),
                 || Ok(Arc::clone(&writer)),

@@ -110,6 +110,13 @@ and `recovery.next_action: "TargetedStatus"`. A finite envelope bound supplies
 Otherwise the time is absent and `retry_time_unavailable` names `MissingBound`
 or `Overflow`. This guidance grants no resubmission or successor permission.
 
+Status of a managed mainnet attempt returns `recovery` with each attempt's
+typed `result`, `class`, `earliest_retry_ms` and `next_action`. Call status
+again at the reported time. After `next_action: "RetryRecovery"`, or to start
+a stopped attempt's run early, pass `retry_recovery: true` (CLI
+`--retry-recovery`). That request starts one bounded evidence run and never
+resubmits.
+
 ## Tool shapes
 
 Each tool is read-only, signs without submitting, or signs and submits; the

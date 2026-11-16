@@ -592,6 +592,7 @@ pub(crate) mod tests {
                     window: &self.fx.store,
                     client,
                     oracle: None,
+                    retry_recovery: false,
                 },
                 || Ok(approvals),
                 || Ok(Arc::clone(&self.writer)),

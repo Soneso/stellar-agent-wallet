@@ -1,6 +1,6 @@
 use super::*;
 
-async fn scan_pair(fx: &Fixture, end: u32) -> [MockServer; 2] {
+pub(super) async fn scan_pair(fx: &Fixture, end: u32) -> [MockServer; 2] {
     let pair = fx.pair([60, 60], NOW, 101).await;
     for server in &pair {
         let tip = std::sync::atomic::AtomicU32::new(61);
@@ -1061,5 +1061,72 @@ async fn driver_history_legacy_and_unusable_records_are_isolated() {
             "{shape} does not block another attempt"
         );
         assert!(fx.fx.record(fx.ids[0]).attempts[0].decision.is_none());
+    }
+}
+
+/// An explicit run continues the saved scan only after a spent allowance;
+/// any other stop restarts from P. Sticky history loss survives both.
+#[tokio::test]
+#[serial]
+async fn explicit_retry_and_configuration_binding() {
+    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+    for compatible in [true, false] {
+        let fx = Fixture::new(1, NOW / 1000 - 10);
+        let pair = scan_pair(&fx, 50).await;
+        let first = fx.run(&pair).await.unwrap();
+        let mut run = fx.run_record(0);
+        assert_eq!(
+            run.stop.as_ref().unwrap().reason,
+            RecoveryStopReason::RequestBudget
+        );
+        let saved = run.scan.as_ref().unwrap().next_unread;
+        assert!(saved > 20, "the first run matched a prefix: {saved}");
+        assert_eq!(first.attempts[0].next_unread, Some(saved));
+        if !compatible {
+            let stop = run.stop.as_mut().unwrap();
+            stop.reason = RecoveryStopReason::Transport;
+            stop.stage = RecoveryStage::Target;
+            stop.method = Some(RecoveryRunMethod::GetLedgers);
+            stop.roles = vec![RecoveryRole::Primary];
+            stop.ledger = Some(saved);
+            stop.target.get_or_insert(60);
+        }
+        fx.fx.rewrite(|wire| {
+            let attempt = &mut wire.operations.as_mut().unwrap().records[0].attempts[0];
+            attempt.recovery_run =
+                Some(serde_json::from_value(serde_json::to_value(&run).unwrap()).unwrap());
+            attempt
+                .recovery
+                .get_or_insert_with(Default::default)
+                .history_incomplete = true;
+        });
+        assert_eq!(
+            fx.run_record(0),
+            run,
+            "the rewritten stop stays interpretable"
+        );
+        let seen = starts(&pair[0]).await.len();
+        let report = fx.retry(&pair).await.unwrap();
+        assert_eq!(
+            report.evaluated, 1,
+            "the explicit request runs before its retry time"
+        );
+        let resumed = starts(&pair[0]).await[seen..]
+            .iter()
+            .copied()
+            .find(|start| *start != 60);
+        assert_eq!(
+            resumed,
+            Some(if compatible { saved } else { 20 }),
+            "compatible: {compatible}"
+        );
+        let after = fx.fx.record(fx.ids[0]).attempts[0].clone();
+        assert!(after.recovery.unwrap().history_incomplete);
+        assert!(
+            after.decision.is_none(),
+            "sticky history loss blocks the history proof"
+        );
+        assert_eq!(fx.run_record(0).automatic_runs, 1);
     }
 }
