@@ -357,9 +357,11 @@ pub fn payment_memo_shape(
 /// in its place.
 pub const TRANSACTION_ENVELOPE_XDR_FORM: &str = "must be base64-encoded TransactionEnvelope XDR";
 
-// This local input budget includes base64 whitespace. The protocol's Soroban
-// byte limit is configurable through ConfigSettingContractBandwidthV0.tx_max_size_bytes.
-pub(crate) const MAX_ENVELOPE_BASE64_LEN: usize = 2 * 1024 * 1024;
+/// The longest base64 envelope text a decoder of untrusted input reads.
+///
+/// This local input budget includes base64 whitespace. The protocol's Soroban
+/// byte limit is configurable through `ConfigSettingContractBandwidthV0.tx_max_size_bytes`.
+pub const MAX_ENVELOPE_BASE64_LEN: usize = 2 * 1024 * 1024;
 pub(crate) const ENVELOPE_INPUT_TOO_LONG: &str = "the envelope exceeds the input length limit";
 
 #[derive(Debug)]
