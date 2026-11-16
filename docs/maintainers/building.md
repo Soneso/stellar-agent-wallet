@@ -852,6 +852,31 @@ operator-enroll suite, it needs no testnet. The driver reports each self-skip
 as a skip marker in the run summary, so a green leg states what did not
 execute.
 
+Both suites also carry HTTPS cases at a signed origin, and these run on Linux
+only. Before each attempt of either suite, the driver generates a test
+certificate authority and a leaf for `approve.example.invalid` and
+`foreign.example.invalid` with `openssl`.
+It installs only that authority into fresh NSS databases with `certutil`, from
+the `libnss3-tools` package. The databases live in a private directory below
+`target/tmp/browser-trust`, which the driver names to cargo in
+`STELLAR_AGENT_BROWSER_TRUST_DIR`. The suites start Chromium with that
+directory's `home` as its `HOME`, a resolver rule for the test name, and
+certificate errors kept fatal. Cargo, the tests and the driver keep their own
+`HOME`, and no host trust store or keychain changes. Each suite's trust
+control loads a page the test authority issued and refuses a listener whose
+leaf another authority issued. The operator-enroll suite enrolls a
+credential at the signed origin and exports it only after the terminal
+confirmation. The consent suite consents there through the approval link and
+refuses an assertion from another origin, a page of another RP, and the
+local inbox under the signed policy. A missing tool or a failed import fails the
+suite before cargo runs. On another OS the HTTPS cases fail with a message
+instead of passing. The self-test covers the setup with stub `certutil` and
+`uname` commands and the system `openssl`.
+
+The remote approval crate declares a default-off `mainnet-write` feature that
+forwards to the core, network and MCP crates, so `MAINNET_WRITE=on` builds its
+suites against the `mainnet-write` build of the crates they drive.
+
 The multicall suites run without extra configuration. The library suite
 `stellar-agent-smart-account` / `smart_account_multicall_testnet_acceptance`
 (feature `testnet-integration`) deploys the vendored router and submits

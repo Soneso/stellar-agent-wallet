@@ -35,6 +35,7 @@
 use crate::policy::v1::EvalContext;
 use crate::policy::v1::asset_equivalence::assets_equivalent;
 use crate::policy::v1::criteria::Criterion;
+use crate::policy::v1::criteria::descriptor::{BucketDescriptor, BucketKind};
 use crate::policy::v1::value::{ValueGate, asset_normalise, classify_value};
 use crate::policy::{DenyReason, PolicyError};
 
@@ -106,6 +107,14 @@ impl PerTxCapCriterion {
 impl Criterion for PerTxCapCriterion {
     fn kind(&self) -> &'static str {
         "per_tx_cap"
+    }
+
+    fn descriptors(&self) -> Vec<BucketDescriptor> {
+        vec![BucketDescriptor::per_call(
+            BucketKind::Transaction,
+            &self.asset,
+            self.max_stroops,
+        )]
     }
 
     /// Evaluates the per-transaction cap against the current tool call.

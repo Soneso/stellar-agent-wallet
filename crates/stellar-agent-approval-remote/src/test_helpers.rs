@@ -9,7 +9,8 @@
 //! hand-rolled byte arrays per test.
 //!
 //! [`pinned_leaf`] generates the certificate files of a pinned TLS load
-//! together with their pin.
+//! together with their pin. [`alpn_get`] sends one HTTP/1.1 request over a
+//! TLS connection that offers chosen ALPN protocols.
 //!
 //! Compiled only under `#[cfg(any(test, feature = "test-helpers"))]` — never
 //! present in a production binary.
@@ -220,4 +221,94 @@ pub fn pinned_leaf(host: &str, algorithm: &'static rcgen::SignatureAlgorithm) ->
         key_pem: leaf_key.serialize_pem(),
         pin: Sha256::digest(leaf_key.subject_public_key_info()).into(),
     }
+}
+
+/// The result of [`alpn_get`]: the protocol the handshake selected and the
+/// raw HTTP/1.1 response.
+pub struct AlpnReply {
+    /// The ALPN protocol the server selected, if any.
+    pub protocol: Option<Vec<u8>>,
+    /// The response bytes up to the server's close.
+    pub response: String,
+}
+
+/// Connects to loopback `port` with SNI `host`, trusting only `issuer_pem`,
+/// offers `alpn`, and sends `GET path` with `Host: authority` over HTTP/1.1.
+///
+/// # Errors
+///
+/// Returns the handshake or I/O error, including the server's refusal of
+/// every offered protocol.
+pub async fn alpn_get(
+    port: u16,
+    host: &str,
+    issuer_pem: &str,
+    alpn: &[&[u8]],
+    authority: &str,
+    path: &str,
+) -> std::io::Result<AlpnReply> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let mut stream = alpn_connect(port, host, issuer_pem, alpn).await?;
+    let protocol = stream.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
+    stream
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nhost: {authority}\r\nconnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await?;
+    Ok(AlpnReply {
+        protocol,
+        response: String::from_utf8_lossy(&response).into_owned(),
+    })
+}
+
+/// Completes only the TLS handshake of [`alpn_get`] and returns the
+/// protocol the server selected.
+///
+/// # Errors
+///
+/// Returns the handshake error, including the server's refusal of every
+/// offered protocol.
+pub async fn alpn_handshake(
+    port: u16,
+    host: &str,
+    issuer_pem: &str,
+    alpn: &[&[u8]],
+) -> std::io::Result<Option<Vec<u8>>> {
+    let stream = alpn_connect(port, host, issuer_pem, alpn).await?;
+    Ok(stream.get_ref().1.alpn_protocol().map(<[u8]>::to_vec))
+}
+
+async fn alpn_connect(
+    port: u16,
+    host: &str,
+    issuer_pem: &str,
+    alpn: &[&[u8]],
+) -> std::io::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+    use rustls_pki_types::pem::PemObject as _;
+    use std::sync::Arc;
+
+    let mut roots = rustls::RootCertStore::empty();
+    for certificate in rustls_pki_types::CertificateDer::pem_slice_iter(issuer_pem.as_bytes()) {
+        roots
+            .add(certificate.map_err(std::io::Error::other)?)
+            .map_err(std::io::Error::other)?;
+    }
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(std::io::Error::other)?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    config.alpn_protocols = alpn.iter().map(|protocol| protocol.to_vec()).collect();
+    let server_name =
+        rustls_pki_types::ServerName::try_from(host.to_owned()).map_err(std::io::Error::other)?;
+    let tcp = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).await?;
+    tokio_rustls::TlsConnector::from(Arc::new(config))
+        .connect(server_name, tcp)
+        .await
 }

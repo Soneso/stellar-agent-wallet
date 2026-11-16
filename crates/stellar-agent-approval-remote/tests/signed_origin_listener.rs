@@ -98,34 +98,12 @@ impl Fixture {
     }
 
     async fn config(&self, one_shot: bool) -> Result<RemoteServeConfig, RemoteServeStartError> {
-        let profile = self
-            .fixture
-            .authority()
-            .load_current()
-            .unwrap()
-            .profile()
-            .clone();
-        let remote = profile.remote_approval.as_ref().unwrap();
-        let context = ApprovalContext::from_profile(self.fixture.name(), &profile);
-        let decision = DecisionContext::new(
-            context.clone(),
-            self.fixture.store_path(),
-            profile.attestation_key_id.clone(),
-            stellar_agent_core::profile::owner_key::OwnerKeyContext::for_profile(
-                self.fixture.name(),
-                &profile,
-            ),
-            self.audit
-                .clone()
-                .unwrap_or_else(|| Arc::new(Mutex::new(self.fixture.audit_writer()))),
-            None,
-        )
-        .with_mainnet_authority(self.fixture.authority());
+        let (remote, context, decision) = self.unauthorized_parts();
         let config = RemoteServeConfig::from_profile(
             remote.bind.parse().unwrap(),
-            remote,
+            &remote,
             RemoteApprovalAuthority::for_profile(self.fixture.name()).unwrap(),
-            decision,
+            decision.with_mainnet_authority(self.fixture.authority()),
         )
         .await?;
         Ok(if one_shot {
@@ -139,6 +117,40 @@ impl Fixture {
         } else {
             config
         })
+    }
+
+    /// The profile's remote section, its approval context, and a decision
+    /// context that carries no mainnet authority yet.
+    fn unauthorized_parts(
+        &self,
+    ) -> (
+        stellar_agent_core::profile::schema::RemoteApprovalConfig,
+        ApprovalContext,
+        DecisionContext,
+    ) {
+        let profile = self
+            .fixture
+            .authority()
+            .load_current()
+            .unwrap()
+            .profile()
+            .clone();
+        let remote = profile.remote_approval.clone().unwrap();
+        let context = ApprovalContext::from_profile(self.fixture.name(), &profile);
+        let decision = DecisionContext::new(
+            context.clone(),
+            self.fixture.store_path(),
+            profile.attestation_key_id.clone(),
+            stellar_agent_core::profile::owner_key::OwnerKeyContext::for_profile(
+                self.fixture.name(),
+                &profile,
+            ),
+            self.audit
+                .clone()
+                .unwrap_or_else(|| Arc::new(Mutex::new(self.fixture.audit_writer()))),
+            None,
+        );
+        (remote, context, decision)
     }
 
     async fn listen(&self, one_shot: bool) -> Result<RemoteServeHandle, RemoteServeStartError> {
@@ -561,9 +573,10 @@ async fn signed_origin_refuses_missing_pem_without_fallback() {
             "denied",
             "malformed",
             "mismatched",
+            "two keys",
         ] {
             if (problem == "denied" && !cfg!(unix))
-                || (problem == "mismatched" && field == "cert_path")
+                || (matches!(problem, "mismatched" | "two keys") && field == "cert_path")
             {
                 continue;
             }
@@ -594,6 +607,14 @@ async fn signed_origin_refuses_missing_pem_without_fallback() {
                     let other = pinned_leaf(SIGNED_RP_ID, &rcgen::PKCS_ECDSA_P256_SHA256);
                     std::fs::write(f.files.path().join("key.pem"), other.key_pem).unwrap();
                 }
+                "two keys" => {
+                    let other = pinned_leaf(SIGNED_RP_ID, &rcgen::PKCS_ECDSA_P256_SHA256);
+                    std::fs::write(
+                        f.files.path().join("key.pem"),
+                        format!("{}{}", f.leaf.key_pem, other.key_pem),
+                    )
+                    .unwrap();
+                }
                 _ => {
                     std::fs::write(
                         f.files.path().join(if field == "cert_path" {
@@ -622,6 +643,103 @@ async fn signed_origin_refuses_missing_pem_without_fallback() {
             assert!(!default_cert.exists() && !default_key.exists());
         }
     }
+    // A signed pin with neither path never provisions a certificate.
+    absent_pair_refuses_without_provisioning().await;
+}
+
+/// The signed consent listener offers only HTTP/1.1 over ALPN: a client that
+/// offers `h2` and `http/1.1` gets `http/1.1` and the sign-in page, and a
+/// client that offers only `h2` fails the handshake. This holds for a
+/// prepared configuration, for one built from a loaded PEM pair, and for a
+/// prepared configuration that receives mainnet authority afterwards.
+#[tokio::test]
+#[serial_test::serial]
+async fn signed_origin_offers_only_http1_over_alpn() {
+    for construction in ["prepared", "unprepared", "late authority"] {
+        let f = Fixture::new();
+        let config = if construction == "prepared" {
+            f.config(false).await.unwrap()
+        } else {
+            unprepared_or_late_config(&f, construction).await
+        };
+        let handle = start_remote_serve(config).await.unwrap();
+        assert_http1_only(&f, handle.local_addr().port(), construction).await;
+        handle.shutdown().await.unwrap();
+    }
+}
+
+/// A configuration built from the loaded PEM pair, or one prepared without
+/// mainnet authority that receives it afterwards.
+async fn unprepared_or_late_config(f: &Fixture, construction: &str) -> RemoteServeConfig {
+    let (remote, _, decision) = f.unauthorized_parts();
+    let bind = remote.bind.parse().unwrap();
+    let authority = RemoteApprovalAuthority::for_profile(f.fixture.name()).unwrap();
+    if construction == "unprepared" {
+        let tls = tls::load_pinned(
+            remote.cert_path.as_ref().unwrap(),
+            remote.key_path.as_ref().unwrap(),
+            &f.leaf.pin,
+        )
+        .unwrap();
+        return RemoteServeConfig::new(
+            bind,
+            &remote.rp_id,
+            authority,
+            decision.with_mainnet_authority(f.fixture.authority()),
+            tls,
+        );
+    }
+    let mut config = RemoteServeConfig::from_profile(bind, &remote, authority, decision)
+        .await
+        .unwrap();
+    config.decision_context.mainnet_authority = Some(f.fixture.authority());
+    config
+}
+
+async fn assert_http1_only(f: &Fixture, port: u16, construction: &str) {
+    use stellar_agent_approval_remote::test_helpers::{alpn_get, alpn_handshake};
+    let reply = alpn_get(
+        port,
+        SIGNED_RP_ID,
+        &f.leaf.issuer_pem,
+        &[b"h2", b"http/1.1"],
+        SIGNED_ORIGIN.trim_start_matches("https://"),
+        &format!("/approvals/{}", f.entry.approval_nonce),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{construction}: {error}"));
+    assert_eq!(
+        reply.protocol.as_deref(),
+        Some(&b"http/1.1"[..]),
+        "{construction}: negotiated protocol"
+    );
+    assert!(
+        reply.response.starts_with("HTTP/1.1 200") && reply.response.contains("id=\"login-btn\""),
+        "{construction}: {}",
+        reply.response
+    );
+    let h2_only = alpn_handshake(port, SIGNED_RP_ID, &f.leaf.issuer_pem, &[b"h2"]).await;
+    assert!(
+        h2_only.is_err(),
+        "{construction}: an h2-only client negotiated {h2_only:?}"
+    );
+}
+
+async fn absent_pair_refuses_without_provisioning() {
+    let f = Fixture::new();
+    f.edit_remote(|remote| {
+        let remote = remote.as_object_mut().unwrap();
+        remote.remove("cert_path");
+        remote.remove("key_path");
+    });
+    let error = f.listen(false).await.unwrap_err().into_wallet_error();
+    assert_eq!(error.code(), "approve.remote_tls_unavailable", "{error}");
+    assert!(error.to_string().contains("cert_path"), "{error}");
+    let (default_cert, default_key) = tls::tls_file_paths(f.fixture.name()).unwrap();
+    assert!(
+        !default_cert.exists() && !default_key.exists(),
+        "no certificate is provisioned under a signed pin"
+    );
 }
 
 #[tokio::test]

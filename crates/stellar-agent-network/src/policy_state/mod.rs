@@ -196,6 +196,7 @@
 //! Reset refuses pending approvals inside their waiting windows and preserves every other approval record.
 
 pub mod approvals;
+pub mod budget;
 pub mod ledger;
 pub mod lock;
 pub mod notices;
@@ -213,23 +214,29 @@ pub use approvals::{
     ApprovalRecorder, ApprovalState, ApprovalStatus, ApprovalView, Consent, ConsentPayload,
     ConsentRow, PendingApprovalFacts, RowProvenance, WireApproval,
 };
+pub use budget::{
+    AuthorizationView, BucketProjection, BucketUsage, BudgetError, BudgetProjection,
+    InformationalBound, NativeClass, NativeObligation, NativeTotal, RuleBudget,
+    SnapshotUnavailable, Undecided, UsageUnavailable,
+};
 pub use ledger::{
-    ClaimExpect, ConsumeExpect, ConsumeReceipt, ConsumptionBinding, DomainBinding, FeeBumpFacts,
-    MAX_OPEN_AUTHORIZATIONS, MintAuthority, MintRequest, MintedRecord, NativeReservation,
-    OpenAuthorization, PolicyAuthorityBinding, SubmissionBinding, WindowReservation,
+    AuthorizationState, ClaimExpect, ConsumeExpect, ConsumeReceipt, ConsumptionBinding,
+    DomainBinding, FeeBumpFacts, MAX_OPEN_AUTHORIZATIONS, MintAuthority, MintRequest, MintedRecord,
+    NativeReservation, OpenAuthorization, PolicyAuthorityBinding, SubmissionBinding,
+    WindowReservation,
 };
 pub use notices::{CommittedBatch, CommittedTransition, WatchClass, WatchedOperation};
 pub use operations::{
     AdmissibleFloors, AgreedOutcome, AttemptAuthorization, AttemptEnvelope, AttemptRequest,
     AttemptStarted, BoundedText, BusinessId, CapacityDetail, ClearForm, CommitBinding, CommitId,
-    CommitTarget, CommittedDecision, ConsumptionExposure, EndpointCoverage, EvidenceAnswer,
-    EvidenceAuditFacts, EvidenceClassification, EvidenceEndpoint, EvidenceInput, EvidenceRowInput,
-    EvidenceSequenceClass, EvidenceVerdict, ExposureIdentity, IntentSlot, LookupOutcome,
-    NotIncludedProof, ObligationKind, OpenOutcome, OpenRequest, OperationAudit, OperationAuthority,
-    OperationHandle, OperationId, OperationKind, OperationLink, OperationRecorder, OperationResult,
-    OperationState, OperationStatus, OperationTool, OperationView, RecoveryUpdate,
-    ReleaseObligation, SequenceReleaseInput, SlotKind, TransitionEvidence, WindowObservation,
-    X402Intent,
+    CommitTarget, CommittedDecision, ConsumptionExposure, Disposition, EndpointCoverage,
+    EvidenceAnswer, EvidenceAuditFacts, EvidenceClassification, EvidenceEndpoint, EvidenceInput,
+    EvidenceRowInput, EvidenceSequenceClass, EvidenceVerdict, ExposureIdentity, IntentSlot,
+    LookupOutcome, NotIncludedProof, ObligationKind, OpenOutcome, OpenRequest, OperationAudit,
+    OperationAuthority, OperationHandle, OperationId, OperationKind, OperationLink,
+    OperationRecorder, OperationResult, OperationState, OperationStatus, OperationTool,
+    OperationView, RecoveryUpdate, ReleaseObligation, SequenceReleaseInput, SlotKind,
+    TransitionEvidence, WindowObservation, X402Intent,
 };
 pub use recovery::{
     AccountAnswer, CheckedRecoveryDecision, DecidedTransition, EndpointPair, LedgerAnswer,

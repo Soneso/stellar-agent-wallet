@@ -25,6 +25,7 @@ use stellar_xdr::{Limits, Memo, ReadXdr as _, TransactionEnvelope};
 
 use crate::fees::ClassicFeeChoice;
 use crate::mainnet::MainnetAuthorizationError;
+use crate::mainnet::canonical::{CanonicalPart, CanonicalRefusal};
 use crate::policy_state::{
     ApprovalRecorder, ApprovalStatus, ApprovalView, AttemptAuthorization, AttemptEnvelope,
     AttemptRequest, BusinessId, CommitBinding, CommitTarget, CommittedBatch, ConsentPayload,
@@ -131,6 +132,66 @@ pub fn classic_intent(
     )
     .map_err(unexpected)?;
     ClassicIntent::new(base, payload).map_err(unexpected)
+}
+
+/// The facts a canonical record is used under: the profile's CAIP-2 chain,
+/// the signing account, and the digest of the policy in force.
+#[derive(Debug, Clone, Copy)]
+pub struct CanonicalUse<'a> {
+    /// The CAIP-2 chain identifier.
+    pub chain_id: &'a str,
+    /// The signing account, a G strkey.
+    pub source: &'a str,
+    /// The digest of the verified policy in force.
+    pub policy_digest: [u8; 32],
+}
+
+/// The validated intent a canonical slot stores, for a use under `admitted`.
+///
+/// The store compares slot kinds and digests and never reads the intent, so
+/// every use rereads it. The stored value must be the JSON form of a valid
+/// [`ClassicIntent`], hash to the slot's digest, and name `admitted`'s chain,
+/// source and policy digest. The check reads and writes no store.
+///
+/// # Errors
+///
+/// [`CanonicalRefusal::NotCanonical`] for another slot kind,
+/// [`CanonicalRefusal::Malformed`], [`CanonicalRefusal::StoredDigest`], and
+/// [`CanonicalRefusal::Mismatch`] naming the chain, source or policy.
+pub fn canonical_slot_intent(
+    slot: &IntentSlot,
+    admitted: &CanonicalUse<'_>,
+) -> Result<ClassicIntent, CanonicalRefusal> {
+    let IntentSlot::Canonical {
+        intent_digest,
+        intent,
+    } = slot
+    else {
+        return Err(CanonicalRefusal::NotCanonical);
+    };
+    let parsed = serde_json::from_value::<ClassicIntent>(intent.clone())
+        .map_err(|_| CanonicalRefusal::Malformed)?;
+    // Unknown fields and noncanonical spellings parse; the round trip refuses them.
+    if serde_json::to_value(&parsed).ok().as_ref() != Some(intent) {
+        return Err(CanonicalRefusal::Malformed);
+    }
+    if parsed.digest().as_bytes() != intent_digest {
+        return Err(CanonicalRefusal::StoredDigest);
+    }
+    let base = parsed.base();
+    for (holds, part) in [
+        (base.chain_id() == admitted.chain_id, CanonicalPart::Chain),
+        (base.source() == admitted.source, CanonicalPart::Source),
+        (
+            base.policy_digest() == &admitted.policy_digest,
+            CanonicalPart::Policy,
+        ),
+    ] {
+        if !holds {
+            return Err(CanonicalRefusal::Mismatch(part));
+        }
+    }
+    Ok(parsed)
 }
 
 /// The domain label of a claim's identity digest.
@@ -323,6 +384,258 @@ pub fn envelope_facts(unsigned_envelope_b64: &str) -> Result<EnvelopeFacts, Wall
     })
 }
 
+/// Refuses an account sequence with no successor, the envelope's sequence.
+fn require_sequence_successor(sequence: i64) -> Result<(), WalletError> {
+    if sequence.checked_add(1).is_none() {
+        return Err(WalletError::Protocol(
+            stellar_agent_core::error::ProtocolError::XdrCodecFailed {
+                detail: "the source account's sequence has no successor".to_owned(),
+            },
+        ));
+    }
+    Ok(())
+}
+
+/// The unsigned envelope of `intent` on `network_passphrase`: the next
+/// transaction after the account sequence `sequence`, at
+/// `fee_per_op_stroops`, valid from zero through `max_time_s`.
+///
+/// # Errors
+///
+/// - `protocol.xdr_codec_failed` for a `sequence` with no successor.
+/// - The builder's refusals.
+pub fn intent_envelope(
+    intent: &ClassicIntent,
+    network_passphrase: &str,
+    sequence: i64,
+    fee_per_op_stroops: u32,
+    max_time_s: u64,
+) -> Result<String, WalletError> {
+    use stellar_agent_core::amount::StellarAmount;
+    require_sequence_successor(sequence)?;
+    let base = intent.base();
+    let mut builder = crate::ClassicOpBuilder::new(
+        base.source(),
+        sequence,
+        network_passphrase,
+        fee_per_op_stroops,
+    );
+    let asset = |asset: &IntentAsset| match asset {
+        IntentAsset::Native => crate::Asset::Native,
+        IntentAsset::Issued { code, issuer } => crate::Asset::Credit {
+            code: code.clone(),
+            issuer: issuer.clone(),
+        },
+    };
+    match intent.payload() {
+        IntentPayload::Pay {
+            destination,
+            asset: sent,
+            amount_stroops,
+        } => builder.payment(
+            destination,
+            StellarAmount::from_stroops(*amount_stroops),
+            &asset(sent),
+        )?,
+        IntentPayload::CreateAccount {
+            destination,
+            starting_balance_stroops,
+        } => builder.create_account(
+            destination,
+            StellarAmount::from_stroops(*starting_balance_stroops),
+        )?,
+        IntentPayload::Trustline {
+            issuer,
+            code,
+            limit_stroops,
+        } => builder.change_trust(
+            &crate::Asset::Credit {
+                code: code.clone(),
+                issuer: issuer.clone(),
+            },
+            Some(*limit_stroops),
+        )?,
+        IntentPayload::Claim { balance_id, .. } => builder
+            .claim_claimable_balance(balance_id.strip_prefix("00000000").unwrap_or(balance_id))?,
+    };
+    let memo = match base.memo() {
+        MemoFact::None => None,
+        MemoFact::Text(text) => Some(Memo::Text(text.as_bytes().to_vec().try_into().map_err(
+            |_| unexpected_envelope("the intent's memo text exceeds the protocol limit"),
+        )?)),
+        MemoFact::Id(id) => Some(Memo::Id(*id)),
+        MemoFact::Hash(hash) => Some(Memo::Hash(stellar_xdr::Hash(*hash))),
+        MemoFact::Return(hash) => Some(Memo::Return(stellar_xdr::Hash(*hash))),
+    };
+    if let Some(memo) = memo {
+        builder.memo(&memo)?;
+    }
+    builder.with_time_bounds(0, max_time_s);
+    builder.build()
+}
+
+/// The inputs of [`rebuild_canonical`].
+pub struct CanonicalRebuildRequest<'a> {
+    /// The profile the rebuild runs under.
+    pub profile: &'a Profile,
+    /// The network the envelope is built for and the oracle reads.
+    pub network: &'a crate::NetworkContext,
+    /// The primary client.
+    pub client: &'a crate::StellarRpcClient,
+    /// The readiness deadline, which also bounds the account read.
+    pub deadline: tokio::time::Instant,
+    /// The validated stored intent.
+    pub intent: &'a ClassicIntent,
+    /// The caller's fee choice.
+    pub fee_choice: ClassicFeeChoice,
+    /// The fee per operation a [`ClassicFeeChoice::ProfileDefault`] gives.
+    pub default_fee_per_op_stroops: u32,
+    /// The current effective classic fee cap per operation.
+    pub fee_cap_stroops: u32,
+    /// The oracle observations of the operation; the fresh source read
+    /// replaces their source observation.
+    pub witness_inputs: crate::cross_check::ClassicInputs,
+    /// The cross-check thresholds.
+    pub thresholds: &'a stellar_agent_core::cross_check::ThresholdSet<'a>,
+    /// The policy tool the oracle check is logged under.
+    pub tool: &'static str,
+}
+
+/// An envelope rebuilt from a canonical intent, with the reads behind it.
+#[derive(Debug, Clone)]
+pub struct CanonicalRebuild {
+    /// The unsigned envelope text.
+    pub unsigned_envelope_b64: String,
+    /// The source account read after the readiness check.
+    pub account: crate::account::AccountView,
+    /// The fee per operation in stroops.
+    pub fee_per_op_stroops: u32,
+    /// The deadline in Unix seconds.
+    pub max_time_s: u64,
+    /// The oracle outcome bound to the rebuilt envelope.
+    pub cross_check: crate::cross_check::CrossCheckOutcome,
+}
+
+/// Rebuilds the envelope of a canonical intent from reads made now.
+///
+/// The reads run in order: the readiness check, the source account, the fee
+/// statistics when the choice is a percentile, then the oracle check bound
+/// to the rebuilt envelope. The envelope takes the account's next sequence,
+/// the chosen fee, and a deadline [`MAINNET_CLASSIC_DEADLINE_SECONDS`] after
+/// the mainnet clock. Nothing is signed or stored.
+///
+/// [`MAINNET_CLASSIC_DEADLINE_SECONDS`]: crate::mainnet::resolve::MAINNET_CLASSIC_DEADLINE_SECONDS
+///
+/// # Errors
+///
+/// - `network.endpoint_not_ready` and the readiness errors, before any
+///   other read.
+/// - `fees.percentile_exceeds_cap` for a fee above the intent's bound or
+///   the current cap.
+/// - `protocol.xdr_codec_failed` for an account sequence with no successor.
+/// - The account, fee, clock, builder and oracle errors.
+pub async fn rebuild_canonical(
+    request: CanonicalRebuildRequest<'_>,
+) -> Result<CanonicalRebuild, WalletError> {
+    use crate::cross_check::{AccountObservation, ClassicInputs};
+    use stellar_agent_core::cross_check::CrossCheckValue;
+    use stellar_agent_core::error::DerivedFee;
+    let intent = request.intent;
+    crate::operational::operational_check(request.client, request.deadline).await?;
+    let account = crate::operational::read_within_readiness_deadline(
+        request.deadline,
+        crate::account::fetch_account(request.client, intent.base().source(), &[]),
+    )
+    .await?;
+    let fee = crate::fees::resolve_classic_fee_selection(
+        request.client,
+        request.default_fee_per_op_stroops,
+        request.fee_choice,
+    )
+    .await?
+    .per_op_stroops;
+    let cap = intent
+        .base()
+        .fee_bound_stroops()
+        .min(request.fee_cap_stroops);
+    if fee > cap {
+        let fee_source = crate::fees::classic_fee_source(
+            request.fee_choice,
+            stellar_agent_core::error::FeeSource::ProfileDefault,
+        );
+        return Err(WalletError::Validation(ValidationError::FeeAboveCap {
+            per_op: DerivedFee::new(fee, &fee_source),
+            cap,
+            fee_source,
+        }));
+    }
+    require_sequence_successor(account.sequence_number)?;
+    let max_time_s = (crate::mainnet::clock::now_ms()? / 1000)
+        .saturating_add(crate::mainnet::resolve::MAINNET_CLASSIC_DEADLINE_SECONDS);
+    let envelope = intent_envelope(
+        intent,
+        request.network.network_passphrase(),
+        account.sequence_number,
+        fee,
+        max_time_s,
+    )?;
+    let mut inputs = request.witness_inputs;
+    let source = AccountObservation::from_view(&account)?;
+    match &mut inputs {
+        ClassicInputs::Pay(inputs) => inputs.source = source,
+        ClassicInputs::CreateAccount(inputs) => inputs.source = source,
+        ClassicInputs::Trustline(inputs) => inputs.source = source,
+        ClassicInputs::Claim(inputs) => inputs.source = source,
+        ClassicInputs::PoolInit(_) => {
+            return Err(unexpected_envelope("pool creation has no canonical intent"));
+        }
+    }
+    let native = stellar_agent_core::asset_id::CanonicalAsset::Native;
+    let issued;
+    let value = match intent.payload() {
+        IntentPayload::Pay {
+            asset,
+            amount_stroops,
+            ..
+        } => CrossCheckValue::Amount {
+            asset: match asset {
+                IntentAsset::Native => &native,
+                IntentAsset::Issued { code, issuer } => {
+                    issued = stellar_agent_core::asset_id::CanonicalAsset::classic(code, issuer)
+                        .map_err(|_| unexpected_envelope("the intent's asset is not canonical"))?;
+                    &issued
+                }
+            },
+            base_units: i128::from(*amount_stroops),
+        },
+        IntentPayload::CreateAccount {
+            starting_balance_stroops,
+            ..
+        } => CrossCheckValue::Amount {
+            asset: &native,
+            base_units: i128::from(*starting_balance_stroops),
+        },
+        IntentPayload::Trustline { .. } | IntentPayload::Claim { .. } => CrossCheckValue::Unvalued,
+    };
+    let cross_check = crate::cross_check::obtain_classic_witness_bound(
+        request.profile,
+        request.network,
+        value,
+        inputs,
+        &envelope,
+        request.thresholds,
+        request.tool,
+    )
+    .await?;
+    Ok(CanonicalRebuild {
+        unsigned_envelope_b64: envelope,
+        account,
+        fee_per_op_stroops: fee,
+        max_time_s,
+        cross_check,
+    })
+}
+
 /// The destinations a result shows for `envelope`. One destination shared by
 /// every payment operation gives `Single`, differing destinations give the
 /// whole list, and an envelope without a payment operation gives `None`.
@@ -504,7 +817,7 @@ fn commit_facts(unsigned_envelope_b64: &str, kind: OperationKind) -> Option<Comm
 
 /// The strkey of a transaction account: a G strkey, or an M strkey for a
 /// multiplexed account.
-fn muxed_strkey(account: &stellar_xdr::MuxedAccount) -> String {
+pub(crate) fn muxed_strkey(account: &stellar_xdr::MuxedAccount) -> String {
     match account {
         stellar_xdr::MuxedAccount::Ed25519(key) => stellar_strkey::ed25519::PublicKey(key.0)
             .to_string()
@@ -521,7 +834,7 @@ fn muxed_strkey(account: &stellar_xdr::MuxedAccount) -> String {
 }
 
 /// The G strkey of an account id.
-fn account_strkey(account: &stellar_xdr::AccountId) -> String {
+pub(crate) fn account_strkey(account: &stellar_xdr::AccountId) -> String {
     let stellar_xdr::PublicKey::PublicKeyTypeEd25519(key) = &account.0;
     stellar_strkey::ed25519::PublicKey(key.0)
         .to_string()
@@ -530,7 +843,7 @@ fn account_strkey(account: &stellar_xdr::AccountId) -> String {
 }
 
 /// An asset code without the zero bytes that pad it.
-fn asset_code(bytes: &[u8]) -> String {
+pub(crate) fn asset_code(bytes: &[u8]) -> String {
     let end = bytes
         .iter()
         .rposition(|byte| *byte != 0)
@@ -1564,6 +1877,394 @@ pub(crate) mod tests {
             PaymentDestinations::None
         );
         assert_eq!(envelope_result_destinations(""), PaymentDestinations::None);
+    }
+
+    /// A canonical slot read back from the authenticated store yields its
+    /// intent only when the stored value is the canonical JSON of a valid
+    /// intent, hashes to the stored digest, and names the admitted chain,
+    /// source and policy. Each refused record still looks up and shows its
+    /// status, and the check leaves the store file unchanged.
+    #[test]
+    #[serial_test::serial]
+    fn canonical_slot_is_validated_before_use() {
+        use crate::policy_state::operations::tests::Fx;
+        use crate::policy_state::{OperationTool, OperationView};
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let mut fx = Fx::new();
+        let intent = classic_intent(
+            base([0x11; 32], MemoFact::Id(7)),
+            IntentPayload::Pay {
+                destination: DESTINATION.to_owned(),
+                asset: IntentAsset::Native,
+                amount_stroops: 10,
+            },
+        )
+        .unwrap();
+        let json = serde_json::to_value(&intent).unwrap();
+        let digest = *intent.digest().as_bytes();
+        let slot = |intent: Value, intent_digest: [u8; 32]| IntentSlot::Canonical {
+            intent_digest,
+            intent,
+        };
+        let mut missing = json.clone();
+        missing["payload"]["pay"]
+            .as_object_mut()
+            .unwrap()
+            .remove("amount_stroops");
+        let mut unknown = json.clone();
+        unknown["base"]["note"] = json!("extra");
+        let mut invalid = json.clone();
+        invalid["payload"]["pay"]["amount_stroops"] = json!("0");
+        let other = json!({"base": json["base"], "payload": {"pay": {
+            "destination": OTHER, "asset": "native", "amount_stroops": "10"}}});
+        let cases = [
+            ("valid", slot(json.clone(), digest), None),
+            (
+                "missing field",
+                slot(missing, digest),
+                Some(CanonicalRefusal::Malformed),
+            ),
+            (
+                "unknown field",
+                slot(unknown, digest),
+                Some(CanonicalRefusal::Malformed),
+            ),
+            (
+                "invalid amount",
+                slot(invalid, digest),
+                Some(CanonicalRefusal::Malformed),
+            ),
+            (
+                "other intent",
+                slot(other, digest),
+                Some(CanonicalRefusal::StoredDigest),
+            ),
+            (
+                "envelope slot",
+                envelope_slot(&digest, &envelope(41, 1_900_000_000), 1_900_000_000),
+                Some(CanonicalRefusal::NotCanonical),
+            ),
+        ];
+        let admitted = CanonicalUse {
+            chain_id: "stellar:mainnet",
+            source: SOURCE,
+            policy_digest: [0x11; 32],
+        };
+        for (index, (name, intent_slot, _)) in cases.iter().enumerate() {
+            let opened = fx
+                .recorder()
+                .open(&OpenRequest {
+                    business_id: BusinessId::parse(&format!("order-{index}")).unwrap(),
+                    tool: OperationTool::CliPay,
+                    kind: OperationKind::Pay,
+                    intent: intent_slot.clone(),
+                    envelope_xdr: Some(envelope(41, 1_900_000_000)),
+                    prepared_decision: None,
+                    rule_ttl_ms: None,
+                })
+                .unwrap();
+            assert!(matches!(opened, OpenOutcome::New(_)), "{name}");
+        }
+        for (index, (name, _, expected)) in cases.iter().enumerate() {
+            let business_id = BusinessId::parse(&format!("order-{index}")).unwrap();
+            let Some(LookupOutcome::Resumable(handle)) =
+                fx.recorder().lookup(&business_id).unwrap()
+            else {
+                panic!("{name}: the record stays resumable")
+            };
+            let status = OperationStatus::new(&fx.store, &fx.profile);
+            assert!(status.view(&business_id).unwrap().is_some(), "{name}");
+            let listed: Vec<OperationView> = status.list_since(0).unwrap();
+            assert!(listed.iter().any(|view| view.business_id == business_id));
+            let before = std::fs::read(fx.store.path()).unwrap();
+            let result = canonical_slot_intent(handle.intent(), &admitted);
+            assert_eq!(std::fs::read(fx.store.path()).unwrap(), before, "{name}");
+            match expected {
+                None => assert_eq!(result.unwrap(), intent, "{name}"),
+                Some(refusal) => assert_eq!(result.unwrap_err(), *refusal, "{name}"),
+            }
+        }
+        let valid = slot(json, digest);
+        for (name, changed, part) in [
+            (
+                "chain",
+                CanonicalUse {
+                    chain_id: "stellar:testnet",
+                    ..admitted
+                },
+                CanonicalPart::Chain,
+            ),
+            (
+                "source",
+                CanonicalUse {
+                    source: OTHER,
+                    ..admitted
+                },
+                CanonicalPart::Source,
+            ),
+            (
+                "policy",
+                CanonicalUse {
+                    policy_digest: [0x12; 32],
+                    ..admitted
+                },
+                CanonicalPart::Policy,
+            ),
+        ] {
+            assert_eq!(
+                canonical_slot_intent(&valid, &changed).unwrap_err(),
+                CanonicalRefusal::Mismatch(part),
+                "{name}"
+            );
+        }
+    }
+
+    /// The `getLedgerEntries` answer of the fixture's source account at
+    /// `sequence`.
+    #[cfg(feature = "mainnet-write")]
+    fn source_at(f: &crate::mainnet::fixtures::ResolverFixture, sequence: i64) -> Value {
+        use stellar_xdr::{LedgerEntryData, WriteXdr as _};
+        let mut answer = f.source.ledger_entries_result();
+        let text = answer["entries"][0]["xdr"].as_str().unwrap().to_owned();
+        let LedgerEntryData::Account(mut account) =
+            LedgerEntryData::from_xdr_base64(&text, Limits::none()).unwrap()
+        else {
+            panic!("an account entry")
+        };
+        account.seq_num = stellar_xdr::SequenceNumber(sequence);
+        answer["entries"][0]["xdr"] = json!(
+            LedgerEntryData::Account(account)
+                .to_xdr_base64(Limits::none())
+                .unwrap()
+        );
+        answer
+    }
+
+    /// Mounts a ready primary endpoint serving the source at `sequence`, and
+    /// an oracle serving the same account.
+    #[cfg(feature = "mainnet-write")]
+    async fn serve_chain(
+        f: &crate::mainnet::fixtures::ResolverFixture,
+        primary: &wiremock::MockServer,
+        oracle: &wiremock::MockServer,
+        sequence: i64,
+        health: &str,
+    ) {
+        use stellar_agent_test_support::{EchoIdResponder, signed_envelope::get_network_result};
+        use wiremock::Mock;
+        use wiremock::matchers::{body_partial_json, method};
+        let now = stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1000;
+        primary.reset().await;
+        oracle.reset().await;
+        let answers = [
+            (
+                "getHealth",
+                json!({"status": health, "latestLedger": 100, "oldestLedger": 1,
+                    "ledgerRetentionWindow": 99}),
+            ),
+            (
+                "getLedgers",
+                json!({"latestLedger": 100, "latestLedgerCloseTime": now.to_string(),
+                    "oldestLedger": 1, "oldestLedgerCloseTime": 1, "cursor": "100",
+                    "ledgers": []}),
+            ),
+            (
+                "getNetwork",
+                get_network_result(stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE),
+            ),
+            ("getLedgerEntries", source_at(f, sequence)),
+        ];
+        for (rpc, answer) in answers {
+            for server in [primary, oracle] {
+                Mock::given(method("POST"))
+                    .and(body_partial_json(json!({ "method": rpc })))
+                    .respond_with(EchoIdResponder::new(answer.clone()))
+                    .mount(server)
+                    .await;
+            }
+        }
+    }
+
+    /// The JSON-RPC methods `server` received, in order.
+    #[cfg(feature = "mainnet-write")]
+    async fn methods(server: &wiremock::MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|request| {
+                serde_json::from_slice::<Value>(&request.body).unwrap()["method"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// A rebuild after consent reads readiness, then the source account, then
+    /// the oracle, and binds the envelope and the oracle proof to the account
+    /// read then. A sequence that moves during consent gives a new envelope,
+    /// hash and proof. A readiness refusal reads nothing further, and a fee
+    /// above the bound or an exhausted sequence asks the oracle nothing. An
+    /// exhausted sequence refuses before the deadline clock is read.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rebuild_reads_after_consent_and_rebinds_oracle() {
+        use crate::cross_check::{
+            AccountObservation, CrossCheckOutcome, DestinationObservation, MemoObservation,
+            PayWitnessInputs,
+        };
+        use crate::mainnet::canonical::{CanonicalCheck, match_envelope};
+        use crate::mainnet::fixtures::ResolverFixture;
+        let f = ResolverFixture::configured(
+            |profile| {
+                use stellar_agent_core::profile::schema::{PrimaryProviderRecord, ProviderRecord};
+                let providers = profile.providers.get_or_insert_with(Default::default);
+                providers.primary =
+                    Some(PrimaryProviderRecord::new("primary", "rpc.example.invalid"));
+                providers.oracle = Some(ProviderRecord::new(
+                    "oracle",
+                    "oracle.example.invalid",
+                    true,
+                ));
+                profile.oracle_provider_url =
+                    Some("https://oracle.example.invalid".parse().unwrap());
+                profile.cross_check_threshold_stroops = 0;
+            },
+            str::to_owned,
+        );
+        let primary = wiremock::MockServer::start().await;
+        let oracle = wiremock::MockServer::start().await;
+        let context = f.context_with_routes(&[
+            ("rpc.example.invalid", &primary.uri()),
+            ("oracle.example.invalid", &oracle.uri()),
+        ]);
+        let network = context.network_context();
+        let client = context.primary_client().unwrap();
+        let thresholds = stellar_agent_core::cross_check::ThresholdSet::from_profile(&f.profile);
+        let intent = classic_intent(
+            IntentBaseFacts {
+                chain_id: "stellar:mainnet",
+                source: f.source.source(),
+                policy_digest: f.policy.digest(),
+                signed_fee_cap: Some(500),
+                profile_fee_cap: None,
+                fee_choice: ClassicFeeChoice::ProfileDefault,
+                memo: MemoFact::None,
+            },
+            IntentPayload::Pay {
+                destination: f.source.destination().to_owned(),
+                asset: IntentAsset::Native,
+                amount_stroops: 10,
+            },
+        )
+        .unwrap();
+        let prepared = AccountObservation {
+            account_id: f.source.source().to_owned(),
+            sequence: 1,
+            native_balance: 0,
+            subentry_count: 0,
+            flags: None,
+        };
+        let rebuild = |fee_choice| {
+            rebuild_canonical(CanonicalRebuildRequest {
+                profile: &f.profile,
+                network: &network,
+                client: &client,
+                deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+                intent: &intent,
+                fee_choice,
+                default_fee_per_op_stroops: 100,
+                fee_cap_stroops: 500,
+                witness_inputs: PayWitnessInputs {
+                    source: prepared.clone(),
+                    destination: DestinationObservation::from_view(f.source.destination(), None),
+                    memo: MemoObservation::Read(false),
+                    trustline: None,
+                }
+                .into(),
+                thresholds: &thresholds,
+                tool: "stellar_pay",
+            })
+        };
+        let subject = |rebuilt: &CanonicalRebuild| match &rebuilt.cross_check {
+            CrossCheckOutcome::Passed(witness) => witness.subject().unwrap(),
+            other => panic!("a bound witness, got {other:?}"),
+        };
+        let tx_hash = |envelope: &str| {
+            let decoded = TransactionEnvelope::from_xdr_base64(envelope, Limits::none()).unwrap();
+            stellar_agent_core::hex::decode_hex32(
+                &crate::submit::compute_local_tx_hash_hex(&decoded, network.network_passphrase())
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let now_ms = crate::mainnet::clock::now_ms().unwrap();
+        let check = CanonicalCheck {
+            intent: &intent,
+            fee_cap_stroops: 500,
+            now_ms,
+            claim_entry: None,
+        };
+
+        serve_chain(&f, &primary, &oracle, 1, "healthy").await;
+        let first = rebuild(ClassicFeeChoice::ProfileDefault).await.unwrap();
+        assert_eq!(
+            methods(&primary).await,
+            ["getHealth", "getLedgers", "getLedgerEntries"]
+        );
+        assert!(
+            methods(&oracle)
+                .await
+                .contains(&"getLedgerEntries".to_owned())
+        );
+        let matched = match_envelope(&first.unsigned_envelope_b64, &check).unwrap();
+        assert_eq!(
+            (matched.sequence, matched.fee_stroops, matched.max_time_s),
+            (2, 100, now_ms / 1000 + 120)
+        );
+        assert_eq!(subject(&first), tx_hash(&first.unsigned_envelope_b64));
+
+        serve_chain(&f, &primary, &oracle, 5, "healthy").await;
+        let second = rebuild(ClassicFeeChoice::ProfileDefault).await.unwrap();
+        assert_eq!(second.account.sequence_number, 5);
+        assert_eq!(
+            match_envelope(&second.unsigned_envelope_b64, &check)
+                .unwrap()
+                .sequence,
+            6
+        );
+        assert_ne!(second.unsigned_envelope_b64, first.unsigned_envelope_b64);
+        assert_eq!(subject(&second), tx_hash(&second.unsigned_envelope_b64));
+        assert_ne!(subject(&second), subject(&first));
+
+        serve_chain(&f, &primary, &oracle, 5, "unhealthy").await;
+        let refused = rebuild(ClassicFeeChoice::ProfileDefault).await.unwrap_err();
+        assert_eq!(refused.code(), "network.endpoint_not_ready");
+        assert_eq!(methods(&primary).await, ["getHealth"]);
+        assert!(methods(&oracle).await.is_empty());
+
+        serve_chain(&f, &primary, &oracle, 5, "healthy").await;
+        let above = rebuild(ClassicFeeChoice::Explicit(501)).await.unwrap_err();
+        assert_eq!(above.code(), "fees.percentile_exceeds_cap");
+        assert!(rebuild(ClassicFeeChoice::Explicit(500)).await.is_ok());
+        serve_chain(&f, &primary, &oracle, i64::MAX, "healthy").await;
+        let exhausted = rebuild(ClassicFeeChoice::ProfileDefault).await.unwrap_err();
+        assert_eq!(exhausted.code(), "protocol.xdr_codec_failed");
+        assert!(methods(&oracle).await.is_empty());
+
+        let clock = crate::mainnet::clock::set_clock_error_for_test();
+        serve_chain(&f, &primary, &oracle, 5, "healthy").await;
+        let unread = rebuild(ClassicFeeChoice::ProfileDefault).await.unwrap_err();
+        assert_eq!(unread.code(), "wallet.clock_error");
+        serve_chain(&f, &primary, &oracle, i64::MAX, "healthy").await;
+        let exhausted = rebuild(ClassicFeeChoice::ProfileDefault).await.unwrap_err();
+        assert_eq!(exhausted.code(), "protocol.xdr_codec_failed");
+        drop(clock);
     }
 
     #[test]

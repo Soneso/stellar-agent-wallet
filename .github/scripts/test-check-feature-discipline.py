@@ -59,6 +59,7 @@ FIXTURE_DEPENDENCIES = {
     'mcp': ['core', 'network', 'sep43', 'x402', 'x402-identity'],
     'sep10': ['core', 'network'], 'sep43': ['core', 'network'],
     'x402': ['core', 'network', 'sep43'], 'x402-identity': ['core', 'network', 'sep10'],
+    'approval-remote': ['core', 'network', 'mcp'],
     'other': [],
 }
 # The one error of each variant that targets a crate of the authorized

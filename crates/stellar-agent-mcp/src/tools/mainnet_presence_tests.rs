@@ -527,7 +527,7 @@ async fn gate_of_running_server(run: &ClassicRun) -> serde_json::Value {
 }
 
 /// A signed listener can persist only under the policy it issued under.
-/// A re-sign keeps the record unauthorised at the MCP commit boundary.
+/// A re-sign keeps the record unauthorized at the MCP commit boundary.
 #[tokio::test]
 #[serial_test::serial(keyring)]
 #[serial_test::serial]

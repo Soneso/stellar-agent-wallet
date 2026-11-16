@@ -55,8 +55,13 @@
 # its one browser-driven test only; its two negative-path tests drive the
 # real HTTP surface directly and need no browser. The mainnet consent browser
 # suite (mainnet_presence_browser_acceptance) has the same Chromium
-# dependency for its one test. Both suites serve their pages over loopback
-# HTTP and need no testnet or RPC.
+# dependency. Both suites need no testnet or RPC. Their loopback cases serve
+# plain HTTP; their HTTPS cases serve a signed origin whose certificate a
+# test authority issues. Before each attempt the driver generates that
+# authority and installs it into fresh NSS databases that only the suite's
+# Chromium reads, so these suites run on Linux only and need openssl and
+# certutil (libnss3-tools) on PATH. Chromium validates the certificates
+# itself: no certificate error is ignored and no host trust store changes.
 #
 # Every suite that signs a smart-account authorization needs
 # STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL: a testnet Soroban RPC endpoint on
@@ -85,6 +90,8 @@ mkdir -p "$storage_root"
 STELLAR_AGENT_HOME=$(mktemp -d "$storage_root/acceptance.XXXXXX")
 touch "$STELLAR_AGENT_HOME/.stellar-agent-test-sandbox"
 export STELLAR_AGENT_HOME
+# Each attempt of a trusted browser suite gets a fresh directory below it.
+trust_root=${storage_root%/*}/browser-trust
 
 # Native-capable routes use the selected headless or platform store.
 # Other suites retain their explicit fixture storage.
@@ -136,6 +143,81 @@ CHILD_DRIVER_SUITES=(
 needs_server_child() {
   local crate="$1" target="$2"
   [ "$crate" = stellar-agent-mcp ] && printf '%s\n' "${CHILD_DRIVER_SUITES[@]}" | grep -qxF "$target"
+}
+
+# Browser suites whose HTTPS cases need a test certificate authority that
+# Chromium trusts. Before each attempt of such a suite, the driver prepares a
+# fresh private directory and passes it to cargo as
+# STELLAR_AGENT_BROWSER_TRUST_DIR; nothing else in the environment changes.
+TRUSTED_BROWSER_SUITES=(
+  "operator_enroll_browser_acceptance"
+  "mainnet_presence_browser_acceptance"
+)
+# The DNS names of the leaf certificates: the signed host of the suites'
+# fixtures and a host of another RP. The suites map both to loopback.
+BROWSER_TRUST_HOST=approve.example.invalid
+BROWSER_TRUST_FOREIGN_HOST=foreign.example.invalid
+
+needs_browser_trust() {
+  printf '%s\n' "${TRUSTED_BROWSER_SUITES[@]}" | grep -qxF "$1"
+}
+
+# Writes a certificate authority and a leaf it signs for both trust hosts:
+# <dir>/<name>-ca.pem, <name>-chain.pem (leaf, then the authority) and
+# <name>-key.pem, readable only by the owner.
+make_test_chain() {
+  local dir="$1" name="$2"
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
+    -subj "/CN=stellar-agent $name test authority" -keyout "$dir/$name-ca-key.pem" -out "$dir/$name-ca.pem" \
+    -addext 'basicConstraints=critical,CA:true' -addext 'keyUsage=critical,keyCertSign,cRLSign' \
+    && openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj "/CN=$BROWSER_TRUST_HOST" \
+      -keyout "$dir/$name-key.pem" -out "$dir/$name.csr" \
+    && printf 'subjectAltName=DNS:%s,DNS:%s\nextendedKeyUsage=serverAuth\nbasicConstraints=critical,CA:false\n' \
+      "$BROWSER_TRUST_HOST" "$BROWSER_TRUST_FOREIGN_HOST" > "$dir/$name.ext" \
+    && openssl x509 -req -in "$dir/$name.csr" -CA "$dir/$name-ca.pem" -CAkey "$dir/$name-ca-key.pem" \
+      -CAcreateserial -days 2 -extfile "$dir/$name.ext" -out "$dir/$name-leaf.pem" \
+    && cat "$dir/$name-leaf.pem" "$dir/$name-ca.pem" > "$dir/$name-chain.pem" \
+    && chmod 600 "$dir/$name-key.pem" "$dir/$name-ca-key.pem"
+}
+
+# Prepares <dir> for one attempt of a trusted browser suite: a trusted chain
+# whose authority is the only anchor of two fresh NSS databases below
+# <dir>/home, and an untrusted chain from an authority no database holds.
+# <dir>/<name>.pin holds the SHA-256 of each leaf's SubjectPublicKeyInfo.
+# Chromium reads the databases only when a suite starts it with
+# HOME=<dir>/home.
+prepare_browser_trust() {
+  local dir="$1" tool db name
+  if [ "$(uname -s)" != Linux ]; then
+    echo "error: the HTTPS browser suites trust their test authority through NSS databases, which only Linux Chromium reads" >&2
+    return 1
+  fi
+  for tool in openssl certutil; do
+    if ! command -v "$tool" > /dev/null; then
+      echo "error: the HTTPS browser suites need $tool on PATH (certutil comes from libnss3-tools)" >&2
+      return 1
+    fi
+  done
+  (umask 077 && make_test_chain "$dir" trusted && make_test_chain "$dir" untrusted) > /dev/null 2>&1 || {
+    echo "error: generating the browser test certificates failed" >&2
+    return 1
+  }
+  for name in trusted untrusted; do
+    openssl x509 -in "$dir/$name-leaf.pem" -pubkey -noout | openssl pkey -pubin -outform DER \
+      | openssl dgst -sha256 -r | cut -c1-64 > "$dir/$name.pin"
+    if ! grep -qxE '[0-9a-f]{64}' "$dir/$name.pin"; then
+      echo "error: deriving the $name browser test leaf pin failed" >&2
+      return 1
+    fi
+  done
+  for db in "$dir/home/.pki/nssdb" "$dir/home/.local/share/pki/nssdb"; do
+    mkdir -p "$db"
+    if ! certutil -N --empty-password -d "sql:$db" \
+      || ! certutil -A -d "sql:$db" -n stellar-agent-test-ca -t 'C,,' -i "$dir/trusted-ca.pem"; then
+      echo "error: installing the browser test authority into $db failed" >&2
+      return 1
+    fi
+  done
 }
 
 # Completeness guard: every live test file on disk, a *testnet* file or a
@@ -377,14 +459,27 @@ in_share() {
 #
 # A suite of CHILD_DRIVER_SUITES first runs the paired prebuild of the CLI
 # and MCP tests with the same flags. A failed prebuild returns 3 before the
-# suite runs.
+# suite runs. A suite of TRUSTED_BROWSER_SUITES first prepares its trust
+# directory; a failed setup returns 3 before any cargo call.
 run_suite() {
   local crate="$1" feature="$2" target="$3" features log status summary executed deterministic tmp_root start
+  local -a trust_env=()
   features=$(suite_features "$crate" "$feature" "$target") || return 3
   tmp_root=${TMPDIR:-/tmp}
-  log=$(mktemp "${tmp_root%/}/run-testnet-acceptance.XXXXXX")
   start=$SECONDS
   LAST_SKIPS=0
+  if needs_browser_trust "$target"; then
+    local trust_dir
+    mkdir -p "$trust_root"
+    trust_dir=$(mktemp -d "$trust_root/attempt.XXXXXX")
+    if ! prepare_browser_trust "$trust_dir"; then
+      LAST_SECONDS=$((SECONDS - start))
+      echo "error: the browser trust setup for $crate/$target failed; the suite does not run" >&2
+      return 3
+    fi
+    trust_env=(STELLAR_AGENT_BROWSER_TRUST_DIR="$trust_dir")
+  fi
+  log=$(mktemp "${tmp_root%/}/run-testnet-acceptance.XXXXXX")
   if needs_server_child "$crate" "$target"; then
     cargo test -p stellar-agent-cli -p "$crate" --no-default-features --features "$features" --no-run 2>&1 | tee "$log"
     status=${PIPESTATUS[0]}
@@ -395,7 +490,7 @@ run_suite() {
       return 3
     fi
   fi
-  cargo test -p "$crate" --no-default-features --features "$features" --test "$target" \
+  env "${trust_env[@]}" cargo test -p "$crate" --no-default-features --features "$features" --test "$target" \
     -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$log"
   status=${PIPESTATUS[0]}
   LAST_SECONDS=$((SECONDS - start))

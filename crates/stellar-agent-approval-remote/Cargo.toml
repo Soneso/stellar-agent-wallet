@@ -78,6 +78,10 @@ testnet-acceptance = ["test-helpers", "stellar-agent-mcp/test-helpers", "stellar
 #     --test operator_enroll_browser_acceptance -- --ignored
 # CI/dev-only; MUST NOT be enabled in any release-artefact feature set.
 operator-enroll-browser-acceptance = ["test-helpers"]
+# Builds the tests against the mainnet-write build of the wallet crates they
+# drive, so the acceptance runner's feature-on leg reaches this crate. Off by
+# default; the library itself has no mainnet-write gate.
+mainnet-write = ["stellar-agent-core/mainnet-write", "stellar-agent-network/mainnet-write", "stellar-agent-mcp/mainnet-write"]
 
 [dev-dependencies]
 stellar-agent-smart-account = { path = "../stellar-agent-smart-account", features = ["test-helpers"] }
@@ -96,7 +100,9 @@ keyring-core = { workspace = true }
 # the WebAuthn-ceremony-adjacent signing/encoding helpers the acceptance test
 # needs to seed a virtual authenticator with a known keypair.
 stellar-agent-mcp = { path = "../stellar-agent-mcp", default-features = false }
-stellar-agent-network = { path = "../stellar-agent-network" }
+# The signed-origin commit fixture routes submission through the network
+# test transport.
+stellar-agent-network = { path = "../stellar-agent-network", features = ["test-hooks"] }
 # The rule-proposal acceptance suite registers a co-signer WebAuthn credential
 # via the local bridge (the rules_webauthn precedent) and exercises the
 # toolset-gated sign-rule-create first-invoke-grant path.
@@ -116,11 +122,11 @@ rmcp = { workspace = true }
 workspace = true
 
 [package.metadata.cargo-machete]
-# `rustls` / `tokio-rustls` / `rustls-pki-types` are never imported directly
-# by name in this crate's source — they exist solely to pin the `ring`
-# crypto-provider feature onto the shared `rustls` dependency edge that
-# `axum-server` (with `tls-rustls-no-provider`) also pulls in. Removing them
-# would silently let the shared dependency default back to `aws-lc-rs`,
-# reintroducing the second crypto backend `deny.toml` forbids. See the
-# comment above the `rustls` dependency declaration.
+# `rustls` and `rustls-pki-types` build the signed listeners' TLS
+# configuration, and the test helpers use `tokio-rustls`. All three also pin
+# the `ring` crypto-provider feature onto the shared `rustls` dependency edge
+# that `axum-server` (with `tls-rustls-no-provider`) pulls in. Removing them
+# would let the shared dependency default back to `aws-lc-rs`, the second
+# crypto backend `deny.toml` forbids. See the comment above the `rustls`
+# dependency declaration.
 ignored = ["rustls", "tokio-rustls", "rustls-pki-types"]
