@@ -52,6 +52,34 @@ pub(super) fn configure_budget(budget: &mut Budget) {
     }
 }
 
+/// A hook that sees each native release's zero-based index and the call
+/// deadline before the release starts.
+type ReleaseHook = Box<dyn FnMut(usize, &mut Instant)>;
+thread_local! {
+    static RELEASE_HOOK: std::cell::RefCell<Option<(usize, ReleaseHook)>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn before_release(budget: &mut Budget) {
+    RELEASE_HOOK.with_borrow_mut(|slot| {
+        if let Some((index, hook)) = slot {
+            hook(*index, &mut budget.deadline);
+            *index += 1;
+        }
+    });
+}
+
+/// Runs `hook` before each native release on this thread until the guard drops.
+pub(crate) fn on_release(hook: impl FnMut(usize, &mut Instant) + 'static) -> impl Drop {
+    struct Armed;
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            RELEASE_HOOK.with_borrow_mut(|slot| *slot = None);
+        }
+    }
+    RELEASE_HOOK.with_borrow_mut(|slot| *slot = Some((0, Box::new(hook))));
+    Armed
+}
+
 /// The seam after the write's audit append, before its prepared image.
 const AUDIT_APPENDED: u8 = 0xA1;
 

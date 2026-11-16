@@ -17,8 +17,9 @@ use tokio::time::Instant;
 use super::notices::CommittedBatch;
 use super::operations::{
     AgreedOutcome, EvidenceAnswer, EvidenceEndpoint, EvidenceInput, EvidenceRowInput,
-    ExposureIdentity, NotIncludedProof, OperationId, OperationRecorder, OperationStatus,
-    RecoveryAttempt, RecoveryUpdate, SequenceReleaseInput, WindowObservation,
+    ExposureIdentity, NotIncludedProof, ObligationKind, OperationId, OperationRecorder,
+    OperationStatus, RecoveryAttempt, RecoveryUpdate, ReleaseObligation, SequenceReleaseInput,
+    WindowObservation,
 };
 use super::recovery_run::{
     RecoveryClass, RecoveryRole, RecoveryRunMethod, RecoveryRunPhase, RecoveryRunState,
@@ -664,6 +665,8 @@ fn account_digest(answers: &[AccountAnswer; 2]) -> Result<[u8; 32], WindowStoreE
 
 struct SharedObservation {
     report: OperationalReport,
+    /// The latest close time in Unix milliseconds.
+    close_ms: u64,
     oldest: u32,
     read_at: Instant,
 }
@@ -676,7 +679,17 @@ impl SharedObservation {
     fn window(&self, now_ms: u64) -> WindowObservation {
         WindowObservation {
             ledger: self.report.latest_ledger,
-            close_time_floor_ms: self.report.close_time_unix.saturating_mul(1_000),
+            close_time_floor_ms: self.close_ms,
+            observed_at_ms: now_ms,
+        }
+    }
+
+    /// The observation both endpoints prove: the smaller latest ledger and
+    /// the smaller close time.
+    fn paired(&self, other: &Self, now_ms: u64) -> WindowObservation {
+        WindowObservation {
+            ledger: self.report.latest_ledger.min(other.report.latest_ledger),
+            close_time_floor_ms: self.close_ms.min(other.close_ms),
             observed_at_ms: now_ms,
         }
     }
@@ -690,10 +703,10 @@ async fn shared_observation(
     let read_at = Instant::now();
     budget.context(budget.context.0, RecoveryMethod::GetHealth, None);
     let observed = budget.read(true, client.recovery_health()).await?;
-    if observed.latest_close.checked_mul(1_000).is_none() {
+    let Some(close_ms) = observed.latest_close.checked_mul(1_000) else {
         budget.failed(RecoveryReason::MissingField);
         return Err(ReadFailure::Pending);
-    }
+    };
     let report =
         OperationalReport::from_health_observation(&observed, now_ms / 1_000).map_err(|_| {
             budget.failed(RecoveryReason::Lagging);
@@ -701,6 +714,7 @@ async fn shared_observation(
         })?;
     Ok(SharedObservation {
         oldest: observed.health.oldest_ledger,
+        close_ms,
         report,
         read_at,
     })
@@ -1460,13 +1474,15 @@ fn sequence_failure_detail(status: &OperationStatus<'_>, attempts: &[RecoveryAtt
     )
 }
 
-/// Wraps a store refusal of the reservation, the release or stop, or the
-/// decision write in the verified progress of `selected`, with
-/// `; decided: N` when N of them hold a committed decision.
-/// Every other refusal returns unchanged.
+/// Wraps a store refusal of the reservation, the release or stop, the
+/// decision write or a native release in the verified progress of
+/// `selected`, with `; decided: N` when N of them hold a committed
+/// decision, and `; native releases: N of M` when N of the M `candidates`
+/// no longer owe a release. Every other refusal returns unchanged.
 fn progress_context(
     status: &OperationStatus<'_>,
     selected: &[RecoveryAttempt],
+    candidates: &[ReleaseObligation],
     now_ms: u64,
     error: RecoveryError,
 ) -> RecoveryError {
@@ -1474,6 +1490,16 @@ fn progress_context(
         return error;
     }
     let mut detail = sequence_failure_detail(status, selected);
+    if !candidates.is_empty() {
+        let released = status.release_candidates(None).map_or_else(
+            |_| "unavailable".to_owned(),
+            |open| {
+                let done = candidates.iter().filter(|c| !open.contains(c)).count();
+                format!("{done} of {}", candidates.len())
+            },
+        );
+        detail.push_str(&format!("; native releases: {released}"));
+    }
     let decided = selected
         .iter()
         .filter(|a| {
@@ -1858,6 +1884,8 @@ struct Driver<'a> {
     writer: &'a Arc<Mutex<AuditWriter>>,
     /// An explicit request may reserve an eligible stopped attempt early.
     retry: bool,
+    /// The release obligations this call may release once proved due.
+    candidates: &'a [ReleaseObligation],
 }
 
 impl Driver<'_> {
@@ -1909,6 +1937,73 @@ impl Driver<'_> {
         committed.append(recorder.take_committed());
         written
     }
+
+    /// Releases each candidate that the verified pair proves due at its
+    /// paired observation, through the window's own recheck and atomic
+    /// release, without the operator's clear. Each release starts only
+    /// before the call deadline and while both observations are fresh; a
+    /// committed release stands when a later one stops or refuses.
+    fn release_due(
+        &self,
+        committed: &mut CommittedBatch,
+        pair: [&SharedObservation; 2],
+        now_ms: u64,
+        budget: &mut Budget,
+    ) -> Result<(), WindowStoreError> {
+        if self.candidates.is_empty() {
+            return Ok(());
+        }
+        let observation = pair[0].paired(pair[1], now_ms);
+        let due: Vec<_> = OperationStatus::new(self.store, self.profile)
+            .release_obligations(Some(observation))?
+            .into_iter()
+            .filter(|due| {
+                self.candidates.iter().any(|candidate| {
+                    (candidate.operation_id, candidate.attempt_index)
+                        == (due.operation_id, due.attempt_index)
+                })
+            })
+            .collect();
+        if due.is_empty() {
+            return Ok(());
+        }
+        let mut writer = self.writer.lock().map_err(|_| WindowStoreError::Invalid {
+            detail: "audit writer mutex is poisoned".into(),
+        })?;
+        let mut recorder = OperationRecorder::new(
+            self.store,
+            self.profile,
+            &mut *writer,
+            uuid::Uuid::new_v4().to_string(),
+        );
+        let mut released = Ok(());
+        for obligation in due {
+            #[cfg(test)]
+            driver_tests::before_release(budget);
+            if Instant::now() >= budget.deadline || pair.iter().any(|shared| shared.stale()) {
+                budget.context(RecoveryEndpoint::Primary, RecoveryMethod::GetHealth, None);
+                budget.failed(if Instant::now() >= budget.deadline {
+                    RecoveryReason::Deadline
+                } else {
+                    RecoveryReason::Lagging
+                });
+                break;
+            }
+            released = recorder
+                .release_obligation(
+                    obligation.operation_id,
+                    obligation.attempt_index,
+                    observation,
+                    false,
+                )
+                .map(|_| ());
+            if released.is_err() {
+                break;
+            }
+        }
+        committed.append(recorder.take_committed());
+        released
+    }
 }
 
 /// What one driver call returns besides its durable writes.
@@ -1923,10 +2018,11 @@ struct Collected {
     unreached: Option<RecoveryFailure>,
 }
 
-/// Runs the shared prefix, then reserves, stops or decides each reached
-/// attempt of `attempts`, at most four, within the attempt and shared
-/// allowances and the call deadline. With `driver.retry`, an eligible
-/// stopped attempt reserves a fresh explicit run even before its retry time.
+/// Runs the shared prefix, releases the due `driver.candidates`, then
+/// reserves, stops or decides each reached attempt of `attempts`, at most
+/// four, within the attempt and shared allowances and the call deadline.
+/// With `driver.retry`, an eligible stopped attempt reserves a fresh
+/// explicit run even before its retry time.
 async fn collect_outcomes(
     driver: &Driver<'_>,
     pair: &EndpointPair<'_>,
@@ -1963,6 +2059,7 @@ async fn collect_outcomes(
         Ok(shared) => shared,
         Err(_) => return Ok(prefix(budget)),
     };
+    driver.release_due(committed, [&primary, &oracle], now_ms, budget)?;
     let configuration = recovery_configuration_digest(driver.profile);
     for attempt in attempts {
         budget.deadline = call_deadline;
@@ -2473,6 +2570,14 @@ fn not_found_covers(observed: &crate::ObservedTransaction, target: Option<u32>) 
 /// A hash selects one attempt, including its non-runnable scheduling result.
 /// Each reached attempt reserves a lease and can release and decide in this call.
 /// Reports also include retained classic attempts with no runnable work.
+///
+/// The same pass releases native obligations: x402 entries and terminal
+/// timed classic attempts that both endpoints prove due, at the smaller
+/// paired ledger and close time, before any classic attempt runs. A store
+/// with such candidates and no classic work still reads the shared
+/// prefix; untimed releases stay with the operator's clear. A hash selects
+/// only its own attempt's obligation. Obligations take no classic slot.
+///
 /// The shared prefix writes nothing. Production dispatch and targeted status
 /// recovery each call this driver once. Receipt replacement and
 /// acknowledgement remain separate.
@@ -2480,10 +2585,12 @@ fn not_found_covers(observed: &crate::ObservedTransaction, target: Option<u32>) 
 /// # Errors
 /// Returns snapshot, audit and commit errors. An endpoint on another network
 /// or protocol refuses the pass before any commit. A store refusal of the
-/// reservation, the release or stop, or the decision write returns
-/// [`RecoveryError::Context`] around the store root, with the verified
-/// progress of the selected attempts and `; decided: N` when N of them hold
-/// a committed decision.
+/// reservation, the release or stop, the decision write or a native release
+/// returns [`RecoveryError::Context`] around the store root, with the
+/// verified progress of the selected attempts, `; decided: N` when N of
+/// them hold a committed decision, and `; native releases: N of M` when
+/// the pass had M release candidates. Releases committed before a refusal
+/// stand.
 pub async fn recover_outcomes(
     store: &PersistedWindowStore,
     profile: &Profile,
@@ -2541,7 +2648,17 @@ async fn recover_reported(
     let status = OperationStatus::new(store, profile);
     let now_ms = super::store::now_ms()?;
     let attempts = status.runnable_snapshot(tx_hash, now_ms)?;
-    if !profile.chain_id.is_mainnet() || attempts.is_empty() {
+    // An untimed release needs the operator's clear, so it starts no pass.
+    let candidates: Vec<_> = if profile.chain_id.is_mainnet() {
+        status
+            .release_candidates(tx_hash)?
+            .into_iter()
+            .filter(|candidate| candidate.kind != ObligationKind::TerminalUntimed)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if !profile.chain_id.is_mainnet() || (attempts.is_empty() && candidates.is_empty()) {
         return if profile.chain_id.is_mainnet() {
             RecoveryReport::read(&status, tx_hash, now_ms).map_err(RecoveryError::from)
         } else {
@@ -2567,7 +2684,7 @@ async fn recover_reported(
         .collect();
     let mut report = RecoveryReport::default();
     let mut unreached = None;
-    let evaluated = if runnable.is_empty() {
+    let evaluated = if runnable.is_empty() && candidates.is_empty() {
         Vec::new()
     } else {
         let driver = Driver {
@@ -2575,6 +2692,7 @@ async fn recover_reported(
             profile,
             writer,
             retry,
+            candidates: &candidates,
         };
         let mut budget = Budget::new();
         let collected = collect_outcomes(&driver, &pair, &runnable, now_ms, committed, &mut budget)
@@ -2603,7 +2721,7 @@ async fn recover_reported(
                         }
                     }
                 }
-                progress_context(&status, &runnable, now_ms, error).with_report(report)
+                progress_context(&status, &runnable, &candidates, now_ms, error).with_report(report)
             })?;
         report.requests = collected.requests;
         unreached = collected.unreached;
@@ -2814,7 +2932,7 @@ pub fn claim_fixture_authorization(
 }
 
 #[cfg(test)]
-mod driver_tests;
+pub(crate) mod driver_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4407,7 +4525,7 @@ mod tests {
                 };
                 recorder.write_recovery_run(attempt, &release_input(attempt), &run, None)
             })
-            .map_err(|error| progress_context(status, attempts, NOW, error.into()))
+            .map_err(|error| progress_context(status, attempts, &[], NOW, error.into()))
     }
 
     /// The selected attempts that hold no matched release yet.
@@ -6387,6 +6505,7 @@ mod tests {
                 close_time_unix: NOW / 1_000,
                 close_lag_seconds: 0,
             },
+            close_ms: NOW,
             oldest: 1,
             read_at: Instant::now(),
         };
