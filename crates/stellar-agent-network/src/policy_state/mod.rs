@@ -68,6 +68,13 @@
 //! against each other, so a single call cannot overshoot a bucket by spreading
 //! its spend across legs.
 //!
+//! Evaluations of the same payment can compose their holds through
+//! [`crate::mainnet::holds::size_evaluated_holds`]. Each descriptor uses its own
+//! evaluated recipient class. Explicit composition retains one debit per
+//! complete key and epoch, with the tighter compatible limit. Singleton calls
+//! retain repeated criteria. Mint admits the entire vector under its existing
+//! window lock; snapshots alone reserve no capacity.
+//!
 //! # Reservation settlement
 //!
 //! Exposure counts through the signed execution deadline and each admitted

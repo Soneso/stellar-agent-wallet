@@ -1533,7 +1533,8 @@ pub trait PolicyEngine: Send + Sync {
     ///
     /// # Errors
     /// Stateful engines must implement this entry; the default refuses them.
-    /// Stateless engines retain their ordinary evaluation errors.
+    /// Provisional evaluation requires an explicit value in the default entry.
+    /// Stateless engines otherwise retain their ordinary evaluation errors.
     fn evaluate_in_snapshot(
         &self,
         inputs: PolicyEvaluationInputs<'_>,
@@ -1542,6 +1543,11 @@ pub trait PolicyEngine: Send + Sync {
         if self.window_state_store().is_some() {
             return Err(PolicyError::Internal {
                 detail: "stateful engine does not support evaluation snapshots".to_owned(),
+            });
+        }
+        if inputs.provisional && inputs.value.is_none() {
+            return Err(PolicyError::Internal {
+                detail: "provisional snapshot evaluation requires an explicit value".to_owned(),
             });
         }
         match inputs.value {

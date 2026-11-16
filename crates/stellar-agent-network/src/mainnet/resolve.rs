@@ -1100,10 +1100,15 @@ mod enabled {
                 now,
             )
             .map_err(|_| refused(P::PolicyEvaluationFailed))?;
-        let value = check_evaluation(&evaluation, req.authority)?;
-        let entries = engine
-            .size_window_entries(&descriptor, req.context.profile(), &value, now)
-            .map_err(|_| refused(P::PolicyEvaluationFailed))?;
+        check_evaluation(&evaluation, req.authority)?;
+        let entries = crate::mainnet::holds::size_evaluated_holds(
+            &engine,
+            req.context.profile(),
+            (&descriptor, &evaluation),
+            None,
+            now,
+        )
+        .map_err(|_| refused(P::PolicyEvaluationFailed))?;
         let asset = match req.consumer {
             MainnetConsumer::CliPay | MainnetConsumer::McpPay => {
                 Some(match args["asset"].as_str().unwrap_or("") {
@@ -6412,6 +6417,50 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn resolve_tx_sign_preserves_repeated_windowed_criteria() {
+        use stellar_agent_core::policy::v1::criteria::state_store::{
+            StateKey, WindowEntry, WindowLimit,
+        };
+
+        let f = ResolverFixture::configured(
+            |_| {},
+            |raw| {
+                let criterion = "{ kind = \"rate_limit\", window = \"1d\", max_calls = 10 }";
+                raw.replace(criterion, &format!("{criterion},\n    {criterion}"))
+            },
+        );
+        let server = f.server().await;
+        let endpoint =
+            stellar_agent_core::mainnet::enablement::normalize_endpoint_host(f.context.authority())
+                .unwrap();
+        let context = f.context_with_routes(&[(&endpoint, &server.uri())]);
+        let client = context.primary_client().unwrap();
+        let authority = policy_authority(&f, AuthorityScope::Classic, f.now, 60_000);
+        let auth = resolve_tx_sign(request(&f, &context, &client, &authority))
+            .await
+            .unwrap();
+        let expected = WindowEntry::new(
+            StateKey::new("operator", 1, "rate_limit", 86_400),
+            f.now,
+            1,
+            WindowLimit::Count {
+                window: "1d".to_owned(),
+                max_calls: 10,
+            },
+        );
+        assert_eq!(
+            auth.entries()
+                .iter()
+                .filter(|entry| entry.key().bucket() == "rate_limit")
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![expected.clone(), expected],
+            "final resolution preserves both identical rate-limit holds"
+        );
     }
 
     /// Both authorities keep a captured end through delay, durable reopen and header checks.

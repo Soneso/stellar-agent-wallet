@@ -280,7 +280,7 @@ applies = ["commit", "single", "verb"]
 [[claim]]
 id = "sizing.paired_frame"
 family = "sizing"
-statement = "the preparation and commit policy checks within each classic handler reuse one captured frame"
+statement = "the preparation and commit policy checks within each classic handler reuse one counterparty-cache acquisition and policy instant"
 applies = ["prepare", "commit"]
 builds = "feature-on"
 
@@ -717,6 +717,9 @@ rows = ["mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticat
 pending = "row-test"
 
 # Cells: the sizing claims a later change delivers.
+# Classified hold composition has API and atomic-mint proofs in
+# policy_state::ledger::tests::composed. Public handlers currently supply one
+# evaluation, so these proofs do not close the pending tool-row cells.
 
 [[cell]]
 claim = "sizing.paired_frame"

@@ -1967,6 +1967,22 @@ impl PersistedWindowStore {
         self.load_into_at(profile_name, profile, dest, now_ms()?)
     }
 
+    /// Rewrites a fixture's authenticated snapshot with the earlier-build version.
+    ///
+    /// # Errors
+    /// Returns authenticated read, keyring, and file-write errors.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[doc(hidden)]
+    pub fn write_earlier_build_for_test(&self, profile: &Profile) -> Result<(), WindowStoreError> {
+        let (key, _) = self.load_or_mint_key(profile)?;
+        let generation = generation_entry_ref(profile);
+        let mut wire = self.read_verified(profile, &key, &generation)?;
+        wire.version = WIRE_VERSION_OPERATIONS;
+        wire.retired_total_epoch = None;
+        self.write_atomic(&key, &wire)?;
+        write_generation(&generation, &wire)
+    }
+
     /// Hydrates an image at the supplied policy instant, including live holds.
     ///
     /// Preserves authenticated reads and earlier-version retirement. Callers
@@ -7685,7 +7701,7 @@ pub(crate) use tests::fail_store_writes;
 #[cfg(test)]
 pub(crate) use tests::{
     COMMIT_FAULT_AFTER_COUNTER, COMMIT_FAULT_AFTER_PREPARED, COMMIT_FAULT_COMPACTION,
-    arm_accounting_fault,
+    COMMIT_STEP_OBSERVER, arm_accounting_fault,
 };
 
 /// Crash seams of a generation commit, for tests of the store's callers.
@@ -7713,6 +7729,8 @@ pub mod commit_faults {
     /// Runs the observer at `point`, then stops the operation there once
     /// when a test armed that point.
     pub(crate) fn accounting_fault(point: u8) -> Result<(), WindowStoreError> {
+        #[cfg(test)]
+        super::tests::observe_commit_step(point);
         OBSERVER.with_borrow_mut(|observer| {
             if let Some(observer) = observer.as_mut() {
                 observer(point);
@@ -23053,6 +23071,23 @@ mod tests {
     /// The crash seam right after an acknowledgement commits, before the
     /// receipt projection.
     pub(super) const ACCOUNTING_FAULT_AFTER_ACKNOWLEDGE: u8 = 3;
+
+    type CommitObserver = Box<dyn FnMut(u8)>;
+
+    thread_local! {
+        /// Observes commit seams on this thread independently of the fault hook.
+        pub(crate) static COMMIT_STEP_OBSERVER: std::cell::RefCell<Option<CommitObserver>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Runs the commit step observer at `point` when a test installed one.
+    pub(super) fn observe_commit_step(point: u8) {
+        COMMIT_STEP_OBSERVER.with_borrow_mut(|observer| {
+            if let Some(observer) = observer {
+                observer(point);
+            }
+        });
+    }
 
     /// The expiry projection step after its verified read routes it.
     pub(super) const EXPIRY_AFTER_ROUTING: u8 = 1;
