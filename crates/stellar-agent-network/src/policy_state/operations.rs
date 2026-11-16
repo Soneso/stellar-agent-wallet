@@ -5310,7 +5310,7 @@ impl<'a> OperationStatus<'a> {
         let configuration = super::recovery_run::recovery_configuration_digest(self.profile);
         let mut candidates = Vec::new();
         for record in records(&wire) {
-            if (record.state != OperationState::SentOutcomeUnknown) || record.kind.is_x402() {
+            if record.state != OperationState::SentOutcomeUnknown || record.kind.is_x402() {
                 continue;
             }
             for attempt in &record.attempts {
@@ -5397,13 +5397,19 @@ impl<'a> OperationStatus<'a> {
         &self,
         tx_hash: Option<&[u8; 32]>,
     ) -> Result<Vec<RecoveryAttempt>, WindowStoreError> {
-        self.classic_snapshot(tx_hash, false)
+        Ok(self
+            .classic_snapshot(tx_hash, false)?
+            .into_iter()
+            .map(|(attempt, _)| attempt)
+            .collect())
     }
 
+    /// Every retained classic attempt, each with whether the driver can select
+    /// it: its record and attempt both have an unknown outcome.
     pub(super) fn reporting_snapshot(
         &self,
         tx_hash: Option<&[u8; 32]>,
-    ) -> Result<Vec<RecoveryAttempt>, WindowStoreError> {
+    ) -> Result<Vec<(RecoveryAttempt, bool)>, WindowStoreError> {
         self.classic_snapshot(tx_hash, true)
     }
 
@@ -5411,7 +5417,7 @@ impl<'a> OperationStatus<'a> {
         &self,
         tx_hash: Option<&[u8; 32]>,
         reporting: bool,
-    ) -> Result<Vec<RecoveryAttempt>, WindowStoreError> {
+    ) -> Result<Vec<(RecoveryAttempt, bool)>, WindowStoreError> {
         let Some(wire) = self.read()? else {
             return Ok(Vec::new());
         };
@@ -5433,14 +5439,14 @@ impl<'a> OperationStatus<'a> {
                 else {
                     continue;
                 };
+                let selectable = record.state == OperationState::SentOutcomeUnknown
+                    && attempt.outcome == Some(OperationState::SentOutcomeUnknown);
                 // A matched release stays selected until a decision resolves it.
-                if (!reporting && attempt.outcome != Some(OperationState::SentOutcomeUnknown))
-                    || tx_hash.is_some_and(|hash| hash != stored_hash)
-                {
+                if (!reporting && !selectable) || tx_hash.is_some_and(|hash| hash != stored_hash) {
                     continue;
                 }
                 let recovery = attempt.recovery.clone().unwrap_or_default();
-                attempts.push(RecoveryAttempt {
+                let selected = RecoveryAttempt {
                     operation_id: record.id,
                     attempt_index: attempt.index,
                     exposure: exposure.identity.clone(),
@@ -5466,10 +5472,11 @@ impl<'a> OperationStatus<'a> {
                             min_close_time_ms: released.min_close_time_ms,
                         }
                     }),
-                });
+                };
+                attempts.push((selected, selectable));
             }
         }
-        attempts.sort_by_key(|attempt| {
+        attempts.sort_by_key(|(attempt, _)| {
             (
                 attempt.started_at_ms,
                 attempt.operation_id.to_hex(),

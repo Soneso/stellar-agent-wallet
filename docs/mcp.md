@@ -841,7 +841,12 @@ A missing or different memo refuses `policy.deny.memo_binding_mismatch`, which n
 
 For an authenticated classic mainnet attempt, transaction status uses cached
 recovery evidence or `UNKNOWN` and sends no additional transaction lookup.
-An unmanaged record keeps its primary lookup. Unknown-submission errors carry
+An unmanaged record keeps its primary lookup. A managed attempt also returns
+`recovery` with typed results, retry class, `earliest_retry_ms` and
+`next_action`. The optional `retry_recovery` argument, default `false`,
+starts one new bounded evidence run for a stopped attempt, as
+`stellar-agent tx status --retry-recovery` does. It never resubmits and
+authorizes no successor. Unknown-submission errors carry
 the shared [recovery guidance](agents.md), including a checked retry
 time or the typed reason that the time is unavailable.
 

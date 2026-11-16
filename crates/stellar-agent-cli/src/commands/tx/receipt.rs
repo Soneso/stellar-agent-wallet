@@ -3276,6 +3276,7 @@ mod tests {
                 tx_hash: TX_HASH.to_owned(),
                 profile: Some(fixture.name.to_owned()),
                 output: OutputFormat::Json,
+                retry_recovery: false,
             })
             .await;
             let envelope = last_rendered();

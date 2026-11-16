@@ -172,6 +172,22 @@ impl Fixture {
         .await
     }
 
+    /// Targeted recovery of the first attempt with the explicit retry request.
+    async fn retry(&self, pair: &[MockServer; 2]) -> Result<RecoveryReport, RecoveryError> {
+        let left = StellarRpcClient::new(&pair[0].uri()).unwrap();
+        let right = StellarRpcClient::new(&pair[1].uri()).unwrap();
+        recover_outcomes_committed(
+            &self.fx.store,
+            &self.fx.profile,
+            EndpointPair::from_clients(&left, Some(&right)),
+            &self.writer,
+            Some(&[1 ^ 0x80; 32]),
+            true,
+            &mut CommittedBatch::default(),
+        )
+        .await
+    }
+
     fn run_record(&self, index: usize) -> WireRecoveryRun {
         let id = self.ids[index];
         RecoveryRunSnapshot::of(id, &self.fx.record(id).attempts[0], Some(&self.source))
@@ -2514,6 +2530,7 @@ async fn driver_batch_keeps_decision_before_later_error() {
         EndpointPair::from_clients(&left, Some(&right)),
         &fx.writer,
         None,
+        false,
         &mut committed,
     )
     .await;

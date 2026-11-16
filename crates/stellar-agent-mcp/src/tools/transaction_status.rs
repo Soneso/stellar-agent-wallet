@@ -28,6 +28,11 @@
 //! clears with `--acknowledge --acknowledge-unbounded`. No step sends the
 //! transaction again.
 //!
+//! For a managed mainnet attempt, `recovery` carries the same typed results
+//! as `stellar-agent tx status`. `retry_recovery`, default false, starts one
+//! new bounded evidence run for a stopped attempt and resets its run count
+//! to one. It never resubmits and authorizes no successor.
+//!
 //! # Why a read tool is not read-only
 //!
 //! The lookup changes wallet state: it records a reported success on the
@@ -63,6 +68,13 @@ pub struct StellarTransactionStatusArgs {
     /// The transaction hash to reconcile, 64 lowercase hex characters. This is
     /// the `details.tx_hash` a `submission.tx_timeout` response carries.
     pub tx_hash: String,
+
+    /// Starts one new bounded recovery run for this hash's stopped mainnet
+    /// attempt, also before its retry time or after its runs are exhausted.
+    /// The run collects evidence only and never sends a transaction.
+    /// Defaults to false.
+    #[serde(default)]
+    pub retry_recovery: bool,
 }
 
 #[mcp_tool_router]
@@ -94,6 +106,12 @@ impl WalletServer {
                        endpoint answer resolves it. A time-bounded hold still ends at its \
                        accounting horizon; otherwise only the operator's tx receipt clear \
                        resolves it, with --acknowledge-unbounded as well for an untimed hold. \
+                       For a managed mainnet attempt, recovery carries each attempt's typed \
+                       result (Included, NeverApplicable or NeedsEvidence), retry class, \
+                       earliest_retry_ms and next_action. retry_recovery (default false) starts \
+                       one new bounded evidence run for a stopped attempt, also before its retry \
+                       time or after RetriesExhausted; it never resubmits and authorizes no \
+                       successor. \
                        This is the only way to resolve a timed-out submission: never \
                        re-simulate or resubmit, because \
                        the transaction may still apply and its sequence may already be spent. \
@@ -136,14 +154,14 @@ impl WalletServer {
 
         let oracle = self.settlement_oracle();
         let outcome = match submission_flow::transaction_status(
-            StatusRequest {
-                profile: &self.profile,
-                profile_name: &profile_name,
-                tx_hash: &args.tx_hash,
-                window: &window,
-                client: &client,
-                oracle: oracle.as_ref(),
-            },
+            status_request(
+                &args,
+                &self.profile,
+                &profile_name,
+                &window,
+                &client,
+                oracle.as_ref(),
+            ),
             || self.resolve_approval_dir(),
             || {
                 crate::tools::value_audit::require_value_audit_writer(
@@ -159,22 +177,49 @@ impl WalletServer {
             Err(error) => return Ok(status_error_result(error)),
         };
 
-        let view = json!({
-            "tx_hash": args.tx_hash,
-            "chain_status": outcome.chain_status,
-            "ledger": outcome.ledger,
-            "record": outcome.record.as_ref().map(|record| receipt_view(record, outcome.reservation_open)),
-            "reservation": outcome.reservation.as_ref().map(|held| json!({
-                "envelope_hash": held.id,
-                "operator_required": held.operator_required,
-            })),
-        });
-        let envelope = Envelope::ok(view);
+        let envelope = Envelope::ok(status_view(&args.tx_hash, &outcome));
         let json_out = envelope
             .to_json_pretty()
             .unwrap_or_else(|_| String::from("{}"));
         Ok(CallToolResult::success(vec![Content::text(json_out)]))
     }
+}
+
+fn status_request<'a>(
+    args: &'a StellarTransactionStatusArgs,
+    profile: &'a stellar_agent_core::profile::schema::Profile,
+    profile_name: &'a str,
+    window: &'a PersistedWindowStore,
+    client: &'a stellar_agent_network::StellarRpcClient,
+    oracle: Option<&'a stellar_agent_network::StellarRpcClient>,
+) -> StatusRequest<'a> {
+    StatusRequest {
+        profile,
+        profile_name,
+        tx_hash: &args.tx_hash,
+        window,
+        client,
+        oracle,
+        retry_recovery: args.retry_recovery,
+    }
+}
+
+/// The success payload; `recovery` appears only with managed results or a refusal.
+fn status_view(tx_hash: &str, outcome: &submission_flow::StatusOutcome) -> serde_json::Value {
+    let mut view = json!({
+        "tx_hash": tx_hash,
+        "chain_status": outcome.chain_status,
+        "ledger": outcome.ledger,
+        "record": outcome.record.as_ref().map(|record| receipt_view(record, outcome.reservation_open)),
+        "reservation": outcome.reservation.as_ref().map(|held| json!({
+            "envelope_hash": held.id,
+            "operator_required": held.operator_required,
+        })),
+    });
+    if let Some(recovery) = outcome.recovery.status_json() {
+        view["recovery"] = recovery;
+    }
+    view
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
@@ -248,5 +293,84 @@ fn status_error_result(error: StatusFailure) -> CallToolResult {
             "network.rpc_unreachable",
             format!("the endpoint could not be asked about this transaction: {e}"),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, reason = "test assertions")]
+    use super::StellarTransactionStatusArgs as Args;
+    use serde_json::json;
+
+    const HASH: &str = "abababababababababababababababababababababababababababababababab";
+
+    /// The argument defaults to false, rejects other types and reaches the
+    /// library request; the payload is the shared recovery projection.
+    #[test]
+    #[serial_test::serial]
+    fn status_recovery_result_and_retry_argument() {
+        use stellar_agent_network::policy_state::{
+            PersistedWindowStore, RecoveryRefusal, RecoveryReport,
+        };
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().expect("sandbox");
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let parse = |value| serde_json::from_value::<Args>(value);
+        let profile = stellar_agent_core::profile::schema::Profile::builder_testnet(
+            "svc", "acct", "n-svc", "n-acct",
+        )
+        .with_noop_engine()
+        .build();
+        let window = PersistedWindowStore::for_profile("status-argument");
+        let client =
+            stellar_agent_network::StellarRpcClient::new("http://127.0.0.1:1").expect("client");
+        for (value, expected) in [
+            (
+                json!({"chain_id": "stellar:mainnet", "tx_hash": HASH}),
+                false,
+            ),
+            (
+                json!({"chain_id": "stellar:mainnet", "tx_hash": HASH, "retry_recovery": false}),
+                false,
+            ),
+            (
+                json!({"chain_id": "stellar:mainnet", "tx_hash": HASH, "retry_recovery": true}),
+                true,
+            ),
+        ] {
+            let args = parse(value).expect("arguments");
+            assert_eq!(args.retry_recovery, expected);
+            let request = super::status_request(&args, &profile, "p", &window, &client, None);
+            assert_eq!(request.retry_recovery, expected);
+        }
+        for wrong in [json!("true"), json!(1), json!(null)] {
+            assert!(
+                parse(
+                    json!({"chain_id": "stellar:mainnet", "tx_hash": HASH, "retry_recovery": wrong})
+                )
+                .is_err()
+            );
+        }
+        let mut recovery = RecoveryReport::default();
+        let outcome = |recovery| stellar_agent_network::submission_flow::StatusOutcome {
+            recovery,
+            chain_status: "UNKNOWN".to_owned(),
+            ledger: None,
+            record: None,
+            reservation: None,
+            reservation_open: false,
+        };
+        let view = super::status_view(HASH, &outcome(recovery.clone()));
+        assert!(view.get("recovery").is_none(), "unmanaged: {view}");
+        recovery.refusal = Some(RecoveryRefusal {
+            code: "submission.record_unavailable",
+            state_unavailable: true,
+        });
+        let view = super::status_view(HASH, &outcome(recovery.clone()));
+        assert_eq!(view["chain_status"], "UNKNOWN");
+        assert_eq!(view["recovery"], recovery.status_json().expect("refusal"));
+        assert_eq!(
+            view["recovery"]["refusal"],
+            json!({"code": "submission.record_unavailable", "state_unavailable": true})
+        );
     }
 }

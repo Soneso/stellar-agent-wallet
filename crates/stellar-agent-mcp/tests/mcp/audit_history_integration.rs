@@ -225,6 +225,7 @@ async fn status(settled: &RotatedSettlement) {
         .call_stellar_transaction_status(StellarTransactionStatusArgs {
             chain_id: "stellar:testnet".to_owned(),
             tx_hash: settled.tx_hash.clone(),
+            retry_recovery: false,
         })
         .await
         .unwrap();
@@ -266,6 +267,7 @@ async fn a_status_run_over_a_broken_archive_renders_and_keeps_the_expiry_owed() 
         .call_stellar_transaction_status(StellarTransactionStatusArgs {
             chain_id: "stellar:testnet".to_owned(),
             tx_hash: settled.tx_hash.clone(),
+            retry_recovery: false,
         })
         .await
         .unwrap();

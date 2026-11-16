@@ -52,11 +52,12 @@ async fn single_oversize_is_cached_terminal() {
     let replay = fx.run(&pair).await.unwrap();
     assert_eq!(replay.requests, RecoveryRequests::default());
     assert_eq!(replay.attempts[0].reservations, Some(16));
+    // An exhausted automatic stop names the explicit retry that can repair it.
     assert!(matches!(
         replay.attempts[0].result,
         RecoveryResult::NeedsEvidence {
             reason: RecoveryReason::RetriesExhausted,
-            next_action: RecoveryAction::EvidenceRequired,
+            next_action: RecoveryAction::RetryRecovery,
             ..
         }
     ));
@@ -66,6 +67,10 @@ async fn single_oversize_is_cached_terminal() {
             last_reason: RecoveryStopReason::ResponseTooLarge
         }
     ));
+    assert_eq!(
+        replay.status_json().unwrap()["attempts"][0]["last_reason"],
+        "ResponseTooLarge"
+    );
     assert_eq!(std::fs::read(fx.fx.store.path()).unwrap(), before);
 }
 
@@ -101,6 +106,7 @@ async fn managed_status_uses_cached_result() {
                     window: &fx.store,
                     client: &client,
                     oracle: None,
+                    retry_recovery: false,
                 },
                 || Ok(home.path().join("approvals")),
                 || Ok(Arc::clone(&writer)),
@@ -137,6 +143,7 @@ async fn managed_status_uses_cached_result() {
             window: &fx.store,
             client: &client,
             oracle: None,
+            retry_recovery: false,
         },
         || Ok(home.path().join("approvals")),
         || Ok(Arc::clone(&writer)),
@@ -233,6 +240,7 @@ async fn production_status_and_dispatch_use_outcomes() {
             window: &fx.fx.store,
             client: &left,
             oracle: Some(&right),
+            retry_recovery: false,
         },
         || Ok(home.path().join("approvals")),
         || Ok(Arc::clone(&fx.writer)),
@@ -510,6 +518,7 @@ async fn writer_or_store_refusal_is_visible() {
             window: &fx.fx.store,
             client: &client,
             oracle: None,
+            retry_recovery: false,
         },
         || Ok(home.path().join("approvals")),
         || {
@@ -559,4 +568,551 @@ async fn writer_or_store_refusal_is_visible() {
     );
     assert_eq!(pair[0].received_requests().await.unwrap().len(), 0);
     assert_eq!(std::fs::read(fx.fx.store.path()).unwrap(), before);
+}
+
+/// Targeted status of `hash` through the production facade.
+async fn status(
+    fx: &Fixture,
+    pair: &[MockServer; 2],
+    home: &std::path::Path,
+    hash: [u8; 32],
+    retry_recovery: bool,
+) -> crate::submission_flow::StatusOutcome {
+    let left = StellarRpcClient::new(&pair[0].uri()).unwrap();
+    let right = StellarRpcClient::new(&pair[1].uri()).unwrap();
+    crate::submission_flow::transaction_status(
+        crate::submission_flow::StatusRequest {
+            profile: &fx.fx.profile,
+            profile_name: "report",
+            tx_hash: &stellar_agent_core::hex::encode(&hash),
+            window: &fx.fx.store,
+            client: &left,
+            oracle: Some(&right),
+            retry_recovery,
+        },
+        || Ok(home.join("approvals")),
+        || Ok(Arc::clone(&fx.writer)),
+    )
+    .await
+    .unwrap()
+}
+
+fn store_run(fx: &Fixture, run: &WireRecoveryRun) {
+    fx.fx.rewrite(|wire| {
+        wire.operations.as_mut().unwrap().records[0].attempts[0].recovery_run =
+            Some(serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap())
+    });
+}
+
+#[tokio::test]
+#[serial]
+async fn explicit_retry_starts_one_bounded_run() {
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+    // An untimed attempt reads only its hash pair in each run.
+    let fx = Fixture::new(1, 0);
+    let early = fx.pair([60, 60], NOW, 0).await;
+    fx.run(&early).await.unwrap();
+    let mut run = fx.run_record(0);
+    assert_eq!(
+        run.stop.as_ref().unwrap().reason,
+        RecoveryStopReason::Untimed
+    );
+    run.automatic_runs = 16;
+    run.consecutive_stops = 16;
+    run.stop.as_mut().unwrap().earliest_retry_ms = Some(recovery_retry_time(NOW, 15).unwrap());
+    store_run(&fx, &run);
+    let hash = [1 ^ 0x80; 32];
+    let later = NOW + 86_400_000;
+    // Health observations are fresh at the later clock.
+    let pair = fx.pair([61, 61], later, 0).await;
+    let hashes = || async { rpc_request_count(&pair[0], "getTransaction").await };
+    let requests = || async {
+        pair[0].received_requests().await.unwrap().len()
+            + pair[1].received_requests().await.unwrap().len()
+    };
+    fx.fx.clock.set(later);
+    let bytes = std::fs::read(fx.fx.store.path()).unwrap();
+    let seen = hashes().await;
+    let ordinary = status(&fx, &pair, home.path(), hash, false).await;
+    assert_eq!(
+        requests().await,
+        0,
+        "ordinary status replays the exhausted stop"
+    );
+    assert_eq!(ordinary.chain_status, "UNKNOWN");
+    assert!(matches!(
+        ordinary.recovery.attempts[0].result,
+        RecoveryResult::NeedsEvidence {
+            reason: RecoveryReason::RetriesExhausted,
+            next_action: RecoveryAction::RetryRecovery,
+            ..
+        }
+    ));
+    // These endpoints are fresh at the earlier clock, so only the clock refuses.
+    fx.fx.clock.set(NOW - 1);
+    let early_hashes = rpc_request_count(&early[0], "getTransaction").await;
+    status(&fx, &early, home.path(), hash, true).await;
+    assert_eq!(
+        rpc_request_count(&early[0], "getTransaction").await,
+        early_hashes,
+        "an earlier clock refuses the explicit run"
+    );
+    assert_eq!(std::fs::read(fx.fx.store.path()).unwrap(), bytes);
+    fx.fx.clock.set(later);
+    let retried = status(&fx, &pair, home.path(), hash, true).await;
+    assert_eq!(
+        hashes().await,
+        seen + 1,
+        "one fresh hash pair and no extra lookup"
+    );
+    assert_eq!(
+        retried.recovery.requests,
+        RecoveryRequests {
+            shared: 4,
+            attempt: 2
+        }
+    );
+    let after = fx.run_record(0);
+    assert_eq!((after.automatic_runs, after.consecutive_stops), (1, 1));
+    assert_eq!(
+        after.stop.as_ref().unwrap().earliest_retry_ms,
+        Some(later + 30_000)
+    );
+    assert_eq!(retried.recovery.attempts[0].reservations, Some(1));
+    assert!(matches!(
+        retried.recovery.attempts[0].result,
+        RecoveryResult::NeedsEvidence {
+            reason: RecoveryReason::Untimed,
+            next_action: RecoveryAction::Wait,
+            ..
+        }
+    ));
+    let bytes = std::fs::read(fx.fx.store.path()).unwrap();
+    let sent = requests().await;
+    status(&fx, &pair, home.path(), hash, false).await;
+    assert_eq!(
+        requests().await,
+        sent,
+        "an early ordinary status sends nothing"
+    );
+    assert_eq!(std::fs::read(fx.fx.store.path()).unwrap(), bytes);
+    status(&fx, &pair, home.path(), hash, true).await;
+    assert_eq!(hashes().await, seen + 2, "an explicit request runs early");
+    assert_eq!(fx.run_record(0).automatic_runs, 1);
+    let mut live = fx.run_record(0);
+    live.phase = RecoveryRunPhase::Running;
+    live.stop = None;
+    live.run_started_ms = later;
+    live.run_deadline_ms = later + 20_000;
+    // The sixteenth reservation normalizes to RetriesExhausted, yet its lease is live.
+    for (runs, stops) in [(1, 0), (16, 15)] {
+        live.automatic_runs = runs;
+        live.consecutive_stops = stops;
+        store_run(&fx, &live);
+        fx.fx.clock.set(later + 1);
+        let bytes = std::fs::read(fx.fx.store.path()).unwrap();
+        let owned = status(&fx, &pair, home.path(), hash, true).await;
+        assert_eq!(
+            hashes().await,
+            seen + 2,
+            "a live lease keeps its owner at reservation {runs}"
+        );
+        assert_eq!(std::fs::read(fx.fx.store.path()).unwrap(), bytes);
+        assert_eq!(owned.recovery.attempts[0].reservations, Some(runs));
+    }
+    // Past its deadline the sixteenth lease is exhausted with an interrupted cause.
+    fx.fx.clock.set(later + 20_000);
+    let expired = status(&fx, &pair, home.path(), hash, false).await;
+    assert_eq!(
+        expired.recovery.attempts[0].view.state,
+        RecoveryRunState::RetriesExhausted {
+            last_reason: RecoveryStopReason::Interrupted
+        }
+    );
+    let public = expired.recovery.status_json().unwrap();
+    assert_eq!(
+        (
+            &public["attempts"][0]["reason"],
+            &public["attempts"][0]["last_reason"]
+        ),
+        (&json!("RetriesExhausted"), &json!("Interrupted"))
+    );
+    assert_eq!(hashes().await, seen + 2);
+    fx.fx.rewrite(|wire| {
+        wire.operations.as_mut().unwrap().records[0].attempts[0].recovery_run =
+            Some(serde_json::from_str("{ \"version\":99 }").unwrap());
+    });
+    let bytes = std::fs::read(fx.fx.store.path()).unwrap();
+    let unusable = status(&fx, &pair, home.path(), hash, true).await;
+    assert_eq!(
+        hashes().await,
+        seen + 2,
+        "a flag repairs no unusable record"
+    );
+    assert_eq!(std::fs::read(fx.fx.store.path()).unwrap(), bytes);
+    assert!(matches!(
+        unusable.recovery.attempts[0].result,
+        RecoveryResult::NeedsEvidence {
+            reason: RecoveryReason::RecordUnusable,
+            ..
+        }
+    ));
+    let unmanaged = status(&fx, &pair, home.path(), [0xff; 32], true).await;
+    assert_eq!(
+        hashes().await,
+        seen + 3,
+        "an unmanaged hash keeps its lookup"
+    );
+    assert!(unmanaged.recovery.status_json().is_none());
+    assert_eq!(std::fs::read(fx.fx.store.path()).unwrap(), bytes);
+    for server in &pair {
+        assert_eq!(rpc_request_count(server, "sendTransaction").await, 0);
+    }
+}
+
+/// An untimed attempt with sixteen spent reservations, the pair fresh at
+/// `NOW`, the pair fresh at `NOW + 1 day`, and its hash.
+async fn exhausted_attempt() -> (Fixture, [MockServer; 2], [MockServer; 2], [u8; 32]) {
+    let fx = Fixture::new(1, 0);
+    let early = fx.pair([60, 60], NOW, 0).await;
+    fx.run(&early).await.unwrap();
+    let mut run = fx.run_record(0);
+    run.automatic_runs = 16;
+    run.consecutive_stops = 16;
+    run.stop.as_mut().unwrap().earliest_retry_ms = Some(recovery_retry_time(NOW, 15).unwrap());
+    store_run(&fx, &run);
+    let later = fx.pair([61, 61], NOW + 86_400_000, 0).await;
+    (fx, early, later, [1 ^ 0x80; 32])
+}
+
+/// An explicit request that reads no hash, writes nothing, and reports
+/// `recovery.retry_refused` beside the readable attempt result.
+async fn refused_retry(
+    fx: &Fixture,
+    pair: &[MockServer; 2],
+    home: &std::path::Path,
+    hash: [u8; 32],
+) -> RecoveryReport {
+    let bytes = std::fs::read(fx.fx.store.path()).unwrap();
+    let seen = rpc_request_count(&pair[0], "getTransaction").await;
+    let outcome = status(fx, pair, home, hash, true).await;
+    assert_eq!(rpc_request_count(&pair[0], "getTransaction").await, seen);
+    assert_eq!(std::fs::read(fx.fx.store.path()).unwrap(), bytes);
+    assert_eq!(
+        outcome
+            .recovery
+            .refusal
+            .as_ref()
+            .map(|r| (r.code, r.state_unavailable)),
+        Some(("recovery.retry_refused", false)),
+        "the refused explicit request carries its stable code"
+    );
+    assert_eq!(outcome.chain_status, "UNKNOWN");
+    for server in pair {
+        assert_eq!(rpc_request_count(server, "sendTransaction").await, 0);
+    }
+    outcome.recovery
+}
+
+#[tokio::test]
+#[serial]
+async fn explicit_retry_refuses_an_earlier_clock() {
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+    let (fx, early, _later, hash) = exhausted_attempt().await;
+    fx.fx.clock.set(NOW - 1);
+    let ordinary = status(&fx, &early, home.path(), hash, false).await;
+    assert_eq!(
+        ordinary.recovery.refusal, None,
+        "an ordinary status requests no retry"
+    );
+    let report = refused_retry(&fx, &early, home.path(), hash).await;
+    assert!(
+        matches!(
+            report.attempts[0].result,
+            RecoveryResult::NeedsEvidence {
+                reason: RecoveryReason::RetriesExhausted,
+                next_action: RecoveryAction::RetryRecovery,
+                ..
+            }
+        ),
+        "the exhausted result stays readable: {:?}",
+        report.attempts[0].result
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn explicit_retry_refuses_an_earlier_clock_after_a_configuration_change() {
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+    // A HistoryLost stop with a saved scan reopens under a changed configuration.
+    let mut fx = Fixture::new(1, NOW / 1000 - 10);
+    let pair = super::scan_tests::scan_pair(&fx, 34).await;
+    for server in &pair {
+        let mut answer = target_page(NOW / 1000);
+        answer["oldestLedger"] = json!(21);
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method":"getLedgers","params":{"startLedger":20}}),
+            ))
+            .respond_with(EchoIdResponder::new(answer))
+            .with_priority(1)
+            .mount(server)
+            .await;
+    }
+    fx.run(&pair).await.unwrap();
+    let stored = fx.run_record(0);
+    assert_eq!(
+        (stored.stop.as_ref().unwrap().reason, stored.automatic_runs),
+        (RecoveryStopReason::HistoryLost, 1)
+    );
+    assert!(stored.scan.is_some());
+    fx.fx.profile.oracle_provider_url = Some("http://127.0.0.3".parse().unwrap());
+    fx.fx
+        .clock
+        .set(stored.stop.as_ref().unwrap().stopped_at_ms - 1);
+    let mut seen = Vec::new();
+    for server in &pair {
+        seen.push(rpc_request_count(server, "getTransaction").await);
+    }
+    let hash = [1 ^ 0x80; 32];
+    let report = refused_retry(&fx, &pair, home.path(), hash).await;
+    for (server, before) in pair.iter().zip(seen) {
+        assert_eq!(
+            rpc_request_count(server, "getTransaction").await,
+            before,
+            "a refused explicit request reads no hash"
+        );
+    }
+    assert_eq!(fx.run_record(0).automatic_runs, 1);
+    assert!(
+        matches!(
+            report.attempts[0].result,
+            RecoveryResult::NeedsEvidence {
+                reason: RecoveryReason::HistoryLost,
+                ..
+            }
+        ),
+        "the history-loss result stays readable: {:?}",
+        report.attempts[0].result
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn explicit_retry_refuses_a_live_lease() {
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+    let (fx, _early, pair, hash) = exhausted_attempt().await;
+    let later = NOW + 86_400_000;
+    let mut live = fx.run_record(0);
+    live.phase = RecoveryRunPhase::Running;
+    live.stop = None;
+    live.automatic_runs = 1;
+    live.consecutive_stops = 0;
+    live.run_started_ms = later;
+    live.run_deadline_ms = later + 20_000;
+    store_run(&fx, &live);
+    fx.fx.clock.set(later + 1);
+    let report = refused_retry(&fx, &pair, home.path(), hash).await;
+    assert_eq!(report.attempts[0].view.state, RecoveryRunState::Running);
+    assert!(
+        matches!(
+            report.attempts[0].result,
+            RecoveryResult::NeedsEvidence {
+                reason: RecoveryReason::Running,
+                ..
+            }
+        ),
+        "the live result stays readable: {:?}",
+        report.attempts[0].result
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn explicit_retry_refuses_unusable_metadata() {
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+    let (fx, _early, pair, hash) = exhausted_attempt().await;
+    fx.fx.rewrite(|wire| {
+        wire.operations.as_mut().unwrap().records[0].attempts[0].recovery_run =
+            Some(serde_json::from_str("{ \"version\":99 }").unwrap());
+    });
+    fx.fx.clock.set(NOW + 86_400_000);
+    let report = refused_retry(&fx, &pair, home.path(), hash).await;
+    assert!(
+        matches!(
+            report.attempts[0].result,
+            RecoveryResult::NeedsEvidence {
+                reason: RecoveryReason::RecordUnusable,
+                next_action: RecoveryAction::EvidenceRequired,
+                ..
+            }
+        ),
+        "the unusable result stays readable: {:?}",
+        report.attempts[0].result
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn non_selectable_records_get_no_status_action() {
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+    let fx = Fixture::new(3, NOW / 1000 + 60);
+    fx.fx.rewrite(|wire| {
+        let records = &mut wire.operations.as_mut().unwrap().records;
+        for (record, state) in records[1..]
+            .iter_mut()
+            .zip([OperationState::Cancelled, OperationState::Expired])
+        {
+            record
+                .history
+                .push(crate::policy_state::operations::HistoryEntry {
+                    from: Some(record.state),
+                    to: state,
+                    at_ms: NOW,
+                    evidence: None,
+                });
+            record.state = state;
+            record.closed_at_ms = Some(NOW);
+        }
+    });
+    let pair = fx.pair([60, 60], NOW, 0).await;
+    let report = fx.run(&pair).await.unwrap();
+    assert_eq!(report.evaluated, 0);
+    let actions: Vec<_> = report
+        .attempts
+        .iter()
+        .map(|a| match a.result {
+            RecoveryResult::NeedsEvidence {
+                reason: RecoveryReason::RecoveryRequired,
+                next_action,
+                ..
+            } => next_action,
+            _ => panic!("no run and no decision: {:?}", a.result),
+        })
+        .collect();
+    assert_eq!(
+        actions,
+        [
+            RecoveryAction::TargetedStatus,
+            RecoveryAction::EvidenceRequired,
+            RecoveryAction::EvidenceRequired
+        ]
+    );
+    assert!(
+        report
+            .attempts
+            .iter()
+            .all(|a| a.chain_status() == ("UNKNOWN", None))
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn status_recovery_projection() {
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+    let mut fx = Fx::new();
+    let mut commits = Vec::new();
+    for (n, kind) in [(1, Checked::Succeeded), (3, Checked::NotIncluded)] {
+        commits.push(commit_checked(&mut fx, n, kind).1.to_hex());
+    }
+    unknown_with(&mut fx, 4, NOW / 1000 + 60, vec![]);
+    let server = endpoint(60, NOW / 1000).await;
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+    let writer = crate::submission_flow::recovery::tests::writer_at(&fx.profile.audit_log_path);
+    let report = recover_outcomes(
+        &fx.store,
+        &fx.profile,
+        EndpointPair::from_clients(&client, None),
+        &writer,
+        None,
+    )
+    .await
+    .unwrap();
+    let value = report.status_json().unwrap();
+    let entry = |n: u8| {
+        value["attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["tx_hash"] == stellar_agent_core::hex::encode(&[n ^ 0x80; 32]))
+            .unwrap()
+            .clone()
+    };
+    let success = entry(1);
+    assert_eq!(
+        (
+            &success["result"],
+            &success["status"],
+            success["ledger"].is_u64()
+        ),
+        (&json!("Included"), &json!("Success"), true)
+    );
+    assert_eq!(success["settlement_commit_id"], commits[0]);
+    let absent = entry(3);
+    assert_eq!(absent["result"], "NeverApplicable");
+    assert!(absent["proof"].is_object(), "{absent}");
+    assert_eq!(absent["settlement_commit_id"], commits[1]);
+    let unknown = entry(4);
+    assert_eq!(unknown["settlement_commit_id"], Value::Null);
+    assert_eq!(unknown["last_reason"], Value::Null);
+    assert_eq!(
+        (
+            &unknown["result"],
+            &unknown["reason"],
+            &unknown["next_action"],
+            &unknown["class"]
+        ),
+        (
+            &json!("NeedsEvidence"),
+            &json!("RecoveryRequired"),
+            &json!("TargetedStatus"),
+            &json!("automatic")
+        )
+    );
+    assert_eq!(unknown["earliest_retry_ms"], (NOW / 1000 + 66) * 1000);
+    assert_eq!(value["refusal"], Value::Null);
+    assert_eq!(server.received_requests().await.unwrap().len(), 0);
+}
+
+#[test]
+#[serial]
+fn attached_report_keeps_the_refusal_shape() {
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+    let fx = Fx::new();
+    let root = || RecoveryError::Store(WindowStoreError::Invalid { detail: "x".into() });
+    let error = root().with_report(RecoveryReport::default());
+    assert_eq!(error.to_string(), root().to_string());
+    let pass = crate::submission_flow::ReconcilePass::RecoveryFailed {
+        legacy: Default::default(),
+        recovery: RecoveryReport::default(),
+        error,
+    };
+    let (warnings, guard) = stellar_agent_test_support::WarningCapture::capture(None);
+    crate::submission_flow::finish_reconciliation(
+        &fx.profile,
+        "ops",
+        &fx.store,
+        None,
+        &pass,
+        || panic!("no accounting obligation needs a writer"),
+    )
+    .unwrap();
+    drop(guard);
+    let messages = format!("{:?}", warnings.seen());
+    assert!(
+        messages.contains("unresolved sequences stay held"),
+        "{messages}"
+    );
+    assert!(
+        !messages.contains("every sequence stays held"),
+        "{messages}"
+    );
 }

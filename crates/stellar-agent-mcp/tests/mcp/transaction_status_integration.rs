@@ -202,6 +202,7 @@ async fn status(server: &WalletServer) -> Value {
         .call_stellar_transaction_status(StellarTransactionStatusArgs {
             chain_id: "stellar:testnet".to_owned(),
             tx_hash: TX_HASH.to_owned(),
+            retry_recovery: false,
         })
         .await
         .expect("the status tool must not error");
@@ -304,6 +305,15 @@ fn the_tool_descriptions_carry_the_timeout_recovery() {
         text.contains("reservation {envelope_hash, operator_required}"),
         "{text}"
     );
+    for phrase in [
+        "recovery carries each attempt's typed result (Included, NeverApplicable or \
+         NeedsEvidence), retry class, earliest_retry_ms and next_action.",
+        "retry_recovery (default false) starts one new bounded evidence run",
+        "it never resubmits and authorizes no successor.",
+        "never re-simulate or resubmit",
+    ] {
+        assert!(text.contains(phrase), "{phrase}: {text}");
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -926,6 +936,7 @@ async fn a_refused_status_run_delivers_old_obligations() {
         .call_stellar_transaction_status(StellarTransactionStatusArgs {
             chain_id: "stellar:testnet".to_owned(),
             tx_hash: TX_HASH.to_owned(),
+            retry_recovery: false,
         })
         .await
         .unwrap();
@@ -1001,6 +1012,7 @@ async fn chain_flip_refuses_status_without_rpc_or_state_changes() {
                 .call_stellar_transaction_status(StellarTransactionStatusArgs {
                     chain_id: "stellar:testnet".to_owned(),
                     tx_hash: TX_HASH.to_owned(),
+                    retry_recovery: false,
                 })
                 .await
                 .unwrap();

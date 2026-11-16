@@ -1853,11 +1853,19 @@ The target is recomputed on each run. A complete-history decision requires
 a durable scan end and a later covering transaction pair. Reports preserve
 the existing proof without adding an interval binding.
 
+An explicit status retry reserves one new run for a stopped attempt with
+interpreted metadata, no live lease and a clock at or after its stored times.
+Its reservation write sets the run count to one and the stop count to zero,
+so the one-to-sixteen invariant holds and no separate counter write exists.
+It keeps the saved scan only after a request budget, deadline or
+interruption stop. History loss stays sticky because it lives outside the
+run record.
+
 Ordinary status and dispatch respect the stored retry class and time.
 Automatic work resumes on a later eligible call; there is no background timer.
 An explicit stop requires the reported configuration, record or evidence to
-be resolved. Sixteen spent reservations stop automatic recovery. These
-reports introduce no new retry command.
+be resolved. Sixteen spent reservations stop automatic recovery until an
+explicit status retry. That retry collects evidence only and sends nothing.
 
 A further attempt needs the last attempt's checked non-inclusion, projected
 onto its receipt; otherwise it refuses with `recovery.retry_refused`. The new

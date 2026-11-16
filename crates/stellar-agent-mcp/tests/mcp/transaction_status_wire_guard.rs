@@ -159,6 +159,7 @@ async fn check(case: Case) {
         .call_stellar_transaction_status(StellarTransactionStatusArgs {
             chain_id: "stellar:testnet".to_owned(),
             tx_hash: TX_HASH.to_owned(),
+            retry_recovery: false,
         })
         .await
         .unwrap();

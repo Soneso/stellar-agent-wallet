@@ -468,6 +468,7 @@ async fn exercise_approval_consumption(fail_once: bool) {
                 .call_stellar_transaction_status(StellarTransactionStatusArgs {
                     chain_id: "stellar:testnet".to_owned(),
                     tx_hash: tx_hash.clone(),
+                    retry_recovery: false,
                 })
                 .await
                 .unwrap();

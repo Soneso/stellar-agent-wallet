@@ -738,6 +738,7 @@ async fn approved_timeout_keeps_cap_until_transaction_status_settles() {
             .call_stellar_transaction_status(StellarTransactionStatusArgs {
                 chain_id: "stellar:testnet".to_owned(),
                 tx_hash: details["tx_hash"].as_str().unwrap().to_owned(),
+                retry_recovery: false,
             })
             .await
             .unwrap(),
@@ -852,6 +853,7 @@ async fn approved_confirmation_ready_after_the_deadline_is_a_timeout() {
             .call_stellar_transaction_status(StellarTransactionStatusArgs {
                 chain_id: "stellar:testnet".to_owned(),
                 tx_hash: details["tx_hash"].as_str().unwrap().to_owned(),
+                retry_recovery: false,
             })
             .await
             .unwrap(),
