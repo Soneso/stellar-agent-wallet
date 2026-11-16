@@ -468,6 +468,7 @@ struct CheckedBody {
     canonical: Vec<u8>,
     digest: [u8; 32],
     mainnet: Option<MainnetBody>,
+    contract_transfer_max_fee_stroops: Option<u32>,
 }
 
 /// Verifies a supplied provisioning body or reads a runtime policy file once.
@@ -520,6 +521,9 @@ fn check_body(load: &PolicyLoad<'_>, signed: &SignedPolicy) -> Result<CheckedBod
         canonical,
         digest,
         mainnet,
+        contract_transfer_max_fee_stroops: super::schema::contract_transfer_max_fee_stroops(
+            &signed.doc,
+        )?,
     })
 }
 
@@ -543,6 +547,7 @@ fn into_verified(
         *load.owner_pubkey,
         engine,
         body.mainnet,
+        body.contract_transfer_max_fee_stroops,
     )
 }
 
@@ -759,6 +764,78 @@ mod tests {
         old: SigningKey,
         new: SigningKey,
     }
+
+    #[test]
+    #[serial]
+    fn contract_fee_metadata_requires_a_verified_signature() {
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let fixture = Fixture::new();
+        for version in [1, 2] {
+            let base = if version == 1 {
+                fixture
+                    .body(1)
+                    .replace("version = 2", "version = 1")
+                    .replace("sequence = 1\n", "")
+            } else {
+                fixture.body(1)
+            };
+            for cap in [None, Some(0), Some(1_000_000), Some(u32::MAX)] {
+                let raw = match cap {
+                    None => base.clone(),
+                    Some(value) => format!("contract_transfer_max_fee_stroops = {value}\n{base}"),
+                };
+                let policy = fixture
+                    .load(&raw, &fixture.old, PinMode::CompareOnly)
+                    .unwrap();
+                assert_eq!(policy.contract_transfer_max_fee_stroops(), cap);
+                let path = fixture.dir.path().join("policy.toml");
+                let load = PolicyLoad {
+                    path: &path,
+                    profile: &fixture.profile,
+                    profile_name: "operator",
+                    owner_pubkey: &fixture.old.verifying_key().to_bytes(),
+                    owner_source: OwnerKeySource::Keyring,
+                    window_path: &fixture.dir.path().join("state.window"),
+                };
+                let signed = std::fs::read_to_string(&path).unwrap();
+                let altered = match cap {
+                    None => format!("contract_transfer_max_fee_stroops = 1\n{signed}"),
+                    Some(value) => signed.replace(
+                        &format!("contract_transfer_max_fee_stroops = {value}"),
+                        "contract_transfer_max_fee_stroops = 2",
+                    ),
+                };
+                std::fs::write(&path, altered).unwrap();
+                assert!(matches!(
+                    load_verified_policy(&load, PolicyStateStore::new(), PinMode::CompareOnly),
+                    Err(PolicyError::OwnerSignatureInvalid { .. })
+                ));
+                std::fs::write(&path, &raw).unwrap();
+                assert!(matches!(
+                    load_verified_policy(&load, PolicyStateStore::new(), PinMode::CompareOnly),
+                    Err(PolicyError::PolicyFileParseFailed { .. })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn contract_fee_canonical_bytes_preserve_legacy_omission() {
+        for (raw, legacy, present) in [
+            ("version = 1\nscope = \"profile:fee-test\"\nrules = []\n",
+             b"version = 1\nscope = \"profile:fee-test\"\n".as_slice(),
+             b"version = 1\nscope = \"profile:fee-test\"\ncontract_transfer_max_fee_stroops = 0\n".as_slice()),
+            ("version = 2\nscope = \"profile:fee-test\"\nsequence = 1\nrules = []\n",
+             b"version = 2\nscope = \"profile:fee-test\"\nsequence = 1\n".as_slice(),
+             b"version = 2\nscope = \"profile:fee-test\"\ncontract_transfer_max_fee_stroops = 0\nsequence = 1\n".as_slice()),
+        ] {
+            assert_eq!(canonical_bytes(raw).unwrap(), legacy);
+            let with_cap = format!("contract_transfer_max_fee_stroops = 0\n{raw}");
+            assert_eq!(canonical_bytes(&with_cap).unwrap(), present);
+        }
+    }
+
     impl Fixture {
         fn new() -> Self {
             keyring_mock::install().unwrap();

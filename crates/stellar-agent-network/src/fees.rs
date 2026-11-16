@@ -2,12 +2,19 @@
 //!
 //! Provides fee-stats fetching, percentile selection, and classic-fee
 //! resolution for transaction construction.
+//! Selects verified contract total fee bounds and checks full transaction totals.
 
 use serde::{Deserialize, Serialize};
 use stellar_agent_core::error::{
     DerivedFee, FeeSource, NetworkError, ValidationError, WalletError,
 };
 use stellar_agent_core::profile::schema::Profile;
+use stellar_agent_core::{
+    mainnet::verified_policy::VerifiedPolicy,
+    policy::v1::schema::DEFAULT_CONTRACT_TRANSFER_MAX_FEE_STROOPS,
+    profile::caip2::Caip2,
+    sac_payment::{ContractTransferFeeCap, SacPaymentError},
+};
 use stellar_rpc_client::{FeeStat, GetFeeStatsResponse};
 
 use crate::client::StellarRpcClient;
@@ -352,6 +359,48 @@ pub fn check_built_fee_cap(
     )
 }
 
+/// Selects the signed full transaction fee bound for contract transfers.
+///
+/// Testnet uses the default when verified metadata has no cap. Mainnet requires
+/// explicit verified consent. Classic per-operation limits do not enter this lookup.
+///
+/// # Errors
+/// Returns `validation.contract_transfer_fee_cap_required` on mainnet without
+/// a cap in the verified policy.
+pub fn contract_transfer_fee_cap(
+    chain: Caip2,
+    policy: Option<&VerifiedPolicy>,
+) -> Result<ContractTransferFeeCap, WalletError> {
+    match policy.and_then(VerifiedPolicy::contract_transfer_max_fee_stroops) {
+        Some(stroops) => Ok(ContractTransferFeeCap {
+            stroops,
+            signed: true,
+        }),
+        None if chain.is_mainnet() => Err(SacPaymentError::FeeConsentRequired.into()),
+        None => Ok(ContractTransferFeeCap {
+            stroops: DEFAULT_CONTRACT_TRANSFER_MAX_FEE_STROOPS,
+            signed: false,
+        }),
+    }
+}
+
+/// Checks the full transaction fee, including resources and restoration.
+///
+/// Equality passes. This arithmetic check accepts caller-supplied bounds;
+/// the cap's descriptive `signed` flag grants no authority.
+///
+/// # Errors
+/// Returns `validation.contract_transfer_fee_exceeded` above the cap.
+pub fn check_contract_transfer_fee_cap(
+    total_stroops: u64,
+    cap: ContractTransferFeeCap,
+) -> Result<(), WalletError> {
+    if total_stroops > u64::from(cap.stroops) {
+        return Err(SacPaymentError::FeeExceeded.into());
+    }
+    Ok(())
+}
+
 /// Checks a classic per-operation fee against the profile's
 /// `classic_max_fee_per_op_stroops` before a stage signs or sends.
 ///
@@ -509,6 +558,137 @@ mod tests {
     #![allow(clippy::panic, clippy::unwrap_used, reason = "test assertions")]
 
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn contract_fee_lookup_uses_only_verified_metadata() {
+        use crate::{check_contract_transfer_fee_cap, contract_transfer_fee_cap};
+        use ed25519_dalek::SigningKey;
+        use stellar_agent_core::policy::v1::{
+            PolicyEngineV1,
+            canonical::canonical_bytes,
+            criteria::state_store::PolicyStateStore,
+            loader::load_signed_policy_text,
+            signature::{digest, sign},
+            verified::{OwnerKeySource, PinMode, PolicyLoad, load_verified_policy},
+        };
+
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.toml");
+        let window = dir.path().join("state.window");
+        let key = SigningKey::from_bytes(&[31; 32]);
+        let public = key.verifying_key().to_bytes();
+        let profile = testnet(Some(100));
+        assert_eq!(
+            contract_transfer_fee_cap(Caip2::Testnet, None).unwrap(),
+            ContractTransferFeeCap {
+                stroops: 1_000_000,
+                signed: false
+            }
+        );
+        assert_eq!(
+            contract_transfer_fee_cap(mainnet(Some(100)).chain_id, None)
+                .unwrap_err()
+                .code(),
+            "validation.contract_transfer_fee_cap_required"
+        );
+        for version in [1, 2] {
+            for cap in [None, Some(0), Some(1_000_000), Some(u32::MAX)] {
+                let sequence = if version == 2 { "sequence = 1\n" } else { "" };
+                let field = cap.map_or_else(String::new, |value| {
+                    format!("contract_transfer_max_fee_stroops = {value}\n")
+                });
+                let body =
+                    format!("version = {version}\nscope = \"profile:fees\"\n{sequence}{field}");
+                let signed = format!(
+                    "{body}\n[signature]\nowner_id = \"{}\"\nsig = \"{}\"\n",
+                    stellar_strkey::ed25519::PublicKey(public),
+                    stellar_agent_core::hex::encode(&sign(
+                        &digest(&canonical_bytes(&body).unwrap()),
+                        &key
+                    ))
+                );
+                std::fs::write(&path, &signed).unwrap();
+                let policy = load_verified_policy(
+                    &PolicyLoad {
+                        path: &path,
+                        profile: &profile,
+                        profile_name: "fees",
+                        owner_pubkey: &public,
+                        owner_source: OwnerKeySource::Keyring,
+                        window_path: &window,
+                    },
+                    PolicyStateStore::new(),
+                    PinMode::CompareOnly,
+                )
+                .unwrap();
+                let selected = contract_transfer_fee_cap(profile.chain_id, Some(&policy)).unwrap();
+                assert_eq!(
+                    selected,
+                    ContractTransferFeeCap {
+                        stroops: cap.unwrap_or(1_000_000),
+                        signed: cap.is_some()
+                    }
+                );
+                match cap {
+                    Some(value) => {
+                        assert_eq!(
+                            contract_transfer_fee_cap(Caip2::Mainnet, Some(&policy))
+                                .unwrap()
+                                .stroops,
+                            value
+                        );
+                        assert!(
+                            check_contract_transfer_fee_cap(u64::from(value), selected).is_ok()
+                        );
+                    }
+                    None => assert_eq!(
+                        contract_transfer_fee_cap(Caip2::Mainnet, Some(&policy))
+                            .unwrap_err()
+                            .code(),
+                        "validation.contract_transfer_fee_cap_required"
+                    ),
+                }
+                let document =
+                    load_signed_policy_text(&signed, "fees", &public, &profile.network_passphrase)
+                        .unwrap();
+                let descriptive = VerifiedPolicy::for_test(
+                    [0; 32],
+                    std::sync::Arc::new(PolicyEngineV1::new(document, "fees".into())),
+                );
+                assert_eq!(
+                    contract_transfer_fee_cap(Caip2::Mainnet, Some(&descriptive))
+                        .unwrap_err()
+                        .code(),
+                    "validation.contract_transfer_fee_cap_required"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn contract_fee_checker_preserves_total_width() {
+        for signed in [false, true] {
+            for cap in [0, 1_000_000, u32::MAX] {
+                let bound = ContractTransferFeeCap {
+                    stroops: cap,
+                    signed,
+                };
+                assert!(crate::check_contract_transfer_fee_cap(u64::from(cap), bound).is_ok());
+                for total in [u64::from(cap) + 1, u64::from(u32::MAX) + 1, u64::MAX] {
+                    assert_eq!(
+                        crate::check_contract_transfer_fee_cap(total, bound)
+                            .unwrap_err()
+                            .code(),
+                        "validation.contract_transfer_fee_exceeded"
+                    );
+                }
+            }
+        }
+    }
 
     fn testnet(cap: Option<u32>) -> Profile {
         Profile::builder_testnet_named("fees", "signer", "fees", "nonce", "fees")

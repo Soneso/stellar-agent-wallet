@@ -150,8 +150,15 @@ mod tests {
             let state = PolicyStateStore::new();
             seed(&state);
             let snapshot = PolicyEvaluationSnapshot::new(state, NOW);
-            let policy =
-                VerifiedPolicy::from_verified(7, b"snapshot", [8; 32], Arc::clone(&engine), None);
+            let policy = VerifiedPolicy::from_verified(
+                7,
+                b"snapshot",
+                [8; 32],
+                Arc::clone(&engine),
+                None,
+                None,
+            );
+            assert_eq!(policy.contract_transfer_max_fee_stroops(), None);
             let evaluate = |snapshot: &PolicyEvaluationSnapshot| {
                 evaluate_mainnet_in_snapshot(
                     &policy,

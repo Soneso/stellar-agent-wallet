@@ -17,9 +17,19 @@ use toml_edit::{DocumentMut, Item, TableLike, Value};
 
 use crate::policy::PolicyError;
 
+/// Default full transaction fee bound for contract transfers, in stroops.
+pub const DEFAULT_CONTRACT_TRANSFER_MAX_FEE_STROOPS: u32 = 1_000_000;
+
 /// Top-level keys of a policy file. `signature` is the envelope, which the
 /// canonical form excludes.
-const ROOT_KEYS: &[&str] = &["version", "scope", "rules", "signature", "owner_rotation"];
+const ROOT_KEYS: &[&str] = &[
+    "version",
+    "scope",
+    "contract_transfer_max_fee_stroops",
+    "rules",
+    "signature",
+    "owner_rotation",
+];
 
 /// Keys of the signed mainnet installation binding, in canonical order.
 pub(crate) const MAINNET_KEYS: &[&str] = &[
@@ -177,6 +187,7 @@ pub fn validate_policy_keys(doc: &DocumentMut) -> Result<(), PolicyError> {
         &[
             "version",
             "scope",
+            "contract_transfer_max_fee_stroops",
             "sequence",
             "engine",
             "mainnet",
@@ -189,6 +200,7 @@ pub fn validate_policy_keys(doc: &DocumentMut) -> Result<(), PolicyError> {
     };
     reject_unknown_keys(doc.as_table(), root, None, "the policy file")?;
     signed_engine(doc)?;
+    contract_transfer_max_fee_stroops(doc)?;
     if let Some(mainnet) = doc.get("mainnet").and_then(Item::as_table_like) {
         reject_unknown_keys(mainnet, MAINNET_KEYS, Some("mainnet"), "the mainnet table")?;
         super::approval_credentials::reject_unknown_fields(mainnet.get("approval_credentials"))?;
@@ -245,6 +257,26 @@ pub fn validate_policy_keys(doc: &DocumentMut) -> Result<(), PolicyError> {
     }
 
     Ok(())
+}
+
+/// Reads the optional full transaction fee bound for contract transfers.
+///
+/// Zero permits only a zero fee. Absence carries no signed fee consent.
+///
+/// # Errors
+/// Returns [`PolicyError::PolicyFileParseFailed`] for a non-integer or a value
+/// outside the `u32` range.
+pub fn contract_transfer_max_fee_stroops(doc: &DocumentMut) -> Result<Option<u32>, PolicyError> {
+    doc.get("contract_transfer_max_fee_stroops")
+        .map(|item| {
+            item.as_integer()
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| PolicyError::PolicyFileParseFailed {
+                    detail: "contract_transfer_max_fee_stroops must be an integer in the u32 range"
+                        .into(),
+                })
+        })
+        .transpose()
 }
 
 /// Reads the optional signed engine selector without inserting a default field.
@@ -396,7 +428,7 @@ mod tests {
             matches!(
                 err,
                 PolicyError::PolicyFileParseFailed { ref detail }
-                    if detail == "unknown key; the policy file accepts version, scope, rules, \
+                    if detail == "unknown key; the policy file accepts version, scope, contract_transfer_max_fee_stroops, rules, \
                                   signature, owner_rotation"
             ),
             "{err:?}"

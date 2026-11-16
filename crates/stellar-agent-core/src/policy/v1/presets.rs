@@ -708,8 +708,9 @@ pub fn policy_body(profile_name: &str, derived: &DerivedSpending) -> String {
     let asset = toml_string(&derived.asset.policy_id());
     let amount = |stroops: i128| toml_string(&stroops.to_string());
     let mut body = format!(
-        "version = 2\nscope = {}\nsequence = 1\n",
-        toml_string(&format!("profile:{profile_name}"))
+        "version = 2\nscope = {}\nsequence = 1\ncontract_transfer_max_fee_stroops = {}\n",
+        toml_string(&format!("profile:{profile_name}")),
+        super::schema::DEFAULT_CONTRACT_TRANSFER_MAX_FEE_STROOPS,
     );
     // One table text on every payment rule: the loader admits equal tables
     // only, and equal budget tables share one counter per asset.
@@ -1423,6 +1424,67 @@ pub enum FeeCapStatus {
     Signed,
 }
 
+/// The authority or fallback governing a reported contract total fee bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContractTransferFeeCapStatus {
+    /// The owner signature and policy admission checks passed.
+    Verified,
+    /// The body declares a cap that needs owner signing and verification.
+    RequiresSignature,
+    /// No cap is declared; testnet uses its default.
+    TestnetDefault,
+    /// Mainnet contract fee consent is absent.
+    Required,
+    /// The body or its authority could not be verified.
+    Unavailable,
+}
+
+/// Configured and effective full transaction bounds, in stroops.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ContractTransferFeeReport {
+    /// The optional root value; `None` means the body declares no cap.
+    pub configured_stroops: Option<u32>,
+    /// The verified cap or testnet fallback, when established.
+    pub effective_stroops: Option<u32>,
+    /// Why the effective bound is present or absent.
+    pub status: ContractTransferFeeCapStatus,
+}
+
+/// Reports a body's contract fee bound using the caller's verification result.
+///
+/// Parsing a body alone never labels its configured cap verified.
+#[must_use]
+pub fn contract_transfer_fee_report(
+    body: &DocumentMut,
+    network_passphrase: &str,
+    authority: AuthorityStatus,
+) -> ContractTransferFeeReport {
+    use ContractTransferFeeCapStatus as Status;
+    let parsed = super::schema::contract_transfer_max_fee_stroops(body);
+    let configured_stroops = parsed.as_ref().ok().copied().flatten();
+    let (effective_stroops, status) = if parsed.is_err()
+        || authority == AuthorityStatus::Unavailable
+    {
+        (None, Status::Unavailable)
+    } else {
+        match configured_stroops {
+            Some(cap) if authority == AuthorityStatus::Verified => (Some(cap), Status::Verified),
+            Some(_) => (None, Status::RequiresSignature),
+            None if Caip2::from_passphrase(network_passphrase) == Some(Caip2::Testnet) => (
+                Some(super::schema::DEFAULT_CONTRACT_TRANSFER_MAX_FEE_STROOPS),
+                Status::TestnetDefault,
+            ),
+            None => (None, Status::Required),
+        }
+    };
+    ContractTransferFeeReport {
+        configured_stroops,
+        effective_stroops,
+        status,
+    }
+}
+
 /// A value the summary states once for several tools.
 ///
 /// It serializes tagged, so no value of `T` reads as the marker: an agreed
@@ -1827,6 +1889,8 @@ pub struct SpendingSummary {
     /// The fee cap in XLM, the maximum per classic operation. Soroban
     /// resource fees are outside it.
     pub max_fee_per_classic_operation_xlm: Option<String>,
+    /// The configured contract total cap and its verified or default provenance.
+    pub contract_transfer_fee_cap: ContractTransferFeeReport,
     /// The balance floor in XLM, agreed over the payment tools whose rule
     /// carries one and that pay; see `balance_floors` when it differs.
     pub balance_floor_xlm: Agreed<String>,
@@ -3439,6 +3503,11 @@ pub fn summarize(
         classic_max_fee_per_op_stroops: fee,
         fee_cap_status,
         max_fee_per_classic_operation_xlm: fee.map(|f| format_amount(i128::from(f))),
+        contract_transfer_fee_cap: contract_transfer_fee_report(
+            body,
+            network_passphrase,
+            authority,
+        ),
         balance_floor_xlm: Agreed::of(
             payment
                 .iter()
@@ -4798,7 +4867,10 @@ mod tests {
 
     #[test]
     fn body_has_no_comment_and_no_mainnet_table() {
-        for input in usdc_inputs() {
+        let native = PRESETS
+            .iter()
+            .map(|preset| xlm_input(preset.name, "10", "0.01"));
+        for input in usdc_inputs().into_iter().chain(native) {
             let body = policy_body(PROFILE, &derive(&input).unwrap());
             assert!(!body.contains('#'), "{}", input.preset.name);
             assert!(!body.contains("[mainnet]"), "{}", input.preset.name);
@@ -4811,8 +4883,20 @@ mod tests {
             assert!(!parsed.contains_key("mainnet"));
             assert!(!parsed.contains_key("signature"));
             assert_eq!(
+                parsed
+                    .get("contract_transfer_max_fee_stroops")
+                    .and_then(toml_edit::Item::as_integer),
+                Some(1_000_000)
+            );
+            assert_eq!(
                 parsed.iter().map(|(key, _)| key).collect::<Vec<_>>(),
-                ["version", "scope", "sequence", "rules"]
+                [
+                    "version",
+                    "scope",
+                    "sequence",
+                    "contract_transfer_max_fee_stroops",
+                    "rules"
+                ]
             );
         }
     }
@@ -6128,6 +6212,7 @@ mod tests {
             "classic_max_fee_per_op_stroops",
             "fee_cap_status",
             "max_fee_per_classic_operation_xlm",
+            "contract_transfer_fee_cap",
             "balance_floor_xlm",
             "balance_floors",
             "recipients",

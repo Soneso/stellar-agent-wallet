@@ -154,6 +154,7 @@ pub struct VerifiedPolicy {
     owner: [u8; 32],
     engine: Arc<PolicyEngineV1>,
     mainnet: Option<MainnetBody>,
+    contract_transfer_max_fee_stroops: Option<u32>,
 }
 
 impl std::fmt::Debug for VerifiedPolicy {
@@ -182,7 +183,7 @@ impl VerifiedPolicy {
     /// Records the policy the loader verified: the signed `sequence` (`0` for
     /// a version 1 document), the `canonical_bytes` the signature covers, the
     /// verifying `owner` key, the engine built from the document, and its
-    /// mainnet section.
+    /// mainnet section and optional contract total fee bound.
     ///
     /// The digest is [`policy_digest`] of `canonical_bytes`.
     pub(crate) fn from_verified(
@@ -191,6 +192,7 @@ impl VerifiedPolicy {
         owner: [u8; 32],
         engine: Arc<PolicyEngineV1>,
         mainnet: Option<MainnetBody>,
+        contract_transfer_max_fee_stroops: Option<u32>,
     ) -> Self {
         Self {
             sequence,
@@ -198,11 +200,12 @@ impl VerifiedPolicy {
             owner,
             engine,
             mainnet,
+            contract_transfer_max_fee_stroops,
         }
     }
 
     /// A fixture policy of `engine` whose digest is `digest`, with sequence
-    /// 1, an all-zero owner, and no mainnet section.
+    /// 1, an all-zero owner, no mainnet section, and no contract fee consent.
     #[cfg(any(test, feature = "test-helpers"))]
     #[must_use]
     pub fn for_test(digest: [u8; 32], engine: Arc<PolicyEngineV1>) -> Self {
@@ -212,6 +215,7 @@ impl VerifiedPolicy {
             owner: [0; 32],
             engine,
             mainnet: None,
+            contract_transfer_max_fee_stroops: None,
         }
     }
 
@@ -245,6 +249,12 @@ impl VerifiedPolicy {
         self.mainnet.as_ref()
     }
 
+    /// The optional full transaction fee bound verified with the owner signature.
+    #[must_use]
+    pub fn contract_transfer_max_fee_stroops(&self) -> Option<u32> {
+        self.contract_transfer_max_fee_stroops
+    }
+
     /// The fact digest under `stellar-agent-authz-fact:policy:v1`.
     ///
     /// Fields, in order: `i64be(sequence)`, the 32-byte digest, the 32-byte
@@ -257,6 +267,7 @@ impl VerifiedPolicy {
     /// parser bounds the list to 16 entries of at most 64-byte IDs, so every
     /// length fits its `u32` prefix. The approval origin and certificate pin
     /// enter through the document digest, which covers their canonical bytes.
+    /// The optional contract total fee bound enters through that digest too.
     /// The engine is not a fact: the digest already names the document it
     /// was built from.
     #[must_use]
@@ -343,7 +354,9 @@ mod tests {
     /// and a frozen vector.
     #[test]
     fn getters_and_fact_digest_follow_the_contract() {
-        let policy = VerifiedPolicy::from_verified(4, b"", [9; 32], engine(), Some(body()));
+        let policy =
+            VerifiedPolicy::from_verified(4, b"", [9; 32], engine(), Some(body()), Some(0));
+        assert_eq!(policy.contract_transfer_max_fee_stroops(), Some(0));
         assert_eq!(policy.sequence(), 4);
         assert_eq!(
             crate::hex::encode(&policy.digest()),
@@ -383,7 +396,8 @@ mod tests {
             "1de9d5c8d749b4077eecbd02f0bc63f5be21b41852809b2ccf184b322ad93900"
         );
 
-        let bare = VerifiedPolicy::from_verified(0, b"canonical", [9; 32], engine(), None);
+        let bare = VerifiedPolicy::from_verified(0, b"canonical", [9; 32], engine(), None, None);
+        assert_eq!(bare.contract_transfer_max_fee_stroops(), None);
         assert_eq!(bare.sequence(), 0);
         assert_eq!(bare.digest(), *blake3::hash(b"canonical").as_bytes());
         assert_ne!(bare.digest(), policy.digest());
@@ -407,7 +421,8 @@ mod tests {
         ] {
             let mut changed = body();
             changed.approval_credentials = credentials;
-            let changed = VerifiedPolicy::from_verified(4, b"", [9; 32], engine(), Some(changed));
+            let changed =
+                VerifiedPolicy::from_verified(4, b"", [9; 32], engine(), Some(changed), None);
             assert_ne!(changed.fact_digest(), policy.fact_digest());
         }
     }

@@ -114,7 +114,8 @@ pub use fees::validate_rpc_url_allowing_loopback;
 pub use fees::{
     ALLOWED_RPC_HOSTS, CLASSIC_SINGLE_OPERATION_COUNT, ClassicFeeChoice, ClassicFeeSelection,
     FeeDistribution, FeePercentile, FeeStatsView, RpcUrlError, check_built_fee_cap,
-    check_classic_fee_cap, classic_fee_source, fetch_fee_stats, parse_classic_fee_choice,
+    check_classic_fee_cap, check_contract_transfer_fee_cap, classic_fee_source,
+    contract_transfer_fee_cap, fetch_fee_stats, parse_classic_fee_choice,
     resolve_classic_fee_selection, validate_rpc_url,
 };
 pub use friendbot::{

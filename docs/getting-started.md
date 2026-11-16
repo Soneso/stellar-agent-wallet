@@ -595,6 +595,12 @@ decision = "require_approval"
 ```
 
 For another profile, replace `default` in the filename and `scope`.
+Policy versions 1 and 2 also accept the optional root
+`contract_transfer_max_fee_stroops`. Generated mainnet presets set it to
+1,000,000 stroops. Enablement and rotation preserve explicit values and insert
+the default when absent. Sign the rewritten policy to establish consent.
+This field does not enable contract payments; see [contract fee bounds](maintainers/contract-payment-fees.md).
+
 Balance reads are allowed, and testnet payments are allowed up to 100 XLM per day.
 An MCP payment needs both payment rules: `stellar_pay` builds and simulates it,
 `stellar_pay_commit` signs and submits it, and each phase matches rules under

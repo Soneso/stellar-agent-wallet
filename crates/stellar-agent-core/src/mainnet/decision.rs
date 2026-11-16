@@ -467,7 +467,7 @@ mod tests {
             },
             "main".to_owned(),
         ));
-        VerifiedPolicy::from_verified(7, b"decision", [9; 32], engine, None)
+        VerifiedPolicy::from_verified(7, b"decision", [9; 32], engine, None, None)
     }
 
     fn tool(name: &'static str) -> ToolDescriptor {

@@ -1838,6 +1838,24 @@ mod tests {
             usdc_body("preset-default", "api-day", false, true)
         );
         assert!(profile_path(dir.path(), "preset-default").exists());
+        let written = std::fs::read_to_string(policy_path(dir.path(), "preset-default")).unwrap();
+        let parsed = written.parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(
+            parsed
+                .get("contract_transfer_max_fee_stroops")
+                .and_then(toml_edit::Item::as_integer),
+            Some(1_000_000)
+        );
+        assert!(!parsed.contains_key("signature"));
+        assert!(
+            stellar_agent_core::policy::v1::loader::load_signed_policy_text(
+                &written,
+                "preset-default",
+                &[0; 32],
+                MAINNET_PASSPHRASE,
+            )
+            .is_err()
+        );
     }
 
     /// An api preset needs an explicit unlisted choice. Init refuses and
@@ -2469,6 +2487,39 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(policy_path(dir.path(), "ordered")).unwrap(),
             usdc_body("ordered", "api-day", false, true)
+        );
+        let written = std::fs::read_to_string(policy_path(dir.path(), "ordered")).unwrap();
+        let parsed = written.parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(
+            parsed
+                .get("contract_transfer_max_fee_stroops")
+                .and_then(toml_edit::Item::as_integer),
+            Some(1_000_000)
+        );
+        assert!(
+            stellar_agent_core::policy::v1::loader::load_signed_policy_text(
+                &written,
+                "ordered",
+                &[0; 32],
+                MAINNET_PASSPHRASE,
+            )
+            .is_err()
+        );
+        let (code, restarted) = init_into(
+            &a,
+            (
+                &dir.path().join("restarted-profiles"),
+                &dir.path().join("policies"),
+            ),
+            false,
+            &mut Vec::new(),
+            queue(&[]),
+        )
+        .await;
+        assert_eq!(code, 0, "{restarted}");
+        assert_eq!(
+            std::fs::read_to_string(policy_path(dir.path(), "ordered")).unwrap(),
+            written
         );
         assert_eq!(
             out.envelope["error"]["details"]["preview"]["phase"],

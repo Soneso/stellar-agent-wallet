@@ -539,6 +539,12 @@ Stdout carries one JSON envelope. Valid input exits 0.
 With `--origin`, valid input declaring an origin exits 3, signed or unsigned.
 Invalid input exits 65 with its policy code. Profile access and input errors exit 1.
 
+Valid output also includes `contract_transfer_fee_cap`, with `configured_stroops`,
+`effective_stroops`, and `status`. A declared cap is `requires_signature`, even
+when input carries a signature table. An absent cap is `testnet_default` on
+testnet and `required` on mainnet. This status does not reject G/M-only policies.
+See [contract fee bounds](../maintainers/contract-payment-fees.md) for all statuses.
+
 ### `profile policy add-counterparty`
 
 Syntax, with placeholders in angle brackets and optional repeated parts in square brackets:
@@ -658,7 +664,10 @@ strict audit writer, stores an installation nonce, then atomically rewrites
 the policy with the profile, normalized endpoint host, and nonce digest.
 A full binding writes `classic_max_fee_per_op_stroops = 10000` into
 `[mainnet]` when the policy states no fee cap, and keeps an authored one.
-The operator reviews that fee cap and supplies the optional authorization
+Every enablement or rotation also inserts root
+`contract_transfer_max_fee_stroops = 1000000` when absent and preserves explicit
+values, including zero. Review both fee bounds before signing.
+The operator supplies the optional authorization
 TTL and thresholds. The operator also adds at least one approval credential
 from `approve credential enroll`, then signs the policy as the output's
 `next` list directs.
