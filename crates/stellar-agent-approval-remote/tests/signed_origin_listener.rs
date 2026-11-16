@@ -37,6 +37,21 @@ use stellar_agent_test_support::{
 #[path = "signed_origin_commit/mod.rs"]
 mod signed_origin_commit;
 
+/// The consent recording of a profile whose entries no durable record names,
+/// as `approve serve` completes them: every consent completes and nothing is
+/// written.
+struct NoDurableRecords;
+
+impl stellar_agent_approval_ui::decision::ConsentRecording for NoDurableRecords {
+    fn complete(
+        &self,
+        _: stellar_agent_approval_ui::decision::VerifiedConsent,
+        _: stellar_agent_approval_ui::decision::ConsentRowSource,
+    ) -> Result<(), stellar_agent_core::error::WalletError> {
+        Ok(())
+    }
+}
+
 struct Fixture {
     fixture: MainnetConsentFixture,
     entry: PendingApproval,
@@ -120,7 +135,8 @@ impl Fixture {
     }
 
     /// The profile's remote section, its approval context, and a decision
-    /// context that carries no mainnet authority yet.
+    /// context that carries the consent recording and no mainnet authority
+    /// yet.
     fn unauthorized_parts(
         &self,
     ) -> (
@@ -149,7 +165,8 @@ impl Fixture {
                 .clone()
                 .unwrap_or_else(|| Arc::new(Mutex::new(self.fixture.audit_writer()))),
             None,
-        );
+        )
+        .with_consent_recording(Arc::new(NoDurableRecords));
         (remote, context, decision)
     }
 

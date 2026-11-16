@@ -21,6 +21,7 @@ struct Harness {
     state: Arc<PresenceState>,
     cookie: String,
     session: SessionState,
+    consent: Arc<crate::tests::RecordingConsent>,
 }
 impl Harness {
     fn new() -> Self {
@@ -32,7 +33,8 @@ impl Harness {
         let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
         store.insert(entry.clone(), now_ms().unwrap()).unwrap();
         drop(store);
-        let ctx = Arc::new(Self::context_of(&fixture));
+        let consent = Arc::new(crate::tests::RecordingConsent::default());
+        let ctx = Arc::new(Self::context_of(&fixture).with_consent_recording(consent.clone()));
         let token = OpaqueToken::generate();
         let hex = token.to_hex();
         let mut auth = AuthState::new(token, SessionPurpose::Inbox);
@@ -56,9 +58,11 @@ impl Harness {
             state,
             cookie,
             session,
+            consent,
         }
     }
-    /// The decision context of the fixture's mainnet inbox.
+    /// The decision context of the fixture's mainnet inbox, with a consent
+    /// recording that completes every value consent.
     fn context_of(fixture: &MainnetConsentFixture) -> DecisionContext {
         DecisionContext::new(
             ApprovalContext::from_profile(fixture.name(), fixture.profile()),
@@ -72,6 +76,7 @@ impl Harness {
             None,
         )
         .with_mainnet_authority(fixture.authority())
+        .with_consent_recording(Arc::new(crate::tests::RecordingConsent::default()))
     }
     fn digest(&self) -> String {
         hex::encode(
@@ -1627,6 +1632,7 @@ struct SignedOrigin {
     context: Arc<DecisionContext>,
     router: Router,
     session: HttpsSession,
+    consent: Arc<crate::tests::RecordingConsent>,
 }
 
 impl SignedOrigin {
@@ -1655,7 +1661,8 @@ impl SignedOrigin {
         drop(store);
         let identity = ListenerIdentity::capture(&fixture.current_policy()).unwrap();
         let (gate, session) = HttpsSessionGate::open();
-        let context = Harness::context_of(&fixture);
+        let consent = Arc::new(crate::tests::RecordingConsent::default());
+        let context = Harness::context_of(&fixture).with_consent_recording(consent.clone());
         let context = Arc::new(match access {
             Some(access) => context.with_revocation_access(access),
             None => context,
@@ -1681,6 +1688,7 @@ impl SignedOrigin {
             context,
             router,
             session,
+            consent,
         }
     }
 
@@ -2733,4 +2741,156 @@ async fn a_busy_inbox_start_keeps_the_busy_refusal() {
     );
     drop(writer);
     start().await.unwrap().shutdown().await.unwrap();
+}
+
+// ── Durable consent ─────────────────────────────────────────────────────────
+
+/// The body of the stored page of the entry `nonce` at the signed origin.
+async fn signed_stored_page(so: &SignedOrigin) -> String {
+    let response = so
+        .send("GET", &format!("/approval/{}", so.nonce()), None)
+        .await;
+    let (status, html) = page_text(response).await;
+    assert_eq!(status, StatusCode::OK, "{html}");
+    html
+}
+
+/// Every inbox response that carries a value attestation follows its durable
+/// consent, on the loopback inbox and at the signed origin. The assertion
+/// completes the consent of the row it wrote before it answers. The stored
+/// page completes it as recovered before it shows the blob.
+#[tokio::test]
+#[serial_test::serial]
+async fn inbox_consent_completes_before_every_attestation_response() {
+    use crate::decision::ConsentRowSource::{Recovered, Written};
+    {
+        let h = Harness::named("consent-loopback");
+        let nonce = h.entry.approval_nonce.clone();
+        let options = h.challenge().await;
+        let (status, body) = h.post("assertion", h.signed(&options, 5), "").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let blob = body["attestation"].as_str().unwrap().to_owned();
+        assert_eq!(h.consent.calls(), [(nonce.clone(), Written)]);
+        let (status, html) = page_text(detail(&h.state, &h.session, &nonce)).await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert!(html.contains(&blob), "{html}");
+        assert_eq!(
+            h.consent.calls(),
+            [(nonce.clone(), Written), (nonce, Recovered)]
+        );
+    }
+    let so = SignedOrigin::new("consent-signed");
+    let nonce = so.nonce().to_owned();
+    let options = so.challenge().await;
+    let (status, body) = so
+        .post("assertion", &SignedOrigin::signed(&options, 3))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let blob = body["attestation"].as_str().unwrap().to_owned();
+    assert_eq!(so.consent.calls(), [(nonce.clone(), Written)]);
+    assert!(signed_stored_page(&so).await.contains(&blob));
+    assert_eq!(
+        so.consent.calls(),
+        [(nonce.clone(), Written), (nonce, Recovered)]
+    );
+}
+
+/// A refused completion returns no attestation on either listener: the
+/// assertion answers unavailable and the stored page renders without the
+/// blob. The entry stays attested, so a later completion can succeed.
+#[tokio::test]
+#[serial_test::serial]
+async fn inbox_completion_failure_returns_no_attestation() {
+    use std::sync::atomic::Ordering;
+    {
+        let h = Harness::named("consent-refused-loopback");
+        h.consent.refuse.store(true, Ordering::SeqCst);
+        let nonce = h.entry.approval_nonce.clone();
+        let options = h.challenge().await;
+        let (status, body) = h.post("assertion", h.signed(&options, 5), "").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(body.get("attestation").is_none(), "{body}");
+        let blob = PendingApprovalStore::open(h.fixture.store_path())
+            .unwrap()
+            .get(&nonce)
+            .unwrap()
+            .attestation_blob_b64
+            .clone()
+            .unwrap();
+        let (status, html) = page_text(detail(&h.state, &h.session, &nonce)).await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert!(!html.contains(&blob), "{html}");
+        assert_eq!(h.consent.calls().len(), 2);
+        h.consent.refuse.store(false, Ordering::SeqCst);
+        let (_, html) = page_text(detail(&h.state, &h.session, &nonce)).await;
+        assert!(html.contains(&blob), "{html}");
+    }
+    let so = SignedOrigin::new("consent-refused-signed");
+    so.consent.refuse.store(true, Ordering::SeqCst);
+    let options = so.challenge().await;
+    let (status, body) = so
+        .post("assertion", &SignedOrigin::signed(&options, 3))
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(body.get("attestation").is_none(), "{body}");
+    let blob = so.stored().attestation_blob_b64.unwrap();
+    assert!(!signed_stored_page(&so).await.contains(&blob));
+}
+
+/// The `approval_attested` rows in the audit log of `fixture`.
+fn attested_rows(fixture: &MainnetConsentFixture) -> usize {
+    std::fs::read_to_string(fixture.audit_path())
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains("\"approval_attested\""))
+        .count()
+}
+
+/// A retried assertion on the loopback inbox, whose challenge the first
+/// assertion consumed, completes the attested entry's consent from its
+/// stored proof before the consumed refusal. It issues no challenge and
+/// writes no row; a refused completion answers with its own refusal.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_loopback_retry_recovers_consent_before_the_consumed_refusal() {
+    use crate::decision::ConsentRowSource::{Recovered, Written};
+    let h = Harness::named("retry-loopback");
+    let nonce = h.entry.approval_nonce.clone();
+    let assertion = h.signed(&h.challenge().await, 5);
+    let (status, body) = h.post("assertion", assertion.clone(), "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, body) = h.post("assertion", assertion.clone(), "").await;
+    assert_eq!(body["error"], "approval.presence_consumed", "{body}");
+    assert_eq!(
+        h.consent.calls(),
+        [(nonce.clone(), Written), (nonce.clone(), Recovered)]
+    );
+    assert!(h.state.challenges.lock().unwrap().is_empty());
+    assert_eq!(attested_rows(&h.fixture), 1);
+    h.consent
+        .refuse
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (_, body) = h.post("assertion", assertion, "").await;
+    assert_eq!(body["error"], "approval.presence_unavailable", "{body}");
+    assert_eq!(h.consent.calls().len(), 3);
+}
+
+/// The signed-origin listener recovers a retried assertion as the loopback
+/// inbox does: completion before the consumed refusal, no row.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_signed_origin_retry_recovers_consent_before_the_consumed_refusal() {
+    use crate::decision::ConsentRowSource::{Recovered, Written};
+    let so = SignedOrigin::new("retry-signed");
+    let nonce = so.nonce().to_owned();
+    let assertion = SignedOrigin::signed(&so.challenge().await, 3);
+    let (status, body) = so.post("assertion", &assertion).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, body) = so.post("assertion", &assertion).await;
+    assert_eq!(body["error"], "approval.presence_consumed", "{body}");
+    assert_eq!(
+        so.consent.calls(),
+        [(nonce.clone(), Written), (nonce, Recovered)]
+    );
+    assert_eq!(so.rows("approval_attested").len(), 1);
 }

@@ -2002,6 +2002,26 @@ and before recovery. These refusals write nothing. An already consented record
 writes nothing on this path. Testnet, clawback opt-ins, and credential
 registration keep their consent paths without accessing durable approval records.
 
+`approve serve` installs a consent recording on the one decision context that
+the loopback inbox and the signed-origin listener share. A mainnet payment,
+claim, trustline or x402 approval reports its attestation only after that
+recording commits consent to the record naming the nonce. A context without
+one refuses such an approve before any row. The approve takes the shared
+policy guard before the inbox store. After the attestation persists, it
+releases the audit writer mutex and verifies the stored proof under that
+guard. It then releases the inbox store and the guard before the recording
+completes consent. The recording reads the record and commits
+under the window lock alone, appends no audit row, and names the row
+`written`. No consent path requests the window lock while it holds the inbox
+store. A failed commit answers unavailable and keeps the attested entry. The
+consent then completes from the stored receipt as `recovered` on every later
+route: a repeated approve, an approve that finds the entry attested by
+another handle, an assertion retry whose challenge is consumed, and the
+stored page. Each keeps its existing answer, and the page shows the blob only
+after the commit. An entry that no record names keeps its inbox path and
+writes nothing durable. Clawback opt-in entries and other chains never reach
+the recording.
+
 Consent retains the attestation, receipt and signed process identifier for
 reconstruction. The record supplies the signed nonce, kind, subject and
 lifetime; the authenticated file supplies the profile and chain.

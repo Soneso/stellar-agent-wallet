@@ -214,7 +214,7 @@ pub async fn run(args: ServeArgs) -> i32 {
         }
     };
 
-    let mut context = install_revocation(
+    let mut context = install_durable_access(
         DecisionContext::new(
             stellar_agent_core::approval::ApprovalContext::from_profile(&profile_name, &profile),
             store_path,
@@ -315,14 +315,21 @@ pub async fn run(args: ServeArgs) -> i32 {
     0
 }
 
-pub(super) fn install_revocation(
+/// Installs the profile's durable approval records on the one context that
+/// the loopback inbox and the signed-origin listener serve: revocation, and
+/// the consent of mainnet value approvals.
+pub(super) fn install_durable_access(
     context: DecisionContext,
     name: &str,
     profile: &stellar_agent_core::profile::Profile,
 ) -> DecisionContext {
     let access =
         super::revoke::DurableRevocations::new(name, profile, context.audit_writer.clone());
-    context.with_revocation_access(std::sync::Arc::new(access))
+    context
+        .with_revocation_access(std::sync::Arc::new(access))
+        .with_consent_recording(std::sync::Arc::new(
+            super::consent_record::DurableConsents::new(name, profile),
+        ))
 }
 
 fn mainnet_browser_refusal(

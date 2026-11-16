@@ -376,7 +376,7 @@ pub(super) mod tests {
     pub(in crate::commands::approve) struct Fixture {
         pub(in crate::commands::approve) core: MainnetConsentFixture,
         pub(in crate::commands::approve) store: PersistedWindowStore,
-        clock: TestClockGuard,
+        pub(in crate::commands::approve) clock: TestClockGuard,
         pub(in crate::commands::approve) entry: PendingApproval,
         handle: OperationHandle,
     }
@@ -492,8 +492,10 @@ pub(super) mod tests {
             )
             .with_mainnet_authority(self.core.authority())
         }
-        fn context(&self) -> stellar_agent_approval_ui::DecisionContext {
-            super::super::serve::install_revocation(
+        pub(in crate::commands::approve) fn context(
+            &self,
+        ) -> stellar_agent_approval_ui::DecisionContext {
+            super::super::serve::install_durable_access(
                 self.base_context(),
                 self.core.name(),
                 self.core.profile(),
@@ -1256,7 +1258,7 @@ pub(super) mod tests {
     }
 
     /// A signed-origin fixture whose listener binds an OS-assigned port.
-    fn signed_fixture() -> (Fixture, tempfile::TempDir) {
+    pub(in crate::commands::approve) fn signed_fixture() -> (Fixture, tempfile::TempDir) {
         use stellar_agent_core::approval::mainnet_fixtures::SIGNED_RP_ID;
         let files = tempfile::tempdir().unwrap();
         let leaf = stellar_agent_approval_remote::signed_origin_test_leaf(SIGNED_RP_ID);
@@ -1545,12 +1547,12 @@ pub(super) mod tests {
         }
     }
 
-    enum Listener {
+    pub(in crate::commands::approve) enum Listener {
         Local(stellar_agent_approval_ui::ServeHandle),
         Signed(stellar_agent_approval_remote::RemoteServeHandle),
     }
     impl Listener {
-        async fn shutdown(self) {
+        pub(in crate::commands::approve) async fn shutdown(self) {
             match self {
                 Self::Local(handle) => handle.shutdown().await.unwrap(),
                 Self::Signed(handle) => handle.shutdown().await.unwrap(),
@@ -1558,14 +1560,14 @@ pub(super) mod tests {
         }
     }
 
-    struct Browser {
+    pub(in crate::commands::approve) struct Browser {
         client: reqwest::Client,
         address: String,
         origin: String,
         cookie: String,
         proof: Option<String>,
     }
-    fn island(html: &str, id: &str) -> Value {
+    pub(in crate::commands::approve) fn island(html: &str, id: &str) -> Value {
         let text = html.split(&format!("id=\"{id}\"")).nth(1).unwrap();
         serde_json::from_str(
             text.split_once('>')
@@ -1631,7 +1633,10 @@ pub(super) mod tests {
                 .unwrap()
                 .to_owned();
         }
-        async fn start(f: &Fixture, signed: bool) -> (Listener, Self) {
+        pub(in crate::commands::approve) async fn start(
+            f: &Fixture,
+            signed: bool,
+        ) -> (Listener, Self) {
             let mut browser = Self::new();
             if signed {
                 let profile = f.core.authority().load_current().unwrap().profile().clone();
@@ -1698,7 +1703,7 @@ pub(super) mod tests {
                 .header("origin", &self.origin)
                 .header("cookie", &self.cookie)
         }
-        async fn page(&self, nonce: &str) -> String {
+        pub(in crate::commands::approve) async fn page(&self, nonce: &str) -> String {
             let response = self
                 .request("GET", &format!("/approval/{nonce}"))
                 .send()
@@ -1707,7 +1712,7 @@ pub(super) mod tests {
             assert_eq!(response.status(), 200);
             response.text().await.unwrap()
         }
-        fn action(
+        pub(in crate::commands::approve) fn action(
             &self,
             nonce: &str,
             csrf: &str,
@@ -1723,7 +1728,12 @@ pub(super) mod tests {
                 None => request,
             }
         }
-        fn signed_assertion(&self, options: &Value, count: u32, rp: &str) -> Value {
+        pub(in crate::commands::approve) fn signed_assertion(
+            &self,
+            options: &Value,
+            count: u32,
+            rp: &str,
+        ) -> Value {
             let proof = stellar_agent_test_support::webauthn::fixture_authenticator().assert(
                 B64.decode(options["challenge"].as_str().unwrap())
                     .unwrap()

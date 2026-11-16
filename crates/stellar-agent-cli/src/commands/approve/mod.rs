@@ -49,6 +49,7 @@
 
 mod common;
 pub(crate) use common::{approval_store_dir, approval_store_open_error};
+mod consent_record;
 pub mod credential;
 pub mod gc;
 pub mod list;

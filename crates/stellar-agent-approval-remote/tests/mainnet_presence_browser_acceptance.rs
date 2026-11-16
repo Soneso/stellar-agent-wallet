@@ -44,6 +44,21 @@ use stellar_agent_core::approval::{
 #[path = "common/trusted_browser.rs"]
 mod trusted_browser;
 
+/// The consent recording of a profile whose entries no durable record names,
+/// as `approve serve` completes them: every consent completes and nothing is
+/// written.
+struct NoDurableRecords;
+
+impl stellar_agent_approval_ui::decision::ConsentRecording for NoDurableRecords {
+    fn complete(
+        &self,
+        _: stellar_agent_approval_ui::decision::VerifiedConsent,
+        _: stellar_agent_approval_ui::decision::ConsentRowSource,
+    ) -> Result<(), stellar_agent_core::error::WalletError> {
+        Ok(())
+    }
+}
+
 async fn text(page: &chromiumoxide::Page, expression: &str) -> String {
     page.evaluate(expression)
         .await
@@ -231,7 +246,8 @@ async fn mainnet_presence_page_drives_real_webauthn() {
         Arc::new(Mutex::new(fixture.audit_writer())),
         None,
     )
-    .with_mainnet_authority(fixture.authority());
+    .with_mainnet_authority(fixture.authority())
+    .with_consent_recording(Arc::new(NoDurableRecords));
     let (count, _receiver) = tokio::sync::mpsc::unbounded_channel();
     let handle = start_serve(ServeConfig::new(
         "127.0.0.1:0".parse().unwrap(),
@@ -456,7 +472,8 @@ async fn signed_listener(
         Arc::new(Mutex::new(fixture.audit_writer())),
         None,
     )
-    .with_mainnet_authority(fixture.authority());
+    .with_mainnet_authority(fixture.authority())
+    .with_consent_recording(Arc::new(NoDurableRecords));
     let config = stellar_agent_approval_remote::RemoteServeConfig::from_profile(
         remote.bind.parse().unwrap(),
         remote,
@@ -575,7 +592,8 @@ async fn signed_origin_browser_consent_and_foreign_origin_refusal() {
         Arc::new(Mutex::new(fixture.audit_writer())),
         None,
     )
-    .with_mainnet_authority(fixture.authority());
+    .with_mainnet_authority(fixture.authority())
+    .with_consent_recording(Arc::new(NoDurableRecords));
     let local = start_serve(ServeConfig::new(
         "127.0.0.1:0".parse().unwrap(),
         context,

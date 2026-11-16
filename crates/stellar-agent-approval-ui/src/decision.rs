@@ -52,6 +52,20 @@
 //! The entry binding is the
 //! process UID, as for the local inbox.
 //!
+//! A mainnet payment, claim, trustline or x402 approval also needs durable
+//! consent, which the context's [`ConsentRecording`] completes. A context
+//! without one refuses such an approve with [`Outcome::Unavailable`] before
+//! any row. A mainnet approve takes the shared policy guard before the
+//! pending store. After the attestation persists, it releases the audit
+//! writer mutex and verifies the stored proof under that guard. It then
+//! releases the pending store and the guard before it calls
+//! [`ConsentRecording::complete`]. It reports
+//! [`Outcome::Attested`] only after that succeeds. A failed completion
+//! answers [`Outcome::Unavailable`] and keeps the attested entry. An approve
+//! that finds the entry attested, before or after its keyring wait,
+//! completes the consent the same way before its existing answer. Other
+//! kinds and other chains never call the recording.
+//!
 //! # What the page showed
 //!
 //! An approve attests only the terms its page rendered. Every approval page
@@ -67,8 +81,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use stellar_agent_core::approval::error::ApprovalError;
-use stellar_agent_core::approval::presence::MAINNET_CHAIN_ID;
+use stellar_agent_core::approval::presence::{MAINNET_CHAIN_ID, MainnetPresenceReceipt};
 use stellar_agent_core::approval::presence_policy::PolicyAdmission;
+use stellar_agent_core::approval::witness::{
+    ApprovalExpectation, ApprovalWitness, ApprovedKind, verify_approval_admitted,
+};
 use stellar_agent_core::approval::{
     ApprovalKind, ApproverIdentity, AttestedApprover, ConsentAudit, ConsentAuthorization,
     DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, PendingApprovalStore, RemoteApprovalAuthority,
@@ -246,6 +263,160 @@ pub trait RevocationAccess: Send + Sync {
     }
 }
 
+/// Where the consent audit row of a completed inbox consent went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsentRowSource {
+    /// The approve that attested the entry wrote the row to the audit log.
+    Written,
+    /// The entry was attested before this request, which writes no row.
+    Recovered,
+}
+
+/// The stored consent of an attested value entry, verified under the policy
+/// guard of the request while it held the pending store.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct VerifiedConsent {
+    /// The witness of the verified attestation.
+    pub witness: ApprovalWitness,
+    /// The stored attestation bytes.
+    pub attestation: [u8; 32],
+    /// The stored presence receipt.
+    pub receipt: MainnetPresenceReceipt,
+    /// The entry's signed process identifier.
+    pub process_uid: String,
+}
+
+/// Durable consent of mainnet value approvals, supplied by the serving binary.
+///
+/// A mainnet payment, claim, trustline or x402 approval reports its
+/// attestation only after [`Self::complete`] succeeds.
+pub trait ConsentRecording: Send + Sync {
+    /// Records `consent` in the durable record that names its nonce. The
+    /// request holds neither the pending store nor the policy guard, so the
+    /// implementation may take the window lock.
+    ///
+    /// # Errors
+    /// Returns the refusal of the durable read or commit.
+    fn complete(&self, consent: VerifiedConsent, row: ConsentRowSource) -> Result<(), WalletError>;
+}
+
+/// Whether consent to `kind` needs a durable record on this context's chain:
+/// a mainnet payment, claim, trustline or x402 approval.
+pub(crate) fn needs_durable_consent(ctx: &DecisionContext, kind: &ApprovalKind) -> bool {
+    ctx.context.chain_id == MAINNET_CHAIN_ID
+        && matches!(
+            kind,
+            ApprovalKind::PaymentSimulated { .. }
+                | ApprovalKind::ClaimSimulated { .. }
+                | ApprovalKind::TrustlineSimulated { .. }
+                | ApprovalKind::X402Payment { .. }
+        )
+}
+
+/// Verifies the stored attestation of the value entry `nonce` in `store`
+/// under `admission`, which the request took before the store. The check
+/// takes no lock of its own.
+///
+/// # Errors
+/// `approval.presence_invalid` for an entry without a decodable stored
+/// attestation and receipt or of another kind, and the refusals of
+/// [`verify_approval_admitted`].
+pub(crate) fn verified_consent(
+    context: &stellar_agent_core::approval::ApprovalContext,
+    store: &PendingApprovalStore,
+    current: &stellar_agent_core::approval::CurrentMainnetApprovalPolicy,
+    nonce: &str,
+    admission: &PolicyAdmission,
+) -> Result<VerifiedConsent, WalletError> {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    let invalid = || WalletError::Approval(stellar_agent_core::ApprovalFailure::PresenceInvalid);
+    let entry = store.get(nonce).ok_or_else(invalid)?;
+    let attestation: [u8; 32] = entry
+        .attestation_blob_b64
+        .as_deref()
+        .and_then(|encoded| URL_SAFE_NO_PAD.decode(encoded).ok())
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(invalid)?;
+    let receipt = entry.mainnet_presence.clone().ok_or_else(invalid)?;
+    let kind = match &entry.kind {
+        ApprovalKind::PaymentSimulated { .. } => ApprovedKind::Payment,
+        ApprovalKind::ClaimSimulated { .. } => ApprovedKind::Claim,
+        ApprovalKind::TrustlineSimulated { .. } => ApprovedKind::Trustline,
+        ApprovalKind::X402Payment { .. } => ApprovedKind::X402Payment,
+        _ => return Err(invalid()),
+    };
+    let expected = ApprovalExpectation {
+        kind,
+        subject: stellar_agent_core::approval::mainnet_consent_subject(entry, &context.binding())?,
+    };
+    let witness = verify_approval_admitted(
+        store,
+        current.profile(),
+        &context.profile_name,
+        nonce,
+        &attestation,
+        &expected,
+        current.policy(),
+        timefmt::now_unix_ms().map_err(|_| {
+            WalletError::Approval(stellar_agent_core::ApprovalFailure::PresenceUnavailable)
+        })?,
+        admission,
+    )?;
+    Ok(VerifiedConsent {
+        witness,
+        attestation,
+        receipt,
+        process_uid: entry.process_uid.clone(),
+    })
+}
+
+/// Completes the durable consent of the attested value entry `nonce` before
+/// its attestation is shown. It verifies the stored proof under `admission`,
+/// releases `store` and `admission` in that order, then calls the context's
+/// [`ConsentRecording`].
+///
+/// # Errors
+/// The refusals of [`verified_consent`], `approval.presence_unavailable` on a
+/// context without a [`ConsentRecording`], and the refusals of
+/// [`ConsentRecording::complete`].
+pub(crate) fn complete_consent(
+    ctx: &DecisionContext,
+    store: PendingApprovalStore,
+    current: &stellar_agent_core::approval::CurrentMainnetApprovalPolicy,
+    nonce: &str,
+    admission: PolicyAdmission,
+    row: ConsentRowSource,
+) -> Result<(), WalletError> {
+    let consent = verified_consent(&ctx.context, &store, current, nonce, &admission);
+    drop(store);
+    drop(admission);
+    let recording = ctx.consent.as_ref().ok_or(WalletError::Approval(
+        stellar_agent_core::ApprovalFailure::PresenceUnavailable,
+    ))?;
+    recording.complete(consent?, row)
+}
+
+/// [`complete_consent`] under the request's policy guard `admission`, which a
+/// mainnet approve always holds.
+///
+/// # Errors
+/// `approval.presence_policy_unavailable` without a guard, the refusals of
+/// the policy read, and those of [`complete_consent`].
+fn complete_admitted(
+    ctx: &DecisionContext,
+    store: PendingApprovalStore,
+    nonce: &str,
+    admission: Option<PolicyAdmission>,
+    row: ConsentRowSource,
+) -> Result<(), WalletError> {
+    let admission = admission.ok_or(WalletError::Approval(
+        stellar_agent_core::ApprovalFailure::PresencePolicyUnavailable,
+    ))?;
+    let current = current_policy(ctx, Some(&admission))?;
+    complete_consent(ctx, store, &current, nonce, admission, row)
+}
+
 /// The current policy, read through `admission` when the request holds one.
 fn current_policy(
     ctx: &DecisionContext,
@@ -268,6 +439,7 @@ fn current_policy(
 #[non_exhaustive]
 pub struct DecisionContext {
     revocation: Option<Arc<dyn RevocationAccess>>,
+    consent: Option<Arc<dyn ConsentRecording>>,
     /// Current signed authority for mainnet consent.
     pub mainnet_authority: Option<stellar_agent_core::approval::MainnetApprovalAuthority>,
     /// Serving profile context: the store name, the chain id, the endpoint host and
@@ -311,6 +483,14 @@ impl DecisionContext {
         })
     }
 
+    /// Installs the durable consent of mainnet value approvals. A context
+    /// without it refuses their consent.
+    #[must_use]
+    pub fn with_consent_recording(mut self, recording: Arc<dyn ConsentRecording>) -> Self {
+        self.consent = Some(recording);
+        self
+    }
+
     /// Supplies the authority that mainnet decisions reload before persistence.
     #[must_use]
     pub fn with_mainnet_authority(
@@ -335,6 +515,7 @@ impl DecisionContext {
     ) -> Self {
         Self {
             revocation: None,
+            consent: None,
             mainnet_authority: None,
             context,
             store_path,
@@ -607,21 +788,22 @@ pub fn apply_decision(
 /// [`stellar_agent_core::approval::MainnetApprovalAuthority::admit_exclusive`].
 ///
 /// Every policy read of the decision runs through the guard, and a
-/// revocation writes its durable record under the exclusive guard. The
-/// decision takes no policy-state lock itself.
+/// revocation writes its durable record under the exclusive guard. An
+/// approve releases the guard before its durable consent commit, which
+/// takes the window lock. The decision takes no other policy-state lock.
 pub(crate) fn apply_admitted_decision(
     ctx: &DecisionContext,
     decision: Decision,
     requester: RequestIdentity,
-    admission: &PolicyAdmission,
+    admission: PolicyAdmission,
 ) -> Outcome {
     match decision {
         Decision::Approve {
             nonce,
             shown_view_digest,
         } => apply_approve(ctx, &nonce, shown_view_digest, requester, Some(admission)),
-        Decision::Reject { nonce } => apply_reject(ctx, &nonce, &requester, Some(admission)),
-        Decision::Revoke { nonce } => apply_revoke(ctx, &nonce, &requester, Some(admission)),
+        Decision::Reject { nonce } => apply_reject(ctx, &nonce, &requester, Some(&admission)),
+        Decision::Revoke { nonce } => apply_revoke(ctx, &nonce, &requester, Some(&admission)),
     }
 }
 
@@ -931,7 +1113,7 @@ fn apply_approve(
     nonce: &str,
     shown_view_digest: Option<[u8; 32]>,
     requester: RequestIdentity,
-    admission: Option<&PolicyAdmission>,
+    admission: Option<PolicyAdmission>,
 ) -> Outcome {
     if ctx.context.chain_id == MAINNET_CHAIN_ID
         && matches!(requester, RequestIdentity::Remote { .. })
@@ -951,6 +1133,17 @@ fn apply_approve(
         ))
         .unwrap_or(Outcome::Unavailable);
     }
+    // A mainnet approve reads the policy and verifies consent under one
+    // shared guard, taken before the pending store.
+    let admission = match (admission, &ctx.mainnet_authority) {
+        (None, Some(authority)) if ctx.context.chain_id == MAINNET_CHAIN_ID => {
+            match authority.admit() {
+                Ok(admission) => Some(admission),
+                Err(error) => return presence_refusal(&error).unwrap_or(Outcome::Unavailable),
+            }
+        }
+        (admission, _) => admission,
+    };
     let store = match open_store(ctx, "approve") {
         Ok(s) => s,
         Err(outcome) => return outcome,
@@ -980,6 +1173,24 @@ fn apply_approve(
             }
             if approval_code_is(&e, "approval.already_attested") {
                 if ctx.context.chain_id == MAINNET_CHAIN_ID {
+                    // A repeated approve of a value entry completes the
+                    // durable consent an earlier approve may have left.
+                    if store
+                        .get(nonce)
+                        .is_some_and(|entry| needs_durable_consent(ctx, &entry.kind))
+                    {
+                        let completed = complete_admitted(
+                            ctx,
+                            store,
+                            nonce,
+                            admission,
+                            ConsentRowSource::Recovered,
+                        );
+                        if let Err(error) = completed {
+                            tracing::warn!(code = %error.code(), "approve: consent completion failed");
+                            return Outcome::Unavailable;
+                        }
+                    }
                     return presence_refusal(&WalletError::Approval(
                         stellar_agent_core::ApprovalFailure::PresenceConsumed,
                     ))
@@ -1004,6 +1215,12 @@ fn apply_approve(
         Ok(current) if shown_view_digest == Some(current) => {}
         Ok(_) => return consent_changed(),
         Err(error) => return entry_outcome(&error),
+    }
+    // Without a recording, a value consent could not become durable: refuse
+    // it before any row or attestation.
+    if ctx.consent.is_none() && needs_durable_consent(ctx, &entry.kind) {
+        tracing::warn!("approve: no durable consent recording for a mainnet value approval");
+        return Outcome::Unavailable;
     }
 
     // Release the store lock BEFORE the keyring read: `load_attestation_key`
@@ -1059,7 +1276,7 @@ fn apply_approve(
     let grant_override = ctx.grant_store_path_override.clone();
     let profile_name = ctx.context.profile_name.as_str();
     let current = if presence_bearing {
-        match current_policy(ctx, admission) {
+        match current_policy(ctx, admission.as_ref()) {
             Ok(current) => Some(current),
             Err(error) => return presence_refusal(&error).unwrap_or(Outcome::Unavailable),
         }
@@ -1071,7 +1288,7 @@ fn apply_approve(
             let Some(current) = &current else {
                 return Outcome::Unavailable;
             };
-            match admission {
+            match &admission {
                 Some(admission) => ConsentAuthorization::MainnetAdmitted {
                     presence,
                     policy: current.policy(),
@@ -1117,10 +1334,23 @@ fn apply_approve(
     );
 
     match result {
-        Ok(attestation) => Outcome::Attested {
-            attestation,
-            expires_at_unix_ms: entry.expires_at_unix_ms,
-        },
+        Ok(attestation) => {
+            drop(writer);
+            if needs_durable_consent(ctx, &entry.kind) {
+                let completed =
+                    complete_admitted(ctx, store, nonce, admission, ConsentRowSource::Written);
+                if let Err(error) = completed {
+                    // The entry stays attested; a repeated approve or the
+                    // stored page completes the consent.
+                    tracing::warn!(code = %error.code(), "approve: consent completion failed");
+                    return Outcome::Unavailable;
+                }
+            }
+            Outcome::Attested {
+                attestation,
+                expires_at_unix_ms: entry.expires_at_unix_ms,
+            }
+        }
         Err(e) => {
             if let Some(refusal) = presence_refusal(&e) {
                 return refusal;
@@ -1150,10 +1380,24 @@ fn apply_approve(
             if approval_code_is(&e, "approval.already_attested") {
                 // Another handle attested this entry since it was validated:
                 // no row was written here, and the stored attestation is the
-                // one to re-show.
+                // one to re-show once a value entry's consent is durable.
                 let attestation = store
                     .get(nonce)
                     .and_then(|e| e.attestation_blob_b64.clone());
+                if needs_durable_consent(ctx, &entry.kind) {
+                    drop(writer);
+                    let completed = complete_admitted(
+                        ctx,
+                        store,
+                        nonce,
+                        admission,
+                        ConsentRowSource::Recovered,
+                    );
+                    if let Err(error) = completed {
+                        tracing::warn!(code = %error.code(), "approve: consent completion failed");
+                        return Outcome::Unavailable;
+                    }
+                }
                 return Outcome::AlreadyResolved { attestation };
             }
             // A refused consent row lands here: nothing was persisted.
@@ -3410,6 +3654,253 @@ mod tests {
             format!(r#"["{hex}"]"#),
         ] {
             assert_eq!(shown_view_digest(body.as_bytes()), None, "{body}");
+        }
+    }
+
+    use stellar_agent_core::approval::mainnet_fixtures::MainnetConsentFixture;
+
+    /// The decision context of a mainnet inbox over `fixture`, without a
+    /// consent recording.
+    fn mainnet_context(fixture: &MainnetConsentFixture) -> DecisionContext {
+        DecisionContext::new(
+            stellar_agent_core::approval::ApprovalContext::from_profile(
+                fixture.name(),
+                fixture.profile(),
+            ),
+            fixture.store_path(),
+            fixture.profile().attestation_key_id.clone(),
+            OwnerKeyContext::for_profile(fixture.name(), fixture.profile()),
+            Arc::new(Mutex::new(fixture.audit_writer())),
+            None,
+        )
+        .with_mainnet_authority(fixture.authority())
+    }
+
+    /// Approves `entry` under a fresh verified presence of the fixture
+    /// credential, as the loopback inbox's assertion route does.
+    fn mainnet_approve(
+        ctx: &DecisionContext,
+        fixture: &MainnetConsentFixture,
+        entry: &PendingApproval,
+    ) -> Outcome {
+        apply_decision(
+            ctx,
+            Decision::Approve {
+                nonce: entry.approval_nonce.clone(),
+                shown_view_digest: Some(
+                    approval_view_digest(entry, &ctx.context.binding()).unwrap(),
+                ),
+            },
+            RequestIdentity::Mainnet(fixture.presence(entry, &fixture.current_policy())),
+        )
+    }
+
+    fn presence_consumed() -> Outcome {
+        presence_refusal(&WalletError::Approval(
+            stellar_agent_core::ApprovalFailure::PresenceConsumed,
+        ))
+        .unwrap()
+    }
+
+    /// A mainnet context without a consent recording refuses a value approve
+    /// before any row or attestation: the store and the audit log keep their
+    /// bytes.
+    #[test]
+    #[serial]
+    fn context_without_an_adapter_refuses_mainnet_value_consent() {
+        let fixture = MainnetConsentFixture::new("no-recording");
+        let ctx = mainnet_context(&fixture);
+        let entry = fixture.payment(600_000);
+        insert(&ctx, entry.clone());
+        let store = std::fs::read(&ctx.store_path).unwrap();
+        let audit = std::fs::read(fixture.audit_path()).unwrap_or_default();
+        assert_eq!(
+            mainnet_approve(&ctx, &fixture, &entry),
+            Outcome::Unavailable
+        );
+        assert_eq!(std::fs::read(&ctx.store_path).unwrap(), store);
+        assert_eq!(
+            std::fs::read(fixture.audit_path()).unwrap_or_default(),
+            audit
+        );
+    }
+
+    /// A repeated mainnet approve of an attested value entry completes its
+    /// consent as recovered, then keeps its `approval.presence_consumed`
+    /// refusal. A refused completion answers unavailable.
+    #[test]
+    #[serial]
+    fn inbox_repeated_approve_recovers_consent() {
+        let fixture = MainnetConsentFixture::new("repeated");
+        let entry = fixture.payment(600_000);
+        drop(fixture.consent(&entry));
+        let recording = Arc::new(crate::tests::RecordingConsent::default());
+        let ctx = mainnet_context(&fixture).with_consent_recording(recording.clone());
+        assert_eq!(mainnet_approve(&ctx, &fixture, &entry), presence_consumed());
+        assert_eq!(
+            recording.calls(),
+            [(entry.approval_nonce.clone(), ConsentRowSource::Recovered)]
+        );
+        recording
+            .refuse
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            mainnet_approve(&ctx, &fixture, &entry),
+            Outcome::Unavailable
+        );
+    }
+
+    /// Another handle attests the entry while the approve waits on the
+    /// keyring. The approve then completes the durable consent as recovered
+    /// before it answers: a refused completion answers unavailable with no
+    /// attestation, and a completed one keeps the re-shown stored blob.
+    #[test]
+    #[serial]
+    fn a_raced_approve_completes_consent_before_it_reshows_the_blob() {
+        use stellar_agent_core::approval::{
+            AttestationBinding, ConsentAuthorization, mainnet_fixtures::ATTESTATION_KEY,
+        };
+        for refuse in [true, false] {
+            let fixture = MainnetConsentFixture::new("raced");
+            let entry = fixture.payment(600_000);
+            let recording = Arc::new(crate::tests::RecordingConsent::default());
+            recording
+                .refuse
+                .store(refuse, std::sync::atomic::Ordering::SeqCst);
+            let ctx = mainnet_context(&fixture).with_consent_recording(recording.clone());
+            insert(&ctx, entry.clone());
+            let policy = fixture.current_policy();
+            let presence = fixture.presence(&entry, &policy);
+            let (path, name, writer, raced) = (
+                ctx.store_path.clone(),
+                fixture.name().to_owned(),
+                ctx.audit_writer.clone(),
+                entry.clone(),
+            );
+            wait_hook::install(move || {
+                let mut store = PendingApprovalStore::open(path).unwrap();
+                attest_and_persist(
+                    &mut store,
+                    &raced,
+                    &ATTESTATION_KEY,
+                    &AttestationBinding::new(&name, MAINNET_CHAIN_ID),
+                    Surface::Serve,
+                    ConsentAudit::Writer(&mut writer.lock().unwrap()),
+                    ConsentAuthorization::Mainnet {
+                        presence,
+                        policy: &policy,
+                    },
+                    |_, _| Err("no toolset grant in a mainnet consent".to_owned()),
+                )
+                .unwrap();
+            });
+            let outcome = mainnet_approve(&ctx, &fixture, &entry);
+            let stored = PendingApprovalStore::open(ctx.store_path.clone())
+                .unwrap()
+                .get(&entry.approval_nonce)
+                .unwrap()
+                .attestation_blob_b64
+                .clone();
+            assert!(stored.is_some(), "{refuse}");
+            assert_eq!(
+                outcome,
+                if refuse {
+                    Outcome::Unavailable
+                } else {
+                    Outcome::AlreadyResolved {
+                        attestation: stored,
+                    }
+                },
+                "{refuse}"
+            );
+            assert_eq!(
+                recording.calls(),
+                [(entry.approval_nonce.clone(), ConsentRowSource::Recovered)],
+                "{refuse}"
+            );
+        }
+    }
+
+    /// Off mainnet, an approve and its repeat never call the consent
+    /// recording and keep their outcomes.
+    #[test]
+    #[serial]
+    fn testnet_consent_calls_no_facade() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let Fixture { _dir, ctx, .. } = fixture("testnet-recording");
+        let recording = Arc::new(crate::tests::RecordingConsent::default());
+        let ctx = ctx.with_consent_recording(recording.clone());
+        let entry = fixtures::payment_pending(
+            SOURCE_G,
+            DEST_G,
+            "XLM",
+            10,
+            None,
+            100,
+            7,
+            uid(),
+            DEFAULT_TTL_MS,
+        );
+        let nonce = insert(&ctx, entry);
+        let outcome = apply_decision(
+            &ctx,
+            approve_shown(&ctx, nonce.clone()),
+            RequestIdentity::Local,
+        );
+        let Outcome::Attested {
+            attestation: Some(blob),
+            ..
+        } = outcome
+        else {
+            panic!("a testnet payment attests: {outcome:?}")
+        };
+        assert_eq!(
+            apply_decision(&ctx, approve_shown(&ctx, nonce), RequestIdentity::Local),
+            Outcome::AlreadyResolved {
+                attestation: Some(blob)
+            }
+        );
+        assert!(recording.calls().is_empty());
+    }
+
+    /// A mainnet trustline clawback opt-in keeps its consent path with and
+    /// without a recording: it attests without a blob, a repeat refuses as
+    /// consumed, and the recording is never called.
+    #[test]
+    #[serial]
+    fn excluded_entries_keep_their_consent_path() {
+        for recorded in [false, true] {
+            let fixture = MainnetConsentFixture::new("excluded");
+            let entry = PendingApproval::new_trustline_clawback_opt_in_pending(
+                "stellar:mainnet".to_owned(),
+                "USDC".to_owned(),
+                "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".to_owned(),
+                uid(),
+                600_000,
+            )
+            .unwrap();
+            let recording = Arc::new(crate::tests::RecordingConsent::default());
+            let mut ctx = mainnet_context(&fixture);
+            if recorded {
+                ctx = ctx.with_consent_recording(recording.clone());
+            }
+            insert(&ctx, entry.clone());
+            let outcome = mainnet_approve(&ctx, &fixture, &entry);
+            assert!(
+                matches!(
+                    outcome,
+                    Outcome::Attested {
+                        attestation: None,
+                        ..
+                    }
+                ),
+                "{recorded}: {outcome:?}"
+            );
+            assert_eq!(mainnet_approve(&ctx, &fixture, &entry), presence_consumed());
+            assert!(recording.calls().is_empty(), "{recorded}");
         }
     }
 }
