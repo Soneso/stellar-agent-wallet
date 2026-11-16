@@ -1240,6 +1240,32 @@ mod tests {
         );
     }
 
+    /// Contract payments retain their full destination in the list and JSON.
+    #[test]
+    #[serial_test::serial]
+    fn contract_list_shows_the_complete_destination() {
+        let entry = fixtures::sac_payment_pending(
+            stellar_agent_core::profile::caip2::Caip2::Testnet,
+            stellar_agent_core::approval::IntentAsset::Native,
+        );
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut store = stellar_agent_core::approval::PendingApprovalStore::open(
+            dir.path().join("contract.toml"),
+        )
+        .unwrap();
+        store
+            .insert(entry.clone(), entry.created_at_unix_ms)
+            .unwrap();
+        let view = store.snapshot(entry.created_at_unix_ms).remove(0);
+        let line = render_pending_row(&view, entry.created_at_unix_ms);
+        assert!(
+            line.contains("CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ"),
+            "full contract destination"
+        );
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["summary"]["fee_stroops"], "500100");
+    }
+
     /// A payment to the maximum-ID M shows its complete `to` and its base
     /// row on the page, the list line, and the prompt.
     #[test]

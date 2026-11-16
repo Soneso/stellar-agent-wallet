@@ -601,6 +601,38 @@ pub fn decode_authoritative_args(
     Ok(args)
 }
 
+/// Decodes the authoritative `stellar_pay_commit` facts of a classic or
+/// contract payment envelope.
+///
+/// With a context, the envelope must be the contract transfer that
+/// [`crate::sac_payment::verify_sac_payment`] proves for it, and the facts
+/// are [`VerifiedSacPayment::policy_args`](crate::sac_payment::VerifiedSacPayment::policy_args).
+/// Without one, a single `transfer(Account, Contract, I128)` invocation is
+/// still a payment and refuses; any other envelope decodes as
+/// [`decode_authoritative_args`] decodes it.
+///
+/// # Errors
+///
+/// The closed contract payment reasons of the verifier,
+/// `validation.contract_payment_invalid` for a transfer without a context,
+/// and `protocol.xdr_codec_failed` for a classic envelope that does not decode.
+pub fn decode_pay_args_with_context(
+    envelope_xdr: &str,
+    context: Option<&crate::sac_payment::SacPaymentContext>,
+) -> Result<serde_json::Value, crate::error::WalletError> {
+    if let Some(context) = context {
+        return Ok(crate::sac_payment::verify_sac_payment(envelope_xdr, context)?.policy_args());
+    }
+    if crate::sac_payment::is_transfer_shaped(envelope_xdr) {
+        return Err(crate::sac_payment::SacPaymentError::Invalid.into());
+    }
+    decode_authoritative_args(envelope_xdr, "stellar_pay_commit").map_err(|error| {
+        crate::error::WalletError::Protocol(crate::error::ProtocolError::XdrCodecFailed {
+            detail: error.to_string(),
+        })
+    })
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tool-specific decoders
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1060,7 +1092,7 @@ impl TryFrom<&stellar_xdr::Memo> for ClassicMemo {
     }
 }
 
-/// The operation of a classic transaction, with every value it moves.
+/// The operation facts of a classic transaction or verified contract payment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ClassicOperation {
@@ -1112,10 +1144,24 @@ pub enum ClassicOperation {
         /// The `B...` strkey of the balance id.
         balance_id_strkey: String,
     },
+    /// A classic-asset transfer to a C contract through the asset's contract,
+    /// verified by [`crate::sac_payment::verify_sac_payment`].
+    SacTransfer {
+        /// The full C recipient.
+        destination: String,
+        /// `"XLM"` or `"CODE:Gissuer"`.
+        asset: String,
+        /// The amount in stroops.
+        amount_stroops: i64,
+        /// The transaction fee minus the resource fee.
+        inclusion_fee_stroops: Option<u32>,
+        /// The Soroban resource fee, including any restoration charge.
+        resource_fee_stroops: Option<u32>,
+    },
 }
 
-/// The details of a single-operation classic transaction an approval surface
-/// shows, every one decoded from the envelope.
+/// The details of a single-operation transaction an approval surface shows,
+/// decoded from a classic envelope or a verified contract payment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ClassicSummary {

@@ -370,7 +370,8 @@ pub enum ApprovalKind {
         /// Destination address of the simulated payment.
         ///
         /// Validated at construction, deserialization, and store insertion: a
-        /// canonical, checksum-valid G account or M address. The check also
+        /// canonical, checksum-valid G account or M address, or a canonical C
+        /// contract when `sac_payment_context` is present. The check also
         /// keeps control text out of terminal renderings.
         summary_to: String,
 
@@ -393,6 +394,11 @@ pub enum ApprovalKind {
 
         /// Simulated sequence number.
         summary_simulated_seq_num: i64,
+
+        /// Asset and network of a contract payment, which every use proves
+        /// against the envelope. Absent on a classic payment and omitted from
+        /// its stored record.
+        sac_payment_context: Option<crate::sac_payment::SacPaymentContext>,
     },
 
     /// A passkey signing request awaiting a browser WebAuthn assertion.
@@ -988,6 +994,7 @@ impl std::fmt::Debug for ApprovalKind {
                 summary_memo,
                 summary_simulated_fee_stroops,
                 summary_simulated_seq_num,
+                sac_payment_context,
             } => f
                 .debug_struct("PaymentSimulated")
                 .field("envelope_xdr_b64", envelope_xdr_b64)
@@ -1001,6 +1008,7 @@ impl std::fmt::Debug for ApprovalKind {
                     summary_simulated_fee_stroops,
                 )
                 .field("summary_simulated_seq_num", summary_simulated_seq_num)
+                .field("sac_payment_context", sac_payment_context)
                 .finish(),
             Self::SignWithPasskey {
                 auth_digest,
@@ -1629,6 +1637,10 @@ struct PendingApprovalOnDisk {
     summary_simulated_fee_stroops: Option<u32>,
     #[serde(default)]
     summary_simulated_seq_num: Option<i64>,
+    // Present only on a contract payment; TOML omits it on a classic record,
+    // which keeps its bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sac_payment_context: Option<crate::sac_payment::SacPaymentContext>,
 
     // SignWithPasskey sub-table — present iff payment fields and register_passkey are absent.
     #[serde(default)]
@@ -1753,8 +1765,8 @@ impl AttestedApproverWire {
     }
 }
 
-/// Optional `summary_to` deserializer: a present value has the G shape
-/// `^G[A-Z2-7]{55}$` or the M shape `^M[A-Z2-7]{68}$`, and `None` passes
+/// Optional `summary_to` deserializer: a present value has the G or C shape
+/// `^[GC][A-Z2-7]{55}$` or the M shape `^M[A-Z2-7]{68}$`, and `None` passes
 /// through unchanged.
 ///
 /// The shape check keeps control text out of terminal renderings. The entry
@@ -1767,8 +1779,10 @@ where
     let opt: Option<String> = Option::deserialize(deserializer)?;
     match opt {
         None => Ok(None),
-        Some(s) if strkey_shaped(&s, b"G", 56) || strkey_shaped(&s, b"M", 69) => Ok(Some(s)),
-        Some(_) => Err(serde::de::Error::custom(SUMMARY_TO_REASON)),
+        Some(s) if strkey_shaped(&s, b"GC", 56) || strkey_shaped(&s, b"M", 69) => Ok(Some(s)),
+        Some(_) => Err(serde::de::Error::custom(
+            "summary_to must have the shape of a G account, M address or C contract.",
+        )),
     }
 }
 
@@ -1776,8 +1790,33 @@ where
 const SUMMARY_TO_REASON: &str =
     "summary_to must be a canonical G account or M address; repair the pending approval record.";
 
+/// Why a contract payment summary's destination refuses.
+const CONTRACT_SUMMARY_TO_REASON: &str = "a contract payment's summary_to must be a canonical C \
+     contract; repair the pending approval record.";
+
+fn summary_to_reason(context: Option<&crate::sac_payment::SacPaymentContext>) -> &'static str {
+    if context.is_some() {
+        CONTRACT_SUMMARY_TO_REASON
+    } else {
+        SUMMARY_TO_REASON
+    }
+}
+
 fn is_payment_account(text: &str) -> bool {
     crate::payment_accounts::PaymentAccount::parse(text).is_ok()
+}
+
+/// Whether a payment summary names the destination its record admits: a
+/// canonical C contract with a contract payment context, otherwise a
+/// canonical G account or M address.
+fn payment_destination_admitted(
+    summary_to: &str,
+    context: Option<&crate::sac_payment::SacPaymentContext>,
+) -> bool {
+    match context {
+        Some(_) => crate::sac_payment::is_canonical_contract(summary_to),
+        None => is_payment_account(summary_to),
+    }
 }
 
 /// Whether `text` is `len` characters: one of `prefixes`, then `[A-Z2-7]`.
@@ -1789,11 +1828,16 @@ fn strkey_shaped(text: &str, prefixes: &[u8], len: usize) -> bool {
             .all(|c| matches!(c, 'A'..='Z' | '2'..='7'))
 }
 
-/// Whether a payment summary or a `sign-payment` request names a destination
-/// other than a canonical G account or M address.
+/// Whether a payment summary names a destination its record does not admit,
+/// or a `sign-payment` request names one other than a canonical G account or
+/// M address.
 pub(crate) fn holds_refused_destination(kind: &ApprovalKind) -> bool {
     match kind {
-        ApprovalKind::PaymentSimulated { summary_to, .. } => !is_payment_account(summary_to),
+        ApprovalKind::PaymentSimulated {
+            summary_to,
+            sac_payment_context,
+            ..
+        } => !payment_destination_admitted(summary_to, sac_payment_context.as_ref()),
         ApprovalKind::ToolsetFirstInvokeGate {
             capability,
             destination,
@@ -2101,6 +2145,7 @@ impl Serialize for PendingApproval {
                 summary_memo,
                 summary_simulated_fee_stroops,
                 summary_simulated_seq_num,
+                sac_payment_context: _,
             } => (
                 Some(envelope_xdr_b64.as_str()),
                 Some(envelope_sha256_hex.as_str()),
@@ -2526,6 +2571,13 @@ impl Serialize for PendingApproval {
             summary_memo: summary_memo.map(ToOwned::to_owned),
             summary_simulated_fee_stroops,
             summary_simulated_seq_num,
+            sac_payment_context: match &self.kind {
+                ApprovalKind::PaymentSimulated {
+                    sac_payment_context,
+                    ..
+                } => sac_payment_context.clone(),
+                _ => None,
+            },
             sign_with_passkey,
             register_passkey,
             toolset_first_invoke_gate,
@@ -2616,7 +2668,7 @@ impl<'de> Deserialize<'de> for PendingApproval {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DestinationCheck {
     /// A request from outside the store: the destination must be a
-    /// canonical G account or M address.
+    /// canonical address admitted by its payment context.
     Strict,
     /// A stored entry: the destination needs only its stored shape, and each
     /// use of the entry checks the canonical form.
@@ -2738,6 +2790,11 @@ impl PendingApproval {
                 "cross-kind field contamination: approval entry carries multiple kind sub-tables: {}",
                 present_subtables.join(", ")
             )));
+        }
+        if raw.sac_payment_context.is_some() && !present_subtables.is_empty() {
+            return Err(serde::de::Error::custom(
+                "cross-kind field contamination: only a payment entry carries sac_payment_context",
+            ));
         }
 
         let kind = if let Some(swp) = raw.sign_with_passkey {
@@ -3453,8 +3510,12 @@ impl PendingApproval {
             let summary_to = raw
                 .summary_to
                 .ok_or_else(|| serde::de::Error::missing_field("summary_to"))?;
-            if destinations == DestinationCheck::Strict && !is_payment_account(&summary_to) {
-                return Err(serde::de::Error::custom(SUMMARY_TO_REASON));
+            if destinations == DestinationCheck::Strict
+                && !payment_destination_admitted(&summary_to, raw.sac_payment_context.as_ref())
+            {
+                return Err(serde::de::Error::custom(summary_to_reason(
+                    raw.sac_payment_context.as_ref(),
+                )));
             }
             let summary_amount_stroops = raw
                 .summary_amount_stroops
@@ -3477,6 +3538,7 @@ impl PendingApproval {
                 summary_memo: raw.summary_memo,
                 summary_simulated_fee_stroops,
                 summary_simulated_seq_num,
+                sac_payment_context: raw.sac_payment_context,
             }
         };
 
@@ -3563,6 +3625,70 @@ impl PendingApproval {
                 summary_memo: None,
                 summary_simulated_fee_stroops: summary.fee_stroops,
                 summary_simulated_seq_num: summary.seq_num,
+                sac_payment_context: None,
+            },
+            attestation_blob_b64: None,
+            passkey_assertion: None,
+            attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
+            attested_approver: None,
+            mainnet_presence: None,
+            consent_publication: None,
+            subject_kind: SubjectKind::EnvelopeText,
+        })
+    }
+
+    /// Constructs a contract payment approval from its envelope and validated
+    /// context, created now and expiring `ttl_ms` later.
+    ///
+    /// The summary is the verified transfer's, so the record names the full C
+    /// recipient and carries the context its every use proves again.
+    ///
+    /// # Errors
+    ///
+    /// The closed contract payment reasons of
+    /// [`crate::sac_payment::verify_sac_payment`], `approval.expired` for a
+    /// zero lifetime, and `approval.record_failed` for a clock failure or an
+    /// expiry beyond `u64`.
+    pub fn new_sac_payment_pending(
+        envelope_xdr: String,
+        context: crate::sac_payment::SacPaymentContext,
+        process_uid: String,
+        ttl_ms: u64,
+    ) -> Result<Self, crate::error::WalletError> {
+        use crate::error::{ApprovalFailure, WalletError};
+        let payment = crate::sac_payment::verify_sac_payment(&envelope_xdr, &context)?;
+        let record = |error| super::attest::record_error(&error);
+        if ttl_ms == 0 {
+            return Err(WalletError::Approval(ApprovalFailure::Expired {
+                detail: "a zero lifetime expires the approval at creation".to_owned(),
+            }));
+        }
+        let created_at_unix_ms = approval_now_unix_ms().map_err(record)?;
+        let expires_at_unix_ms = created_at_unix_ms.checked_add(ttl_ms).ok_or_else(|| {
+            record(ApprovalError::InvalidEntry {
+                detail: "the approval expiry exceeds the clock range".to_owned(),
+            })
+        })?;
+        let mut raw = [0u8; 16];
+        OsRng.fill_bytes(&mut raw);
+        let envelope_sha256_hex =
+            crate::hex::encode(&super::subject::approval_subject_classic(&envelope_xdr));
+        Ok(Self {
+            approval_nonce: URL_SAFE_NO_PAD.encode(raw),
+            process_uid,
+            created_at_unix_ms,
+            expires_at_unix_ms,
+            reason: None,
+            kind: ApprovalKind::PaymentSimulated {
+                summary_to: payment.destination(),
+                summary_amount_stroops: payment.amount_stroops(),
+                summary_asset: payment.asset_text(),
+                summary_memo: None,
+                summary_simulated_fee_stroops: payment.transaction().fee,
+                summary_simulated_seq_num: payment.transaction().seq_num.0,
+                envelope_xdr_b64: envelope_xdr,
+                envelope_sha256_hex,
+                sac_payment_context: Some(context),
             },
             attestation_blob_b64: None,
             passkey_assertion: None,
@@ -3734,6 +3860,7 @@ impl PendingApproval {
                 summary_memo,
                 summary_simulated_fee_stroops,
                 summary_simulated_seq_num,
+                sac_payment_context: None,
             },
             attestation_blob_b64: None,
             passkey_assertion: None,
@@ -5522,9 +5649,8 @@ impl PendingApprovalStore {
     ///
     /// # Errors
     ///
-    /// - [`ApprovalError::InvalidEntry`] if a payment summary or a
-    ///   `sign-payment` request names a destination other than a canonical G
-    ///   account or M address.
+    /// - [`ApprovalError::InvalidEntry`] if a payment destination does not
+    ///   have the canonical form its record admits.
     /// - [`ApprovalError::PendingStoreFull`] if, after pruning expired entries,
     ///   the store already contains the maximum number of entries (4 096).
     /// - [`ApprovalError::DuplicateNonce`] if `entry.approval_nonce` already exists.
@@ -5556,7 +5682,7 @@ impl PendingApprovalStore {
     ) -> Result<(), ApprovalError> {
         if holds_refused_destination(&entry.kind) {
             return Err(ApprovalError::InvalidEntry {
-                detail: "a payment destination must be a canonical G account or M address"
+                detail: "a payment destination must have the canonical form its record admits"
                     .to_owned(),
             });
         }
@@ -7217,6 +7343,210 @@ mod tests {
         ]
     }
 
+    #[test]
+    fn contract_pending_roundtrip_and_lifecycle() {
+        use crate::approval::{IntentAsset, fixtures, verify_entry_terms};
+        use crate::profile::caip2::Caip2;
+        for chain in [Caip2::Testnet, Caip2::Mainnet] {
+            for asset in [
+                IntentAsset::Native,
+                IntentAsset::Issued {
+                    code: "USD".into(),
+                    issuer: "GABQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQHGPC".into(),
+                },
+            ] {
+                let sample = fixtures::sac_payment_pending(chain, asset);
+                let wire = toml::to_string(&sample).unwrap();
+                let reopened: PendingApproval = toml::from_str(&wire).unwrap();
+                assert_eq!(
+                    toml::to_string(&reopened).unwrap(),
+                    wire,
+                    "native and issued context bytes"
+                );
+                crate::approval::attest::classic_entry_summary(&reopened.kind)
+                    .unwrap()
+                    .unwrap();
+            }
+        }
+        let entry = fixtures::sac_payment_pending(Caip2::Testnet, IntentAsset::Native);
+        let now = entry.created_at_unix_ms;
+        let nonce = entry.approval_nonce.clone();
+        let text = toml::to_string(&entry).unwrap();
+        let reopened: PendingApproval = toml::from_str(&text).unwrap();
+        assert_eq!(
+            toml::to_string(&reopened).unwrap(),
+            text,
+            "context roundtrip"
+        );
+        verify_entry_terms(&reopened.kind).unwrap();
+        let ApprovalKind::PaymentSimulated {
+            envelope_xdr_b64,
+            sac_payment_context,
+            ..
+        } = &entry.kind
+        else {
+            unreachable!()
+        };
+        for (ttl, code) in [
+            (0, "approval.expired"),
+            (u64::MAX, "approval.record_failed"),
+        ] {
+            assert_eq!(
+                PendingApproval::new_sac_payment_pending(
+                    envelope_xdr_b64.clone(),
+                    sac_payment_context.clone().unwrap(),
+                    "1000".into(),
+                    ttl
+                )
+                .unwrap_err()
+                .code(),
+                code,
+                "ttl {ttl}"
+            );
+        }
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("contract.toml");
+        let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+        store.insert(entry.clone(), now).unwrap();
+        let legacy = fixtures::payment_pending(
+            "GAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQDZ7H",
+            "GAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQDZ7H",
+            "XLM",
+            1,
+            None,
+            100,
+            1,
+            "1000".into(),
+            DEFAULT_TTL_MS,
+        );
+        let legacy_nonce = legacy.approval_nonce.clone();
+        let legacy_text = toml::to_string(&legacy).unwrap();
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("sac_payment_context")
+                .is_none(),
+            "legacy JSON context omitted"
+        );
+        assert!(
+            !legacy_text.contains("sac_payment_context"),
+            "legacy context omitted"
+        );
+        store.insert(legacy.clone(), now).unwrap();
+        assert!(
+            matches!(
+                store.insert(entry.clone(), now),
+                Err(ApprovalError::DuplicateNonce { .. })
+            ),
+            "repeat insert"
+        );
+        drop(store);
+        let original = std::fs::read_to_string(&path).unwrap();
+        for case in ["destination", "missing context", "amount"] {
+            let mut bad = entry.clone();
+            if let ApprovalKind::PaymentSimulated {
+                summary_to,
+                summary_amount_stroops,
+                sac_payment_context,
+                ..
+            } = &mut bad.kind
+            {
+                match case {
+                    "destination" => *summary_to = format!("{}A", &summary_to[..55]),
+                    "missing context" => *sac_payment_context = None,
+                    _ => *summary_amount_stroops = 2,
+                }
+            }
+            let wire = toml::to_string(&StoreFile {
+                pending: vec![bad, legacy.clone()],
+                payment_recovery: Vec::new(),
+            })
+            .unwrap();
+            std::fs::write(&path, &wire).unwrap();
+            let mut opened = PendingApprovalStore::open(path.clone()).unwrap();
+            assert_eq!(opened.snapshot(now).len(), 2, "list {case}");
+            assert_eq!(
+                crate::approval::attest::classic_entry_summary(&opened.get(&nonce).unwrap().kind)
+                    .unwrap()
+                    .unwrap_err()
+                    .code(),
+                "approval.entry_inconsistent",
+                "use {case}"
+            );
+            verify_entry_terms(&opened.get(&legacy_nonce).unwrap().kind).unwrap();
+            assert_eq!(
+                toml::to_string(opened.get(&legacy_nonce).unwrap()).unwrap(),
+                legacy_text,
+                "legacy bytes"
+            );
+            opened.reject(&nonce, now, 1).unwrap();
+            assert!(matches!(
+                opened.get(&nonce).unwrap().kind,
+                ApprovalKind::Rejected { .. }
+            ));
+            drop(opened);
+            let mut opened = PendingApprovalStore::open(path.clone()).unwrap();
+            assert!(
+                matches!(
+                    opened.get(&nonce).unwrap().kind,
+                    ApprovalKind::Rejected { .. }
+                ),
+                "rejected on restart"
+            );
+            opened
+                .insert(
+                    fixtures::sac_payment_pending(Caip2::Testnet, IntentAsset::Native),
+                    now + 1,
+                )
+                .unwrap();
+            assert!(opened.get(&nonce).is_none(), "collect expired rejection");
+            drop(opened);
+        }
+        std::fs::write(&path, original).unwrap();
+        let opened = PendingApprovalStore::open(path).unwrap();
+        verify_entry_terms(&opened.get(&nonce).unwrap().kind).unwrap();
+        assert!(!opened.get(&nonce).unwrap().is_expired(now - 1));
+        assert!(opened.get(&nonce).unwrap().is_expired(u64::MAX));
+
+        let mut contradictory = legacy;
+        if let ApprovalKind::PaymentSimulated {
+            sac_payment_context: context,
+            ..
+        } = &mut contradictory.kind
+        {
+            *context = sac_payment_context.clone();
+        }
+        assert!(
+            toml::from_str::<PendingApproval>(&toml::to_string(&contradictory).unwrap()).is_err(),
+            "classic context rejected"
+        );
+        let mut gate = toml::Value::try_from(
+            toolset_gate_to(
+                "sign-rule-create",
+                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        gate.as_table_mut().unwrap().insert(
+            "sac_payment_context".into(),
+            toml::Value::try_from(sac_payment_context.as_ref().unwrap()).unwrap(),
+        );
+        assert!(
+            toml::from_str::<PendingApproval>(&toml::to_string(&gate).unwrap()).is_err(),
+            "context contamination"
+        );
+        let mut unknown: toml::Value = toml::from_str(&text).unwrap();
+        unknown["sac_payment_context"]
+            .as_table_mut()
+            .unwrap()
+            .insert("extra".into(), 1.into());
+        assert!(
+            toml::from_str::<PendingApproval>(&toml::to_string(&unknown).unwrap()).is_err(),
+            "unknown context field"
+        );
+    }
+
     fn payment_entry_to(destination: &str) -> Result<PendingApproval, ApprovalError> {
         PendingApproval::new_payment_pending(
             "b64xdr".to_owned(),
@@ -7306,11 +7636,11 @@ mod tests {
         }
     }
 
-    /// Whether `text` has a destination shape a stored entry loads with: G or
-    /// M for a payment summary, and also C for a `sign-payment` request.
-    fn stored_shape(text: &str, request: bool) -> bool {
-        let prefixes: &[u8] = if request { b"GC" } else { b"G" };
-        strkey_shaped(text, prefixes, 56) || strkey_shaped(text, b"M", 69)
+    /// Whether `text` has a destination shape a stored entry loads with: G,
+    /// C or M for a payment summary, since a contract payment names a C, and
+    /// for a `sign-payment` request.
+    fn stored_shape(text: &str) -> bool {
+        strkey_shaped(text, b"GC", 56) || strkey_shaped(text, b"M", 69)
     }
 
     /// A stored destination with a stored shape loads as an ordinary entry,
@@ -7320,9 +7650,9 @@ mod tests {
     fn malformed_stored_payment_destinations_refuse_reopening() {
         let [_, _, m_max] = payment_destinations();
         for malformed in malformed_payment_destinations() {
-            for (entry, request) in [
-                (payment_entry_to(&m_max).unwrap(), false),
-                (toolset_gate_to("sign-payment", &m_max).unwrap(), true),
+            for entry in [
+                payment_entry_to(&m_max).unwrap(),
+                toolset_gate_to("sign-payment", &m_max).unwrap(),
             ] {
                 let nonce = entry.approval_nonce.clone();
                 let dir = TempDir::new().unwrap();
@@ -7335,7 +7665,7 @@ mod tests {
                 assert_eq!(text.matches(m_max.as_str()).count(), 1);
                 let edited = text.replace(m_max.as_str(), &malformed);
                 std::fs::write(&path, &edited).unwrap();
-                if stored_shape(&malformed, request) {
+                if stored_shape(&malformed) {
                     let mut store = PendingApprovalStore::open(path.clone()).unwrap();
                     let entry = store.get(&nonce).unwrap();
                     assert_eq!(stored_destination(entry), malformed);
@@ -11225,8 +11555,7 @@ amount_max_stroops = 1000000
         let value = || serde_json::Value::String(format!("{MARKER}!"));
         assert_reason_exact(
             &deserialize_opt_summary_to(value()).unwrap_err().to_string(),
-            "summary_to must be a canonical G account or M address; repair the pending approval \
-             record.",
+            "summary_to must have the shape of a G account, M address or C contract.",
             &[MARKER],
         );
         assert_reason_exact(

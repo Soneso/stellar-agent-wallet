@@ -899,6 +899,16 @@ fn read_mainnet_record<'a>(
     // The receipt check below also verifies the entry terms; this check is
     // defense in depth and refuses before any digest is computed.
     super::verify_stored_destination(&record.kind)?;
+    if let ApprovalKind::PaymentSimulated {
+        sac_payment_context: Some(context),
+        ..
+    } = &record.kind
+        && context.chain().caip2_str() != chain_id
+    {
+        return Err(WalletError::Approval(ApprovalFailure::BindingMismatch {
+            detail: "this contract payment belongs to another network".to_owned(),
+        }));
+    }
     if let Some(summary) = super::attest::classic_entry_summary(&record.kind) {
         summary?;
     }
@@ -1093,6 +1103,54 @@ mod tests {
             .mainnet_presence
             .clone()
             .expect("a mainnet consent stores its receipt")
+    }
+
+    /// Witness verification binds the context before checking receipt proof.
+    #[test]
+    #[serial]
+    fn contract_witness_binds_active_chain() {
+        let fixture = MainnetConsentFixture::new(NAME);
+        let entry = crate::approval::fixtures::sac_payment_pending(
+            Caip2::Mainnet,
+            crate::approval::IntentAsset::Native,
+        );
+        let consented = consent(&fixture, &entry);
+        let expected = payment_expectation(&entry);
+        assert_eq!(
+            verify(&fixture, &consented, &expected, &consented.policy, now())
+                .unwrap()
+                .kind(),
+            ApprovedKind::Payment
+        );
+        drop(consented);
+        let other = crate::approval::fixtures::sac_payment_pending(
+            Caip2::Testnet,
+            crate::approval::IntentAsset::Native,
+        );
+        let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
+        store.insert(other.clone(), now()).unwrap();
+        let result = verify_approval(
+            &store,
+            fixture.profile(),
+            fixture.name(),
+            &other.approval_nonce,
+            &[0; 32],
+            &payment_expectation(&other),
+            &fixture.current_policy(),
+            now(),
+        );
+        assert_eq!(
+            result.unwrap_err().code(),
+            "approval.binding_mismatch",
+            "active witness chain"
+        );
+        assert!(
+            store
+                .get(&other.approval_nonce)
+                .unwrap()
+                .mainnet_presence
+                .is_none()
+        );
     }
 
     /// A mainnet consent yields a witness of exactly the record's facts, and

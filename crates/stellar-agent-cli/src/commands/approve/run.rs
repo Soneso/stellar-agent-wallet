@@ -991,7 +991,7 @@ fn render_rule_proposal_definition(definition: &ContextRuleProposalSnapshot) -> 
 /// rows. A payment, claim, or trustline entry is rendered from its envelope
 /// through [`classic_entry_summary`]: the effective source, every amount,
 /// asset, destination, memo, fee and sequence number are the envelope's, and
-/// the entry's stored `summary_*` fields are not read. An entry that fails
+/// a contract payment's cached summary must agree. An entry that fails
 /// that check renders as inconsistent and is never prompted for. Every value
 /// that does not come from this command passes through
 /// [`render::escape_for_terminal`], so a control or direction-override
@@ -1147,6 +1147,33 @@ pub(super) fn write_summary(
                     strkey = esc(balance_id_strkey),
                     hex = esc(balance_id_hex72),
                 ),
+                ClassicOperation::SacTransfer {
+                    destination,
+                    asset,
+                    amount_stroops,
+                    inclusion_fee_stroops,
+                    resource_fee_stroops,
+                } => {
+                    let part = |fee: &Option<u32>| {
+                        fee.map_or_else(|| "unknown".to_owned(), |fee| format!("{fee} stroops"))
+                    };
+                    format!(
+                        "  Kind:              contract payment\n  \
+                         To:                {to}\n  \
+                         Amount:            {amount}\n  \
+                         Asset:             {asset}\n  \
+                         Memo:              {memo}\n  \
+                         Simulated fee:     {fee} stroops\n  \
+                         Inclusion fee:     {inclusion}\n  \
+                         Resource fee:      {resource}\n  \
+                         Simulated seq num: {seq}",
+                        to = esc(destination),
+                        amount = stroop_amount(*amount_stroops, asset),
+                        asset = esc(asset),
+                        inclusion = part(inclusion_fee_stroops),
+                        resource = part(resource_fee_stroops),
+                    )
+                }
                 other => format!(
                     "  Kind:              {}\n  \
                      Terms:             this build cannot show this operation ({other:?})",
@@ -4449,6 +4476,31 @@ mod tests {
         *summary_memo = Some("refund".to_owned());
         *summary_simulated_fee_stroops = 7;
         *summary_simulated_seq_num = 8;
+    }
+
+    /// The contract summary shows its full recipient and total fee breakdown.
+    #[test]
+    #[serial_test::serial]
+    fn contract_approve_summary_shows_full_destination_and_fees() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let entry = fixtures::sac_payment_pending(
+            stellar_agent_core::profile::caip2::Caip2::Testnet,
+            stellar_agent_core::approval::IntentAsset::Native,
+        );
+        let mut sink = Vec::new();
+        write_summary(&entry, &test_context(), &mut sink).unwrap();
+        let text = String::from_utf8(sink).unwrap();
+        for row in [
+            "To:                CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ",
+            "Simulated fee:     500100 stroops",
+            "Inclusion fee:     100 stroops",
+            "Resource fee:      500000 stroops",
+            "Simulated seq num: 77",
+        ] {
+            assert!(text.contains(row), "missing {row}");
+        }
     }
 
     /// The `approve` summary shows the envelope's destination, amount, asset

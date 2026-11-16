@@ -949,6 +949,26 @@ pub(crate) fn render_intent_html(nonce: &str, intent: &IntentView) -> String {
             ]
             .concat(),
         ),
+        IntentPayloadView::ContractPay {
+            destination,
+            asset,
+            amount_stroops,
+            explicit_inclusion_bid_stroops,
+        } => (
+            "Contract payment",
+            amount_headline(*amount_stroops, asset),
+            address_block("Destination", destination),
+            [
+                fact_row("Asset", asset),
+                fact_row("Amount (stroops)", &amount_stroops.to_string()),
+                fact_row(
+                    "Inclusion bid (stroops)",
+                    &explicit_inclusion_bid_stroops
+                        .map_or_else(|| "chosen by the wallet".to_owned(), |bid| bid.to_string()),
+                ),
+            ]
+            .concat(),
+        ),
     };
     let rows = [
         fact_row("Kind", kind),
@@ -1016,6 +1036,8 @@ pub fn render_summary_html(view: &PendingApprovalView) -> String {
             memo,
             fee_stroops,
             seq_num,
+            inclusion_fee_stroops,
+            resource_fee_stroops,
         } => {
             let mut rows = String::new();
             rows.push_str(&fact_row("Asset", asset));
@@ -1036,6 +1058,14 @@ pub fn render_summary_html(view: &PendingApprovalView) -> String {
                 "Simulated fee (stroops)",
                 &fee_stroops.to_string(),
             ));
+            for (label, part) in [
+                ("Inclusion fee (stroops)", inclusion_fee_stroops),
+                ("Resource fee (stroops)", resource_fee_stroops),
+            ] {
+                if let Some(part) = part {
+                    rows.push_str(&fact_row(label, &part.to_string()));
+                }
+            }
             rows.push_str(&fact_row("Simulated seq num", &seq_num.to_string()));
             format!(
                 "{}{}{}{}",
@@ -1737,6 +1767,48 @@ mod tests {
 
     /// A classic intent from its JSON transport form, as the intent module
     /// validates it.
+    #[test]
+    #[serial_test::serial]
+    fn contract_consent_shows_full_destination_and_fees() {
+        use stellar_agent_core::approval::{IntentAsset, IntentView};
+        use stellar_agent_core::profile::caip2::Caip2;
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let entry = fixtures::sac_payment_pending(Caip2::Testnet, IntentAsset::Native);
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut store = stellar_agent_core::approval::PendingApprovalStore::open(
+            dir.path().join("contract.toml"),
+        )
+        .unwrap();
+        store
+            .insert(entry.clone(), entry.created_at_unix_ms)
+            .unwrap();
+        let view = store.snapshot(entry.created_at_unix_ms).remove(0);
+        let mut context = test_context();
+        context.profile_name = "<script>&\"".into();
+        let html = render_detail_page(&view, &context, "csrf", "activity", None, None, &neutral());
+        for fact in [
+            "CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ",
+            "<dt>Simulated fee (stroops)</dt><dd>500100</dd>",
+            "<dt>Inclusion fee (stroops)</dt><dd>100</dd>",
+            "<dt>Resource fee (stroops)</dt><dd>500000</dd>",
+            "&lt;script&gt;&amp;&quot;",
+        ] {
+            assert!(html.contains(fact), "missing {fact}");
+        }
+        assert!(!html.contains("Fee bound"), "no fabricated cap");
+        let intent = intent_of(
+            serde_json::json!({"base": intent_base(&serde_json::json!("none")), "payload": {"contract_pay": {
+                "destination": "CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ", "asset": "native", "amount_stroops": "1", "explicit_inclusion_bid_stroops": "100"
+            }}}),
+        );
+        let html = render_intent_html("nonce", &IntentView::new(&intent));
+        assert!(html.contains("Contract payment"));
+        assert!(html.contains("<dt>Inclusion bid (stroops)</dt><dd>100</dd>"));
+        assert!(html.contains("CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ"));
+    }
+
     fn intent_of(value: serde_json::Value) -> stellar_agent_core::approval::ClassicIntent {
         serde_json::from_value(value).unwrap()
     }

@@ -27,57 +27,7 @@ fn context(asset: IntentAsset) -> SacPaymentContext {
 }
 
 fn fixture(context: &SacPaymentContext) -> TransactionV1Envelope {
-    let asset = match context.asset() {
-        IntentAsset::Native => CanonicalAsset::Native,
-        IntentAsset::Issued { code, issuer } => CanonicalAsset::classic(code, issuer).unwrap(),
-    };
-    let contract = stellar_strkey::Contract::from_string(
-        &asset
-            .sac_contract_id(context.chain().network_passphrase())
-            .unwrap(),
-    )
-    .unwrap();
-    let invoke = InvokeContractArgs {
-        contract_address: ScAddress::Contract(ContractId(Hash(contract.0))),
-        function_name: ScSymbol("transfer".try_into().unwrap()),
-        args: vec![
-            ScVal::Address(ScAddress::Account(account(1))),
-            ScVal::Address(ScAddress::Contract(ContractId(Hash([2; 32])))),
-            ScVal::from(1_i128),
-        ]
-        .try_into()
-        .unwrap(),
-    };
-    let auth = SorobanAuthorizationEntry {
-        credentials: SorobanCredentials::SourceAccount,
-        root_invocation: SorobanAuthorizedInvocation {
-            function: SorobanAuthorizedFunction::ContractFn(invoke.clone()),
-            sub_invocations: Default::default(),
-        },
-    };
-    TransactionV1Envelope {
-        tx: Transaction {
-            source_account: MuxedAccount::Ed25519(Uint256([1; 32])),
-            fee: 500_100,
-            seq_num: SequenceNumber(77),
-            cond: Preconditions::None,
-            memo: Memo::None,
-            operations: vec![Operation {
-                source_account: None,
-                body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
-                    host_function: HostFunction::InvokeContract(invoke),
-                    auth: vec![auth].try_into().unwrap(),
-                }),
-            }]
-            .try_into()
-            .unwrap(),
-            ext: TransactionExt::V1(SorobanTransactionData {
-                resource_fee: 500_000,
-                ..Default::default()
-            }),
-        },
-        signatures: Default::default(),
-    }
+    crate::approval::fixtures::sac_transfer(context)
 }
 
 fn host(envelope: &mut TransactionV1Envelope) -> &mut InvokeHostFunctionOp {
@@ -221,6 +171,13 @@ fn b1_context_and_closed_errors() {
             serde_json::json!({"chain":"stellar:unknown", "asset":"native"})
         )
         .is_err()
+    );
+    assert!(
+        serde_json::from_value::<SacPaymentContext>(
+            serde_json::json!({"chain":"stellar:testnet","asset":"native","extra":1})
+        )
+        .is_err(),
+        "unknown context field"
     );
     let cases = [
         (
@@ -588,6 +545,21 @@ fn trustline(code: &str, issuer: u8, payer: u8) -> LedgerKey {
     })
 }
 
+/// The payer's (key `[1; 32]`) trustline for an asset of issuer `[3; 32]`,
+/// as literal `LedgerKey` XDR computed outside this crate.
+fn pinned_trustline(code: &str) -> LedgerKey {
+    let xdr = match code {
+        "USD" => {
+            "AAAAAQAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAAFVU0QAAAAAAAMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMD"
+        }
+        "LongCode1234" => {
+            "AAAAAQAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAAJMb25nQ29kZTEyMzQAAAAAAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM="
+        }
+        other => panic!("no pinned trustline for {other}"),
+    };
+    LedgerKey::from_xdr_base64(xdr, Limits::none()).unwrap()
+}
+
 fn footprint(envelope: &mut TransactionV1Envelope, ro: Vec<LedgerKey>, rw: Vec<LedgerKey>) {
     data(envelope).resources.footprint = LedgerFootprint {
         read_only: ro.try_into().unwrap(),
@@ -641,7 +613,7 @@ fn b1_forward_footprint() {
                 bad_data(&e, &ctx, "issuer trustline");
             } else {
                 ro.push(account_key(3));
-                rw.push(trustline(code, 3, 1));
+                rw.push(pinned_trustline(code));
             }
         }
         footprint(&mut good, ro.clone(), rw.clone());
@@ -857,4 +829,447 @@ fn b1_total_fee_and_inclusion() {
         validate(&e, &ctx, None, u32::MAX).unwrap_err().code(),
         INVALID
     );
+}
+
+fn b64(envelope: &TransactionV1Envelope) -> String {
+    TransactionEnvelope::Tx(envelope.clone())
+        .to_xdr_base64(Limits::none())
+        .unwrap()
+}
+
+/// A classic envelope from payer `[1; 32]` with the single operation `body`.
+fn classic(body: OperationBody) -> String {
+    let mut envelope = fixture(&context(IntentAsset::Native));
+    envelope.tx.operations = vec![Operation {
+        source_account: None,
+        body,
+    }]
+    .try_into()
+    .unwrap();
+    envelope.tx.ext = TransactionExt::V0;
+    b64(&envelope)
+}
+
+const PAYER: &str = "GAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQDZ7H";
+const RECIPIENT: &str = "CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ";
+
+#[test]
+fn b1_contextual_policy_facts() {
+    use crate::envelope_decode::{
+        ClassicMemo, ClassicOperation, decode_authoritative_args, decode_pay_args_with_context,
+    };
+    let native = context(IntentAsset::Native);
+    let good = fixture(&native);
+    let args = decode_pay_args_with_context(&b64(&good), Some(&native)).unwrap();
+    assert_eq!(
+        args,
+        serde_json::json!({
+            "source": PAYER,
+            "total_fee_stroops": 500_100,
+            "destination": RECIPIENT,
+            "amount_stroops": "1",
+            "asset": "XLM",
+            "sequence_number": 77,
+            "memo_kind": "none",
+            "memo": null,
+        }),
+        "authoritative facts"
+    );
+    let payment = verify(&good, &native).unwrap();
+    assert_eq!(payment.policy_args(), args);
+    let summary = payment.summary();
+    assert_eq!(
+        (
+            summary.source.as_str(),
+            summary.fee_stroops,
+            summary.seq_num
+        ),
+        (PAYER, 500_100, 77)
+    );
+    assert_eq!(summary.memo, ClassicMemo::None);
+    assert_eq!(
+        summary.operation,
+        ClassicOperation::SacTransfer {
+            destination: RECIPIENT.to_owned(),
+            asset: "XLM".to_owned(),
+            amount_stroops: 1,
+            inclusion_fee_stroops: Some(100),
+            resource_fee_stroops: Some(500_000),
+        },
+        "summary"
+    );
+    let usd = context(issued("USD", 3));
+    let issued_args = decode_pay_args_with_context(&b64(&fixture(&usd)), Some(&usd)).unwrap();
+    assert_eq!(
+        issued_args["asset"],
+        format!(
+            "USD:{}",
+            "GABQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQHGPC"
+        )
+    );
+    assert_eq!(
+        verify(&good, &native).unwrap().intent_payload(Some(7)),
+        crate::approval::IntentPayload::ContractPay {
+            destination: RECIPIENT.to_owned(),
+            asset: IntentAsset::Native,
+            amount_stroops: 1,
+            explicit_inclusion_bid_stroops: Some(7),
+        },
+        "intent payload"
+    );
+
+    let mut custom = good.clone();
+    edit_invoke(&mut custom, |i| {
+        i.contract_address = ScAddress::Contract(ContractId(Hash([9; 32])))
+    });
+    for (envelope, context, case) in [
+        (&good, Some(&usd), "wrong asset context"),
+        (&good, None, "missing context"),
+        (&custom, Some(&native), "custom token"),
+        (&custom, None, "custom token without context"),
+    ] {
+        assert_eq!(
+            decode_pay_args_with_context(&b64(envelope), context)
+                .unwrap_err()
+                .code(),
+            INVALID,
+            "{case}"
+        );
+    }
+    let mut memo = good.clone();
+    memo.tx.memo = Memo::Id(7);
+    assert_eq!(
+        decode_pay_args_with_context(&b64(&memo), None)
+            .unwrap_err()
+            .code(),
+        INVALID,
+        "memo transfer without context"
+    );
+
+    let payment_op = OperationBody::Payment(PaymentOp {
+        destination: MuxedAccount::Ed25519(Uint256([2; 32])),
+        asset: Asset::Native,
+        amount: 5,
+    });
+    let classic_payment = classic(payment_op);
+    assert_eq!(
+        decode_pay_args_with_context(&classic_payment, None).unwrap(),
+        decode_authoritative_args(&classic_payment, "stellar_pay_commit").unwrap(),
+        "classic decoding without context"
+    );
+    assert_eq!(
+        decode_pay_args_with_context(&classic_payment, Some(&native))
+            .unwrap_err()
+            .code(),
+        INVALID,
+        "classic payment with context"
+    );
+    let create = classic(OperationBody::CreateAccount(CreateAccountOp {
+        destination: account(2),
+        starting_balance: 5,
+    }));
+    assert_eq!(
+        decode_pay_args_with_context(&create, None)
+            .unwrap_err()
+            .code(),
+        "protocol.xdr_codec_failed",
+        "other operations stay classic decode failures"
+    );
+}
+
+const POLICY_NOW_MS: u64 = 1_700_000_000_000;
+
+#[test]
+#[serial_test::serial]
+fn contract_presence_binds_active_chain() {
+    use crate::approval::presence::issue_mainnet_presence;
+    use crate::approval::{AttestationBinding, fixtures, mainnet_fixtures::MainnetConsentFixture};
+    let fixture = MainnetConsentFixture::new("contract-presence");
+    let binding = AttestationBinding::new(fixture.name(), "stellar:mainnet");
+    let policy = fixture.current_policy();
+    for chain in [Caip2::Mainnet, Caip2::Testnet] {
+        let entry = fixtures::sac_payment_pending(chain, IntentAsset::Native);
+        let result = issue_mainnet_presence(
+            &entry,
+            &binding,
+            &policy,
+            "http://localhost:49152",
+            entry.created_at_unix_ms,
+            std::time::Instant::now(),
+        );
+        if chain == Caip2::Mainnet {
+            assert!(result.is_ok(), "matching presence chain: {result:?}");
+        } else {
+            assert_eq!(
+                result.unwrap_err().code(),
+                "approval.binding_mismatch",
+                "active presence chain"
+            );
+        }
+    }
+}
+
+#[test]
+fn contract_summary_wire_facts() {
+    use crate::approval::{ClassicIntent, IntentBase, IntentView, MemoFact};
+    let entry = crate::approval::fixtures::sac_payment_pending(Caip2::Testnet, IntentAsset::Native);
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut store =
+        crate::approval::PendingApprovalStore::open(dir.path().join("contract.toml")).unwrap();
+    store
+        .insert(entry.clone(), entry.created_at_unix_ms)
+        .unwrap();
+    let view = store.snapshot(entry.created_at_unix_ms).remove(0);
+    let wire = serde_json::to_value(&view.summary).unwrap();
+    assert_eq!(
+        wire,
+        serde_json::json!({
+            "kind": "payment", "source": PAYER, "to": RECIPIENT, "amount_stroops": "1",
+            "asset": "XLM", "memo": {"kind": "none"}, "fee_stroops": "500100", "seq_num": 77,
+            "inclusion_fee_stroops": "100", "resource_fee_stroops": "500000"
+        }),
+        "contract summary JSON"
+    );
+    let native = context(IntentAsset::Native);
+    let payment = verify(&fixture(&native), &native).unwrap();
+    let base = IntentBase::new(
+        "stellar:testnet".into(),
+        PAYER.into(),
+        [0x11; 32],
+        1_000_000,
+        MemoFact::None,
+    )
+    .unwrap();
+    let intent = ClassicIntent::new(base, payment.intent_payload(Some(100))).unwrap();
+    let wire = serde_json::to_value(IntentView::new(&intent)).unwrap();
+    assert_eq!(wire["fee_at_most_stroops"], "1000000", "intent cap");
+    assert_eq!(wire["kind"], "contract_pay");
+    assert_eq!(wire["destination"], RECIPIENT);
+    assert_eq!(wire["explicit_inclusion_bid_stroops"], "100");
+    for fee in [-1, 500_101, i64::MAX, i64::from(u32::MAX) + 1] {
+        let mut envelope = fixture(&native);
+        data(&mut envelope).resource_fee = fee;
+        let summary = verify(&envelope, &native).unwrap().summary();
+        assert!(
+            matches!(
+                summary.operation,
+                crate::envelope_decode::ClassicOperation::SacTransfer {
+                    inclusion_fee_stroops: None,
+                    resource_fee_stroops: None,
+                    ..
+                }
+            ),
+            "invalid fee split {fee}"
+        );
+    }
+    let mut missing = fixture(&native);
+    missing.tx.ext = TransactionExt::V0;
+    assert!(
+        matches!(
+            verify(&missing, &native).unwrap().summary().operation,
+            crate::envelope_decode::ClassicOperation::SacTransfer {
+                inclusion_fee_stroops: None,
+                resource_fee_stroops: None,
+                ..
+            }
+        ),
+        "missing resource data supplies no split"
+    );
+}
+
+struct ObservedBalance(i64);
+
+impl crate::policy::v1::AccountReservesView for ObservedBalance {
+    fn reserves_stroops(&self, base_reserve_stroops: i64) -> i64 {
+        2 * base_reserve_stroops
+    }
+
+    fn balance_stroops(&self) -> Result<i64, crate::policy::v1::AccountReserveLookupError> {
+        Ok(self.0)
+    }
+
+    fn observation(&self) -> Option<crate::policy::v1::AccountObservation> {
+        Some(crate::policy::v1::AccountObservation {
+            ledger_sequence: 1,
+            observed_at_ms: POLICY_NOW_MS,
+            close_time_floor_ms: POLICY_NOW_MS,
+        })
+    }
+
+    fn effective_native_reservations_stroops(&self) -> Option<u64> {
+        Some(0)
+    }
+}
+
+/// The decision of a signed testnet `stellar_pay_commit` rule with one
+/// criterion over `args`, for a payer with `balance` stroops.
+fn decide(criterion: &str, args: &serde_json::Value, balance: i64) -> crate::policy::Decision {
+    use crate::policy::v1::{
+        PolicyEngineV1, canonical::canonical_bytes, loader::load_signed_policy_text, signature,
+        value::derive_value_class,
+    };
+    use crate::policy::{PolicyEngine, ToolDescriptor, ToolValueKind};
+    let body = format!(
+        "version = 2\nsequence = 1\nscope = \"profile:sac-test\"\n[[rules]]\nmatch = {{ tool = \"stellar_pay_commit\", chain = \"stellar:testnet\" }}\ncriteria = [{criterion}]\ndecision = \"allow\"\n"
+    );
+    let key = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+    let digest = signature::digest(&canonical_bytes(&body).unwrap());
+    let sig = crate::hex::encode(&signature::sign(&digest, &key));
+    let signed = format!("{body}\n[signature]\nowner_id = \"sac-test\"\nsig = \"{sig}\"\n");
+    let doc = load_signed_policy_text(
+        &signed,
+        "sac-test",
+        &key.verifying_key().to_bytes(),
+        crate::profile::caip2::TESTNET_PASSPHRASE,
+    )
+    .unwrap();
+    let tool = ToolDescriptor {
+        name: "stellar_pay_commit".into(),
+        destructive_hint: true,
+        read_only_hint: false,
+        chain_id_required: true,
+        chain_id: "stellar:testnet".into(),
+        value_kind: ToolValueKind::MovesValue,
+    };
+    let profile =
+        crate::profile::schema::Profile::builder_testnet("sac-test", "acct", "n-svc", "n-acct")
+            .build();
+    PolicyEngineV1::new(doc, "sac-test".into())
+        .evaluate_with_value_full(
+            &tool,
+            args,
+            &profile,
+            derive_value_class("stellar_pay_commit", args),
+            Some(&ObservedBalance(balance)),
+            None,
+            None,
+            None,
+            None,
+            POLICY_NOW_MS,
+        )
+        .unwrap()
+        .decision
+}
+
+/// Verified contract payment facts reach the existing payment criteria: the
+/// C recipient is an address alternative, carries no home domain, and the
+/// whole transaction fee counts against the floor.
+#[test]
+#[serial_test::serial]
+fn b1_contextual_policy_decisions() {
+    use crate::policy::Decision;
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let native = context(IntentAsset::Native);
+    let args = verify(&fixture(&native), &native).unwrap().policy_args();
+    let rich = 1_000_000_000;
+    let g_only = format!(
+        "{{ kind = \"counterparty_allowlist\", kinds = [\"G_ACCOUNT\"], allowlist = [\"{PAYER}\"] }}"
+    );
+    assert!(
+        matches!(decide(&g_only, &args, rich), Decision::Deny(_)),
+        "G-only list"
+    );
+    let mixed = format!(
+        "{{ kind = \"counterparty_allowlist\", kinds = [\"G_ACCOUNT\", \"C_ACCOUNT\"], allowlist = [\"{PAYER}\", \"{RECIPIENT}\"] }}"
+    );
+    assert_eq!(decide(&mixed, &args, rich), Decision::Allow, "mixed list");
+    let home = "{ kind = \"counterparty_allowlist\", kinds = [\"HOME_DOMAIN\"], allowlist = [\"example.com\"] }";
+    assert!(
+        matches!(decide(home, &args, rich), Decision::Deny(_)),
+        "home domain"
+    );
+    // Amount 1 plus the whole 500,100 stroop fee leaves exactly the floor.
+    let floor = "{ kind = \"balance_floor\", min_stroops = \"10000000\" }";
+    let exact = 10_000_000 + 1 + 500_100;
+    assert_eq!(
+        decide(floor, &args, exact),
+        Decision::Allow,
+        "floor equality"
+    );
+    assert!(
+        matches!(decide(floor, &args, exact - 1), Decision::Deny(_)),
+        "full fee crosses the floor"
+    );
+    let reserve = "{ kind = \"minimum_reserve\", margin_stroops = 0 }";
+    assert_eq!(
+        decide(reserve, &args, exact),
+        Decision::Allow,
+        "reserve equality"
+    );
+    assert!(
+        matches!(decide(reserve, &args, exact - 1), Decision::Deny(_)),
+        "full fee crosses reserve"
+    );
+}
+
+/// A contract payment record shows only its verified envelope facts: any
+/// stored fact, context, digest or envelope that disagrees refuses.
+#[test]
+fn b1_contextual_reopen_refuses_tampering() {
+    use crate::approval::{ApprovalKind, attest::classic_entry_summary};
+    let native = context(IntentAsset::Native);
+    let entry = crate::approval::fixtures::sac_payment_pending(Caip2::Testnet, IntentAsset::Native);
+    assert_eq!(
+        classic_entry_summary(&entry.kind).unwrap().unwrap(),
+        verify(&fixture(&native), &native).unwrap().summary(),
+        "valid reopen"
+    );
+    let mut bounded = fixture(&native);
+    bounded.tx.cond = Preconditions::Time(TimeBounds {
+        min_time: TimePoint(0),
+        max_time: TimePoint(1),
+    });
+    for case in [
+        "context",
+        "context chain",
+        "digest",
+        "envelope",
+        "destination",
+        "amount",
+        "asset",
+        "memo",
+        "fee",
+        "sequence",
+    ] {
+        let mut kind = entry.kind.clone();
+        let ApprovalKind::PaymentSimulated {
+            envelope_xdr_b64,
+            envelope_sha256_hex,
+            summary_to,
+            summary_amount_stroops,
+            summary_asset,
+            summary_memo,
+            summary_simulated_fee_stroops,
+            summary_simulated_seq_num,
+            sac_payment_context,
+        } = &mut kind
+        else {
+            panic!("payment fixture")
+        };
+        match case {
+            "context" => *sac_payment_context = Some(context(issued("USD", 3))),
+            "context chain" => {
+                *sac_payment_context =
+                    Some(SacPaymentContext::new(Caip2::Mainnet, IntentAsset::Native).unwrap())
+            }
+            "digest" => *envelope_sha256_hex = "00".repeat(32),
+            "envelope" => *envelope_xdr_b64 = b64(&bounded),
+            "destination" => *summary_to = format!("{}", stellar_strkey::Contract([5; 32])),
+            "amount" => *summary_amount_stroops = 2,
+            "asset" => *summary_asset = format!("USD:{PAYER}"),
+            "memo" => *summary_memo = Some("note".to_owned()),
+            "fee" => *summary_simulated_fee_stroops = 100,
+            _ => *summary_simulated_seq_num = 78,
+        }
+        assert_eq!(
+            classic_entry_summary(&kind)
+                .unwrap()
+                .err()
+                .map(|error| error.code()),
+            Some("approval.entry_inconsistent"),
+            "{case}"
+        );
+    }
 }

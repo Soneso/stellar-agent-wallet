@@ -21,8 +21,8 @@ reporting, and the default's measurement basis.
 `stellar_agent_core::sac_payment` provides offline inspection of a classic
 asset transfer from an unmuxed G source to a C recipient. These primitives
 grant no execution or signing authority. CLI and MCP payment routes retain
-their current admission rules. The complete contextual payment, intent and
-approval API is not available from this module.
+their current admission rules. Offline approval records retain the context
+needed to verify the envelope again when they are displayed or used.
 
 | Interface | Contract |
 |---|---|
@@ -31,6 +31,13 @@ approval API is not available from this module.
 | `VerifiedSacPayment::context(&self) -> &SacPaymentContext` | Returns the validated context. |
 | `VerifiedSacPayment::transaction(&self) -> &Transaction` | Returns the exact inspected transaction. |
 | `VerifiedSacPayment::invoke(&self) -> &InvokeContractArgs` | Returns the exact transfer invocation. |
+| `VerifiedSacPayment::policy_args(&self) -> serde_json::Value` | Returns full C destination, classic asset, decimal amount, numeric sequence and total fee, and the absent memo. |
+| `VerifiedSacPayment::summary(&self) -> ClassicSummary` | Returns `SacTransfer` with the full recipient and available inclusion and resource fee components. |
+| `VerifiedSacPayment::intent_payload(&self, explicit_inclusion_bid_stroops: Option<u32>) -> IntentPayload` | Returns `ContractPay`; an absent bid differs from an explicit zero. |
+| `envelope_decode::decode_pay_args_with_context(envelope_xdr: &str, context: Option<&SacPaymentContext>) -> Result<serde_json::Value, WalletError>` | Proves contextual transfers. A single transfer with Account, Contract and I128 arguments refuses without context, including custom tokens. Other envelopes use classic payment decoding. |
+| `PendingApproval::new_sac_payment_pending(envelope_xdr: String, context: SacPaymentContext, process_uid: String, ttl_ms: u64) -> Result<PendingApproval, WalletError>` | Builds an offline approval with verified summary facts. Zero lifetime and expiry overflow refuse. |
+| `operation_entry::contract_pay_base(chain: Caip2, source: &str, policy_digest: [u8; 32], memo: MemoFact, cap: ContractTransferFeeCap) -> Result<IntentBase, WalletError>` | The network library binds the supplied total cap in the canonical base. |
+| `operation_entry::contract_pay_identity(intent: &ClassicIntent) -> Result<[u8; 32], WalletError>` | Returns the canonical digest for `ContractPay`; other payload kinds refuse. |
 | `ContractTransferFeeCap { stroops: u32, signed: bool }` | Supplies one total bound. The flag describes provenance and cannot establish signed-policy authority. |
 | `ContractTransferFeeLimits { total: ContractTransferFeeCap }` | Holds the single supplied bound. |
 | `validate_sac_payment_data(payment: &VerifiedSacPayment, explicit_inclusion_bid_stroops: Option<u32>, limits: ContractTransferFeeLimits) -> Result<SacTransferFee, WalletError>` | Checks forward key allowances, restoration indices and fee arithmetic without simulation evidence. |
@@ -65,6 +72,34 @@ of resources from the full transaction fee yields the inclusion bid. A supplied
 explicit bid must equal it. The full fee, including restoration, must fit the
 supplied cap. There is no separate resource ceiling and this validator selects
 no default or policy consent.
+
+`ContractPay` uses payload tag 4. Existing payload tags and canonical bytes
+remain unchanged. The destination, classic asset, amount and explicit-bid
+option follow the base, which binds the total fee cap. Classic builders refuse
+this payload. The stored context and the cap's `signed` flag confer no authority.
+
+Contract approval records carry optional validated context in approval TOML.
+Classic records omit it and retain their bytes. Using a reopened record checks
+the envelope digest, forward asset proof and every stored contract summary fact. Attestation,
+presence and witness verification also bind the context to the active chain.
+Malformed but safely shaped destinations remain listable, rejectable and
+collectable; using them refuses. Unsafe shapes and cross-kind context fields
+refuse file decoding. The store retains its exclusive sidecar lock and atomic
+file replacement; its recovery intervals and wire version remain unchanged.
+An older reader may refuse files containing contract payment records.
+Compatibility covers existing G/M records read by this reader.
+
+Approval JSON, local and remote pages, and CLI summaries show the full C
+recipient. Available resource and inclusion fees accompany the total fee.
+An intent supplies its total cap; an envelope-only record supplies no cap or
+signed-policy origin. The mainnet transaction confirmation entry still requires
+a classic envelope. These offline primitives do not enable contract execution.
+
+Policy evaluation sees a Payment value leg. A G-only deny list does not list
+a C recipient; a mixed G/C list can. C recipients supply no account home-domain
+identity. Reserve and balance-floor criteria charge the entire transaction fee.
+Payment audit records redact C destinations and hash their complete canonical
+text. Generic audit conversion retains its existing behavior.
 
 `SacPaymentError` is carried by `ValidationError::SacPayment` through
 `WalletError`. Its closed wire codes are:
@@ -263,9 +298,9 @@ A matching grant names the current install identity, package version and package
 
 A `sign-payment` grant destination is a canonical, checksum-valid G account or M address, parsed by `payment_accounts::PaymentAccount`. Construction, deserialization, store insertion, and the pending request's invariants refuse any other text, including C, W, and noncanonical spellings. A G grant covers its account and every M address of that account, which credit the same balance. An M grant covers only its complete M address, so another ID or the base account re-prompts. Other capabilities compare the destination text exactly; `sign-rule-create` keeps its smart-account C-strkey. Coverage never rewrites a grant, and the attestation binds the stored destination bytes: an M grant and its base G grant have different digests.
 
-A `PaymentSimulated` entry's `summary_to` must also be a canonical G account or M address, at construction, deserialization, and store insertion. Existing checksum-valid G records load without changing their destination or attestation bytes.
+At construction, strict deserialization, and store insertion, a `PaymentSimulated` entry's `summary_to` must be a canonical C contract with `sac_payment_context`, or a canonical G account or M address without it. Existing checksum-valid G records load without changing their destination or attestation bytes.
 
-A stored record loads by the shape of its destination, and every use checks the canonical form. A stored grant loads whatever its destination text. A stored payment summary loads with the G shape `^G[A-Z2-7]{55}$` or the M shape `^M[A-Z2-7]{68}$`. A stored `sign-payment` request also admits the C shape. Any other destination text fails the whole file. A record whose destination fails the canonical check is an ordinary record. It is listed, found, rejected, revoked, expired, pruned, collected, and counted like any other, and outbox-loss recovery revokes it. A `sign-payment` grant with such a destination covers no destination. A `sign-payment` request with one shows as an inconsistent view. A payment's consent view and digest come from its envelope, so rejection and revocation work on every surface. Attestation, consumption before a send, the mainnet witness, and the commit gate refuse such a payment with `approval.entry_inconsistent` and change no stored state. The receipt repair after a send records the consumption without reading the destination.
+A stored record loads by the shape of its destination, and every use checks the canonical form. A stored grant loads whatever its destination text. A stored payment summary loads with the G or C shape `^[GC][A-Z2-7]{55}$` or the M shape `^M[A-Z2-7]{68}$`. A stored `sign-payment` request also admits the C shape. Any other destination text fails the whole file. A record whose destination fails the canonical check is an ordinary record. It is listed, found, rejected, revoked, expired, pruned, collected, and counted like any other, and outbox-loss recovery revokes it. A `sign-payment` grant with such a destination covers no destination. A `sign-payment` request with one shows as an inconsistent view. A payment's consent view and digest come from its envelope, so rejection and revocation work on every surface. Attestation, consumption before a send, the mainnet witness, and the commit gate refuse such a payment with `approval.entry_inconsistent` and change no stored state. The receipt repair after a send records the consumption without reading the destination.
 
 Consent views carry complete validated destinations. The payment view decodes `to` from the stored envelope, so a stored summary cannot change it. The `ToolsetFirstInvokeGate` view adds `destination` from the validated stored terms and keeps `destination_redacted` for diagnostics.
 
@@ -676,7 +711,7 @@ The non-regular-file check rejects directories and symlinks before open, closing
 
 The commit and submit paths in the following table write `value_action_pending` through the submission recorder before the send. It carries the SAME value legs the policy gate sized (single-derivation invariant: the legs are the `ValueEffects` the gate evaluated, never re-derived at the emission site). The locally computed transaction hash is recorded redacted (first-8-last-8); the row never carries key material. A row the writer cannot append refuses the send with `submission.record_unavailable`. A reported success writes no further row: the receipt records it as a report. A DeFi adapter that instead FAILS at submit records a `sa_raw_invocation` row (with the mapped `SaInvocationResult`) in its error arm.
 
-Each `ValueLegRecord` records its destination redacted first-5-last-5, never in full. `ValueLegRecord::from_payment_leg` builds a classic payment leg and refuses a destination that is not a canonical G account or M address. It adds `destination_sha256`, the lowercase hexadecimal SHA-256 of the complete destination's UTF-8 bytes. The hash tells two M addresses of one account apart without recording either. The generic `From<&ValueLeg>` conversion sets no hash, so x402, MPP, and contract legs keep their wire form. The field is omitted when absent. Rows written without it read as `None`, serialize to the same bytes, and keep their chain hashes; verification never derives a hash.
+Each `ValueLegRecord` records its destination redacted first-5-last-5, never in full. `ValueLegRecord::from_payment_leg` builds a payment leg and refuses a destination that is not a canonical G account, M address, or C contract. It adds `destination_sha256`, the lowercase hexadecimal SHA-256 of the complete destination's UTF-8 bytes. The hash tells two M addresses of one account apart without recording either. The generic `From<&ValueLeg>` conversion sets no hash, so x402, MPP, and contract legs keep their wire form. The field is omitted when absent. Rows written without it read as `None`, serialize to the same bytes, and keep their chain hashes; verification never derives a hash.
 
 x402 authorization signing is the exception to the row kind and to the timing. It writes `x402_payment_authorized` (its own `EventKind` carrying legs, network, and scheme) rather than `value_action_pending`. The wallet signs the payment authorization without submitting it. The signed authorization still leaves the wallet: the payment flow re-simulates the signed entry against the configured RPC. That RPC therefore observes the signed x402 authorization and is part of the trust boundary.
 

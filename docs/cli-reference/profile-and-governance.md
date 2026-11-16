@@ -1224,6 +1224,12 @@ Payment, claim, and trustline summaries are decoded from the transaction envelop
 Every destination, amount, asset, memo, limit, balance id, fee, and sequence number shown is the envelope's.
 The effective source is the operation source when the operation has one, otherwise the transaction source.
 A muxed destination shows as its `M...` address.
+A stored contract payment shows its complete `C...` recipient, classic asset,
+amount and total fee, with resource and inclusion components when available.
+Its context must prove the asset contract and match the active network before
+consent is recorded. A mismatched stored summary refuses use.
+An envelope-only record supplies no total cap or policy origin to display.
+These offline records do not enable contract payment execution.
 A path payment shows the most the source pays and the least the destination receives.
 Memos show their signed type: `none`, `text "<escaped value>"`, `id <n>`, `hash <hex>`, or `return <hex>`.
 A claim names the balance by id only, so its asset and amount read `not part of the signed claim transaction`.
