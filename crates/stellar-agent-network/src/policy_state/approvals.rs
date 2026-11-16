@@ -1514,6 +1514,9 @@ pub(super) fn check_record(
     if record.state == ApprovalState::Revoked {
         return Err(refuse(MainnetPrecondition::ApprovalRevoked));
     }
+    if record.state == ApprovalState::Consumed && operation != Some(record.operation_id) {
+        return Err(refuse(MainnetPrecondition::ApprovalNonceReused));
+    }
     let Some(consent) = &record.consent else {
         return Err(refuse(if now < record.waiting_expires_at_ms {
             MainnetPrecondition::ApprovalConsentMissing

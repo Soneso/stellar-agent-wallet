@@ -9,7 +9,14 @@
 
 use rmcp::model::{CallToolResult, Content};
 use serde_json::Value;
-use stellar_agent_core::error::{SubmissionError, WalletError};
+use stellar_agent_core::approval::{
+    ApprovalError, ApprovalKind, PendingApproval, PendingApprovalStore,
+    attest::record_error,
+    retry::{DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, open_with_retry},
+    witness::ApprovedKind,
+};
+use stellar_agent_core::audit_log::PolicyDecision;
+use stellar_agent_core::error::{ApprovalFailure, InternalError, SubmissionError, WalletError};
 use stellar_agent_core::mainnet::verified_policy::VerifiedPolicy;
 use stellar_agent_network::fees::ClassicFeeChoice;
 use stellar_agent_network::mainnet::MainnetConsumer;
@@ -17,7 +24,8 @@ use stellar_agent_network::operation_entry::{
     self, ClassicEntry, CommitEntry, EnvelopeFacts, IdentityFacts, IntentBaseFacts, OpenedEntry,
 };
 use stellar_agent_network::policy_state::{
-    BusinessId, OpenRequest, OperationHandle, OperationKind, OperationRecorder, OperationTool,
+    ApprovalRecorder, ApprovalStatus, BusinessId, OpenRequest, OperationHandle, OperationKind,
+    OperationRecorder, OperationState, OperationTool,
 };
 
 use crate::server::WalletServer;
@@ -42,6 +50,8 @@ pub(crate) struct PreparedEnvelope {
     pub waiting_end: Option<u64>,
     /// The ID of the winning retained operation.
     pub operation_id: Option<[u8; 16]>,
+    /// The retained operation that owns this envelope and its approval.
+    pub handle: Option<OperationHandle>,
 }
 
 impl ClassicOperation {
@@ -76,7 +86,224 @@ fn refusal(error: &WalletError) -> CallToolResult {
     crate::tools::common::ledger_err_result(error)
 }
 
+fn approval_io(error: std::io::Error) -> WalletError {
+    record_error(&ApprovalError::Io {
+        kind: error.kind(),
+        source: error,
+    })
+}
+
+/// Serializes orphan cleanup and record opening across producer processes.
+/// The guard precedes the inbox, audit mutex and window locks. Consent paths
+/// never acquire it, so they can release the inbox while a producer waits.
+fn producer_lock(
+    path: &std::path::Path,
+) -> Result<stellar_agent_core::file_lock::HeldFileLock, WalletError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).read(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let attempts = DEFAULT_RETRY_ATTEMPTS.max(1);
+    let mut attempt = 0_u32;
+    loop {
+        attempt += 1;
+        let file = options.open(path).map_err(approval_io)?;
+        match stellar_agent_core::file_lock::HeldFileLock::try_lock(file) {
+            Ok(guard) => return Ok(guard),
+            Err(std::fs::TryLockError::WouldBlock) if attempt < attempts => {
+                std::thread::sleep(DEFAULT_RETRY_BACKOFF);
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(WalletError::Approval(ApprovalFailure::WriterLocked {
+                    detail:
+                        "another preparation is opening an approval; retry the same business id"
+                            .to_owned(),
+                }));
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(approval_io(error)),
+        }
+    }
+}
+
+fn open_inbox(path: &std::path::Path) -> Result<PendingApprovalStore, WalletError> {
+    open_with_retry(path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF)
+        .map_err(|error| record_error(&error))
+}
+
+fn linked_entry(path: &std::path::Path, nonce: &str) -> Result<PendingApproval, WalletError> {
+    open_inbox(path)?.get(nonce).cloned().ok_or_else(|| {
+        WalletError::Approval(ApprovalFailure::NotFound {
+            detail: "the operation's approval entry is gone; prepare the operation again"
+                .to_owned(),
+        })
+    })
+}
+
+/// Removes live unattested entries of this envelope only when authenticated
+/// status proves that no durable record names their nonce.
+fn remove_orphans(
+    store: &mut PendingApprovalStore,
+    status: &ApprovalStatus<'_>,
+    handle: &OperationHandle,
+) -> Result<(), WalletError> {
+    let Some(envelope) = handle.unsigned_envelope_sha256() else {
+        return Ok(());
+    };
+    let envelope = stellar_agent_core::hex::encode(&envelope);
+    let now = stellar_agent_core::timefmt::now_unix_ms().map_err(|error| {
+        WalletError::Approval(ApprovalFailure::ClockError {
+            detail: error.to_string(),
+        })
+    })?;
+    for view in store.snapshot(now) {
+        let Some(stored) = store.get(&view.approval_nonce) else {
+            continue;
+        };
+        let (ApprovalKind::PaymentSimulated {
+            envelope_sha256_hex,
+            ..
+        }
+        | ApprovalKind::ClaimSimulated {
+            envelope_sha256_hex,
+            ..
+        }
+        | ApprovalKind::TrustlineSimulated {
+            envelope_sha256_hex,
+            ..
+        }) = &stored.kind
+        else {
+            continue;
+        };
+        if view.expired
+            || stored.attestation_blob_b64.is_some()
+            || *envelope_sha256_hex != envelope
+            || status
+                .find_by_nonce(&view.approval_nonce)
+                .map_err(operation_entry::operation_refusal)?
+                .is_some()
+        {
+            continue;
+        }
+        store
+            .remove(&view.approval_nonce)
+            .map_err(|error| record_error(&error))?;
+    }
+    Ok(())
+}
+
 impl WalletServer {
+    /// Reuses the linked approval or persists and opens it for `handle`.
+    /// Inbox insertion retains the tool's protocol-error format. Durable
+    /// recorder refusals use the wallet error envelope.
+    pub(crate) fn classic_pending_approval(
+        &self,
+        handle: Option<&OperationHandle>,
+        kind: ApprovedKind,
+        decision: PolicyDecision,
+        persist: impl FnOnce() -> Result<PendingApproval, String>,
+    ) -> Result<PendingApproval, crate::tools::common::ToolError> {
+        use crate::tools::common::ToolError;
+        self.start_classic_approval(handle, kind, decision, persist)
+            .map_err(|error| ToolError::Business(refusal(&error)))?
+            .map_err(|error| {
+                ToolError::Protocol(rmcp::ErrorData::internal_error(
+                    format!("approval.store_error: {error}"),
+                    None,
+                ))
+            })
+    }
+
+    fn start_classic_approval(
+        &self,
+        handle: Option<&OperationHandle>,
+        kind: ApprovedKind,
+        decision: PolicyDecision,
+        persist: impl FnOnce() -> Result<PendingApproval, String>,
+    ) -> Result<Result<PendingApproval, String>, WalletError> {
+        if !self.context.chain_id.is_mainnet() {
+            return Ok(persist());
+        }
+        let handle = handle.ok_or_else(|| {
+            WalletError::Internal(InternalError::UnexpectedState {
+                detail: "a mainnet approval requires its operation record".to_owned(),
+            })
+        })?;
+        let name = self.profile_name_for_approval();
+        let directory = self.resolve_approval_dir().map_err(|error| {
+            WalletError::Approval(ApprovalFailure::StoreOpenFailed {
+                detail: error.to_string(),
+            })
+        })?;
+        let path = directory.join(format!("{name}.toml"));
+        // Opening the inbox establishes its private directory before the
+        // producer lock is created; this initial guard writes no entry.
+        drop(open_inbox(&path)?);
+        let _producer = producer_lock(&directory.join(format!("{name}.producer.lock")))?;
+        let status = ApprovalStatus::new(&self.window_store, self.security_profile());
+        if let Some(view) = status
+            .find_by_operation(handle.id())
+            .map_err(operation_entry::operation_refusal)?
+        {
+            return linked_entry(&path, &view.record.nonce).map(Ok);
+        }
+        if handle.state() != OperationState::Prepared {
+            return Err(operation_entry::approval_requires_prepared());
+        }
+        {
+            let mut pending = open_inbox(&path)?;
+            remove_orphans(&mut pending, &status, handle)?;
+        }
+        let entry = match persist() {
+            Ok(entry) => entry,
+            Err(error) => return Ok(Err(error)),
+        };
+        let opened = (|| {
+            let ttl = entry
+                .expires_at_unix_ms
+                .checked_sub(entry.created_at_unix_ms)
+                .ok_or_else(|| {
+                    WalletError::Internal(InternalError::UnexpectedState {
+                        detail: "the signed approval interval ends before it starts".to_owned(),
+                    })
+                })?;
+            let subject = stellar_agent_core::approval::mainnet_consent_subject(
+                &entry,
+                &stellar_agent_core::approval::AttestationBinding::new(
+                    &name,
+                    self.context.chain_id.caip2_str(),
+                ),
+            )?;
+            let facts = operation_entry::pending_approval_facts(&entry, handle, kind, subject, ttl);
+            self.approval_step(|recorder| {
+                recorder
+                    .open_pending(handle.id(), &facts, decision)
+                    .map_err(operation_entry::operation_refusal)
+            })
+        })();
+        if let Err(error) = opened {
+            match status.find_by_operation(handle.id()) {
+                Ok(Some(view)) if view.record.nonce != entry.approval_nonce => {
+                    open_inbox(&path)?
+                        .remove(&entry.approval_nonce)
+                        .map_err(|error| record_error(&error))?;
+                    return linked_entry(&path, &view.record.nonce).map(Ok);
+                }
+                Ok(None) => {
+                    // A failed cleanup leaves an orphan for the next retry.
+                    if let Ok(mut pending) = open_inbox(&path) {
+                        let _ = pending.remove(&entry.approval_nonce);
+                    }
+                }
+                Ok(Some(_)) | Err(_) => {}
+            }
+            return Err(error);
+        }
+        Ok(Ok(entry))
+    }
+
     /// The business id a value tool enters with.
     ///
     /// The check runs only for a call on the profile's own chain, so a call
@@ -141,6 +368,32 @@ impl WalletServer {
         let mut recorder =
             OperationRecorder::new(&self.window_store, profile, &mut *guard, request_id);
         step(&mut recorder)
+    }
+
+    /// Runs one approval step with the value audit writer acquired before
+    /// the window lock. The caller holds no inbox lock during the step.
+    pub(crate) fn approval_step<T>(
+        &self,
+        step: impl FnOnce(&mut ApprovalRecorder<'_>) -> Result<T, WalletError>,
+    ) -> Result<T, WalletError> {
+        let profile = self.security_profile();
+        let writer = crate::tools::value_audit::require_value_audit_writer(
+            profile,
+            &self.profile_name_for_approval(),
+            self.audit_binding,
+        )?;
+        let mut guard = writer.lock().map_err(|_| {
+            WalletError::Submission(SubmissionError::RecordUnavailable {
+                detail: "the audit writer mutex is poisoned, so the approval cannot be recorded"
+                    .to_owned(),
+            })
+        })?;
+        step(&mut ApprovalRecorder::new(
+            &self.window_store,
+            profile,
+            &mut *guard,
+            uuid::Uuid::new_v4().to_string(),
+        ))
     }
 
     /// Runs `step` as [`Self::operation_step`] does, a refusal rendered as
@@ -228,6 +481,7 @@ impl WalletServer {
                 stored: None,
                 waiting_end: None,
                 operation_id: None,
+                handle: None,
             });
         };
         let stored = |xdr: &str, handle: &OperationHandle| {
@@ -237,6 +491,7 @@ impl WalletServer {
                     stored: Some(facts),
                     waiting_end: Some(handle.waiting_expires_at_ms()),
                     operation_id: Some(*handle.id().as_bytes()),
+                    handle: Some(handle.clone()),
                 })
                 .map_err(|error| refusal(&error))
         };
@@ -267,6 +522,7 @@ impl WalletServer {
                     stored: None,
                     waiting_end: Some(handle.waiting_expires_at_ms()),
                     operation_id: Some(*handle.id().as_bytes()),
+                    handle: Some(handle),
                 }),
             },
             OpenedEntry::Replay(view) => Err(replay_result(&view)),
@@ -631,6 +887,29 @@ mod tests {
 
     const G: &str = "GADQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOZPI";
     const M_MAX: &str = "MADQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQP77777777777754MA";
+
+    #[test]
+    fn producer_lock_uses_the_inbox_retry_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("producer.lock");
+        let held = producer_lock(&path).unwrap();
+        let start = std::time::Instant::now();
+        let result = producer_lock(&path);
+        let elapsed = start.elapsed();
+        assert!(matches!(
+            result,
+            Err(WalletError::Approval(ApprovalFailure::WriterLocked { .. }))
+        ));
+        assert!(
+            elapsed >= DEFAULT_RETRY_BACKOFF * (DEFAULT_RETRY_ATTEMPTS - 1),
+            "producer contention waits through every inbox retry backoff"
+        );
+        drop(held);
+        assert!(
+            producer_lock(&path).is_ok(),
+            "a released producer lock can be acquired"
+        );
+    }
 
     fn data_of(destinations: PaymentDestinations, compacted: bool) -> Value {
         let view = OperationView {

@@ -710,14 +710,21 @@ impl WalletServer {
 
         let approval_block = if let DispatchOutcome::RequireApproval(approval) = &dispatch_outcome {
             let profile_name = self.profile_name_for_approval();
-            match self.persist_create_account_pending_approval(
-                &envelope_xdr,
-                &args.destination,
-                starting_balance_stroops,
-                total_fee_stroops,
-                source_sequence.saturating_add(1),
-                &profile_name,
-                &approval.request,
+            match self.classic_pending_approval(
+                prepared.handle.as_ref(),
+                stellar_agent_core::approval::witness::ApprovedKind::Payment,
+                dispatch_outcome.audit_decision(),
+                || {
+                    self.persist_create_account_pending_approval(
+                        &envelope_xdr,
+                        &args.destination,
+                        starting_balance_stroops,
+                        total_fee_stroops,
+                        source_sequence.saturating_add(1),
+                        &profile_name,
+                        &approval.request,
+                    )
+                },
             ) {
                 Ok(entry) => Some(json!({
                     "approval_nonce": entry.approval_nonce,
@@ -734,12 +741,7 @@ impl WalletServer {
                         "simulated_seq_num": source_sequence.saturating_add(1),
                     }
                 })),
-                Err(e) => {
-                    return Err(rmcp::ErrorData::internal_error(
-                        format!("approval.store_error: {e}"),
-                        None,
-                    ));
-                }
+                Err(error) => return error.into_result(),
             }
         } else {
             None

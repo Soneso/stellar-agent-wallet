@@ -966,6 +966,11 @@ mod enabled {
             record.disposition != ApprovalDisposition::Revoked,
             P::ApprovalRevoked,
         )?;
+        let same_operation =
+            operation.is_some_and(|link| *link.operation_id.as_bytes() == record.operation_id);
+        if record.disposition == ApprovalDisposition::Consumed {
+            require(same_operation, P::ApprovalNonceReused)?;
+        }
         let Some(consent) = &record.consent else {
             return Err(refused(if now < record.expires_at_ms {
                 P::ApprovalConsentMissing
@@ -986,10 +991,7 @@ mod enabled {
             .payload
             .as_ref()
             .ok_or_else(|| refused(P::ApprovalExpired))?;
-        require(
-            operation.is_some_and(|link| *link.operation_id.as_bytes() == record.operation_id),
-            P::ApprovalNonceReused,
-        )?;
+        require(same_operation, P::ApprovalNonceReused)?;
         require(approval.nonce() == record.nonce, P::ApprovalNonce)?;
         require(approval.kind() == record.kind, P::ApprovalKindMismatch)?;
         require(

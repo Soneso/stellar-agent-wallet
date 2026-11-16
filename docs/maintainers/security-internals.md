@@ -2160,9 +2160,8 @@ The operator outbox refuses this event. No operation notification accompanies re
 If append fails, the error states that the record is revoked. A retry neither appends nor repairs the row.
 Concurrent calls can each append because the recorder returns no changed flag.
 
-The CLI mainnet ceremony under an approval rule produces these records. Other
-preparations create none, so other surfaces act only on records that already
-exist. The ceremony refuses an approval rule without an operation record.
+The CLI mainnet ceremony under an approval rule produces these records.
+The ceremony refuses an approval rule without an operation record.
 Before it parks an entry, it reads the record by operation. Without one, it
 removes the unattested live value entries of the operation's envelope that no
 record names. It then parks the new entry and opens the record with the
@@ -2177,6 +2176,24 @@ The witness returns only after it. A refused presence or consent keeps entry
 and record, and the waiting expiry ends both. A rerun therefore converges on
 one nonce per operation. A queued consent row's outbox reference stays in the
 payload. A payload without one names its row `written` or `recovered`.
+
+MCP create-account, trustline and claim preparations under an approval rule
+also open durable records. Payment preparation retains its inbox recovery
+binding and creates no durable approval record. Each durable producer carries
+the retained operation through envelope reuse and returns its linked approval
+on retry. A missing linked entry refuses with `approval.not_found`. Without a
+link, the producer removes live unattested orphans of the same envelope,
+inserts the entry, releases the inbox, and opens the record. A producer lock
+serializes that sequence; consent paths never take it. Acquisition uses the
+inbox's five attempts with 20 milliseconds between attempts. A preparation that
+still finds the lock held after those attempts refuses with
+`approval.writer_locked`; retry with the same business id. The open retains the
+prepare decision and the entry's signed interval as its rule lifetime.
+After an open error, authenticated status determines whether cleanup is safe.
+A committed record keeps its nonce; a competing record returns its winner.
+An unreadable status keeps the entry for retry. Rejection creates no durable
+consent, and signed expiry ends the waiting window. Allow, testnet and
+clawback opt-ins keep their existing paths without the approval facade.
 
 `approve --id` completes an existing mainnet value record after its consent row
 and inbox attestation persist. It releases the inbox before committing consent
