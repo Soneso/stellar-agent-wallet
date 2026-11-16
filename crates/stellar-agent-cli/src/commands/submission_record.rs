@@ -1038,6 +1038,12 @@ mod tests {
       "envelope_hash": "fdca46b81c5c77753f52cce8845503c8eef69ef48266f0e4ded1ea19060db975",
       "outcome": "unknown",
       "reconcile_with": "stellar-agent tx status",
+      "recovery": {
+        "next_action": "TargetedStatus",
+        "reason": "RecoveryRequired",
+        "result": "NeedsEvidence",
+        "retry_time_unavailable": "MissingBound"
+      },
       "timeout_seconds": 30,
       "tx_hash": "abababababababababababababababababababababababababababababababab"
     }

@@ -32,6 +32,9 @@ use super::{PersistedWindowStore, WindowStoreError};
 use crate::operational::OperationalReport;
 use crate::{MainnetOracle, StellarRpcClient};
 
+mod report;
+pub use report::{RecoveryAction, RecoveryInclusion, RecoveryRefusal, RecoveryResult};
+
 const ATTEMPT_REQUESTS: usize = 24;
 const SHARED_REQUESTS: usize = 4;
 const PASS_DURATION: Duration = Duration::from_secs(20);
@@ -41,6 +44,24 @@ const PAGE_SIZE: usize = 1;
 /// The evidence a bounded recovery read cannot obtain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum RecoveryReason {
+    /// No recovery run has supplied evidence.
+    RecoveryRequired,
+    /// A live lease owns the work.
+    Running,
+    /// All sixteen reservations are spent.
+    RetriesExhausted,
+    /// The envelope has not expired.
+    AwaitingExpiry,
+    /// No finite envelope bound exists.
+    Untimed,
+    /// The clock precedes the stored run.
+    ClockRegression,
+    /// The authenticated run cannot be interpreted.
+    RecordUnusable,
+    /// A previous lease expired unfinished.
+    Interrupted,
+    /// Independent endpoint configuration is required.
+    ConfigurationRequired,
     /// A response exceeds the 10 MiB transport limit.
     ResponseTooLarge,
     /// The endpoint rejects work because it is overloaded.
@@ -141,13 +162,10 @@ fn rpc_failure(error: &stellar_rpc_client::Error) -> RecoveryReason {
 
 fn read_failure(error: &crate::client::RecoveryReadError) -> RecoveryReason {
     use crate::client::RecoveryReadError;
-    use stellar_agent_core::error::{NetworkError, ProtocolError};
+    use stellar_agent_core::error::ProtocolError;
     match error {
         RecoveryReadError::Rpc(error) => rpc_failure(error),
         RecoveryReadError::Shape => RecoveryReason::MissingField,
-        RecoveryReadError::Validation(WalletError::Network(NetworkError::AccountNotFound {
-            ..
-        })) => RecoveryReason::CoverageRequired,
         RecoveryReadError::Validation(WalletError::Protocol(ProtocolError::XdrCodecFailed {
             ..
         })) => RecoveryReason::MissingField,
@@ -201,6 +219,9 @@ impl<'a> EndpointPair<'a> {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum RecoveryError {
+    /// Acquiring the audit writer refuses.
+    #[error(transparent)]
+    Writer(WalletError),
     /// The window store refuses the snapshot or a commit.
     #[error(transparent)]
     Store(#[from] WindowStoreError),
@@ -221,6 +242,8 @@ pub enum RecoveryError {
         /// `REPAIR_DECISION_DETAIL_LIMIT` (16) decisions in stored order,
         /// followed by one item stating how many more decisions exist.
         detail: String,
+        /// Readable authenticated results after the refusal.
+        report: Option<Box<RecoveryReport>>,
     },
 }
 
@@ -230,7 +253,7 @@ impl RecoveryError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::Store(error) => error.submission_code(),
-            Self::EndpointIdentity(error) => error.code(),
+            Self::EndpointIdentity(error) | Self::Writer(error) => error.code(),
             Self::NeedsEvidence(_) => "recovery.needs_evidence",
             Self::Context { source, .. } => source.code(),
         }
@@ -240,6 +263,31 @@ impl RecoveryError {
         Self::Context {
             source: Box::new(self),
             detail,
+            report: None,
+        }
+    }
+
+    /// The verified results carried with a refusal, when state remains readable.
+    #[must_use]
+    pub fn report(&self) -> Option<&RecoveryReport> {
+        match self {
+            Self::Context { report, source, .. } => report.as_deref().or_else(|| source.report()),
+            _ => None,
+        }
+    }
+
+    fn with_report(self, value: RecoveryReport) -> Self {
+        match self {
+            Self::Context { source, detail, .. } => Self::Context {
+                source,
+                detail,
+                report: Some(Box::new(value)),
+            },
+            source => Self::Context {
+                source: Box::new(source),
+                detail: "recovery results attached".into(),
+                report: Some(Box::new(value)),
+            },
         }
     }
 }
@@ -290,6 +338,7 @@ struct Budget {
     context: (RecoveryEndpoint, RecoveryMethod, Option<u32>),
     failure: Option<RecoveryFailure>,
     attempt_limit: usize,
+    completed: usize,
 }
 
 impl Budget {
@@ -300,6 +349,7 @@ impl Budget {
             context: (RecoveryEndpoint::Primary, RecoveryMethod::GetNetwork, None),
             failure: None,
             attempt_limit: ATTEMPT_REQUESTS,
+            completed: 0,
         }
     }
 
@@ -372,6 +422,7 @@ impl Budget {
             Ok(Err(crate::client::RecoveryReadError::Validation(error)))
                 if identity_refusal(&error) =>
             {
+                self.failed(RecoveryReason::ConfigurationRequired);
                 Err(IdentityFailure::Refused(error))
             }
             Ok(Err(error)) => {
@@ -1182,6 +1233,7 @@ fn classify_non_inclusion(
     attempt: &RecoveryAttempt,
     outcome: &[OutcomeAnswer; 2],
     accounts: Option<&AccountRead>,
+    history_end: Option<u32>,
 ) -> Result<NotIncludedProof, &'static str> {
     use super::operations::EndpointCoverage;
     let ExposureIdentity::Classic {
@@ -1228,13 +1280,7 @@ fn classify_non_inclusion(
     if attempt.recovery.history_incomplete {
         return Err("history_incomplete");
     }
-    let end = attempt
-        .recovery_run
-        .as_ref()
-        .and_then(|snapshot| snapshot.record())
-        .and_then(|run| run.scan.as_ref())
-        .and_then(|scan| scan.end)
-        .map_or(release.primary_ledger, |(ledger, _)| ledger);
+    let end = history_end.unwrap_or(release.primary_ledger);
     let mut coverage = [None, None];
     for (index, answer) in outcome.iter().enumerate() {
         match (
@@ -1287,6 +1333,7 @@ fn observe(
     outcome: Option<&[OutcomeAnswer; 2]>,
     sequence: Option<SequenceReleaseInput>,
     accounts: Option<&AccountRead>,
+    history_end: Option<u32>,
 ) -> Observed {
     let class = outcome.map(|answers| classify_outcome(attempt, answers));
     match &class {
@@ -1305,7 +1352,7 @@ fn observe(
     }
     match (class, outcome) {
         (Some(OutcomeClass::Absent), Some(answers)) => {
-            match classify_non_inclusion(attempt, answers, accounts) {
+            match classify_non_inclusion(attempt, answers, accounts, history_end) {
                 Ok(proof) => Observed::Decided(DecidedTransition::NotIncluded(proof)),
                 Err(detail) => Observed::Pending(detail),
             }
@@ -1321,18 +1368,30 @@ fn observe(
 pub struct RecoveryReport {
     /// Requests issued under each allowance.
     pub requests: RecoveryRequests,
-    /// Attempts whose evaluation commits.
+    /// Completed evaluations; a refused later write may also have committed.
     pub evaluated: usize,
     /// The first evidence this pass could not obtain or use.
     pub missing: Option<RecoveryFailure>,
-    /// Per-attempt scheduling results from the public outcome driver.
+    /// Verified chain results and scheduling advice for retained classic attempts.
     pub attempts: Vec<RecoveryAttemptResult>,
+    /// The typed refusal, including whether state was unreadable.
+    pub refusal: Option<RecoveryRefusal>,
 }
 
 /// An attempt's verified state or an ephemeral refusal before reservation.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveryAttemptResult {
+    /// The authenticated transaction hash.
+    pub tx_hash: [u8; 32],
+    /// The chain result or evidence collection advice.
+    pub result: RecoveryResult,
+    /// The existing authenticated decision and projection acknowledgement.
+    pub settlement: Option<super::operations::CommittedDecision>,
+    /// Spent reservations, when interpreted authenticated metadata supplies them.
+    pub reservations: Option<u8>,
+    /// The next unread ledger, when an authenticated scan supplies it.
+    pub next_unread: Option<u32>,
     /// The owning operation.
     pub operation_id: OperationId,
     /// The attempt index.
@@ -1538,6 +1597,10 @@ fn partial_account_rows(
 
 /// Evaluates one attempt from its transaction answers, the sequence scans
 /// and, after a recorded release, the account answers.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the observations and the durable history gate"
+)]
 fn evaluate_outcome(
     attempt: &RecoveryAttempt,
     outcome: Option<[OutcomeAnswer; 2]>,
@@ -1546,6 +1609,7 @@ fn evaluate_outcome(
     shared_ledgers: (Option<u32>, Option<u32>),
     now_ms: u64,
     detail: &str,
+    history_end: Option<u32>,
 ) -> Result<Evaluated, WindowStoreError> {
     // A transaction answer whose retention starts after the pre-exposure
     // ledger proves history loss. The sticky flag is set before
@@ -1567,7 +1631,13 @@ fn evaluate_outcome(
     let outcome_read = outcome.is_some();
     let mut input = evaluate(attempt, scans.0, scans.1, now_ms, detail)?;
     let sequence = input.sequence_released.take();
-    let observed = observe(attempt, outcome.as_ref(), sequence, accounts.as_ref());
+    let observed = observe(
+        attempt,
+        outcome.as_ref(),
+        sequence,
+        accounts.as_ref(),
+        history_end,
+    );
     let mut update = input.recovery.take().unwrap_or_default();
     let mut decision = None;
     if let Some(answers) = &outcome {
@@ -1697,6 +1767,7 @@ fn contextual_stop(
                 RecoveryReason::HistoryLost => R::HistoryLost,
                 RecoveryReason::MissingProvenance => R::MissingProvenance,
                 RecoveryReason::Disagreement => R::Disagreement,
+                _ => reason,
             };
             let stage = match f.method {
                 RecoveryMethod::GetNetwork => S::Identity,
@@ -1838,18 +1909,18 @@ async fn collect_outcomes(
     attempts: &[RecoveryAttempt],
     now_ms: u64,
     committed: &mut CommittedBatch,
+    budget: &mut Budget,
 ) -> Result<Collected, RecoveryError> {
-    let mut budget = Budget::new();
     let call_deadline = budget.deadline;
     let mut first_missing = None;
     let mut evaluated = Vec::new();
-    let prefix = |budget: Budget| Collected {
+    let prefix = |budget: &Budget| Collected {
         evaluated: Vec::new(),
         requests: budget.used,
         missing: budget.failure,
         unreached: budget.failure,
     };
-    match pair.verify(&mut budget).await {
+    match pair.verify(budget).await {
         Ok(()) => {}
         Err(IdentityFailure::Refused(error)) => return Err(RecoveryError::EndpointIdentity(error)),
         Err(IdentityFailure::Read) => return Ok(prefix(budget)),
@@ -1858,13 +1929,13 @@ async fn collect_outcomes(
         return Ok(prefix(budget));
     };
     budget.context(RecoveryEndpoint::Primary, RecoveryMethod::GetHealth, None);
-    let primary = match shared_observation(pair.primary, &mut budget, now_ms).await {
+    let primary = match shared_observation(pair.primary, budget, now_ms).await {
         Ok(shared) => shared,
         Err(_) => return Ok(prefix(budget)),
     };
     let observation = Some(primary.window(now_ms));
     budget.context(RecoveryEndpoint::Oracle, RecoveryMethod::GetHealth, None);
-    let oracle = match shared_observation(oracle_client, &mut budget, now_ms).await {
+    let oracle = match shared_observation(oracle_client, budget, now_ms).await {
         Ok(shared) => shared,
         Err(_) => return Ok(prefix(budget)),
     };
@@ -1972,7 +2043,7 @@ async fn collect_outcomes(
                 detail: "recovery_schedule_overflow".into(),
             })?;
         #[cfg(test)]
-        driver_tests::configure_budget(&mut budget);
+        driver_tests::configure_budget(budget);
         let history_end = complete_history_end(&run, &owned, &configuration);
         let target = history_end.or(timed.then_some(
             primary
@@ -2035,8 +2106,8 @@ async fn collect_outcomes(
                 .report
                 .latest_ledger
                 .min(oracle.report.latest_ledger);
-            let left = history(pair.primary, &primary, &mut budget, &seeded, true, target).await;
-            let right = history(oracle_client, &oracle, &mut budget, &seeded, false, target).await;
+            let left = history(pair.primary, &primary, budget, &seeded, true, target).await;
+            let right = history(oracle_client, &oracle, budget, &seeded, false, target).await;
             scans = (left.ok().flatten(), right.ok().flatten());
             let mut release = evaluate(
                 &seeded,
@@ -2078,13 +2149,13 @@ async fn collect_outcomes(
                 RecoveryMethod::GetLedgerEntries,
                 None,
             );
-            let left = account_read(pair.primary, account, &primary, &mut budget).await;
+            let left = account_read(pair.primary, account, &primary, budget).await;
             budget.context(
                 RecoveryEndpoint::Oracle,
                 RecoveryMethod::GetLedgerEntries,
                 None,
             );
-            let right = account_read(oracle_client, account, &oracle, &mut budget).await;
+            let right = account_read(oracle_client, account, &oracle, budget).await;
             let (left, right) = (
                 left.unwrap_or(Err("deadline")),
                 right.unwrap_or(Err("deadline")),
@@ -2179,7 +2250,7 @@ async fn collect_outcomes(
                 &run.exposure,
                 &configuration,
                 &mut scan_progress,
-                &mut budget,
+                budget,
             )
             .await;
         }
@@ -2198,6 +2269,7 @@ async fn collect_outcomes(
             } else {
                 "endpoint_unreachable"
             },
+            history_end,
         )?;
         if let Some(endpoint) = missing_endpoint {
             budget.context(endpoint, RecoveryMethod::GetTransaction, None);
@@ -2331,6 +2403,7 @@ async fn collect_outcomes(
         #[cfg(test)]
         tests::capture_evaluation(&evaluation);
         evaluated.push(evaluation);
+        budget.completed += 1;
         first_missing = first_missing.or(budget.failure.take());
         #[cfg(test)]
         driver_tests::after_attempt().await;
@@ -2364,6 +2437,7 @@ fn not_found_covers(observed: &crate::ObservedTransaction, target: Option<u32>) 
 /// Runs bounded recovery over the four oldest runnable classic attempts.
 /// A hash selects one attempt, including its non-runnable scheduling result.
 /// Each reached attempt reserves a lease and can release and decide in this call.
+/// Reports also include retained classic attempts with no runnable work.
 /// The shared prefix writes nothing. Production dispatch and targeted status
 /// recovery each call this driver once. Receipt replacement and
 /// acknowledgement remain separate.
@@ -2403,11 +2477,36 @@ pub(crate) async fn recover_outcomes_committed(
     tx_hash: Option<&[u8; 32]>,
     committed: &mut CommittedBatch,
 ) -> Result<RecoveryReport, RecoveryError> {
+    match recover_reported(store, profile, pair, writer, tx_hash, committed).await {
+        Err(error) if error.report().is_none() => {
+            let report = RecoveryReport::refused(
+                &OperationStatus::new(store, profile),
+                tx_hash,
+                error.code(),
+            );
+            Err(error.with_report(report))
+        }
+        result => result,
+    }
+}
+
+async fn recover_reported(
+    store: &PersistedWindowStore,
+    profile: &Profile,
+    pair: EndpointPair<'_>,
+    writer: &Arc<Mutex<AuditWriter>>,
+    tx_hash: Option<&[u8; 32]>,
+    committed: &mut CommittedBatch,
+) -> Result<RecoveryReport, RecoveryError> {
     let status = OperationStatus::new(store, profile);
     let now_ms = super::store::now_ms()?;
     let attempts = status.runnable_snapshot(tx_hash, now_ms)?;
     if !profile.chain_id.is_mainnet() || attempts.is_empty() {
-        return Ok(RecoveryReport::default());
+        return if profile.chain_id.is_mainnet() {
+            RecoveryReport::read(&status, tx_hash, now_ms).map_err(RecoveryError::from)
+        } else {
+            Ok(RecoveryReport::default())
+        };
     }
     let configuration = recovery_configuration_digest(profile);
     let runnable: Vec<_> = attempts
@@ -2432,9 +2531,35 @@ pub(crate) async fn recover_outcomes_committed(
             profile,
             writer,
         };
-        let collected = collect_outcomes(&driver, &pair, &runnable, now_ms, committed)
+        let mut budget = Budget::new();
+        let collected = collect_outcomes(&driver, &pair, &runnable, now_ms, committed, &mut budget)
             .await
-            .map_err(|error| progress_context(&status, &runnable, now_ms, error))?;
+            .map_err(|error| {
+                let mut report = RecoveryReport::refused(&status, tx_hash, error.code());
+                report.requests = budget.used;
+                report.evaluated = budget.completed;
+                report.missing = budget.failure;
+                if matches!(error, RecoveryError::EndpointIdentity(_)) {
+                    for entry in &mut report.attempts {
+                        if runnable.iter().any(|a| {
+                            a.operation_id == entry.operation_id
+                                && a.attempt_index == entry.attempt_index
+                        }) {
+                            entry.view.state = RecoveryRunState::Stopped(
+                                RecoveryStopReason::ConfigurationRequired,
+                            );
+                            entry.view.class = Some(RecoveryClass::Explicit);
+                            entry.view.earliest_retry_ms = None;
+                            entry.result = RecoveryResult::NeedsEvidence {
+                                reason: RecoveryReason::ConfigurationRequired,
+                                missing: budget.failure,
+                                next_action: RecoveryAction::EvidenceRequired,
+                            };
+                        }
+                    }
+                }
+                progress_context(&status, &runnable, now_ms, error).with_report(report)
+            })?;
         report.requests = collected.requests;
         unreached = collected.unreached;
         report.missing = collected.missing;
@@ -2442,6 +2567,13 @@ pub(crate) async fn recover_outcomes_committed(
         collected.evaluated
     };
     let now_ms = super::store::now_ms()?;
+    report.attempts = RecoveryReport::read(&status, tx_hash, now_ms)?.attempts;
+    if report.missing.is_some() {
+        report.refusal = Some(RecoveryRefusal {
+            code: "recovery.needs_evidence",
+            state_unavailable: false,
+        });
+    }
     for attempt in &attempts {
         let mut view = status
             .recovery_run_view(attempt.operation_id, attempt.attempt_index, now_ms)?
@@ -2486,13 +2618,14 @@ pub(crate) async fn recover_outcomes_committed(
             view.earliest_retry_ms = advice.earliest_retry_ms;
             stop = Some(advice);
         }
-        report.attempts.push(RecoveryAttemptResult {
-            operation_id: attempt.operation_id,
-            attempt_index: attempt.attempt_index,
-            history_start: attempt.pre_exposure_ledger,
-            view,
-            stop,
-        });
+        if let Some(entry) = report.attempts.iter_mut().find(|entry| {
+            entry.operation_id == attempt.operation_id
+                && entry.attempt_index == attempt.attempt_index
+        }) {
+            entry.view = view;
+            entry.stop = stop;
+            entry.refresh_result();
+        }
     }
     Ok(report)
 }
@@ -3130,6 +3263,7 @@ mod tests {
                 (Some(60), Some(60)),
                 NOW,
                 "pending",
+                None,
             )
             .unwrap();
             assert!(evaluated.decision.is_none(), "{detail}");
@@ -3207,13 +3341,14 @@ mod tests {
                 &unreleased,
                 Some(&[good.clone(), good.clone()]),
                 Some(release),
+                None,
                 None
             ),
             Observed::Decided(DecidedTransition::Succeeded(_))
         ));
         let gone = [absent(5, 60), absent(5, 61)];
         assert_eq!(
-            observe(&unreleased, Some(&gone), Some(release), None),
+            observe(&unreleased, Some(&gone), Some(release), None, None),
             Observed::SequenceReleased(release)
         );
         let mut late = good.clone();
@@ -3223,6 +3358,7 @@ mod tests {
                 &unreleased,
                 Some(&[good.clone(), late]),
                 Some(release),
+                None,
                 None
             ),
             Observed::Disagreement(LEDGER_MISMATCH)
@@ -3230,13 +3366,19 @@ mod tests {
         let released = exposed(true);
         let read = accounts(6, 6, (60, 61));
         assert!(matches!(
-            observe(&released, Some(&gone), Some(release), Some(&read)),
+            observe(&released, Some(&gone), Some(release), Some(&read), None),
             Observed::Decided(DecidedTransition::NotIncluded(
                 NotIncludedProof::AccountSequence { .. }
             ))
         ));
         assert!(matches!(
-            observe(&released, Some(&[good.clone(), good]), None, Some(&read)),
+            observe(
+                &released,
+                Some(&[good.clone(), good]),
+                None,
+                Some(&read),
+                None
+            ),
             Observed::Decided(DecidedTransition::Succeeded(_))
         ));
         let evaluated = evaluate_outcome(
@@ -3247,6 +3389,7 @@ mod tests {
             (Some(60), Some(61)),
             NOW,
             "pending",
+            None,
         )
         .unwrap();
         assert!(evaluated.decision.is_none());
@@ -3260,7 +3403,7 @@ mod tests {
     fn recovery_account_non_inclusion_requires_both_lower_sequences_and_expiry_coverage() {
         let gone = [absent(30, 60), absent(30, 61)];
         let released = exposed(true);
-        let proof = classify_non_inclusion(&released, &gone, Some(&accounts(6, 6, (50, 51))));
+        let proof = classify_non_inclusion(&released, &gone, Some(&accounts(6, 6, (50, 51))), None);
         assert!(
             matches!(proof, Ok(NotIncludedProof::AccountSequence { primary, witness })
                 if primary.latest_ledger == 50 && witness.latest_ledger == 51),
@@ -3276,7 +3419,7 @@ mod tests {
         for (attempt, read) in &refused {
             assert!(
                 !matches!(
-                    classify_non_inclusion(attempt, &gone, Some(read)),
+                    classify_non_inclusion(attempt, &gone, Some(read), None),
                     Ok(NotIncludedProof::AccountSequence { .. })
                 ),
                 "{read:?}"
@@ -3286,7 +3429,9 @@ mod tests {
         if let ExposureIdentity::Classic { max_time, .. } = &mut untimed.exposure {
             *max_time = 0;
         }
-        assert!(classify_non_inclusion(&untimed, &gone, Some(&accounts(6, 6, (60, 61)))).is_err());
+        assert!(
+            classify_non_inclusion(&untimed, &gone, Some(&accounts(6, 6, (60, 61))), None).is_err()
+        );
     }
 
     /// A regressed account read keeps the attempt pending: no decision, no
@@ -3295,10 +3440,10 @@ mod tests {
     fn recovery_ledger_regressed_keeps_pending() {
         let released = exposed(true);
         let gone = [absent(5, 60), absent(5, 61)];
-        assert!(classify_non_inclusion(&released, &gone, None).is_ok());
+        assert!(classify_non_inclusion(&released, &gone, None, None).is_ok());
         let regressed: AccountRead = Err(ACCOUNT_LEDGER_REGRESSED);
         assert_eq!(
-            classify_non_inclusion(&released, &gone, Some(&regressed)),
+            classify_non_inclusion(&released, &gone, Some(&regressed), None),
             Err(ACCOUNT_LEDGER_REGRESSED)
         );
         let mut counted = released.clone();
@@ -3311,6 +3456,7 @@ mod tests {
             (Some(60), Some(61)),
             NOW,
             "pending",
+            None,
         )
         .unwrap();
         assert!(evaluated.decision.is_none());
@@ -3324,7 +3470,8 @@ mod tests {
     #[test]
     fn recovery_complete_history_requires_both_transaction_coverages_and_continuity() {
         let released = exposed(true);
-        let proof = classify_non_inclusion(&released, &[absent(20, 50), absent(19, 51)], None);
+        let proof =
+            classify_non_inclusion(&released, &[absent(20, 50), absent(19, 51)], None, None);
         assert!(
             matches!(proof, Ok(NotIncludedProof::CompleteHistory { primary, witness })
                 if primary.oldest_ledger == 20 && witness.first_ledger == 20),
@@ -3344,20 +3491,20 @@ mod tests {
             ],
         ] {
             assert!(
-                classify_non_inclusion(&released, &answers, None).is_err(),
+                classify_non_inclusion(&released, &answers, None, None).is_err(),
                 "{answers:?}"
             );
         }
         let good = [absent(5, 60), absent(5, 61)];
-        assert!(classify_non_inclusion(&exposed(false), &good, None).is_err());
+        assert!(classify_non_inclusion(&exposed(false), &good, None, None).is_err());
         let mut no_provenance = released.clone();
         no_provenance.pre_exposure_ledger = None;
-        assert!(classify_non_inclusion(&no_provenance, &good, None).is_err());
+        assert!(classify_non_inclusion(&no_provenance, &good, None, None).is_err());
         let mut untimed = released;
         if let ExposureIdentity::Classic { max_time, .. } = &mut untimed.exposure {
             *max_time = 0;
         }
-        assert!(classify_non_inclusion(&untimed, &good, None).is_err());
+        assert!(classify_non_inclusion(&untimed, &good, None, None).is_err());
     }
 
     /// Recorded history loss disables complete history across restart and
@@ -3394,9 +3541,9 @@ mod tests {
         let mut released = exposed(true);
         released.recovery = stored.recovery;
         let good = [absent(5, 60), absent(5, 61)];
-        assert!(classify_non_inclusion(&released, &good, None).is_err());
+        assert!(classify_non_inclusion(&released, &good, None, None).is_err());
         assert!(matches!(
-            classify_non_inclusion(&released, &good, Some(&accounts(6, 6, (60, 61)))),
+            classify_non_inclusion(&released, &good, Some(&accounts(6, 6, (60, 61))), None),
             Ok(NotIncludedProof::AccountSequence { .. })
         ));
     }
@@ -3541,6 +3688,7 @@ mod tests {
                 (Some(60), Some(61)),
                 NOW,
                 "pending",
+                None,
             )
             .unwrap();
             assert_eq!(
@@ -3566,6 +3714,7 @@ mod tests {
             (Some(60), Some(61)),
             NOW,
             "pending",
+            None,
         )
         .unwrap();
         evaluated.input.expected_attempt = Some(original.clone());
@@ -3598,6 +3747,7 @@ mod tests {
             (Some(60), Some(61)),
             NOW + 1,
             "pending",
+            None,
         )
         .unwrap();
         assert_eq!(std::fs::read(fx.store.path()).unwrap(), bytes);
@@ -3623,6 +3773,7 @@ mod tests {
             (Some(60), Some(61)),
             NOW,
             "pending",
+            None,
         )
         .unwrap();
         assert!(evaluated.decision.is_none());
@@ -3644,6 +3795,7 @@ mod tests {
             (Some(60), Some(61)),
             NOW,
             "pending",
+            None,
         )
         .unwrap();
         evaluated.input.expected_attempt = Some(attempt.clone());
@@ -3684,6 +3836,7 @@ mod tests {
             (Some(140), Some(141)),
             NOW,
             "endpoint_unreachable",
+            None,
         )
         .unwrap();
         evaluated
@@ -3720,6 +3873,7 @@ mod tests {
             (Some(60), Some(61)),
             NOW,
             "endpoint_unreachable",
+            None,
         )
         .unwrap();
         assert!(
@@ -4260,6 +4414,7 @@ mod tests {
         );
         let pass = crate::submission_flow::ReconcilePass::RecoveryFailed {
             legacy: Default::default(),
+            recovery: RecoveryReport::default(),
             error,
         };
         let (warnings, guard) = stellar_agent_test_support::WarningCapture::capture(None);
@@ -4464,6 +4619,7 @@ mod tests {
         assert!(fx.record(id).attempts[0].sequence_released.is_some());
         let pass = ReconcilePass::RecoveryFailed {
             legacy: Default::default(),
+            recovery: RecoveryReport::default(),
             error,
         };
         let (warnings, guard) = stellar_agent_test_support::WarningCapture::capture(None);
@@ -4524,7 +4680,7 @@ mod tests {
             .await
         };
         let crate::submission_flow::ReconcilePass::RecoveryFailed {
-            error: RecoveryError::Context { source, detail },
+            error: RecoveryError::Context { source, detail, .. },
             ..
         } = pass
         else {
@@ -4532,7 +4688,7 @@ mod tests {
         };
         assert!(detail.contains(&refused.to_hex()));
         assert!(detail.contains("missing_projection_fact:source"));
-        let RecoveryError::Context { source, detail } = *source else {
+        let RecoveryError::Context { source, detail, .. } = *source else {
             panic!("the sequence progress remains authoritative: {source:?}");
         };
         assert!(matches!(*source, RecoveryError::Store(_)));
@@ -5362,7 +5518,15 @@ mod tests {
             },
         )
         .await;
-        let crate::submission_flow::ReconcilePass::Completed(actual) = result else {
+        assert!(matches!(
+            result,
+            crate::submission_flow::ReconcilePass::Recovered { .. }
+        ));
+        let crate::submission_flow::ReconcilePass::Recovered {
+            legacy: actual,
+            recovery: _,
+        } = result
+        else {
             panic!("completed pass required");
         };
         assert_eq!(actual, expected);
@@ -5439,7 +5603,10 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(result, crate::submission_flow::ReconcilePass::Completed(_)),
+            matches!(
+                result,
+                crate::submission_flow::ReconcilePass::Recovered { .. }
+            ),
             "{result:?}"
         );
         let both = (methods(&primary).await, methods(&oracle).await);
@@ -5535,7 +5702,7 @@ mod tests {
             || Ok(Arc::clone(&fx.writer)),
         )
         .await;
-        let crate::submission_flow::ReconcilePass::RecoveryFailed { legacy, error } = &result
+        let crate::submission_flow::ReconcilePass::RecoveryFailed { legacy, error, .. } = &result
         else {
             panic!("a refused recovery stage keeps the legacy report: {result:?}");
         };
@@ -5609,7 +5776,15 @@ mod tests {
             },
         )
         .await;
-        let crate::submission_flow::ReconcilePass::Completed(actual) = result else {
+        assert!(matches!(
+            result,
+            crate::submission_flow::ReconcilePass::Recovered { .. }
+        ));
+        let crate::submission_flow::ReconcilePass::Recovered {
+            legacy: actual,
+            recovery: _,
+        } = result
+        else {
             panic!("completed pass required")
         };
         assert_eq!(actual, expected);
@@ -5630,9 +5805,16 @@ mod tests {
         unknown_with(&mut fx, 1, NOW / 1_000 - 10, vec![]);
         bind_source(&mut fx);
         unknown_with(&mut fx, 2, NOW / 1_000 - 10, vec![]);
-        let snapshots = OperationStatus::new(&fx.store, &fx.profile)
+        let mut snapshots = OperationStatus::new(&fx.store, &fx.profile)
             .outcome_snapshot(None)
             .unwrap();
+        // The request names order-2, whose source account no endpoint serves,
+        // so its absence stays unvalidated. Both attempts start at the fixed
+        // clock, and the snapshot order between them follows random ids.
+        snapshots.sort_by_key(|snapshot| {
+            !matches!(snapshot.exposure, ExposureIdentity::Classic { tx_hash, .. }
+                if tx_hash == [2 ^ 0x80; 32])
+        });
         let untouched = fx.record(snapshots[1].operation_id);
         let ExposureIdentity::Classic { tx_hash, .. } = snapshots[0].exposure else {
             panic!("classic attempt required")
@@ -5661,7 +5843,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(result.chain_status, "NOT_FOUND");
+        assert_eq!(result.chain_status, "UNKNOWN");
+        assert_eq!(result.recovery.attempts[0].tx_hash, tx_hash);
+        assert_eq!(rpc_request_count(&primary, "getTransaction").await, 1);
+        assert_eq!(rpc_request_count(&oracle, "getTransaction").await, 1);
         assert!(result.record.is_none());
         assert!(result.reservation.is_none());
         assert!(!result.reservation_open);
@@ -5795,15 +5980,15 @@ mod tests {
             &mut committed,
         )
         .await;
-        assert!(
-            matches!(
-                result,
-                Err(crate::submission_flow::StatusFailure::ChainQueryFailed(_))
-            ),
-            "{result:?}"
-        );
+        let result = result.unwrap();
+        assert_eq!(result.chain_status, "NOT_FOUND");
+        assert_eq!(result.recovery.attempts[0].operation_id, id);
+        assert!(matches!(
+            result.recovery.attempts[0].result,
+            RecoveryResult::NeverApplicable { .. }
+        ));
         assert_eq!(calls.get(), 1);
-        // The decision committed before the refused lookup reaches the batch.
+        // The cached decision also reaches the caller's batch.
         let edges: Vec<_> = committed
             .into_iter()
             .map(|edge| (edge.operation_id(), edge.state(), edge.attempt_index()))
@@ -5822,8 +6007,8 @@ mod tests {
                 .unacknowledged
                 .is_empty()
         );
-        // Recovery's two hashes, ledgers and accounts, then one diagnostic lookup.
-        assert_eq!(rpc_request_count(&primary, "getTransaction").await, 2);
+        // The managed answer uses only recovery's transaction pair.
+        assert_eq!(rpc_request_count(&primary, "getTransaction").await, 1);
         assert_eq!(rpc_request_count(&oracle, "getTransaction").await, 1);
         assert_eq!(rpc_request_count(&primary, "getLedgers").await, 1);
         let record = fx.record(id);
@@ -5874,7 +6059,10 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(pass, crate::submission_flow::ReconcilePass::Completed(_)),
+            matches!(
+                pass,
+                crate::submission_flow::ReconcilePass::Recovered { .. }
+            ),
             "{pass:?}"
         );
         assert_eq!(fx.record(id).state, OperationState::NotIncluded);
@@ -5932,7 +6120,12 @@ mod tests {
             .await
         };
         drop(guard);
-        assert_eq!(result.unwrap().chain_status, "NOT_FOUND");
+        let result = result.unwrap();
+        assert_eq!(result.chain_status, "UNKNOWN");
+        assert_eq!(
+            result.recovery.refusal.as_ref().map(|r| r.code),
+            Some("submission.record_unavailable")
+        );
         let seen = warnings.seen();
         let logged = seen
             .iter()
@@ -6011,7 +6204,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(result.chain_status, "NOT_FOUND");
+        assert_eq!(result.chain_status, "UNKNOWN");
+        assert_eq!(
+            result.recovery.refusal.as_ref().map(|r| r.code),
+            Some("submission.record_unavailable")
+        );
+        assert_eq!(rpc_request_count(&primary, "getTransaction").await, 0);
         assert_eq!(calls.get(), 1);
         assert_eq!(rpc_request_count(&oracle, "getTransaction").await, 0);
         assert_eq!(std::fs::read(fx.store.path()).unwrap(), before);
@@ -6099,7 +6297,10 @@ mod tests {
         .await
         .unwrap();
         drop(guard);
+        // The same hash has an authenticated non-inclusion decision even
+        // though its receipt lacks the submission ledger needed for repair.
         assert_eq!(answer.chain_status, "NOT_FOUND");
+        assert_eq!(rpc_request_count(&server, "getTransaction").await, 0);
         let seen = warnings.seen();
         let repair = seen
             .iter()
@@ -6786,6 +6987,7 @@ mod tests {
                 &attempts[0],
                 &[absent(1, 60), absent(1, 59)],
                 Some(&accounts(0, 0, (60, 59))),
+                None
             )
             .is_err()
         );
@@ -7008,6 +7210,7 @@ mod tests {
                 evaluated: evaluations.len(),
                 missing,
                 attempts: Vec::new(),
+                refusal: None,
             };
             assert!(
                 matches!(report.require_evidence(), Err(RecoveryError::NeedsEvidence(failure)) if failure == expected)
@@ -7392,6 +7595,7 @@ mod tests {
                 evaluated: 0,
                 missing: Some(failure),
                 attempts: Vec::new(),
+                refusal: None,
             };
             assert!(
                 matches!(report.require_evidence(), Err(RecoveryError::NeedsEvidence(seen)) if seen == failure)
@@ -7569,7 +7773,7 @@ mod tests {
                 .await
                 .unwrap_err();
                 assert!(
-                    matches!(error, RecoveryError::EndpointIdentity(_)),
+                    matches!(&error, RecoveryError::Context { source, .. } if matches!(source.as_ref(), RecoveryError::EndpointIdentity(_))),
                     "{error:?}"
                 );
                 assert_eq!(std::fs::read(fx.store.path()).unwrap(), before);
@@ -7881,9 +8085,13 @@ mod tests {
         let recovery = fx.record(id).attempts[0].recovery.clone().unwrap();
         assert_eq!(recovery.disagreements, 3);
         assert_eq!(recovery.last_pass_at_ms, None);
-        // The status values equal the control's, field by field.
-        assert_eq!(refused.chain_status, control.chain_status);
-        assert_eq!(refused.ledger, control.ledger);
+        // Receipt and reservation values match the control; managed evidence stays unknown.
+        assert_eq!(refused.chain_status, "UNKNOWN");
+        assert_eq!(refused.ledger, None);
+        assert_eq!(
+            refused.recovery.refusal.as_ref().map(|r| r.code),
+            Some("submission.record_unavailable")
+        );
         assert_eq!(refused.record, control.record);
         assert_eq!(refused.reservation, control.reservation);
         assert_eq!(refused.reservation_open, control.reservation_open);
