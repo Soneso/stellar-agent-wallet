@@ -1181,7 +1181,7 @@ pub fn attest_mainnet_confirmation(
     presence: VerifiedMainnetPresence,
 ) -> Result<(), WalletError> {
     attest_mainnet_confirmation_impl::<false>(
-        store, entry, key_bytes, binding, audit, gated_tool, policy, presence,
+        store, entry, key_bytes, binding, audit, gated_tool, policy, presence, None,
     )
     .map(|_| ())
 }
@@ -1208,7 +1208,40 @@ pub fn attest_mainnet_confirmation_with_row(
     presence: VerifiedMainnetPresence,
 ) -> Result<Option<OutboxRowRef>, WalletError> {
     attest_mainnet_confirmation_impl::<true>(
-        store, entry, key_bytes, binding, audit, gated_tool, policy, presence,
+        store, entry, key_bytes, binding, audit, gated_tool, policy, presence, None,
+    )
+}
+
+/// Strict mainnet confirmation under an already held policy admission.
+/// The caller acquires admission before opening the pending store.
+///
+/// # Errors
+/// Returns the refusals of [`attest_mainnet_confirmation_with_row`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the attester inputs and held admission are explicit"
+)]
+pub fn attest_mainnet_confirmation_admitted_with_row(
+    store: &mut PendingApprovalStore,
+    entry: &PendingApproval,
+    key_bytes: &[u8],
+    binding: &super::AttestationBinding<'_>,
+    audit: ConsentAudit<'_>,
+    gated_tool: &str,
+    policy: &VerifiedPolicy,
+    presence: VerifiedMainnetPresence,
+    admission: &super::presence_policy::PolicyAdmission,
+) -> Result<Option<OutboxRowRef>, WalletError> {
+    attest_mainnet_confirmation_impl::<true>(
+        store,
+        entry,
+        key_bytes,
+        binding,
+        audit,
+        gated_tool,
+        policy,
+        presence,
+        Some(admission),
     )
 }
 
@@ -1225,6 +1258,7 @@ fn attest_mainnet_confirmation_impl<const STRICT: bool>(
     gated_tool: &str,
     policy: &VerifiedPolicy,
     presence: VerifiedMainnetPresence,
+    admission: Option<&super::presence_policy::PolicyAdmission>,
 ) -> Result<Option<OutboxRowRef>, WalletError> {
     if !matches!(
         entry.kind,
@@ -1247,7 +1281,7 @@ fn attest_mainnet_confirmation_impl<const STRICT: bool>(
         presence,
         policy,
         gated_tool,
-        None,
+        admission,
     )
     .map(|(_, outbox_row)| outbox_row)
 }

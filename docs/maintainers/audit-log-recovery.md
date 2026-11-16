@@ -582,6 +582,28 @@ Recovery takes the sink only from a verified handoff, and a `written` or `recove
 A repeated publication returns the committed consent only for an identical receipt, delivery, and reference, and refuses after payload release.
 Queued success reports `audit.outbox_queued` at once and never waits for delivery.
 
+The CLI confirmation routes for payment, account creation, claim, and trustline use the shared kind capability.
+When enabled, they reserve before inbox insertion, summary display, and presence.
+The audited pending open borrows the held writer; an existing request reacquires its slot through the keyed outbox without that writer.
+Both paths refuse unknown inventory, uninitialized evidence, and unresolved migration pins.
+Every production kind capability remains disabled.
+
+CLI publication verifies the original receipt and handoff under policy admission.
+It releases the writer, inbox, and admission before the window commit, and returns a witness or success only after that commit.
+An already published `approve --id` repeat performs no proof verification or consent commit.
+The missing-record and post-wait disposition guards, and integrated inbox and MCP routes, remain prerequisites for activation.
+
+A crash after the pending open retains its identity even if reservation or insertion fails.
+A missing winner inbox entry refuses; it never supplies authority to release evidence or create a replacement grant.
+A crash after the consent row but before inbox persistence leaves no authenticated grant.
+A present Queued row and a Delivered row cannot be retargeted to a different consent digest.
+A missing queued row permits the existing retry protocol; direct row-only recovery can append another row.
+An attested inbox entry without window publication retries its original receipt, sink, reference, and clocks without another ceremony or row.
+Missing, edited, or foreign handoffs refuse publication.
+A pre-counter commit failure returns no success; an exact authenticated post-counter record completes successfully even if compaction fails.
+Recoverable failures retry the same CLI command. Unrecoverable row-only bindings wait for expiry and a fresh preparation, or use `approve revoke --id` to end the grant.
+Use `audit verify` to inspect evidence failures; never erase evidence to make a retry succeed.
+
 **Lifecycle and clocks.** Release follows authenticated revocation or final operation termination, outside the policy-window lock.
 First consumption and a missing approval record do not authorize release; retryable consumed grants retain their proof.
 Explicit floor advancement removes records expiring at or below the persistent maximum clock, and migration pins never expire through clock collection.
