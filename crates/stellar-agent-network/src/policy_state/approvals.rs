@@ -18,7 +18,7 @@ use stellar_agent_core::approval::{
         ApprovalRecordFacts, ApprovalWitness, ApprovedKind,
     },
 };
-use stellar_agent_core::audit_log::OutboxRowRef;
+use stellar_agent_core::audit_log::{OutboxRowRef, PolicyDecision};
 use stellar_agent_core::policy::state_lock::WindowStoreLock;
 use stellar_agent_core::profile::{
     Profile, name::profile_name_for_approval, owner_key::OwnerKeyContext,
@@ -102,6 +102,70 @@ pub struct ConsentPayload {
         with = "super::ledger::opt_hex32"
     )]
     pub challenge_subject: Option<[u8; 32]>,
+    /// Why no queued reference is retained; present exactly when
+    /// `outbox_row` is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_provenance: Option<RowProvenance>,
+}
+
+/// Where the consent audit row of a payload without a queued reference went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RowProvenance {
+    /// The consenting process wrote the row to the audit log directly.
+    Written,
+    /// The consent was recovered from an attested inbox entry, and the
+    /// row's queue reference, if any, was not retained.
+    Recovered,
+}
+
+/// The consent audit row of one consent, as its producer knows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsentRow {
+    /// The row went to the audit log directly.
+    Written,
+    /// The row waits in the keyed outbox under this reference.
+    Queued(OutboxRowRef),
+    /// The consent is recovered from an attested inbox entry.
+    Recovered,
+}
+
+impl ConsentPayload {
+    /// The payload of `attestation` and `receipt`, stating where its row went.
+    /// The challenge subject stays empty; `record_consent` fills it for an
+    /// intent record.
+    #[must_use]
+    pub fn new(
+        attestation: [u8; 32],
+        receipt: MainnetPresenceReceipt,
+        process_uid: String,
+        row: ConsentRow,
+    ) -> Self {
+        let (outbox_row, row_provenance) = match row {
+            ConsentRow::Written => (None, Some(RowProvenance::Written)),
+            ConsentRow::Queued(reference) => (Some(reference), None),
+            ConsentRow::Recovered => (None, Some(RowProvenance::Recovered)),
+        };
+        Self {
+            attestation,
+            receipt,
+            process_uid,
+            outbox_row,
+            challenge_subject: None,
+            row_provenance,
+        }
+    }
+
+    fn row_consistent(&self) -> bool {
+        self.outbox_row.is_some() != self.row_provenance.is_some()
+    }
+
+    /// A stored payload names at most one of a reference and a provenance.
+    /// A payload with neither is the earlier direct form, which reads as
+    /// stored.
+    fn row_readable(&self) -> bool {
+        self.outbox_row.is_none() || self.row_provenance.is_none()
+    }
 }
 
 impl std::fmt::Debug for ConsentPayload {
@@ -369,6 +433,7 @@ impl WindowSection for Approvals {
                 if let Some(payload) = &consent.payload
                     && (payload.process_uid.is_empty()
                         || payload.process_uid.len() > PROCESS_UID_MAX
+                        || !payload.row_readable()
                         || payload.receipt.digest() != Some(consent.receipt_sha256)
                         || payload.challenge_subject.is_some()
                             != (record.subject_kind == SubjectKind::IntentDigest)
@@ -479,10 +544,37 @@ impl WindowSection for Approvals {
     }
 }
 
+/// Counts the calls into [`ApprovalRecorder`] and [`ApprovalStatus`] by
+/// window-state file, so a test proves that a path makes none.
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod facade_calls {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static CALLS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    pub(super) fn note(path: &Path) {
+        if let Ok(mut calls) = CALLS.lock() {
+            calls.push(path.to_path_buf());
+        }
+    }
+
+    /// The facade calls on the window-state file at `path` in this process,
+    /// reads included.
+    #[must_use]
+    pub fn count(path: &Path) -> usize {
+        CALLS.lock().map_or(0, |calls| {
+            calls.iter().filter(|p| p.as_path() == path).count()
+        })
+    }
+}
+
 /// Records approval changes under one window lock and one generation commit.
 #[derive(Debug)]
 pub struct ApprovalRecorder<'a> {
     recorder: OperationRecorder<'a>,
+    #[cfg(any(test, feature = "test-helpers"))]
+    store: &'a PersistedWindowStore,
 }
 
 impl<'a> ApprovalRecorder<'a> {
@@ -496,6 +588,8 @@ impl<'a> ApprovalRecorder<'a> {
     ) -> Self {
         Self {
             recorder: OperationRecorder::new(store, profile, audit, request_id),
+            #[cfg(any(test, feature = "test-helpers"))]
+            store,
         }
     }
 
@@ -505,7 +599,16 @@ impl<'a> ApprovalRecorder<'a> {
         self.recorder.take_committed()
     }
 
+    /// Notes one facade call for the test observer.
+    fn observed(&self) {
+        #[cfg(any(test, feature = "test-helpers"))]
+        facade_calls::note(self.store.path());
+    }
+
     /// Opens a pending record, links its operation and records the waiting edge.
+    ///
+    /// The same commit stores `decision` as the operation's prepare decision
+    /// and ends its waiting window with the signed waiting expiry.
     ///
     /// # Errors
     ///
@@ -514,7 +617,9 @@ impl<'a> ApprovalRecorder<'a> {
         &mut self,
         operation_id: OperationId,
         facts: &PendingApprovalFacts,
+        decision: PolicyDecision,
     ) -> Result<ApprovalView, WindowStoreError> {
+        self.observed();
         self.recorder.run(None, |session| {
             if !waiting_valid(
                 facts.created_at_ms,
@@ -548,7 +653,7 @@ impl<'a> ApprovalRecorder<'a> {
                     detail: CapacityDetail::FileSize,
                 });
             }
-            session.await_approval(operation_id, id, facts.intent_digest)?;
+            session.await_approval(operation_id, id, facts, decision)?;
             let record = WireApproval {
                 id,
                 nonce: facts.nonce.clone(),
@@ -589,6 +694,7 @@ impl<'a> ApprovalRecorder<'a> {
         witness: &ApprovalWitness,
         payload: &ConsentPayload,
     ) -> Result<ApprovalView, WindowStoreError> {
+        self.observed();
         self.recorder.run(None, |session| {
             let profile = session.profile;
             let record = session
@@ -652,6 +758,7 @@ impl<'a> ApprovalRecorder<'a> {
     ///
     /// Refuses an absent record, a clock before creation and store errors.
     pub fn revoke(&mut self, id: [u8; 32]) -> Result<ApprovalView, WindowStoreError> {
+        self.observed();
         self.recorder.run(None, |session| revoke_step(session, id))
     }
 
@@ -667,6 +774,7 @@ impl<'a> ApprovalRecorder<'a> {
         lock: &WindowStoreLock,
         id: [u8; 32],
     ) -> Result<ApprovalView, WindowStoreError> {
+        self.observed();
         self.recorder
             .run_held(lock, None, |session| revoke_step(session, id))
     }
@@ -703,6 +811,11 @@ fn verify_payload(
     if payload.process_uid.is_empty() || payload.process_uid.len() > PROCESS_UID_MAX {
         return Err(unexpected(
             "the signed process identifier exceeds its allowance",
+        ));
+    }
+    if !payload.row_consistent() {
+        return Err(unexpected(
+            "the consent payload needs exactly one of a row reference and a row provenance",
         ));
     }
     let name = profile_name_for_approval(profile);
@@ -764,6 +877,8 @@ impl<'a> ApprovalStatus<'a> {
         &self,
         predicate: impl Fn(&WireApproval) -> bool,
     ) -> Result<Option<ApprovalView>, WindowStoreError> {
+        #[cfg(any(test, feature = "test-helpers"))]
+        facade_calls::note(self.store.path());
         let Some(mut wire) = self.store.read_for_inspection(self.profile)? else {
             return Ok(None);
         };
@@ -791,6 +906,18 @@ impl<'a> ApprovalStatus<'a> {
     /// Returns integrity, clock, keyring and I/O errors from inspection.
     pub fn find_by_nonce(&self, nonce: &str) -> Result<Option<ApprovalView>, WindowStoreError> {
         self.find(|r| r.nonce == nonce)
+    }
+
+    /// Looks up the record linked to an operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns integrity, clock, keyring and I/O errors from inspection.
+    pub fn find_by_operation(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<Option<ApprovalView>, WindowStoreError> {
+        self.find(|r| r.operation_id == operation_id)
     }
 
     /// Projects authenticated durable proof facts without writing or opening the inbox.
@@ -994,18 +1121,31 @@ pub(in crate::policy_state) mod tests {
         .unwrap();
         (
             witness,
-            ConsentPayload {
+            ConsentPayload::new(
                 attestation,
                 receipt,
-                process_uid: entry.process_uid.clone(),
-                outbox_row: None,
-                challenge_subject: None,
-            },
+                entry.process_uid.clone(),
+                ConsentRow::Written,
+            ),
         )
     }
 
     impl Fx {
         pub(in crate::policy_state) fn new(ttl: u64) -> Self {
+            Self::with_intent(
+                ttl,
+                IntentSlot::Canonical {
+                    intent_digest: [1; 32],
+                    intent: serde_json::json!({"op":"pay"}),
+                },
+                Some(ttl),
+            )
+        }
+
+        /// An entry of lifetime `ttl` and an operation over `intent` opened
+        /// with `rule_ttl_ms`.
+        fn with_intent(ttl: u64, intent: IntentSlot, rule_ttl_ms: Option<u64>) -> Self {
+            let intent_digest = intent.intent_digest();
             let fixture = MainnetConsentFixture::new("approvals");
             let mut entry = fixture.payment(ttl);
             entry.process_uid = "1000".to_owned();
@@ -1023,13 +1163,10 @@ pub(in crate::policy_state) mod tests {
                     business_id: BusinessId::parse("order-1").unwrap(),
                     tool: OperationTool::CliPay,
                     kind: OperationKind::Pay,
-                    intent: IntentSlot::Canonical {
-                        intent_digest: [1; 32],
-                        intent: serde_json::json!({"op":"pay"}),
-                    },
+                    intent,
                     envelope_xdr: Some("AAAA".to_owned()),
                     prepared_decision: None,
-                    rule_ttl_ms: Some(ttl),
+                    rule_ttl_ms,
                 })
                 .unwrap();
             let OpenOutcome::New(handle) = opened else {
@@ -1040,7 +1177,7 @@ pub(in crate::policy_state) mod tests {
                 kind: witness.kind(),
                 subject_kind: SubjectKind::EnvelopeText,
                 subject: witness.subject(),
-                intent_digest: [1; 32],
+                intent_digest,
                 created_at_ms: witness.created_at_ms(),
                 waiting_expires_at_ms: witness.expires_at_ms(),
                 rule_ttl_ms: ttl,
@@ -1070,7 +1207,9 @@ pub(in crate::policy_state) mod tests {
         pub(in crate::policy_state) fn open(&mut self) -> ApprovalView {
             let operation = self.operation;
             let facts = self.facts.clone();
-            self.recorder().open_pending(operation, &facts).unwrap()
+            self.recorder()
+                .open_pending(operation, &facts, PolicyDecision::RequireApproval)
+                .unwrap()
         }
 
         pub(in crate::policy_state) fn consent(&mut self) -> ApprovalView {
@@ -1154,7 +1293,8 @@ pub(in crate::policy_state) mod tests {
         let operation = fx.operation;
         fx.rows.fail = true;
         assert!(matches!(
-            fx.recorder().open_pending(operation, &facts),
+            fx.recorder()
+                .open_pending(operation, &facts, PolicyDecision::RequireApproval),
             Err(WindowStoreError::AuditAppendFailed { .. })
         ));
         assert_eq!(fx.bytes(), bytes);
@@ -1181,7 +1321,9 @@ pub(in crate::policy_state) mod tests {
         let operation = fx.operation;
         let facts = fx.facts.clone();
         let mut recorder = fx.recorder();
-        recorder.open_pending(operation, &facts).unwrap();
+        recorder
+            .open_pending(operation, &facts, PolicyDecision::RequireApproval)
+            .unwrap();
         let batch = recorder.take_committed();
         assert!(recorder.take_committed().is_empty());
         let found = ApprovalStatus::new(&fx.store, fx.fixture.profile())
@@ -1215,6 +1357,98 @@ pub(in crate::policy_state) mod tests {
         );
     }
 
+    /// Over the consent commit's sink, consent commits without an audit
+    /// writer, and a step that appends a row fails as `audit.append_failed`.
+    #[test]
+    #[serial]
+    fn consent_commit_needs_no_audit_writer() {
+        use crate::operation_entry::ConsentOnlyAudit;
+        let mut fx = Fx::new(300_000);
+        let (operation, facts) = (fx.operation, fx.facts.clone());
+        let before = fx.bytes();
+        assert!(matches!(
+            ApprovalRecorder::new(&fx.store, fx.fixture.profile(), &mut ConsentOnlyAudit, "r")
+                .open_pending(operation, &facts, PolicyDecision::RequireApproval),
+            Err(WindowStoreError::AuditAppendFailed { .. })
+        ));
+        assert_eq!(fx.bytes(), before);
+        fx.open();
+        let id = fx.id();
+        let view =
+            ApprovalRecorder::new(&fx.store, fx.fixture.profile(), &mut ConsentOnlyAudit, "r")
+                .record_consent(id, &fx.witness, &fx.payload)
+                .unwrap();
+        assert_eq!(
+            view.record.consent.unwrap().payload,
+            Some(fx.payload.clone())
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn find_by_operation_reads_without_writing() {
+        let mut fx = Fx::new(300_000);
+        let operation = fx.operation;
+        let find = |fx: &Fx, id| {
+            ApprovalStatus::new(&fx.store, fx.fixture.profile())
+                .find_by_operation(id)
+                .unwrap()
+        };
+        assert_eq!(find(&fx, operation), None);
+        let opened = fx.open();
+        let bytes = fx.bytes();
+        assert_eq!(find(&fx, operation), Some(opened));
+        assert_eq!(find(&fx, OperationId::random()), None);
+        assert_eq!(fx.bytes(), bytes);
+    }
+
+    /// The open commit stores the prepare decision and moves the waiting
+    /// expiry from the open's 600-second default to the signed waiting
+    /// expiry, capped at the envelope's end.
+    #[test]
+    #[serial]
+    fn open_stores_the_prepare_decision_and_the_earlier_waiting_end() {
+        for ttl in [300_000, 3_600_000] {
+            let mut fx = Fx::with_intent(
+                ttl,
+                IntentSlot::Canonical {
+                    intent_digest: [1; 32],
+                    intent: serde_json::json!({"op":"pay"}),
+                },
+                None,
+            );
+            let before = fx.wire().operations.unwrap().records[0].clone();
+            assert_eq!(before.prepared_decision, None);
+            assert_eq!(
+                before.waiting_expires_at_ms,
+                fx.payload.receipt.verified_at_unix_ms() + 600_000
+            );
+            fx.open();
+            let after = fx.wire().operations.unwrap().records[0].clone();
+            assert_eq!(
+                after.prepared_decision,
+                Some(serde_json::json!("require_approval"))
+            );
+            assert_eq!(after.waiting_expires_at_ms, fx.facts.waiting_expires_at_ms);
+        }
+        let probe = Fx::new(3_600_000);
+        let end_s = (probe.facts.waiting_expires_at_ms - 60_000) / 1_000;
+        drop(probe);
+        let mut fx = Fx::with_intent(
+            3_600_000,
+            IntentSlot::Envelope {
+                unsigned_envelope_sha256: [2; 32],
+                intent_digest: [1; 32],
+                max_time: end_s,
+            },
+            Some(3_600_000),
+        );
+        fx.open();
+        let after = fx.wire().operations.unwrap().records[0].clone();
+        assert_eq!(after.waiting_expires_at_ms, end_s * 1_000);
+        assert!(after.waiting_expires_at_ms < fx.facts.waiting_expires_at_ms);
+    }
+
     #[test]
     #[serial]
     fn open_pending_refuses_a_non_prepared_or_linked_operation() {
@@ -1238,7 +1472,8 @@ pub(in crate::policy_state) mod tests {
             let facts = fx.facts.clone();
             let operation = fx.operation;
             assert!(matches!(
-                fx.recorder().open_pending(operation, &facts),
+                fx.recorder()
+                    .open_pending(operation, &facts, PolicyDecision::RequireApproval),
                 Err(WindowStoreError::UnexpectedState { .. })
             ));
             assert_eq!(fx.bytes(), before);
@@ -1256,11 +1491,19 @@ pub(in crate::policy_state) mod tests {
         let mut changed = fx.facts.clone();
         changed.nonce.push('x');
         let operation = fx.operation;
-        assert!(fx.recorder().open_pending(operation, &changed).is_err());
+        assert!(
+            fx.recorder()
+                .open_pending(operation, &changed, PolicyDecision::RequireApproval)
+                .is_err()
+        );
         let facts = fx.facts.clone();
         assert!(
             fx.recorder()
-                .open_pending(OperationId::random(), &facts)
+                .open_pending(
+                    OperationId::random(),
+                    &facts,
+                    PolicyDecision::RequireApproval,
+                )
                 .is_err()
         );
         assert_eq!(fx.bytes(), bytes);
@@ -1278,13 +1521,21 @@ pub(in crate::policy_state) mod tests {
                 .waiting_expires_at_ms
                 .checked_add_signed(offset)
                 .unwrap();
-            assert!(fx.recorder().open_pending(operation, &facts).is_err());
+            assert!(
+                fx.recorder()
+                    .open_pending(operation, &facts, PolicyDecision::RequireApproval)
+                    .is_err()
+            );
         }
         for ttl in [0, 86_400_001, u64::MAX] {
             let mut facts = fx.facts.clone();
             facts.rule_ttl_ms = ttl;
             facts.waiting_expires_at_ms = facts.created_at_ms.saturating_add(ttl);
-            assert!(fx.recorder().open_pending(operation, &facts).is_err());
+            assert!(
+                fx.recorder()
+                    .open_pending(operation, &facts, PolicyDecision::RequireApproval)
+                    .is_err()
+            );
         }
         assert_eq!(fx.bytes(), before);
     }
@@ -1464,7 +1715,7 @@ pub(in crate::policy_state) mod tests {
         };
         assert_eq!(witness.subject(), digest);
         let record = ApprovalRecorder::new(&store, fixture.profile(), &mut rows, "request")
-            .open_pending(handle.id(), &facts)
+            .open_pending(handle.id(), &facts, PolicyDecision::RequireApproval)
             .unwrap()
             .record;
         let id = record.id;
@@ -1485,13 +1736,12 @@ pub(in crate::policy_state) mod tests {
             &receipt,
         );
         let before = std::fs::read(store.path()).unwrap();
-        let refused = ConsentPayload {
-            attestation: version_5,
-            receipt: receipt.clone(),
-            process_uid: entry.process_uid.clone(),
-            outbox_row: None,
-            challenge_subject: None,
-        };
+        let refused = ConsentPayload::new(
+            version_5,
+            receipt.clone(),
+            entry.process_uid.clone(),
+            ConsentRow::Written,
+        );
         assert!(
             ApprovalRecorder::new(&store, fixture.profile(), &mut rows, "request")
                 .record_consent(id, &witness, &refused)
@@ -1499,13 +1749,12 @@ pub(in crate::policy_state) mod tests {
             "a version 5 blob on an intent record"
         );
         assert_eq!(std::fs::read(store.path()).unwrap(), before);
-        let payload = ConsentPayload {
+        let payload = ConsentPayload::new(
             attestation,
-            receipt: receipt.clone(),
-            process_uid: entry.process_uid.clone(),
-            outbox_row: None,
-            challenge_subject: None,
-        };
+            receipt.clone(),
+            entry.process_uid.clone(),
+            ConsentRow::Written,
+        );
         let view = ApprovalRecorder::new(&store, fixture.profile(), &mut rows, "request")
             .record_consent(id, &witness, &payload)
             .unwrap();
@@ -1786,6 +2035,7 @@ pub(in crate::policy_state) mod tests {
             }))
             .unwrap(),
         );
+        payload.row_provenance = None;
         let mut receipt = serde_json::to_value(&payload.receipt).unwrap();
         receipt["version"] = serde_json::json!(2);
         receipt["policy_sequence"] = serde_json::json!(i64::MIN);
@@ -1828,23 +2078,155 @@ pub(in crate::policy_state) mod tests {
         .unwrap()
     }
 
+    fn queued(fx: &Fx, sequence: u64) -> ConsentPayload {
+        ConsentPayload::new(
+            fx.payload.attestation,
+            fx.payload.receipt.clone(),
+            fx.payload.process_uid.clone(),
+            ConsentRow::Queued(queued_reference(sequence)),
+        )
+    }
+
+    /// A payload without a queued reference names where its row went. The
+    /// write refuses a payload that states both or neither, and the
+    /// validation refuses one that states both.
     #[test]
     #[serial]
-    fn consent_payload_keeps_its_bytes_without_a_reference() {
+    fn missing_reference_states_its_provenance() {
         let mut fx = Fx::new(300_000);
-        let expected = format!(
-            "{{\"attestation\":\"{}\",\"receipt\":{},\"process_uid\":{}}}",
-            stellar_agent_core::hex::encode(&fx.payload.attestation),
-            serde_json::to_string(&fx.payload.receipt).unwrap(),
-            serde_json::to_string(&fx.payload.process_uid).unwrap(),
-        );
-        assert_eq!(serde_json::to_string(&fx.payload).unwrap(), expected);
-        assert_eq!(
-            serde_json::from_str::<ConsentPayload>(&expected).unwrap(),
-            fx.payload
-        );
+        for (row, provenance) in [
+            (ConsentRow::Written, "written"),
+            (ConsentRow::Recovered, "recovered"),
+        ] {
+            let payload = ConsentPayload::new(
+                fx.payload.attestation,
+                fx.payload.receipt.clone(),
+                fx.payload.process_uid.clone(),
+                row,
+            );
+            let expected = format!(
+                "{{\"attestation\":\"{}\",\"receipt\":{},\"process_uid\":{},\"row_provenance\":\"{provenance}\"}}",
+                stellar_agent_core::hex::encode(&payload.attestation),
+                serde_json::to_string(&payload.receipt).unwrap(),
+                serde_json::to_string(&payload.process_uid).unwrap(),
+            );
+            assert_eq!(serde_json::to_string(&payload).unwrap(), expected);
+            assert_eq!(
+                serde_json::from_str::<ConsentPayload>(&expected).unwrap(),
+                payload
+            );
+        }
         fx.open();
-        fx.payload.outbox_row = Some(queued_reference(7));
+        let id = fx.id();
+        let before = fx.bytes();
+        for (outbox_row, row_provenance) in [
+            (None, None),
+            (Some(queued_reference(7)), Some(RowProvenance::Written)),
+        ] {
+            let mut payload = fx.payload.clone();
+            payload.outbox_row = outbox_row;
+            payload.row_provenance = row_provenance;
+            assert!(matches!(
+                ApprovalRecorder::new(&fx.store, fx.fixture.profile(), &mut fx.rows, "request")
+                    .record_consent(id, &fx.witness, &payload),
+                Err(WindowStoreError::UnexpectedState { .. })
+            ));
+            assert_eq!(fx.bytes(), before);
+        }
+        fx.payload.row_provenance = Some(RowProvenance::Recovered);
+        fx.consent();
+        let mut wire = fx.wire();
+        wire.approvals.as_mut().unwrap().records[0]
+            .consent
+            .as_mut()
+            .unwrap()
+            .payload
+            .as_mut()
+            .unwrap()
+            .outbox_row = Some(queued_reference(7));
+        assert!(matches!(
+            Approvals::validate(&wire),
+            Err(WindowStoreError::Invalid { .. })
+        ));
+    }
+
+    /// A window that holds a direct consent payload with neither a reference
+    /// nor a provenance reads with that payload as stored, writes nothing on
+    /// the read, and its record still mints.
+    #[test]
+    #[serial]
+    fn a_stored_payload_without_reference_or_provenance_reads_unchanged() {
+        let mut fx = Fx::new(300_000);
+        fx.open();
+        fx.consent();
+        let mut wire = fx.wire();
+        let stored = wire.approvals.as_mut().unwrap().records[0]
+            .consent
+            .as_mut()
+            .unwrap()
+            .payload
+            .as_mut()
+            .unwrap();
+        stored.row_provenance = None;
+        assert_eq!(stored.outbox_row, None);
+        let earlier = stored.clone();
+        fx.store
+            .seal_unchecked_for_test(fx.fixture.profile(), &wire);
+        let before = fx.bytes();
+        let read = ApprovalStatus::new(&fx.store, fx.fixture.profile())
+            .view(fx.id())
+            .map(|view| view.and_then(|view| view.record.consent?.payload));
+        assert!(
+            matches!(&read, Ok(Some(payload)) if *payload == earlier),
+            "the stored payload reads as written: {read:?}"
+        );
+        assert_eq!(fx.bytes(), before);
+        assert_eq!(
+            fx.wire().approvals.unwrap().records[0]
+                .consent
+                .as_ref()
+                .unwrap()
+                .payload,
+            Some(earlier)
+        );
+        let request = fx.mint_request();
+        fx.store
+            .mint_authorization(fx.fixture.profile(), &request)
+            .unwrap();
+        assert_eq!(fx.view().record.state, ApprovalState::Consumed);
+    }
+
+    /// A new consent without a reference or a provenance refuses and writes
+    /// nothing.
+    #[test]
+    #[serial]
+    fn a_new_consent_without_reference_or_provenance_refuses() {
+        let mut fx = Fx::new(300_000);
+        fx.open();
+        let id = fx.id();
+        let before = fx.bytes();
+        let mut payload = fx.payload.clone();
+        payload.row_provenance = None;
+        assert_eq!(payload.outbox_row, None);
+        let refused =
+            ApprovalRecorder::new(&fx.store, fx.fixture.profile(), &mut fx.rows, "request")
+                .record_consent(id, &fx.witness, &payload);
+        assert!(
+            matches!(refused, Err(WindowStoreError::UnexpectedState { .. })),
+            "a new consent states where its row went: {refused:?}"
+        );
+        assert_eq!(fx.bytes(), before);
+        assert_eq!(fx.view().record.consent, None);
+    }
+
+    #[test]
+    #[serial]
+    fn queued_consent_stores_its_reference() {
+        let mut fx = Fx::new(300_000);
+        fx.open();
+        fx.payload = queued(&fx, 7);
+        assert_eq!(fx.payload.outbox_row, Some(queued_reference(7)));
+        assert_eq!(fx.payload.row_provenance, None);
         let consent = fx.consent().record.consent.unwrap();
         assert_eq!(consent.payload, Some(fx.payload.clone()));
         let stored = fx.wire();
@@ -1908,10 +2290,10 @@ pub(in crate::policy_state) mod tests {
     fn a_second_consent_keeps_its_receipt_rule() {
         let mut fx = Fx::new(300_000);
         fx.open();
-        fx.payload.outbox_row = Some(queued_reference(7));
+        fx.payload = queued(&fx, 7);
         let first = fx.consent();
         let before = fx.bytes();
-        fx.payload.outbox_row = Some(queued_reference(8));
+        fx.payload = queued(&fx, 8);
         assert_eq!(
             fx.consent(),
             first,
@@ -1920,6 +2302,7 @@ pub(in crate::policy_state) mod tests {
         assert_eq!(fx.bytes(), before);
         let (witness, mut payload) = proof(&fx.fixture, &fx.entry, "second.toml");
         payload.outbox_row = Some(queued_reference(9));
+        payload.row_provenance = None;
         assert_ne!(payload.receipt.digest(), fx.payload.receipt.digest());
         let id = fx.id();
         assert!(matches!(

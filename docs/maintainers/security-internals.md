@@ -1884,7 +1884,24 @@ Every surface names the kind from the authenticated record, so inbox collection 
 The operator outbox refuses this event. No operation notification accompanies revocation.
 If append fails, the error states that the record is revoked. A retry neither appends nor repairs the row.
 Concurrent calls can each append because the recorder returns no changed flag.
-Approval preparation creates no durable records, so every surface acts only on records that already exist.
+
+The CLI mainnet ceremony under an approval rule produces these records. Other
+preparations create none, so other surfaces act only on records that already
+exist. The ceremony refuses an approval rule without an operation record.
+Before it parks an entry, it reads the record by operation. Without one, it
+removes the unattested live value entries of the operation's envelope that no
+record names. It then parks the new entry and opens the record with the
+prepare decision. The open commit sets the operation's waiting expiry to the
+earlier of the signed waiting expiry and the envelope's end. A refused open
+removes the entry unless a record names it. A record that names an unattested
+entry runs the ceremony on that entry. A record that names an attested entry
+completes its consent from the stored receipt without a ceremony. After the
+attestation, the ceremony releases the inbox and commits the consent under the
+window lock alone. That commit appends no audit row and needs no audit writer.
+The witness returns only after it. A refused presence or consent keeps entry
+and record, and the waiting expiry ends both. A rerun therefore converges on
+one nonce per operation. A queued consent row's outbox reference stays in the
+payload. A payload without one names its row `written` or `recovered`.
 
 Consent retains the attestation, receipt and signed process identifier for
 reconstruction. The record supplies the signed nonce, kind, subject and

@@ -218,7 +218,7 @@ use lock::StateLockError;
 pub use approvals::{
     APPROVAL_CLOSED_MAX, APPROVAL_EXECUTION_MAX_MS, APPROVAL_RECORD_MAX, APPROVAL_RULE_TTL_MAX_MS,
     ApprovalRecorder, ApprovalState, ApprovalStatus, ApprovalView, Consent, ConsentPayload,
-    PendingApprovalFacts, WireApproval,
+    ConsentRow, PendingApprovalFacts, RowProvenance, WireApproval,
 };
 pub use ledger::{
     ClaimExpect, ConsumeExpect, ConsumeReceipt, ConsumptionBinding, DomainBinding, FeeBumpFacts,

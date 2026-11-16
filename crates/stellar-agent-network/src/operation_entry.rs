@@ -6,12 +6,18 @@
 //! retained operation receives. On every other chain a business id is validated
 //! and echoed, and no record exists.
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use stellar_agent_core::approval::{
-    ClassicIntent, IntentAsset, IntentBase, IntentPayload, MemoFact,
+    ClassicIntent, IntentAsset, IntentBase, IntentPayload, MemoFact, PendingApproval,
+    PendingApprovalStore,
+    witness::{ApprovalExpectation, ApprovalWitness, ApprovedKind, verify_approval},
 };
-use stellar_agent_core::error::{InternalError, SubmissionError, ValidationError, WalletError};
+use stellar_agent_core::audit_log::AuditEntry;
+use stellar_agent_core::error::{
+    ApprovalFailure, InternalError, SubmissionError, ValidationError, WalletError,
+};
 use stellar_agent_core::mainnet::verified_policy::VerifiedPolicy;
 use stellar_agent_core::profile::receipt::{DestinationFields, PaymentDestinations};
 use stellar_agent_core::profile::schema::Profile;
@@ -20,10 +26,12 @@ use stellar_xdr::{Limits, Memo, ReadXdr as _, TransactionEnvelope};
 use crate::fees::ClassicFeeChoice;
 use crate::mainnet::MainnetAuthorizationError;
 use crate::policy_state::{
-    AttemptAuthorization, AttemptEnvelope, AttemptRequest, BusinessId, CommitBinding, CommitTarget,
-    CommittedBatch, IntentSlot, LookupOutcome, OpenOutcome, OpenRequest, OperationHandle,
-    OperationKind, OperationLink, OperationRecorder, OperationState, OperationStatus,
-    OperationView, PersistedWindowStore, SlotKind, WindowStoreError,
+    ApprovalRecorder, ApprovalStatus, ApprovalView, AttemptAuthorization, AttemptEnvelope,
+    AttemptRequest, BusinessId, CommitBinding, CommitTarget, CommittedBatch, ConsentPayload,
+    ConsentRow, IntentSlot, LookupOutcome, OpenOutcome, OpenRequest, OperationAudit,
+    OperationHandle, OperationKind, OperationLink, OperationRecorder, OperationState,
+    OperationStatus, OperationView, PendingApprovalFacts, PersistedWindowStore, SlotKind,
+    WindowStoreError,
 };
 use crate::submission_record::{AuditWriterHandle, OperationAttempt};
 
@@ -788,6 +796,174 @@ fn resumable(handle: OperationHandle) -> Result<OperationHandle, WalletError> {
         }));
     }
     Ok(handle)
+}
+
+/// The facts of the durable record that the pending inbox `entry` opens for
+/// the operation of `handle`. The record keeps the entry's signed clocks.
+#[must_use]
+pub fn pending_approval_facts(
+    entry: &PendingApproval,
+    handle: &OperationHandle,
+    kind: ApprovedKind,
+    subject: [u8; 32],
+    rule_ttl_ms: u64,
+) -> PendingApprovalFacts {
+    PendingApprovalFacts {
+        nonce: entry.approval_nonce.clone(),
+        kind,
+        subject_kind: entry.subject_kind,
+        subject,
+        intent_digest: handle.intent().intent_digest(),
+        created_at_ms: entry.created_at_unix_ms,
+        waiting_expires_at_ms: entry.expires_at_unix_ms,
+        rule_ttl_ms,
+    }
+}
+
+/// The refusal of an approval open for a handle whose operation is not
+/// `Prepared`, which the open itself would give.
+#[must_use]
+pub fn approval_requires_prepared() -> WalletError {
+    operation_refusal(crate::policy_state::operations::approval_requires_prepared())
+}
+
+/// A verified consent and the durable record it completes.
+#[derive(Debug)]
+pub struct ConsentCompletion {
+    id: [u8; 32],
+    witness: ApprovalWitness,
+    payload: ConsentPayload,
+}
+
+impl ConsentCompletion {
+    /// The witness of the verified consent.
+    #[must_use]
+    pub fn into_witness(self) -> ApprovalWitness {
+        self.witness
+    }
+}
+
+/// The attestation persisted for `nonce` in `pending`.
+///
+/// # Errors
+///
+/// `approval.attestation_invalid` when it is absent, not base64url, or not
+/// 32 bytes.
+pub fn persisted_attestation(
+    pending: &PendingApprovalStore,
+    nonce: &str,
+) -> Result<[u8; 32], WalletError> {
+    let invalid = |detail: &str| {
+        WalletError::Approval(ApprovalFailure::AttestationInvalid {
+            detail: detail.to_owned(),
+        })
+    };
+    let encoded = pending
+        .get(nonce)
+        .and_then(|entry| entry.attestation_blob_b64.as_deref())
+        .ok_or_else(|| invalid("the persisted attestation is missing"))?;
+    URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| invalid("the persisted attestation is not base64url"))?
+        .try_into()
+        .map_err(|_| invalid("the persisted attestation has the wrong length"))
+}
+
+/// Verifies the attested inbox entry `nonce` against the durable record that
+/// names it, and builds the consent from a copy of that entry. `row` states
+/// where the consent audit row went.
+///
+/// The expectation is the record's kind and subject, so the entry consents
+/// only to what the record opened.
+///
+/// # Errors
+///
+/// `approval.not_found` when no record or entry names the nonce,
+/// `approval.presence_required` for an entry without a receipt, the
+/// refusals of [`persisted_attestation`] and `verify_approval`, and the
+/// store's refusals.
+pub fn consent_completion(
+    pending: &PendingApprovalStore,
+    store: &PersistedWindowStore,
+    profile: &Profile,
+    name: &str,
+    nonce: &str,
+    policy: &VerifiedPolicy,
+    row: ConsentRow,
+) -> Result<ConsentCompletion, WalletError> {
+    let not_found = || {
+        WalletError::Approval(ApprovalFailure::NotFound {
+            detail: "no durable approval record and inbox entry name this nonce".to_owned(),
+        })
+    };
+    let record = ApprovalStatus::new(store, profile)
+        .find_by_nonce(nonce)
+        .map_err(operation_refusal)?
+        .ok_or_else(not_found)?
+        .record;
+    let entry = pending.get(nonce).cloned().ok_or_else(not_found)?;
+    let attestation = persisted_attestation(pending, nonce)?;
+    let receipt = entry
+        .mainnet_presence
+        .ok_or(WalletError::Approval(ApprovalFailure::PresenceRequired))?;
+    let now = stellar_agent_core::timefmt::now_unix_ms().map_err(|error| {
+        WalletError::Approval(ApprovalFailure::ClockError {
+            detail: error.to_string(),
+        })
+    })?;
+    let witness = verify_approval(
+        pending,
+        profile,
+        name,
+        nonce,
+        &attestation,
+        &ApprovalExpectation {
+            kind: record.kind,
+            subject: record.subject,
+        },
+        policy,
+        now,
+    )?;
+    Ok(ConsentCompletion {
+        id: record.id,
+        witness,
+        payload: ConsentPayload::new(attestation, receipt, entry.process_uid, row),
+    })
+}
+
+/// The audit sink of a consent commit, which appends no row. An append is a
+/// defect and fails the step as `audit.append_failed`.
+pub(crate) struct ConsentOnlyAudit;
+
+impl OperationAudit for ConsentOnlyAudit {
+    fn append(&mut self, _entry: AuditEntry) -> Result<(), String> {
+        Err("a consent commit appends no audit row".to_owned())
+    }
+}
+
+/// Commits `completion` to its durable record under the window lock alone.
+///
+/// The step takes no audit writer, so a process that cannot hold the writer
+/// still commits; the consent audit row keeps its own route. A repeated
+/// commit of the same receipt changes nothing.
+///
+/// # Errors
+///
+/// The refusals of [`ApprovalRecorder::record_consent`], rendered through
+/// [`operation_refusal`].
+pub fn commit_consent(
+    store: &PersistedWindowStore,
+    profile: &Profile,
+    completion: &ConsentCompletion,
+) -> Result<ApprovalView, WalletError> {
+    ApprovalRecorder::new(
+        store,
+        profile,
+        &mut ConsentOnlyAudit,
+        uuid::Uuid::new_v4().to_string(),
+    )
+    .record_consent(completion.id, &completion.witness, &completion.payload)
+    .map_err(operation_refusal)
 }
 
 /// How a classic commit proceeds under its business id.

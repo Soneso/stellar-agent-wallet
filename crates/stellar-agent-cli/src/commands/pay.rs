@@ -7405,16 +7405,16 @@ pub(crate) mod tests {
         }
 
         /// Asserts a confirmation refusal with `code`: one ceremony started,
-        /// no consent row, no pending entry left, no record, nothing sent.
+        /// no consent row, the live entry the durable approval record names
+        /// kept for a retry, no authorization record, nothing sent.
         async fn assert_confirmation_refused(fixture: &MainnetFixture, run: &Run, code: &str) {
             assert_eq!(run.code, 1, "{}", run.envelope);
             assert_eq!(run.code(), code, "{}", run.envelope);
             assert_eq!(fixture.ceremonies().len(), 1, "the ceremony started");
             assert!(fixture.audit_rows("approval_attested").is_empty());
-            assert!(
-                fixture.pending_entries().is_empty(),
-                "the parked entry is gone"
-            );
+            let entries = fixture.pending_entries();
+            assert_eq!(entries.len(), 1, "the parked entry stays with its record");
+            assert!(!entries[0].expired);
             assert!(records(fixture).is_empty(), "no authorization record");
             assert!(fixture.sent_envelopes().await.is_empty(), "nothing is sent");
         }

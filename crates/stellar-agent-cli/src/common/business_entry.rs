@@ -19,8 +19,8 @@ use stellar_agent_network::operation_entry::{
     self, ClassicEntry, IdentityFacts, IntentBaseFacts, OpenedEntry,
 };
 use stellar_agent_network::policy_state::{
-    BusinessId, OpenRequest, OperationHandle, OperationKind, OperationRecorder, OperationState,
-    OperationTool, OperationView, PersistedWindowStore,
+    ApprovalRecorder, BusinessId, OpenRequest, OperationAudit, OperationHandle, OperationKind,
+    OperationRecorder, OperationState, OperationTool, OperationView, PersistedWindowStore,
 };
 
 use crate::commands::policy_engine::MainnetPolicy;
@@ -107,6 +107,39 @@ fn operation_step<T>(
     context: &MainnetWriteContext,
     step: impl FnOnce(&mut OperationRecorder<'_>) -> Result<T, WalletError>,
 ) -> Result<T, WalletError> {
+    with_accounting_audit(context, |store, audit, request_id| {
+        step(&mut OperationRecorder::new(
+            store,
+            context.profile(),
+            audit,
+            request_id,
+        ))
+    })
+}
+
+/// Runs `step` with an approval recorder over the profile's window store
+/// and its accounting audit writer, the writer lock taken first.
+///
+/// The caller holds no inbox store across the step, so the window commit
+/// never waits on the inbox while it holds the window lock.
+pub(crate) fn approval_step<T>(
+    context: &MainnetWriteContext,
+    step: impl FnOnce(&mut ApprovalRecorder<'_>) -> Result<T, WalletError>,
+) -> Result<T, WalletError> {
+    with_accounting_audit(context, |store, audit, request_id| {
+        step(&mut ApprovalRecorder::new(
+            store,
+            context.profile(),
+            audit,
+            request_id,
+        ))
+    })
+}
+
+fn with_accounting_audit<T>(
+    context: &MainnetWriteContext,
+    step: impl FnOnce(&PersistedWindowStore, &mut dyn OperationAudit, String) -> Result<T, WalletError>,
+) -> Result<T, WalletError> {
     let profile = context.profile();
     let name = context.profile_name();
     let writer = accounting_audit_writer(profile, name, ProfileOrigin::Persisted)?;
@@ -119,9 +152,7 @@ fn operation_step<T>(
         )
     })?;
     let store = PersistedWindowStore::for_profile(name);
-    let request_id = uuid::Uuid::new_v4().to_string();
-    let mut recorder = OperationRecorder::new(&store, profile, &mut *guard, request_id);
-    step(&mut recorder)
+    step(&store, &mut *guard, uuid::Uuid::new_v4().to_string())
 }
 
 /// Looks `business_id` up before a classic mainnet run does any network

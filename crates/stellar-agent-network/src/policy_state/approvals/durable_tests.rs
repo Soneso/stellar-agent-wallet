@@ -80,6 +80,7 @@ fn durable_facts_match_the_record_and_read_without_writing() {
         }))
         .unwrap(),
     );
+    fx.payload.row_provenance = None;
     let record = fx.consent().record;
     let before = fx.bytes();
     let generation = fx.wire().generation;
@@ -616,18 +617,20 @@ impl IntentFx {
             rule_ttl_ms: ttl,
         };
         let mut recorder = ApprovalRecorder::new(&store, fixture.profile(), &mut rows, "request");
-        let record = recorder.open_pending(handle.id(), &pending).unwrap().record;
+        let record = recorder
+            .open_pending(handle.id(), &pending, PolicyDecision::RequireApproval)
+            .unwrap()
+            .record;
         recorder
             .record_consent(
                 record.id,
                 &witness,
-                &ConsentPayload {
-                    attestation: blob,
+                &ConsentPayload::new(
+                    blob,
                     receipt,
-                    process_uid: entry.process_uid.clone(),
-                    outbox_row: None,
-                    challenge_subject: None,
-                },
+                    entry.process_uid.clone(),
+                    ConsentRow::Written,
+                ),
             )
             .unwrap();
         let facts = ApprovalStatus::new(&store, fixture.profile())
