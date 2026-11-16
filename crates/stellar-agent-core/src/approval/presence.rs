@@ -2022,10 +2022,9 @@ impl MainnetPresenceReceipt {
         preimage.finish()
     }
 
-    /// Recomputes the challenge of this receipt over `entry`, `binding`,
-    /// `policy` and `intent`, after checking `entry` is a supported kind.
+    /// Recomputes the challenge over the retained entry and optional intent digest.
     ///
-    /// The layout, the RP ID and the pin are those `policy` and `intent`
+    /// The layout, the RP ID and the pin are those `policy` and the digest
     /// select, never the receipt's version, so a receipt verifies only after
     /// its version is checked against that selection.
     fn challenge_for(
@@ -2033,17 +2032,16 @@ impl MainnetPresenceReceipt {
         entry: &impl ReceiptEntry,
         binding: &AttestationBinding<'_>,
         policy: &VerifiedPolicy,
-        intent: Option<&ClassicIntent>,
+        intent_digest: Option<&[u8; 32]>,
     ) -> Result<[u8; 32], WalletError> {
         let subject = entry.consent_subject(binding)?;
         let site = PresenceSite::of(policy)?;
         let random = self.random().ok_or_else(presence_invalid)?;
-        let intent_digest = intent.map(|intent| *intent.digest().as_bytes());
         let layout = if site.version(intent_digest.is_some()) == MAINNET_PRESENCE_RECEIPT_VERSION {
             ChallengeLayout::Legacy
         } else {
             ChallengeLayout::Intent {
-                intent: intent_digest.as_ref(),
+                intent: intent_digest,
                 pin: site.pin(),
             }
         };
@@ -2323,6 +2321,40 @@ fn verify_receipt_entry(
     intent: Option<&ClassicIntent>,
     now_ms: u64,
 ) -> Result<StoredPresence, WalletError> {
+    let digest = intent.map(|i| i.digest());
+    verify_receipt_bound(
+        entry,
+        receipt,
+        binding,
+        policy,
+        digest.as_ref().map(|d| d.as_bytes()),
+        intent,
+        now_ms,
+    )
+}
+
+/// Checks retained consent against its stored canonical digest. This produces
+/// receipt facts only; commit callers also compare their independent intent.
+pub(crate) fn verify_receipt_for_inspection(
+    entry: &impl ReceiptEntry,
+    receipt: &MainnetPresenceReceipt,
+    binding: &AttestationBinding<'_>,
+    policy: &VerifiedPolicy,
+    intent_digest: Option<&[u8; 32]>,
+    now_ms: u64,
+) -> Result<StoredPresence, WalletError> {
+    verify_receipt_bound(entry, receipt, binding, policy, intent_digest, None, now_ms)
+}
+
+fn verify_receipt_bound(
+    entry: &impl ReceiptEntry,
+    receipt: &MainnetPresenceReceipt,
+    binding: &AttestationBinding<'_>,
+    policy: &VerifiedPolicy,
+    intent_digest: Option<&[u8; 32]>,
+    intent: Option<&ClassicIntent>,
+    now_ms: u64,
+) -> Result<StoredPresence, WalletError> {
     if !receipt.is_well_formed() {
         return Err(presence_invalid());
     }
@@ -2342,7 +2374,7 @@ fn verify_receipt_entry(
         return Err(presence_invalid());
     }
     let site = PresenceSite::of(policy).map_err(|_| presence_invalid())?;
-    if receipt.version != site.version(intent.is_some()) {
+    if receipt.version != site.version(intent_digest.is_some()) {
         return Err(presence_invalid());
     }
     if !intent_describes(entry, binding, intent) {
@@ -2352,7 +2384,7 @@ fn verify_receipt_entry(
     if receipt.identity() != identity {
         return Err(presence_invalid());
     }
-    let challenge = receipt.challenge_for(entry, binding, policy, intent)?;
+    let challenge = receipt.challenge_for(entry, binding, policy, intent_digest)?;
     let facts = check_assertion(
         policy,
         &challenge,
