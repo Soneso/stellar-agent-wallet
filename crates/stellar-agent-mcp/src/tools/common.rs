@@ -7778,7 +7778,7 @@ pub(crate) mod tests {
                         serde_json::json!({
                             "source": preparation["source"], "destination": preparation["destination"],
                             "amount_stroops": "10", "asset": "XLM", "total_fee_stroops": 100,
-                            "sequence_number": 2, "memo": null,
+                            "sequence_number": 2, "memo_kind": "none", "memo": null,
                         })
                     );
                     assert_eq!(account_reads(&primary, f.envelope.source()).await, 1);
