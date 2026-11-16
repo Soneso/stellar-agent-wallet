@@ -2680,6 +2680,8 @@ mod tests {
         anchored_count: 10,
     };
 
+    include!("ledger_composed_tests.rs");
+
     struct Ledger {
         _dir: TempDir,
         profile: Profile,
