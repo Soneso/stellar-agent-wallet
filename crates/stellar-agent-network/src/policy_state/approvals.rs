@@ -5,6 +5,8 @@
 
 use std::collections::HashSet;
 
+pub mod status;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use stellar_agent_core::WalletError;
@@ -1148,44 +1150,47 @@ impl<'a> ApprovalStatus<'a> {
     ///
     /// Returns integrity, clock, keyring and I/O errors from inspection.
     pub fn facts_by_nonce(&self, nonce: &str) -> Result<Option<ApprovalFacts>, WindowStoreError> {
-        Ok(self.find_by_nonce(nonce)?.map(|view| {
-            let record = view.record;
-            ApprovalFacts::new(
-                profile_name_for_approval(self.profile),
-                self.profile.chain_id,
-                ApprovalRecordFacts {
-                    id: record.id,
-                    operation_id: *record.operation_id.as_bytes(),
-                    nonce: record.nonce,
-                    disposition: match record.state {
-                        ApprovalState::Pending => ApprovalDisposition::Pending,
-                        ApprovalState::Consumed => ApprovalDisposition::Consumed,
-                        ApprovalState::Revoked => ApprovalDisposition::Revoked,
-                    },
-                    consumed_at_ms: record.consumed_at_ms,
-                    revoked_at_ms: record.revoked_at_ms,
-                    kind: record.kind,
-                    subject_kind: record.subject_kind,
-                    subject: record.subject,
-                    intent_digest: record.intent_digest,
-                    created_at_ms: record.created_at_ms,
-                    expires_at_ms: record.waiting_expires_at_ms,
-                    rule_ttl_ms: record.rule_ttl_ms,
-                    consent: record.consent.map(|consent| ApprovalConsentFacts {
-                        consent_at_ms: consent.consent_at_ms,
-                        execution_expires_at_ms: consent.execution_expires_at_ms,
-                        receipt_sha256: consent.receipt_sha256,
-                        payload: consent.payload.map(|payload| ApprovalPayloadFacts {
-                            attestation: payload.attestation,
-                            receipt: payload.receipt,
-                            process_uid: payload.process_uid,
-                            challenge_subject: payload.challenge_subject,
-                            outbox_row: payload.outbox_row,
-                        }),
-                    }),
+        Ok(self
+            .find_by_nonce(nonce)?
+            .map(|view| Self::facts(view.record, self.profile)))
+    }
+
+    fn facts(record: WireApproval, profile: &Profile) -> ApprovalFacts {
+        ApprovalFacts::new(
+            profile_name_for_approval(profile),
+            profile.chain_id,
+            ApprovalRecordFacts {
+                id: record.id,
+                operation_id: *record.operation_id.as_bytes(),
+                nonce: record.nonce,
+                disposition: match record.state {
+                    ApprovalState::Pending => ApprovalDisposition::Pending,
+                    ApprovalState::Consumed => ApprovalDisposition::Consumed,
+                    ApprovalState::Revoked => ApprovalDisposition::Revoked,
                 },
-            )
-        }))
+                consumed_at_ms: record.consumed_at_ms,
+                revoked_at_ms: record.revoked_at_ms,
+                kind: record.kind,
+                subject_kind: record.subject_kind,
+                subject: record.subject,
+                intent_digest: record.intent_digest,
+                created_at_ms: record.created_at_ms,
+                expires_at_ms: record.waiting_expires_at_ms,
+                rule_ttl_ms: record.rule_ttl_ms,
+                consent: record.consent.map(|consent| ApprovalConsentFacts {
+                    consent_at_ms: consent.consent_at_ms,
+                    execution_expires_at_ms: consent.execution_expires_at_ms,
+                    receipt_sha256: consent.receipt_sha256,
+                    payload: consent.payload.map(|payload| ApprovalPayloadFacts {
+                        attestation: payload.attestation,
+                        receipt: payload.receipt,
+                        process_uid: payload.process_uid,
+                        challenge_subject: payload.challenge_subject,
+                        outbox_row: payload.outbox_row,
+                    }),
+                }),
+            },
+        )
     }
 
     /// Binds retained delivery facts to a verified witness without pruning the inspected image.

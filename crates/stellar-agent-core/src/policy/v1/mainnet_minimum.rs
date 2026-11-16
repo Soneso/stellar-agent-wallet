@@ -23,6 +23,7 @@ pub const MAINNET_READ_ONLY_TOOLS: &[&str] = &[
     "stellar_x402_parse_receipt",
     "stellar_transaction_status",
     "stellar_signed_intents_list",
+    "stellar_approval_status",
 ];
 /// Registry tools that move value out of the account: payments, native
 /// account funding, and x402 payments.

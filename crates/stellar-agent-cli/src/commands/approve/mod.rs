@@ -57,6 +57,7 @@ pub mod operator;
 pub mod revoke;
 pub mod run;
 pub mod serve;
+pub mod status;
 
 use clap::{Args, Subcommand};
 
@@ -106,6 +107,9 @@ pub enum ApproveSubcommand {
     /// Performs no keyring access and no network calls.
     List(list::ListArgs),
 
+    /// Inspect one approval by its public nonce without consuming it.
+    Status(status::StatusArgs),
+
     /// Serve a local web UI for the pending-approval queue.
     ///
     /// Binds a loopback HTTP server so the operator can review and
@@ -142,6 +146,7 @@ pub async fn dispatch(args: ApproveArgs) -> i32 {
         Some(ApproveSubcommand::Revoke(args)) => revoke::run(args).await,
         Some(ApproveSubcommand::Gc(gc_args)) => gc::run(gc_args).await,
         Some(ApproveSubcommand::List(list_args)) => list::run(list_args).await,
+        Some(ApproveSubcommand::Status(args)) => status::run(args).await,
         Some(ApproveSubcommand::Serve(serve_args)) => serve::run(serve_args).await,
         Some(ApproveSubcommand::Operator(operator_args)) => operator::dispatch(operator_args).await,
         Some(ApproveSubcommand::Credential(credential_args)) => {
@@ -165,6 +170,7 @@ impl ApproveArgs {
             Some(ApproveSubcommand::Revoke(a)) => a.profile.as_deref(),
             Some(ApproveSubcommand::Gc(a)) => a.profile.as_deref(),
             Some(ApproveSubcommand::List(a)) => a.profile.as_deref(),
+            Some(ApproveSubcommand::Status(a)) => a.profile.as_deref(),
             Some(ApproveSubcommand::Serve(a)) => a.profile.as_deref(),
             Some(ApproveSubcommand::Operator(a)) => a.profile_flag(),
             Some(ApproveSubcommand::Credential(a)) => a.profile_flag(),

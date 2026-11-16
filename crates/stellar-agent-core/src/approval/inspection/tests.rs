@@ -106,6 +106,20 @@ fn approval_status_context_precedence() {
         .as_ref()
         .unwrap()
         .verified_at_unix_ms();
+    let (intent_entry, intent) = fixture.intent_payment(60_000);
+    let (store, _) = fixture.intent_consent(&intent_entry, &intent);
+    let intent_entry = store.get(&intent_entry.approval_nonce).unwrap().clone();
+    let intent_now = intent_entry
+        .mainnet_presence
+        .as_ref()
+        .unwrap()
+        .verified_at_unix_ms();
+    assert_eq!(
+        result(&intent_entry, intent_now, &fixture),
+        Inspection::unavailable(),
+        "the inbox retains no canonical intent digest"
+    );
+    drop(store);
     let key = &fixture.profile().attestation_key_id;
     keyring_core::Entry::new(&key.service, &key.account)
         .unwrap()
@@ -177,6 +191,40 @@ fn approval_status_context_precedence() {
     );
     std::fs::write(fixture.policy_path(), "invalid signed policy").unwrap();
     assert_eq!(result(&entry, now, &fixture), Inspection::unavailable());
+}
+
+#[test]
+#[serial]
+fn inspection_mainnet_context_requires_enablement_and_policy() {
+    let fixture = MainnetConsentFixture::new(NAME);
+    let entry = consent(&fixture, &fixture.payment(60_000));
+    let now = entry
+        .mainnet_presence
+        .as_ref()
+        .unwrap()
+        .verified_at_unix_ms();
+    assert!(result(&entry, now, &fixture).valid);
+    let policy = std::fs::read(fixture.policy_path()).unwrap();
+    std::fs::remove_file(fixture.policy_path()).unwrap();
+    assert_eq!(
+        result(&entry, now, &fixture),
+        Inspection::unavailable(),
+        "an absent mainnet policy is unavailable"
+    );
+    std::fs::write(fixture.policy_path(), policy).unwrap();
+    assert!(result(&entry, now, &fixture).valid);
+    let nonce = crate::profile::schema::mainnet_enablement_entry_ref(
+        &fixture.profile().policy_window_state_key_id,
+    );
+    let nonce = keyring_core::Entry::new(&nonce.service, &nonce.account).unwrap();
+    nonce.set_password("another-installation").unwrap();
+    assert_eq!(
+        result(&entry, now, &fixture),
+        Inspection::unavailable(),
+        "enablement bindings gate the mainnet context"
+    );
+    nonce.set_password(ENABLEMENT_NONCE).unwrap();
+    assert!(result(&entry, now, &fixture).valid);
 }
 
 #[test]
@@ -515,6 +563,50 @@ fn inspection_durable_proof_clocks_and_cleanup() {
             .reason,
             InspectionReason::AttestationInvalid
         );
+        let mut record = facts.record().clone();
+        record.rule_ttl_ms += 1;
+        assert_eq!(
+            inspect(
+                &ApprovalFacts::new(NAME.into(), Caip2::Mainnet, record),
+                now
+            )
+            .reason,
+            InspectionReason::AttestationInvalid,
+            "the stored rule lifetime binds the record"
+        );
+        let mut record = facts.record().clone();
+        record.consent.as_mut().unwrap().receipt_sha256[0] ^= 1;
+        assert_eq!(
+            inspect(
+                &ApprovalFacts::new(NAME.into(), Caip2::Mainnet, record),
+                now
+            )
+            .reason,
+            InspectionReason::AttestationInvalid,
+            "the stored receipt digest binds the receipt"
+        );
+        if canonical {
+            let mut record = facts.record().clone();
+            let consent = record.consent.as_mut().unwrap();
+            let end = intent_clocks(
+                record.created_at_ms,
+                record.expires_at_ms,
+                consent.consent_at_ms,
+                record.expires_at_ms - record.created_at_ms,
+                consent.consent_at_ms,
+            )
+            .unwrap();
+            consent.execution_expires_at_ms = u64::MAX;
+            assert_eq!(
+                inspect(
+                    &ApprovalFacts::new(NAME.into(), Caip2::Mainnet, record),
+                    end
+                )
+                .reason,
+                InspectionReason::WindowClosed,
+                "the signed clocks close the intent execution window"
+            );
+        }
     }
 }
 
@@ -831,6 +923,35 @@ fn approval_status_strict_open_first_duplicate_and_tombstones() {
         result(&second, now, &fixture).reason,
         InspectionReason::Rejected,
         "tombstone precedes expiry and absent proof"
+    );
+    let mut consumed = second.clone();
+    consumed.kind = ApprovalKind::Consumed {
+        original_kind_name: "PaymentSimulated".into(),
+        tx_hash: "ab".repeat(32),
+        outcome: crate::approval::ConsumedOutcome::Confirmed,
+    };
+    assert_eq!(
+        result(&consumed, now, &fixture).reason,
+        InspectionReason::Consumed,
+        "a consumed tombstone precedes expiry and absent proof"
+    );
+    let swapped: String = entry
+        .approval_nonce
+        .chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() {
+                c.to_ascii_uppercase()
+            } else {
+                c.to_ascii_lowercase()
+            }
+        })
+        .collect();
+    assert_ne!(swapped, entry.approval_nonce);
+    assert!(
+        read_pending_approval(&fixture.store_path(), &swapped)
+            .unwrap()
+            .is_none(),
+        "nonce selection is case-exact"
     );
     let locked = crate::approval::PendingApprovalStore::open(fixture.store_path()).unwrap();
     assert_eq!(

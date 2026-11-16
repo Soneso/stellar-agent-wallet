@@ -58,8 +58,8 @@ the server exposes.
 ## Every call carries `chain_id`
 
 Every tool requires a `chain_id` argument (the CAIP-2 chain id, e.g.
-`stellar:testnet`) that must match the active profile. `stellar_x402_parse_receipt`
-and `stellar_toolset_list` take none, and the two SEP-43 read tools make it
+`stellar:testnet`) that must match the active profile. `stellar_x402_parse_receipt`,
+`stellar_toolset_list`, and `stellar_approval_status` take none, and the two SEP-43 read tools make it
 optional. The five `stellar_mpp_*` tools reject a `chain_id` field as unknown;
 they act on the chain of the profile the server was started with. `stellar_toolset_invoke` accepts an optional `chain_id` that it forwards
 to the routed tool, which may itself require it (a routed `stellar_balances` or

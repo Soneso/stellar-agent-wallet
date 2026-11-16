@@ -37,6 +37,7 @@
 // Shared decimal-string <-> i128 parse helpers for the DeFi tool args (dex,
 // vault, dex) and other i128-carrying wire fields.
 pub(crate) mod amount_wire;
+pub(crate) mod approval_status;
 pub(crate) mod balances;
 pub(crate) mod business_entry;
 pub(crate) mod common;

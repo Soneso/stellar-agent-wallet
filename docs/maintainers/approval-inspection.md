@@ -40,7 +40,14 @@ Inspection takes no window writer, receipt, nonce or outbox lock and writes no
 domain audit row. Callers release the inbox lock before policy inspection,
 which takes only the existing shared policy-state lock and never upgrades it.
 
-This library API does not add a CLI command or MCP tool. Public status adapters
-must retain policy denial and read-audit behavior, use one authenticated window
-image through dispatch, and preserve durable integrity failures before considering
-an inbox fallback. Positive approval reuse requires canonical commit support.
+`approve status` and `stellar_approval_status` share the network approval status
+facade. It selects durable records by nonce and joins business IDs through their
+authenticated operation links. An absent durable record permits strict inbox
+fallback; an unreadable durable image refuses.
+
+The MCP handler retains policy decisions and the existing read-audit path.
+It hydrates the gate from the facade's authenticated image, without another
+window read. Legacy hydration applies existing retirement rules to an in-memory
+copy. Inspection never persists that copy or acquires a writer lock.
+Other tools retain ordinary hydration. Positive approval reuse requires canonical
+commit support; both status surfaces report reuse as unavailable.

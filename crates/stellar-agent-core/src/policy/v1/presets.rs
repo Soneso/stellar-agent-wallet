@@ -3569,7 +3569,7 @@ mod tests {
     /// The spacing of recorded payments, beyond the 1m window.
     const STEP_MS: u64 = 61_000;
 
-    const READ_ONLY: [&str; 17] = [
+    const READ_ONLY: [&str; 18] = [
         "stellar_balances",
         "stellar_fee_stats",
         "stellar_dex_quote",
@@ -3587,6 +3587,7 @@ mod tests {
         "stellar_x402_parse_receipt",
         "stellar_transaction_status",
         "stellar_signed_intents_list",
+        "stellar_approval_status",
     ];
 
     fn usdc() -> PresetAsset {
@@ -5988,7 +5989,7 @@ mod tests {
             usdc.tools.uncovered,
             ["stellar_create_account", "stellar_create_account_commit"]
         );
-        assert_eq!(usdc.tools.covered.len(), 25);
+        assert_eq!(usdc.tools.covered.len(), 26);
         let native = summary_of(&policy_body(
             PROFILE,
             &derive(&xlm_input("compute-week", "100", "1")).unwrap(),
