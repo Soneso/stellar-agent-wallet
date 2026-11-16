@@ -10,7 +10,7 @@ use zeroize::Zeroizing;
 use super::attestation::{AttestationScope, AttestedApprover, AttestedLifetime};
 use super::presence::{MainnetPresenceReceipt, approval_view_subject};
 use super::subject::SubjectKind;
-use super::witness::{ApprovalDisposition, ApprovalFacts, ApprovedKind, inbox_kind};
+use super::witness::{ApprovalDisposition, ApprovalFacts, ApprovedKind};
 use super::{ApprovalError, ApprovalKind, AttestationBinding, PendingApproval};
 use crate::error::{ApprovalFailure, WalletError};
 use crate::mainnet::verified_policy::VerifiedPolicy;
@@ -306,7 +306,7 @@ fn precheck<'a>(
             Proof {
                 nonce: &record.nonce,
                 uid: &payload.process_uid,
-                kind: inbox_kind(record.kind),
+                kind: record.kind.kind_name(),
                 subject_kind: record.subject_kind,
                 subject: record.subject,
                 created: record.created_at_ms,
@@ -378,7 +378,7 @@ fn inspect_proof(
             R::AttestationInvalid
         };
     };
-    if canonical && (proof.kind == inbox_kind(ApprovedKind::X402Payment) || consent.is_none()) {
+    if canonical && (proof.kind == ApprovedKind::X402Payment.kind_name() || consent.is_none()) {
         return R::KindMismatch;
     }
     if now < proof.created

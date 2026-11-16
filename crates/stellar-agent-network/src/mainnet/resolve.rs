@@ -639,7 +639,8 @@ mod enabled {
         endpoint_identity::EndpointIdentity,
         keyring::EnrolledRole,
         policy_state::{
-            ConsumptionBinding, DomainBinding, MintAuthority, MintRequest, NativeReservation,
+            ApprovalStatus, ConsumptionBinding, DomainBinding, MintAuthority, MintRequest,
+            NativeReservation,
         },
         policy_view::AccountViewAdapter,
     };
@@ -650,10 +651,10 @@ mod enabled {
         approval::{
             store::governing_ttl_ms,
             subject::{
-                approval_subject_classic, approval_subject_x402,
+                SubjectKind, approval_subject_classic, approval_subject_x402,
                 approval_subject_x402_authenticated, root_invocation_digest, soroban_intent_digest,
             },
-            witness::ApprovedKind,
+            witness::{ApprovalDisposition, ApprovalFacts, ApprovalWitness, ApprovedKind},
         },
         asset_id::CanonicalAsset,
         cross_check::{
@@ -910,9 +911,15 @@ mod enabled {
         audit: &AuditReadiness,
         signer: &EnrolledSigner,
         now: u64,
+        store: &PersistedWindowStore,
+        operation: Option<OperationLink>,
     ) -> Result<(), MainnetAuthorizationError> {
         match authority {
             MainnetAuthority::Approval(approval) => {
+                let facts = ApprovalStatus::new(store, context.profile())
+                    .facts_by_nonce(approval.witness().nonce())
+                    .map_err(mint::store_error)?;
+                check_approval_facts(facts.as_ref(), approval.witness(), operation, now)?;
                 approval_checks(
                     context,
                     policy,
@@ -944,8 +951,69 @@ mod enabled {
         )
     }
 
+    /// Compares a witness with the retained consent after ordered state checks.
+    pub(super) fn check_approval_facts(
+        facts: Option<&ApprovalFacts>,
+        approval: &ApprovalWitness,
+        operation: Option<OperationLink>,
+        now: u64,
+    ) -> Result<(), MainnetAuthorizationError> {
+        let Some(facts) = facts else {
+            return Ok(());
+        };
+        let record = facts.record();
+        require(
+            record.disposition != ApprovalDisposition::Revoked,
+            P::ApprovalRevoked,
+        )?;
+        let Some(consent) = &record.consent else {
+            return Err(refused(if now < record.expires_at_ms {
+                P::ApprovalConsentMissing
+            } else {
+                P::ApprovalExpired
+            }));
+        };
+        let end = if record.subject_kind == SubjectKind::EnvelopeText {
+            consent.execution_expires_at_ms.min(record.expires_at_ms)
+        } else {
+            consent.execution_expires_at_ms
+        };
+        require(
+            now >= consent.consent_at_ms && now < end,
+            P::ApprovalExpired,
+        )?;
+        let payload = consent
+            .payload
+            .as_ref()
+            .ok_or_else(|| refused(P::ApprovalExpired))?;
+        require(
+            operation.is_some_and(|link| *link.operation_id.as_bytes() == record.operation_id),
+            P::ApprovalNonceReused,
+        )?;
+        require(approval.nonce() == record.nonce, P::ApprovalNonce)?;
+        require(approval.kind() == record.kind, P::ApprovalKindMismatch)?;
+        require(
+            approval.subject() == record.subject,
+            P::ApprovalSubjectMismatch,
+        )?;
+        require(
+            approval.created_at_ms() == record.created_at_ms
+                && approval.expires_at_ms() == record.expires_at_ms,
+            P::ApprovalExpiry,
+        )?;
+        require(
+            payload.receipt.policy_digest_hex()
+                == stellar_agent_core::hex::encode(&approval.policy_digest()),
+            P::ApprovalPolicyMismatch,
+        )?;
+        require(
+            approval.presence_receipt_digest() == consent.receipt_sha256,
+            P::ApprovalReceiptMismatch,
+        )
+    }
+
     /// The checks an approval witness must pass under [`final_checks`].
-    fn approval_checks(
+    pub(super) fn approval_checks(
         context: &MainnetWriteContext,
         policy: &VerifiedPolicy,
         approval: &stellar_agent_core::approval::witness::ApprovalWitness,
@@ -969,6 +1037,9 @@ mod enabled {
         require(approval.subject() == subject, P::ApprovalSubjectMismatch)?;
         require(approval.kind() == kind, P::ApprovalKindMismatch)?;
         require(approval.created_at_ms() <= now, P::NotYetValid)?;
+        if approval.subject_kind() == SubjectKind::IntentDigest {
+            return require(now < approval.execution_expires_at_ms(), P::ApprovalExpired);
+        }
         require(now < approval.expires_at_ms(), P::ApprovalExpired)?;
         let lifetime = approval
             .expires_at_ms()
@@ -1160,6 +1231,8 @@ mod enabled {
             &req.audit,
             req.signer,
             now,
+            req.store,
+            req.operation,
         )?;
         let mut request = request(
             req.context,
@@ -1336,6 +1409,8 @@ mod enabled {
             &req.audit,
             req.signer,
             now,
+            req.store,
+            req.operation,
         )?;
         let mut request = request(
             req.context,
@@ -1714,6 +1789,8 @@ mod tests {
     use super::super::{MainnetPrecondition as P, fixtures::ResolverFixture};
     use super::*;
     use stellar_agent_core::approval::witness::ApprovalWitness;
+
+    include!("resolve_approval_tests.rs");
 
     /// The entry nonce every intent request in this module names.
     const INTENT_NONCE: i64 = 41;
@@ -3504,6 +3581,8 @@ mod tests {
                 &audit,
                 &f.signer,
                 f.now,
+                &f.window,
+                None,
             )
         };
         assert_eq!(approval.kind(), ApprovedKind::Payment);
@@ -6246,6 +6325,8 @@ mod tests {
                 &audit,
                 &f.signer,
                 now,
+                &f.window,
+                None,
             )
         };
         let authority = policy_authority(&f, AuthorityScope::Classic, f.now, 60_000);

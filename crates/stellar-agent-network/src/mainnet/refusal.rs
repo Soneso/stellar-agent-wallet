@@ -83,6 +83,8 @@ pub enum MainnetPrecondition {
     ApprovalExpired,
     /// The durable approval is revoked.
     ApprovalRevoked,
+    /// The approval and retained consent name different presence receipts.
+    ApprovalReceiptMismatch,
     /// The durable approval has no consent.
     ApprovalConsentMissing,
     /// The approval lifetime exceeds the governing rule.
@@ -289,6 +291,7 @@ impl MainnetPrecondition {
             Self::ApprovalKindMismatch => "approval_kind_mismatch",
             Self::ApprovalExpired => "approval_expired",
             Self::ApprovalRevoked => "approval_revoked",
+            Self::ApprovalReceiptMismatch => "approval_receipt_mismatch",
             Self::ApprovalConsentMissing => "approval_consent_missing",
             Self::ApprovalTtlExceedsRule => "approval_ttl_exceeds_rule",
             Self::ApprovalPolicyMismatch => "approval_policy_mismatch",
@@ -621,6 +624,7 @@ mod tests {
             P::ApprovalKindMismatch,
             P::ApprovalExpired,
             P::ApprovalRevoked,
+            P::ApprovalReceiptMismatch,
             P::ApprovalConsentMissing,
             P::ApprovalTtlExceedsRule,
             P::ApprovalPolicyMismatch,
@@ -734,6 +738,7 @@ mod tests {
                 | P::ApprovalKindMismatch
                 | P::ApprovalExpired
                 | P::ApprovalRevoked
+                | P::ApprovalReceiptMismatch
                 | P::ApprovalConsentMissing
                 | P::ApprovalTtlExceedsRule
                 | P::ApprovalPolicyMismatch
@@ -856,6 +861,7 @@ mod tests {
             "approval_kind_mismatch",
             "approval_expired",
             "approval_revoked",
+            "approval_receipt_mismatch",
             "approval_consent_missing",
             "approval_ttl_exceeds_rule",
             "approval_policy_mismatch",

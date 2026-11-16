@@ -1022,7 +1022,7 @@ pub(super) mod tests {
                 assert!(matches!(
                     f.store.mint_authorization(f.core.profile(), &request),
                     Err(WindowStoreError::AuthorizationRefused {
-                        precondition: MainnetPrecondition::DuplicateOpen
+                        precondition: MainnetPrecondition::ApprovalRevoked
                     })
                 ));
                 f.clock
@@ -1037,7 +1037,7 @@ pub(super) mod tests {
                     matches!(
                         earlier,
                         Err(WindowStoreError::AuthorizationRefused {
-                            precondition: MainnetPrecondition::ApprovalNonceReused
+                            precondition: MainnetPrecondition::ApprovalRevoked
                         })
                     ),
                     "{earlier:?}"

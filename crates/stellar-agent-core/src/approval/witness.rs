@@ -110,7 +110,6 @@ use crate::policy::Decision;
 use crate::profile::caip2::Caip2;
 use crate::profile::owner_key::OwnerKeyContext;
 use crate::profile::schema::Profile;
-pub(crate) use durable::inbox_kind;
 pub use durable::{
     ApprovalConsentFacts, ApprovalDisposition, ApprovalFacts, ApprovalPayloadFacts,
     ApprovalRecordFacts, verify_durable_approval, verify_durable_intent_approval,

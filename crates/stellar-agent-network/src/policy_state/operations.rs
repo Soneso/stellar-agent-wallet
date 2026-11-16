@@ -1887,15 +1887,16 @@ fn authority_of(
 
 /// Takes `auth`'s authority onto `record`: the authority on first adoption,
 /// and an execution expiry no later than the authority's end, the envelope's
-/// end and any earlier execution expiry.
+/// end, the durable consent bound and any earlier execution expiry.
 fn take_authority(
     record: &mut WireOperation,
     auth: &WireAuthorization,
+    cap: Option<u64>,
 ) -> Result<(), WindowStoreError> {
     if record.authority.is_none() {
         record.authority = Some(authority_of(record, auth)?);
     }
-    let end = auth.authority_end_ms();
+    let end = auth.authority_end_ms().min(cap.unwrap_or(u64::MAX));
     let end = record
         .intent
         .envelope_end_ms()
@@ -1915,9 +1916,10 @@ fn adopt(
     auth: &WireAuthorization,
     now_ms: u64,
     commit: CommitId,
+    cap: Option<u64>,
 ) -> Result<(), WindowStoreError> {
     let mut adopted = record.clone();
-    take_authority(&mut adopted, auth)?;
+    take_authority(&mut adopted, auth, cap)?;
     adopted.step(OperationState::Authorized, now_ms, None, commit)?;
     *record = adopted;
     Ok(())
@@ -1947,8 +1949,10 @@ pub(super) fn adopt_on_expiry(
     auth: &WireAuthorization,
     now_ms: u64,
     commit: CommitId,
+    cap: Option<u64>,
 ) -> bool {
-    waiting_record(section, auth).is_some_and(|record| adopt(record, auth, now_ms, commit).is_ok())
+    waiting_record(section, auth)
+        .is_some_and(|record| adopt(record, auth, now_ms, commit, cap).is_ok())
 }
 
 /// Requires the operation a mint links to exist and be open, and the link to
@@ -2033,11 +2037,15 @@ fn adopt_live(
         .cloned()
         .collect();
     for auth in live {
+        let cap = auth
+            .approval_nonce
+            .as_deref()
+            .and_then(|nonce| super::approvals::record_cap(&wire.approvals, nonce));
         let Some(record) = waiting_record(&mut wire.operations, &auth) else {
             continue;
         };
         let from = record.state;
-        adopt(record, &auth, now_ms, audit.commit)?;
+        adopt(record, &auth, now_ms, audit.commit, cap)?;
         audit.transition(
             record,
             None,
@@ -3513,13 +3521,17 @@ impl Session<'_> {
             return Err(invalid("an attempt's holds exceed their allowance"));
         }
         let mut record = records(&self.wire)[index].clone();
+        let cap = auth
+            .approval_nonce
+            .as_deref()
+            .and_then(|nonce| super::approvals::record_cap(&self.wire.approvals, nonce));
         if from.is_waiting() {
-            take_authority(&mut record, &auth)?;
+            take_authority(&mut record, &auth, cap)?;
             record.step(S::Authorized, now, None, commit)?;
             self.audit
                 .transition(&record, None, Some(from), S::Authorized.wire_name());
         } else if record.execution_expires_at_ms.is_none() {
-            take_authority(&mut record, &auth)?;
+            take_authority(&mut record, &auth, cap)?;
         }
         let authority = authority_of(&record, &auth)?;
         match (&record.intent, &request.envelope) {
@@ -4403,18 +4415,18 @@ impl<'a> OperationRecorder<'a> {
     }
 
     /// Runs one locked step and commits it when it changed the window. A
-    /// mint's checks that precede the window key run under the lock before
-    /// the read.
+    /// mint checks its retained approval and other preconditions under the
+    /// lock before creating a key or reading the successor image.
     pub(super) fn run<T>(
         &mut self,
-        mint: Option<&MintRequest>,
+        mint: Option<(&MintRequest, OperationId)>,
         step: impl FnOnce(&mut Session<'_>) -> Result<T, WindowStoreError>,
     ) -> Result<T, WindowStoreError> {
         let store = self.store;
         let profile = self.profile;
         // A malformed mint entry refuses before the lock, the key, and any
         // read.
-        if let Some(request) = mint {
+        if let Some((request, _)) = mint {
             super::store::check_total_shape(&request.holds)?;
         }
         if !profile.chain_id.is_mainnet() {
@@ -4440,7 +4452,7 @@ impl<'a> OperationRecorder<'a> {
     pub(super) fn run_held<T>(
         &mut self,
         lock: &WindowStoreLock,
-        mint: Option<&MintRequest>,
+        mint: Option<(&MintRequest, OperationId)>,
         step: impl FnOnce(&mut Session<'_>) -> Result<T, WindowStoreError>,
     ) -> Result<T, WindowStoreError> {
         let store = self.store;
@@ -4457,7 +4469,10 @@ impl<'a> OperationRecorder<'a> {
         }
         let now = now_ms()?;
         let mint_expires = match mint {
-            Some(request) => Some(store.mint_prechecks(lock, profile, request, now)?),
+            Some((request, operation)) => {
+                let cap = store.mint_record_checks(profile, request, Some(operation), now)?;
+                Some(store.mint_prechecks(lock, profile, request, now, cap)?)
+            }
             None => None,
         };
         let (key, _minted) = store.load_or_mint_key(profile)?;
@@ -4593,7 +4608,7 @@ impl<'a> OperationRecorder<'a> {
             return Err(capacity(CapacityDetail::EnvelopeSize));
         }
         let mint = match &request.authorization {
-            AttemptAuthorization::Mint(mint) => Some(mint.as_ref()),
+            AttemptAuthorization::Mint(mint) => Some((mint.as_ref(), handle.id())),
             AttemptAuthorization::Linked => None,
         };
         let request_id = self.request_id.clone();
@@ -7935,6 +7950,41 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     fn sweep_adopts_waiting_operation_before_restart() {
+        for expired in [false, true] {
+            let mut durable = super::super::approvals::tests::Fx::new(86_400_000);
+            durable.open();
+            let end = durable
+                .consent()
+                .record
+                .consent
+                .unwrap()
+                .execution_expires_at_ms;
+            let request = durable.mint_request();
+            let minted = durable
+                .store
+                .mint_authorization(durable.fixture.profile(), &request)
+                .unwrap();
+            if expired {
+                durable.clock.set(minted.expires_at_ms + 1);
+            }
+            OperationRecorder::new(
+                &durable.store,
+                durable.fixture.profile(),
+                &mut durable.rows,
+                "adopt",
+            )
+            .expire_due(if expired {
+                minted.expires_at_ms + 1
+            } else {
+                minted.issued_at_ms
+            })
+            .unwrap();
+            assert_eq!(
+                durable.wire().operations.as_ref().unwrap().records[0].execution_expires_at_ms,
+                Some(end),
+                "direct and expiry adoption retain durable consent"
+            );
+        }
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());

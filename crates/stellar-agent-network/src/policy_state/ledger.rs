@@ -903,7 +903,11 @@ fn sweep(wire: &mut WireFile, now_ms: u64, commit: CommitId, scope: SweepScope) 
         }
         let is_exposed = exposed.contains(&auth.id);
         if auth.claimed_ms.is_none() && !is_exposed {
-            if operations::adopt_on_expiry(&mut wire.operations, auth, now_ms, commit)
+            let cap = auth
+                .approval_nonce
+                .as_deref()
+                .and_then(|nonce| super::approvals::record_cap(&wire.approvals, nonce));
+            if operations::adopt_on_expiry(&mut wire.operations, auth, now_ms, commit, cap)
                 && let Some(link) = auth.operation
             {
                 adopted.push(link.operation_id);
@@ -2092,8 +2096,8 @@ impl PersistedWindowStore {
     /// parent and no other request does; no hold may be dated past the store
     /// clock plus [`CLOCK_SKEW_TOLERANCE_MS`]; a policy authority must name
     /// the request's policy; the lifetime is the earliest of the issue time
-    /// plus `authorization_ttl_ms`, the end of the authority, and the
-    /// envelope's on-chain deadline, and a zero, an overflowing, or an
+    /// plus `authorization_ttl_ms`, the end of the authority, the retained
+    /// approval bound, and the envelope's on-chain deadline. A zero, an overflowing, or an
     /// already elapsed lifetime refuses; the policy pin must be present and
     /// equal to the request's policy. These checks precede the window key, so
     /// a refusal among them mints no key. Then expired authorizations are
@@ -2105,6 +2109,11 @@ impl PersistedWindowStore {
     /// at most [`MAX_OPEN_AUTHORIZATIONS`] may be open; and the holds must be
     /// admitted against the window's spend, its pending records, and every
     /// other hold.
+    ///
+    /// Retained approvals are checked after the chain and before the other
+    /// prechecks, using a non-minting read under the lock. Their consent bound
+    /// also caps the authorization, including a continuation under a used parent.
+    /// An envelope approval additionally caps it at the signed pending expiry.
     ///
     /// After the identity is allocated, a record that holds entries sets its
     /// reservation's fact digest in the bindings, and the aggregate bindings
@@ -2127,7 +2136,13 @@ impl PersistedWindowStore {
         check_total_shape(&request.holds)?;
         let lock = self.ledger_lock(profile)?;
         let now = now_ms()?;
-        let expires = self.mint_prechecks(&lock, profile, request, now)?;
+        let cap = self.mint_record_checks(
+            profile,
+            request,
+            request.operation.map(|link| link.operation_id),
+            now,
+        )?;
+        let expires = self.mint_prechecks(&lock, profile, request, now, cap)?;
 
         let (key, _mint) = self.load_or_mint_key(profile)?;
         let gen_entry = generation_entry_ref(profile);
@@ -2152,12 +2167,42 @@ impl PersistedWindowStore {
         Ok(minted)
     }
 
+    /// Checks the chain and retained approval under the caller's window lock.
+    /// Inspection authenticates existing state without creating a window key.
+    pub(super) fn mint_record_checks(
+        &self,
+        profile: &Profile,
+        request: &MintRequest,
+        operation: Option<OperationId>,
+        now: u64,
+    ) -> Result<Option<u64>, WindowStoreError> {
+        check(
+            request.chain.is_mainnet(),
+            MainnetPrecondition::ChainNotMainnet,
+        )?;
+        check(
+            request.chain == profile.chain_id,
+            MainnetPrecondition::ChainMismatch,
+        )?;
+        let MintAuthority::Approval { nonce, .. } = &request.authority else {
+            return Ok(None);
+        };
+        let Some(wire) = self.read_for_inspection(profile)? else {
+            return Ok(None);
+        };
+        if request.parent.is_some() {
+            Ok(super::approvals::record_cap(&wire.approvals, nonce))
+        } else {
+            super::approvals::check_record(&wire, nonce, operation, now)
+        }
+    }
+
     /// The mint checks that precede the window key, on the store clock
-    /// `now`, under `lock`: the chain, the bindings, the consumer, the holds,
+    /// `now`, under `lock`: the bindings, the consumer, the holds,
     /// the parent, the policy authority, the lifetime and the policy pin.
     /// Returns the authorization's expiry: the earliest of `now` plus the
-    /// lifetime, the end of the authority, and the envelope's on-chain
-    /// deadline.
+    /// lifetime, the end of the authority, the retained approval cap, and the
+    /// envelope's on-chain deadline.
     ///
     /// # Errors
     ///
@@ -2169,10 +2214,9 @@ impl PersistedWindowStore {
         profile: &Profile,
         request: &MintRequest,
         now: u64,
+        cap: Option<u64>,
     ) -> Result<u64, WindowStoreError> {
         use MainnetPrecondition as P;
-        check(request.chain.is_mainnet(), P::ChainNotMainnet)?;
-        check(request.chain == profile.chain_id, P::ChainMismatch)?;
         let domain = request.binding.domain();
         check(
             request.bindings.reservation.is_none(),
@@ -2228,6 +2272,7 @@ impl PersistedWindowStore {
             .ok_or_else(|| refused(P::LifetimeInvalid))?;
         let expires = ttl_end
             .min(request.authority.expires_at_ms())
+            .min(cap.unwrap_or(u64::MAX))
             .min(request.chain_deadline_ms.unwrap_or(u64::MAX));
         check(expires > now, P::LifetimeInvalid)?;
 
@@ -2629,6 +2674,59 @@ mod tests {
     use super::*;
     use crate::mainnet::clock::{TestClockGuard, set_now_ms_for_test};
     use crate::mainnet::types::RecomputedFacts;
+
+    #[test]
+    #[serial]
+    fn revocation_waits_for_the_mint_commit() {
+        use super::super::approvals::{
+            ApprovalRecorder,
+            tests::{Fx, Rows},
+        };
+        use std::sync::mpsc;
+        let mut fx = Fx::new(300_000);
+        fx.open();
+        fx.consent();
+        let path = fx.store.path().to_owned();
+        let profile = fx.fixture.profile().clone();
+        let id = fx.id();
+        let (attempted, outcome) = mpsc::channel();
+        let (committed, retry) = mpsc::channel();
+        let thread = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let slot = thread.clone();
+        MINT_AFTER_READ.with_borrow_mut(|hook| {
+            *hook = Some(Box::new(move || {
+                *slot.borrow_mut() = Some(std::thread::spawn(move || {
+                    let store = PersistedWindowStore::at_path(path);
+                    let mut rows = Rows::default();
+                    let mut recorder = ApprovalRecorder::new(&store, &profile, &mut rows, "revoke");
+                    attempted.send(recorder.revoke(id)).unwrap();
+                    retry.recv().unwrap();
+                    recorder.revoke(id)
+                }));
+                assert!(
+                    matches!(outcome.recv().unwrap(), Err(WindowStoreError::WriterLocked)),
+                    "revocation waits for the mint lock"
+                );
+            }))
+        });
+        let request = fx.mint_request();
+        assert!(
+            fx.store
+                .mint_authorization(fx.fixture.profile(), &request)
+                .is_ok(),
+            "mint commits its locked image"
+        );
+        committed.send(()).unwrap();
+        thread.borrow_mut().take().unwrap().join().unwrap().unwrap();
+        assert_eq!(
+            fx.view().record.state,
+            super::super::approvals::ApprovalState::Revoked
+        );
+        assert_eq!(
+            refusal(fx.store.mint_authorization(fx.fixture.profile(), &request)),
+            MainnetPrecondition::ApprovalRevoked
+        );
+    }
 
     impl MintAuthority {
         /// The nonce of an approval authority.
@@ -7756,8 +7854,12 @@ mod tests {
                 matches!(
                     result,
                     Err(WindowStoreError::AuthorizationRefused {
-                        precondition: MainnetPrecondition::ApprovalNonceReused
-                    })
+                        precondition
+                    }) if precondition == if at > expiry {
+                        MainnetPrecondition::ApprovalExpired
+                    } else {
+                        MainnetPrecondition::ApprovalNonceReused
+                    }
                 ),
                 "mint at {at}, execution expiry {expiry}: {result:?}"
             );
@@ -7930,7 +8032,8 @@ mod tests {
             let mut fx = Fx::new(ttl);
             fx.open();
             fx.consent();
-            let expiry = fx.payload.receipt.verified_at_unix_ms() + duration;
+            let expiry = (fx.payload.receipt.verified_at_unix_ms() + duration)
+                .min(fx.witness.expires_at_ms());
             let request = fx.mint_request();
             for (at, accepted) in [(expiry - 1, true), (expiry, false), (expiry + 1, false)] {
                 fx.clock.set(at);

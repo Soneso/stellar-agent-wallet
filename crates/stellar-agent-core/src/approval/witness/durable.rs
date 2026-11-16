@@ -123,15 +123,6 @@ impl ApprovalFacts {
     }
 }
 
-pub(crate) fn inbox_kind(kind: ApprovedKind) -> &'static str {
-    match kind {
-        ApprovedKind::Payment => "PaymentSimulated",
-        ApprovedKind::Claim => "ClaimSimulated",
-        ApprovedKind::Trustline => "TrustlineSimulated",
-        ApprovedKind::X402Payment => "X402Payment",
-    }
-}
-
 fn wrong_kind() -> WalletError {
     WalletError::Approval(ApprovalFailure::WrongKind {
         detail: "the approval does not bind this kind of subject".to_owned(),
@@ -284,7 +275,7 @@ fn verify(
     let scope = AttestationScope::pending_for_subject(
         crate::approval::mainnet_attestation_version(subject_kind),
         AttestedLifetime::new(
-            inbox_kind(record.kind),
+            record.kind.kind_name(),
             record.created_at_ms,
             record.expires_at_ms,
         ),
