@@ -295,6 +295,15 @@ of that kind and value.
 Without one the call is refused with `policy.deny.memo_binding_mismatch`,
 which names the required kind only. Unbound and contract destinations pass.
 
+CLI and MCP payment preparation evaluate the parsed memo. Signing and commit
+evaluate the memo encoded in the envelope. Caller fields cannot replace that
+signed fact, and the MCP commit still checks that its rebuilt envelope matches
+the prepared bytes. An ID of zero is a present memo; IDs retain all 64 bits.
+Text, ID, hash and return memos remain distinct even when their values look
+alike. An empty text memo in an existing envelope remains text, while an empty
+text argument in payment preparation means no memo. Account creation prepares
+with no memo. A bound account therefore requires a payment carrying its memo.
+
 `approval_above` permits amounts at or below its threshold and requests
 approval above it. It uses `asset` and `max_stroops`, with the same units and
 asset matching as `per_tx_cap`. One XLM is 10,000,000 stroops.

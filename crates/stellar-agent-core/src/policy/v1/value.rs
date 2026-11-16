@@ -433,7 +433,7 @@ pub fn asset_normalise(asset: &str) -> String {
 /// derives [`ValueClass::ReadOnly`].
 #[must_use]
 pub fn derive_value_class(tool_name: &str, args: &Value) -> ValueClass {
-    match tool_name {
+    let value = match tool_name {
         "stellar_pay" | "stellar_pay_commit" => {
             let amount = resolve_pay_or_create_account_stroops(tool_name, args, "derive")
                 .ok()
@@ -537,6 +537,12 @@ pub fn derive_value_class(tool_name: &str, args: &Value) -> ValueClass {
         }
         "stellar_sep43_sign_auth_entry" => ValueClass::Opaque(OpaqueReason::RawAuthEntrySignature),
         _ => ValueClass::ReadOnly,
+    };
+    match value {
+        ValueClass::Value(effects) => {
+            ValueClass::Value(effects.with_memo(ClassicMemo::from_policy_args(args)))
+        }
+        other => other,
     }
 }
 

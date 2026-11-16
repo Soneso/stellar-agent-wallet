@@ -389,6 +389,8 @@ impl WalletServer {
             "source": &args.source,
             "destination": &args.destination,
             "starting_balance_stroops": args.starting_balance.as_stroops().to_string(),
+            "memo_kind": "none",
+            "memo": null,
         });
         // ── Validate G-strkeys ────────────────────────────────────────────────
         validate_g_strkey(&args.source, "source")?;

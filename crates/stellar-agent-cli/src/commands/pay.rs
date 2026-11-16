@@ -276,6 +276,7 @@ pub struct PayResult {
 #[derive(Debug, Clone)]
 struct BuiltPaymentEnvelope {
     envelope_xdr: String,
+    memo: stellar_agent_core::envelope_decode::ClassicMemo,
     fee_selection: ClassicFeeSelection,
     /// The parsed `--fee` choice the selection came from; it names the fee's
     /// source in a fee-cap refusal.
@@ -1787,6 +1788,11 @@ async fn build_unsigned_envelope(
 
     Ok(BuiltPaymentEnvelope {
         envelope_xdr,
+        memo: stellar_agent_core::envelope_decode::ClassicMemo::try_from(&memo).map_err(|_| {
+            WalletError::Validation(ValidationError::MemoInvalidType {
+                memo_type: "TEXT (not UTF-8)".into(),
+            })
+        })?,
         fee_selection,
         fee_choice,
         asset,
@@ -1964,10 +1970,13 @@ fn evaluate_pay_policy(
     // envelope's total fee, which `minimum_reserve` counts with the debit.
     // Both `--build-only` and the full pipeline gate the envelope they built,
     // so the reserve check sees what that envelope spends once signed.
-    let policy_args = with_total_fee(
+    let mut policy_args = with_total_fee(
         pay_policy_args(built.amount_stroops, &built.asset_raw, &built.destination),
         total_fee,
     );
+    for (key, value) in built.memo.policy_fields() {
+        policy_args[key] = value;
+    }
     // `account_view` reuses the source-account state `build_unsigned_envelope`
     // already fetched (feeds `minimum_reserve`); `identity_view` reuses the
     // destination-account state the same function fetched (`.ok()`-optional,
@@ -2464,10 +2473,13 @@ where
         Ok(fee) => fee,
         Err(e) => return fail(&Envelope::<()>::err(&e)),
     };
-    let policy_args = with_total_fee(
+    let mut policy_args = with_total_fee(
         pay_policy_args(built.amount_stroops, &built.asset_raw, &built.destination),
         total_fee,
     );
+    for (key, value) in built.memo.policy_fields() {
+        policy_args[key] = value;
+    }
     let source_adapter =
         stellar_agent_network::policy_view::AccountViewAdapter::new(&built.source_account_view);
     let dest_adapter = built
@@ -4812,6 +4824,186 @@ pub(crate) mod tests {
         args
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pay_memo_policy_prepare_commit_parity() {
+        use crate::test_rpc::{ClassicRpc, last_rendered, methods, witness_profile};
+        use stellar_agent_core::policy::v1::{
+            canonical::canonical_bytes,
+            signature::{digest, sign},
+        };
+        use stellar_agent_core::profile::schema::{PolicyEngineKind, default_policy_dir};
+        use stellar_xdr::{Limits, ReadXdr, TransactionEnvelope, WriteXdr};
+
+        async fn invoke(args: &PayArgs, profile: &Profile) -> (i32, serde_json::Value, usize) {
+            crate::common::render::take_rendered_for_test();
+            let (code, signers) = crate::test_rpc::signers_resolved_by(run_with_dependencies(
+                args,
+                |_| Ok(profile.clone()),
+                || Ok(()),
+            ))
+            .await;
+            (code, last_rendered(), signers)
+        }
+
+        let _isolation = zero_config();
+        let audit = tempfile::tempdir().unwrap();
+        let signer = EnvSigner::new([0x5d; 32], "PAY_MEMO_PARITY_SK");
+        let primary = ClassicRpc::testnet(&[&signer.g, DEST_G]).serve().await;
+        let mut profile = witness_profile("memo-parity", &primary.uri(), None, audit.path());
+        profile.policy.engine = PolicyEngineKind::V1;
+        let owner = ed25519_dalek::SigningKey::from_bytes(&[0x5e; 32]);
+        let owner_id =
+            stellar_strkey::ed25519::PublicKey(owner.verifying_key().to_bytes()).to_string();
+        keyring_core::Entry::new(
+            &profile.policy_owner_key_id.service,
+            &profile.policy_owner_key_id.account,
+        )
+        .unwrap()
+        .set_password(&owner_id)
+        .unwrap();
+        let body = format!(
+            "version = 2\nscope = \"profile:memo-parity\"\nsequence = 1\n[[rules]]\nmatch = {{tool = \"*\", chain = \"stellar:testnet\"}}\ncriteria = [{{kind = \"memo_binding\", bindings = [{{destination = \"{DEST_G}\", kind = \"id\", value = \"18446744073709551615\"}}]}}]\ndecision = \"allow\"\n"
+        );
+        let signature = sign(&digest(&canonical_bytes(&body).unwrap()), &owner);
+        let policies = default_policy_dir().unwrap();
+        std::fs::create_dir_all(&policies).unwrap();
+        std::fs::write(
+            policies.join("memo-parity.toml"),
+            format!(
+                "{body}\n[signature]\nowner_id = \"{owner_id}\"\nsig = \"{}\"\n",
+                stellar_agent_core::hex::encode(&signature)
+            ),
+        )
+        .unwrap();
+        let base = stellar_strkey::ed25519::PublicKey::from_string(DEST_G)
+            .unwrap()
+            .0;
+        for id in [None, Some(0), Some(u64::MAX)] {
+            let destination = id.map_or_else(
+                || DEST_G.to_owned(),
+                |id| {
+                    stellar_strkey::ed25519::MuxedAccount { ed25519: base, id }
+                        .to_string()
+                        .to_string()
+                },
+            );
+            let make_args = || {
+                let mut args = signed_payment_args(&signer, &primary.uri());
+                args.profile = Some("memo-parity".into());
+                args.destination = destination.clone();
+                args.memo_id = Some(u64::MAX);
+                args.build_only = true;
+                args
+            };
+            let mut args = make_args();
+            let (code, built, signers) = invoke(&args, &profile).await;
+            assert_eq!(code, 0, "memo preparation: {built}");
+            assert_eq!(signers, 0);
+            let unsigned = built["data"]["envelope_xdr"].as_str().unwrap().to_owned();
+            let facts = stellar_agent_core::envelope_decode::decode_authoritative_args(
+                &unsigned,
+                "stellar_pay_commit",
+            )
+            .unwrap();
+            assert_eq!(facts["memo_id"], "18446744073709551615");
+            assert_eq!(facts["destination"], destination);
+
+            for build_only in [true, false] {
+                let sends = methods(&primary)
+                    .await
+                    .iter()
+                    .filter(|m| *m == "sendTransaction")
+                    .count();
+                let mut wrong = make_args();
+                wrong.build_only = build_only;
+                wrong.memo_id = None;
+                wrong.memo_text = Some(u64::MAX.to_string());
+                let (code, result, signers) = invoke(&wrong, &profile).await;
+                assert_eq!(code, 1, "{result}");
+                assert_eq!(result["error"]["code"], "policy.deny.memo_binding_mismatch");
+                assert!(
+                    !result["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains(&u64::MAX.to_string())
+                );
+                assert_eq!(signers, 0);
+                assert_eq!(
+                    methods(&primary)
+                        .await
+                        .iter()
+                        .filter(|m| *m == "sendTransaction")
+                        .count(),
+                    sends
+                );
+            }
+
+            // The signed envelope owns the memo even when caller flags disagree.
+            let mut staged = make_args();
+            staged.build_only = false;
+            staged.memo_id = None;
+            staged.memo_text = Some("支払".into());
+            staged.sign_only = Some(unsigned.clone());
+            let (code, signed, _) = invoke(&staged, &profile).await;
+            assert_eq!(code, 0, "signed facts: {signed}");
+            staged.sign_only = None;
+            staged.secret_env = None;
+            staged.submit_only = Some(signed["data"]["envelope_xdr"].as_str().unwrap().into());
+            let (code, submitted, _) = invoke(&staged, &profile).await;
+            assert_eq!(code, 0, "submitted facts: {submitted}");
+
+            let TransactionEnvelope::Tx(mut changed) =
+                TransactionEnvelope::from_xdr_base64(&unsigned, Limits::none()).unwrap()
+            else {
+                panic!("v1");
+            };
+            changed.tx.memo = Memo::Text(u64::MAX.to_string().into_bytes().try_into().unwrap());
+            let wrong_xdr = TransactionEnvelope::Tx(changed)
+                .to_xdr_base64(Limits::none())
+                .unwrap();
+            for submit in [false, true] {
+                let sends = methods(&primary)
+                    .await
+                    .iter()
+                    .filter(|m| *m == "sendTransaction")
+                    .count();
+                let mut forged = make_args();
+                forged.build_only = false;
+                if submit {
+                    forged.submit_only = Some(
+                        attach_signature(
+                            &wrong_xdr,
+                            &stellar_agent_network::SoftwareSigningKey::new_from_bytes([0x5d; 32]),
+                            stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+                        )
+                        .await
+                        .unwrap(),
+                    );
+                } else {
+                    forged.sign_only = Some(wrong_xdr.clone());
+                }
+                let (code, result, signers) = invoke(&forged, &profile).await;
+                assert_eq!(code, 1, "forged caller memo: {result}");
+                assert_eq!(result["error"]["code"], "policy.deny.memo_binding_mismatch");
+                assert_eq!(signers, 0);
+                assert_eq!(
+                    methods(&primary)
+                        .await
+                        .iter()
+                        .filter(|m| *m == "sendTransaction")
+                        .count(),
+                    sends
+                );
+            }
+
+            args.build_only = false;
+            args.amount = "2 XLM".into();
+            let (code, full, _) = invoke(&args, &profile).await;
+            assert_eq!(code, 0, "full payment: {full}");
+        }
+    }
+
     /// An unsigned payment envelope from `signer`, built against an endpoint
     /// of its own so the endpoint under test sees only the stage's requests.
     async fn unsigned_payment_from(signer: &EnvSigner) -> String {
@@ -6764,6 +6956,38 @@ pub(crate) mod tests {
             let mut args = mainnet_args(fixture);
             args.memo_text = Some("invoice 7".to_owned());
             args
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mainnet_pay_memo_policy_prepare_commit_parity() {
+            let fixture = Spec::new("pay-memo-mainnet")
+                .rules(vec![pay_rule("allow", &format!(
+                    "{{kind = \"memo_binding\", bindings = [{{destination = \"{DESTINATION}\", kind = \"id\", value = \"0\"}}]}},"
+                ))])
+                .build().await;
+            let mut args = mainnet_args(&fixture);
+            args.memo_text = Some("0".into());
+            let refused = run(&fixture, &args).await;
+            assert_refused_before_confirmation(
+                &fixture,
+                &refused,
+                "policy.deny.memo_binding_mismatch",
+            )
+            .await;
+            args.memo_text = None;
+            args.memo_id = Some(0);
+            args.business_id = Some(crate::common::business_entry::fresh_business_id());
+            let allowed = run(&fixture, &args).await;
+            assert_eq!(allowed.code, 0, "mainnet memo: {}", allowed.envelope);
+            let sent = fixture.sent_envelopes().await;
+            assert_eq!(sent.len(), 1);
+            let facts = stellar_agent_core::envelope_decode::decode_authoritative_args(
+                &sent[0],
+                "stellar_pay_commit",
+            )
+            .unwrap();
+            assert_eq!(facts["memo_id"], "0");
         }
 
         /// One run of the verb: its exit code and the envelope it printed.
