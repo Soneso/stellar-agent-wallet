@@ -682,22 +682,34 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
-    #[allow(
-        unsafe_code,
-        reason = "test-only, serialised via #[serial]: process-env mutation is race-free with \
-                  no concurrent readers of this specific var"
-    )]
     fn with_isolated_home<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
-        let dir = tempfile::TempDir::new().unwrap();
-        unsafe {
-            stellar_agent_test_support::sandbox::mark_sandbox(dir.path()).unwrap();
-            std::env::set_var("STELLAR_AGENT_HOME", dir.path());
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        f(dir.path())
+    }
+
+    #[test]
+    #[serial]
+    fn isolated_home_restores_previous_home_after_return_and_unwind() {
+        let outer = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(outer.path());
+        let previous = std::env::var_os("STELLAR_AGENT_HOME");
+        for should_panic in [false, true] {
+            let outcome = std::panic::catch_unwind(|| {
+                with_isolated_home(|home| {
+                    assert_ne!(home, outer.path());
+                    assert_eq!(
+                        stellar_agent_core::profile::schema::canonical_data_root().unwrap(),
+                        home
+                    );
+                    if should_panic {
+                        panic!("fixture closure unwinds");
+                    }
+                });
+            });
+            assert_eq!(outcome.is_err(), should_panic);
+            assert_eq!(std::env::var_os("STELLAR_AGENT_HOME"), previous);
         }
-        let result = f(dir.path());
-        unsafe {
-            std::env::remove_var("STELLAR_AGENT_HOME");
-        }
-        result
     }
 
     #[test]

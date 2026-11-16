@@ -14805,19 +14805,19 @@ pub(crate) mod tests {
                     &TransitionEvidence::default(),
                 )
                 .unwrap();
+            // Keep the template after its record leaves under the cap.
+            let template = fx.record(filler.id());
+            // Later copies make the original filler the first eligible eviction.
+            fx.clock.set(fx.now() + 1);
             let fill = |fx: &Fx, first: usize, count: usize| {
                 fx.rewrite(|wire| {
                     let section = wire.operations.as_mut().unwrap();
-                    let template = section
-                        .records
-                        .iter()
-                        .find(|record| record.id == filler.id())
-                        .unwrap()
-                        .clone();
                     for n in first..first + count {
                         let mut extra = template.clone();
                         extra.id = OperationId::random();
                         extra.business_id = BusinessId::parse(&format!("fill-{n}")).unwrap();
+                        extra.updated_at_ms = fx.now();
+                        extra.closed_at_ms = Some(extra.updated_at_ms);
                         section.records.push(extra);
                     }
                 });
@@ -14833,6 +14833,10 @@ pub(crate) mod tests {
             assert_eq!(terminal(&fx), TERMINAL_RECORDS_MAX + 1);
             fx.prune_now();
             assert_eq!(terminal(&fx), TERMINAL_RECORDS_MAX);
+            assert!(
+                records(&fx.wire()).iter().all(|r| r.id != filler.id()),
+                "the original filler leaves before the refill"
+            );
             assert!(
                 kept(&fx),
                 "the cap removes the success before its hold is final"

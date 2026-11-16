@@ -2270,6 +2270,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(keyring)]
     #[allow(clippy::unwrap_used, reason = "test fixtures and assertions")]
+    #[serial_test::serial]
     async fn pay_memo_policy_prepare_commit_parity() {
         use crate::tools::common::tests::mainnet::{ClassicRun, Tool, authorizations, wire};
         use stellar_xdr::{Limits, ReadXdr, TransactionEnvelope, WriteXdr};
@@ -2372,6 +2373,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(keyring)]
     #[allow(clippy::unwrap_used, reason = "test assertions")]
+    #[serial_test::serial]
     async fn a_malformed_payment_leg_refuses_before_exposure() {
         use crate::tools::common::tests::mainnet::{ClassicRun, Tool, authorizations};
         let run = ClassicRun::allowed(Tool::Pay).await;
