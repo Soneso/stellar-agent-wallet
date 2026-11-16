@@ -104,6 +104,12 @@ passing `details.tx_hash` to `stellar_transaction_status` (or
 `stellar-agent tx status`), and never resubmit: no recovery path sends a
 transaction again.
 
+Unknown-submission details include `recovery.reason: "RecoveryRequired"`
+and `recovery.next_action: "TargetedStatus"`. A finite envelope bound supplies
+`earliest_retry_ms`, exactly six seconds after maxTime in Unix milliseconds.
+Otherwise the time is absent and `retry_time_unavailable` names `MissingBound`
+or `Overflow`. This guidance grants no resubmission or successor permission.
+
 ## Tool shapes
 
 Each tool is read-only, signs without submitting, or signs and submits; the

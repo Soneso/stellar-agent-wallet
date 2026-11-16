@@ -1841,6 +1841,24 @@ diagnostic. An endpoint whose transaction retention starts after the
 attempt's pre-exposure ledger marks the attempt's history incomplete. That
 mark is sticky, and no history non-inclusion is decided on it.
 
+The library recovery report carries attempt identity, scheduling advice,
+typed chain results and the authenticated settlement reference. Writer,
+identity and store refusals retain their codes and any subsequently verified
+state. An unavailable state read is explicit. Receipt display data and a
+scheduling label supply no settlement authority.
+
+One recovery call uses at most four shared requests and 24 attempt requests
+within 20 seconds. Ledger scans resume from the stored next unread ledger.
+The target is recomputed on each run. A complete-history decision requires
+a durable scan end and a later covering transaction pair. Reports preserve
+the existing proof without adding an interval binding.
+
+Ordinary status and dispatch respect the stored retry class and time.
+Automatic work resumes on a later eligible call; there is no background timer.
+An explicit stop requires the reported configuration, record or evidence to
+be resolved. Sixteen spent reservations stop automatic recovery. These
+reports introduce no new retry command.
+
 A further attempt needs the last attempt's checked non-inclusion, projected
 onto its receipt; otherwise it refuses with `recovery.retry_refused`. The new
 attempt's authorization must carry the predecessor's policy digest and

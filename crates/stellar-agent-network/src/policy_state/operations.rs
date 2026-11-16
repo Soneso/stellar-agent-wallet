@@ -5295,7 +5295,7 @@ impl<'a> OperationStatus<'a> {
         let configuration = super::recovery_run::recovery_configuration_digest(self.profile);
         let mut candidates = Vec::new();
         for record in records(&wire) {
-            if record.state != OperationState::SentOutcomeUnknown || record.kind.is_x402() {
+            if (record.state != OperationState::SentOutcomeUnknown) || record.kind.is_x402() {
                 continue;
             }
             for attempt in &record.attempts {
@@ -5382,12 +5382,29 @@ impl<'a> OperationStatus<'a> {
         &self,
         tx_hash: Option<&[u8; 32]>,
     ) -> Result<Vec<RecoveryAttempt>, WindowStoreError> {
+        self.classic_snapshot(tx_hash, false)
+    }
+
+    pub(super) fn reporting_snapshot(
+        &self,
+        tx_hash: Option<&[u8; 32]>,
+    ) -> Result<Vec<RecoveryAttempt>, WindowStoreError> {
+        self.classic_snapshot(tx_hash, true)
+    }
+
+    fn classic_snapshot(
+        &self,
+        tx_hash: Option<&[u8; 32]>,
+        reporting: bool,
+    ) -> Result<Vec<RecoveryAttempt>, WindowStoreError> {
         let Some(wire) = self.read()? else {
             return Ok(Vec::new());
         };
         let mut attempts = Vec::new();
         for record in records(&wire) {
-            if record.state != OperationState::SentOutcomeUnknown || record.kind.is_x402() {
+            if (!reporting && record.state != OperationState::SentOutcomeUnknown)
+                || record.kind.is_x402()
+            {
                 continue;
             }
             for attempt in &record.attempts {
@@ -5402,7 +5419,7 @@ impl<'a> OperationStatus<'a> {
                     continue;
                 };
                 // A matched release stays selected until a decision resolves it.
-                if attempt.outcome != Some(OperationState::SentOutcomeUnknown)
+                if (!reporting && attempt.outcome != Some(OperationState::SentOutcomeUnknown))
                     || tx_hash.is_some_and(|hash| hash != stored_hash)
                 {
                     continue;
@@ -5444,7 +5461,9 @@ impl<'a> OperationStatus<'a> {
                 attempt.attempt_index,
             )
         });
-        attempts.truncate(if tx_hash.is_some() { 1 } else { 4 });
+        if !reporting {
+            attempts.truncate(if tx_hash.is_some() { 1 } else { 4 });
+        }
         Ok(attempts)
     }
 
@@ -6780,6 +6799,20 @@ pub(crate) mod tests {
                 .unwrap();
             record.attempts[0].send_by_ms = due_ms;
         });
+        handle
+    }
+
+    /// A `Sending` attempt of `order-{n}` whose authorization its holder
+    /// invalidated unused, so the next expiry step ends it as `NotSent`.
+    pub(crate) fn invalidated_sending(fx: &mut Fx, n: u8) -> OperationHandle {
+        let handle = fx.open_new(&request(&format!("order-{n}"), canonical(n)));
+        let mint = fx.mint_request(tx(n), fx.policy(), vec![]);
+        let started = fx.begin_mint(&handle, &mint).unwrap();
+        assert!(
+            fx.store
+                .invalidate_authorization(&fx.profile, started.authorization_id, "abandoned")
+                .unwrap()
+        );
         handle
     }
 

@@ -20,6 +20,7 @@ use wiremock::{Mock, MockServer};
 
 const NOW: u64 = 1_800_000_000_000;
 
+mod report_tests;
 mod scan_tests;
 
 type WriteHook = Box<dyn FnMut(u8)>;
@@ -574,7 +575,7 @@ async fn driver_untimed_cap_and_backoff() {
 
 #[tokio::test]
 #[serial]
-async fn driver_eligibility_and_filter_before_four() {
+async fn stopped_attempts_do_not_starve_selection() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let _storage_home =
         stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
@@ -599,7 +600,24 @@ async fn driver_eligibility_and_filter_before_four() {
         .collect();
     let report = fx.run(&pair).await.unwrap();
     assert_eq!(report.evaluated, 1);
-    assert_eq!(report.attempts[0].operation_id, fx.ids[4]);
+    assert_eq!(report.attempts.len(), 5);
+    assert_eq!(report.attempts[4].operation_id, fx.ids[4]);
+    assert!(matches!(
+        report.attempts[4].result,
+        RecoveryResult::NeverApplicable { .. }
+    ));
+    assert!(report.attempts[..4].iter().all(|a| matches!(
+        a.result,
+        RecoveryResult::NeedsEvidence {
+            reason: RecoveryReason::RecordUnusable,
+            ..
+        }
+    )));
+    let bytes = std::fs::read(fx.fx.store.path()).unwrap();
+    let replay = fx.run(&pair).await.unwrap();
+    assert_eq!(replay.attempts, report.attempts);
+    assert_eq!(replay.requests, RecoveryRequests::default());
+    assert_eq!(std::fs::read(fx.fx.store.path()).unwrap(), bytes);
     assert_eq!(
         report.requests,
         RecoveryRequests {
@@ -811,7 +829,9 @@ async fn driver_prefix_and_identity_are_read_only() {
     for _ in 0..2 {
         let error = fx.run(&pair).await.unwrap_err();
         assert_eq!(error.code(), "network.endpoint_network_mismatch");
-        assert!(matches!(error, RecoveryError::EndpointIdentity(_)));
+        assert!(
+            matches!(&error, RecoveryError::Context { source, .. } if matches!(source.as_ref(), RecoveryError::EndpointIdentity(_)))
+        );
         assert_eq!(std::fs::read(fx.fx.store.path()).unwrap(), before);
     }
     assert_eq!(rpc_request_count(&pair[0], "getNetwork").await, 2);
@@ -915,7 +935,7 @@ async fn driver_audit_append_seam_keeps_prior_generation() {
             "submission.record_unavailable",
             "stage {stage}"
         );
-        let RecoveryError::Context { source, detail } = error else {
+        let RecoveryError::Context { source, detail, .. } = error else {
             panic!("verified context required")
         };
         assert!(matches!(
@@ -965,7 +985,7 @@ async fn commit_seams(stages: &[u8], seams: &[u8]) {
             } else {
                 let error = result.unwrap_err();
                 assert_eq!(error.code(), "submission.record_unavailable");
-                let RecoveryError::Context { source, detail } = error else {
+                let RecoveryError::Context { source, detail, .. } = error else {
                     panic!("verified context required")
                 };
                 assert!(matches!(
@@ -2183,7 +2203,7 @@ async fn driver_writer_schedule_overflow_has_store_context() {
         let before = serde_json::to_vec(&fx.fx.record(fx.ids[0])).unwrap();
         let error = fx.run(&pair).await.unwrap_err();
         assert_eq!(error.code(), "submission.record_unavailable");
-        let RecoveryError::Context { source, detail } = error else {
+        let RecoveryError::Context { source, detail, .. } = error else {
             panic!("store context")
         };
         assert!(
@@ -2325,6 +2345,13 @@ async fn driver_prefix_quality_is_ephemeral_and_unavailable_is_unknown() {
     let _hook = Hook;
     let error = fx.run(&pair).await.unwrap_err();
     assert_eq!(error.code(), "submission.record_unavailable");
+    assert_eq!(
+        error
+            .report()
+            .and_then(|r| r.refusal.as_ref())
+            .map(|r| (r.code, r.state_unavailable)),
+        Some(("submission.record_unavailable", true))
+    );
     let RecoveryError::Context { detail, .. } = error else {
         panic!("store context")
     };
@@ -2420,7 +2447,14 @@ async fn driver_four_timed_attempts_share_one_prefix() {
     let _clock = stellar_agent_test_support::timing::ClockHold::new();
     let report = fx.run(&pair).await.unwrap();
     assert_eq!(report.evaluated, 4);
-    assert_eq!(report.attempts.len(), 4);
+    assert!(matches!(
+        report.attempts[4].result,
+        RecoveryResult::NeedsEvidence {
+            reason: RecoveryReason::RecoveryRequired,
+            ..
+        }
+    ));
+    assert_eq!(report.attempts.len(), 5);
     assert_eq!(
         report.requests,
         RecoveryRequests {
@@ -2432,6 +2466,7 @@ async fn driver_four_timed_attempts_share_one_prefix() {
         report
             .attempts
             .iter()
+            .take(4)
             .all(|a| a.view.state == RecoveryRunState::Resolved)
     );
     assert_eq!(
@@ -3079,6 +3114,7 @@ async fn driver_store_context_reaches_unchanged_warning_adapter() {
     );
     let pass = crate::submission_flow::ReconcilePass::RecoveryFailed {
         legacy: Default::default(),
+        recovery: error.report().cloned().unwrap_or_default(),
         error,
     };
     let (warnings, guard) = stellar_agent_test_support::WarningCapture::capture(None);

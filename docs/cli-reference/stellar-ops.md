@@ -714,10 +714,12 @@ What it changes:
 On a mainnet profile no single endpoint answer settles a submission. Before
 its accounting horizon, a submission with an unknown outcome stays `pending`
 with its reservation open, even when the primary endpoint reports `SUCCESS`.
-The verb still reads the primary endpoint and shows its answer as
-`chain_status`, but records nothing from it on the receipt. Only a checked
-recovery decision settles the chain outcome: the primary endpoint and the
-oracle named by `oracle_provider_url` give the same answer in one pass.
+For an authenticated classic attempt, `chain_status` uses the recovery result.
+An included decision supplies `SUCCESS` or `FAILED`; proven non-inclusion
+supplies `NOT_FOUND`. Without validated cached evidence it shows `UNKNOWN`.
+This path sends no additional transaction lookup. A record without a managed
+attempt keeps the primary lookup. Only a checked recovery decision settles
+the chain outcome.
 
 Once the accounting horizon passes, the verb commits the accounting expiry and
 projects it onto the receipt. A `pending` or `ambiguous` receipt becomes

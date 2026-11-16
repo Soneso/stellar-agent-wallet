@@ -257,9 +257,38 @@ pub fn submission_details(
             envelope_hash_hex(signed_xdr).into(),
         );
     }
+    details.insert("recovery".to_owned(), initial_recovery(signed_xdr));
     details.insert("outcome".to_owned(), "unknown".into());
     details.insert("reconcile_with".to_owned(), reconcile_with.into());
     Some(serde_json::Value::Object(details))
+}
+
+#[derive(serde::Serialize)]
+enum RetryTimeUnavailable {
+    MissingBound,
+    Overflow,
+}
+
+fn initial_recovery(signed_xdr: &str) -> serde_json::Value {
+    let bound = crate::operation_entry::envelope_max_time(signed_xdr)
+        .ok()
+        .filter(|m| *m > 0 && *m != u64::MAX);
+    let retry = bound.and_then(crate::policy_state::recovery_expiry);
+    let mut result = serde_json::json!({
+        "result": "NeedsEvidence",
+        "reason": "RecoveryRequired",
+        "next_action": "TargetedStatus",
+    });
+    if let Some(retry) = retry {
+        result["earliest_retry_ms"] = retry.into();
+    } else {
+        result["retry_time_unavailable"] = serde_json::json!(if bound.is_some() {
+            RetryTimeUnavailable::Overflow
+        } else {
+            RetryTimeUnavailable::MissingBound
+        });
+    }
+    result
 }
 
 /// Renders a wallet error with submission recovery details when available.
@@ -309,6 +338,13 @@ pub fn settlement_oracle(
 pub enum ReconcilePass {
     /// The pass completes over the due reservations.
     Completed(ReconcileReport),
+    /// Legacy accounting and bounded recovery completed.
+    Recovered {
+        /// Legacy accounting counts.
+        legacy: ReconcileReport,
+        /// Verified recovery results, retained through the finisher.
+        recovery: crate::policy_state::RecoveryReport,
+    },
     /// The system clock is unavailable, so the pass is skipped.
     ClockUnavailable,
     /// The primary RPC client is unavailable, so the pass is skipped.
@@ -329,6 +365,8 @@ pub enum ReconcilePass {
         /// The first recovery refusal; only validated evidence can commit,
         /// and completed commits stand.
         error: crate::policy_state::RecoveryError,
+        /// Readable results even when recovery or projection refuses.
+        recovery: crate::policy_state::RecoveryReport,
     },
 }
 
@@ -351,7 +389,9 @@ pub fn finish_reconciliation(
     writer: impl FnOnce() -> Result<Arc<Mutex<AuditWriter>>, WalletError>,
 ) -> Result<DeliveryReport, WalletError> {
     match pass {
-        ReconcilePass::Completed(report) | ReconcilePass::RecoveryFailed { legacy: report, .. }
+        ReconcilePass::Completed(report)
+        | ReconcilePass::Recovered { legacy: report, .. }
+        | ReconcilePass::RecoveryFailed { legacy: report, .. }
             if report.receipt_write_failed > 0 =>
         {
             tracing::warn!(
@@ -360,7 +400,9 @@ pub fn finish_reconciliation(
                 "window reconcile: receipt writes stay owed"
             );
         }
-        ReconcilePass::Completed(_) | ReconcilePass::RecoveryFailed { .. } => {}
+        ReconcilePass::Completed(_)
+        | ReconcilePass::Recovered { .. }
+        | ReconcilePass::RecoveryFailed { .. } => {}
         ReconcilePass::ClockUnavailable => {
             tracing::debug!("window reconcile: system clock unavailable; reservations stand");
         }
@@ -387,12 +429,13 @@ pub fn finish_reconciliation(
             )
         }
         ReconcilePass::RecoveryFailed {
-            error: error @ crate::policy_state::RecoveryError::Context { source, detail },
+            error: error @ crate::policy_state::RecoveryError::Context { source, detail, .. },
             ..
         } if detail.starts_with("selected sequences: ")
             || matches!(
                 source.as_ref(),
-                crate::policy_state::RecoveryError::Context { .. }
+                crate::policy_state::RecoveryError::Context { source, .. }
+                    if matches!(source.as_ref(), crate::policy_state::RecoveryError::Store(_))
             ) =>
         {
             tracing::warn!(
@@ -403,14 +446,20 @@ pub fn finish_reconciliation(
             )
         }
         ReconcilePass::RecoveryFailed {
-            error: error @ crate::policy_state::RecoveryError::Context { .. },
+            error: error @ crate::policy_state::RecoveryError::Context { source, .. },
             ..
-        } => tracing::warn!(
-            profile = %profile_name,
-            code = error.code(),
-            error = %error,
-            "recovery: the stage refused; every sequence stays held"
-        ),
+        } if !matches!(
+            source.as_ref(),
+            crate::policy_state::RecoveryError::EndpointIdentity(_)
+        ) =>
+        {
+            tracing::warn!(
+                profile = %profile_name,
+                code = error.code(),
+                error = %error,
+                "recovery: the stage refused; every sequence stays held"
+            )
+        }
         ReconcilePass::RecoveryFailed { error, .. }
             if !matches!(error, crate::policy_state::RecoveryError::NeedsEvidence(_)) =>
         {
@@ -422,6 +471,15 @@ pub fn finish_reconciliation(
             );
         }
         _ => {}
+    }
+    if let ReconcilePass::Recovered { recovery, .. }
+    | ReconcilePass::RecoveryFailed { recovery, .. } = pass
+    {
+        tracing::debug!(
+            evaluated = recovery.evaluated,
+            attempts = recovery.attempts.len(),
+            "recovery: bounded results retained"
+        );
     }
     drain_accounting_obligations(window, profile, profile_name, receipts, writer)
 }
@@ -440,9 +498,9 @@ const SEQUENCES_MISSING_EVIDENCE: &str = "sequence recovery evidence missing; ";
 /// past its window ends before any work reads it. A failure there is logged
 /// and the pass continues.
 ///
-/// A completed pass maps to [`ReconcilePass::Completed`]; a refusal of the
-/// window store maps to [`ReconcilePass::Failed`] and leaves every open
-/// reservation in place.
+/// Successful recovery returns [`ReconcilePass::Recovered`]. A legacy-only pass
+/// returns [`ReconcilePass::Completed`], or [`ReconcilePass::Failed`] on refusal.
+/// Earlier committed work remains committed.
 ///
 /// After a completed legacy stage, the recovery stage runs the bounded
 /// recovery driver of [`crate::policy_state::recover_outcomes`] once, then repairs the receipt of
@@ -594,7 +652,13 @@ async fn reconcile_stages(
     #[cfg(test)]
     RECOVERY_STAGE_TRACE.with_borrow_mut(|trace| trace.push("expire"));
     let writer = if profile.chain_id.is_mainnet() {
-        expire_due_operations(profile, window, now_ms, operations_writer, committed)
+        Some(expire_due_operations(
+            profile,
+            window,
+            now_ms,
+            operations_writer,
+            committed,
+        ))
     } else {
         None
     };
@@ -615,6 +679,21 @@ async fn reconcile_stages(
     let (Some(writer), ReconcilePass::Completed(report)) = (writer, &legacy) else {
         return legacy;
     };
+    let writer = match writer {
+        Ok(writer) => writer,
+        Err(error) => {
+            let recovery = crate::policy_state::RecoveryReport::refused(
+                &crate::policy_state::OperationStatus::new(window, profile),
+                None,
+                error.code(),
+            );
+            return ReconcilePass::RecoveryFailed {
+                legacy: report.clone(),
+                error,
+                recovery,
+            };
+        }
+    };
     // The one recovery driver runs first; a projection refusal never starves it.
     let sequences = crate::policy_state::recovery::recover_outcomes_committed(
         window,
@@ -624,19 +703,51 @@ async fn reconcile_stages(
         None,
         committed,
     )
-    .await
-    .and_then(crate::policy_state::RecoveryReport::require_evidence);
+    .await;
+    let mut recovery_report = match &sequences {
+        Ok(report) => report.clone(),
+        Err(error) => error.report().cloned().unwrap_or_else(|| {
+            crate::policy_state::RecoveryReport::refused(
+                &crate::policy_state::OperationStatus::new(window, profile),
+                None,
+                error.code(),
+            )
+        }),
+    };
+    let sequences = sequences.and_then(crate::policy_state::RecoveryReport::require_evidence);
     #[cfg(test)]
     recovery::tests::trace("sequences");
     let repaired = receipts.map_or(Ok(()), |receipts| {
         recovery::repair_committed_receipts(window, profile, receipts, &writer, None)
     });
+    if let Err(error) = &sequences {
+        recovery_report.refusal = Some(crate::policy_state::RecoveryRefusal {
+            code: error.code(),
+            state_unavailable: recovery_report
+                .refusal
+                .as_ref()
+                .is_some_and(|r| r.state_unavailable),
+        });
+    }
+    recovery_report.refresh_settlements(
+        &crate::policy_state::OperationStatus::new(window, profile),
+        None,
+    );
+    if let Err(error) = &repaired {
+        recovery_report
+            .refusal
+            .get_or_insert(crate::policy_state::RecoveryRefusal {
+                code: error.code(),
+                state_unavailable: false,
+            });
+    }
     match (sequences, repaired) {
         (Err(error), repaired)
             if !matches!(error, crate::policy_state::RecoveryError::NeedsEvidence(_)) =>
         {
             ReconcilePass::RecoveryFailed {
                 legacy: report.clone(),
+                recovery: recovery_report.clone(),
                 error: match repaired {
                     Err(refused) => error.with_context(refused.to_string()),
                     Ok(()) => error,
@@ -651,6 +762,7 @@ async fn reconcile_stages(
             };
             ReconcilePass::RecoveryFailed {
                 legacy: report.clone(),
+                recovery: recovery_report.clone(),
                 error: crate::policy_state::RecoveryError::Store(WindowStoreError::Invalid {
                     detail: format!("{prefix}{refused}"),
                 }),
@@ -659,8 +771,12 @@ async fn reconcile_stages(
         (Err(error), Ok(())) => ReconcilePass::RecoveryFailed {
             legacy: report.clone(),
             error,
+            recovery: recovery_report,
         },
-        (Ok(_), Ok(())) => legacy,
+        (Ok(_), Ok(())) => ReconcilePass::Recovered {
+            legacy: report.clone(),
+            recovery: recovery_report,
+        },
     }
 }
 
@@ -695,7 +811,7 @@ fn expire_due_operations(
     now_ms: u64,
     writer: impl FnOnce() -> Result<Arc<Mutex<AuditWriter>>, WalletError>,
     committed: &mut CommittedBatch,
-) -> Option<Arc<Mutex<AuditWriter>>> {
+) -> Result<Arc<Mutex<AuditWriter>>, crate::policy_state::RecoveryError> {
     let writer = match writer() {
         Ok(writer) => writer,
         Err(error) => {
@@ -703,18 +819,21 @@ fn expire_due_operations(
                 code = error.code(),
                 "operation expiry: no audit writer; expiry edges wait for the next step"
             );
-            return None;
+            return Err(crate::policy_state::RecoveryError::Writer(error));
         }
     };
     let Ok(mut guard) = writer.lock() else {
         tracing::warn!("operation expiry: the audit writer mutex is poisoned; expiry skipped");
-        return None;
+        return Err(WindowStoreError::Invalid {
+            detail: "audit writer mutex is poisoned".into(),
+        }
+        .into());
     };
     let request_id = uuid::Uuid::new_v4().to_string();
     let mut recorder = OperationRecorder::new(window, profile, &mut *guard, request_id);
     let expired = recorder.expire_due(now_ms);
     committed.append(recorder.take_committed());
-    match expired {
+    match &expired {
         Ok(0) => {}
         Ok(ended) => tracing::debug!(ended, "operation expiry: records ended"),
         Err(error) => tracing::warn!(
@@ -723,7 +842,7 @@ fn expire_due_operations(
         ),
     }
     drop(guard);
-    Some(writer)
+    Ok(writer)
 }
 
 /// Inputs for reconciling and displaying one transaction.
@@ -745,9 +864,11 @@ pub struct StatusRequest<'a> {
 /// The chain observation and the records after reconciliation and delivery.
 #[derive(Debug)]
 pub struct StatusOutcome {
-    /// The endpoint's transaction status.
+    /// Recovery results for authenticated mainnet classic attempts.
+    pub recovery: crate::policy_state::RecoveryReport,
+    /// Managed cached status or UNKNOWN; otherwise the endpoint's status.
     pub chain_status: String,
-    /// The ledger the endpoint reports.
+    /// The including ledger, when known.
     pub ledger: Option<u32>,
     /// The resulting submission receipt.
     pub record: Option<SubmissionReceipt>,
@@ -846,6 +967,9 @@ impl<F: Fn() -> Result<Arc<Mutex<AuditWriter>>, WalletError>> OnceWriter<F> {
 }
 
 /// Reconciles one transaction and reads its resulting receipt and reservation.
+/// Managed hashes use cached recovery evidence or UNKNOWN without an extra RPC.
+/// Unmanaged hashes retain the primary lookup.
+///
 /// Mainnet recovery and accounting delivery use the caller's audit writer.
 /// After reconciliation, recovery, the drain and receipt repair share one
 /// writer acquisition, made by the first of them that needs it.
@@ -947,31 +1071,52 @@ pub async fn transaction_status_committed(
         state: WriterState::Unacquired,
     };
     let mut sequences = "not run";
+    let mut recovery_report = crate::policy_state::RecoveryReport::default();
     if profile.chain_id.is_mainnet()
         && status_recovery_enabled()
         && let Ok(hash) = stellar_agent_core::hex::decode_hex32(tx_hash)
-        && let Some(writer) = writer.handle()
     {
-        sequences = "completed";
-        if let Err(error) = crate::policy_state::recovery::recover_outcomes_committed(
-            window,
-            profile,
-            crate::policy_state::EndpointPair::from_clients(client, oracle),
-            &writer,
+        let status = crate::policy_state::OperationStatus::new(window, profile);
+        recovery_report = crate::policy_state::RecoveryReport::read(
+            &status,
             Some(&hash),
-            committed,
+            stellar_agent_core::timefmt::now_unix_ms().map_err(StatusFailure::ClockUnavailable)?,
         )
-        .await
-        .and_then(crate::policy_state::RecoveryReport::require_evidence)
-        {
-            if matches!(error, crate::policy_state::RecoveryError::NeedsEvidence(_)) {
-                sequences = "evidence missing";
-            } else {
-                sequences = "refused";
-                // The status answer stands; the drain below runs as on the
-                // refused reconciliation path.
-                warn_status_recovery_refusal(profile_name, &error);
+        .map_err(StatusFailure::WindowUnreadable)?;
+        if let Some(handle) = writer.handle() {
+            match crate::policy_state::recovery::recover_outcomes_committed(
+                window,
+                profile,
+                crate::policy_state::EndpointPair::from_clients(client, oracle),
+                &handle,
+                Some(&hash),
+                committed,
+            )
+            .await
+            {
+                Ok(report) => {
+                    sequences = if report.missing.is_some() {
+                        "evidence missing"
+                    } else {
+                        "completed"
+                    };
+                    recovery_report = report;
+                }
+                Err(error) => {
+                    sequences = "refused";
+                    recovery_report = error.report().cloned().unwrap_or_else(|| {
+                        crate::policy_state::RecoveryReport::refused(
+                            &status,
+                            Some(&hash),
+                            error.code(),
+                        )
+                    });
+                    warn_status_recovery_refusal(profile_name, &error);
+                }
             }
+        } else if let WriterState::Refused(Some(error)) = &writer.state {
+            recovery_report =
+                crate::policy_state::RecoveryReport::refused(&status, Some(&hash), error.code());
         }
     }
     // The status answer does not depend on the drain: a refusal is logged by
@@ -985,6 +1130,12 @@ pub async fn transaction_status_committed(
         && let Err(refused) =
             recovery::repair_committed_receipts(window, profile, &receipts, &writer, Some(&hash))
     {
+        recovery_report
+            .refusal
+            .get_or_insert(crate::policy_state::RecoveryRefusal {
+                code: refused.code(),
+                state_unavailable: false,
+            });
         // The status answer stands; a later call repeats the refused repair.
         tracing::warn!(
             profile = %profile_name,
@@ -1011,10 +1162,34 @@ pub async fn transaction_status_committed(
         )
         .map_err(StatusFailure::RepairRefused)?;
     }
-    let chain = client
-        .get_transaction_status(tx_hash)
-        .await
-        .map_err(StatusFailure::ChainQueryFailed)?;
+    if profile.chain_id.is_mainnet()
+        && let Ok(hash) = stellar_agent_core::hex::decode_hex32(tx_hash)
+    {
+        recovery_report.refresh_settlements(
+            &crate::policy_state::OperationStatus::new(window, profile),
+            Some(&hash),
+        );
+    }
+    let (chain_status, ledger) = if let Some(attempt) = recovery_report
+        .attempts
+        .iter()
+        .min_by_key(|attempt| attempt.settlement.is_none())
+    {
+        let (status, ledger) = attempt.chain_status();
+        (status.to_owned(), ledger)
+    } else if recovery_report
+        .refusal
+        .as_ref()
+        .is_some_and(|r| r.state_unavailable)
+    {
+        ("UNKNOWN".to_owned(), None)
+    } else {
+        let chain = client
+            .get_transaction_status(tx_hash)
+            .await
+            .map_err(StatusFailure::ChainQueryFailed)?;
+        (chain.status, chain.ledger)
+    };
     // Both reads reflect reconciliation and the projection of owed accounting decisions.
     let reservation = window
         .pending_reservations(profile)
@@ -1030,8 +1205,9 @@ pub async fn transaction_status_committed(
             .is_some_and(|r| r.id == record.envelope_hash)
     });
     Ok(StatusOutcome {
-        chain_status: chain.status,
-        ledger: chain.ledger,
+        recovery: recovery_report,
+        chain_status,
+        ledger,
         record,
         reservation,
         reservation_open,
@@ -1084,7 +1260,7 @@ mod tests {
         })
         .await;
 
-        assert!(matches!(pass, ReconcilePass::Completed(_)), "{pass:?}");
+        assert!(matches!(pass, ReconcilePass::Recovered { .. }), "{pass:?}");
         let record = fx.operation_record(attempt);
         assert_eq!(record["state"], "not_sent", "{record}");
         assert_eq!(
@@ -1136,7 +1312,14 @@ mod tests {
                 )
                 .await
             };
-            assert!(matches!(pass, ReconcilePass::Completed(_)), "{pass:?}");
+            assert!(
+                if legacy {
+                    matches!(pass, ReconcilePass::Completed(_))
+                } else {
+                    matches!(pass, ReconcilePass::Recovered { .. })
+                },
+                "{pass:?}"
+            );
             assert_eq!(
                 batch_edges(&committed),
                 vec![(
@@ -1195,7 +1378,14 @@ mod tests {
                 )
                 .await
             };
-            assert!(matches!(pass, ReconcilePass::Completed(_)), "{pass:?}");
+            assert!(
+                if legacy {
+                    matches!(pass, ReconcilePass::Completed(_))
+                } else {
+                    matches!(pass, ReconcilePass::Recovered { .. })
+                },
+                "{pass:?}"
+            );
             let edges: Vec<_> = committed
                 .into_iter()
                 .map(|edge| (edge.operation_id(), edge.state(), edge.attempt_index()))
@@ -1227,6 +1417,66 @@ mod tests {
         assert!(
             matches!(*reason, stellar_agent_core::policy::DenyReason::EvaluationError { detail } if detail == "sizing refusal")
         );
+    }
+
+    #[test]
+    fn submission_details_recovery_required() {
+        use stellar_agent_test_support::signed_envelope::SignedTestEnvelope;
+        let errors = [
+            SubmissionError::TxTimeout {
+                tx_hash: "ab".repeat(32),
+                seconds: 30,
+            },
+            SubmissionError::TxAlreadySubmitted {
+                hash: "ab".repeat(32),
+            },
+            SubmissionError::HashMismatch {
+                local: "ab".repeat(32),
+                server: "cd".repeat(32),
+            },
+        ];
+        let edge = u64::MAX / 1000 - 6;
+        for error in errors {
+            let error = WalletError::Submission(error);
+            for bound in [0, 1, edge, edge + 1, u64::MAX - 1, u64::MAX] {
+                let signed = SignedTestEnvelope::builder([1; 32])
+                    .time_bounds(0, bound)
+                    .build();
+                let details = submission_details(&error, signed.envelope_xdr(), "status").unwrap();
+                let recovery = &details["recovery"];
+                assert_eq!(details["tx_hash"], "ab".repeat(32));
+                assert_eq!(
+                    details["envelope_hash"],
+                    envelope_hash_hex(signed.envelope_xdr())
+                );
+                assert_eq!(recovery["result"], "NeedsEvidence");
+                assert_eq!(recovery["reason"], "RecoveryRequired");
+                assert_eq!(recovery["next_action"], "TargetedStatus");
+                if bound == 1 || bound == edge {
+                    assert_eq!(recovery["earliest_retry_ms"], (bound + 6) * 1000);
+                    assert!(recovery.get("retry_time_unavailable").is_none());
+                } else {
+                    assert!(recovery.get("earliest_retry_ms").is_none());
+                    assert_eq!(
+                        recovery["retry_time_unavailable"],
+                        if bound == 0 || bound == u64::MAX {
+                            "MissingBound"
+                        } else {
+                            "Overflow"
+                        }
+                    );
+                }
+                assert!(recovery.get("attempt_index").is_none());
+            }
+            for text in ["", "malformed"] {
+                let details = submission_details(&error, text, "status").unwrap();
+                assert_eq!(
+                    details["recovery"]["retry_time_unavailable"],
+                    "MissingBound"
+                );
+                assert!(details["recovery"].get("earliest_retry_ms").is_none());
+            }
+        }
     }
 
     #[test]
