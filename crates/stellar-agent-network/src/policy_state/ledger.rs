@@ -442,7 +442,7 @@ pub enum ConsumptionBinding {
 /// Where an authorization is in its life.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum AuthorizationState {
+pub enum AuthorizationState {
     /// Minted and neither used, invalidated, nor expired.
     Open,
     /// Its signature is being or was produced; its holds stay until settlement.

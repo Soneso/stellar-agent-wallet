@@ -58,6 +58,7 @@ use crate::policy::v1::EvalContext;
 use crate::policy::v1::asset_equivalence::assets_equivalent;
 use crate::policy::v1::bundle::{BundleStateOverlay, InnerOpDescriptor};
 use crate::policy::v1::criteria::Criterion;
+use crate::policy::v1::criteria::descriptor::{BucketDescriptor, BucketKind};
 use crate::policy::v1::criteria::state_store::{StateKey, WindowEntry, WindowLimit};
 use crate::policy::v1::value::{ValueGate, asset_normalise, classify_value};
 use crate::policy::{DenyReason, PolicyError};
@@ -239,6 +240,15 @@ impl Criterion for PerPeriodCapCriterion {
         true
     }
 
+    fn descriptors(&self) -> Vec<BucketDescriptor> {
+        vec![BucketDescriptor::accumulating(
+            BucketKind::Period,
+            &self.asset,
+            self.max_stroops,
+            &self.state_key(""),
+        )]
+    }
+
     fn kind(&self) -> &'static str {
         "per_period_cap"
     }
@@ -394,9 +404,8 @@ impl Criterion for PerPeriodCapCriterion {
         if !matched {
             return Ok(None);
         }
-        let state_key = StateKey::new(ctx.profile_name, 1, &criterion_asset, self.window.as_secs());
         Ok(Some(WindowEntry::new(
-            state_key,
+            self.state_key(ctx.profile_name),
             now_ms,
             sum,
             self.window_limit(),
@@ -405,6 +414,17 @@ impl Criterion for PerPeriodCapCriterion {
 }
 
 impl PerPeriodCapCriterion {
+    /// The bucket each recorded entry charges: scope specificity 1, the
+    /// normalized asset, and the window.
+    fn state_key(&self, profile_name: &str) -> StateKey {
+        StateKey::new(
+            profile_name,
+            1,
+            &asset_normalise(&self.asset),
+            self.window.as_secs(),
+        )
+    }
+
     /// The limit every entry this criterion records carries, so the durable
     /// reservation write re-applies the comparison `check_window` makes.
     ///

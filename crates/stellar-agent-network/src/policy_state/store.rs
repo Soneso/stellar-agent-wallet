@@ -36,6 +36,7 @@ use subtle::ConstantTimeEq as _;
 
 use crate::endpoint_identity::MainnetOracle;
 use crate::mainnet::AuthorizationId;
+use crate::policy_state::budget::{BudgetError, Share, SnapshotUnavailable};
 use crate::policy_state::ledger::{self, WireAuthorization, WireAuthorizationHold};
 use crate::policy_state::lock::WindowStoreLock;
 use crate::policy_state::operations::{
@@ -4456,52 +4457,105 @@ impl PersistedWindowStore {
         &self,
         profile: &Profile,
     ) -> Result<Option<WireFile>, WindowStoreError> {
-        use stellar_agent_core::policy::state_lock::{LOCK_ATTEMPTS, LOCK_RETRY_DELAY};
-
-        // A writer can advance the commitment between the file and keyring reads.
-        // Retry only that race, with the same bound as the writer lock.
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            match self.read_for_inspection_once(profile) {
-                Err(WindowStoreError::GenerationMismatch) if attempt < LOCK_ATTEMPTS => {
-                    std::thread::sleep(LOCK_RETRY_DELAY);
-                }
-                result => {
-                    return result.map_err(|error| {
-                        let defect = defect_of(&error, !self.path.exists());
-                        mainnet_loading_error(profile, error, defect)
-                    });
-                }
-            }
-        }
+        self.inspect(profile).map_err(|miss| {
+            let error = miss.into_store_error();
+            let defect = defect_of(&error, !self.path.exists());
+            mainnet_loading_error(profile, error, defect)
+        })
     }
 
     fn read_for_inspection_once(
         &self,
         profile: &Profile,
     ) -> Result<Option<WireFile>, WindowStoreError> {
-        refuse_owner_coordinate(profile)?;
+        self.inspect_once(profile)
+            .map_err(InspectionMiss::into_store_error)
+    }
+
+    /// The verified snapshot a budget projection reads: one inspection read,
+    /// taking no lock, whose generation-race retries each read the whole
+    /// file again. `Ok(None)` means neither a file nor a committed generation
+    /// exists.
+    ///
+    /// # Errors
+    ///
+    /// [`BudgetError::Unavailable`] for a missing or unreadable file under a
+    /// committed generation, naming that generation, and for an unreadable
+    /// generation counter. [`BudgetError::State`] for every other refusal,
+    /// as [`Self::read_for_inspection`] reports it.
+    pub(super) fn snapshot_for_projection(
+        &self,
+        profile: &Profile,
+    ) -> Result<Option<WireFile>, BudgetError> {
+        let unavailable = |generation, reason| Err(BudgetError::Unavailable { generation, reason });
+        match self.inspect(profile) {
+            Ok(wire) => Ok(wire),
+            Err(InspectionMiss::Missing { generation }) => {
+                unavailable(Some(generation), SnapshotUnavailable::FileMissing)
+            }
+            Err(InspectionMiss::Unreadable { kind }) => {
+                match load_generation(&generation_entry_ref(profile)) {
+                    Ok(Some(generation)) => {
+                        unavailable(Some(generation), SnapshotUnavailable::Unreadable)
+                    }
+                    Ok(None) => Err(BudgetError::State(WindowStoreError::Io { kind })),
+                    Err(_) => unavailable(None, SnapshotUnavailable::GenerationUnreadable),
+                }
+            }
+            Err(InspectionMiss::Counter(_)) => {
+                unavailable(None, SnapshotUnavailable::GenerationUnreadable)
+            }
+            Err(InspectionMiss::Refused(error)) => {
+                let defect = defect_of(&error, false);
+                Err(BudgetError::State(mainnet_loading_error(
+                    profile, error, defect,
+                )))
+            }
+        }
+    }
+
+    /// Reads and verifies the file, retrying only the race in which a writer
+    /// advances the commitment between the file and keyring reads, with the
+    /// same bound as the writer lock.
+    fn inspect(&self, profile: &Profile) -> Result<Option<WireFile>, InspectionMiss> {
+        use stellar_agent_core::policy::state_lock::{LOCK_ATTEMPTS, LOCK_RETRY_DELAY};
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match self.inspect_once(profile) {
+                Err(
+                    InspectionMiss::Missing { .. }
+                    | InspectionMiss::Refused(WindowStoreError::GenerationMismatch),
+                ) if attempt < LOCK_ATTEMPTS => std::thread::sleep(LOCK_RETRY_DELAY),
+                result => return result,
+            }
+        }
+    }
+
+    fn inspect_once(&self, profile: &Profile) -> Result<Option<WireFile>, InspectionMiss> {
+        refuse_owner_coordinate(profile).map_err(InspectionMiss::Refused)?;
         let gen_entry = generation_entry_ref(profile);
         let bytes = match fs::read(&self.path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return match load_generation(&gen_entry)? {
+                return match load_generation(&gen_entry).map_err(InspectionMiss::Counter)? {
                     None => Ok(None),
-                    Some(_) => Err(WindowStoreError::GenerationMismatch),
+                    Some(generation) => Err(InspectionMiss::Missing { generation }),
                 };
             }
-            Err(e) => return Err(WindowStoreError::Io { kind: e.kind() }),
+            Err(e) => return Err(InspectionMiss::Unreadable { kind: e.kind() }),
         };
         let key = crate::keyring::load_hmac_key_32(&profile.policy_window_state_key_id)
-            .map_err(|e| key_load_error(profile, &e))?;
-        refuse_owner_public_key(key.as_ref(), &OwnerKeyContext::for_loaded_profile(profile))?;
+            .map_err(|e| InspectionMiss::Refused(key_load_error(profile, &e)))?;
+        refuse_owner_public_key(key.as_ref(), &OwnerKeyContext::for_loaded_profile(profile))
+            .map_err(InspectionMiss::Refused)?;
         #[cfg(test)]
         tests::after_inspection_file_read();
-        let counter = load_counter(&gen_entry)?;
+        let counter = load_counter(&gen_entry).map_err(InspectionMiss::Counter)?;
         self.verify_with_key(&key, &bytes)
             .and_then(|wire| self.select_scoped_generation(profile, wire, counter))
             .map(Some)
+            .map_err(InspectionMiss::Refused)
     }
 
     pub(super) fn ensure_parent_dir(&self) -> Result<(), WindowStoreError> {
@@ -4788,6 +4842,30 @@ struct GenerationCommitment {
 struct GenerationState {
     generation: u64,
     body_sha256: Option<String>,
+}
+
+/// Why an inspection read verified no snapshot.
+enum InspectionMiss {
+    /// The file is absent while the keyring commits `generation`.
+    Missing { generation: u64 },
+    /// The file exists and cannot be read.
+    Unreadable { kind: std::io::ErrorKind },
+    /// The keyring's generation counter cannot be read.
+    Counter(WindowStoreError),
+    /// Every other refusal of the read or its verification.
+    Refused(WindowStoreError),
+}
+
+impl InspectionMiss {
+    /// The store error an inspection read reports: a missing file under a
+    /// committed generation is a generation mismatch.
+    fn into_store_error(self) -> WindowStoreError {
+        match self {
+            Self::Missing { .. } => WindowStoreError::GenerationMismatch,
+            Self::Unreadable { kind } => WindowStoreError::Io { kind },
+            Self::Counter(error) | Self::Refused(error) => error,
+        }
+    }
 }
 
 /// Numeric entries retain compatibility with files written under versions 1 and 2.
@@ -6521,6 +6599,33 @@ fn collect_pending(wire: &WireFile) -> Result<Vec<SubmissionHold>, WindowStoreEr
 /// authorization counts too, whatever its age, until the authorization is
 /// consumed, invalidated, or swept as expired.
 fn window_in_file(wire: &WireFile, key: &StateKey, now_ms: u64) -> Result<(i128, u32), DenyReason> {
+    let mut sum: i128 = 0;
+    let mut count: u32 = 0;
+    window_shares(wire, key, now_ms, |_, amount, entries| {
+        sum = sum.saturating_add(amount);
+        count = count.saturating_add(entries);
+    })?;
+    Ok((sum, count))
+}
+
+/// Visits every live representation `wire` charges to the windowed `key` at
+/// `now_ms`, once each, with its share, amount, and entry count. A confirmed
+/// row of the key's window is used; a pending or exposure row, a signed
+/// intent leg, and an authorization hold are reserved. A row or leg that a
+/// signed intent or another window of the same id already charges adds
+/// nothing, and one id charged only under other windows counts at its
+/// largest window total.
+///
+/// # Errors
+///
+/// [`DenyReason::EvaluationError`] for an exposure row or intent leg dated
+/// beyond the clock-skew tolerance.
+pub(super) fn window_shares(
+    wire: &WireFile,
+    key: &StateKey,
+    now_ms: u64,
+    mut visit: impl FnMut(Share, i128, u32),
+) -> Result<(), DenyReason> {
     let future_limit = now_ms.saturating_add(CLOCK_SKEW_TOLERANCE_MS);
     let exact_ids: std::collections::HashSet<&str> = wire
         .entries
@@ -6535,8 +6640,6 @@ fn window_in_file(wire: &WireFile, key: &StateKey, now_ms: u64) -> Result<(i128,
         .map(|record| record.id.as_str())
         .collect();
     let mut fallback: HashMap<(&str, u64), (i128, u32)> = HashMap::new();
-    let mut sum: i128 = 0;
-    let mut count: u32 = 0;
     for bucket in &wire.entries {
         if bucket.scope_specificity != key.scope_specificity() || bucket.bucket != key.bucket() {
             continue;
@@ -6568,8 +6671,12 @@ fn window_in_file(wire: &WireFile, key: &StateKey, now_ms: u64) -> Result<(i128,
                     total.1 = total.1.saturating_add(1);
                 }
             } else {
-                sum = sum.saturating_add(record.amount);
-                count = count.saturating_add(1);
+                let share = if is_exposure(record) {
+                    Share::Reserved
+                } else {
+                    Share::Used
+                };
+                visit(share, record.amount, 1);
             }
         }
     }
@@ -6605,8 +6712,7 @@ fn window_in_file(wire: &WireFile, key: &StateKey, now_ms: u64) -> Result<(i128,
                 });
             }
             if leg.window_secs == key.window_secs() {
-                sum = sum.saturating_add(leg.amount);
-                count = count.saturating_add(1);
+                visit(Share::Reserved, leg.amount, 1);
             } else if !exact {
                 let total = fallback
                     .entry((&intent.intent_id, leg.window_secs))
@@ -6623,19 +6729,17 @@ fn window_in_file(wire: &WireFile, key: &StateKey, now_ms: u64) -> Result<(i128,
         maximum.1 = maximum.1.max(total.1);
     }
     for total in retained.values() {
-        sum = sum.saturating_add(total.0);
-        count = count.saturating_add(total.1);
+        visit(Share::Reserved, total.0, total.1);
     }
     for hold in &wire.holds {
         if hold.scope_specificity == key.scope_specificity()
             && hold.bucket == key.bucket()
             && hold.window_secs == key.window_secs()
         {
-            sum = sum.saturating_add(hold.amount);
-            count = count.saturating_add(1);
+            visit(Share::Reserved, hold.amount, 1);
         }
     }
-    Ok((sum, count))
+    Ok(())
 }
 
 fn is_exposure(record: &WireRecord) -> bool {
@@ -7131,17 +7235,41 @@ pub(super) fn total_in_file(
     key: &StateKey,
     epoch: [u8; 32],
 ) -> Result<(i128, u32), WindowStoreError> {
-    let overflow = || WindowStoreError::Invalid {
-        detail: "a total-budget sum overflows".to_owned(),
-    };
+    let mut sum: i128 = 0;
+    let mut count: u32 = 0;
+    total_shares(wire, key, epoch, |_, amount| {
+        sum = sum
+            .checked_add(amount)
+            .ok_or_else(|| WindowStoreError::Invalid {
+                detail: "a total-budget sum overflows".to_owned(),
+            })?;
+        count = count.saturating_add(1);
+        Ok(())
+    })?;
+    Ok((sum, count))
+}
+
+/// Visits every representation [`total_in_file`] counts, once each, with its
+/// share and amount. A row that is not pending or exposed and a settled sum
+/// are used; a pending or exposure row, a hold, and a signed intent leg are
+/// reserved.
+///
+/// # Errors
+///
+/// [`WindowStoreError::Invalid`] when the bucket holds a negative stored
+/// row, and every error of `visit`.
+pub(super) fn total_shares(
+    wire: &WireFile,
+    key: &StateKey,
+    epoch: [u8; 32],
+    mut visit: impl FnMut(Share, i128) -> Result<(), WindowStoreError>,
+) -> Result<(), WindowStoreError> {
     let target = canonical_total_bucket(key.bucket(), wire);
     let same_bucket = |scope: u8, bucket: &str, window_secs: u64| {
         scope == key.scope_specificity()
             && window_secs == 0
             && canonical_total_bucket(bucket, wire) == target
     };
-    let mut sum: i128 = 0;
-    let mut count: u32 = 0;
     for bucket in &wire.entries {
         if !same_bucket(bucket.scope_specificity, &bucket.bucket, bucket.window_secs) {
             continue;
@@ -7158,8 +7286,12 @@ pub(super) fn total_in_file(
             if record.status == RecordStatus::ProvedUnspent || record.epoch != Some(epoch) {
                 continue;
             }
-            sum = sum.checked_add(record.amount).ok_or_else(overflow)?;
-            count = count.saturating_add(1);
+            let share = if is_exposure(record) {
+                Share::Reserved
+            } else {
+                Share::Used
+            };
+            visit(share, record.amount)?;
         }
     }
     for hold in &wire.holds {
@@ -7168,26 +7300,23 @@ pub(super) fn total_in_file(
         {
             continue;
         }
-        sum = sum.checked_add(hold.amount).ok_or_else(overflow)?;
-        count = count.saturating_add(1);
+        visit(Share::Reserved, hold.amount)?;
     }
     // A settled sum adds its full amount as one representation entry.
     for settled in &wire.total_sums {
         if !same_bucket(settled.scope_specificity, &settled.bucket, 0) || settled.epoch != epoch {
             continue;
         }
-        sum = sum.checked_add(settled.amount).ok_or_else(overflow)?;
-        count = count.saturating_add(1);
+        visit(Share::Used, settled.amount)?;
     }
     for leg in wire.signed_intents.iter().flat_map(|intent| &intent.legs) {
         if same_bucket(leg.scope_specificity, &leg.bucket, leg.window_secs)
             && leg.epoch == Some(epoch)
         {
-            sum = sum.checked_add(leg.amount).ok_or_else(overflow)?;
-            count = count.saturating_add(1);
+            visit(Share::Reserved, leg.amount)?;
         }
     }
-    Ok((sum, count))
+    Ok(())
 }
 
 /// The committed use of one total-budget allocation in one epoch.
@@ -7220,20 +7349,26 @@ impl TotalUsageError {
     /// and `policy.window_state_unverifiable` for every other state failure.
     #[must_use]
     pub fn code(&self) -> &'static str {
-        let store = match self {
-            Self::Policy(error) => return error.wire_code(),
-            Self::State(error) | Self::Unavailable(error) => error,
-        };
-        if let Some(error) = store
-            .total_epoch_error()
-            .or_else(|| store.chain_validation_error())
-        {
-            return error.code();
+        match self {
+            Self::Policy(error) => error.wire_code(),
+            Self::State(error) | Self::Unavailable(error) => inspection_code(error),
         }
-        match store {
-            WindowStoreError::WriterLocked => "policy.state_lock_busy",
-            _ => "policy.window_state_unverifiable",
-        }
+    }
+}
+
+/// The stable code of an inspection read's store failure: the epoch, chain,
+/// and lock codes, and `policy.window_state_unverifiable` for every other
+/// failure.
+pub(super) fn inspection_code(store: &WindowStoreError) -> &'static str {
+    if let Some(error) = store
+        .total_epoch_error()
+        .or_else(|| store.chain_validation_error())
+    {
+        return error.code();
+    }
+    match store {
+        WindowStoreError::WriterLocked => "policy.state_lock_busy",
+        _ => "policy.window_state_unverifiable",
     }
 }
 
@@ -7372,7 +7507,7 @@ pub(super) fn bind_total_entries(
 }
 
 /// Whether `wire` is a committed snapshot an earlier build wrote.
-fn earlier_build(wire: &WireFile) -> bool {
+pub(super) fn earlier_build(wire: &WireFile) -> bool {
     wire.generation != 0 && wire.version < WIRE_VERSION_TOTAL_EPOCH
 }
 

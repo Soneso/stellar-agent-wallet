@@ -43,6 +43,7 @@ pub mod bundle_per_period_cap;
 pub mod bundle_per_tx_cap;
 pub mod bundle_rate_limit;
 pub mod counterparty_allowlist;
+pub mod descriptor;
 pub mod home_domain_resolved;
 pub mod inner_invocation_count_cap;
 pub mod memo_binding;
@@ -285,6 +286,14 @@ pub trait Criterion: Send + Sync + std::fmt::Debug + std::any::Any {
         _ctx: &EvalContext<'_>,
     ) -> Result<Vec<state_store::WindowEntry>, PolicyError> {
         Ok(Vec::new())
+    }
+
+    /// The amount limits this criterion configures, from its signed fields.
+    ///
+    /// Default: none. `per_tx_cap`, `per_period_cap`, `total_budget`, and the
+    /// `budget` mode of `counterparty_allowlist` override this.
+    fn descriptors(&self) -> Vec<descriptor::BucketDescriptor> {
+        Vec::new()
     }
 }
 

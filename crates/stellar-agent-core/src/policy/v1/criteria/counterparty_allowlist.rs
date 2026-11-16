@@ -164,6 +164,7 @@ use crate::policy::v1::EvalContext;
 use crate::policy::v1::asset_equivalence::assets_equivalent;
 use crate::policy::v1::bundle::{BundleStateOverlay, InnerOpDescriptor};
 use crate::policy::v1::criteria::Criterion;
+use crate::policy::v1::criteria::descriptor::{BucketDescriptor, BucketKind};
 use crate::policy::v1::criteria::per_period_cap::Window;
 use crate::policy::v1::criteria::state_store::{StateKey, WindowEntry, WindowLimit};
 use crate::policy::v1::loader::DEFAULT_APPROVAL_TTL_SECONDS;
@@ -642,6 +643,24 @@ impl Criterion for CounterpartyAllowlistCriterion {
 
     fn windowed(&self) -> bool {
         self.budget().is_some()
+    }
+
+    fn descriptors(&self) -> Vec<BucketDescriptor> {
+        self.budget().map_or_else(Vec::new, |budget| {
+            vec![
+                BucketDescriptor::per_call(
+                    BucketKind::UnlistedTransaction,
+                    budget.asset(),
+                    budget.per_tx_stroops(),
+                ),
+                BucketDescriptor::accumulating(
+                    BucketKind::UnlistedPeriod,
+                    budget.asset(),
+                    budget.per_period_stroops(),
+                    &budget.state_key(""),
+                ),
+            ]
+        })
     }
 
     fn records_bundle_inners(&self) -> bool {

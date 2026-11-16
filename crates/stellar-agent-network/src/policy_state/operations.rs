@@ -1538,7 +1538,7 @@ pub struct WindowObservation {
 /// How a linked authorization ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum Disposition {
+pub enum Disposition {
     /// Consumed once.
     Used,
     /// Ended without a signature leaving.
@@ -8016,9 +8016,14 @@ pub(crate) mod tests {
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let fx = Fx::new();
-        let open = fx.mint_request(tx(1), fx.approval(), vec![hold(70)]);
+        let mut open = fx.mint_request(tx(1), fx.approval(), vec![hold(70)]);
+        open.native_reservation = Some(super::super::ledger::NativeReservation {
+            debit_stroops: 70,
+            fee_stroops: 1,
+        });
         let unused = fx.store.mint_authorization(&fx.profile, &open).unwrap();
-        let claimed_request = fx.mint_request(tx(2), fx.approval(), vec![hold(30)]);
+        let mut claimed_request = fx.mint_request(tx(2), fx.approval(), vec![hold(30)]);
+        claimed_request.native_reservation = open.native_reservation;
         let claimed = fx
             .store
             .mint_authorization(&fx.profile, &claimed_request)
@@ -8042,6 +8047,25 @@ pub(crate) mod tests {
         assert_eq!(claimed.state, AuthorizationState::Expired);
         assert_eq!(claimed.disposition, None);
         assert_eq!(claimed.native_release, None);
+        {
+            use crate::policy_state::budget::{NativeClass, Undecided};
+            assert_eq!(
+                budget::projected(&fx, unused.id),
+                (
+                    Some(Disposition::Unused),
+                    Some((Ok(false), NativeClass::ProvedUnspent, None))
+                ),
+                "an Open sweep releases without an observation"
+            );
+            assert_eq!(
+                budget::projected(&fx, claimed.id),
+                (
+                    None,
+                    Some((Err(Undecided::NoObservation), NativeClass::Live, None))
+                ),
+                "a claimed expiry keeps a live reservation"
+            );
+        }
         assert!(
             wire.entries
                 .iter()
@@ -8064,6 +8088,10 @@ pub(crate) mod tests {
             operation_id: handle.id(),
             attempt_index: 1,
         });
+        linked.native_reservation = Some(super::super::ledger::NativeReservation {
+            debit_stroops: 70,
+            fee_stroops: 1,
+        });
         let first = fx.store.mint_authorization(&fx.profile, &linked).unwrap();
         let handle = match fx.open(&request("order-1", canonical(1))).unwrap() {
             OpenOutcome::Resumable(handle) => handle,
@@ -8084,7 +8112,8 @@ pub(crate) mod tests {
         assert_eq!(kept.disposition, None);
         assert_eq!(fx.wire().holds.len(), 1);
 
-        let remint = fx.mint_request(tx(2), authority, vec![hold(70)]);
+        let mut remint = fx.mint_request(tx(2), authority, vec![hold(70)]);
+        remint.native_reservation = linked.native_reservation;
         let started = fx.begin_mint(&handle, &remint).unwrap();
         assert_eq!(fx.generation(), before + 1);
         let retired = fx.auth(first.id);
@@ -8125,6 +8154,23 @@ pub(crate) mod tests {
             }]
         );
         assert_eq!(row.commit_id, started.commit_id);
+        use crate::policy_state::budget::{NativeClass, Undecided};
+        assert_eq!(
+            budget::projected(&fx, first.id),
+            (
+                Some(Disposition::Unused),
+                Some((Ok(false), NativeClass::RetiredUnused, None))
+            ),
+            "the retired reservation stops counting in the remint commit"
+        );
+        assert_eq!(
+            budget::projected(&fx, started.authorization_id),
+            (
+                None,
+                Some((Err(Undecided::NoObservation), NativeClass::Live, None))
+            ),
+            "the replacement reserves again"
+        );
     }
 
     /// A remint never retires an exposed authorization: a claimed one keeps
@@ -15397,4 +15443,6 @@ pub(crate) mod tests {
             assert!(replay.get("destinations").is_none(), "{replay}");
         }
     }
+
+    include!("budget_tests.rs");
 }
