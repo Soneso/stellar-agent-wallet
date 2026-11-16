@@ -215,6 +215,9 @@ Several rules may carry one, and every table must equal the policy's first in
 mode, asset, both bounds, and window.
 Equal budget tables share one counter per asset across the rules that carry
 them. A rule without a table, its allow list, and its caps are unaffected.
+The unlisted counter survives re-signing and restart. Its key contains the
+asset and rolling window, with no signed-policy digest. Earlier classic-asset
+rows and SAC rows count together without rewriting their stored spelling.
 Address kinds are alternatives. G_ACCOUNT covers G and M; C_ACCOUNT covers C and W.
 A destination is listed only when its kind is selected and its exact string or
 base G or C appears in the list. An exact M or W entry covers only that mux id.

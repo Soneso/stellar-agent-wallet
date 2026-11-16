@@ -1,0 +1,41 @@
+{
+  "test_kind": "sequence",
+  "name": "mainnet_unlisted_period_approval",
+  "category": "extended_grammar",
+  "description": "Mainnet allows equality at the remaining rolling allowance and requests approval one stroop beyond it. Expired usage frees the allowance.",
+  "tool": {
+    "name": "stellar_pay",
+    "destructive_hint": true,
+    "read_only_hint": false,
+    "chain_id_required": true,
+    "chain_id": "stellar:mainnet"
+  },
+  "profile_name": "default",
+  "state_seed": [
+    {
+      "offset_secs_ago": 3600,
+      "amount_stroops": 200,
+      "bucket": "unlisted:native",
+      "window_secs": 86400
+    }
+  ],
+  "steps": [
+    {
+      "args": { "amount_stroops": "50", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+      "expected": { "kind": "Allow" }
+    },
+    {
+      "args": { "amount_stroops": "51", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+      "expected": {
+        "kind": "RequireApproval",
+        "approval_reason": "counterparty_allowlist: an unlisted recipient requires approval",
+        "approval_ttl_secs": 86400
+      }
+    },
+    {
+      "after_ms": 86400000,
+      "args": { "amount_stroops": "100", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+      "expected": { "kind": "Allow" }
+    }
+  ]
+}

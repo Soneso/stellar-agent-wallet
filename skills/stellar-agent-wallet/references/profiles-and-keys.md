@@ -1077,7 +1077,9 @@ mode. Missing destinations, unverified bindings, reserved kinds, and gated
 inflow failures refuse in every mode. An unlisted approval keeps evaluating
 its rule, so a later failing criterion still denies; a later rule cannot
 rescue a refusal. Equal `unlisted` tables share one counter per asset and
-window. Other strkey forms and malformed strings
+window. Classic and SAC spellings share that counter, including stored rows
+from earlier builds. Re-signing and restart preserve its rolling usage.
+Other strkey forms and malformed strings
 return evaluation errors. Raw arguments keep their denials in every mode.
 Opaque signing and exempted generic bundle inners refuse because third-party
 transactions have no evaluated effects, recipient class, or amount for a budget

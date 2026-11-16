@@ -621,3 +621,126 @@ fn persisted_store_retries_contention_and_refuses_a_held_lock() {
     ));
     assert!(start.elapsed() >= std::time::Duration::from_millis(100));
 }
+
+/// Classic and SAC rows hydrate into one counter without rewriting their
+/// stored representation. Both payment spellings consume that history.
+#[test]
+#[serial]
+fn documented_unlisted_alias_fixture() {
+    use stellar_agent_core::asset_id::CanonicalAsset;
+    use stellar_agent_core::policy::v1::criteria::state_store::{
+        StateKey, WindowEntry, WindowLimit,
+    };
+    use stellar_agent_core::policy::{
+        Decision, DenyReason, McpToolRegistration, PolicyEngine, ToolDescriptor,
+    };
+    use stellar_agent_network::policy_state::PersistedWindowStore;
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Fixture {
+        classic_asset: String,
+        // The first row uses classic text, the second its network SAC.
+        history_stroops: [i128; 2],
+        expected_usage: (i128, u32),
+        allowed_stroops: i128,
+        refused_stroops: i128,
+    }
+    let fixture: Fixture = serde_json::from_str(include_str!(
+        "../../../../tests/policy-fixtures/accounting/unlisted_alias_history.case.json"
+    ))
+    .unwrap();
+    keyring_mock::install().unwrap();
+    let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = StellarAgentHomeGuard::new(dir.path());
+    let profile = profile(false);
+    let pk = write_policy(include_str!(
+        "../../../../tests/policy-fixtures/accounting/unlisted_alias_history.toml"
+    ));
+    let build = || {
+        build_policy_engine(
+            &profile,
+            None,
+            "operator",
+            None,
+            pk,
+            OwnerKeySource::TestFile,
+        )
+        .unwrap()
+        .verified
+        .unwrap()
+        .engine()
+    };
+    let _ = build();
+    let sac = CanonicalAsset::parse_threshold_key(&fixture.classic_asset)
+        .unwrap()
+        .sac_contract_id(&profile.network_passphrase)
+        .unwrap();
+    let now: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    let key = |asset| StateKey::new("operator", 1, &format!("unlisted:{asset}"), 86_400);
+    let entries: Vec<_> = [&fixture.classic_asset, &sac]
+        .into_iter()
+        .zip(fixture.history_stroops)
+        .map(|(asset, amount)| {
+            WindowEntry::new(
+                key(asset),
+                now,
+                amount,
+                WindowLimit::Unlisted {
+                    asset: fixture.classic_asset.clone(),
+                    window: "1d".to_owned(),
+                    max_stroops: 250,
+                },
+            )
+        })
+        .collect();
+    let store = PersistedWindowStore::for_profile("operator");
+    store.record_and_persist(&profile, &entries).unwrap();
+    let stored = std::fs::read(store.path()).unwrap();
+    let engine = build();
+    assert_eq!(std::fs::read(store.path()).unwrap(), stored);
+    assert_eq!(
+        engine.state_store().query_window(&key(&sac), now).unwrap(),
+        fixture.expected_usage,
+        "classic and SAC history share one counter"
+    );
+    let mut tool = ToolDescriptor::from_registration(&McpToolRegistration {
+        name: "stellar_pay",
+        destructive_hint: true,
+        read_only_hint: false,
+        chain_id_required: true,
+        value_kind: stellar_agent_core::policy::ToolValueKind::MovesValue,
+    });
+    tool.chain_id = profile.chain_id.caip2_str().to_owned();
+    for asset in [&fixture.classic_asset, &sac] {
+        for (amount, expected) in [
+            (fixture.allowed_stroops, Decision::Allow),
+            (
+                fixture.refused_stroops,
+                Decision::Deny(DenyReason::UnlistedBudgetExceeded {
+                    asset: fixture.classic_asset.clone(),
+                    bound: stellar_agent_core::policy::UnlistedBound::PerPeriod,
+                    max_stroops: 250,
+                    attempted_stroops: fixture.refused_stroops,
+                }),
+            ),
+        ] {
+            let args = serde_json::json!({
+                "asset": asset, "amount_stroops": amount.to_string(),
+                "destination": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+            });
+            assert_eq!(
+                engine
+                    .evaluate(&tool, &args, &profile, None, None, None, None, None, now)
+                    .unwrap(),
+                expected,
+                "both asset spellings consume the fixture history"
+            );
+        }
+    }
+}

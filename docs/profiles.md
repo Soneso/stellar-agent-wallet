@@ -390,7 +390,7 @@ actual keys (see [Migration and key rotation](#migration-and-key-rotation)).
 | `[policy_owner_key_id]` | keyring ref | yes | ed25519 owner PUBLIC key whose signature every V1 policy file must carry (enrolled with `profile enroll-owner-key`). |
 | `[attestation_key_id]` | keyring ref | yes | HMAC key minting approval attestations at `approve` time. |
 | `[counterparty_cache_key_id]` | keyring ref | yes | HMAC key protecting the local `stellar.toml` cache integrity. |
-| `[policy_window_state_key_id]` | keyring ref | no (name-derived default) | HMAC key protecting the persisted policy-window-state store (`per_period_cap` / `rate_limit` / `bundle_per_period_cap` / `bundle_rate_limit` accumulated history). Absent from profiles predating this field; the loader derives `stellar-agent-policy-window-<profile>` when omitted, so existing profile TOMLs keep loading unchanged. |
+| `[policy_window_state_key_id]` | keyring ref | no (name-derived default) | HMAC key protecting the persisted policy-window-state store (`per_period_cap`, `rate_limit`, their bundle forms, unlisted budgets, and `total_budget` usage). Absent from profiles predating this field; the loader derives `stellar-agent-policy-window-<profile>` when omitted, so existing profile TOMLs keep loading unchanged. |
 
 ### Cross-check, MCP, and scan bounds
 
@@ -802,7 +802,7 @@ on error.
 | `stellar-agent profile rotate-audit-key <name>` | `audit_log_hash_chain_key_id` | Fresh 32-byte HMAC key. Rotation re-signs every existing per-file chain-root sidecar with the new key, so the whole log verifies under it; the old key stops verifying. |
 | `stellar-agent profile rotate-counterparty-key <name>` | `counterparty_cache_key_id` | Fresh 32-byte HMAC key. Cached `stellar.toml` entries read as absent until a refresh rewrites them. `counterparty refresh <domain>` rewrites the entry for that domain. `counterparty warm-up` refreshes only the `HOME_DOMAIN` entries of the policy allowlist. |
 | `stellar-agent profile rotate-nonce-key <name>` | `mcp_nonce_key_alias` | Fresh 32-byte HMAC key. Outstanding nonces minted with the old key are invalidated. |
-| `stellar-agent profile rotate-policy-state-key <name>` | `policy_window_state_key_id` | Fresh 32-byte HMAC key. Unlike the other rotations, the accumulated window-state store is re-signed under the new key, so `per_period_cap` / `rate_limit` history is preserved, not invalidated. |
+| `stellar-agent profile rotate-policy-state-key <name>` | `policy_window_state_key_id` | Fresh 32-byte HMAC key. Unlike the other rotations, the accumulated window-state store is re-signed under the new key, so `per_period_cap` / `rate_limit` history and unlisted and total-budget usage are preserved. |
 | `stellar-agent profile reset-window-state <name> --reason <reason>` | `policy_window_state_key_id` (mints if absent) | Clears verified ordinary accrual and preserves stored total-budget entries exactly. Reset creates no epoch. A pin or enrolled owner requires `--owner-secret-env VAR`, including without mainnet enablement. The pin takes precedence; absent pins use the enrolled owner. Only genuine ownerless state permits unsigned reset. Unreadable authority and unverifiable state refuse. Stop MCP before reset. The audit row records authorization before mutation. Terminal history and unreleased reservations survive; protected open work still refuses. |
 
 ### Enroll the MCP signer
@@ -1100,8 +1100,10 @@ decides `allow`, and sets `allow_opaque_signing = false`.
   takes effect when the wallet pays W destinations.
 - A chosen unlisted budget writes the same `unlisted` table on every payment
   rule. Equal tables share one counter per asset, so one budget of `U` per
-  rolling day, at most `P/2` per payment, bounds the four payment tools
-  together. A payment beyond it is denied and requests no approval.
+  rolling day, at most `P/2` per payment, bounds unattended use across the
+  four payment tools. On mainnet, a payment beyond either bound requests
+  per-payment approval and counts in full when approved. Caps, rate limits,
+  and the total allocation still apply. Other networks deny the excess.
 - The trustline tools of a USDC body allow USDC alone; the claim tools carry
   no asset allowlist. Both take 2 calls per 1m and 6 per 1h. An XLM body has
   no trustline rule.
