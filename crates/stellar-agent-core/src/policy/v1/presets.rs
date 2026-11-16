@@ -1589,8 +1589,10 @@ pub struct ToolLimits {
     pub largest_payment: Option<String>,
     /// At most the largest single payment through the unlisted budget or to
     /// an address in no list; when every such payment goes through the
-    /// budget, also its per-payment bound and window cap. `0` when the rule
-    /// pays no such recipient.
+    /// budget and `unlisted_exhaustion` is `deny`, also its per-payment bound
+    /// and window cap. Where it is `approval`, a payment beyond the budget's
+    /// bounds needs approval, and neither bound limits this amount. `0` when the rule pays no
+    /// such recipient.
     pub unlisted_largest_payment: Option<String>,
     /// Every period cap of the rule, one per window, shortest window first.
     pub period_caps: Vec<PeriodCap>,
@@ -1619,13 +1621,16 @@ pub struct ToolLimits {
     /// `budget`, `approval_within_budget`, or `unrestricted` when its rule
     /// carries no counterparty criterion and allows.
     pub unlisted_mode: &'static str,
-    /// The largest payment the rule's unlisted budget admits; it bounds every
-    /// recipient treated as budgeted. `null` without a budget.
+    /// The largest payment the rule's unlisted budget admits without
+    /// approval; it bounds every recipient treated as budgeted unless
+    /// `unlisted_exhaustion` is `approval`. `null` without a budget.
     pub unlisted_per_tx_cap: Option<String>,
     /// The rule's unlisted budget per window. `null` without a budget.
     pub unlisted_period_cap: Option<PeriodCap>,
-    /// `deny` when the rule carries an unlisted budget, the decision once it
-    /// is spent; `unbudgeted` otherwise.
+    /// The decision for a payment beyond the rule's unlisted budget:
+    /// `approval` on a mainnet profile, whose locked mint admits a
+    /// per-payment approval over the budget, `deny` on every other network,
+    /// and `unbudgeted` without a budget.
     pub unlisted_exhaustion: &'static str,
     /// Every recipient a payment rule lists, with this tool's treatment.
     pub recipients: Vec<RecipientTreatment>,
@@ -2086,8 +2091,8 @@ const CLASS_CONDITION_KINDS: [&str; 1] = ["home_domain_resolved"];
 /// (`total` for the total budget). `per_period_cap` keys the identifier as
 /// written, with the native aliases normalized; `total_budget` keys the
 /// identity every spelling of its asset shares
-/// ([`total_budget_identity`]); an unlisted budget keys `unlisted:<identifier>`;
-/// every `rate_limit` shares the `rate_limit` bucket of its window.
+/// ([`total_budget_identity`]); an unlisted budget keys `unlisted:` and that
+/// identity; every `rate_limit` shares the `rate_limit` bucket of its window.
 type CounterKey = (String, &'static str);
 
 /// What a counter counts.
@@ -2138,6 +2143,9 @@ struct ToolView {
     /// The budget's per-payment bound and window cap, when the rule carries
     /// one for the asset.
     budget: Option<(Option<i128>, Option<PeriodCap>)>,
+    /// A payment beyond the budget requests approval, as the evaluation on
+    /// a mainnet profile decides, rather than being denied.
+    budget_escalates: bool,
     /// An x402 rule with a floor denies every call.
     blocked: bool,
     /// The treatment of an address in no list.
@@ -2262,13 +2270,38 @@ impl ToolView {
 
     /// The largest single payment to the class the evaluation allows
     /// without approval: the largest admitted payment, at most the approval
-    /// threshold. `0` when the tool pays no recipient of the class with
-    /// `allow`.
+    /// threshold, the budget's per-payment bound, and the limit of every
+    /// unlisted allowance counter the class pays through, which the
+    /// approved maximum omits on a network that escalates. `0` when the
+    /// tool pays no recipient of the class with `allow`.
     fn unattended_largest(&self, class: Class) -> Option<i128> {
         if !self.pays_unattended(class) {
             return Some(0);
         }
-        min_present([self.largest(class), self.approval])
+        let allowance_counters = self
+            .class_caps(class)
+            .into_iter()
+            .filter(|c| c.kind == CapKind::Amount && c.unlisted_only)
+            .map(|c| Some(c.limit));
+        min_present(
+            [
+                self.largest(class),
+                self.approval,
+                self.budget_per_tx(class),
+            ]
+            .into_iter()
+            .chain(allowance_counters),
+        )
+    }
+
+    /// The budget's per-payment bound when every payment of the class goes
+    /// through the budget.
+    fn budget_per_tx(&self, class: Class) -> Option<i128> {
+        if self.budgeted(class) {
+            self.budget.as_ref().and_then(|(per_tx, _)| *per_tx)
+        } else {
+            None
+        }
     }
 
     /// The counters a payment to the class writes and must fit.
@@ -2281,21 +2314,25 @@ impl ToolView {
     }
 
     /// The largest single payment to the class: the smallest of the
-    /// per-payment caps and of every amount counter's limit.
+    /// per-payment caps and of every amount counter's limit. The budget's
+    /// per-payment bound and its window counter are among them unless a
+    /// payment beyond the budget requests approval.
     fn largest(&self, class: Class) -> Option<i128> {
         if !self.admits(class) {
             return Some(0);
         }
-        let budget_per_tx = if self.budgeted(class) {
-            self.budget.as_ref().and_then(|(per_tx, _)| *per_tx)
-        } else {
+        let budget_per_tx = if self.budget_escalates {
             None
+        } else {
+            self.budget_per_tx(class)
         };
         min_present(
             [self.per_tx, budget_per_tx].into_iter().chain(
                 self.class_caps(class)
                     .into_iter()
-                    .filter(|c| c.kind == CapKind::Amount)
+                    .filter(|c| {
+                        c.kind == CapKind::Amount && !(self.budget_escalates && c.unlisted_only)
+                    })
                     .map(|c| Some(c.limit)),
             ),
         )
@@ -2442,10 +2479,10 @@ impl ToolView {
             unlisted_mode: self.unlisted.unlisted_mode(),
             unlisted_per_tx_cap: amount_string(budget.as_ref().and_then(|(per_tx, _)| *per_tx)),
             unlisted_period_cap: budget.as_ref().and_then(|(_, cap)| cap.clone()),
-            unlisted_exhaustion: if budget.is_some() {
-                "deny"
-            } else {
-                "unbudgeted"
+            unlisted_exhaustion: match (&budget, self.budget_escalates) {
+                (None, _) => "unbudgeted",
+                (Some(_), true) => "approval",
+                (Some(_), false) => "deny",
             },
             recipients: self
                 .recipients
@@ -2800,7 +2837,10 @@ fn tool_view(
         {
             write(CapView {
                 key: (
-                    format!("unlisted:{}", asset_normalise(budget_asset)),
+                    format!(
+                        "unlisted:{}",
+                        total_budget_identity(budget_asset, passphrase)
+                    ),
                     window.label(),
                 ),
                 secs: Some(window.as_secs()),
@@ -2886,6 +2926,7 @@ fn tool_view(
         caps,
         unmodeled,
         budget,
+        budget_escalates: Caip2::from_passphrase(passphrase).is_some_and(Caip2::is_mainnet),
         blocked,
         unlisted: treatment(None),
         recipients: named
@@ -3414,8 +3455,13 @@ pub fn summarize(
         "Caps use rolling windows: 1d covers the last 86,400 seconds and 1w the last 604,800 seconds."
             .to_owned(),
         "Rate limits count every tool in one shared bucket per window.".to_owned(),
-        "A payment beyond an exhausted cap, total budget, or unlisted budget is denied."
-            .to_owned(),
+        if mainnet_chain {
+            "A payment beyond an exhausted cap or total budget is denied; one beyond the \
+             unlisted budget needs a per-payment approval."
+        } else {
+            "A payment beyond an exhausted cap, total budget, or unlisted budget is denied."
+        }
+        .to_owned(),
         "Signing the same policy body again keeps its total_budget allocation; a different \
          digest starts another."
             .to_owned(),
@@ -5783,16 +5829,17 @@ mod tests {
                     );
                 }
                 if mode == "budget" {
-                    // B is unlisted to the budget criterion, so its cap applies.
+                    // B is unlisted to the budget criterion, so its cap
+                    // applies; beyond it a mainnet payment needs approval.
                     assert_eq!(create.unlisted_per_tx_cap.as_deref(), Some("0.25"));
-                    assert_eq!(create.unlisted_exhaustion, "deny");
+                    assert_eq!(create.unlisted_exhaustion, "approval");
                     assert_eq!(
                         label(&x402(&engine, CREATE_TOOL, &b, 2_500_000, T0)),
                         "allow"
                     );
                     assert_eq!(
                         label(&x402(&engine, CREATE_TOOL, &b, 2_500_001, T0)),
-                        "deny"
+                        "approval"
                     );
                 }
             }
@@ -5965,16 +6012,15 @@ mod tests {
         );
     }
 
+    /// A mainnet evaluation escalates a payment beyond the unlisted budget,
+    /// and every other network denies it.
     #[test]
-    fn summary_states_exhaustion_deny() {
-        let with = serde_json::to_value(summary_of(&policy_body(
-            PROFILE,
-            &derived("api-week", true, true),
-        )))
-        .unwrap();
+    fn summary_states_exhaustion_by_network() {
+        let body = policy_body(PROFILE, &derived("api-week", true, true));
+        let with = serde_json::to_value(summary_of(&body)).unwrap();
         assert_eq!(
             with["unlisted_exhaustion"],
-            serde_json::json!({"uniform": "deny"})
+            serde_json::json!({"uniform": "approval"})
         );
         assert_eq!(
             with["limits"][0]["unlisted_mode"],
@@ -5983,8 +6029,21 @@ mod tests {
         let create = &with["limits"][0]["tools"][2];
         assert_eq!(create["tool"], CREATE_TOOL);
         assert_eq!(create["unlisted_mode"], "budget");
-        assert_eq!(create["unlisted_exhaustion"], "deny");
-        assert_eq!(with["limits"][0]["tools"][0]["unlisted_exhaustion"], "deny");
+        assert_eq!(create["unlisted_exhaustion"], "approval");
+        assert_eq!(
+            with["limits"][0]["tools"][0]["unlisted_exhaustion"],
+            "approval"
+        );
+        let testnet =
+            serde_json::to_value(Net::Testnet.summary(&Net::Testnet.body(&body))).unwrap();
+        assert_eq!(
+            testnet["unlisted_exhaustion"],
+            serde_json::json!({"uniform": "deny"})
+        );
+        assert_eq!(
+            testnet["limits"][0]["tools"][2]["unlisted_exhaustion"],
+            "deny"
+        );
         let without = serde_json::to_value(summary_of(&policy_body(
             PROFILE,
             &derived("api-week", false, true),
@@ -6002,8 +6061,13 @@ mod tests {
             without["limits"][0]["unlisted_per_tx_cap"],
             serde_json::json!({"uniform": null})
         );
+        assert!(with["notes"].as_array().unwrap().iter().any(|n| {
+            n.as_str()
+                .unwrap()
+                .contains("unlisted budget needs a per-payment approval")
+        }));
         assert!(
-            with["notes"]
+            testnet["notes"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -6031,9 +6095,10 @@ mod tests {
         );
         let engine = verified_engine(&body);
         assert_eq!(pay(&engine, &unlisted, 3_000_000, T0), Decision::Allow);
+        // Beyond the 0.25 budget bound a mainnet payment needs approval.
         assert_eq!(
             label(&x402(&engine, CREATE_TOOL, &unlisted, 3_000_000, T0)),
-            "deny"
+            "approval"
         );
         let summary = summary_of(&body);
         let limits = &summary.limits[0];
@@ -6063,7 +6128,7 @@ mod tests {
                 amount: "1.25".to_owned()
             })
         );
-        assert_eq!(create.unlisted_exhaustion, "deny");
+        assert_eq!(create.unlisted_exhaustion, "approval");
     }
 
     #[test]
@@ -6097,7 +6162,8 @@ mod tests {
             "Signing the same policy body again keeps its total_budget allocation; a different \
              digest starts another.",
             "Caps use rolling windows: 1d covers the last 86,400 seconds and 1w the last 604,800 seconds.",
-            "A payment beyond an exhausted cap, total budget, or unlisted budget is denied.",
+            "A payment beyond an exhausted cap or total budget is denied; one beyond the \
+             unlisted budget needs a per-payment approval.",
         ] {
             assert!(summary.notes.contains(&note.to_owned()), "{note}");
         }
@@ -6577,7 +6643,9 @@ mod tests {
     }
 
     /// api-day with its unlisted budget: payments to an address in no list
-    /// fit the budget's counter, at most 0.1 each and 0.5 per day. With no
+    /// fit the budget's counter, at most 0.1 each and 0.5 per day without
+    /// approval. Beyond the budget a mainnet payment needs approval up to the
+    /// 0.2 per-payment cap, and every other network denies it. With no
     /// listed recipient the listed class pays 0; with one, 0.2 and 2.
     #[test]
     #[serial_test::serial]
@@ -6590,7 +6658,18 @@ mod tests {
             let body = net.body(&policy_body(PROFILE, &derived("api-day", true, true)));
             let summary = net.summary(&body);
             let create = tool_limits(&summary, CREATE_TOOL);
-            assert_eq!(create.unlisted_largest_payment.as_deref(), Some("0.1"));
+            let mainnet = net == Net::Mainnet;
+            let (largest, beyond) = if mainnet {
+                (Some("0.2"), "approval")
+            } else {
+                (Some("0.1"), "deny")
+            };
+            assert_eq!(create.unlisted_largest_payment.as_deref(), largest);
+            assert_eq!(create.unlisted_per_tx_cap.as_deref(), Some("0.1"));
+            assert_eq!(
+                create.unlisted_exhaustion,
+                if mainnet { "approval" } else { "deny" }
+            );
             let day = tool_bound(create, true, "1d");
             assert_eq!((day.amount.as_deref(), day.reachable), (Some("0.5"), true));
             assert_eq!(create.largest_payment.as_deref(), Some("0"));
@@ -6623,7 +6702,8 @@ mod tests {
                     .iter()
                     .any(|c| c.kind == "unlisted" && c.window == "1d")
             );
-            // Both sides: five payments of 0.1 pass, one stroop more is refused.
+            // Both sides: five payments of 0.1 pass, and one stroop more
+            // takes the network's decision beyond the budget.
             let engine = verified_engine_on(&body, net);
             assert_eq!(
                 label(&x402_on(
@@ -6634,7 +6714,18 @@ mod tests {
                     T0,
                     net
                 )),
-                "deny"
+                beyond
+            );
+            // The stated largest payment is the hard cap: the evaluation
+            // admits it, with approval on mainnet, and denies one stroop more.
+            let hard = if mainnet { 2_000_000 } else { 1_000_000 };
+            assert_eq!(
+                label(&x402_on(&engine, CREATE_TOOL, &unlisted, hard, T0, net)),
+                if mainnet { "approval" } else { "allow" }
+            );
+            assert_eq!(
+                label(&x402_on(&engine, CREATE_TOOL, &unlisted, hard + 1, T0, net)),
+                if mainnet { "deny" } else { beyond }
             );
             for i in 0..5 {
                 assert_eq!(
@@ -6658,7 +6749,66 @@ mod tests {
                     T0 + 5 * STEP_MS,
                     net
                 )),
-                "deny"
+                beyond
+            );
+
+            // With the daily allowance at 0.15, under the hard cap of 0.2,
+            // the approved maximum on mainnet stays the hard cap while the
+            // unattended bound keeps the allowance counter.
+            let lowered = body.replace(
+                "per_period_stroops = \"5000000\"",
+                "per_period_stroops = \"1500000\"",
+            );
+            assert_ne!(lowered, body);
+            let summary = net.summary(&lowered);
+            let create = tool_limits(&summary, CREATE_TOOL);
+            assert_eq!(create.unlisted_largest_payment.as_deref(), largest);
+            let day = tool_bound(create, true, "1d");
+            assert_eq!(day.amount.as_deref(), Some("0.15"));
+            let engine = verified_engine_on(&lowered, net);
+            assert_eq!(
+                label(&x402_on(&engine, CREATE_TOOL, &unlisted, hard, T0, net)),
+                if mainnet { "approval" } else { "allow" }
+            );
+            assert_eq!(
+                label(&x402_on(&engine, CREATE_TOOL, &unlisted, hard + 1, T0, net)),
+                if mainnet { "deny" } else { beyond }
+            );
+
+            // With the daily allowance at 0.08, below the per-payment
+            // allowance of 0.1, and one call a week, an unattended week pays
+            // at most 0.08; the approved maximum stays the hard cap on
+            // mainnet.
+            let weekly = edit_rules(
+                &body.replace(
+                    "per_period_stroops = \"5000000\"",
+                    "per_period_stroops = \"800000\"",
+                ),
+                &[CREATE_TOOL],
+                |criteria| {
+                    criteria.push(criterion(
+                        "{ kind = \"rate_limit\", window = \"1w\", max_calls = 1 }",
+                    ));
+                },
+            );
+            let summary = net.summary(&weekly);
+            let create = tool_limits(&summary, CREATE_TOOL);
+            assert_eq!(
+                create.unlisted_largest_payment.as_deref(),
+                if mainnet { Some("0.2") } else { Some("0.08") }
+            );
+            assert_eq!(
+                tool_bound(create, true, "1w").amount.as_deref(),
+                Some("0.08")
+            );
+            let engine = verified_engine_on(&weekly, net);
+            assert_eq!(
+                label(&x402_on(&engine, CREATE_TOOL, &unlisted, 800_000, T0, net)),
+                "allow"
+            );
+            assert_eq!(
+                label(&x402_on(&engine, CREATE_TOOL, &unlisted, 800_001, T0, net)),
+                beyond
             );
         }
     }
@@ -6885,8 +7035,14 @@ mod tests {
             validate_unsigned_policy(&body, PROFILE, net.passphrase()).unwrap();
             let summary = net.summary(&body);
             let pay = tool_limits(&summary, "stellar_pay");
+            // Beyond the budget a mainnet payment needs approval up to the
+            // per-payment cap of 1; every other network denies it.
+            let (largest, beyond) = match net {
+                Net::Mainnet => ("1", "approval"),
+                Net::Testnet => ("0.5", "deny"),
+            };
             assert_eq!(pay.largest_payment.as_deref(), Some("0"));
-            assert_eq!(pay.unlisted_largest_payment.as_deref(), Some("0.5"));
+            assert_eq!(pay.unlisted_largest_payment.as_deref(), Some(largest));
             let day = tool_bound(pay, true, "1d");
             assert_eq!((day.amount.as_deref(), day.reachable), (Some("1.5"), true));
             let engine = verified_engine_on(&body, net);
@@ -6898,7 +7054,7 @@ mod tests {
             }
             assert_eq!(
                 coarse(&spend(&engine, "stellar_pay", &named, 1, T0 + 3, net)),
-                "deny"
+                beyond
             );
             assert_eq!(
                 coarse(&spend(&engine, "stellar_pay", &budget_listed, 1, T0, net)),
@@ -7378,15 +7534,19 @@ mod tests {
         } else {
             &limits.largest_payment
         };
+        // A payment beyond the budget's bound takes the stated exhaustion.
+        let beyond_budget =
+            budgeted && cap(&limits.unlisted_per_tx_cap).is_some_and(|cap| amount > cap);
         if treatment == Treatment::Denied
             || cap(largest).is_some_and(|cap| amount > cap)
-            || (budgeted && cap(&limits.unlisted_per_tx_cap).is_some_and(|cap| amount > cap))
+            || (beyond_budget && limits.unlisted_exhaustion == "deny")
         {
             "deny"
         } else if matches!(
             treatment,
             Treatment::Approval | Treatment::ApprovalWithinBudget
         ) || cap(&limits.approval_above).is_some_and(|a| amount > a)
+            || beyond_budget
         {
             "approval"
         } else {
@@ -7725,7 +7885,7 @@ mod tests {
         }
         assert_eq!(
             (bodies.len(), cases, bounds, sequences, unreachable, staged),
-            (320, 36_650, 1_960, 550_121, 360, 60),
+            (320, 36_650, 1_960, 671_777, 360, 60),
             "property size"
         );
         // The family holds both rate windows, a repeated counter, an
@@ -7953,12 +8113,19 @@ mod tests {
                         .or_else(|| open.contains(&t.tool).then(|| outsider.clone()))
                 };
                 let admitted = stroops(largest);
+                // Where a payment beyond the budget requests approval, the
+                // budget's bound caps what a payer pays without approval.
+                let budget_per_tx = if unlisted && t.unlisted_exhaustion == "approval" {
+                    stroops(&t.unlisted_per_tx_cap)
+                } else {
+                    None
+                };
                 recipient.map(|recipient| Payer {
                     tool: t.tool.as_str(),
                     asset,
                     recipient,
                     admitted,
-                    largest: min_present([admitted, stroops(&t.approval_above)]),
+                    largest: min_present([admitted, stroops(&t.approval_above), budget_per_tx]),
                     own,
                 })
             })
@@ -8309,7 +8476,7 @@ mod tests {
             (
                 114,
                 BoundCounts {
-                    evaluations: 995_188,
+                    evaluations: 1_091_869,
                     checked: 1_556,
                     staged: 86,
                 },
@@ -8343,6 +8510,7 @@ mod tests {
         "unlisted_pay:deny",
         "unlisted_x402:deny",
     ];
+    /// A mainnet payment beyond the unlisted budget needs approval.
     const API_UNLISTED: &[&str] = &[
         "typical:allow",
         "per_tx:allow",
@@ -8350,11 +8518,11 @@ mod tests {
         "x402_per_tx:allow",
         "unlisted_pay:allow",
         "unlisted_half:allow",
-        "unlisted_half+1:deny",
+        "unlisted_half+1:approval",
         "unlisted_authenticated:allow",
         "unlisted_within_u:allow",
-        "unlisted_beyond_u:deny",
-        "unlisted_pay_beyond_u:deny",
+        "unlisted_beyond_u:approval",
+        "unlisted_pay_beyond_u:approval",
     ];
     const APPROVING: &[&str] = &[
         "typical:allow",

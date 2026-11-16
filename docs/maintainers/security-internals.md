@@ -1504,7 +1504,8 @@ internal argument map keeps `memo` as text or null and adds `memo_kind` for all
 five kinds. ID, hash and return payloads use `memo_id` as a canonical decimal
 string, or `memo_hash` and `memo_return` as lowercase hex. A known no-memo
 transaction carries `memo_kind = "none"`; absent, malformed or contradictory
-facts produce no memo fact. Both refuse a destination's memo binding. Path
+facts produce no memo fact. A known no-memo fact and an absent fact both fail a
+destination's memo binding. Path
 payments retain the full destination and memo while sizing the send-side debit.
 Preparation uses the parsed memo; commit derives facts from the envelope before
 policy evaluation and retains the existing envelope integrity checks.
@@ -1536,8 +1537,27 @@ bundle inners refuse because third-party transactions have no evaluated effects.
 No recipient class or amount exists for a budget or approval threshold to bind.
 The evaluation carries the class of the matched rule on its
 `ValueEffects`, and budget sizing reads it there instead of classifying again.
-A budget entry uses the key `unlisted:<asset>` at the window's length, shared
-by every rule. A bundle accumulates unlisted transfers in its overlay.
+A budget entry uses the key `unlisted:` plus the asset's `total_budget_identity`
+on the profile's network at the window's length, shared by every rule, so a
+classic asset and its asset contract share one counter. A bundle accumulates
+unlisted transfers in its overlay. The window, the overlay, and the attempt sum
+with checked arithmetic, and an overflow refuses with
+`policy.accounting_overflow`.
+Beyond either budget bound, a mainnet evaluation escalates and every other
+network denies with `policy.deny.unlisted_budget_exceeded`.
+The durable window maps a stored `unlisted:` bucket to the same identity when it
+compares, hydrates, and admits, so rows an earlier build wrote count in the
+same counter and keep their stored bytes. Unlisted sums there are checked: an
+overflow refuses with `policy.accounting_overflow` and a negative stored amount
+with `policy.accounting_invalid`, before any write. Hydration keeps a negative
+row as stored, and evaluation refuses its bucket with the same code.
+`mint_into` derives the admission mode from the mint's own verified authority,
+after the nonce check and consumption or the parent check. Under an approval
+authority an unlisted hold passes the spent allowance and still counts in
+full; every other limit applies. Under a policy authority a spent allowance
+refuses with `policy.approval_required` and nothing is written. The recorders
+outside the mint keep the restrictive admission and refuse with the policy
+denial.
 The loader admits at most one table per rule and requires every table of a
 policy to equal the first as parsed: mode, asset after its `native` default,
 both bounds, and window. Equal budget tables share one counter per asset

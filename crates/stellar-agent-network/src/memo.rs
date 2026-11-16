@@ -22,8 +22,45 @@
 //! Memo construction is a prerequisite for the `memo_present` flag passed to
 //! [`crate::sep29::check_memo_required`].
 
+use stellar_agent_core::envelope_decode::ClassicMemo;
 use stellar_agent_core::error::{ValidationError, WalletError};
 use stellar_xdr::{Hash, Memo, StringM};
+
+/// Parses the memo fields as [`parse_memo_fields`] does, and returns the
+/// XDR memo with the policy fact of the same memo.
+///
+/// The text fact is the parsed `&str`, so building the fact has no failing
+/// step.
+///
+/// # Errors
+///
+/// The refusals of [`parse_memo_fields`].
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::envelope_decode::ClassicMemo;
+/// use stellar_agent_network::memo::parse_memo_with_fact;
+///
+/// let (_, fact) = parse_memo_with_fact(Some("hello"), None, None, None).unwrap();
+/// assert_eq!(fact, ClassicMemo::Text("hello".to_owned()));
+/// ```
+pub fn parse_memo_with_fact(
+    memo_text: Option<&str>,
+    memo_id: Option<u64>,
+    memo_hash_hex: Option<&str>,
+    memo_return_hex: Option<&str>,
+) -> Result<(Memo, ClassicMemo), WalletError> {
+    let memo = parse_memo_fields(memo_text, memo_id, memo_hash_hex, memo_return_hex)?;
+    let fact = match &memo {
+        Memo::None => ClassicMemo::None,
+        Memo::Text(_) => ClassicMemo::Text(memo_text.unwrap_or_default().to_owned()),
+        Memo::Id(id) => ClassicMemo::Id(*id),
+        Memo::Hash(hash) => ClassicMemo::Hash(hash.0),
+        Memo::Return(hash) => ClassicMemo::Return(hash.0),
+    };
+    Ok((memo, fact))
+}
 
 /// Parses up to four optional memo fields into a single [`Memo`].
 ///

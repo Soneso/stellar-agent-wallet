@@ -12,6 +12,9 @@ pub(crate) fn store_error(error: WindowStoreError) -> MainnetAuthorizationError 
     if let Some(refusal) = super::TotalEpochRefusal::from_store(&error) {
         return MainnetAuthorizationError::TotalEpoch(refusal);
     }
+    if let Some(refusal) = super::AccountingRefusal::from_store(&error) {
+        return MainnetAuthorizationError::Accounting(refusal);
+    }
     match error {
         WindowStoreError::AuthorizationRefused { precondition } => {
             MainnetAuthorizationError::Refused(precondition)

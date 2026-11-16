@@ -664,6 +664,24 @@ async fn payment_outer_gate_memo_accepts_routed_id() {
     );
 }
 
+/// A stray fact key the caller writes beside a routed memo is replaced by the
+/// parsed memo's facts, so the matching routed ID still passes the outer gate.
+#[tokio::test]
+#[serial]
+async fn payment_outer_gate_memo_replaces_caller_fact_keys() {
+    let _root = crate::common::isolated_data_root();
+    let stores = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let server = memo_binding_server(stores.path());
+    let mut args = payment_invoke("stellar_pay", DEST_G, 10);
+    args.args["memo_id"] = serde_json::json!(0);
+    args.args["memo_hash"] = serde_json::json!("ab".repeat(32));
+    let result = server.call_stellar_toolset_invoke(args).await;
+    assert!(
+        matches!(&result, Err(err) if err.message.starts_with("toolset.not_installed:")),
+        "the parsed routed memo alone supplies the facts: {result:?}"
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn payment_outer_gate_memo_refuses_caller_facts() {

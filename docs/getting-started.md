@@ -647,7 +647,11 @@ Review it before you sign it with `profile sign-policy`:
   after a seed prompt.
 - Unlisted recipients: with `--unlisted-budget yes`, an api preset pays
   recipients outside the list from one budget per rolling day, shared by
-  CLI `pay` and the MCP payment tools. A payment beyond it is denied.
+  CLI `pay` and the MCP payment tools. A payment beyond it requests a
+  per-payment approval, granted with
+  `stellar-agent approve --id <nonce> --profile <NAME>`. The approved
+  payment counts in full, and every cap still applies. Unattended payments
+  resume once the rolling day frees budget.
 - Caps: every payment rule allows the preset's asset alone, with a
   per-payment cap, 1d and 1w caps, and rate limits. A chosen
   `total_budget` bounds all spending under the signed policy's digest.

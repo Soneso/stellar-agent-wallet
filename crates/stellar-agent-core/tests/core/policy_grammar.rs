@@ -4417,3 +4417,317 @@ fn muxed_budget_and_counterparty_accounting() {
         Decision::Deny(DenyReason::UnlistedBudgetExceeded { .. })
     ));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Unlisted allowance on mainnet
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Evaluates `value` strictly on [`mainnet_profile`].
+fn on_mainnet(engine: &PolicyEngineV1, value: ValueClass) -> Result<Evaluation, PolicyError> {
+    engine.evaluate_with_value_full(
+        &pay(),
+        &Value::Null,
+        &mainnet_profile(),
+        value,
+        None,
+        None,
+        None,
+        None,
+        None,
+        instant(),
+    )
+}
+
+/// Records a payment the mainnet evaluation permits, with or without
+/// approval, as confirmed.
+fn confirm_on_mainnet(engine: &PolicyEngineV1, value: ValueClass) {
+    let evaluation = on_mainnet(engine, value).unwrap();
+    assert!(
+        !matches!(evaluation.decision, Decision::Deny(_)),
+        "{evaluation:?}"
+    );
+    engine
+        .record_confirmed(
+            &pay(),
+            &mainnet_profile(),
+            &ValueClass::Value(evaluation.value_effects.unwrap()),
+        )
+        .unwrap();
+}
+
+/// The native asset contract on the public network.
+fn mainnet_native_sac() -> String {
+    CanonicalAsset::Native
+        .sac_contract_id(stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE)
+        .unwrap()
+}
+
+fn mainnet_bundle(
+    engine: &PolicyEngineV1,
+    inners: &[InnerOpDescriptor],
+) -> Result<Decision, PolicyError> {
+    let overlay = BundleStateOverlay::default();
+    engine.evaluate_bundle(
+        &pay(),
+        &Value::Null,
+        &mainnet_profile(),
+        &BundleView {
+            inners,
+            overlay: &overlay,
+        },
+    )
+}
+
+fn mainnet_transfer(to: &str, amount: i128) -> InnerOpDescriptor {
+    InnerOpDescriptor::TokenTransfer {
+        asset: mainnet_native_sac(),
+        from: LISTED.to_owned(),
+        to: to.to_owned(),
+        amount,
+    }
+}
+
+/// On a mainnet profile an unlisted payment beyond either budget bound
+/// requests approval with the fixed reason, and is counted in full once
+/// confirmed. Every hard cap still denies, in either criterion order, and a
+/// listed payment is unaffected. Every other network keeps the denial.
+#[test]
+#[serial_test::serial]
+fn unlisted_exhaustion_requires_approval_below_hard_caps() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let _clock = set_query_time_for_test(NOW_MS);
+    let escalated = |decision: &Decision| {
+        matches!(decision, Decision::RequireApproval(request)
+            if request.reason.as_deref()
+                == Some("counterparty_allowlist: an unlisted recipient requires approval"))
+    };
+    let per_tx = "{ kind = \"per_tx_cap\", asset = \"native\", max_stroops = 1000 }";
+    let period =
+        "{ kind = \"per_period_cap\", asset = \"native\", window = \"1d\", max_stroops = 1300 }";
+    let total = "{ kind = \"total_budget\", asset = \"native\", max_stroops = 1250 }";
+    for hard in [period, total] {
+        for budget_first in [true, false] {
+            let caps = format!("{per_tx}, {hard}");
+            let criteria = if budget_first {
+                format!("{}, {caps}", budget(100, 250))
+            } else {
+                format!("{caps}, {}", budget(100, 250))
+            };
+            let engine = engine_from_criteria(&criteria);
+            let mainnet = |amount, to| on_mainnet(&engine, payment(amount, to)).unwrap().decision;
+            let case = format!("{hard} budget_first={budget_first}");
+
+            // The per-transaction bound: equality passes, beyond it asks for
+            // approval up to the hard cap, and the hard cap denies.
+            assert_eq!(mainnet(100, UNLISTED), Decision::Allow, "{case}");
+            assert!(escalated(&mainnet(101, UNLISTED)), "{case}");
+            assert!(escalated(&mainnet(1000, UNLISTED)), "{case}");
+            assert_eq!(
+                mainnet(1001, UNLISTED),
+                Decision::Deny(DenyReason::PerTxCapExceeded {
+                    asset: "native".to_owned(),
+                    max_stroops: 1000,
+                    attempted_stroops: 1001,
+                }),
+                "{case}"
+            );
+            assert_eq!(mainnet(1000, LISTED), Decision::Allow, "{case}");
+            assert_eq!(
+                decide(&engine, payment(101, UNLISTED)),
+                native_exceeded(UnlistedBound::PerTx, 100, 101),
+                "{case}"
+            );
+
+            // The period bound reads the recorded window.
+            confirm_on_mainnet(&engine, payment(100, UNLISTED));
+            confirm_on_mainnet(&engine, payment(100, UNLISTED));
+            assert_eq!(mainnet(50, UNLISTED), Decision::Allow, "{case}");
+            assert!(escalated(&mainnet(51, UNLISTED)), "{case}");
+            assert_eq!(
+                decide(&engine, payment(51, UNLISTED)),
+                native_exceeded(UnlistedBound::PerPeriod, 250, 51),
+                "{case}"
+            );
+
+            // An approved payment counts in full in every counter; the hard
+            // caps then deny before the approval is asked.
+            confirm_on_mainnet(&engine, payment(1000, UNLISTED));
+            assert_eq!(
+                engine
+                    .state_store()
+                    .query_window(&unlisted_key(), NOW_MS)
+                    .unwrap(),
+                (1200, 3),
+                "{case}"
+            );
+            let (equal, beyond) = if hard == period { (100, 101) } else { (50, 51) };
+            assert!(escalated(&mainnet(equal, UNLISTED)), "{case}");
+            assert_eq!(mainnet(equal, LISTED), Decision::Allow, "{case}");
+            let denied = mainnet(beyond, UNLISTED);
+            if hard == period {
+                assert!(
+                    matches!(
+                        denied,
+                        Decision::Deny(DenyReason::PerPeriodCapExceeded { .. })
+                    ),
+                    "{case}: {denied:?}"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        denied,
+                        Decision::Deny(DenyReason::TotalBudgetExhausted { .. })
+                    ),
+                    "{case}: {denied:?}"
+                );
+            }
+        }
+    }
+
+    // A bundle keeps the escalation of an earlier inner, and a hard cap of a
+    // later inner wins over it.
+    let engine = engine_from_criteria(&format!("{}, {per_tx}", budget(100, 250)));
+    assert_eq!(
+        mainnet_bundle(&engine, &[mainnet_transfer(UNLISTED, 100)]).unwrap(),
+        Decision::Allow
+    );
+    assert!(escalated(
+        &mainnet_bundle(
+            &engine,
+            &[
+                mainnet_transfer(UNLISTED, 200),
+                mainnet_transfer(UNLISTED, 10)
+            ]
+        )
+        .unwrap()
+    ));
+    assert!(matches!(
+        mainnet_bundle(
+            &engine,
+            &[
+                mainnet_transfer(UNLISTED, 200),
+                mainnet_transfer(UNLISTED, 1001)
+            ]
+        )
+        .unwrap(),
+        Decision::Deny(DenyReason::BundleDenied { inner_index: 1, .. })
+    ));
+}
+
+/// Unlisted sums never saturate: an attempt, a recorded window, and a bundle
+/// overlay that overflow refuse with `policy.accounting_overflow`.
+#[test]
+#[serial_test::serial]
+fn unlisted_sum_limits_refuse() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let _clock = set_query_time_for_test(NOW_MS);
+    let overflow = |result: Result<Evaluation, PolicyError>| {
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, PolicyError::AccountingOverflow),
+            "{error:?}"
+        );
+        assert_eq!(error.wire_code(), "policy.accounting_overflow");
+    };
+
+    // Two debit legs whose sum exceeds i128.
+    let engine = engine_from_criteria(&budget(100, 250));
+    let legs = ValueClass::Value(ValueEffects::new(vec![
+        leg(ActionKind::Payment, i128::MAX, "native", Some(UNLISTED)),
+        leg(ActionKind::Payment, 1, "native", Some(UNLISTED)),
+    ]));
+    overflow(on_mainnet(&engine, legs.clone()));
+    overflow(strict(&engine, legs, None));
+
+    // A recorded window at i128::MAX and one stroop more.
+    let store = engine.state_store();
+    store.append(&unlisted_key(), NOW_MS, i128::MAX).unwrap();
+    overflow(on_mainnet(&engine, payment(1, UNLISTED)));
+    // A zero debit adds nothing to the full window.
+    assert!(matches!(
+        on_mainnet(&engine, payment(0, UNLISTED)).unwrap().decision,
+        Decision::RequireApproval(_)
+    ));
+    // Two recorded entries whose sum exceeds i128.
+    store.append(&unlisted_key(), NOW_MS, 1).unwrap();
+    overflow(on_mainnet(&engine, payment(0, UNLISTED)));
+
+    // A bundle overlay at i128::MAX before a last inner of one stroop.
+    let fresh = engine_from_criteria(&budget(100, 250));
+    let result = mainnet_bundle(
+        &fresh,
+        &[
+            mainnet_transfer(UNLISTED, i128::MAX),
+            mainnet_transfer(UNLISTED, 1),
+        ],
+    );
+    assert!(
+        matches!(result, Err(PolicyError::AccountingOverflow)),
+        "{result:?}"
+    );
+
+    // A negative amount beside a larger one refuses, on every network,
+    // though the window's total stays positive.
+    let negative = engine_from_criteria(&budget(100, 250));
+    negative
+        .state_store()
+        .append(&unlisted_key(), NOW_MS, 5)
+        .unwrap();
+    negative
+        .state_store()
+        .append(&unlisted_key(), NOW_MS, -3)
+        .unwrap();
+    for result in [
+        on_mainnet(&negative, payment(1, UNLISTED)),
+        strict(&negative, payment(1, UNLISTED), None),
+    ] {
+        let error = result.unwrap_err();
+        assert!(matches!(error, PolicyError::AccountingInvalid), "{error:?}");
+        assert_eq!(error.wire_code(), "policy.accounting_invalid");
+    }
+}
+
+/// Every spelling of the budget asset selects one bucket: a classic asset
+/// and its asset contract share one window, keyed by the contract.
+#[test]
+#[serial_test::serial]
+fn unlisted_aliases_share_one_canonical_bucket() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let _clock = set_query_time_for_test(NOW_MS);
+    let classic = usd();
+    let contract = sac(&classic);
+    let engine = engine_from_criteria(&budget_table(
+        &format!(", asset = \"{classic}\""),
+        "100",
+        "250",
+        "1d",
+    ));
+    let debit = |asset: &str, amount| {
+        ValueClass::single(leg(ActionKind::Payment, amount, asset, Some(UNLISTED)))
+    };
+    confirm(&engine, debit(&classic, 100));
+    confirm(&engine, debit(&contract, 100));
+    let key = StateKey::new("operator", 1, &format!("unlisted:{contract}"), 86_400);
+    assert_eq!(
+        engine.state_store().query_window(&key, NOW_MS).unwrap(),
+        (200, 2)
+    );
+    for asset in [&classic, &contract] {
+        assert_eq!(decide(&engine, debit(asset, 50)), Decision::Allow);
+        assert_eq!(
+            decide(&engine, debit(asset, 51)),
+            Decision::Deny(DenyReason::UnlistedBudgetExceeded {
+                asset: classic.clone(),
+                bound: UnlistedBound::PerPeriod,
+                max_stroops: 250,
+                attempted_stroops: 51,
+            })
+        );
+    }
+}

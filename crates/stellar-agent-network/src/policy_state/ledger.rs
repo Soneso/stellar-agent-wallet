@@ -56,12 +56,13 @@ use stellar_agent_core::profile::caip2::Caip2;
 use stellar_agent_core::profile::schema::Profile;
 
 use super::WindowStoreError;
+use super::accounting::Admission;
 use super::operations::{
     self, CommitId, Disposition, OperationId, OperationLink, ReleaseClass, ReleaseRow,
 };
 use super::store::{
     PersistedWindowStore, RecordStatus, WIRE_VERSION_LEDGER, WireBucket, WireFile, WireRecord,
-    admit, check_total_shape, file_holds_id, find_or_insert_bucket, generation_entry_ref,
+    admit_as, check_total_shape, file_holds_id, find_or_insert_bucket, generation_entry_ref,
     i128_decimal_str, is_total_entry, is_total_hold, now_ms, prune_stale,
 };
 use crate::mainnet::digest::{BindingFacts, bindings_digest};
@@ -1883,8 +1884,11 @@ fn apply_consumption(
 ///
 /// [`WindowStoreError::AuthorizationRefused`] naming the broken
 /// precondition, [`WindowStoreError::PolicyDenied`] when the window cannot
-/// admit the holds, and [`WindowStoreError::UnexpectedState`] for a link to
-/// an operation the window does not hold open.
+/// admit the holds, [`WindowStoreError::UnlistedApprovalRequired`] when a
+/// policy authority finds the unlisted allowance spent, and
+/// [`WindowStoreError::UnexpectedState`] for a link to an operation the
+/// window does not hold open. An approval authority admits holds beyond the
+/// unlisted allowance; every other limit applies to both authorities.
 pub(super) fn mint_into(
     wire: &mut WireFile,
     profile: &Profile,
@@ -1966,7 +1970,13 @@ pub(super) fn mint_into(
                 < MAX_OPEN_AUTHORIZATIONS,
         P::TooManyOpen,
     )?;
-    admit(wire, &request.holds)?;
+    // The authority was verified above: a fresh approval's nonce was checked
+    // and consumed, and a child's authority equals its used parent's.
+    let mode = match request.authority {
+        MintAuthority::Approval { .. } => Admission::Approved,
+        MintAuthority::Policy(_) => Admission::Policy,
+    };
+    admit_as(wire, &request.holds, mode)?;
 
     let id = loop {
         let candidate = AuthorizationId::random();
@@ -2657,6 +2667,7 @@ mod tests {
     use std::cell::Cell;
     use std::fs;
 
+    use crate::policy_state::store::admit;
     use serial_test::serial;
     use stellar_agent_core::policy::pin::Pin;
     use stellar_agent_core::policy::v1::criteria::state_store::{
@@ -8148,6 +8159,13 @@ mod tests {
             .find(|auth| auth.id == minted.id)
             .unwrap();
         assert_eq!(stored.operation, Some(link));
+    }
+
+    /// Unlisted-recipient admission on the mainnet mint.
+    mod unlisted {
+        use super::*;
+
+        include!("ledger_unlisted_tests.rs");
     }
 
     /// Total-budget accounting on the mainnet authorization path: the gate

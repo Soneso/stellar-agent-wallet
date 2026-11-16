@@ -396,6 +396,53 @@ pub enum MainnetAuthorizationError {
     /// The durable total-budget accounting refuses the authorization's holds.
     #[error("{0}")]
     TotalEpoch(TotalEpochRefusal),
+    /// The durable unlisted-recipient accounting refuses the authorization's
+    /// holds.
+    #[error("{0}")]
+    Accounting(AccountingRefusal),
+}
+
+/// A refusal of the durable unlisted-recipient accounting, kept apart from
+/// the generic refusal because each names its own remedy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum AccountingRefusal {
+    /// The allowance is spent and the mint runs under policy authority.
+    #[error("the unlisted-recipient allowance is spent; this payment needs a per-payment approval")]
+    ApprovalRequired,
+    /// An unlisted-recipient sum exceeds its representation.
+    #[error("the unlisted-recipient spending sum overflows; nothing was recorded")]
+    Overflow,
+    /// The window holds a negative unlisted-recipient amount.
+    #[error("the spending window holds a negative unlisted-recipient amount")]
+    Invalid,
+}
+
+impl AccountingRefusal {
+    /// The refusal a window-store error names, when it is an accounting
+    /// refusal.
+    #[cfg(feature = "mainnet-write")]
+    #[must_use]
+    pub(crate) fn from_store(error: &crate::policy_state::WindowStoreError) -> Option<Self> {
+        use crate::policy_state::WindowStoreError;
+        match error {
+            WindowStoreError::UnlistedApprovalRequired => Some(Self::ApprovalRequired),
+            WindowStoreError::AccountingOverflow => Some(Self::Overflow),
+            WindowStoreError::AccountingInvalid => Some(Self::Invalid),
+            _ => None,
+        }
+    }
+
+    /// The validation error the agent receives.
+    #[must_use]
+    pub fn validation_error(self) -> stellar_agent_core::error::ValidationError {
+        use stellar_agent_core::error::ValidationError;
+        match self {
+            Self::ApprovalRequired => ValidationError::UnlistedApprovalRequired,
+            Self::Overflow => ValidationError::AccountingOverflow,
+            Self::Invalid => ValidationError::AccountingInvalid,
+        }
+    }
 }
 
 /// A refusal of the durable total-budget accounting, kept apart from the
@@ -472,8 +519,10 @@ impl MainnetAuthorizationError {
 impl From<MainnetAuthorizationError> for WalletError {
     /// The agent-facing error: the policy's `policy.deny.*` code for a
     /// denial, `network.mainnet_write_forbidden` for a build without mainnet
-    /// writes, `policy.total_epoch_*` for a total-budget epoch refusal, and
-    /// `network.mainnet_authorization_refused` for every refused
+    /// writes, `policy.total_epoch_*` for a total-budget epoch refusal,
+    /// `policy.approval_required`, `policy.accounting_overflow` or
+    /// `policy.accounting_invalid` for an unlisted-recipient accounting
+    /// refusal, and `network.mainnet_authorization_refused` for every refused
     /// precondition. The precondition does not cross into the error: the
     /// caller logs it.
     fn from(error: MainnetAuthorizationError) -> Self {
@@ -486,6 +535,7 @@ impl From<MainnetAuthorizationError> for WalletError {
                 WalletError::Network(NetworkError::MainnetAuthorizationRefused)
             }
             MainnetAuthorizationError::TotalEpoch(refusal) => refusal.validation_error().into(),
+            MainnetAuthorizationError::Accounting(refusal) => refusal.validation_error().into(),
         }
     }
 }
@@ -530,6 +580,9 @@ impl From<MainnetAuthorizationError> for AuthorizedPathError {
                 Self::Wallet(WalletError::Network(NetworkError::MainnetWriteForbidden))
             }
             MainnetAuthorizationError::TotalEpoch(refusal) => {
+                Self::Wallet(refusal.validation_error().into())
+            }
+            MainnetAuthorizationError::Accounting(refusal) => {
                 Self::Wallet(refusal.validation_error().into())
             }
         }
@@ -581,6 +634,39 @@ mod tests {
             ),
         ] {
             let refused = super::super::mint::store_error(error);
+            assert_eq!(WalletError::from(refused.clone()).code(), code);
+            assert_eq!(refused.report("mint").code(), code);
+        }
+    }
+
+    /// The unlisted-recipient accounting refusals keep their codes from the
+    /// store through the operation, submission and mint adapters, the
+    /// wallet conversion, and the authorized path.
+    #[cfg(feature = "mainnet-write")]
+    #[test]
+    fn accounting_carriers_keep_their_codes() {
+        use crate::policy_state::WindowStoreError;
+        for (error, refusal, code) in [
+            (
+                WindowStoreError::UnlistedApprovalRequired,
+                AccountingRefusal::ApprovalRequired,
+                "policy.approval_required",
+            ),
+            (
+                WindowStoreError::AccountingOverflow,
+                AccountingRefusal::Overflow,
+                "policy.accounting_overflow",
+            ),
+            (
+                WindowStoreError::AccountingInvalid,
+                AccountingRefusal::Invalid,
+                "policy.accounting_invalid",
+            ),
+        ] {
+            assert_eq!(error.operation_error().map(|e| e.code()), Some(code));
+            assert_eq!(error.submission_code(), code);
+            let refused = super::super::mint::store_error(error);
+            assert_eq!(refused, MainnetAuthorizationError::Accounting(refusal));
             assert_eq!(WalletError::from(refused.clone()).code(), code);
             assert_eq!(refused.report("mint").code(), code);
         }

@@ -336,7 +336,7 @@ async fn assert_muxed_approval_id_binding(authenticated: bool, contract: bool) {
 #[tokio::test]
 #[serial_test::serial(keyring)]
 #[serial_test::serial]
-async fn muxed_unlisted_budget_pays_unattended_and_refuses_exhaustion() {
+async fn muxed_unlisted_budget_pays_unattended_and_requests_approval_beyond_it() {
     for authenticated in [false, true] {
         let (payee, expected) = muxed_payee(false, 7);
         let run = Run::build(|raw| {
@@ -391,10 +391,18 @@ async fn muxed_unlisted_budget_pays_unattended_and_refuses_exhaustion() {
         assert_eq!(simulations, 2);
         let mut next = run.args(HOME, None);
         next.payment_required = serde_json::to_string(&requirements).unwrap();
-        let denied = call_muxed(&run, authenticated, next).await;
+        // Beyond the spent budget a mainnet payment asks for a per-payment
+        // approval and signs, simulates and records nothing.
+        let queued = call_muxed(&run, authenticated, next).await;
+        assert!(queued["error"].is_null(), "{queued}");
+        assert!(
+            queued["data"]["approval"]["approval_nonce"].is_string(),
+            "{queued}"
+        );
         assert_eq!(
-            denied["error"]["code"], "policy.deny.unlisted_budget_exceeded",
-            "{denied}"
+            queued["data"]["approval"]["reason"],
+            "counterparty_allowlist: an unlisted recipient requires approval",
+            "{queued}"
         );
         assert_eq!(run.control.count("simulateTransaction"), simulations);
         assert_eq!(ledger(&run.f).unwrap()["entries"], state["entries"]);

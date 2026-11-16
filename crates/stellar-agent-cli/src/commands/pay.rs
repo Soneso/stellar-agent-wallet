@@ -155,8 +155,8 @@ use stellar_agent_network::signing::source::signer_from_ledger;
 use stellar_agent_network::{
     CLASSIC_SINGLE_OPERATION_COUNT, ClassicFeeChoice, ClassicFeeSelection, StellarRpcClient,
     SubmissionResult, SubmissionSignerKind, check_built_fee_cap, check_classic_fee_cap,
-    init_platform_keyring_store, parse_classic_fee_choice, parse_memo_fields,
-    resolve_classic_fee_selection, submit_transaction_and_wait,
+    init_platform_keyring_store, parse_classic_fee_choice, resolve_classic_fee_selection,
+    submit_transaction_and_wait,
 };
 
 use crate::commands::policy_engine::{
@@ -1756,7 +1756,7 @@ async fn build_unsigned_envelope(
     let sequence_number = source_account.sequence_number;
 
     // Parse memo.
-    let memo = parse_memo(args)?;
+    let (memo, memo_fact) = parse_memo(args)?;
     let memo_present = !matches!(memo, Memo::None);
 
     // SEP-29: check memo-required BEFORE signing. The observation feeds the
@@ -1788,11 +1788,7 @@ async fn build_unsigned_envelope(
 
     Ok(BuiltPaymentEnvelope {
         envelope_xdr,
-        memo: stellar_agent_core::envelope_decode::ClassicMemo::try_from(&memo).map_err(|_| {
-            WalletError::Validation(ValidationError::MemoInvalidType {
-                memo_type: "TEXT (not UTF-8)".into(),
-            })
-        })?,
+        memo: memo_fact,
         fee_selection,
         fee_choice,
         asset,
@@ -1974,9 +1970,7 @@ fn evaluate_pay_policy(
         pay_policy_args(built.amount_stroops, &built.asset_raw, &built.destination),
         total_fee,
     );
-    for (key, value) in built.memo.policy_fields() {
-        policy_args[key] = value;
-    }
+    built.memo.insert_policy_fields(&mut policy_args);
     // `account_view` reuses the source-account state `build_unsigned_envelope`
     // already fetched (feeds `minimum_reserve`); `identity_view` reuses the
     // destination-account state the same function fetched (`.ok()`-optional,
@@ -2129,12 +2123,16 @@ where
 // Memo parsing
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Parses memo arguments into an XDR `Memo`.
+/// Parses memo arguments into an XDR `Memo` and the policy fact of the same
+/// memo.
 ///
-/// Delegates to [`stellar_agent_network::parse_memo_fields`], the shared
-/// implementation for both the CLI pay command and the `stellar_pay` MCP tool.
-fn parse_memo(args: &PayArgs) -> Result<Memo, WalletError> {
-    parse_memo_fields(
+/// Delegates to [`stellar_agent_network::memo::parse_memo_with_fact`], the
+/// shared implementation for both the CLI pay command and the `stellar_pay`
+/// MCP tool.
+fn parse_memo(
+    args: &PayArgs,
+) -> Result<(Memo, stellar_agent_core::envelope_decode::ClassicMemo), WalletError> {
+    stellar_agent_network::memo::parse_memo_with_fact(
         args.memo_text.as_deref(),
         args.memo_id,
         args.memo_hash_hex.as_deref(),
@@ -2410,7 +2408,7 @@ where
         Err(envelope) => return fail(&envelope),
     };
     let memo = match parse_memo(args) {
-        Ok(memo) => memo,
+        Ok((memo, _)) => memo,
         Err(e) => return fail(&Envelope::<()>::err(&e)),
     };
     // The id is checked where the run first needs it, after every refusal
@@ -2477,9 +2475,7 @@ where
         pay_policy_args(built.amount_stroops, &built.asset_raw, &built.destination),
         total_fee,
     );
-    for (key, value) in built.memo.policy_fields() {
-        policy_args[key] = value;
-    }
+    built.memo.insert_policy_fields(&mut policy_args);
     let source_adapter =
         stellar_agent_network::policy_view::AccountViewAdapter::new(&built.source_account_view);
     let dest_adapter = built
@@ -3359,7 +3355,7 @@ pub(crate) mod tests {
     #[test]
     fn parse_memo_none() {
         let args = minimal_args();
-        let memo = parse_memo(&args).unwrap();
+        let (memo, _) = parse_memo(&args).unwrap();
         assert!(matches!(memo, Memo::None));
     }
 
@@ -3367,7 +3363,7 @@ pub(crate) mod tests {
     fn parse_memo_text() {
         let mut args = minimal_args();
         args.memo_text = Some("hello".to_owned());
-        let memo = parse_memo(&args).unwrap();
+        let (memo, _) = parse_memo(&args).unwrap();
         assert!(matches!(memo, Memo::Text(_)));
     }
 
@@ -3382,7 +3378,7 @@ pub(crate) mod tests {
     fn parse_memo_id() {
         let mut args = minimal_args();
         args.memo_id = Some(42);
-        let memo = parse_memo(&args).unwrap();
+        let (memo, _) = parse_memo(&args).unwrap();
         assert!(matches!(memo, Memo::Id(_)));
     }
 
@@ -4849,7 +4845,9 @@ pub(crate) mod tests {
         let _isolation = zero_config();
         let audit = tempfile::tempdir().unwrap();
         let signer = EnvSigner::new([0x5d; 32], "PAY_MEMO_PARITY_SK");
-        let primary = ClassicRpc::testnet(&[&signer.g, DEST_G]).serve().await;
+        let primary = ClassicRpc::testnet(&[&signer.g, DEST_G, SOURCE_G])
+            .serve()
+            .await;
         let mut profile = witness_profile("memo-parity", &primary.uri(), None, audit.path());
         profile.policy.engine = PolicyEngineKind::V1;
         let owner = ed25519_dalek::SigningKey::from_bytes(&[0x5e; 32]);
@@ -4863,7 +4861,7 @@ pub(crate) mod tests {
         .set_password(&owner_id)
         .unwrap();
         let body = format!(
-            "version = 2\nscope = \"profile:memo-parity\"\nsequence = 1\n[[rules]]\nmatch = {{tool = \"*\", chain = \"stellar:testnet\"}}\ncriteria = [{{kind = \"memo_binding\", bindings = [{{destination = \"{DEST_G}\", kind = \"id\", value = \"18446744073709551615\"}}]}}]\ndecision = \"allow\"\n"
+            "version = 2\nscope = \"profile:memo-parity\"\nsequence = 1\n[[rules]]\nmatch = {{tool = \"*\", chain = \"stellar:testnet\"}}\ncriteria = [{{kind = \"memo_binding\", bindings = [{{destination = \"{DEST_G}\", kind = \"id\", value = \"18446744073709551615\"}}, {{destination = \"{SOURCE_G}\", kind = \"text\", value = \"支払\"}}]}}]\ndecision = \"allow\"\n"
         );
         let signature = sign(&digest(&canonical_bytes(&body).unwrap()), &owner);
         let policies = default_policy_dir().unwrap();
@@ -5002,6 +5000,23 @@ pub(crate) mod tests {
             let (code, full, _) = invoke(&args, &profile).await;
             assert_eq!(code, 0, "full payment: {full}");
         }
+
+        // A destination bound to a text memo accepts the bound text: the
+        // policy fact is the parsed text the envelope carries.
+        let mut text = signed_payment_args(&signer, &primary.uri());
+        text.profile = Some("memo-parity".into());
+        text.destination = SOURCE_G.to_owned();
+        text.memo_text = Some("支払".into());
+        text.build_only = true;
+        let (code, built, signers) = invoke(&text, &profile).await;
+        assert_eq!(code, 0, "bound text memo: {built}");
+        assert_eq!(signers, 0);
+        let facts = stellar_agent_core::envelope_decode::decode_authoritative_args(
+            built["data"]["envelope_xdr"].as_str().unwrap(),
+            "stellar_pay_commit",
+        )
+        .unwrap();
+        assert_eq!(facts["memo"], "支払");
     }
 
     /// An unsigned payment envelope from `signer`, built against an endpoint

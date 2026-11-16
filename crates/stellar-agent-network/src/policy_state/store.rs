@@ -42,7 +42,7 @@ use crate::policy_state::lock::WindowStoreLock;
 use crate::policy_state::operations::{
     self, OperationsSection, WindowObservation, WindowSection as _,
 };
-use crate::policy_state::{NO_RECOVERY_NOTICE, WindowStoreError};
+use crate::policy_state::{NO_RECOVERY_NOTICE, WindowStoreError, accounting};
 use crate::signed_intent::IntentPurpose;
 use crate::signing::LedgerWitnessCapability;
 use crate::transaction_record::TransactionRecord;
@@ -2065,7 +2065,7 @@ impl PersistedWindowStore {
                 let key = StateKey::new(
                     profile_name,
                     leg.scope_specificity,
-                    &leg.bucket,
+                    &accounting::counted_bucket(&leg.bucket, wire.chain_scope),
                     leg.window_secs,
                 );
                 dest.append_exposure(
@@ -2083,10 +2083,12 @@ impl PersistedWindowStore {
         }
         let scope = wire.chain_scope;
         for entry in &wire.entries {
+            // An unlisted row counts in the bucket the evaluation keys for
+            // its asset, whatever spelling the writing build stored.
             let key = StateKey::new(
                 profile_name,
                 entry.scope_specificity,
-                &entry.bucket,
+                &accounting::counted_bucket(&entry.bucket, scope),
                 entry.window_secs,
             );
             // A total-budget row counts in its epoch, whatever its age, until a
@@ -2111,6 +2113,8 @@ impl PersistedWindowStore {
                 }
                 continue;
             }
+            // A negative unlisted row enters as stored, so a query of its
+            // bucket refuses it as durable admission does.
             for record in &entry.records {
                 if record.signed_intent.is_some() {
                     continue;
@@ -6678,14 +6682,29 @@ fn collect_pending(wire: &WireFile) -> Result<Vec<SubmissionHold>, WindowStoreEr
 /// when they are ahead of the host clock. Every hold of an open mainnet
 /// authorization counts too, whatever its age, until the authorization is
 /// consumed, invalidated, or swept as expired.
-fn window_in_file(wire: &WireFile, key: &StateKey, now_ms: u64) -> Result<(i128, u32), DenyReason> {
-    let mut sum: i128 = 0;
-    let mut count: u32 = 0;
+///
+/// An unlisted sum is checked ([`accounting::Tally`]) over the shares
+/// [`window_shares`] visits.
+///
+/// # Errors
+///
+/// [`WindowStoreError::PolicyDenied`] with the evaluation error of
+/// [`window_shares`], and the refusals of [`accounting::Tally::add_all`].
+fn window_in_file(
+    wire: &WireFile,
+    key: &StateKey,
+    now_ms: u64,
+) -> Result<(i128, u32), WindowStoreError> {
+    let mut total = accounting::Tally::for_bucket(key.bucket());
+    let mut refused = None;
     window_shares(wire, key, now_ms, |_, amount, entries| {
-        sum = sum.saturating_add(amount);
-        count = count.saturating_add(entries);
+        if refused.is_none()
+            && let Err(error) = total.add_all(amount, entries)
+        {
+            refused = Some(error);
+        }
     })?;
-    Ok((sum, count))
+    refused.map_or(Ok((total.sum, total.count)), Err)
 }
 
 /// Visits every live representation `wire` charges to the windowed `key` at
@@ -6694,34 +6713,45 @@ fn window_in_file(wire: &WireFile, key: &StateKey, now_ms: u64) -> Result<(i128,
 /// intent leg, and an authorization hold are reserved. A row or leg that a
 /// signed intent or another window of the same id already charges adds
 /// nothing, and one id charged only under other windows counts at its
-/// largest window total.
+/// largest window total. Buckets compare as [`accounting::counted_bucket`]
+/// maps them, so every spelling of an unlisted asset is one bucket. The
+/// rows of one id under another window sum through an
+/// [`accounting::Tally`], which is checked for an unlisted bucket.
 ///
 /// # Errors
 ///
-/// [`DenyReason::EvaluationError`] for an exposure row or intent leg dated
-/// beyond the clock-skew tolerance.
+/// [`WindowStoreError::PolicyDenied`] with [`DenyReason::EvaluationError`]
+/// for an exposure row or intent leg dated beyond the clock-skew tolerance,
+/// and the refusals of [`accounting::Tally::add`].
 pub(super) fn window_shares(
     wire: &WireFile,
     key: &StateKey,
     now_ms: u64,
     mut visit: impl FnMut(Share, i128, u32),
-) -> Result<(), DenyReason> {
+) -> Result<(), WindowStoreError> {
+    let denied = |detail: String| WindowStoreError::PolicyDenied {
+        reason: Box::new(DenyReason::EvaluationError { detail }),
+    };
+    let scope = wire.chain_scope;
+    let wanted = accounting::counted_bucket(key.bucket(), scope);
+    let in_key = |bucket: &str| accounting::counted_bucket(bucket, scope) == wanted;
     let future_limit = now_ms.saturating_add(CLOCK_SKEW_TOLERANCE_MS);
     let exact_ids: std::collections::HashSet<&str> = wire
         .entries
         .iter()
         .filter(|bucket| {
             bucket.scope_specificity == key.scope_specificity()
-                && bucket.bucket == key.bucket()
                 && bucket.window_secs == key.window_secs()
+                && in_key(&bucket.bucket)
         })
         .flat_map(|bucket| &bucket.records)
         .filter(|record| record.signed_intent.is_none() && is_exposure(record))
         .map(|record| record.id.as_str())
         .collect();
-    let mut fallback: HashMap<(&str, u64), (i128, u32)> = HashMap::new();
+    let empty = accounting::Tally::for_bucket(&wanted);
+    let mut fallback: HashMap<(&str, u64), accounting::Tally> = HashMap::new();
     for bucket in &wire.entries {
-        if bucket.scope_specificity != key.scope_specificity() || bucket.bucket != key.bucket() {
+        if bucket.scope_specificity != key.scope_specificity() || !in_key(&bucket.bucket) {
             continue;
         }
         for record in &bucket.records {
@@ -6729,13 +6759,13 @@ pub(super) fn window_shares(
                 continue;
             }
             if is_exposure(record) && record.ts_ms > future_limit {
-                return Err(DenyReason::EvaluationError {
-                    detail: StateStoreError::ClockSkewExceeded {
+                return Err(denied(
+                    StateStoreError::ClockSkewExceeded {
                         entry_ts_ms: record.ts_ms,
                         now_ms,
                     }
                     .to_string(),
-                });
+                ));
             }
             if (!is_exposure(record) && bucket.window_secs != key.window_secs())
                 || !record_is_live(record, now_ms, bucket.window_secs.max(key.window_secs()))
@@ -6744,11 +6774,10 @@ pub(super) fn window_shares(
             }
             if bucket.window_secs != key.window_secs() {
                 if !exact_ids.contains(record.id.as_str()) {
-                    let total = fallback
+                    fallback
                         .entry((&record.id, bucket.window_secs))
-                        .or_default();
-                    total.0 = total.0.saturating_add(record.amount);
-                    total.1 = total.1.saturating_add(1);
+                        .or_insert(empty)
+                        .add(record.amount)?;
                 }
             } else {
                 let share = if is_exposure(record) {
@@ -6767,54 +6796,52 @@ pub(super) fn window_shares(
             key.window_secs(),
             now_ms,
         )
-        .map_err(|error| DenyReason::EvaluationError {
-            detail: error.to_string(),
-        })? {
+        .map_err(|error| denied(error.to_string()))?
+        {
             continue;
         }
 
         let exact = intent.legs.iter().any(|leg| {
             leg.scope_specificity == key.scope_specificity()
-                && leg.bucket == key.bucket()
                 && leg.window_secs == key.window_secs()
+                && in_key(&leg.bucket)
         });
         for leg in &intent.legs {
-            if leg.scope_specificity != key.scope_specificity() || leg.bucket != key.bucket() {
+            if leg.scope_specificity != key.scope_specificity() || !in_key(&leg.bucket) {
                 continue;
             }
             if leg.ts_ms > future_limit {
-                return Err(DenyReason::EvaluationError {
-                    detail: StateStoreError::ClockSkewExceeded {
+                return Err(denied(
+                    StateStoreError::ClockSkewExceeded {
                         entry_ts_ms: leg.ts_ms,
                         now_ms,
                     }
                     .to_string(),
-                });
+                ));
             }
             if leg.window_secs == key.window_secs() {
                 visit(Share::Reserved, leg.amount, 1);
             } else if !exact {
-                let total = fallback
+                fallback
                     .entry((&intent.intent_id, leg.window_secs))
-                    .or_default();
-                total.0 = total.0.saturating_add(leg.amount);
-                total.1 = total.1.saturating_add(1);
+                    .or_insert(empty)
+                    .add(leg.amount)?;
             }
         }
     }
     let mut retained: HashMap<&str, (i128, u32)> = HashMap::new();
-    for ((id, _), total) in fallback {
+    for ((id, _), tally) in fallback {
         let maximum = retained.entry(id).or_default();
-        maximum.0 = maximum.0.max(total.0);
-        maximum.1 = maximum.1.max(total.1);
+        maximum.0 = maximum.0.max(tally.sum);
+        maximum.1 = maximum.1.max(tally.count);
     }
     for total in retained.values() {
         visit(Share::Reserved, total.0, total.1);
     }
     for hold in &wire.holds {
         if hold.scope_specificity == key.scope_specificity()
-            && hold.bucket == key.bucket()
             && hold.window_secs == key.window_secs()
+            && in_key(&hold.bucket)
         {
             visit(Share::Reserved, hold.amount, 1);
         }
@@ -7639,7 +7666,22 @@ pub(super) fn retire_earlier_build(
 /// epoch, so no spelling opens a second counter. A negative total, an
 /// overflowing sum, and a retired epoch refuse. The caller sweeps expired
 /// authorizations into `wire` first, under the same lock.
+///
+/// An exceeded unlisted allowance refuses with the policy denial.
 pub(super) fn admit(wire: &WireFile, entries: &[WindowEntry]) -> Result<(), WindowStoreError> {
+    admit_as(wire, entries, accounting::Admission::Restrictive)
+}
+
+/// [`admit`] with the treatment `mode` gives an exceeded unlisted allowance.
+///
+/// An unlisted entry accumulates under the bucket every spelling of its
+/// asset shares ([`accounting::counted_bucket`]). A negative unlisted amount
+/// and an unlisted sum that overflows refuse in every mode.
+pub(super) fn admit_as(
+    wire: &WireFile,
+    entries: &[WindowEntry],
+    mode: accounting::Admission,
+) -> Result<(), WindowStoreError> {
     // Total entries accumulate per scope, canonical bucket, and epoch;
     // windowed ones per key.
     type Slot = (String, u8, String, u64, Option<[u8; 32]>);
@@ -7657,13 +7699,13 @@ pub(super) fn admit(wire: &WireFile, entries: &[WindowEntry]) -> Result<(), Wind
             (
                 key.profile_name().to_owned(),
                 key.scope_specificity(),
-                key.bucket().to_owned(),
+                accounting::counted_bucket(key.bucket(), wire.chain_scope).into_owned(),
                 key.window_secs(),
                 None,
             )
         }
     };
-    let mut batch: HashMap<Slot, (i128, u32)> = HashMap::new();
+    let mut batch: HashMap<Slot, accounting::Tally> = HashMap::new();
     for entry in entries {
         let total = is_total_entry(entry);
         if total && entry.amount() < 0 {
@@ -7675,7 +7717,11 @@ pub(super) fn admit(wire: &WireFile, entries: &[WindowEntry]) -> Result<(), Wind
     for entry in entries {
         let total = is_total_entry(entry);
         let slot = slot_of(entry);
-        let (batch_sum, batch_count) = batch.get(&slot).copied().unwrap_or((0, 0));
+        let accrued = batch
+            .get(&slot)
+            .copied()
+            .unwrap_or_else(|| accounting::Tally::for_bucket(&slot.2));
+        let (batch_sum, batch_count) = (accrued.sum, accrued.count);
         let (used, calls) = if total {
             let epoch = entry.epoch().ok_or_else(|| WindowStoreError::Invalid {
                 detail: "a total-budget entry needs its epoch".to_owned(),
@@ -7696,23 +7742,32 @@ pub(super) fn admit(wire: &WireFile, entries: &[WindowEntry]) -> Result<(), Wind
                 })?;
             (used, file_count.saturating_add(batch_count))
         } else {
-            let (file_sum, file_count) = window_in_file(wire, entry.key(), entry.timestamp_ms())
-                .map_err(|reason| WindowStoreError::PolicyDenied {
-                    reason: Box::new(reason),
-                })?;
-            (
-                file_sum.saturating_add(batch_sum),
-                file_count.saturating_add(batch_count),
-            )
+            let (file_sum, file_count) = window_in_file(wire, entry.key(), entry.timestamp_ms())?;
+            let mut used = accrued;
+            used.add_all(file_sum, file_count)?;
+            // The entry's own debit must be representable before any limit
+            // compares it.
+            let mut after = used;
+            after.add(entry.amount())?;
+            (used.sum, used.count)
         };
         if let Some(reason) = entry.refusal(used, calls) {
-            return Err(WindowStoreError::PolicyDenied {
-                reason: Box::new(reason),
-            });
+            let allowance = matches!(entry.limit(), WindowLimit::Unlisted { .. });
+            match (allowance, mode) {
+                (true, accounting::Admission::Approved) => {}
+                (true, accounting::Admission::Policy) => {
+                    return Err(WindowStoreError::UnlistedApprovalRequired);
+                }
+                _ => {
+                    return Err(WindowStoreError::PolicyDenied {
+                        reason: Box::new(reason),
+                    });
+                }
+            }
         }
-        let accrued = batch.entry(slot).or_insert((0, 0));
-        accrued.0 = accrued.0.saturating_add(entry.amount());
-        accrued.1 = accrued.1.saturating_add(1);
+        let mut accrued = accrued;
+        accrued.add(entry.amount())?;
+        batch.insert(slot, accrued);
     }
     Ok(())
 }
@@ -10007,8 +10062,9 @@ mod tests {
             let key = StateKey::new("intent", 1, "native", seconds);
             assert!(matches!(
                 window_in_file(&wire, &key, 2000),
-                Err(DenyReason::EvaluationError { ref detail })
-                    if detail == "signed intent horizon overflows"
+                Err(WindowStoreError::PolicyDenied { ref reason })
+                    if matches!(&**reason, DenyReason::EvaluationError { detail }
+                        if detail == "signed intent horizon overflows")
             ));
             assert!(matches!(loaded.query_window(&key,2000),Err(stellar_agent_core::policy::v1::criteria::state_store::StateStoreError::HorizonOverflow)));
             assert_eq!(file_sha256(store.path()), closed);
