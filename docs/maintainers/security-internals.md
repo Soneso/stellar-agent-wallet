@@ -1359,6 +1359,16 @@ Each criterion is a `Box<dyn Criterion>` (`Send + Sync`) with a snake_case kind 
 | `balance_floor` | Absolute native floor over an observed account read, v2 only |
 | `memo_binding` | Required memo per bound `G...` destination, v2 only |
 
+Classic policy effects retain the envelope's exact memo kind and value. The
+internal argument map keeps `memo` as text or null and adds `memo_kind` for all
+five kinds. ID, hash and return payloads use `memo_id` as a canonical decimal
+string, or `memo_hash` and `memo_return` as lowercase hex. A known no-memo
+transaction carries `memo_kind = "none"`; absent, malformed or contradictory
+facts produce no memo fact. Both refuse a destination's memo binding. Path
+payments retain the full destination and memo while sizing the send-side debit.
+Preparation uses the parsed memo; commit derives facts from the envelope before
+policy evaluation and retains the existing envelope integrity checks.
+
 W addresses decode for inspection and display. Envelope signing, submission,
 plain SEP-43 auth signing, multicall arguments and CLI execute arguments refuse W
 before signing, sending or persistence. Staged pay and claim refuse W before

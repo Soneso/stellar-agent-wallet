@@ -75,6 +75,7 @@ mod context;
 pub mod error;
 #[cfg(any(test, feature = "test-helpers"))]
 pub mod fixtures;
+pub mod inspection;
 pub mod intent;
 #[cfg(any(test, feature = "test-helpers"))]
 pub mod mainnet_fixtures;

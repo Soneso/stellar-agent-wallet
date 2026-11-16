@@ -397,7 +397,7 @@ impl LoadInputs {
 
 /// Reads and decodes the owner public key at the profile's owner coordinate,
 /// without rewriting it or rendering its bytes.
-fn read_owner_key(profile: &Profile) -> Result<[u8; 32], WalletError> {
+pub(crate) fn read_owner_key(profile: &Profile) -> Result<[u8; 32], WalletError> {
     let coordinate = &profile.policy_owner_key_id;
     let raw = keyring_core::Entry::new(&coordinate.service, &coordinate.account)
         .and_then(|entry| entry.get_password())

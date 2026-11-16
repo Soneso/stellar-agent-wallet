@@ -536,6 +536,155 @@ async fn display_aliases_of_toolset_and_action_names_reach_no_route() {
 
 #[tokio::test]
 #[serial]
+async fn payment_outer_gate_memo_accepts_routed_id() {
+    let _root = crate::common::isolated_data_root();
+    let stores = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let server = memo_binding_server(stores.path());
+    let mut args = payment_invoke("stellar_pay", DEST_G, 10);
+    args.args["memo_id"] = serde_json::json!(0);
+    let result = server.call_stellar_toolset_invoke(args).await;
+    // The install lookup follows the outer gate and precedes the routed handler.
+    assert!(
+        matches!(&result, Err(err) if err.message.starts_with("toolset.not_installed:")),
+        "the matching routed ID memo must pass the outer gate: {result:?}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn payment_outer_gate_memo_refuses_caller_facts() {
+    let _root = crate::common::isolated_data_root();
+    let stores = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let server = memo_binding_server(stores.path());
+    let mut args = payment_invoke("stellar_pay", DEST_G, 10);
+    args.args["memo_kind"] = serde_json::json!("id");
+    args.args["memo"] = serde_json::Value::Null;
+    args.args["memo_id"] = serde_json::json!("0");
+    let result = server.call_stellar_toolset_invoke(args).await;
+    assert!(
+        matches!(&result, Ok(result) if crate::common::assert_business_envelope(result).0
+            == "policy.deny.memo_binding_mismatch"),
+        "caller memo facts must be refused at the outer gate: {result:?}"
+    );
+}
+
+fn memo_binding_server(root: &std::path::Path) -> WalletServer {
+    use stellar_agent_core::policy::v1::criteria::memo_binding::{
+        MemoBinding, MemoBindingCriterion, MemoRequirement,
+    };
+    let _key = setup_mock_keyring();
+    let mut server = build_allow_server(root, &root.join("grants.toml"), root);
+    server.set_policy_engine_for_test(Arc::new(single_rule_engine(
+        TEST_PROFILE_NAME,
+        "*",
+        vec![Box::new(MemoBindingCriterion::new(vec![
+            MemoBinding::new(DEST_G, MemoRequirement::Id(0)).unwrap(),
+        ]))],
+    )));
+    server
+}
+
+#[tokio::test]
+#[serial]
+async fn payment_outer_gate_memo_preserves_parse_refusal_codes() {
+    let _root = crate::common::isolated_data_root();
+    let stores = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let server = memo_binding_server(stores.path());
+    for (memo_fields, code) in [
+        (
+            serde_json::json!({"memo_id": 0, "memo_text": "invoice"}),
+            "validation.memo_mutually_exclusive",
+        ),
+        (
+            serde_json::json!({"memo_hash_hex": "invalid"}),
+            "validation.memo_invalid_type",
+        ),
+        (
+            serde_json::json!({"memo_return_hex": "invalid"}),
+            "validation.memo_invalid_type",
+        ),
+    ] {
+        let mut args = payment_invoke("stellar_pay", DEST_G, 10);
+        args.args["chain_id"] = serde_json::json!("stellar:testnet");
+        args.args
+            .as_object_mut()
+            .unwrap()
+            .extend(memo_fields.as_object().unwrap().clone());
+        let direct = server
+            .call_stellar_pay(serde_json::from_value(args.args.clone()).unwrap())
+            .await
+            .unwrap();
+        let routed = server.call_stellar_toolset_invoke(args).await.unwrap();
+        assert_eq!(crate::common::assert_business_envelope(&direct).0, code);
+        assert_eq!(crate::common::assert_business_envelope(&routed).0, code);
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn payment_outer_gate_memo_preserves_overlong_text_refusal() {
+    assert_payment_outer_gate_protocol_refusal(
+        serde_json::json!({"memo_text": "x".repeat(29)}),
+        "overlong memo text",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn payment_outer_gate_memo_preserves_control_character_refusal() {
+    assert_payment_outer_gate_protocol_refusal(
+        serde_json::json!({"memo_text": "a\u{7}b"}),
+        "memo control character",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn payment_outer_gate_memo_preserves_destination_refusal_order() {
+    assert_payment_outer_gate_protocol_refusal(
+        serde_json::json!({"destination": "GBAD", "memo_id": 0, "memo_text": "invoice"}),
+        "invalid destination with both memo kinds",
+    )
+    .await;
+}
+
+async fn assert_payment_outer_gate_protocol_refusal(fields: serde_json::Value, case: &str) {
+    let _root = crate::common::isolated_data_root();
+    let stores = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let server = memo_binding_server(stores.path());
+    let mut args = payment_invoke("stellar_pay", DEST_G, 10);
+    args.args["chain_id"] = serde_json::json!("stellar:testnet");
+    args.args
+        .as_object_mut()
+        .unwrap()
+        .extend(fields.as_object().unwrap().clone());
+    // The typed handler's argument boundary rejects invalid text before entry.
+    let direct = async {
+        let typed = serde_json::from_value(args.args.clone()).map_err(|err| {
+            assert!(err.is_data());
+            rmcp::ErrorData::invalid_params(
+                "toolset.args_deserialise: stellar_pay: the arguments have a missing field \
+                 or a field of the wrong type or value",
+                None,
+            )
+        })?;
+        server.call_stellar_pay(typed).await
+    }
+    .await
+    .unwrap_err();
+    assert_eq!(direct.code.0, -32602);
+    let routed = server.call_stellar_toolset_invoke(args).await;
+    assert!(
+        matches!(&routed, Err(err) if err.code == direct.code && err.message == direct.message),
+        "{case}: routed refusal code and message must equal the direct payment refusal: \
+         direct={direct:?}, routed={routed:?}"
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn payment_outer_gate_defers_reserve_check() {
     let _root = crate::common::isolated_data_root();
     let key = setup_mock_keyring();
