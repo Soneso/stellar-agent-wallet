@@ -290,11 +290,16 @@ pub fn decode_sha256_hex(hex: &str) -> Result<[u8; 32], WalletError> {
 /// [`ClassicSummary`] rather than the entry's stored `summary_*` fields, and
 /// [`attest_and_persist`] refuses an entry for which this returns an error.
 ///
+/// A payment with a contract payment context is the verified transfer of
+/// [`crate::sac_payment::verify_sac_payment`], and its stored summary fields
+/// must equal the verified facts.
+///
 /// # Errors
 ///
 /// `approval.entry_inconsistent` when the stored digest is not the digest of
-/// the stored envelope, or the envelope does not decode as the entry's kind
-/// (see [`classic_summary`]).
+/// the stored envelope, the envelope does not decode as the entry's kind
+/// (see [`classic_summary`]), or a contract payment's envelope or stored
+/// summary does not verify.
 #[must_use]
 pub fn classic_entry_summary(kind: &ApprovalKind) -> Option<Result<ClassicSummary, WalletError>> {
     let (envelope_xdr_b64, envelope_sha256_hex, classic_kind) = match kind {
@@ -333,6 +338,43 @@ pub fn classic_entry_summary(kind: &ApprovalKind) -> Option<Result<ClassicSummar
         return Some(Err(super::inconsistent(
             "the stored digest is not the digest of the stored envelope",
         )));
+    }
+    // A contract payment record has no classic decoding a surface could show
+    // instead of its stored summary, so every stored fact must be verified.
+    if let ApprovalKind::PaymentSimulated {
+        summary_to,
+        summary_amount_stroops,
+        summary_asset,
+        summary_memo,
+        summary_simulated_fee_stroops,
+        summary_simulated_seq_num,
+        sac_payment_context: Some(context),
+        ..
+    } = kind
+    {
+        return Some(
+            crate::sac_payment::verify_sac_payment(envelope_xdr_b64, context)
+                .map_err(|error| {
+                    super::inconsistent(&format!(
+                        "the stored envelope is not the recorded contract payment: {}",
+                        error.message()
+                    ))
+                })
+                .and_then(|payment| {
+                    let summary = payment.summary();
+                    let stored = *summary_to == payment.destination()
+                        && *summary_amount_stroops == payment.amount_stroops()
+                        && *summary_asset == payment.asset_text()
+                        && summary_memo.is_none()
+                        && *summary_simulated_fee_stroops == summary.fee_stroops
+                        && *summary_simulated_seq_num == summary.seq_num;
+                    stored.then_some(summary).ok_or_else(|| {
+                        super::inconsistent(
+                            "the stored contract payment summary differs from its envelope",
+                        )
+                    })
+                }),
+        );
     }
     Some(
         classic_summary(envelope_xdr_b64, classic_kind).map_err(|error| {
@@ -1089,6 +1131,10 @@ fn prepare_attestation<'k>(
         ApprovalKind::MppChargeSimulated {
             profile, chain_id, ..
         } => profile == binding.profile_name && chain_id == binding.chain_id,
+        ApprovalKind::PaymentSimulated {
+            sac_payment_context: Some(context),
+            ..
+        } => context.chain().caip2_str() == binding.chain_id,
         _ => true,
     };
     if !binding_matches {
@@ -2766,6 +2812,57 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code(), "approval.rejected", "unexpected error: {err}");
+    }
+
+    #[test]
+    fn contract_attestation_binds_active_chain() {
+        use crate::profile::caip2::Caip2;
+        for chain in [Caip2::Mainnet, Caip2::Testnet] {
+            let dir = TempDir::new().unwrap();
+            let mut audit_writer = test_audit_writer(&dir);
+            let path = dir.path().join("contract.toml");
+            let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+            let entry = crate::approval::fixtures::sac_payment_pending(
+                chain,
+                crate::approval::IntentAsset::Native,
+            );
+            store
+                .insert(entry.clone(), entry.created_at_unix_ms)
+                .unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let result = attest_and_persist(
+                &mut store,
+                &entry,
+                &[0x42; 32],
+                &crate::approval::AttestationBinding::new("contract", "stellar:testnet"),
+                Surface::Cli,
+                ConsentAudit::Writer(&mut audit_writer),
+                ConsentAuthorization::Standard(&AttestedApprover::Local),
+                |_, _| Ok(()),
+            );
+            if chain == Caip2::Mainnet {
+                assert_eq!(
+                    result.unwrap_err().code(),
+                    "approval.binding_mismatch",
+                    "active attestation chain"
+                );
+                assert_eq!(
+                    std::fs::read(&path).unwrap(),
+                    before,
+                    "refusal writes nothing"
+                );
+            } else {
+                result.unwrap();
+                assert!(
+                    store
+                        .get(&entry.approval_nonce)
+                        .unwrap()
+                        .attestation_blob_b64
+                        .is_some(),
+                    "matching chain attests"
+                );
+            }
+        }
     }
 
     #[test]

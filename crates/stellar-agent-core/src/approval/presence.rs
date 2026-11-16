@@ -666,7 +666,8 @@ impl MainnetApprovalCredential {
 /// `approval.entry_inconsistent` for stored terms or a classic digest or
 /// envelope that do not check, `approval.attestation_invalid` for an x402
 /// invocation that does not match its digest, `approval.binding_mismatch`
-/// for an x402 chain that is not a CAIP-2 chain, `approval.wrong_kind` for a
+/// for an invalid x402 chain or a contract payment on another chain,
+/// `approval.wrong_kind` for a
 /// passkey request, which the WebAuthn bridge decides, and
 /// `approval.rejected` or `approval.consumed` for a tombstone.
 pub fn approval_view_subject(
@@ -674,6 +675,14 @@ pub fn approval_view_subject(
     binding: &AttestationBinding<'_>,
 ) -> Result<[u8; 32], WalletError> {
     super::verify_entry_terms(&entry.kind)?;
+    if let ApprovalKind::PaymentSimulated {
+        sac_payment_context: Some(context),
+        ..
+    } = &entry.kind
+        && context.chain().caip2_str() != binding.chain_id
+    {
+        return Err(binding_mismatch());
+    }
     match &entry.kind {
         ApprovalKind::PaymentSimulated {
             envelope_xdr_b64, ..

@@ -108,17 +108,17 @@ pub enum ApprovalSummaryView {
 
     /// [`ApprovalKind::PaymentSimulated`] summary, decoded from the envelope.
     ///
-    /// Covers payments, path payments and account creation; for an account
-    /// creation `to` is the new account, `amount_stroops` its starting
-    /// balance and `asset` is `"XLM"`.
+    /// Covers payments, path payments, account creation and contract
+    /// payments; for an account creation `to` is the new account,
+    /// `amount_stroops` its starting balance and `asset` is `"XLM"`.
     Payment {
         /// Effective source G-strkey.
         source: String,
-        /// Destination as the envelope names it: a G-strkey, or an M-strkey
-        /// for a muxed destination.
+        /// Destination as the envelope names it: a G-strkey, an M-strkey
+        /// for a muxed destination, or the C recipient of a contract payment.
         to: String,
         /// The G base account of a muxed `to`, shown on its own row so the
-        /// owner sees which account receives the funds. Absent for a G `to`.
+        /// owner sees which account receives the funds. Absent for a G or C `to`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         to_base: Option<String>,
         /// Amount the source pays in stroops, decimal-string encoded on the
@@ -145,6 +145,20 @@ pub enum ApprovalSummaryView {
         fee_stroops: u32,
         /// Transaction sequence number.
         seq_num: i64,
+        /// For a contract payment, the part of `fee_stroops` that bids for
+        /// inclusion, decimal-string encoded.
+        #[serde(
+            serialize_with = "crate::wire_stroops::u32_opt::serialize",
+            skip_serializing_if = "Option::is_none"
+        )]
+        inclusion_fee_stroops: Option<u32>,
+        /// For a contract payment, the Soroban resource part of
+        /// `fee_stroops`, including any restoration charge.
+        #[serde(
+            serialize_with = "crate::wire_stroops::u32_opt::serialize",
+            skip_serializing_if = "Option::is_none"
+        )]
+        resource_fee_stroops: Option<u32>,
     },
 
     /// [`ApprovalKind::TrustlineSimulated`] summary, decoded from the
@@ -186,9 +200,8 @@ pub enum ApprovalSummaryView {
         memo: ClassicMemo,
     },
 
-    /// A classic, MPP or rule proposal entry whose stored digest is not the
-    /// digest of what it shows, whose envelope does not decode, or whose MPP
-    /// terms fail fingerprint verification.
+    /// An entry whose digest, envelope, context or recorded terms fail
+    /// verification.
     /// It cannot be approved; it can be rejected.
     Inconsistent {
         /// `kind_name()` of the entry.
@@ -408,6 +421,19 @@ pub enum IntentPayloadView {
         /// The claimant account.
         claimant: String,
     },
+    /// A classic-asset transfer to a contract.
+    ContractPay {
+        /// The full C recipient.
+        destination: String,
+        /// The asset sent.
+        asset: String,
+        /// The amount, in stroops.
+        #[serde(with = "crate::wire_stroops::i64")]
+        amount_stroops: i64,
+        /// The inclusion bid the caller chose, in stroops.
+        #[serde(with = "crate::wire_stroops::u32_opt")]
+        explicit_inclusion_bid_stroops: Option<u32>,
+    },
 }
 
 impl IntentView {
@@ -459,6 +485,17 @@ impl IntentView {
                 asset: asset_text(asset),
                 amount_stroops: *amount_stroops,
                 claimant: claimant.clone(),
+            },
+            IntentPayload::ContractPay {
+                destination,
+                asset,
+                amount_stroops,
+                explicit_inclusion_bid_stroops,
+            } => IntentPayloadView::ContractPay {
+                destination: destination.clone(),
+                asset: asset_text(asset),
+                amount_stroops: *amount_stroops,
+                explicit_inclusion_bid_stroops: *explicit_inclusion_bid_stroops,
             },
         };
         let base = intent.base();
@@ -535,7 +572,7 @@ fn muxed_base(destination: &str) -> Option<String> {
         .map(|account| account.base_account().to_owned())
 }
 
-/// The summary of a classic entry, decoded from its envelope, or
+/// The summary of an envelope entry, decoded from its envelope, or
 /// [`ApprovalSummaryView::Inconsistent`] when the entry fails
 /// [`classic_entry_summary`].
 fn classic_summary_view(kind: &ApprovalKind) -> ApprovalSummaryView {
@@ -573,6 +610,8 @@ fn classic_summary_view(kind: &ApprovalKind) -> ApprovalSummaryView {
             memo,
             fee_stroops,
             seq_num,
+            inclusion_fee_stroops: None,
+            resource_fee_stroops: None,
         },
         ClassicOperation::PathPayment {
             destination,
@@ -591,6 +630,8 @@ fn classic_summary_view(kind: &ApprovalKind) -> ApprovalSummaryView {
             memo,
             fee_stroops,
             seq_num,
+            inclusion_fee_stroops: None,
+            resource_fee_stroops: None,
         },
         ClassicOperation::CreateAccount {
             destination,
@@ -606,6 +647,28 @@ fn classic_summary_view(kind: &ApprovalKind) -> ApprovalSummaryView {
             memo,
             fee_stroops,
             seq_num,
+            inclusion_fee_stroops: None,
+            resource_fee_stroops: None,
+        },
+        ClassicOperation::SacTransfer {
+            destination,
+            asset,
+            amount_stroops,
+            inclusion_fee_stroops,
+            resource_fee_stroops,
+        } => ApprovalSummaryView::Payment {
+            source,
+            to: destination,
+            to_base: None,
+            amount_stroops,
+            asset,
+            dest_asset: None,
+            dest_amount_stroops: None,
+            memo,
+            fee_stroops,
+            seq_num,
+            inclusion_fee_stroops,
+            resource_fee_stroops,
         },
         ClassicOperation::ChangeTrust {
             asset_code,
@@ -633,10 +696,11 @@ fn classic_summary_view(kind: &ApprovalKind) -> ApprovalSummaryView {
 }
 
 impl PendingApprovalView {
-    /// Builds a redacted view from a stored entry.
+    /// Builds a display view from a stored entry.
     ///
     /// A classic entry's summary is decoded from its envelope; its stored
-    /// `summary_*` fields are not read.
+    /// `summary_*` fields are not read. A contextual contract payment also
+    /// requires its stored summary to agree with the envelope.
     pub(super) fn from_entry(entry: &PendingApproval, now_unix_ms: u64) -> Self {
         let attested = match &entry.kind {
             ApprovalKind::X402Payment { .. }
@@ -899,6 +963,8 @@ mod tests {
                 memo: ClassicMemo::Text("hello".to_owned()),
                 fee_stroops: 100,
                 seq_num: 1,
+                inclusion_fee_stroops: None,
+                resource_fee_stroops: None,
             }
         );
     }
@@ -1275,6 +1341,8 @@ mod tests {
             memo: ClassicMemo::None,
             fee_stroops: 100,
             seq_num: 1,
+            inclusion_fee_stroops: None,
+            resource_fee_stroops: None,
         };
         let json = serde_json::to_value(&payment).unwrap();
         assert_eq!(json["kind"], "payment");
@@ -1415,6 +1483,8 @@ mod tests {
             memo: ClassicMemo::None,
             fee_stroops: 100,
             seq_num: 1,
+            inclusion_fee_stroops: None,
+            resource_fee_stroops: None,
         };
         let json = serde_json::to_value(&payment).unwrap();
         assert_eq!(json["amount_stroops"], "9007199254740993");
@@ -1683,6 +1753,8 @@ mod tests {
                 memo: ClassicMemo::Text("invoice 7".to_owned()),
                 fee_stroops: 300,
                 seq_num: 77,
+                inclusion_fee_stroops: None,
+                resource_fee_stroops: None,
             }
         );
 
@@ -1775,6 +1847,8 @@ mod tests {
                     .map_or(ClassicMemo::None, ClassicMemo::Text),
                 fee_stroops: *summary_simulated_fee_stroops,
                 seq_num: *summary_simulated_seq_num,
+                inclusion_fee_stroops: None,
+                resource_fee_stroops: None,
             }
         );
 

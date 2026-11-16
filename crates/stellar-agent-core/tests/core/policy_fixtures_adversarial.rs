@@ -102,6 +102,7 @@ struct CaseMeta {
     // evaluate fields
     tool: Option<ToolMeta>,
     args: Option<Value>,
+    sac_payment_context: Option<stellar_agent_core::sac_payment::SacPaymentContext>,
     profile_name: Option<String>,
     expected: Option<ExpectedMeta>,
 
@@ -502,8 +503,27 @@ fn run_case(case_path: &Path) -> Result<(), String> {
     let raw_json = std::fs::read_to_string(case_path)
         .map_err(|e| format!("{}: cannot read case file: {e}", case_path.display()))?;
 
-    let meta: CaseMeta = serde_json::from_str(&raw_json)
+    let mut meta: CaseMeta = serde_json::from_str(&raw_json)
         .map_err(|e| format!("{}: invalid case JSON: {e}", case_path.display()))?;
+
+    if let Some(context) = &meta.sac_payment_context {
+        use stellar_xdr::{Limits, TransactionEnvelope, WriteXdr as _};
+        let envelope = stellar_agent_core::approval::fixtures::sac_transfer(context);
+        let xdr = TransactionEnvelope::Tx(envelope)
+            .to_xdr_base64(Limits::none())
+            .unwrap();
+        let args =
+            stellar_agent_core::envelope_decode::decode_pay_args_with_context(&xdr, Some(context))
+                .map_err(|error| error.code().to_owned())?;
+        assert!(
+            matches!(
+                derive_value_class("stellar_pay_commit", &args),
+                ValueClass::Value(_)
+            ),
+            "contract transfer stays a value action"
+        );
+        meta.args = Some(args);
+    }
 
     let policy_body = load_policy_body(case_path);
 
@@ -1454,7 +1474,7 @@ const LEGACY_CASES: [&str; 28] = [
 /// Every legacy pair has a `_v2` companion whose policy differs only in
 /// `version = 2` and `sequence = 1`, whose case differs only in its name,
 /// and which reaches the same outcome. The legacy and companion pairs are
-/// the whole legacy corpus.
+/// the whole legacy corpus; contract cases extend the directory inventory.
 #[test]
 #[serial_test::serial]
 fn legacy_corpus_v2_companions_preserve_outcomes() {
@@ -1510,16 +1530,28 @@ fn legacy_corpus_v2_companions_preserve_outcomes() {
         }
     }
 
+    for name in [
+        "native",
+        "issued",
+        "mixed_accounts",
+        "home_domain",
+        "opaque_payment",
+    ] {
+        let path = root.join(format!("k3_contract/{name}.case.json"));
+        assert!(run_case(&path).is_ok(), "contract corpus case {name}");
+        expected_files.push(path);
+    }
+
     let extended = root.join(EXTENDED_DIR);
-    let mut legacy_files: Vec<PathBuf> = collect_case_files(&root)
+    let mut corpus_files: Vec<PathBuf> = collect_case_files(&root)
         .into_iter()
         .filter(|path| !path.starts_with(&extended))
         .collect();
-    legacy_files.sort();
+    corpus_files.sort();
     expected_files.sort();
     assert_eq!(
-        legacy_files, expected_files,
-        "the legacy corpus is the 28 pairs and their companions"
+        corpus_files, expected_files,
+        "the corpus is the 28 legacy pairs, their companions and five contract cases"
     );
 }
 

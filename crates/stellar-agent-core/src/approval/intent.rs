@@ -1,4 +1,4 @@
-//! Canonical lasting facts for classic approvals.
+//! Canonical lasting facts for transaction approvals.
 //!
 //! [`ClassicIntent`] holds an [`IntentBase`] and an [`IntentPayload`]. The base
 //! binds the CAIP-2 chain, effective source, BLAKE3 policy digest, fee bound,
@@ -8,10 +8,11 @@
 //!
 //! The base precedes the payload; fields follow declaration order. Enum tags
 //! occupy one byte, starting at zero in declaration order. Payload tags are
-//! Pay 0, CreateAccount 1, Trustline 2, Claim 3. Asset tags are Native 0 and
-//! Issued 1. Memo tags are None 0, Text 1, Id 2, Hash 3, Return 4.
+//! Pay 0, CreateAccount 1, Trustline 2, Claim 3, ContractPay 4. Asset tags are
+//! Native 0 and Issued 1. Memo tags are None 0, Text 1, Id 2, Hash 3, Return 4.
 //! Integers occupy eight big-endian bytes, with signed values in two's
-//! complement and the u32 fee bound zero-extended. UTF-8 strings and byte
+//! complement and each u32 (the fee bound and an explicit inclusion bid)
+//! zero-extended. UTF-8 strings and byte
 //! arrays carry a four-byte big-endian byte length followed by their bytes.
 //! An option carries tag 0 for absence or tag 1 followed by its value.
 //!
@@ -30,7 +31,7 @@ use crate::profile::caip2::Caip2;
 /// Domain label for the canonical classic intent digest.
 pub const CLASSIC_INTENT_DIGEST_LABEL: &[u8] = b"stellar-agent-wallet/classic-intent/v1";
 
-/// Validated lasting facts of one classic operation.
+/// Validated lasting facts of one classic operation or contract payment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RawClassicIntent")]
 pub struct ClassicIntent {
@@ -38,7 +39,7 @@ pub struct ClassicIntent {
     payload: IntentPayload,
 }
 
-/// Network, source, policy, fee bound, and memo shared by classic operations.
+/// Network, source, policy, fee bound, and memo shared by transaction intents.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RawIntentBase")]
 pub struct IntentBase {
@@ -106,6 +107,26 @@ pub enum IntentPayload {
         amount_stroops: i64,
         /// Claimant G account, equal to the effective source.
         claimant: String,
+    },
+    /// A classic-asset transfer to a C contract through the asset's contract.
+    /// The base fee bound is the total fee cap.
+    ContractPay {
+        /// Canonical C contract recipient.
+        destination: String,
+        /// Asset whose contract the transfer invokes.
+        asset: IntentAsset,
+        /// Positive amount in stroops.
+        #[serde(
+            serialize_with = "crate::wire_stroops::i64::serialize",
+            deserialize_with = "deserialize_decimal"
+        )]
+        amount_stroops: i64,
+        /// Inclusion bid the caller chose; `None` when the wallet selects it.
+        #[serde(
+            serialize_with = "crate::wire_stroops::u32_opt::serialize",
+            deserialize_with = "deserialize_optional_decimal"
+        )]
+        explicit_inclusion_bid_stroops: Option<u32>,
     },
 }
 
@@ -179,6 +200,9 @@ pub enum IntentError {
     /// The payment destination is not a canonical G account or M address.
     #[error("payment destination must be a G or M strkey")]
     InvalidPayDestination,
+    /// The contract payment destination is not a canonical C contract.
+    #[error("contract payment destination must be a C strkey")]
+    InvalidContractPayDestination,
     /// A decoded strkey re-encodes differently.
     #[error("strkey must re-encode to the same text")]
     NonCanonicalStrkey,
@@ -253,6 +277,15 @@ where
         ));
     }
     Ok(value)
+}
+
+fn deserialize_optional_decimal<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    struct Decimal(#[serde(deserialize_with = "deserialize_decimal")] u32);
+    Ok(Option::<Decimal>::deserialize(deserializer)?.map(|Decimal(value)| value))
 }
 
 mod wire_hex32 {
@@ -339,7 +372,7 @@ impl IntentPayload {
     #[must_use]
     pub fn kind(&self) -> ActionKind {
         match self {
-            Self::Pay { .. } => ActionKind::Payment,
+            Self::Pay { .. } | Self::ContractPay { .. } => ActionKind::Payment,
             Self::CreateAccount { .. } => ActionKind::AccountCreation,
             Self::Trustline { .. } => ActionKind::Trustline,
             Self::Claim { .. } => ActionKind::Claim,
@@ -407,6 +440,18 @@ impl ClassicIntent {
                     return Err(IntentError::ClaimantMismatch);
                 }
             }
+            IntentPayload::ContractPay {
+                destination,
+                asset,
+                amount_stroops,
+                ..
+            } => {
+                if !crate::sac_payment::is_canonical_contract(destination) {
+                    return Err(IntentError::InvalidContractPayDestination);
+                }
+                check_asset(asset)?;
+                check_amount(*amount_stroops)?;
+            }
         }
         Ok(Self { base, payload })
     }
@@ -424,9 +469,9 @@ impl ClassicIntent {
     #[must_use]
     pub fn approved_kind(&self) -> ApprovedKind {
         match self.payload {
-            IntentPayload::Pay { .. } | IntentPayload::CreateAccount { .. } => {
-                ApprovedKind::Payment
-            }
+            IntentPayload::Pay { .. }
+            | IntentPayload::CreateAccount { .. }
+            | IntentPayload::ContractPay { .. } => ApprovedKind::Payment,
             IntentPayload::Trustline { .. } => ApprovedKind::Trustline,
             IntentPayload::Claim { .. } => ApprovedKind::Claim,
         }
@@ -498,6 +543,24 @@ impl ClassicIntent {
                 put_asset(&mut out, asset);
                 out.extend_from_slice(&amount_stroops.to_be_bytes());
                 put_bytes(&mut out, claimant.as_bytes());
+            }
+            IntentPayload::ContractPay {
+                destination,
+                asset,
+                amount_stroops,
+                explicit_inclusion_bid_stroops,
+            } => {
+                out.push(4);
+                put_bytes(&mut out, destination.as_bytes());
+                put_asset(&mut out, asset);
+                out.extend_from_slice(&amount_stroops.to_be_bytes());
+                match explicit_inclusion_bid_stroops {
+                    None => out.push(0),
+                    Some(bid) => {
+                        out.push(1);
+                        out.extend_from_slice(&u64::from(*bid).to_be_bytes());
+                    }
+                }
             }
         }
         out
@@ -650,6 +713,7 @@ mod tests {
                     assets.insert(matches!(asset, IntentAsset::Issued { .. }) as u8);
                     3
                 }
+                IntentPayload::ContractPay { .. } => 4,
             });
         }
         assert_eq!(payloads, BTreeSet::from([0, 1, 2, 3]));
@@ -1247,6 +1311,97 @@ mod tests {
             ),
             crate::policy::Decision::Allow
         );
+    }
+
+    /// The vector bytes and digests were computed outside this crate from the
+    /// canonical layout in the module documentation.
+    #[test]
+    fn b1_contract_intent_vectors_and_identity() {
+        let text = include_str!("intent/vectors/contract_pay_issued_bid.json");
+        let v: super::super::fixtures::intent::Vector = serde_json::from_str(text).unwrap();
+        let hex = |intent: &ClassicIntent| crate::hex::encode(intent.digest().as_bytes());
+        assert_eq!(
+            crate::hex::encode(&v.intent.canonical_bytes()),
+            v.canonical_hex,
+            "contract canonical bytes"
+        );
+        assert_eq!(hex(&v.intent), v.digest_hex, "contract digest");
+        let raw = serde_json::from_str::<Value>(text).unwrap()["intent"].clone();
+        assert_eq!(serde_json::to_value(&v.intent).unwrap(), raw, "wire form");
+        assert_eq!(v.intent.payload().kind(), ActionKind::Payment);
+        assert_eq!(v.intent.approved_kind(), ApprovedKind::Payment);
+        assert_eq!(v.intent.base().fee_bound_stroops(), 1_000_000);
+
+        let with_bid = |bid: &str| {
+            let mut edited = raw.clone();
+            edited["payload"]["contract_pay"]["explicit_inclusion_bid_stroops"] =
+                serde_json::from_str(bid).unwrap();
+            build(&edited).unwrap()
+        };
+        assert_eq!(
+            hex(&with_bid("null")),
+            "d5da99b64e31b658e366f69e4796218fd62c3b9655774e0a96abaf2fdfb02211",
+            "absent bid digest"
+        );
+        assert_ne!(hex(&with_bid("\"0\"")), hex(&with_bid("null")), "zero bid");
+        let other_c = stellar_strkey::Contract([5; 32]).to_string().to_string();
+        for (path, value) in [
+            ("/payload/contract_pay/destination", json!(other_c)),
+            ("/payload/contract_pay/asset", json!("native")),
+            ("/payload/contract_pay/asset/issued/code", json!("USDC")),
+            (
+                "/payload/contract_pay/asset/issued/issuer",
+                raw["base"]["source"].clone(),
+            ),
+            ("/payload/contract_pay/amount_stroops", json!("2")),
+            (
+                "/payload/contract_pay/explicit_inclusion_bid_stroops",
+                json!("101"),
+            ),
+            ("/base/fee_bound_stroops", json!("999999")),
+            ("/base/memo", json!({"id":"1"})),
+        ] {
+            let mut edited = raw.clone();
+            *edited.pointer_mut(path).unwrap() = value;
+            assert_ne!(hex(&build(&edited).unwrap()), v.digest_hex, "{path}");
+        }
+
+        let g = raw["base"]["source"].clone();
+        let w = stellar_strkey::MuxedContract {
+            contract_id: [2; 32],
+            id: 7,
+        }
+        .to_string()
+        .to_string();
+        let c = raw["payload"]["contract_pay"]["destination"].clone();
+        for bad in [g, json!(w), json!(c.as_str().unwrap().to_lowercase())] {
+            let mut edited = raw.clone();
+            edited["payload"]["contract_pay"]["destination"] = bad.clone();
+            assert_eq!(
+                build(&edited).unwrap_err(),
+                IntentError::InvalidContractPayDestination,
+                "{bad}"
+            );
+            assert!(serde_json::from_value::<ClassicIntent>(edited).is_err());
+        }
+        for spelling in [json!(100), json!("0100"), json!("-1")] {
+            let mut edited = raw.clone();
+            edited["payload"]["contract_pay"]["explicit_inclusion_bid_stroops"] = spelling.clone();
+            assert!(
+                serde_json::from_value::<ClassicIntent>(edited).is_err(),
+                "bid {spelling}"
+            );
+        }
+        for (path, value) in [
+            ("/payload/contract_pay/amount_stroops", json!("0")),
+            ("/payload/contract_pay/amount_stroops", json!("-1")),
+            ("/payload/contract_pay/asset/issued/code", json!("bad!")),
+            ("/payload/contract_pay/asset/issued/issuer", json!("GBAD")),
+        ] {
+            let mut edited = raw.clone();
+            *edited.pointer_mut(path).unwrap() = value;
+            assert!(build(&edited).is_err(), "invalid contract fact {path}");
+        }
     }
 
     #[test]

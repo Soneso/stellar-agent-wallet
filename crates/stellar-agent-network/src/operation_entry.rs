@@ -22,9 +22,11 @@ use stellar_agent_core::error::{
     ApprovalFailure, InternalError, SubmissionError, ValidationError, WalletError,
 };
 use stellar_agent_core::mainnet::verified_policy::VerifiedPolicy;
+use stellar_agent_core::profile::caip2::Caip2;
 use stellar_agent_core::profile::receipt::{DestinationFields, PaymentDestinations};
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_core::profile::{name::profile_name_for_approval, owner_key::OwnerKeyContext};
+use stellar_agent_core::sac_payment::{ContractTransferFeeCap, SacPaymentError};
 use stellar_xdr::{Limits, Memo, ReadXdr as _, TransactionEnvelope};
 
 use crate::fees::ClassicFeeChoice;
@@ -115,13 +117,17 @@ pub fn fee_bound(
 ///
 /// # Errors
 ///
-/// `validation.mainnet_fee_cap_required` from [`fee_bound`], and
-/// `internal.unexpected_state` for facts the argument checks before this
-/// call admit but the intent refuses.
+/// `validation.mainnet_fee_cap_required` from [`fee_bound`],
+/// `validation.contract_payment_unavailable` for a contract payment, whose
+/// bound is [`contract_pay_base`]'s total cap, and `internal.unexpected_state`
+/// for facts the argument checks before this call admit but the intent refuses.
 pub fn classic_intent(
     base: IntentBaseFacts<'_>,
     payload: IntentPayload,
 ) -> Result<ClassicIntent, WalletError> {
+    if matches!(payload, IntentPayload::ContractPay { .. }) {
+        return Err(SacPaymentError::Unavailable.into());
+    }
     let bound = fee_bound(base.profile_fee_cap, base.signed_fee_cap, base.fee_choice)?;
     let unexpected = |error: stellar_agent_core::approval::IntentError| {
         WalletError::Internal(InternalError::UnexpectedState {
@@ -137,6 +143,42 @@ pub fn classic_intent(
     )
     .map_err(unexpected)?;
     ClassicIntent::new(base, payload).map_err(unexpected)
+}
+
+/// The base facts of a contract payment intent, whose fee bound is the total
+/// fee cap and never an explicit inclusion bid.
+///
+/// # Errors
+///
+/// `validation.contract_payment_invalid` for a source that is not a
+/// canonical G account or a text memo above 28 bytes.
+pub fn contract_pay_base(
+    chain: Caip2,
+    source: &str,
+    policy_digest: [u8; 32],
+    memo: MemoFact,
+    cap: ContractTransferFeeCap,
+) -> Result<IntentBase, WalletError> {
+    IntentBase::new(
+        chain.caip2_str().to_owned(),
+        source.to_owned(),
+        policy_digest,
+        cap.stroops,
+        memo,
+    )
+    .map_err(|_| SacPaymentError::Invalid.into())
+}
+
+/// The identity digest of a contract payment intent: its canonical digest.
+///
+/// # Errors
+///
+/// `validation.contract_payment_invalid` for another payload kind.
+pub fn contract_pay_identity(intent: &ClassicIntent) -> Result<[u8; 32], WalletError> {
+    match intent.payload() {
+        IntentPayload::ContractPay { .. } => Ok(*intent.digest().as_bytes()),
+        _ => Err(SacPaymentError::Invalid.into()),
+    }
 }
 
 /// The facts a canonical record is used under: the profile's CAIP-2 chain,
@@ -408,6 +450,8 @@ fn require_sequence_successor(sequence: i64) -> Result<(), WalletError> {
 /// # Errors
 ///
 /// - `protocol.xdr_codec_failed` for a `sequence` with no successor.
+/// - `validation.contract_payment_unavailable` for a contract payment, which
+///   no classic operation builds.
 /// - The builder's refusals.
 pub fn intent_envelope(
     intent: &ClassicIntent,
@@ -462,6 +506,7 @@ pub fn intent_envelope(
         )?,
         IntentPayload::Claim { balance_id, .. } => builder
             .claim_claimable_balance(balance_id.strip_prefix("00000000").unwrap_or(balance_id))?,
+        IntentPayload::ContractPay { .. } => return Err(SacPaymentError::Unavailable.into()),
     };
     let memo = match base.memo() {
         MemoFact::None => None,
@@ -621,6 +666,7 @@ pub async fn rebuild_canonical(
             base_units: i128::from(*starting_balance_stroops),
         },
         IntentPayload::Trustline { .. } | IntentPayload::Claim { .. } => CrossCheckValue::Unvalued,
+        IntentPayload::ContractPay { .. } => return Err(SacPaymentError::Unavailable.into()),
     };
     let cross_check = crate::cross_check::obtain_classic_witness_bound(
         request.profile,
@@ -1766,6 +1812,59 @@ pub(crate) mod tests {
             .unwrap();
         builder.with_presented_deadline(max_time);
         builder.build().unwrap()
+    }
+
+    /// A contract payment's base binds the total cap and its identity is the
+    /// canonical digest; the classic helpers refuse to build one. The digest
+    /// literal is the core contract intent vector.
+    #[test]
+    fn b1_contract_pay_base_and_identity() {
+        let source = "GAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQDZ7H";
+        let cap = ContractTransferFeeCap {
+            stroops: 1_000_000,
+            signed: false,
+        };
+        let contract_base =
+            contract_pay_base(Caip2::Testnet, source, [0x11; 32], MemoFact::None, cap).unwrap();
+        assert_eq!(contract_base.fee_bound_stroops(), 1_000_000, "cap bound");
+        assert_eq!(contract_base.chain_id(), "stellar:testnet");
+        let payload = IntentPayload::ContractPay {
+            destination: "CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ".to_owned(),
+            asset: IntentAsset::Issued {
+                code: "USD".to_owned(),
+                issuer: "GABQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQHGPC".to_owned(),
+            },
+            amount_stroops: 1,
+            explicit_inclusion_bid_stroops: Some(100),
+        };
+        let intent = ClassicIntent::new(contract_base.clone(), payload.clone()).unwrap();
+        assert_eq!(
+            stellar_agent_core::hex::encode(&contract_pay_identity(&intent).unwrap()),
+            "68018e1f2c0b5516a051f4e12eb28c8706897da35168895690f4750241c2a6db",
+            "identity literal"
+        );
+        let invalid = "validation.contract_payment_invalid";
+        let bad_source = contract_pay_base(Caip2::Testnet, "GBAD", [0x11; 32], MemoFact::None, cap);
+        assert_eq!(bad_source.unwrap_err().code(), invalid);
+        let classic = ClassicIntent::new(
+            contract_base,
+            IntentPayload::Pay {
+                destination: DESTINATION.to_owned(),
+                asset: IntentAsset::Native,
+                amount_stroops: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(contract_pay_identity(&classic).unwrap_err().code(), invalid);
+        let unavailable = "validation.contract_payment_unavailable";
+        let classic_build = classic_intent(base([0x11; 32], MemoFact::None), payload);
+        assert_eq!(
+            classic_build.unwrap_err().code(),
+            unavailable,
+            "classic intent"
+        );
+        let rebuild = intent_envelope(&intent, "Test SDF Network ; September 2015", 1, 100, 0);
+        assert_eq!(rebuild.unwrap_err().code(), unavailable, "classic rebuild");
     }
 
     /// Two builds of the same facts at different times and sequences give
