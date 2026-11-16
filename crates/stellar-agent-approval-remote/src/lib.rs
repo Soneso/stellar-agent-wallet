@@ -488,9 +488,11 @@ async fn start_listener(
     if config.one_shot.is_some() && signed.is_none() {
         return Err(RemoteServeStartError::MainnetPresenceUnsupported);
     }
+    // A configuration prepared without mainnet authority offers `h2`, so a
+    // signed listener always builds its own from the verified PEM pair.
     let rustls_config = match prepared {
+        _ if signed.is_some() => tls::signed_server_config(&config.tls)?,
         Some(prepared) => prepared.server,
-        None if signed.is_some() => tls::server_config(&config.tls).await?,
         None => RustlsConfig::from_pem(config.tls.cert_pem.clone(), config.tls.key_pem.clone())
             .await
             .map_err(|error| RemoteServeStartError::TlsConfigLoad {

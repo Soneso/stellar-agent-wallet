@@ -10,7 +10,7 @@ use stellar_agent_network::{
 };
 use stellar_agent_test_support::SignedTestEnvelope;
 
-/// A real envelope whose memo routing needs no independent observation.
+/// A mainnet payment envelope to a muxed destination, valid for two minutes.
 fn envelope() -> SignedTestEnvelope {
     SignedTestEnvelope::builder([42; 32])
         .network_passphrase(stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE)
@@ -340,6 +340,50 @@ impl Rpc {
     }
 }
 
+/// The mainnet decision the signed policy makes for the payment envelope
+/// `envelope_xdr`, from which the commit's approval authority is built.
+fn payment_decision(
+    policy: &stellar_agent_core::mainnet::verified_policy::VerifiedPolicy,
+    profile: &stellar_agent_core::profile::schema::Profile,
+    envelope_xdr: &str,
+) -> stellar_agent_core::mainnet::decision::MainnetDecision {
+    use stellar_agent_core::mainnet::decision::{
+        EvaluationScope, MainnetEvaluationRequest, evaluate_mainnet,
+    };
+    use stellar_agent_core::policy::{McpToolRegistration, ToolDescriptor, ToolValueKind};
+    let mut descriptor = ToolDescriptor::from_registration(&McpToolRegistration {
+        name: "stellar_pay",
+        destructive_hint: true,
+        read_only_hint: false,
+        chain_id_required: true,
+        value_kind: ToolValueKind::MovesValue,
+    });
+    descriptor.chain_id = profile.chain_id.caip2_str().to_owned();
+    let args = stellar_agent_core::envelope_decode::decode_authoritative_args(
+        envelope_xdr,
+        "stellar_pay_commit",
+    )
+    .unwrap();
+    evaluate_mainnet(
+        policy,
+        EvaluationScope::Classic,
+        now(),
+        MainnetEvaluationRequest {
+            chain_id: profile.chain_id.caip2_str(),
+            tool: &descriptor,
+            args: &args,
+            profile,
+            value: None,
+            account_view: None,
+            identity_view: None,
+            counterparty_cache: None,
+            sep10_sessions: None,
+            sep45_sessions: None,
+        },
+    )
+    .unwrap()
+}
+
 pub(super) async fn commit(f: &Fixture) {
     use stellar_agent_core::{
         audit_log::PolicyDecision,
@@ -428,7 +472,7 @@ pub(super) async fn commit(f: &Fixture) {
         },
     )
     .unwrap();
-    let authority = MainnetAuthority::from_decision(&decision, Some(&approval)).unwrap();
+    MainnetAuthority::from_decision(&decision, Some(&approval)).unwrap();
     let counters = f.counter_bytes();
     let enablement = verify_enablement(
         current.policy(),
@@ -454,6 +498,7 @@ pub(super) async fn commit(f: &Fixture) {
     let window = PersistedWindowStore::for_profile(f.fixture.name());
     let audit = audit_readiness(profile, f.fixture.name()).unwrap();
     let writer = audit.writer().clone();
+    let decision = payment_decision(current.policy(), profile, unsigned);
     let authorization = resolve_tx_sign(TxSignRequest {
         context: &context,
         consumer: MainnetConsumer::CliPay,
@@ -464,7 +509,7 @@ pub(super) async fn commit(f: &Fixture) {
         signer: &signer,
         policy: current.policy(),
         enablement: &enablement,
-        authority: &authority,
+        authority: &MainnetAuthority::from_decision(&decision, Some(&approval)).unwrap(),
         audit,
         store: &window,
         operation: None,
@@ -523,9 +568,10 @@ pub(super) async fn commit(f: &Fixture) {
         "submission consumes the approval"
     );
     assert_eq!(f.counter_bytes(), counters);
-    assert!(
-        verify(f, entry.created_at_unix_ms).is_err(),
-        "an earlier clock cannot revive consumed approval"
+    assert_eq!(
+        verify(f, now()).unwrap_err().code(),
+        "approval.consumed",
+        "a consumed approval stays consumed"
     );
     assert_eq!(signing.sign_calls(), 1);
     assert_eq!(rpc.submissions(), 1);

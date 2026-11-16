@@ -714,4 +714,41 @@ mod tests {
             "an aborted owner task releases the socket within five seconds"
         );
     }
+
+    /// The enrollment listener offers only HTTP/1.1 over ALPN: a client that
+    /// offers `h2` and `http/1.1` gets `http/1.1` and the code form, and a
+    /// client that offers only `h2` fails the handshake.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn signed_enrollment_offers_only_http1_over_alpn() {
+        use crate::test_helpers::{alpn_get, alpn_handshake};
+        let setup = Setup::new();
+        let handle = setup.start().await;
+        let reply = alpn_get(
+            setup.bind.port(),
+            SIGNED_RP_ID,
+            &setup.leaf.issuer_pem,
+            &[b"h2", b"http/1.1"],
+            SIGNED_ORIGIN.trim_start_matches("https://"),
+            "/enroll",
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply.protocol.as_deref(), Some(&b"http/1.1"[..]));
+        assert!(
+            reply.response.starts_with("HTTP/1.1 200")
+                && reply.response.contains("id=\"code-input\""),
+            "{}",
+            reply.response
+        );
+        let h2_only = alpn_handshake(
+            setup.bind.port(),
+            SIGNED_RP_ID,
+            &setup.leaf.issuer_pem,
+            &[b"h2"],
+        )
+        .await;
+        assert!(h2_only.is_err(), "an h2-only client negotiated {h2_only:?}");
+        handle.shutdown().await.unwrap();
+    }
 }

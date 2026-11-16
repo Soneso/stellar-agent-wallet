@@ -71,6 +71,14 @@
 //! challenge, enroll a credential nor decide an approval, while the
 //! operator's own tab still can.
 //!
+//! # Trust controls
+//!
+//! `signed_origin_enrollment_browser_trusts_only_the_test_authority` runs
+//! through the acceptance runner, which installs its test certificate
+//! authority for Chromium alone. Chromium loads a page the authority issued
+//! and refuses the signed enrollment listener when another authority issued
+//! its leaf; no registration is staged.
+//!
 //! # Gate
 //!
 //! ```text
@@ -130,6 +138,9 @@ use stellar_agent_core::profile::schema::{KeyringEntryRef, Profile};
 use stellar_agent_core::timefmt;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+#[path = "common/trusted_browser.rs"]
+mod trusted_browser;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // RAII guards
@@ -1238,4 +1249,176 @@ async fn cross_port_cookie_does_not_authorize_decision() {
     drop(browser_guard);
     handler_task.abort();
     serve.shutdown().await.expect("serve shutdown");
+}
+
+/// The trust controls of this suite. Positive: Chromium loads a page whose
+/// leaf the runner's test authority issued, through ordinary certificate
+/// validation. Negative: the signed-origin enrollment listener serving a
+/// leaf from an authority Chromium does not hold fails certificate
+/// verification, its page never loads, and no registration is staged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+#[ignore = "requires Chromium and the acceptance runner's test authority"]
+async fn signed_origin_enrollment_browser_trusts_only_the_test_authority() {
+    use stellar_agent_approval_remote::enroll_listener::{
+        SignedEnrollmentConfig, start_signed_enrollment,
+    };
+    use stellar_agent_approval_ui::operator_enroll::OperatorEnrollAwaitError;
+
+    let trust = trusted_browser::BrowserTrust::from_runner();
+    let chromium = trusted_browser::launch(&trust).await;
+    let page = chromium
+        .browser
+        .new_page("about:blank")
+        .await
+        .expect("new page must open");
+    trusted_browser::assert_trusted_page_loads(&page, &trust.trusted()).await;
+
+    let port = trusted_browser::free_port();
+    let pin = trust.untrusted_pin();
+    let fixture = trusted_browser::signed_fixture(
+        "enroll-trust",
+        port,
+        &trust.untrusted(),
+        &pin,
+        &[&stellar_agent_test_support::webauthn::fixture_authenticator()],
+    );
+    let origin = fixture
+        .current_policy()
+        .mainnet()
+        .expect("mainnet policy")
+        .approval_origin
+        .clone()
+        .expect("signed origin");
+    let mut handle = start_signed_enrollment(
+        SignedEnrollmentConfig::new(
+            fixture.name(),
+            fixture.profile().clone(),
+            origin,
+            pin,
+            Duration::from_secs(300),
+        ),
+        |_| {},
+    )
+    .await
+    .expect("the enrollment listener starts with its pinned leaf");
+    assert_eq!(handle.public_origin(), trusted_browser::origin_at(port));
+    trusted_browser::assert_authority_refused(&page, &handle.enroll_url()).await;
+    assert!(matches!(
+        handle
+            .await_completion_until(Instant::now() + Duration::from_millis(500))
+            .await,
+        Err(OperatorEnrollAwaitError::Timeout)
+    ));
+    handle.shutdown().await.expect("enrollment listener stops");
+    chromium.close().await;
+}
+
+/// Enrollment at the signed origin in Chromium: the terminal's enrollment
+/// code opens the shipped registration page, the browser creates the
+/// credential for the signed RP, and only the terminal confirmation of the
+/// displayed code exports it. Nothing enters a credential store, and the
+/// owner's signature alone admits the exported entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+#[ignore = "requires Chromium and the acceptance runner's test authority"]
+async fn signed_origin_enrollment_browser_exports_policy_credential() {
+    use stellar_agent_approval_remote::enroll_listener::{
+        SignedEnrollmentConfig, start_signed_enrollment,
+    };
+    use stellar_agent_core::approval::mainnet_fixtures::SIGNED_RP_ID;
+
+    let trust = trusted_browser::BrowserTrust::from_runner();
+    let pin = trust.trusted_pin();
+    let port = trusted_browser::free_port();
+    let fixture = trusted_browser::signed_fixture(
+        "enroll-signed",
+        port,
+        &trust.trusted(),
+        &pin,
+        &[&stellar_agent_test_support::webauthn::fixture_authenticator()],
+    );
+    let origin = fixture
+        .current_policy()
+        .mainnet()
+        .expect("mainnet policy")
+        .approval_origin
+        .clone()
+        .expect("signed origin");
+    assert_eq!(origin.as_str(), trusted_browser::origin_at(port));
+    let printed = Arc::new(StdMutex::new(Vec::new()));
+    let sink = Arc::clone(&printed);
+    let mut handle = start_signed_enrollment(
+        SignedEnrollmentConfig::new(
+            fixture.name(),
+            fixture.profile().clone(),
+            origin.clone(),
+            pin,
+            Duration::from_secs(300),
+        ),
+        move |code| sink.lock().unwrap().push(code.to_owned()),
+    )
+    .await
+    .expect("the signed enrollment listener starts");
+    let code = handle.enrollment_code().to_owned();
+    assert_eq!(*printed.lock().unwrap(), vec![code.clone()]);
+    assert_eq!(handle.enroll_url(), format!("{}/enroll", origin.as_str()));
+
+    let chromium = trusted_browser::launch(&trust).await;
+    let (page, authenticator) = trusted_browser::authenticator_page(&chromium.browser).await;
+    let (pending, shown) =
+        trusted_browser::enroll_in_browser(&page, &mut handle, &code, "signed-laptop").await;
+    assert_eq!(pending.label(), "signed-laptop");
+    let counters =
+        stellar_agent_core::approval::RemoteApprovalAuthority::for_profile(fixture.name())
+            .unwrap()
+            .credentials_path()
+            .to_path_buf();
+    let policy = std::fs::read(fixture.policy_path()).unwrap();
+    let credential = pending
+        .confirm(&shown, Instant::now())
+        .expect("the displayed code confirms the staged credential")
+        .into_mainnet_policy_credential()
+        .expect("a mainnet approval credential");
+
+    let created = page
+        .execute(GetCredentialsParams::new(authenticator))
+        .await
+        .expect("getCredentials must succeed")
+        .result
+        .credentials
+        .clone();
+    assert_eq!(created.len(), 1, "the browser created one credential");
+    assert_eq!(created[0].rp_id.as_deref(), Some(SIGNED_RP_ID));
+    assert_eq!(
+        decode_cdp_binary(&created[0].credential_id),
+        URL_SAFE_NO_PAD
+            .decode(credential.credential_id_b64url())
+            .unwrap()
+    );
+    let key = SecretKey::from_pkcs8_der(&decode_cdp_binary(&created[0].private_key)).unwrap();
+    assert_eq!(
+        key.public_key().to_encoded_point(false).as_bytes(),
+        credential.public_key_sec1().as_slice()
+    );
+    assert!(!counters.exists(), "enrollment writes no credential store");
+    assert_eq!(std::fs::read(fixture.policy_path()).unwrap(), policy);
+    handle.shutdown().await.expect("enrollment listener stops");
+    assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_ok());
+
+    trusted_browser::sign_origin_policy(
+        &fixture,
+        2,
+        port,
+        &pin,
+        &[],
+        &[credential.policy_entry_toml()],
+    );
+    let admitted = fixture.current_policy();
+    let entries = &admitted
+        .mainnet()
+        .expect("mainnet policy")
+        .approval_credentials;
+    assert_eq!(entries.len(), 1, "the owner's signature admits the entry");
+    chromium.close().await;
 }
