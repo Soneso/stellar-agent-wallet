@@ -304,6 +304,29 @@ mod tests {
 
     const HASH: &str = "abababababababababababababababababababababababababababababababab";
 
+    #[test]
+    fn status_progress_refusal_contract() {
+        use stellar_agent_network::policy_state::WindowStoreError;
+        use stellar_agent_network::submission_flow::StatusFailure;
+        for error in [
+            WindowStoreError::ChainMismatch,
+            WindowStoreError::Invalid {
+                detail: "unreadable: 状態".to_owned(),
+            },
+        ] {
+            let code = error.submission_code();
+            let result = super::status_error_result(StatusFailure::WindowUnreadable(error));
+            let value: serde_json::Value =
+                serde_json::from_str(&result.content[0].as_text().expect("text").text)
+                    .expect("envelope");
+            assert_eq!(
+                value["error"]["code"], code,
+                "typed progress read code crosses MCP"
+            );
+            assert!(value.get("progress").is_none());
+        }
+    }
+
     /// The argument defaults to false, rejects other types and reaches the
     /// library request; the payload is the shared recovery projection.
     #[test]
@@ -353,6 +376,7 @@ mod tests {
         let mut recovery = RecoveryReport::default();
         let outcome = |recovery| stellar_agent_network::submission_flow::StatusOutcome {
             recovery,
+            progress: None,
             chain_status: "UNKNOWN".to_owned(),
             ledger: None,
             record: None,
