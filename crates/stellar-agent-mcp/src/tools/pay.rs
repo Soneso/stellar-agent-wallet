@@ -1475,7 +1475,7 @@ impl WalletServer {
         let mut overridden_gate_effects: Option<stellar_agent_core::policy::v1::ValueEffects> =
             None;
         let dispatch_outcome = match forced_dispatch_outcome {
-            Some(forced) => {
+            Some(mut forced) => {
                 // Still run dispatch_gate for chain_id validation + Deny check;
                 // override Allow with the forced outcome if the gate does not deny.
                 let gate_outcome = match self
@@ -1495,6 +1495,17 @@ impl WalletServer {
                     super::common::DispatchOutcome::Allow(effects) => {
                         // Override: policy said Allow but toolset-gated path forces RequireApproval.
                         overridden_gate_effects = effects.value_effects;
+                        #[cfg(any(test, feature = "test-helpers"))]
+                        let captured = effects.snapshot.clone();
+                        if let DispatchOutcome::RequireApproval(approval) = &mut forced {
+                            approval.snapshot = effects.snapshot;
+                        }
+                        #[cfg(any(test, feature = "test-helpers"))]
+                        if let Some(observe) = &self.forced_snapshot_observer {
+                            observe(captured.as_ref().zip(forced.snapshot().ok()).is_some_and(
+                                |(captured, retained)| std::sync::Arc::ptr_eq(captured, retained),
+                            ));
+                        }
                         tracing::debug!(
                             tool = "stellar_pay_commit",
                             "toolset_gated: overriding DispatchOutcome::Allow → forced RequireApproval"
@@ -2090,6 +2101,7 @@ impl WalletServer {
             ));
         };
         let forced_outcome = DispatchOutcome::RequireApproval(super::common::ApprovalOutcome {
+            snapshot: None,
             request: pending.approval_request(),
             value_effects: None,
             governing_ttl_ms: pending

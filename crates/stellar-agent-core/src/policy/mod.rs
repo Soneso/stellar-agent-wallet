@@ -82,6 +82,8 @@ pub mod state_lock;
 pub mod transaction_effects;
 
 pub use v1::criteria::state_store::policy_now_ms;
+mod snapshot;
+pub use snapshot::{PolicyEvaluationInputs, PolicyEvaluationSnapshot};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BuildRegistryError
@@ -1527,6 +1529,56 @@ impl PolicyError {
 /// caller maps `Err(PolicyError::NotImplemented)` to the `policy.engine_required`
 /// wire-format error code.
 pub trait PolicyEngine: Send + Sync {
+    /// Evaluates against a privately owned window image and its fixed instant.
+    ///
+    /// # Errors
+    /// Stateful engines must implement this entry; the default refuses them.
+    /// Stateless engines retain their ordinary evaluation errors.
+    fn evaluate_in_snapshot(
+        &self,
+        inputs: PolicyEvaluationInputs<'_>,
+        snapshot: &PolicyEvaluationSnapshot,
+    ) -> Result<Evaluation, PolicyError> {
+        if self.window_state_store().is_some() {
+            return Err(PolicyError::Internal {
+                detail: "stateful engine does not support evaluation snapshots".to_owned(),
+            });
+        }
+        match inputs.value {
+            Some(value) => {
+                let evaluate = if inputs.provisional {
+                    Self::evaluate_provisional
+                } else {
+                    Self::evaluate_with_value_full
+                };
+                evaluate(
+                    self,
+                    inputs.tool,
+                    inputs.args,
+                    inputs.profile,
+                    value,
+                    inputs.account_view,
+                    inputs.identity_view,
+                    inputs.counterparty_cache,
+                    inputs.sep10_sessions,
+                    inputs.sep45_sessions,
+                    snapshot.now_ms(),
+                )
+            }
+            None => self.evaluate_full(
+                inputs.tool,
+                inputs.args,
+                inputs.profile,
+                inputs.account_view,
+                inputs.identity_view,
+                inputs.counterparty_cache,
+                inputs.sep10_sessions,
+                inputs.sep45_sessions,
+                snapshot.now_ms(),
+            ),
+        }
+    }
+
     /// Evaluates whether the given tool call is permitted under the active profile.
     ///
     /// Returns the [`Decision`] ONLY and discards any value descriptor the engine

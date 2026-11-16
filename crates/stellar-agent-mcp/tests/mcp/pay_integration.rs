@@ -3002,17 +3002,10 @@ async fn simulate_nonce_mint_failed_envelope_shape() {
 /// Builds a `PolicyEngineV1` with one `Decision::Allow` `per_period_cap` rule
 /// per tool name in `tools`.
 ///
-/// `profile_name` MUST equal the target `Profile`'s
-/// `profile_name_for_approval()` value exactly: the engine bakes
-/// `profile_name` into every `StateKey` its `evaluate`/`record_confirmed`
-/// calls derive, while `dispatch_gate_inner`'s window-state refresh
-/// reconstructs `StateKey`s using `profile_name_for_approval()` when
-/// re-hydrating from the persisted file. A mismatch does not error — it
-/// silently makes the refreshed entries invisible to the engine's own
-/// criteria, breaking cross-dispatch persistence without any test failure to
-/// flag it. (The shared `common::v1_engine_mock::minimum_reserve_engine`
-/// helper hardcodes `"default"` — safe there only because `minimum_reserve`
-/// is stateless and never touches the window-state store.)
+/// `profile_name` must equal the target profile's `profile_name_for_approval()`.
+/// Evaluation and recording derive state keys from the engine's name; private
+/// gate hydration derives them from the profile. A mismatch makes persisted
+/// entries invisible to the engine's criteria.
 fn per_period_cap_engine(
     tools: &[&str],
     profile_name: &str,
@@ -3370,6 +3363,15 @@ async fn dispatch_stored_endpoints_environment_child() {
             .state_store()
             .query_window(&count_key, 2001 + retention)
             .unwrap(),
+        (0, 0),
+        "dispatch refreshes the shared engine's exposure image"
+    );
+    let fresh = stellar_agent_core::policy::v1::PolicyStateStore::new();
+    store
+        .load_into_at("intent", &profile, &fresh, 2001 + retention)
+        .unwrap();
+    assert_eq!(
+        fresh.query_window(&count_key, 2001 + retention).unwrap(),
         (0, 0)
     );
     assert_eq!(std::fs::read(store.path()).unwrap(), closed);
@@ -3399,14 +3401,10 @@ async fn dispatch_stored_endpoints_environment_child() {
 /// Two dispatches of `stellar_pay` through the SAME server instance under a
 /// `per_period_cap` rule (cap 100 XLM, each payment 60 XLM): the first
 /// simulates, commits, and submits successfully, which records the confirmed
-/// amount to the PERSISTED window-state store (not just the engine's
-/// in-memory state — the commit handler's post-submit
-/// `record_confirmed_window_state` call writes through to disk). The second
-/// simulate call is DENIED: `dispatch_gate_inner`'s window-state refresh
-/// clears the in-memory store and re-hydrates from the file BEFORE
-/// evaluating, so the deny is driven by the on-disk record, proving the
-/// persist -> refresh -> evaluate wiring end to end through the real MCP
-/// dispatch path.
+/// amount to the persisted window-state store. The second simulation must
+/// deny: its private gate image includes the first commit's durable record.
+/// This exercises persistence, capture and evaluation through public MCP
+/// dispatch.
 ///
 /// (`end_to_end_persist_seam_second_process_denies` in
 /// `stellar-agent-network`'s `store.rs` covers the same invariant at the
@@ -3540,8 +3538,7 @@ async fn pay_two_phase_per_period_cap_second_call_denied_by_persisted_window() {
     );
 
     // ── Call 2: simulate is DENIED — 60 + 60 = 120 XLM exceeds the cap ────────
-    // dispatch_gate_inner refreshes the window-state store from the file call
-    // 1's commit just wrote, before evaluating this second call.
+    // The second gate hydrates its image from the first commit's durable record.
     let sim2 = server
         .call_stellar_pay(pay_args)
         .await

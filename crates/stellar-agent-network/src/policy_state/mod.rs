@@ -30,29 +30,22 @@
 //! evaluates, and — on a confirmed commit — records and exits. There is
 //! nothing to go stale within that lifetime.
 //!
-//! The MCP server is a LONG-LIVED process: a single `PolicyEngineV1` instance
-//! serves every dispatch for the life of the server. Hydrating it once at
-//! construction and never again would mean a CLI-written (or a sibling MCP
-//! request's) accumulated entry never becomes visible to this process's
-//! evaluations — the server would silently evaluate stateful criteria against
-//! a startup-frozen snapshot. `dispatch_gate_inner`
-//! (`stellar-agent-mcp::tools::common`) closes this: before every evaluation,
-//! it calls [`stellar_agent_core::policy::PolicyEngine::window_state_store`]
-//! to reach the engine's in-memory store, `clear()`s it, and re-populates it
-//! via `load_into` from the CURRENT on-disk file. This is a REPLACE, not a
-//! merge: clearing before re-loading is what prevents an entry a concurrent
-//! process has already pruned or a reset has cleared from lingering in this
-//! process's view. Construction-time hydration is kept in addition (not
-//! replaced by the per-dispatch refresh): it makes the server refuse to
-//! start at all on a tampered/unparseable store file, rather than deferring
-//! that discovery to first dispatch.
+//! MCP gates hydrate a private image through
+//! [`PersistedWindowStore::load_into_at`] at their policy instant. Paired
+//! checks reuse that image without clearing or repopulating the shared engine.
+//! A later gate sees newly committed history. Startup hydration remains a
+//! separate integrity check, so a corrupt store also refuses server startup.
+//! Hydration can perform earlier-version retirement and must propagate errors.
+//! The gate evaluates its captured frame, final resolution reads the shared
+//! store refreshed at each gate, and mint rechecks durable headroom under the
+//! window lock.
 //!
 //! # Admission
 //!
 //! A call passes through the window in three steps.
 //!
 //! 1. **Evaluation at dispatch.** The policy gate reads this store into the
-//!    engine's in-memory view and evaluates the call against it, before the
+//!    evaluation's private image and evaluates the call against it, before the
 //!    transaction is built and signed.
 //! 2. **Reservation under the lock.** Immediately before the send,
 //!    [`PersistedWindowStore::record_pending`] takes the store's exclusive
