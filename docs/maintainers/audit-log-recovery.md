@@ -571,6 +571,17 @@ Only an anchored writer marks a matching Queued record Delivered.
 The closed batch hashes every ordered row independently of evidence membership.
 Unreserved compatibility rows audit without creating live evidence.
 
+**Integrated admission and publication.** An integrated request is presented only after its committed pending record holds a reservation.
+Admission requires an authenticated inventory of the whole owner scope, then explicit owner initialization, then the reservation.
+No such inventory exists yet, so integrated admission refuses with `owner-scope inventory unavailable`.
+A retry reuses the committed record's nonce, signed clocks, and facts; a refused presentation keeps the record and its slot.
+Integrated consent succeeds only after the window commit holds the receipt, the authenticated sink, and the exact queued reference.
+The strict mainnet attester stores a sink handoff in the same inbox replacement as the attestation blob and receipt.
+The handoff is an HMAC under the attestation key with domain `stellar-agent-consent-publication:v1`.
+Recovery takes the sink only from a verified handoff, and a `written` or `recovered` row never becomes direct anchoring.
+A repeated publication returns the committed consent only for an identical receipt, delivery, and reference, and refuses after payload release.
+Queued success reports `audit.outbox_queued` at once and never waits for delivery.
+
 **Lifecycle and clocks.** Release follows authenticated revocation or final operation termination, outside the policy-window lock.
 First consumption and a missing approval record do not authorize release; retryable consumed grants retain their proof.
 Explicit floor advancement removes records expiring at or below the persistent maximum clock, and migration pins never expire through clock collection.

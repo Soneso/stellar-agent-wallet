@@ -1543,7 +1543,14 @@ mod tests {
         let mut store = PendingApprovalStore::open(fixture.home().join("memo.toml")).unwrap();
         store.insert(entry.clone(), now()).unwrap();
         store
-            .record_mainnet_attestation_at(&entry.approval_nonce, blob, approver, receipt, now())
+            .record_mainnet_attestation_at(
+                &entry.approval_nonce,
+                blob,
+                approver,
+                receipt,
+                None,
+                now(),
+            )
             .unwrap();
         let record = Consented {
             store,
@@ -1681,7 +1688,14 @@ mod tests {
         let mut store = PendingApprovalStore::open(fixture.home().join("altered.toml")).unwrap();
         store.insert(entry.clone(), now()).unwrap();
         store
-            .record_mainnet_attestation_at(&entry.approval_nonce, blob, approver, altered, now())
+            .record_mainnet_attestation_at(
+                &entry.approval_nonce,
+                blob,
+                approver,
+                altered,
+                None,
+                now(),
+            )
             .unwrap();
         let altered = Consented {
             store,
@@ -2386,6 +2400,7 @@ mod tests {
                     blob,
                     approver,
                     receipt,
+                    None,
                     now(),
                 )
                 .unwrap();

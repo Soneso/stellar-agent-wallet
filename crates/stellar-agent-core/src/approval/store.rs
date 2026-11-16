@@ -1606,6 +1606,9 @@ struct PendingApprovalOnDisk {
     // with a mainnet passkey approver.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mainnet_presence: Option<MainnetPresenceReceipt>,
+    // The strict sink handoff; present only beside a mainnet receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    consent_publication: Option<super::publication::ConsentPublicationV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
 
@@ -1980,6 +1983,15 @@ pub struct PendingApproval {
     /// consumed tombstone retains it with the blob it is bound into.
     pub mainnet_presence: Option<MainnetPresenceReceipt>,
 
+    /// The sink handoff of a strict mainnet consent, stored in the same
+    /// replacement as the blob and receipt it binds.
+    ///
+    /// Present only with [`Self::mainnet_presence`]. A compatibility,
+    /// testnet or clawback opt-in consent stores none. Only
+    /// [`super::publication::verify_consent_publication`] reads its sink. A
+    /// consumed tombstone retains it with its blob.
+    pub consent_publication: Option<super::publication::ConsentPublicationV1>,
+
     /// The binding convention of the approved subject.
     ///
     /// [`SubjectKind::EnvelopeText`] for every record a constructor writes,
@@ -2028,6 +2040,7 @@ impl std::fmt::Debug for PendingApproval {
             .field("attestation_version", &self.attestation_version)
             .field("attested_approver", &self.attested_approver)
             .field("mainnet_presence", &self.mainnet_presence)
+            .field("consent_publication", &self.consent_publication)
             .field("subject_kind", &self.subject_kind)
             .finish()
     }
@@ -2503,6 +2516,7 @@ impl Serialize for PendingApproval {
                 .as_ref()
                 .map(AttestedApproverWire::from_approver),
             mainnet_presence: self.mainnet_presence.clone(),
+            consent_publication: self.consent_publication.clone(),
             reason: self.reason.clone(),
             envelope_xdr_b64: envelope_xdr_b64.map(ToOwned::to_owned),
             envelope_sha256_hex: envelope_sha256_hex.map(ToOwned::to_owned),
@@ -2685,6 +2699,12 @@ impl PendingApproval {
             return Err(serde::de::Error::custom(
                 "mainnet_presence, a mainnet_passkey approver and a mainnet attestation version \
                  are recorded together",
+            ));
+        }
+        let consent_publication = raw.consent_publication.take();
+        if consent_publication.is_some() && mainnet_presence.is_none() {
+            return Err(serde::de::Error::custom(
+                "consent_publication is present without a mainnet consent",
             ));
         }
 
@@ -3483,6 +3503,7 @@ impl PendingApproval {
             attestation_version: raw.attestation_version,
             attested_approver,
             mainnet_presence,
+            consent_publication,
             subject_kind,
         })
     }
@@ -3548,6 +3569,7 @@ impl PendingApproval {
             attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
             attested_approver: None,
             mainnet_presence: None,
+            consent_publication: None,
             subject_kind: SubjectKind::EnvelopeText,
         })
     }
@@ -3718,6 +3740,7 @@ impl PendingApproval {
             attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
             attested_approver: None,
             mainnet_presence: None,
+            consent_publication: None,
             subject_kind: SubjectKind::EnvelopeText,
         })
     }
@@ -3865,6 +3888,7 @@ impl PendingApproval {
             attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
             attested_approver: None,
             mainnet_presence: None,
+            consent_publication: None,
             subject_kind: SubjectKind::EnvelopeText,
         })
     }
@@ -3989,6 +4013,7 @@ impl PendingApproval {
             attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
             attested_approver: None,
             mainnet_presence: None,
+            consent_publication: None,
             subject_kind: SubjectKind::EnvelopeText,
         })
     }
@@ -4108,6 +4133,7 @@ impl PendingApproval {
             attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
             attested_approver: None,
             mainnet_presence: None,
+            consent_publication: None,
             subject_kind: SubjectKind::EnvelopeText,
         })
     }
@@ -4185,6 +4211,7 @@ impl PendingApproval {
             attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
             attested_approver: None,
             mainnet_presence: None,
+            consent_publication: None,
             subject_kind: SubjectKind::EnvelopeText,
         })
     }
@@ -4240,6 +4267,7 @@ impl PendingApproval {
             attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
             attested_approver: None,
             mainnet_presence: None,
+            consent_publication: None,
             subject_kind: SubjectKind::EnvelopeText,
         })
     }
@@ -4394,6 +4422,7 @@ impl PendingApproval {
             attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
             attested_approver: None,
             mainnet_presence: None,
+            consent_publication: None,
             subject_kind: SubjectKind::EnvelopeText,
         })
     }
@@ -4458,6 +4487,7 @@ impl PendingApproval {
             attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
             attested_approver: None,
             mainnet_presence: None,
+            consent_publication: None,
             subject_kind: SubjectKind::EnvelopeText,
         })
     }
@@ -4543,6 +4573,7 @@ impl PendingApproval {
             attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
             attested_approver: None,
             mainnet_presence: None,
+            consent_publication: None,
             subject_kind: SubjectKind::EnvelopeText,
         })
     }
@@ -4688,6 +4719,7 @@ impl PendingApproval {
             attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
             attested_approver: None,
             mainnet_presence: None,
+            consent_publication: None,
             subject_kind: SubjectKind::EnvelopeText,
         })
     }
@@ -5967,6 +5999,7 @@ impl PendingApprovalStore {
             attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
             attested_approver: None,
             mainnet_presence: None,
+            consent_publication: None,
             subject_kind: SubjectKind::EnvelopeText,
         };
 
@@ -6066,6 +6099,7 @@ impl PendingApprovalStore {
             attestation_version: existing.attestation_version,
             attested_approver: existing.attested_approver.clone(),
             mainnet_presence: existing.mainnet_presence.clone(),
+            consent_publication: existing.consent_publication.clone(),
             subject_kind: existing.subject_kind,
         };
 
@@ -6397,7 +6431,8 @@ impl PendingApprovalStore {
 
     /// Records a mainnet consent in one store replacement. It stores the
     /// blob under the version the subject kind selects, 5 or 6, with the
-    /// mainnet passkey approver and the presence receipt the blob binds.
+    /// mainnet passkey approver and the presence receipt the blob binds, and
+    /// with `publication`, the sink handoff of a strict consent.
     ///
     /// Only the mainnet attester calls it, after verifying the assertion and
     /// rechecking the locked entry and the current policy. Expiry and an
@@ -6419,6 +6454,7 @@ impl PendingApprovalStore {
         attestation_blob: [u8; 32],
         approver: AttestedApprover,
         receipt: MainnetPresenceReceipt,
+        publication: Option<super::publication::ConsentPublicationV1>,
         now_ms: u64,
     ) -> Result<(), ApprovalError> {
         self.observe_recovery_expiry(approval_nonce, now_ms)?;
@@ -6466,6 +6502,7 @@ impl PendingApprovalStore {
             super::attestation::mainnet_attestation_version(entry.subject_kind);
         entry.attested_approver = Some(approver);
         entry.mainnet_presence = Some(receipt);
+        entry.consent_publication = publication;
         self.persist()
     }
 
@@ -7561,7 +7598,7 @@ mod tests {
                 .record_attestation(nonce, [7; 32], AttestedApprover::Local)
                 .unwrap_err(),
             store
-                .record_mainnet_attestation_at(nonce, [7; 32], passkey, receipt, TEST_NOW_MS)
+                .record_mainnet_attestation_at(nonce, [7; 32], passkey, receipt, None, TEST_NOW_MS)
                 .unwrap_err(),
             store
                 .consume(nonce, &"a".repeat(64), ConsumedOutcome::Confirmed)

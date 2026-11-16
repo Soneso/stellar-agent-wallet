@@ -226,6 +226,44 @@ fn parse_rows(rows: &[String]) -> Vec<AuditEntry> {
         .collect()
 }
 
+/// Adds a Reserved record expiring at `expires_at_ms` for each of
+/// `identities` to the committed consent evidence of `log`, under its
+/// ordinary authenticated successor commit, for a capacity fixture.
+///
+/// # Errors
+///
+/// Returns the carrier, evidence, key and storage refusals of the commit.
+pub fn seed_reserved_evidence(
+    log: &std::path::Path,
+    store: &dyn super::TipAnchorStore,
+    key: &[u8; 32],
+    identities: &[[u8; 32]],
+    expires_at_ms: u64,
+) -> Result<(), super::WriterError> {
+    use super::consent_evidence::{EvidenceRecord, RecordState};
+    super::outbox::OutboxBatch::read_locked(log, store)?.commit_evidence_change(
+        log,
+        store,
+        key,
+        false,
+        |image, _| {
+            image
+                .records
+                .extend(identities.iter().map(|identity| EvidenceRecord {
+                    identity: *identity,
+                    digest: [0; 32],
+                    expires_at_ms,
+                    generation: 0,
+                    sequence: 0,
+                    state: RecordState::Reserved,
+                }));
+            image.records.sort_by_key(|record| record.identity);
+            Ok(())
+        },
+    )?;
+    Ok(())
+}
+
 /// Records the current carriers of `log` as generation 1 when `store` holds
 /// no carrier record, for a fixture whose subject is not the enrollment.
 ///

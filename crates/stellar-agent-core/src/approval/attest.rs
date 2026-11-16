@@ -67,6 +67,7 @@ use super::attestation::{
 };
 use super::error::ApprovalError;
 use super::presence::{MAINNET_CHAIN_ID, VerifiedMainnetPresence};
+use super::publication::{ConsentPublicationV1, PublicationFacts, PublicationSink};
 use super::store::{ApprovalKind, PendingApproval, PendingApprovalStore};
 use super::subject::{SubjectKind, approval_subject_classic};
 use super::user_id::ApproverIdentity;
@@ -458,14 +459,29 @@ enum PreparedConsentAudit<'a> {
 }
 
 impl PreparedConsentAudit<'_> {
-    fn write(self, entry: AuditEntry, strict: bool) -> Result<Option<OutboxRowRef>, WriterError> {
+    /// Writes `entry` and names the sink arm that accepted it.
+    fn write(self, entry: AuditEntry, strict: bool) -> Result<WrittenConsentRow, WriterError> {
         match self {
-            Self::Writer(writer) if strict => writer.write_anchored(entry).map(|()| None),
-            Self::Writer(writer) => writer.write(entry).map(|()| None),
-            Self::Outbox(append) if strict => append.append_queued(&entry).map(Some),
-            Self::Outbox(append) => append.append(&entry).map(|()| None),
+            Self::Writer(writer) if strict => writer
+                .write_anchored(entry)
+                .map(|()| WrittenConsentRow::Anchored),
+            Self::Writer(writer) => writer.write(entry).map(|()| WrittenConsentRow::Unsealed),
+            Self::Outbox(append) if strict => {
+                append.append_queued(&entry).map(WrittenConsentRow::Queued)
+            }
+            Self::Outbox(append) => append.append(&entry).map(|()| WrittenConsentRow::Unsealed),
         }
     }
+}
+
+/// The sink arm that accepted a mainnet consent row.
+enum WrittenConsentRow {
+    /// The strict direct writer anchored the row.
+    Anchored,
+    /// The strict keyed outbox queued the row under this reference.
+    Queued(OutboxRowRef),
+    /// A compatibility sink wrote the row; no handoff is sealed.
+    Unsealed,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1447,7 +1463,18 @@ fn attest_mainnet_presence<const STRICT: bool>(
         binding.chain_id,
         super::presence::presence_audit(&stored, &parts.receipt),
     );
-    let outbox_row = audit.write(row, STRICT).map_err(|e| {
+    // A clawback opt-in has no approval record to publish into.
+    let sealed_receipt = match current.kind {
+        ApprovalKind::TrustlineClawbackOptIn { .. } => None,
+        _ if STRICT => Some(
+            parts
+                .receipt
+                .digest()
+                .ok_or(WalletError::Approval(ApprovalFailure::PresenceInvalid))?,
+        ),
+        _ => None,
+    };
+    let written = audit.write(row, STRICT).map_err(|e| {
         tracing::warn!(
             error = %e,
             approval_kind = current.kind.kind_name(),
@@ -1455,6 +1482,21 @@ fn attest_mainnet_presence<const STRICT: bool>(
         );
         audit_writer_refusal(binding.profile_name, &e)
     })?;
+    let (outbox_row, sink) = match written {
+        WrittenConsentRow::Anchored => (None, Some(PublicationSink::DirectAnchored)),
+        WrittenConsentRow::Queued(reference) => (Some(reference), Some(PublicationSink::Queued)),
+        WrittenConsentRow::Unsealed => (None, None),
+    };
+    let publication = sink.zip(sealed_receipt).map(|(sink, receipt)| {
+        let facts = PublicationFacts {
+            binding,
+            entry: &current,
+            subject,
+            attestation: attestation_blob,
+            receipt,
+        };
+        ConsentPublicationV1::seal(key, &facts, sink, outbox_row)
+    });
     #[cfg(any(test, feature = "test-helpers"))]
     consent_test_seam::run(store.path());
     store
@@ -1463,6 +1505,7 @@ fn attest_mainnet_presence<const STRICT: bool>(
             attestation_blob,
             approver,
             parts.receipt,
+            publication,
             row_ms,
         )
         .map_err(|e| record_error(&e))?;
