@@ -1066,3 +1066,42 @@ pub async fn assert_credential_refusals(
         "each refused tool made the identity request alone"
     );
 }
+/// Counts local cache acquisitions without remote resolution.
+#[derive(Default)]
+#[allow(
+    dead_code,
+    reason = "shared test module also builds in transport-only targets"
+)]
+pub struct CountingCounterpartyCache(std::sync::atomic::AtomicUsize);
+
+#[allow(
+    dead_code,
+    reason = "shared test module also builds in transport-only targets"
+)]
+impl CountingCounterpartyCache {
+    /// Number of completed local cache acquisitions.
+    pub fn reads(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+#[allow(clippy::panic, reason = "unexpected remote reads fail the fixture")]
+impl stellar_agent_network::CounterpartyResolver for CountingCounterpartyCache {
+    async fn refresh(
+        &self,
+        _: &str,
+    ) -> Result<stellar_agent_network::StellarTomlBinding, stellar_agent_network::CounterpartyError>
+    {
+        panic!("policy evaluation does not refresh remote documents")
+    }
+    async fn list_cached(
+        &self,
+    ) -> Result<
+        Vec<stellar_agent_network::StellarTomlBinding>,
+        stellar_agent_network::CounterpartyError,
+    > {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Vec::new())
+    }
+}

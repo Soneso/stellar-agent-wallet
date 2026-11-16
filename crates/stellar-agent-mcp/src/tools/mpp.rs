@@ -127,7 +127,7 @@ impl WalletServer {
         let effects = mpp_value_effects(prepared.selected());
         let args_value = serde_json::to_value(&args)
             .map_err(|_| rmcp::ErrorData::invalid_params("invalid MPP arguments", None))?;
-        let mut disposition = match self
+        let gate = match self
             .dispatch_gate_with_value(
                 "stellar_mpp_charge_prepare",
                 &args_value,
@@ -138,9 +138,12 @@ impl WalletServer {
             )
             .await
         {
-            Ok(DispatchOutcome::Allow(_)) => ApprovalDisposition::Allow,
-            Ok(DispatchOutcome::RequireApproval(_)) => ApprovalDisposition::RequireApproval,
+            Ok(outcome) => outcome,
             Err(error) => return error.into_result(),
+        };
+        let mut disposition = match &gate {
+            DispatchOutcome::Allow(_) => ApprovalDisposition::Allow,
+            DispatchOutcome::RequireApproval(_) => ApprovalDisposition::RequireApproval,
         };
 
         // As in `paired_commit_outcome`, only a commit RequireApproval parks a request.
@@ -151,16 +154,16 @@ impl WalletServer {
                 &prepared,
                 now_unix,
             ) {
-                Ok(record) => match stellar_agent_core::policy::policy_now_ms() {
-                    Ok(now_ms) => match self
-                        .evaluate_policy_only(
+                Ok(record) => match gate.snapshot() {
+                    Ok(snapshot) => match self
+                        .evaluate_policy_in_snapshot(
                             "stellar_mpp_charge_commit",
                             &json!({"authorization_id": record.authorization_id()}),
                             "stellar:testnet",
                             Some(ValueClass::Value(effects)),
                             None,
                             None,
-                            now_ms,
+                            snapshot,
                         )
                         .await
                     {
@@ -180,8 +183,8 @@ impl WalletServer {
                     },
                     Err(error) => tracing::debug!(
                         tool = "stellar_mpp_charge_commit",
-                        error = %error,
-                        "stellar_mpp_charge_prepare: policy clock unreadable; disposition unchanged"
+                        error_code = %error.code(),
+                        "stellar_mpp_charge_prepare: policy frame unavailable; disposition unchanged"
                     ),
                 },
                 Err(error) => tracing::debug!(

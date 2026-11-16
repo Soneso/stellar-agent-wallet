@@ -1367,6 +1367,10 @@ async fn split_mpp_approval_prepare_records_commit_request() {
 
     const NAME: &str = "mpp-split-approval";
     let mut fixture = mpp_fixture(NAME, [0xb7; 32], true, |r, _| r).await;
+    let cache = std::sync::Arc::new(crate::common::CountingCounterpartyCache::default());
+    fixture
+        .server
+        .set_counterparty_resolver_for_test(cache.clone());
     let approvals = tempfile::tempdir().unwrap();
     fixture
         .server
@@ -1426,12 +1430,18 @@ async fn split_mpp_approval_prepare_records_commit_request() {
         AuditWriterRegistry::get_or_open_keyed(NAME, &fixture.profile.audit_log_path, access)
             .expect("writer cached");
     for attempt in 0..3 {
+        let cache_reads = cache.reads();
         let result = fixture
             .server
             .call_stellar_mpp_charge_prepare(NAME.into(), challenge(30 + attempt))
             .await
             .unwrap();
         let prepared = result_json(&result);
+        assert_eq!(
+            cache.reads() - cache_reads,
+            1,
+            "MPP pair shares one cache acquisition"
+        );
         assert_eq!(prepared["ok"], true, "{prepared}");
         let data = &prepared["data"];
         let approval_id = data["authorization"]["approval_id"]

@@ -1923,6 +1923,15 @@ struct RecipientRecorder {
 }
 
 impl stellar_agent_core::PolicyEngine for RecipientRecorder {
+    fn evaluate_in_snapshot(
+        &self,
+        inputs: stellar_agent_core::policy::PolicyEvaluationInputs<'_>,
+        snapshot: &stellar_agent_core::policy::PolicyEvaluationSnapshot,
+    ) -> Result<stellar_agent_core::policy::Evaluation, stellar_agent_core::policy::PolicyError>
+    {
+        self.inner.evaluate_in_snapshot(inputs, snapshot)
+    }
+
     fn window_state_store(
         &self,
     ) -> Option<&stellar_agent_core::policy::v1::criteria::state_store::PolicyStateStore> {

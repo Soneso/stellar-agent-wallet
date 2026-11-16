@@ -1407,6 +1407,37 @@ impl PolicyEngineV1 {
 }
 
 impl PolicyEngine for PolicyEngineV1 {
+    fn evaluate_in_snapshot(
+        &self,
+        inputs: crate::policy::PolicyEvaluationInputs<'_>,
+        snapshot: &crate::policy::PolicyEvaluationSnapshot,
+    ) -> Result<crate::policy::Evaluation, PolicyError> {
+        let value = inputs
+            .value
+            .unwrap_or_else(|| value::derive_value_class(&inputs.tool.name, inputs.args));
+        self.assert_value_kind_populated(inputs.tool, &value);
+        let (decision, class, rule_ordinal) = self.evaluate_inner(
+            inputs.tool,
+            inputs.args,
+            inputs.profile,
+            &value,
+            inputs.account_view,
+            inputs.identity_view,
+            inputs.counterparty_cache,
+            inputs.sep10_sessions,
+            inputs.sep45_sessions,
+            inputs.provisional,
+            snapshot.now_ms(),
+            &snapshot.state,
+        )?;
+        Ok(crate::policy::Evaluation {
+            value_effects: value_effects_on_permitted_decision(&decision, &value, class),
+            decision,
+            provisional: inputs.provisional,
+            rule_ordinal,
+        })
+    }
+
     /// Evaluates whether the given tool call is permitted under the active profile.
     ///
     /// Uses first-match stop-semantics over the rules in the scope resolved
@@ -1488,6 +1519,7 @@ impl PolicyEngine for PolicyEngineV1 {
             sep45_sessions,
             false,
             now_ms,
+            &self.state_store,
         )?;
         Ok(crate::policy::Evaluation {
             value_effects: value_effects_on_permitted_decision(&decision, &value, class),
@@ -1554,6 +1586,7 @@ impl PolicyEngine for PolicyEngineV1 {
             sep45_sessions,
             false,
             now_ms,
+            &self.state_store,
         )?;
         Ok(crate::policy::Evaluation {
             value_effects: value_effects_on_permitted_decision(&decision, &value, class),
@@ -1593,6 +1626,7 @@ impl PolicyEngine for PolicyEngineV1 {
             sep45_sessions,
             true,
             now_ms,
+            &self.state_store,
         )?;
         Ok(crate::policy::Evaluation {
             value_effects: value_effects_on_permitted_decision(&decision, &value, class),
@@ -1770,6 +1804,7 @@ impl PolicyEngineV1 {
         sep45_sessions: Option<&dyn Sep45SessionView>,
         provisional: bool,
         now_ms: u64,
+        state_store: &PolicyStateStore,
     ) -> Result<(Decision, Option<RecipientClass>, Option<usize>), PolicyError> {
         let rules = self.effective_rules();
 
@@ -1805,7 +1840,7 @@ impl PolicyEngineV1 {
                 counterparty_cache,
                 sep10_sessions,
                 sep45_sessions,
-                state_store: &self.state_store,
+                state_store,
                 // Single-tx path: no bundle view.
                 bundle: None,
                 policy_digest: self.policy_digest,
