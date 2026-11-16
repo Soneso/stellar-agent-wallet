@@ -1,0 +1,45 @@
+{
+  "test_kind": "sequence",
+  "name": "testnet_unlisted_per_tx_boundary",
+  "category": "extended_grammar",
+  "description": "On the test network the unlisted per-transaction bound is inclusive: 100 stroops allows and 101 refuses with the per_tx bound. Controls: the hard cap still refuses a listed payment, and a debit in another asset keeps the counterparty denial.",
+  "tool": {
+    "name": "stellar_pay",
+    "destructive_hint": true,
+    "read_only_hint": false,
+    "chain_id_required": true,
+    "chain_id": "stellar:testnet"
+  },
+  "profile_name": "default",
+  "steps": [
+    {
+      "args": { "amount_stroops": "100", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+      "expected": { "kind": "Allow" }
+    },
+    {
+      "args": { "amount_stroops": "101", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+      "expected": {
+        "kind": "Deny",
+        "deny_reason": "unlisted_budget_exceeded",
+        "wire_code": "policy.deny.unlisted_budget_exceeded",
+        "reason": { "UnlistedBudgetExceeded": { "asset": "native", "bound": "per_tx", "max_stroops": "100", "attempted_stroops": "101" } }
+      }
+    },
+    {
+      "args": { "amount_stroops": "1001", "asset": "native", "destination": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF" },
+      "expected": {
+        "kind": "Deny",
+        "wire_code": "policy.deny.per_tx_cap_exceeded",
+        "reason": { "PerTxCapExceeded": { "asset": "native", "max_stroops": "1000", "attempted_stroops": "1001" } }
+      }
+    },
+    {
+      "args": { "amount_stroops": "10", "asset": "USD:GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+      "expected": {
+        "kind": "Deny",
+        "wire_code": "policy.deny.counterparty_denied",
+        "reason": { "CounterpartyDenied": { "kind": "G_ACCOUNT", "value": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" } }
+      }
+    }
+  ]
+}

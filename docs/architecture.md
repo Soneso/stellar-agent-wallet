@@ -269,8 +269,8 @@ Network checks establish endpoint identity and signature binding and refuse main
 
 | Check | Enforcement and limit |
 | --- | --- |
-| CLI entry | Payment commands refuse a mainnet profile before signing unless the action is authorized; the `--build-only`, `--sign-only` and `--submit-only` stages always refuse it. |
-| MCP entry | The four classic commit tools and the two x402 payment tools admit mainnet only under authorization for the action; other commit and signing tools refuse mainnet before key access. MPP restricts its flow to testnet. |
+| CLI entry | Payment commands refuse a mainnet profile before signing unless policy authority (Allow) or approval authority (RequireApproval) covers the action; the `--build-only`, `--sign-only` and `--submit-only` stages always refuse it. |
+| MCP entry | The four classic commit tools and the two x402 payment tools admit mainnet only under policy or approval authority for the action; other commit and signing tools refuse mainnet before key access. MPP restricts its flow to testnet. |
 | Submit layer | Ordinary submission refuses a mainnet passphrase or a known mainnet host before decoding or RPC. Authorized submission binds each action to its endpoint, signer, policy, approval, audit state, and window reservation. |
 | Endpoint identity | `getNetwork` must match the configured passphrase before reads used for signing and again before sending. Unsupported protocol responses refuse on mainnet and warn on other networks. |
 | Signature binding | Local verification checks the envelope's signatures against that network and fetched signer sets before transmission. |

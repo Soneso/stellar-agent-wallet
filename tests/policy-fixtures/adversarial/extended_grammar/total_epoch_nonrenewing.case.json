@@ -1,0 +1,37 @@
+{
+  "test_kind": "sequence",
+  "name": "total_epoch_nonrenewing",
+  "category": "extended_grammar",
+  "description": "A total allocation counts across time: 600 stroops recorded, 400 more thirty days later reach the cap exactly, and one more stroop sixty days later refuses with nothing remaining.",
+  "tool": {
+    "name": "stellar_pay",
+    "destructive_hint": true,
+    "read_only_hint": false,
+    "chain_id_required": true,
+    "chain_id": "stellar:testnet"
+  },
+  "profile_name": "default",
+  "steps": [
+    {
+      "args": { "amount_stroops": "600", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+      "record": true,
+      "expected": { "kind": "Allow" }
+    },
+    {
+      "after_ms": 2592000000,
+      "args": { "amount_stroops": "400", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+      "record": true,
+      "expected": { "kind": "Allow" }
+    },
+    {
+      "after_ms": 5184000000,
+      "args": { "amount_stroops": "1", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+      "expected": {
+        "kind": "Deny",
+        "deny_reason": "total_budget_exhausted",
+        "wire_code": "policy.deny.total_budget_exhausted",
+        "reason": { "TotalBudgetExhausted": { "asset": "native", "max_stroops": "1000", "remaining_stroops": "0" } }
+      }
+    }
+  ]
+}

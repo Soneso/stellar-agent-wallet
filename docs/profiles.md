@@ -97,7 +97,9 @@ can refuse on its generation check. Mainnet key-scope reconciliation already
 refuses the shared entry. A copy without the field starts a fresh, empty window;
 the original's spend does not count against it. Neither is a way to inherit or reset a spend window on
 purpose. Use `profile init` for a new profile and `profile reset-window-state`
-for a deliberate reset. Amount caps size outbound value, so a vault withdrawal,
+for a deliberate reset. The same store holds unlisted-budget and total-budget
+usage. A reset clears rolling usage and keeps total-budget usage; only a policy
+with a new signed digest starts a new total allocation. Amount caps size outbound value, so a vault withdrawal,
 which returns underlying assets and burns the wallet's shares, reserves no
 amount against them.
 
@@ -871,11 +873,16 @@ Builds from this repository and releases from v0.1.0-alpha.14 on carry
 `mainnet-write`. Mainnet writes also need enablement and a signed v2 body.
 CLI value operations follow the governing decision: `allow` grants policy
 authority without a ceremony; `require_approval` requires passkey consent.
-Every MCP mainnet write requires approval. For the governance flow that V1
+An MCP mainnet write signs under Allow and needs a verified approval under
+RequireApproval. For the governance flow that V1
 enforces, see
 [cli-reference/profile-and-governance.md](cli-reference/profile-and-governance.md).
 
 ### Create the V1 policy file
+
+This testnet example is a version 1 document. The `unlisted`,
+`total_budget`, `balance_floor`, and `memo_binding` additions need
+`version = 2` with a `sequence`; see [V1 engine](concepts.md#v1-engine).
 
 Before `profile sign-policy`, create `policies/<name>.toml` in the wallet's
 state directory. The default paths are:
@@ -1064,9 +1071,14 @@ decides `allow`, and sets `allow_opaque_signing = false`.
   per-payment cap, the 1d and 1w caps, and the 1m and 1h rate limits.
 - Shop and business presets add `approval_above` at `A`, so a payment above
   `A` requests approval.
-- A chosen total budget adds `total_budget` at `L`. A new policy signature
-  starts a new `total_budget` allocation.
-- `stellar_pay` and `stellar_pay_commit` add `balance_floor` at `M`.
+- A chosen total budget adds `total_budget` at `L`. The allocation belongs
+  to the digest of the signed canonical bytes. `profile sign-policy` assigns
+  the next sequence, so each signing starts a new allocation;
+  `profile reset-window-state` keeps total-budget usage.
+- `stellar_pay` and `stellar_pay_commit` add `balance_floor` at `M`. The
+  floor needs an observed account read with its reservation sum. The shipped
+  CLI and MCP payment paths do not supply one, so a matched floor refuses
+  `account.unread`.
 - Each payment rule's `counterparty_allowlist` selects `G_ACCOUNT` and
   `C_ACCOUNT` with `allowlist = []`. G, M, and C recipients share that one
   list, and no listed recipient is paid until one is added. A G address
@@ -1109,7 +1121,8 @@ budget an api preset offers. `api-day` is the default. With `--asset XLM`,
 caps derive by the same rules, rounded down to one stroop.
 
 `M` is the XLM floor: the pay tools refuse a payment that would leave less
-native balance. `R` is the recommended XLM balance of the operating account,
+native balance after reservations, debit, and fee. It refuses `account.unread`
+until the caller supplies an observed account read. `R` is the recommended XLM balance of the operating account,
 covering the floor and the fees of `T` days. Fund the operating account with
 the operating balance of the plan in the asset, and `R` in XLM.
 
@@ -1219,6 +1232,16 @@ When either family cannot be held, the ceremony does not start.
 | `approval_credentials` | The `[mainnet]` table lists 1 to 16 approval credentials. Required in either build. |
 | `approval.cert_pin_without_origin` | A certificate pin requires an approval origin. |
 | `approval.origin_without_cert_pin` | An approval origin requires a certificate pin. |
+
+[`policy-v2-extended-minimum.toml`](../crates/stellar-agent-core/tests/fixtures/policy-v2-extended-minimum.toml)
+is a complete body that meets this minimum, and a core test loads it. Its
+payment rule needs approval with `ttl_secs = 86400`, the longest accepted.
+Its claim and trustline rules, commit phases included, each carry a rate
+limit; trustlines pin one asset and claims carry no asset allowlist. Three
+clocks stay separate: `ttl_secs` bounds the approval, an Allow grants
+600 seconds of policy authority, and an authorization lasts at most the
+`authorization_ttl_seconds` above. An unlisted approval escalation uses the
+default one-day lifetime.
 
 Address kinds are alternatives: G_ACCOUNT admits G and M forms, and C_ACCOUNT
 admits C and W. A listed destination needs both its kind and its exact string or base

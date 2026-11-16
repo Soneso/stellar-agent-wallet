@@ -313,7 +313,7 @@ but mints no key material; the rotation commands mint the actual keys (see
 | `[policy_owner_key_id]` | keyring ref | yes | ed25519 key whose signature every V1 policy file must carry. |
 | `[attestation_key_id]` | keyring ref | yes | HMAC key minting approval attestations at `approve` time. |
 | `[counterparty_cache_key_id]` | keyring ref | yes | HMAC key protecting the local `stellar.toml` cache integrity. |
-| `[policy_window_state_key_id]` | keyring ref | no (name-derived default) | HMAC key authenticating the persisted policy-window-state store behind `per_period_cap`, `rate_limit`, `bundle_per_period_cap`, and `bundle_rate_limit`. When omitted, the loader derives `stellar-agent-policy-window-<profile>`. The key mints on the first store write. |
+| `[policy_window_state_key_id]` | keyring ref | no (name-derived default) | HMAC key authenticating the persisted policy-window-state store behind `per_period_cap`, `rate_limit`, `bundle_per_period_cap`, `bundle_rate_limit`, unlisted budgets, and `total_budget`. When omitted, the loader derives `stellar-agent-policy-window-<profile>`. The key mints on the first store write. |
 
 ### Cross-check, MCP, and scan bounds
 
@@ -779,7 +779,7 @@ after upgrading. Symmetric-key loaders compare both forms.
 | `stellar-agent profile rotate-audit-key <name>` | `audit_log_hash_chain_key_id` | Fresh 32-byte HMAC key. Re-signs every existing per-file chain-root sidecar with the new key, so `audit verify <LOG_PATH> --profile <name>` stays green across the rotation and the old key stops verifying; the response carries `sidecars_resigned`. |
 | `stellar-agent profile rotate-counterparty-key <name>` | `counterparty_cache_key_id` | Fresh 32-byte HMAC key. Cached `stellar.toml` entries read as absent until a refresh rewrites them. `counterparty refresh <domain>` rewrites the entry for that domain. `counterparty warm-up` refreshes only the `HOME_DOMAIN` entries of the policy allowlist. |
 | `stellar-agent profile rotate-nonce-key <name>` | `mcp_nonce_key_alias` | Fresh 32-byte HMAC key. Outstanding nonces minted with the old key are invalidated. |
-| `stellar-agent profile rotate-policy-state-key <name>` | `policy_window_state_key_id` | Fresh 32-byte HMAC key. The window-state store is verified under the old key and re-signed under the new one, so `per_period_cap` / `rate_limit` history is preserved. A store that does not verify refuses the rotation. |
+| `stellar-agent profile rotate-policy-state-key <name>` | `policy_window_state_key_id` | Fresh 32-byte HMAC key. The window-state store is verified under the old key and re-signed under the new one, so `per_period_cap` / `rate_limit` history and unlisted and total-budget usage are preserved. A store that does not verify refuses the rotation. A rotation changes no policy digest, so it starts no new total allocation; `profile reset-window-state` clears rolling usage and keeps total usage. |
 
 ### Enroll the MCP signer
 
@@ -1047,12 +1047,22 @@ Ledger signing also requires this passkey ceremony.
 | `approval.cert_pin_without_origin` | A certificate pin requires an approval origin. |
 | `approval.origin_without_cert_pin` | An approval origin requires a certificate pin. |
 
+The core fixture `crates/stellar-agent-core/tests/fixtures/policy-v2-extended-minimum.toml`
+is a complete body that meets this minimum. Its payment rule needs approval
+with `ttl_secs = 86400`; its claim and trustline rules, commit phases
+included, each carry a rate limit. `ttl_secs` bounds the approval, an Allow
+grants 600 seconds of policy authority, and an authorization lasts at most
+`authorization_ttl_seconds`.
+
 Address kinds are alternatives: G_ACCOUNT admits G and M forms, and C_ACCOUNT
 admits C and W. A listed destination needs both its kind and its exact string or base
 G or C in the allowlist. Entries compare byte for byte; an exact M or W entry covers only
 that mux id. Issuer and verified-domain checks also apply before the unlisted
 mode. Missing destinations, unverified bindings, reserved kinds, and gated
-inflow failures refuse in every mode. Other strkey forms and malformed strings
+inflow failures refuse in every mode. An unlisted approval keeps evaluating
+its rule, so a later failing criterion still denies; a later rule cannot
+rescue a refusal. Equal `unlisted` tables share one counter per asset and
+window. Other strkey forms and malformed strings
 return evaluation errors. Raw arguments keep their denials in every mode.
 Opaque signing and exempted generic bundle inners refuse because third-party
 transactions have no evaluated effects, recipient class, or amount for a budget
@@ -1066,7 +1076,8 @@ Pairing applies when the enabled-policy minimum is required.
 
 The minimum has no memo criterion. SEP-29 still refuses a missing memo when
 the destination's `config.memo_required` entry is `1`. The operator supplies
-required deposit memos for destinations without that entry.
+required deposit memos for destinations without that entry, or binds them in
+a `memo_binding` criterion (see [approvals-and-audit.md](approvals-and-audit.md#version-2-additions)).
 
 #### Policy-tool names
 

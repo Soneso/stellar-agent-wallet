@@ -1,0 +1,17 @@
+version = 2
+scope = "profile:*"
+sequence = 1
+
+[[rules]]
+match = { tool = "stellar_pay", chain = "*" }
+criteria = [
+    { kind = "counterparty_allowlist", kinds = ["G_ACCOUNT"], allowlist = ["GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"], unlisted = { mode = "budget", per_tx_stroops = 100, per_period_stroops = 150, window = "1d" } },
+]
+decision = "allow"
+
+[[rules]]
+match = { tool = "stellar_pay_commit", chain = "*" }
+criteria = [
+    { kind = "counterparty_allowlist", kinds = ["G_ACCOUNT"], allowlist = [], unlisted = { window = "1d", per_period_stroops = 150, per_tx_stroops = 100, mode = "budget" } },
+]
+decision = "allow"

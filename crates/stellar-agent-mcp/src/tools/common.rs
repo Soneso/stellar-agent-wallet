@@ -1611,7 +1611,7 @@ impl WalletServer {
     ///      gate-sized effects (`Some` for a value-moving allow).
     ///    - `Decision::Deny(reason)` → `Err(ToolError::Business)` — a business
     ///      refusal surfaced as the documented result envelope with wire code
-    ///      `policy.deny.<reason.code()>` and the redacted `DenyReason`
+    ///      `reason.wire_code()` and the redacted `DenyReason`
     ///      (first-5-last-5 on account IDs) carried in the message.
     ///    - `Decision::RequireApproval(req)` → `Ok(DispatchOutcome::RequireApproval(_))`.
     ///      The simulate handler persists a `PendingApproval` and embeds the
@@ -2352,7 +2352,7 @@ impl WalletServer {
                 // Redact account IDs in CounterpartyDenied before serialising
                 // into the wire message. A policy denial is a business refusal the
                 // agent branches on, so it surfaces as the documented result
-                // envelope with wire code `policy.deny.<reason.code()>`. The
+                // envelope with wire code `reason.wire_code()`. The
                 // redacted `DenyReason` (first-5-last-5 on account IDs) is carried
                 // in the message so no structured detail is lost in the move from
                 // the JSON-RPC `data` field.

@@ -203,6 +203,8 @@ Simulate step: builds a Payment transaction envelope for a native XLM or non-nat
 
 **SEP-29:** If the destination's `config.memo_required` data entry is set to `"1"` and no memo is provided, returns `validation.memo_required`.
 
+**Memo binding:** A version 2 policy's `memo_binding` criterion can require an exact memo kind and value for a destination and its muxed addresses. This tool evaluates the parsed memo argument, and the commit evaluates the memo encoded in the envelope. A missing or different memo refuses `policy.deny.memo_binding_mismatch`.
+
 **Fee cap:** The resolved per-operation fee is checked against the effective signed/profile
 `classic_max_fee_per_op_stroops`. A fee above the cap returns
 `fees.percentile_exceeds_cap`; the message names an auto-selected fee and its

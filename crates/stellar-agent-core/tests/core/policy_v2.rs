@@ -677,6 +677,99 @@ fn minimum_read_only_and_trustline_requirements() {
     }
 }
 
+/// The documented mainnet example: a payment rule needing approval for at
+/// most one day, and claim and trustline rules for both phases.
+const EXTENDED_MINIMUM: &str = include_str!("../fixtures/policy-v2-extended-minimum.toml");
+
+/// The rule indexes for which `doc` fails the mainnet `requirement`.
+fn failing_rules(doc: &DocumentMut, requirement: &str) -> Vec<Option<usize>> {
+    mainnet_minimum::failures(doc, &profile(true), "operator")
+        .into_iter()
+        .filter_map(|error| match error {
+            PolicyError::MainnetMinimumUnmet {
+                requirement: name,
+                rule,
+            } if name == requirement => Some(rule),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The example loads signed and meets the mainnet minimum. Every claim and
+/// trustline rule, commit phase included, fails without its own rate limit.
+/// The approval rule accepts an explicit lifetime of 1 through 86,400
+/// seconds only.
+#[test]
+#[serial_test::serial]
+fn documented_mainnet_minimum_examples() {
+    use stellar_agent_core::policy::v1::loader::load_signed_policy_text;
+    use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let key = SigningKey::from_bytes(&[11; 32]);
+    load_signed_policy_text(
+        &signed(EXTENDED_MINIMUM, &key),
+        "operator",
+        &key.verifying_key().to_bytes(),
+        MAINNET_PASSPHRASE,
+    )
+    .unwrap();
+    let doc = EXTENDED_MINIMUM.parse::<DocumentMut>().unwrap();
+    mainnet_minimum::validate(&doc, &profile(true), "operator").unwrap();
+
+    let tools: Vec<String> = doc["rules"]
+        .as_array_of_tables()
+        .unwrap()
+        .iter()
+        .map(|rule| rule["match"]["tool"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        tools,
+        [
+            "stellar_pay",
+            "stellar_claim",
+            "stellar_claim_commit",
+            "stellar_trustline",
+            "stellar_trustline_commit"
+        ]
+    );
+    for (index, tool) in tools.iter().enumerate().skip(1) {
+        let mut without = doc.clone();
+        let criteria = without["rules"]
+            .as_array_of_tables_mut()
+            .unwrap()
+            .get_mut(index)
+            .unwrap()["criteria"]
+            .as_array_mut()
+            .unwrap();
+        criteria.retain(|c| c.as_inline_table().unwrap()["kind"].as_str() != Some("rate_limit"));
+        assert_eq!(
+            failing_rules(&without, "rate_limit"),
+            [Some(index)],
+            "{tool}"
+        );
+    }
+
+    for (ttl, accepted) in [
+        (None, false),
+        (Some(0), false),
+        (Some(1), true),
+        (Some(86_400), true),
+        (Some(86_401), false),
+    ] {
+        let mut edited = doc.clone();
+        match ttl {
+            Some(ttl) => rule(&mut edited)["ttl_secs"] = value(ttl),
+            None => {
+                rule(&mut edited).remove("ttl_secs");
+            }
+        }
+        let expected: &[Option<usize>] = if accepted { &[] } else { &[Some(0)] };
+        assert_eq!(failing_rules(&edited, "rule_ttl"), expected, "{ttl:?}");
+    }
+}
+
 #[test]
 #[serial_test::serial]
 fn minimum_cap_coverage_uses_network_identity() {

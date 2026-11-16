@@ -419,7 +419,9 @@ looks up the tool's registry descriptor and calls
 `policy_engine.evaluate(...)`. The verdict is one of:
 
 - `Allow`: the tool proceeds.
-- `Deny`: the call is refused with wire code `policy.deny.<reason>`.
+- `Deny`: the call is refused with the denial's wire code, `policy.deny.<reason>`
+  for a policy refusal or `account.unread`, `account.stale`, or
+  `account.floor_refused` for a balance floor.
 - `RequireApproval`: an out-of-band operator approval is required.
 
 ### Classic mainnet authorization
@@ -825,6 +827,9 @@ For `stellar_pay` and `stellar_pay_commit`:
 On every network, a `memo_text` holding a control character (U+0000 to U+001F, U+007F to U+009F) or a Unicode format character (category Cf), line separator (U+2028), or paragraph separator (U+2029) is refused as invalid parameters whose message names `validation.memo_control_character` and the character, before any request is sent.
 The format characters include the zero-width non-joiner (U+200C) and joiner (U+200D), so a memo cannot carry them.
 Other non-ASCII text is accepted.
+Besides SEP-29, a version 2 policy's `memo_binding` criterion can require an exact memo kind and value for a destination and its muxed addresses.
+`stellar_pay` evaluates the parsed memo argument; `stellar_pay_commit` evaluates the memo encoded in the envelope, which caller fields cannot replace.
+A missing or different memo refuses `policy.deny.memo_binding_mismatch`, which names only the required kind.
 
 For an authenticated classic mainnet attempt, transaction status uses cached
 recovery evidence or `UNKNOWN` and sends no additional transaction lookup.

@@ -15,13 +15,27 @@
 //!
 //! # Coverage
 //!
-//! Six adversarial categories:
-//! 1. `per_tx_cap_boundary/` — per-transaction cap boundary values
-//! 2. `per_period_rollover/` — rolling-window cap with pre-seeded state store
-//! 3. `combinator_and_or/` — multi-criterion first-fail ordering
-//! 4. `counterparty_lookalike/` — homoglyph + IDN + case-insensitive HOME_DOMAIN
-//! 5. `null_source_account/` — null G-account vs G-allowlist
-//! 6. `mutation_stale_key/` — load-time owner-signature verification
+//! Seven legacy categories:
+//! 1. `per_tx_cap_boundary/`: per-transaction cap boundary values
+//! 2. `per_period_rollover/`: rolling-window cap with pre-seeded state store
+//! 3. `combinator_and_or/`: multi-criterion first-fail ordering
+//! 4. `counterparty_lookalike/`: homoglyph + IDN + case-insensitive HOME_DOMAIN
+//! 5. `null_source_account/`: null G-account vs G-allowlist
+//! 6. `home_domain_resolved/`: home-domain resolution and the missing cache
+//! 7. `mutation_stale_key/`: load-time owner-signature verification
+//!
+//! Each of the 28 legacy pairs has a `<name>_v2` companion: the same policy
+//! as a version 2 document with `sequence = 1`, and the same case metadata
+//! under the companion name. Both must reach the same outcome.
+//!
+//! `extended_grammar/` holds the version 2 additions: unlisted recipient
+//! modes, total budgets, the balance floor, and memo bindings. Its cases run
+//! in the named `extended_corpus_*` tests. A `sequence` case evaluates its
+//! steps against one usage history. Each step loads its policy through the
+//! verified loader, so `total_budget` counts against the signed digest. The
+//! history is replayed into each step's in-memory store; it is not a durable
+//! restart. Account views in these cases are core test inputs, not evidence
+//! that a caller supplies them.
 //!
 //! # Scope
 //!
@@ -41,6 +55,7 @@
 )]
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ed25519_dalek::Signer;
 use rand_core::OsRng;
@@ -49,12 +64,22 @@ use serde_json::Value;
 use tempfile::TempDir;
 use zeroize::Zeroizing;
 
-use stellar_agent_core::policy::v1::PolicyEngineV1;
+use stellar_agent_core::asset_id::CanonicalAsset;
+use stellar_agent_core::policy::v1::bundle::{BundleStateOverlay, BundleView, InnerOpDescriptor};
 use stellar_agent_core::policy::v1::canonical::canonical_bytes;
-use stellar_agent_core::policy::v1::criteria::state_store::{PolicyStateStore, StateKey};
+use stellar_agent_core::policy::v1::criteria::state_store::{
+    PolicyStateStore, StateKey, WindowEntry, set_query_time_for_test,
+};
 use stellar_agent_core::policy::v1::loader::{PolicyDocument, load_signed_policy};
 use stellar_agent_core::policy::v1::signature::digest;
-use stellar_agent_core::policy::{Decision, PolicyEngine, ToolDescriptor};
+use stellar_agent_core::policy::v1::value::{ValueClass, derive_value_class};
+use stellar_agent_core::policy::v1::verified::{
+    OwnerKeySource, PinMode, PolicyLoad, load_verified_policy,
+};
+use stellar_agent_core::policy::v1::{
+    AccountReserveLookupError, AccountReservesView, FloorInput, ObservedAccount, PolicyEngineV1,
+};
+use stellar_agent_core::policy::{Decision, PolicyEngine, PolicyError, ToolDescriptor};
 use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
 use stellar_agent_core::profile::schema::Profile;
 
@@ -63,7 +88,10 @@ use stellar_agent_core::profile::schema::Profile;
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Root case metadata structure parsed from `<name>.case.json`.
+///
+/// Unknown fields refuse, so a misspelled expectation cannot be skipped.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CaseMeta {
     test_kind: String,
     name: String,
@@ -95,9 +123,63 @@ struct CaseMeta {
     expected_load_ok: Option<bool>,
     expected_load_error: Option<String>,
     expected_load_wire_code: Option<String>,
+    // grammar_refused: the exact loader refusal detail.
+    expected_load_detail: Option<String>,
+
+    // sequence fields: the steps evaluated in order against one history.
+    steps: Option<Vec<StepMeta>>,
+    // sequence: build each engine without the verified loader, so its policy
+    // digest is all zeros. Only a case that tests the zero digest sets it.
+    unverified_engine: Option<bool>,
 }
 
+/// One evaluation of a `sequence` case.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StepMeta {
+    /// Overrides the case tool's name.
+    tool: Option<String>,
+    /// A sibling policy stem to load instead of the case's own policy.
+    policy: Option<String>,
+    args: Value,
+    /// Evaluates a bundle of token transfers instead of `args` alone.
+    bundle: Option<Vec<InnerMeta>>,
+    /// The account view the evaluation receives.
+    account: Option<AccountMeta>,
+    /// Evaluates provisionally instead of strictly.
+    #[serde(default)]
+    provisional: bool,
+    /// Milliseconds after [`EVALUATION_INSTANT_MS`] at which the step runs.
+    #[serde(default)]
+    after_ms: u64,
+    /// Records the permitted step into the history.
+    #[serde(default)]
+    record: bool,
+    expected: ExpectedMeta,
+}
+
+/// A token transfer inside a bundle, in the asset's Stellar Asset Contract.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InnerMeta {
+    to: String,
+    asset: String,
+    amount_stroops: i128,
+}
+
+/// A native account view. Without `observed_age_ms` it is a plain view with
+/// no observation; with it, the observation is that old at the step's
+/// instant, and `reservations_stroops` adds the floor's reservation sum.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AccountMeta {
+    balance_stroops: i64,
+    observed_age_ms: Option<u64>,
+    reservations_stroops: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ToolMeta {
     name: String,
     destructive_hint: bool,
@@ -107,21 +189,37 @@ struct ToolMeta {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ExpectedMeta {
-    /// "Allow", "Deny", or "Error" (for fail-closed criterion errors).
+    /// "Allow", "Deny", "RequireApproval", or "Error" (for fail-closed
+    /// criterion errors).
     kind: String,
+    /// For kind = "Deny": the expected `DenyReason::code()`.
     deny_reason: Option<String>,
+    /// For kind = "Deny": the expected `DenyReason::wire_code()`, compared
+    /// whether or not `deny_reason` is present.
     wire_code: Option<String>,
+    /// For kind = "Deny": the expected serialized `DenyReason`.
+    reason: Option<Value>,
+    /// For kind = "RequireApproval": the exact approval reason and lifetime,
+    /// both required.
+    approval_reason: Option<String>,
+    approval_ttl_secs: Option<u32>,
     /// For kind = "Error": expected substring of the `PolicyError` Debug string.
     error_contains: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StateSeedEntry {
     /// Seconds before the current wall-clock time that this entry was recorded.
     offset_secs_ago: u64,
     /// Stroop amount recorded.
     amount_stroops: i64,
+    /// The state-store bucket; `native` when absent.
+    bucket: Option<String>,
+    /// The bucket's window in seconds; 86,400 when absent.
+    window_secs: Option<u64>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -368,20 +466,25 @@ const EVALUATION_INSTANT_MS: u64 = 1_700_000_000_000;
 /// metadata.  Each seed entry specifies how many seconds ago the entry was
 /// recorded and the amount.
 ///
-/// The key matches what `PerPeriodCapCriterion` uses at evaluation time:
+/// The key matches what the windowed criteria use at evaluation time:
 /// - profile_name from the case
 /// - scope_specificity = 1 (AllProfiles default)
-/// - bucket = "native" (all per_period_rollover and combinator fixtures use native)
-/// - window_secs = 86_400 (1d, matching the fixture TOML)
+/// - bucket = the entry's `bucket`, or "native" as `per_period_cap` uses for
+///   the native asset; an unlisted budget reads `unlisted:<asset>`
+/// - window_secs = the entry's `window_secs`, or 86_400 (1d)
 ///
 /// Entries sit relative to [`EVALUATION_INSTANT_MS`], the instant the case
 /// evaluates at.
 fn seed_state_store(store: &PolicyStateStore, profile_name: &str, seeds: &[StateSeedEntry]) {
     let now_ms = EVALUATION_INSTANT_MS;
 
-    let key = StateKey::new(profile_name, 1, "native", 86_400);
-
     for seed in seeds {
+        let key = StateKey::new(
+            profile_name,
+            1,
+            seed.bucket.as_deref().unwrap_or("native"),
+            seed.window_secs.unwrap_or(86_400),
+        );
         let ts_ms = now_ms.saturating_sub(seed.offset_secs_ago.saturating_mul(1_000));
         store
             .append(&key, ts_ms, i128::from(seed.amount_stroops))
@@ -407,6 +510,7 @@ fn run_case(case_path: &Path) -> Result<(), String> {
     match meta.test_kind.as_str() {
         "evaluate" => run_evaluate_case(case_path, &meta, &policy_body),
         "load_failure" => run_load_failure_case(case_path, &meta, &policy_body),
+        "sequence" => run_sequence_case(case_path, &meta, &policy_body),
         other => Err(format!(
             "{}: unknown test_kind '{other}'",
             case_path.display()
@@ -478,9 +582,8 @@ fn run_evaluate_case(case_path: &Path, meta: &CaseMeta, policy_body: &str) -> Re
 
     // Evaluate via the engine's injection point.  Pass identity_view when a
     // mock_home_domain is configured (HOME_DOMAIN criterion cases); pass None
-    // for all other cases.  account_view is None in both paths because none of
-    // the adversarial fixtures currently exercise the minimum-reserve criterion
-    // with a real account view.
+    // for all other cases.  account_view is None for every evaluate case;
+    // sequence cases supply their account views.
     let identity_view_ref: Option<&dyn stellar_agent_core::policy::v1::AccountIdentityView> =
         mock_identity
             .as_ref()
@@ -502,7 +605,21 @@ fn run_evaluate_case(case_path: &Path, meta: &CaseMeta, policy_body: &str) -> Re
         EVALUATION_INSTANT_MS,
     );
 
-    // If expected.kind == "Error", assert the evaluation errored.
+    check_outcome(&case_label(case_path, meta), expected, eval_result)
+}
+
+/// Names a case in failure messages.
+fn case_label(case_path: &Path, meta: &CaseMeta) -> String {
+    format!("{} [{}::{}]", case_path.display(), meta.category, meta.name)
+}
+
+/// Asserts an evaluation result matches `expected`: an error for kind
+/// "Error", otherwise the decision.
+fn check_outcome(
+    label: &str,
+    expected: &ExpectedMeta,
+    eval_result: Result<Decision, PolicyError>,
+) -> Result<(), String> {
     if expected.kind == "Error" {
         return match eval_result {
             Err(e) => {
@@ -512,11 +629,7 @@ fn run_evaluate_case(case_path: &Path, meta: &CaseMeta, policy_body: &str) -> Re
                         Ok(())
                     } else {
                         Err(format!(
-                            "{} [{}::{}]: expected error containing '{}', got: {debug_str}",
-                            case_path.display(),
-                            meta.category,
-                            meta.name,
-                            contains
+                            "{label}: expected error containing '{contains}', got: {debug_str}"
                         ))
                     }
                 } else {
@@ -524,42 +637,47 @@ fn run_evaluate_case(case_path: &Path, meta: &CaseMeta, policy_body: &str) -> Re
                 }
             }
             Ok(decision) => Err(format!(
-                "{} [{}::{}]: expected Error, got Decision: {decision:?}",
-                case_path.display(),
-                meta.category,
-                meta.name
+                "{label}: expected Error, got Decision: {decision:?}"
             )),
         };
     }
 
-    let decision = eval_result.map_err(|e| {
-        format!(
-            "{} [{}::{}]: evaluate returned error: {e:?}",
-            case_path.display(),
-            meta.category,
-            meta.name
-        )
-    })?;
-
-    // Assert the outcome.
-    assert_decision(case_path, meta, expected, &decision)
+    let decision = eval_result.map_err(|e| format!("{label}: evaluate returned error: {e:?}"))?;
+    assert_decision(label, expected, &decision)
 }
 
 /// Asserts the `Decision` matches `expected`.
 fn assert_decision(
-    case_path: &Path,
-    meta: &CaseMeta,
+    label: &str,
     expected: &ExpectedMeta,
     decision: &Decision,
 ) -> Result<(), String> {
     match expected.kind.as_str() {
         "Allow" => {
             if !matches!(decision, Decision::Allow) {
+                return Err(format!("{label}: expected Allow, got: {decision:?}"));
+            }
+        }
+        "RequireApproval" => {
+            let Decision::RequireApproval(request) = decision else {
                 return Err(format!(
-                    "{} [{}::{}]: expected Allow, got: {decision:?}",
-                    case_path.display(),
-                    meta.category,
-                    meta.name
+                    "{label}: expected RequireApproval, got: {decision:?}"
+                ));
+            };
+            let (Some(reason), Some(ttl_secs)) =
+                (&expected.approval_reason, expected.approval_ttl_secs)
+            else {
+                return Err(format!(
+                    "{label}: a RequireApproval expectation needs approval_reason and \
+                     approval_ttl_secs"
+                ));
+            };
+            if request.reason.as_deref() != Some(reason.as_str()) || request.ttl_seconds != ttl_secs
+            {
+                return Err(format!(
+                    "{label}: expected approval reason '{reason}' for {ttl_secs} s, got \
+                     {:?} for {} s",
+                    request.reason, request.ttl_seconds
                 ));
             }
         }
@@ -567,12 +685,7 @@ fn assert_decision(
             let reason = match decision {
                 Decision::Deny(r) => r,
                 other => {
-                    return Err(format!(
-                        "{} [{}::{}]: expected Deny, got: {other:?}",
-                        case_path.display(),
-                        meta.category,
-                        meta.name
-                    ));
+                    return Err(format!("{label}: expected Deny, got: {other:?}"));
                 }
             };
 
@@ -580,41 +693,295 @@ fn assert_decision(
                 let actual_code = reason.code();
                 if actual_code != expected_code.as_str() {
                     return Err(format!(
-                        "{} [{}::{}]: expected deny_reason '{}', got '{}'",
-                        case_path.display(),
-                        meta.category,
-                        meta.name,
-                        expected_code,
-                        actual_code
+                        "{label}: expected deny_reason '{expected_code}', got '{actual_code}'"
                     ));
                 }
-
-                // Also verify the wire_code if supplied.
-                if let Some(expected_wire) = &expected.wire_code {
-                    let actual_wire = format!("policy.deny.{actual_code}");
-                    if actual_wire != *expected_wire {
-                        return Err(format!(
-                            "{} [{}::{}]: expected wire_code '{}', got '{}'",
-                            case_path.display(),
-                            meta.category,
-                            meta.name,
-                            expected_wire,
-                            actual_wire
-                        ));
-                    }
+            }
+            if let Some(expected_wire) = &expected.wire_code {
+                let actual_wire = reason.wire_code();
+                if actual_wire != expected_wire.as_str() {
+                    return Err(format!(
+                        "{label}: expected wire_code '{expected_wire}', got '{actual_wire}'"
+                    ));
+                }
+            }
+            if let Some(expected_reason) = &expected.reason {
+                let actual_reason = serde_json::to_value(reason)
+                    .map_err(|e| format!("{label}: cannot serialize the denial: {e}"))?;
+                if actual_reason != *expected_reason {
+                    return Err(format!(
+                        "{label}: expected reason {expected_reason}, got {actual_reason}"
+                    ));
                 }
             }
         }
         other => {
-            return Err(format!(
-                "{} [{}::{}]: unknown expected.kind '{other}'",
-                case_path.display(),
-                meta.category,
-                meta.name
-            ));
+            return Err(format!("{label}: unknown expected.kind '{other}'"));
         }
     }
 
+    Ok(())
+}
+
+/// A native-balance account view with the reserve of an account without
+/// subentries.
+struct Balance(i64);
+
+impl AccountReservesView for Balance {
+    fn reserves_stroops(&self, base_reserve_stroops: i64) -> i64 {
+        2 * base_reserve_stroops
+    }
+
+    fn balance_stroops(&self) -> Result<i64, AccountReserveLookupError> {
+        Ok(self.0)
+    }
+}
+
+/// Signs `body` and loads it through the verified loader for `profile`,
+/// with `store` as the engine's window state.
+///
+/// The load compares against no pin, so a step may return to an earlier
+/// sequence; the engine carries the digest of the signed canonical bytes.
+fn verified_engine(
+    body: &str,
+    (seed, pk): (&[u8; 32], &[u8; 32]),
+    profile: &Profile,
+    profile_name: &str,
+    dir: &TempDir,
+    store: PolicyStateStore,
+) -> Result<Arc<PolicyEngineV1>, PolicyError> {
+    let path = dir.path().join("policy.toml");
+    std::fs::write(&path, make_signed_toml(body, seed, "TEST_OWNER_ID")).expect("write policy");
+    let policy = load_verified_policy(
+        &PolicyLoad {
+            path: &path,
+            profile,
+            profile_name,
+            owner_pubkey: pk,
+            owner_source: OwnerKeySource::TestFile,
+            window_path: &dir.path().join("state.window"),
+        },
+        store,
+        PinMode::CompareOnly,
+    )?;
+    Ok(policy.engine())
+}
+
+/// Replays recorded entries into `store`, each in its own epoch.
+fn replay(store: &PolicyStateStore, history: &[WindowEntry]) {
+    for entry in history {
+        match entry.epoch() {
+            Some(epoch) => {
+                store.append_epoch(entry.key(), entry.timestamp_ms(), entry.amount(), epoch)
+            }
+            None => store.append(entry.key(), entry.timestamp_ms(), entry.amount()),
+        }
+        .expect("state store append must succeed");
+    }
+}
+
+/// Builds the bundle inners of a step; each asset is its Stellar Asset
+/// Contract on the test network.
+fn bundle_inners(inners: &[InnerMeta]) -> Result<Vec<InnerOpDescriptor>, String> {
+    inners
+        .iter()
+        .map(|inner| {
+            let asset = if inner.asset == "native" {
+                CanonicalAsset::Native
+            } else {
+                CanonicalAsset::parse_threshold_key(&inner.asset)
+                    .map_err(|e| format!("bundle asset '{}': {e}", inner.asset))?
+            };
+            Ok(InnerOpDescriptor::TokenTransfer {
+                asset: asset
+                    .sac_contract_id(TESTNET_PASSPHRASE)
+                    .ok_or_else(|| format!("bundle asset '{}' has no contract", inner.asset))?,
+                from: BUNDLE_SOURCE.to_owned(),
+                to: inner.to.clone(),
+                amount: inner.amount_stroops,
+            })
+        })
+        .collect()
+}
+
+/// The account a bundle's transfers debit.
+const BUNDLE_SOURCE: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+
+/// Runs a `sequence` case: each step evaluates at its instant against the
+/// seeds and every entry earlier steps recorded.
+fn run_sequence_case(case_path: &Path, meta: &CaseMeta, policy_body: &str) -> Result<(), String> {
+    let label = case_label(case_path, meta);
+    let (Some(tool_meta), Some(profile_name), Some(steps)) =
+        (&meta.tool, meta.profile_name.as_deref(), &meta.steps)
+    else {
+        return Err(format!(
+            "{label}: a sequence case needs 'tool', 'profile_name' and 'steps'"
+        ));
+    };
+    if steps.is_empty() {
+        return Err(format!("{label}: a sequence case needs at least one step"));
+    }
+    // The verified loader reads the profile's mainnet enablement from the
+    // keyring; the mock keyring holds none.
+    stellar_agent_test_support::keyring_mock::install()
+        .map_err(|e| format!("{label}: mock keyring: {e:?}"))?;
+    let (sk, pk) = make_keypair();
+    let dir = TempDir::new().map_err(|e| format!("tempdir creation failed: {e}"))?;
+    let profile = profile_from_case(profile_name, &tool_meta.chain_id);
+    let mut history: Vec<WindowEntry> = Vec::new();
+
+    for (index, step) in steps.iter().enumerate() {
+        let label = format!("{label} step {index}");
+        let now_ms = EVALUATION_INSTANT_MS + step.after_ms;
+        let _clock = set_query_time_for_test(now_ms);
+
+        let body = match &step.policy {
+            Some(stem) => {
+                let path = case_path.with_file_name(format!("{stem}.toml"));
+                std::fs::read_to_string(&path)
+                    .map_err(|e| format!("{label}: cannot read {}: {e}", path.display()))?
+            }
+            None => policy_body.to_owned(),
+        };
+        let store = PolicyStateStore::new();
+        if let Some(seeds) = &meta.state_seed {
+            seed_state_store(&store, profile_name, seeds);
+        }
+        replay(&store, &history);
+        let engine = if meta.unverified_engine == Some(true) {
+            let doc = load_doc_signed(&body, &sk, &pk, profile_name, &profile, &dir);
+            Arc::new(PolicyEngineV1::new_with_store(
+                doc,
+                profile_name.to_owned(),
+                store,
+            ))
+        } else {
+            verified_engine(&body, (&sk, &pk), &profile, profile_name, &dir, store)
+                .map_err(|e| format!("{label}: verified load failed: {e:?}"))?
+        };
+
+        let mut step_tool = tool_meta.clone();
+        if let Some(name) = &step.tool {
+            step_tool.name.clone_from(name);
+        }
+        let tool = tool_descriptor_from_meta(&step_tool);
+
+        if let Some(inners) = &step.bundle {
+            if step.account.is_some() || step.provisional {
+                return Err(format!(
+                    "{label}: a bundle step takes no account view and is never provisional"
+                ));
+            }
+            let inners = bundle_inners(inners).map_err(|e| format!("{label}: {e}"))?;
+            let overlay = BundleStateOverlay::default();
+            let view = BundleView {
+                inners: &inners,
+                overlay: &overlay,
+            };
+            let result = engine.evaluate_bundle(&tool, &step.args, &profile, &view);
+            check_outcome(&label, &step.expected, result)?;
+            if step.record {
+                let recorded = engine
+                    .record_confirmed_bundle(&tool, &profile, &view)
+                    .map_err(|e| format!("{label}: recording the bundle failed: {e:?}"))?;
+                history.extend(recorded);
+            }
+            continue;
+        }
+
+        let plain;
+        let observed;
+        let input;
+        let account_view: Option<&dyn AccountReservesView> = match &step.account {
+            None => None,
+            Some(AccountMeta {
+                balance_stroops,
+                observed_age_ms: None,
+                reservations_stroops: None,
+            }) => {
+                plain = Balance(*balance_stroops);
+                Some(&plain)
+            }
+            Some(AccountMeta {
+                balance_stroops,
+                observed_age_ms: Some(age_ms),
+                reservations_stroops,
+            }) => {
+                let observed_at_ms = now_ms - age_ms;
+                observed = ObservedAccount::new(
+                    Balance(*balance_stroops),
+                    1,
+                    observed_at_ms,
+                    observed_at_ms,
+                );
+                match reservations_stroops {
+                    None => Some(&observed),
+                    Some(reservations) => {
+                        input = FloorInput {
+                            observed: &observed,
+                            effective_reservations_stroops: *reservations,
+                        };
+                        Some(&input)
+                    }
+                }
+            }
+            Some(AccountMeta {
+                observed_age_ms: None,
+                reservations_stroops: Some(_),
+                ..
+            }) => {
+                return Err(format!(
+                    "{label}: reservations_stroops needs observed_age_ms"
+                ));
+            }
+        };
+
+        let value = derive_value_class(&tool.name, &step.args);
+        let evaluation = if step.provisional {
+            engine.evaluate_provisional(
+                &tool,
+                &step.args,
+                &profile,
+                value,
+                account_view,
+                None,
+                None,
+                None,
+                None,
+                now_ms,
+            )
+        } else {
+            engine.evaluate_with_value_full(
+                &tool,
+                &step.args,
+                &profile,
+                value,
+                account_view,
+                None,
+                None,
+                None,
+                None,
+                now_ms,
+            )
+        };
+        let effects = evaluation
+            .as_ref()
+            .ok()
+            .and_then(|evaluation| evaluation.value_effects.clone());
+        check_outcome(
+            &label,
+            &step.expected,
+            evaluation.map(|evaluation| evaluation.decision),
+        )?;
+        if step.record {
+            let effects =
+                effects.ok_or_else(|| format!("{label}: a recorded step carries no effects"))?;
+            let recorded = engine
+                .record_confirmed(&tool, &profile, &ValueClass::Value(effects))
+                .map_err(|e| format!("{label}: recording failed: {e:?}"))?;
+            history.extend(recorded);
+        }
+    }
     Ok(())
 }
 
@@ -742,6 +1109,29 @@ fn run_load_failure_case(
             check_load_error(case_path, meta, result, "policy_file_parse_failed")
         }
 
+        "grammar_refused" => {
+            // Correctly signed; the body itself must refuse with the exact detail.
+            let signed_toml = make_signed_toml(policy_body, &sk_correct, "TEST_OWNER");
+            let path = dir.path().join("policy.toml");
+            std::fs::write(&path, &signed_toml).expect("write");
+            let result = load_signed_policy(&path, "default", &pk_correct, TESTNET_PASSPHRASE);
+            let expected_detail = meta.expected_load_detail.as_deref().ok_or_else(|| {
+                format!(
+                    "{}: grammar_refused case missing expected_load_detail",
+                    case_label(case_path, meta)
+                )
+            })?;
+            if let Err(PolicyError::PolicyFileParseFailed { detail }) = &result
+                && detail != expected_detail
+            {
+                return Err(format!(
+                    "{}: expected refusal '{expected_detail}', got '{detail}'",
+                    case_label(case_path, meta)
+                ));
+            }
+            check_load_error(case_path, meta, result, "policy_file_parse_failed")
+        }
+
         other => Err(format!(
             "{} [{}::{}]: unknown load_signing_strategy '{other}'",
             case_path.display(),
@@ -756,11 +1146,9 @@ fn run_load_failure_case(
 fn check_load_error(
     case_path: &Path,
     meta: &CaseMeta,
-    result: Result<PolicyDocument, stellar_agent_core::policy::PolicyError>,
+    result: Result<PolicyDocument, PolicyError>,
     expected_variant: &str,
 ) -> Result<(), String> {
-    use stellar_agent_core::policy::PolicyError;
-
     let expected_from_fixture = meta.expected_load_error.as_deref().ok_or_else(|| {
         format!(
             "{} [{}::{}]: load-failure case missing expected_load_error metadata",
@@ -915,8 +1303,14 @@ const REQUIRED_SUBDIRS: &[&str] = &[
     "combinator_and_or",
     "counterparty_lookalike",
     "null_source_account",
+    "home_domain_resolved",
     "mutation_stale_key",
+    EXTENDED_DIR,
 ];
+
+/// The directory of the version 2 addition cases, run by the named
+/// `extended_corpus_*` tests instead of [`run_all_adversarial_fixtures`].
+const EXTENDED_DIR: &str = "extended_grammar";
 
 /// Defence-in-depth structural guard that fails fast when a required adversarial
 /// subdirectory or its case files are missing.
@@ -963,11 +1357,25 @@ fn run_all_adversarial_fixtures() {
     let root = adversarial_root();
     assert_required_subdirs(&root);
 
-    let cases = collect_case_files(&root);
+    let extended = root.join(EXTENDED_DIR);
+    let (extended_cases, cases): (Vec<PathBuf>, Vec<PathBuf>) = collect_case_files(&root)
+        .into_iter()
+        .partition(|path| path.starts_with(&extended));
     assert!(
         !cases.is_empty(),
         "no *.case.json files found under {root:?}"
     );
+    let claimed: std::collections::BTreeSet<&str> = EXTENDED_GROUPS
+        .iter()
+        .flat_map(|group| group.iter().copied())
+        .collect();
+    for path in &extended_cases {
+        let stem = case_stem(path);
+        assert!(
+            claimed.contains(stem.as_str()),
+            "{EXTENDED_DIR}/{stem} belongs to no extended_corpus_* test"
+        );
+    }
 
     let total = cases.len();
     let mut failures: Vec<String> = Vec::new();
@@ -995,4 +1403,271 @@ fn run_all_adversarial_fixtures() {
     }
 
     println!("run_all_adversarial_fixtures: {total} fixtures passed");
+}
+
+/// Returns the `<name>` of a `<name>.case.json` path.
+fn case_stem(case_path: &Path) -> String {
+    case_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".case.json"))
+        .unwrap_or_else(|| panic!("not a case file: {}", case_path.display()))
+        .to_owned()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Version 2 companions of the legacy corpus
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The 28 legacy pairs, each with a `_v2` companion.
+const LEGACY_CASES: [&str; 28] = [
+    "per_tx_cap_boundary/999_xlm_allow",
+    "per_tx_cap_boundary/1000_xlm_allow_inclusive",
+    "per_tx_cap_boundary/1000_0000001_xlm_deny",
+    "per_tx_cap_boundary/1001_xlm_deny",
+    "per_period_rollover/in_window_under_cap_allow",
+    "per_period_rollover/in_window_over_cap_deny",
+    "per_period_rollover/boundary_23h59m_deny",
+    "per_period_rollover/past_window_rollover_allow",
+    "combinator_and_or/both_pass_allow",
+    "combinator_and_or/per_tx_fails_first",
+    "combinator_and_or/per_period_fails_first",
+    "combinator_and_or/ordering_inversion_different_deny",
+    "counterparty_lookalike/legitimate_circle_allow",
+    "counterparty_lookalike/case_insensitive_match_allow",
+    "counterparty_lookalike/cyrillic_s_circle_deny",
+    "counterparty_lookalike/homoglyph_digit1_circ1e_deny",
+    "null_source_account/legitimate_g_allow",
+    "null_source_account/null_g_account_deny",
+    "home_domain_resolved/no_home_domain_allow",
+    "home_domain_resolved/resolved_domain_allow",
+    "home_domain_resolved/unresolved_domain_deny",
+    "home_domain_resolved/missing_cache_fail_closed",
+    "mutation_stale_key/signed_with_correct_key_loads",
+    "mutation_stale_key/post_rotation_correct_key_loads",
+    "mutation_stale_key/signed_with_stale_key_rejected",
+    "mutation_stale_key/tampered_signature_byte_rejected",
+    "mutation_stale_key/truncated_signature_rejected",
+    "mutation_stale_key/cross_profile_replay_rejected",
+];
+
+/// Every legacy pair has a `_v2` companion whose policy differs only in
+/// `version = 2` and `sequence = 1`, whose case differs only in its name,
+/// and which reaches the same outcome. The legacy and companion pairs are
+/// the whole legacy corpus.
+#[test]
+#[serial_test::serial]
+fn legacy_corpus_v2_companions_preserve_outcomes() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let root = adversarial_root();
+    let mut expected_files: Vec<PathBuf> = Vec::new();
+    for case in LEGACY_CASES {
+        let original = root.join(format!("{case}.case.json"));
+        let companion = root.join(format!("{case}_v2.case.json"));
+        expected_files.extend([original.clone(), companion.clone()]);
+
+        let original_policy = load_policy_body(&original);
+        let companion_policy = load_policy_body(&companion);
+        assert!(
+            original_policy.starts_with("version = 1\n"),
+            "{case}: the original is a version 1 document"
+        );
+        let mut lines: Vec<&str> = companion_policy.lines().collect();
+        assert_eq!(lines.first(), Some(&"version = 2"), "{case}_v2");
+        assert_eq!(
+            lines.iter().filter(|line| **line == "sequence = 1").count(),
+            1,
+            "{case}_v2 carries one `sequence = 1`"
+        );
+        lines.retain(|line| *line != "sequence = 1");
+        lines[0] = "version = 1";
+        assert_eq!(
+            lines,
+            original_policy.lines().collect::<Vec<_>>(),
+            "{case}_v2 differs from {case} only in version and sequence"
+        );
+
+        let read_json = |path: &Path| -> Value {
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+        };
+        let mut original_case = read_json(&original);
+        let companion_case = read_json(&companion);
+        assert_eq!(
+            companion_case["name"],
+            format!("{}_v2", original_case["name"].as_str().unwrap()),
+            "{case}_v2"
+        );
+        original_case["name"] = companion_case["name"].clone();
+        assert_eq!(
+            companion_case, original_case,
+            "{case}_v2 keeps every expectation of {case}"
+        );
+
+        for path in [&original, &companion] {
+            run_case(path).unwrap_or_else(|failure| panic!("{failure}"));
+        }
+    }
+
+    let extended = root.join(EXTENDED_DIR);
+    let mut legacy_files: Vec<PathBuf> = collect_case_files(&root)
+        .into_iter()
+        .filter(|path| !path.starts_with(&extended))
+        .collect();
+    legacy_files.sort();
+    expected_files.sort();
+    assert_eq!(
+        legacy_files, expected_files,
+        "the legacy corpus is the 28 pairs and their companions"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Version 2 additions
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The four additions are closed, signed version 2 syntax; version 1 refuses
+/// each of them.
+const CLOSED_GRAMMAR: &[&str] = &[
+    "v2_extended_fields",
+    "v1_unlisted_rejected",
+    "v1_total_rejected",
+    "v1_floor_rejected",
+    "v1_memo_rejected",
+    "unlisted_unknown_key_rejected",
+    "binding_unknown_key_rejected",
+    "unlisted_unequal_rules_rejected",
+    "unlisted_wrong_decision_rejected",
+    "unlisted_bound_not_below_cap_rejected",
+    "binding_duplicate_destination_rejected",
+    "budget_window_30d_rejected",
+];
+
+/// Unlisted recipients deny by default; approval escalates only a
+/// classifiable unlisted debit, and hard refusals still win.
+const RECIPIENT_MODES: &[&str] = &[
+    "unlisted_default_deny",
+    "unlisted_explicit_deny",
+    "unlisted_approval",
+    "unverifiable_never_approved",
+    "approval_then_hard_cap_deny",
+    "hard_cap_then_approval_deny",
+    "equal_tables_shared_counter",
+];
+
+/// Both unlisted bounds are inclusive and refuse the excess on the test
+/// network.
+const TESTNET_BUDGET_BOUNDARIES: &[&str] = &[
+    "testnet_unlisted_per_tx_boundary",
+    "testnet_unlisted_period_boundary",
+    "unlisted_bundle_overlay",
+    "listed_not_charged",
+];
+
+/// A total allocation never renews with time and is bound to the signed
+/// digest.
+const TOTAL_EPOCH: &[&str] = &[
+    "total_epoch_nonrenewing",
+    "total_digest_change",
+    "total_zero_digest_refused",
+];
+
+/// The floor is a strict check that needs fresh, complete account facts.
+const FLOOR_FACTS: &[&str] = &[
+    "floor_missing_facts_refused",
+    "floor_fresh_boundary",
+    "floor_stale_refused",
+    "floor_provisional_then_strict",
+];
+
+/// A bound payment needs the exact memo kind and value.
+const MEMO_BINDINGS: &[&str] = &[
+    "memo_kind_value_matrix",
+    "memo_id_boundaries",
+    "memo_none_refused",
+    "memo_muxed_base_binding",
+    "memo_unbound_contract",
+    "memo_malformed_fact_refused",
+];
+
+/// Refusals carry the production wire code and redacted structured fields.
+/// `account_wire_code_only` sets only `wire_code`, so that expectation is
+/// compared on its own.
+const REFUSAL_CODES: &[&str] = &[
+    "account_wire_code_only",
+    "floor_stale_refused",
+    "memo_kind_value_matrix",
+    "testnet_unlisted_per_tx_boundary",
+];
+
+const EXTENDED_GROUPS: [&[&str]; 7] = [
+    CLOSED_GRAMMAR,
+    RECIPIENT_MODES,
+    TESTNET_BUDGET_BOUNDARIES,
+    TOTAL_EPOCH,
+    FLOOR_FACTS,
+    MEMO_BINDINGS,
+    REFUSAL_CODES,
+];
+
+/// Runs every named `extended_grammar` case and fails on a missing one.
+fn run_extended(stems: &[&str]) {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let dir = adversarial_root().join(EXTENDED_DIR);
+    let failures: Vec<String> = stems
+        .iter()
+        .filter_map(|stem| {
+            let path = dir.join(format!("{stem}.case.json"));
+            if !path.is_file() {
+                return Some(format!("{EXTENDED_DIR}/{stem}.case.json is missing"));
+            }
+            run_case(&path).err()
+        })
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+#[serial_test::serial]
+fn extended_corpus_closed_grammar() {
+    run_extended(CLOSED_GRAMMAR);
+}
+
+#[test]
+#[serial_test::serial]
+fn extended_corpus_recipient_modes() {
+    run_extended(RECIPIENT_MODES);
+}
+
+#[test]
+#[serial_test::serial]
+fn extended_corpus_testnet_budget_boundaries() {
+    run_extended(TESTNET_BUDGET_BOUNDARIES);
+}
+
+#[test]
+#[serial_test::serial]
+fn extended_corpus_total_epoch() {
+    run_extended(TOTAL_EPOCH);
+}
+
+#[test]
+#[serial_test::serial]
+fn extended_corpus_floor_facts() {
+    run_extended(FLOOR_FACTS);
+}
+
+#[test]
+#[serial_test::serial]
+fn extended_corpus_memo_bindings() {
+    run_extended(MEMO_BINDINGS);
+}
+
+#[test]
+#[serial_test::serial]
+fn extended_corpus_refusal_codes() {
+    run_extended(REFUSAL_CODES);
 }

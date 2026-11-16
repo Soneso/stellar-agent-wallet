@@ -1,0 +1,37 @@
+{
+  "test_kind": "sequence",
+  "name": "testnet_unlisted_period_boundary",
+  "category": "extended_grammar",
+  "description": "On the test network the unlisted period bound is inclusive: with 200 stroops of unlisted usage an hour old, 50 allows and 51 refuses with the per_period bound. A day later that usage has left the window.",
+  "tool": {
+    "name": "stellar_pay",
+    "destructive_hint": true,
+    "read_only_hint": false,
+    "chain_id_required": true,
+    "chain_id": "stellar:testnet"
+  },
+  "profile_name": "default",
+  "state_seed": [
+    { "offset_secs_ago": 3600, "amount_stroops": 200, "bucket": "unlisted:native", "window_secs": 86400 }
+  ],
+  "steps": [
+    {
+      "args": { "amount_stroops": "50", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+      "expected": { "kind": "Allow" }
+    },
+    {
+      "args": { "amount_stroops": "51", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+      "expected": {
+        "kind": "Deny",
+        "deny_reason": "unlisted_budget_exceeded",
+        "wire_code": "policy.deny.unlisted_budget_exceeded",
+        "reason": { "UnlistedBudgetExceeded": { "asset": "native", "bound": "per_period", "max_stroops": "250", "attempted_stroops": "51" } }
+      }
+    },
+    {
+      "after_ms": 86400000,
+      "args": { "amount_stroops": "100", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+      "expected": { "kind": "Allow" }
+    }
+  ]
+}

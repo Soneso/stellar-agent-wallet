@@ -1,0 +1,11 @@
+{
+  "test_kind": "load_failure",
+  "name": "unlisted_unequal_rules_rejected",
+  "category": "extended_grammar",
+  "description": "Every unlisted table of a policy must equal the first; a second rule with another period bound refuses. Equal tables across rules load (see equal_tables_shared_counter).",
+  "load_signing_strategy": "grammar_refused",
+  "expected_load_ok": false,
+  "expected_load_error": "policy_file_parse_failed",
+  "expected_load_wire_code": "policy.policy_file_parse_failed",
+  "expected_load_detail": "rule[1].criteria[0]: every `unlisted` table of a policy must equal the first; rule[0].criteria[0] carries the first"
+}
