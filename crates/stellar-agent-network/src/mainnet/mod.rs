@@ -7,6 +7,8 @@
 //!   approval or the verified policy's own decision.
 //! - [`authorization`]: the five mainnet authorization types and their
 //!   checks.
+//! - [`canonical`]: the match of a rebuilt classic envelope against its
+//!   stored canonical intent.
 //! - [`clock`]: the clock the ledger, the signing points, and the submit gate
 //!   share.
 //! - [`consumed`]: the proof a mainnet send depends on, that the submission
@@ -25,6 +27,7 @@
 pub mod audit_readiness;
 pub mod authority;
 pub mod authorization;
+pub mod canonical;
 pub mod clock;
 pub mod consumed;
 pub mod digest;
