@@ -176,7 +176,7 @@ fn toolset_payment_value(
                     )));
                 }
             };
-            let memo = match stellar_agent_network::parse_memo_fields(
+            let policy_memo = match stellar_agent_network::memo::parse_memo_with_fact(
                 memo_text
                     .as_ref()
                     .map(stellar_agent_core::amount::McpMemoTextArgument::as_str),
@@ -188,31 +188,17 @@ fn toolset_payment_value(
                     .get("memo_return_hex")
                     .and_then(serde_json::Value::as_str),
             ) {
-                Ok(memo) => memo,
+                Ok((_, fact)) => fact,
                 Err(err) => {
                     return Some(Err(super::common::ToolError::Business(
                         super::common::ledger_err_result(&err),
                     )));
                 }
             };
-            let policy_memo =
-                match stellar_agent_core::envelope_decode::ClassicMemo::try_from(&memo) {
-                    Ok(memo) => memo,
-                    Err(_) => {
-                        return Some(Err(super::common::ToolError::Protocol(
-                            rmcp::ErrorData::invalid_params("memo text is not valid UTF-8", None),
-                        )));
-                    }
-                };
             // Only the parsed routed memo supplies policy facts.
-            for key in ["memo_kind", "memo", "memo_id", "memo_hash", "memo_return"] {
-                merged.remove(key);
-            }
-            merged.extend(policy_memo.policy_fields());
-            Some(Ok(derive_value_class(
-                "stellar_pay",
-                &serde_json::Value::Object(merged),
-            )))
+            let mut merged = serde_json::Value::Object(merged);
+            policy_memo.insert_policy_fields(&mut merged);
+            Some(Ok(derive_value_class("stellar_pay", &merged)))
         }
         _ => None,
     }

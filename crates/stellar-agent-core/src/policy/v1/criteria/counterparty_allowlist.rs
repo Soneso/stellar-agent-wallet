@@ -161,12 +161,14 @@
 use stellar_strkey::{Strkey, ed25519::PublicKey};
 
 use crate::policy::v1::EvalContext;
-use crate::policy::v1::asset_equivalence::assets_equivalent;
+use crate::policy::v1::asset_equivalence::{assets_equivalent, total_budget_identity};
 use crate::policy::v1::bundle::{BundleStateOverlay, InnerOpDescriptor};
 use crate::policy::v1::criteria::Criterion;
 use crate::policy::v1::criteria::descriptor::{BucketDescriptor, BucketKind};
 use crate::policy::v1::criteria::per_period_cap::Window;
-use crate::policy::v1::criteria::state_store::{StateKey, WindowEntry, WindowLimit};
+use crate::policy::v1::criteria::state_store::{
+    StateKey, StateStoreError, WindowEntry, WindowLimit,
+};
 use crate::policy::v1::loader::DEFAULT_APPROVAL_TTL_SECONDS;
 use crate::policy::v1::value::{
     ValueClass, ValueEffects, ValueGate, ValueLeg, asset_normalise, classify_value,
@@ -378,12 +380,17 @@ impl UnlistedBudget {
     }
 
     /// The bucket every rule's unlisted budget in this asset and window
-    /// shares, at scope specificity 1 as `per_period_cap` uses.
-    fn state_key(&self, profile_name: &str) -> StateKey {
+    /// shares, at scope specificity 1 as `per_period_cap` uses. Every
+    /// spelling of the asset on the network of `network_passphrase`, its
+    /// asset contract included, names one bucket.
+    fn state_key(&self, profile_name: &str, network_passphrase: &str) -> StateKey {
         StateKey::new(
             profile_name,
             1,
-            &format!("unlisted:{}", asset_normalise(&self.asset)),
+            &format!(
+                "unlisted:{}",
+                total_budget_identity(&self.asset, network_passphrase)
+            ),
             self.window.as_secs(),
         )
     }
@@ -657,7 +664,12 @@ impl Criterion for CounterpartyAllowlistCriterion {
                     BucketKind::UnlistedPeriod,
                     budget.asset(),
                     budget.per_period_stroops(),
-                    &budget.state_key(""),
+                    &StateKey::new(
+                        "",
+                        1,
+                        &format!("unlisted:{}", asset_normalise(budget.asset())),
+                        budget.window().as_secs(),
+                    ),
                 ),
             ]
         })
@@ -679,8 +691,9 @@ impl Criterion for CounterpartyAllowlistCriterion {
     ///
     /// Under `unlisted.mode = "approval"` an unlisted recipient returns the
     /// denial here; [`Criterion::evaluate_decision`] escalates it. Under
-    /// `budget` an unlisted recipient passes within both bounds and refuses
-    /// with [`DenyReason::UnlistedBudgetExceeded`] beyond either.
+    /// `budget` an unlisted recipient passes within both bounds and returns
+    /// [`DenyReason::UnlistedBudgetExceeded`] beyond either. On a mainnet
+    /// profile [`Criterion::evaluate_decision`] escalates that excess.
     ///
     /// # Errors
     ///
@@ -693,7 +706,8 @@ impl Criterion for CounterpartyAllowlistCriterion {
         })
     }
 
-    /// Escalates an unlisted recipient under `approval` with the default
+    /// Escalates an unlisted recipient under `approval`, and on a mainnet
+    /// profile an unlisted payment beyond a budget bound, with the default
     /// approval lifetime and a fixed reason that names no address.
     fn evaluate_decision(&self, ctx: &EvalContext<'_>) -> Result<Decision, PolicyError> {
         Ok(match self.outcome(ctx)? {
@@ -754,7 +768,10 @@ impl Criterion for CounterpartyAllowlistCriterion {
         ) {
             return;
         }
-        overlay.accumulate(budget.state_key(ctx.profile_name), *amount);
+        overlay.accumulate(
+            budget.state_key(ctx.profile_name, &ctx.profile.network_passphrase),
+            *amount,
+        );
     }
 
     /// Records the confirmed debit to unlisted recipients into the budget's
@@ -785,7 +802,8 @@ impl Criterion for CounterpartyAllowlistCriterion {
     /// # Errors
     ///
     /// Returns [`PolicyError::CriterionEvaluationFailed`] when the effects
-    /// carry no recipient class.
+    /// carry no recipient class, and [`PolicyError::AccountingOverflow`]
+    /// when the debit legs overflow their sum.
     fn size(&self, ctx: &EvalContext<'_>, now_ms: u64) -> Result<Option<WindowEntry>, PolicyError> {
         let Some(budget) = self.budget() else {
             return Ok(None);
@@ -823,13 +841,15 @@ impl Criterion for CounterpartyAllowlistCriterion {
                 continue;
             };
             matched = true;
-            sum = sum.saturating_add(amount);
+            sum = sum
+                .checked_add(amount)
+                .ok_or(PolicyError::AccountingOverflow)?;
         }
         if !matched {
             return Ok(None);
         }
         Ok(Some(WindowEntry::new(
-            budget.state_key(ctx.profile_name),
+            budget.state_key(ctx.profile_name, &ctx.profile.network_passphrase),
             now_ms,
             sum,
             budget.window_limit(),
@@ -882,7 +902,15 @@ impl CounterpartyAllowlistCriterion {
     /// Checks an unlisted call against both budget bounds.
     ///
     /// The attempt sums the debit legs in the budget asset. A debit leg in
-    /// another asset, or without an asset, keeps the criterion's denial.
+    /// another asset, or without an asset, keeps the criterion's denial. The
+    /// recorded window, the bundle overlay, and the attempt sum without
+    /// overflow before either bound applies. A call beyond a bound escalates
+    /// on a mainnet profile, whose locked mint admits a per-payment approval
+    /// over the allowance, and is denied on every other network.
+    ///
+    /// # Errors
+    ///
+    /// [`PolicyError::AccountingOverflow`] when a sum overflows.
     fn check_budget(
         &self,
         ctx: &EvalContext<'_>,
@@ -910,40 +938,51 @@ impl CounterpartyAllowlistCriterion {
                         ctx.tool.name
                     ),
                 })?;
-            attempted_stroops = attempted_stroops.saturating_add(amount);
+            attempted_stroops = attempted_stroops
+                .checked_add(amount)
+                .ok_or(PolicyError::AccountingOverflow)?;
         }
 
-        if attempted_stroops > budget.per_tx_stroops() {
-            return Ok(Outcome::Deny(DenyReason::UnlistedBudgetExceeded {
-                asset: budget.asset().to_owned(),
-                bound: UnlistedBound::PerTx,
-                max_stroops: budget.per_tx_stroops(),
-                attempted_stroops,
-            }));
-        }
-
-        let now_ms = ctx.now_ms;
-        let state_key = budget.state_key(ctx.profile_name);
-        let (window_used_stroops, _) =
-            ctx.state_store
-                .query_window(&state_key, now_ms)
-                .map_err(|e| PolicyError::CriterionEvaluationFailed {
+        let state_key = budget.state_key(ctx.profile_name, &ctx.profile.network_passphrase);
+        let (window_used_stroops, _) = ctx
+            .state_store
+            .query_window(&state_key, ctx.now_ms)
+            .map_err(|e| match e {
+                StateStoreError::SumOverflow => PolicyError::AccountingOverflow,
+                StateStoreError::NegativeAmount => PolicyError::AccountingInvalid,
+                e => PolicyError::CriterionEvaluationFailed {
                     detail: format!("counterparty_allowlist: state store error: {e}"),
-                })?;
+                },
+            })?;
         let bundle_accumulated_stroops = ctx
             .bundle
             .map(|view| view.overlay.get(&state_key))
             .unwrap_or(0);
         let would_use = window_used_stroops
-            .saturating_add(bundle_accumulated_stroops)
-            .saturating_add(attempted_stroops);
-        if would_use > budget.per_period_stroops() {
-            return Ok(Outcome::Deny(DenyReason::UnlistedBudgetExceeded {
+            .checked_add(bundle_accumulated_stroops)
+            .and_then(|used| used.checked_add(attempted_stroops))
+            .ok_or(PolicyError::AccountingOverflow)?;
+        let exceeded = |bound, max_stroops| {
+            let denial = DenyReason::UnlistedBudgetExceeded {
                 asset: budget.asset().to_owned(),
-                bound: UnlistedBound::PerPeriod,
-                max_stroops: budget.per_period_stroops(),
+                bound,
+                max_stroops,
                 attempted_stroops,
-            }));
+            };
+            if ctx.profile.chain_id.is_mainnet() {
+                Outcome::Escalate(denial)
+            } else {
+                Outcome::Deny(denial)
+            }
+        };
+        if attempted_stroops > budget.per_tx_stroops() {
+            return Ok(exceeded(UnlistedBound::PerTx, budget.per_tx_stroops()));
+        }
+        if would_use > budget.per_period_stroops() {
+            return Ok(exceeded(
+                UnlistedBound::PerPeriod,
+                budget.per_period_stroops(),
+            ));
         }
         Ok(Outcome::Pass)
     }

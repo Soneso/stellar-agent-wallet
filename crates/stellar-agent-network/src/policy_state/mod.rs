@@ -202,6 +202,7 @@
 //! At most 256 closed records stay; records inside either window remain protected.
 //! Reset refuses pending approvals inside their waiting windows and preserves every other approval record.
 
+mod accounting;
 pub mod approvals;
 pub mod budget;
 pub mod ledger;
@@ -658,6 +659,21 @@ pub enum WindowStoreError {
     )]
     TotalEpochRetired,
 
+    /// A mint under policy authority finds the unlisted-recipient allowance
+    /// spent. Nothing is written; a per-payment approval covers the payment.
+    #[error("the unlisted-recipient allowance is spent; this payment needs a per-payment approval")]
+    UnlistedApprovalRequired,
+
+    /// An unlisted-recipient sum exceeds its representation. Nothing is
+    /// written.
+    #[error("the unlisted-recipient spending sum overflows; nothing was recorded")]
+    AccountingOverflow,
+
+    /// The spending window holds a negative unlisted-recipient amount.
+    /// Nothing is written.
+    #[error("the spending window holds a negative unlisted-recipient amount")]
+    AccountingInvalid,
+
     /// The reset refuses while approvals remain inside their waiting windows.
     #[error("reset.approvals_pending: the spending window holds {pending} pending approval(s)")]
     ApprovalsPending {
@@ -747,8 +763,8 @@ impl WindowStoreError {
 
     /// The wallet refusal an operation store failure names, when it names
     /// one: the business id, capacity, attempt, retry, reset, audit and
-    /// state-rule refusals of the operation section, and the total-budget
-    /// epoch refusals.
+    /// state-rule refusals of the operation section, the total-budget epoch
+    /// refusals, and the unlisted-recipient accounting refusals.
     #[must_use]
     pub fn operation_error(&self) -> Option<stellar_agent_core::error::WalletError> {
         use stellar_agent_core::error::{InternalError, SubmissionError, ValidationError};
@@ -771,6 +787,9 @@ impl WindowStoreError {
             Self::TotalEpochUnavailable { .. }
             | Self::TotalEpochStale
             | Self::TotalEpochRetired => self.total_epoch_error()?.into(),
+            Self::UnlistedApprovalRequired => ValidationError::UnlistedApprovalRequired.into(),
+            Self::AccountingOverflow => ValidationError::AccountingOverflow.into(),
+            Self::AccountingInvalid => ValidationError::AccountingInvalid.into(),
             Self::AuditAppendFailed { detail } => ValidationError::AuditAppendFailed {
                 detail: detail.clone(),
             }

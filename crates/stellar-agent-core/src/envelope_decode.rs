@@ -294,6 +294,23 @@ pub enum MemoKind {
     Return,
 }
 
+impl MemoKind {
+    /// The kind's name, as the `memo_kind` policy fact carries it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Text => "text",
+            Self::Id => "id",
+            Self::Hash => "hash",
+            Self::Return => "return",
+        }
+    }
+}
+
+/// The keys of the memo policy facts.
+const MEMO_FACT_KEYS: [&str; 5] = ["memo_kind", "memo", "memo_id", "memo_hash", "memo_return"];
+
 /// The memo kind of a single-payment envelope and the form of its
 /// destination.
 ///
@@ -580,9 +597,7 @@ pub fn decode_authoritative_args(
         // The validation above is exhaustive; this arm is unreachable.
         _ => unreachable!("tool name validated in step 1"),
     }?;
-    for (key, value) in ClassicMemo::try_from(&tx.memo)?.policy_fields() {
-        args[key] = value;
-    }
+    ClassicMemo::try_from(&tx.memo)?.insert_policy_fields(&mut args);
     Ok(args)
 }
 
@@ -933,27 +948,55 @@ pub enum ClassicMemo {
 }
 
 impl ClassicMemo {
+    /// The memo's kind.
+    #[must_use]
+    pub const fn kind(&self) -> MemoKind {
+        match self {
+            Self::None => MemoKind::None,
+            Self::Text(_) => MemoKind::Text,
+            Self::Id(_) => MemoKind::Id,
+            Self::Hash(_) => MemoKind::Hash,
+            Self::Return(_) => MemoKind::Return,
+        }
+    }
+
     /// The authoritative policy facts, retaining the legacy text-or-null
     /// `memo` field. IDs are canonical decimal strings and hashes are lowercase
     /// hex, so neither integer precision nor the memo kind is lost.
     #[must_use]
     pub fn policy_fields(&self) -> serde_json::Map<String, serde_json::Value> {
         use serde_json::Value;
-        let (kind, payload) = match self {
-            Self::None => ("none", None),
-            Self::Text(text) => ("text", Some(("memo", text.clone()))),
-            Self::Id(id) => ("id", Some(("memo_id", id.to_string()))),
-            Self::Hash(hash) => ("hash", Some(("memo_hash", crate::hex::encode(hash)))),
-            Self::Return(hash) => ("return", Some(("memo_return", crate::hex::encode(hash)))),
+        let payload = match self {
+            Self::None => None,
+            Self::Text(text) => Some(("memo", text.clone())),
+            Self::Id(id) => Some(("memo_id", id.to_string())),
+            Self::Hash(hash) => Some(("memo_hash", crate::hex::encode(hash))),
+            Self::Return(hash) => Some(("memo_return", crate::hex::encode(hash))),
         };
         let mut fields = serde_json::Map::from_iter([
-            ("memo_kind".to_owned(), Value::String(kind.to_owned())),
+            (
+                "memo_kind".to_owned(),
+                Value::String(self.kind().as_str().to_owned()),
+            ),
             ("memo".to_owned(), Value::Null),
         ]);
         if let Some((key, value)) = payload {
             fields.insert(key.to_owned(), Value::String(value));
         }
         fields
+    }
+
+    /// Writes the policy facts into `args`, replacing every memo fact it
+    /// held, so no other source supplies one.
+    pub fn insert_policy_fields(&self, args: &mut serde_json::Value) {
+        if let Some(object) = args.as_object_mut() {
+            for key in MEMO_FACT_KEYS {
+                object.remove(key);
+            }
+        }
+        for (key, value) in self.policy_fields() {
+            args[key] = value;
+        }
     }
 
     /// Missing, malformed or contradictory facts carry no known memo.
@@ -975,7 +1018,7 @@ impl ClassicMemo {
             _ => return None,
         };
         let expected = memo.policy_fields();
-        ["memo_kind", "memo", "memo_id", "memo_hash", "memo_return"]
+        MEMO_FACT_KEYS
             .iter()
             .all(|key| args.get(*key) == expected.get(*key))
             .then_some(memo)

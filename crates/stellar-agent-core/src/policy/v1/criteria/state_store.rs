@@ -538,9 +538,14 @@ pub enum StateStoreError {
         now_ms: u64,
     },
 
-    /// The amounts of one total-budget epoch overflow their sum.
-    #[error("the total-budget sum overflows")]
+    /// The amounts of one total-budget epoch, or of one unlisted-recipient
+    /// window, overflow their sum.
+    #[error("the spending sum overflows")]
     SumOverflow,
+
+    /// An unlisted-recipient window holds a negative amount.
+    #[error("the unlisted-recipient window holds a negative amount")]
+    NegativeAmount,
 }
 
 /// Checks inclusive exposure accounting for the queried window.
@@ -599,6 +604,10 @@ impl PolicyStateStore {
     ///   previous panic.
     /// - [`StateStoreError::ClockSkewExceeded`] — a pending entry is more than 30
     ///   seconds in the future relative to `now_ms`.
+    /// - [`StateStoreError::SumOverflow`]: the amounts of an `unlisted:`
+    ///   bucket overflow their sum. Other buckets saturate.
+    /// - [`StateStoreError::NegativeAmount`]: an `unlisted:` bucket holds a
+    ///   negative amount.
     ///
     /// # Examples
     ///
@@ -645,6 +654,21 @@ impl PolicyStateStore {
                     .map(|exposure| exposure.reservation_id.clone())
             })
             .collect();
+        // An unlisted bucket refuses a sum it cannot represent; the other
+        // buckets saturate.
+        let checked = key.bucket.starts_with("unlisted:");
+        let add = |total: i128, amount: i128| {
+            if checked {
+                if amount < 0 {
+                    return Err(StateStoreError::NegativeAmount);
+                }
+                total
+                    .checked_add(amount)
+                    .ok_or(StateStoreError::SumOverflow)
+            } else {
+                Ok(total.saturating_add(amount))
+            }
+        };
         let mut fallback: HashMap<(&str, u64), (i128, u32)> = HashMap::new();
         let mut sum: i128 = 0;
         let mut count: u32 = 0;
@@ -682,11 +706,11 @@ impl PolicyStateStore {
                         let total = fallback
                             .entry((&exposure.reservation_id, stored_key.window_secs))
                             .or_default();
-                        total.0 = total.0.saturating_add(entry.amount);
+                        total.0 = add(total.0, entry.amount)?;
                         total.1 = total.1.saturating_add(1);
                     }
                 } else {
-                    sum = sum.saturating_add(entry.amount);
+                    sum = add(sum, entry.amount)?;
                     count = count.saturating_add(1);
                 }
             }
@@ -698,7 +722,7 @@ impl PolicyStateStore {
             maximum.1 = maximum.1.max(total.1);
         }
         for total in retained.values() {
-            sum = sum.saturating_add(total.0);
+            sum = add(sum, total.0)?;
             count = count.saturating_add(total.1);
         }
         for (stored_key, deque) in guard.iter_mut() {
