@@ -41,7 +41,8 @@ fn is_unlisted(bucket: &str) -> bool {
 ///
 /// The sum of an unlisted bucket is checked: a negative amount refuses with
 /// [`WindowStoreError::AccountingInvalid`] and an overflow with
-/// [`WindowStoreError::AccountingOverflow`]. Other sums saturate.
+/// [`WindowStoreError::AccountingOverflow`]. Other sums also check overflow;
+/// admission maps that failure to the entry's governing limit.
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct Tally {
     pub(super) sum: i128,
@@ -73,7 +74,9 @@ impl Tally {
                 .checked_add(amount)
                 .ok_or(WindowStoreError::AccountingOverflow)?
         } else {
-            self.sum.saturating_add(amount)
+            self.sum
+                .checked_add(amount)
+                .ok_or(WindowStoreError::AccountingOverflow)?
         };
         self.count = self.count.saturating_add(count);
         Ok(())

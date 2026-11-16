@@ -15,6 +15,7 @@
 use stellar_agent_core::mainnet::verified_policy::VerifiedPolicy;
 use stellar_agent_core::policy::pin::PinState;
 use stellar_agent_core::policy::v1::criteria::descriptor::{BucketDescriptor, BucketKind};
+use stellar_agent_core::policy::v1::criteria::state_store::StateStoreError;
 use stellar_agent_core::policy::v1::verified::with_pin_without_creating;
 use stellar_agent_core::policy::{DenyReason, PolicyError};
 use stellar_agent_core::profile::schema::Profile;
@@ -379,6 +380,13 @@ fn rule_budget(
                     tally.add(share, amount);
                 })
                 .map_err(|error| match error {
+                    WindowStoreError::AccountingOverflow
+                        if !key.bucket().starts_with("unlisted:") =>
+                    {
+                        BudgetError::State(WindowStoreError::Invalid {
+                            detail: StateStoreError::SumOverflow.to_string(),
+                        })
+                    }
                     WindowStoreError::PolicyDenied { reason } => BudgetError::Clock {
                         detail: match *reason {
                             DenyReason::EvaluationError { detail } => detail,

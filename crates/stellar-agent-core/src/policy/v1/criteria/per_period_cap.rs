@@ -307,7 +307,10 @@ impl Criterion for PerPeriodCapCriterion {
                     ),
                 })?;
             matched = true;
-            sum = sum.saturating_add(amount);
+            let Some(next) = sum.checked_add(amount) else {
+                return Ok(Some(self.overflow_refusal()));
+            };
+            sum = next;
         }
 
         // The configured asset is not moved by this call — criterion not applicable.
@@ -399,7 +402,11 @@ impl Criterion for PerPeriodCapCriterion {
                 continue;
             };
             matched = true;
-            sum = sum.saturating_add(amount);
+            sum =
+                sum.checked_add(amount)
+                    .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
+                        detail: "per_period_cap: sum overflows".to_owned(),
+                    })?;
         }
         if !matched {
             return Ok(None);
@@ -474,27 +481,40 @@ impl PerPeriodCapCriterion {
             self.window.as_secs(),
         );
 
-        let (period_used_stroops_recorded, _) = ctx
-            .state_store
-            .query_window(&state_key, now_ms)
-            .map_err(|e| PolicyError::CriterionEvaluationFailed {
-                detail: format!("per_period_cap: state store error: {e}"),
-            })?;
+        let period_used_stroops_recorded = match ctx.state_store.query_window(&state_key, now_ms) {
+            Ok((amount, _)) => amount,
+            Err(super::state_store::StateStoreError::SumOverflow) => {
+                return Ok(Some(self.overflow_refusal()));
+            }
+            Err(e) => {
+                return Err(PolicyError::CriterionEvaluationFailed {
+                    detail: format!("per_period_cap: state store error: {e}"),
+                });
+            }
+        };
 
         // Add any overlay amount accumulated from earlier inners in the same
         // multicall bundle.  On the single-tx path (bundle = None) the overlay
         // contributes 0.
-        let bundle_accumulated_stroops: i128 = ctx
+        let Some(bundle_accumulated_stroops) = ctx
             .bundle
-            .map(|view| view.overlay.get(&state_key))
-            .unwrap_or(0);
+            .map(|view| view.overlay.checked_get(&state_key))
+            .unwrap_or(Some(0))
+        else {
+            return Ok(Some(self.overflow_refusal()));
+        };
 
-        let period_used_stroops =
-            period_used_stroops_recorded.saturating_add(bundle_accumulated_stroops);
+        let Some(period_used_stroops) =
+            period_used_stroops_recorded.checked_add(bundle_accumulated_stroops)
+        else {
+            return Ok(Some(self.overflow_refusal()));
+        };
 
         // Would-exceed check: period_used + attempted > max?
-        let would_use = period_used_stroops.saturating_add(attempted_stroops);
-        if would_use > self.max_stroops {
+        if period_used_stroops
+            .checked_add(attempted_stroops)
+            .is_none_or(|sum| sum > self.max_stroops)
+        {
             return Ok(Some(DenyReason::PerPeriodCapExceeded {
                 asset: self.asset.clone(),
                 window: self.window.label().to_owned(),
@@ -505,6 +525,14 @@ impl PerPeriodCapCriterion {
         }
 
         Ok(None)
+    }
+
+    fn overflow_refusal(&self) -> DenyReason {
+        DenyReason::PerPeriodCapOverflow {
+            asset: self.asset.clone(),
+            window: self.window.label().to_owned(),
+            max_stroops: self.max_stroops,
+        }
     }
 }
 

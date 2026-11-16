@@ -633,10 +633,7 @@ mod composed {
         l.store
             .record_authorized(&l.profile, &[total(i128::MAX - 40)])
             .unwrap();
-        for (amount, detail) in [
-            (1, "a total-budget sum overflows"),
-            (-1, "a total-budget debit is negative"),
-        ] {
+        for amount in [1, -1] {
             let entry = total(amount);
             let entries =
                 stellar_agent_core::policy::v1::criteria::state_store::compose_window_entries(
@@ -645,10 +642,22 @@ mod composed {
                 )
                 .unwrap();
             let before = l.bytes();
-            assert!(
-                matches!(l.mint(&rules.request(&l, 3, entries)), Err(WindowStoreError::Invalid { detail: actual }) if actual == detail),
-                "arithmetic refuses without wrapping or lowering spend"
-            );
+            let refusal = l.mint(&rules.request(&l, 3, entries)).unwrap_err();
+            if amount > 0 {
+                assert!(
+                    matches!(refusal, WindowStoreError::PolicyDenied { reason }
+                    if *reason == stellar_agent_core::policy::DenyReason::TotalBudgetExhausted {
+                        asset: "native".into(), max_stroops: i128::MAX, remaining_stroops: 0,
+                    }),
+                    "a composed overflow is the governing total-budget denial"
+                );
+            } else {
+                assert!(
+                    matches!(refusal, WindowStoreError::Invalid { detail }
+                    if detail == "a total-budget debit is negative"),
+                    "a negative debit remains invalid"
+                );
+            }
             assert_eq!(l.bytes(), before);
         }
         let zero = total(0);

@@ -261,6 +261,11 @@ remaining amount. The criterion requires `decision = "allow"`.
 An exhausted allocation denies the payment and requests no approval. An
 approval for a payment beyond an unlisted budget never lifts an allocation,
 a cap, or a rate limit.
+Period caps, total budgets, and unlisted budgets also refuse overflowing sums.
+Exact-cap use remains allowed, including the largest representable amount.
+An overflow under a period cap or total budget returns that limit's denial code.
+An unlisted-budget overflow refuses with `policy.accounting_overflow`.
+Diagnostics omit totals that cannot be represented exactly.
 `profile enable-mainnet --check` reports each signed bound's committed use
 and remaining amount in exact stroops, without changing wallet state. The
 report is `null` when the use is unknown, and never zero for unknown history.
@@ -561,6 +566,8 @@ binding still refuses with `audit.log_binding_changed` before signing or submiss
 The SEP-43 sign-only pair (`signTransaction`, `signAuthEntry`) runs the same
 preflight. It writes `opaque_payload_signed` when it produces the signature,
 recording the redacted payload digest and signer. The caller broadcasts externally.
+The audit schema accepts optional evaluated value legs on this row.
+Empty legs are omitted, so existing signing tools retain their serialized row shape.
 
 ## Emergency stop
 

@@ -16,8 +16,8 @@
 //! The recorded amount is `i128`, exact across the full range a token
 //! quantity or an aggregated per-period stroop total can take (a Soroban SAC
 //! transfer, or a rolling-window sum across many legs, can exceed
-//! `i64::MAX`). `query_window` sums entries with `i128::saturating_add`; the
-//! call-count field stays `u32` (call counts never approach that range).
+//! `i64::MAX`). `query_window` uses checked addition and refuses overflow.
+//! The call-count field stays `u32` with its existing saturation.
 //!
 //! # Sliding-window API pattern
 //!
@@ -336,8 +336,10 @@ impl WindowEntry {
                 window,
                 max_stroops,
             } => {
-                let would_use = used_stroops.saturating_add(self.amount);
-                (would_use > *max_stroops).then(|| DenyReason::PerPeriodCapExceeded {
+                let exceeds = used_stroops
+                    .checked_add(self.amount)
+                    .is_none_or(|would_use| would_use > *max_stroops);
+                exceeds.then(|| DenyReason::PerPeriodCapExceeded {
                     asset: asset.clone(),
                     window: window.clone(),
                     max_stroops: *max_stroops,
@@ -356,14 +358,15 @@ impl WindowEntry {
             }
             WindowLimit::Unlisted {
                 asset, max_stroops, ..
-            } => (used_stroops.saturating_add(self.amount) > *max_stroops).then(|| {
-                DenyReason::UnlistedBudgetExceeded {
+            } => used_stroops
+                .checked_add(self.amount)
+                .is_none_or(|sum| sum > *max_stroops)
+                .then(|| DenyReason::UnlistedBudgetExceeded {
                     asset: asset.clone(),
                     bound: UnlistedBound::PerPeriod,
                     max_stroops: *max_stroops,
                     attempted_stroops: self.amount,
-                }
-            }),
+                }),
             // An overflowing sum exceeds every allocation, so it refuses.
             WindowLimit::Total { asset, max_stroops } => used_stroops
                 .checked_add(self.amount)
@@ -373,6 +376,39 @@ impl WindowEntry {
                     max_stroops: *max_stroops,
                     remaining_stroops: max_stroops.saturating_sub(used_stroops).max(0),
                 }),
+        }
+    }
+
+    /// Refuses an unrepresentable amount sum under this entry's governing limit.
+    /// No usage total is invented for the diagnostic. Count-only buckets have
+    /// no amount limit and retain a typed evaluation failure.
+    #[must_use]
+    pub fn overflow_refusal(&self) -> DenyReason {
+        match &self.limit {
+            WindowLimit::Amount {
+                asset,
+                window,
+                max_stroops,
+            } => DenyReason::PerPeriodCapOverflow {
+                asset: asset.clone(),
+                window: window.clone(),
+                max_stroops: *max_stroops,
+            },
+            WindowLimit::Unlisted {
+                asset, max_stroops, ..
+            } => DenyReason::UnlistedBudgetOverflow {
+                asset: asset.clone(),
+                bound: UnlistedBound::PerPeriod,
+                max_stroops: *max_stroops,
+            },
+            WindowLimit::Total { asset, max_stroops } => DenyReason::TotalBudgetExhausted {
+                asset: asset.clone(),
+                max_stroops: *max_stroops,
+                remaining_stroops: 0,
+            },
+            WindowLimit::Count { .. } => DenyReason::EvaluationError {
+                detail: StateStoreError::SumOverflow.to_string(),
+            },
         }
     }
 }
@@ -654,8 +690,7 @@ impl PolicyStateStore {
                     .map(|exposure| exposure.reservation_id.clone())
             })
             .collect();
-        // An unlisted bucket refuses a sum it cannot represent; the other
-        // buckets saturate.
+        // Every bucket checks its sum; unlisted buckets also reject negative amounts.
         let checked = key.bucket.starts_with("unlisted:");
         let add = |total: i128, amount: i128| {
             if checked {
@@ -666,7 +701,9 @@ impl PolicyStateStore {
                     .checked_add(amount)
                     .ok_or(StateStoreError::SumOverflow)
             } else {
-                Ok(total.saturating_add(amount))
+                total
+                    .checked_add(amount)
+                    .ok_or(StateStoreError::SumOverflow)
             }
         };
         let mut fallback: HashMap<(&str, u64), (i128, u32)> = HashMap::new();
@@ -1313,6 +1350,45 @@ mod tests {
         let (sum, count) = store.query_window(&k, 1_300_000).unwrap();
         assert_eq!(sum, expected);
         assert_eq!(count, 3);
+    }
+
+    /// Amount and unlisted entries refuse overflow while preserving equality.
+    #[test]
+    fn a_window_entry_refuses_an_overflowing_sum() {
+        for (limit, code) in [
+            (
+                WindowLimit::Amount {
+                    asset: "native".into(),
+                    window: "1h".into(),
+                    max_stroops: i128::MAX,
+                },
+                "policy.deny.per_period_cap_exceeded",
+            ),
+            (
+                WindowLimit::Unlisted {
+                    asset: "native".into(),
+                    window: "1h".into(),
+                    max_stroops: i128::MAX,
+                },
+                "policy.deny.unlisted_budget_exceeded",
+            ),
+        ] {
+            let entry = WindowEntry::new(
+                StateKey::new("operator", 1, "native", 3600),
+                1000,
+                1,
+                limit.clone(),
+            );
+            assert_eq!(
+                entry.refusal(i128::MAX, 0).map(|reason| reason.wire_code()),
+                Some(code)
+            );
+            assert!(entry.refusal(i128::MAX - 1, 0).is_none());
+            let maximum = WindowEntry::new(entry.key().clone(), 1000, i128::MAX, limit.clone());
+            assert!(maximum.refusal(0, 0).is_none());
+            let zero = WindowEntry::new(entry.key().clone(), 1000, 0, limit);
+            assert!(zero.refusal(i128::MAX, 0).is_none());
+        }
     }
 
     /// A total entry whose addition to the used amount overflows refuses.

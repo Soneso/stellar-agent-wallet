@@ -785,10 +785,9 @@ pub struct EvalContext<'a> {
     /// `None` on the single-tx path (standard `PolicyEngineV1::evaluate`
     /// call); `Some(&view)` during [`PolicyEngineV1::evaluate_bundle`] where
     /// the view carries the full set of inner descriptors and the in-flight
-    /// state overlay.  Bundle-level criteria check this field; stateful
-    /// criteria (`per_period_cap`, `rate_limit`) add `overlay.get(&state_key)`
-    /// to the persisted window total to account for earlier inners in the same
-    /// bundle.
+    /// state overlay. Stateful criteria combine the overlay with persisted
+    /// usage to account for earlier inners. Amount criteria require an exact
+    /// overlay sum; rate limits retain the count projection.
     ///
     pub bundle: Option<&'a BundleView<'a>>,
     /// The BLAKE3 digest of the signed policy's canonical bytes.
@@ -1407,6 +1406,13 @@ impl PolicyEngineV1 {
 }
 
 impl PolicyEngine for PolicyEngineV1 {
+    fn opaque_signing_opted_in(&self, tool: &ToolDescriptor) -> bool {
+        self.matching_rules(&self.profile_name, self.project_id.as_deref())
+            .into_iter()
+            .find(|rule| rule.matches_tool(tool))
+            .is_some_and(|rule| rule.allow_opaque_signing)
+    }
+
     fn evaluate_in_snapshot(
         &self,
         inputs: crate::policy::PolicyEvaluationInputs<'_>,
@@ -2014,12 +2020,7 @@ impl PolicyEngineV1 {
     }
 
     fn effective_unvalued(&self, tool: &ToolDescriptor, reason: OpaqueReason) -> ValueClass {
-        if self
-            .matching_rules(&self.profile_name, self.project_id.as_deref())
-            .into_iter()
-            .find(|rule| rule.matches_tool(tool))
-            .is_some_and(|rule| rule.allow_opaque_signing)
-        {
+        if self.opaque_signing_opted_in(tool) {
             ValueClass::ReadOnly
         } else {
             ValueClass::Opaque(reason)

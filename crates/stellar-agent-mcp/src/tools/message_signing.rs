@@ -74,5 +74,6 @@ pub(crate) fn message_signed_row(
         stellar_agent_network::submit::redact_tx_hash(&digest),
         RedactedStrkey::from_full(signer),
         uuid::Uuid::new_v4().to_string(),
+        Vec::new(),
     )
 }

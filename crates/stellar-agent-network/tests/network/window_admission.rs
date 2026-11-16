@@ -639,6 +639,260 @@ fn confirmed_ledger_time_ahead_of_host_counts_at_admission_and_gate() {
 /// Independent gate snapshots must share one durable authorization cap.
 #[test]
 #[serial]
+fn authorized_states_are_admitted_in_one_step() {
+    use stellar_agent_core::policy::v1::criteria::per_period_cap::{PerPeriodCapCriterion, Window};
+    use stellar_agent_core::policy::v1::criteria::rate_limit::RateLimitCriterion;
+    use stellar_agent_core::policy::v1::criteria::total_budget::TotalBudgetCriterion;
+    use stellar_agent_core::policy::v1::loader::{PolicyDocument, PolicyRule, RuleMatch, ScopeId};
+    use stellar_agent_core::policy::v1::value::{ActionKind, ValueLeg};
+    use stellar_agent_core::policy::v1::{PolicyEngineV1, ValueClass};
+    use stellar_agent_core::policy::{
+        Decision, McpToolRegistration, ToolDescriptor, ToolValueKind,
+    };
+    use stellar_agent_network::policy_state::record_authorized_window_states;
+
+    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+    keyring_mock::install().unwrap();
+    let name = "authorized-batch";
+    let profile = test_profile(name);
+    let engine = || {
+        PolicyEngineV1::new(
+            PolicyDocument {
+                version: 2,
+                scope: ScopeId::AllProfiles,
+                signature: None,
+                rules: vec![
+                    PolicyRule {
+                        r#match: RuleMatch {
+                            tool: "stellar_pay_commit".into(),
+                            chain: "*".into(),
+                        },
+                        criteria: vec![Box::new(PerPeriodCapCriterion::new(
+                            "native".into(),
+                            Window::parse("1d").unwrap(),
+                            15,
+                        ))],
+                        decision: Decision::Allow,
+                        allow_opaque_signing: false,
+                    },
+                    PolicyRule {
+                        r#match: RuleMatch {
+                            tool: "stellar_sep43_sign_transaction".into(),
+                            chain: "*".into(),
+                        },
+                        criteria: vec![Box::new(RateLimitCriterion::new(
+                            Window::parse("1m").unwrap(),
+                            2,
+                        ))],
+                        decision: Decision::Allow,
+                        allow_opaque_signing: true,
+                    },
+                    PolicyRule {
+                        r#match: RuleMatch {
+                            tool: "*".into(),
+                            chain: "*".into(),
+                        },
+                        criteria: vec![Box::new(TotalBudgetCriterion::new("native".into(), 15))],
+                        decision: Decision::Allow,
+                        allow_opaque_signing: false,
+                    },
+                ],
+            },
+            name.into(),
+        )
+    };
+    let item = |tool, amount| {
+        (
+            ToolDescriptor::from_registration(&McpToolRegistration {
+                name: tool,
+                destructive_hint: true,
+                read_only_hint: false,
+                chain_id_required: true,
+                value_kind: ToolValueKind::MovesValue,
+            }),
+            ValueClass::single(ValueLeg {
+                kind: ActionKind::Payment,
+                amount: Some(amount),
+                asset: Some("native".into()),
+                destination: None,
+            }),
+        )
+    };
+    let first = engine();
+    let stale = engine();
+    let store = PersistedWindowStore::for_profile(name);
+    let key = amount_key(name);
+    let refresh = |engine: &PolicyEngineV1| {
+        engine.state_store().clear().unwrap();
+        store
+            .load_into(name, &profile, engine.state_store())
+            .unwrap();
+        engine.state_store().query_window(&key, now_ms()).unwrap()
+    };
+    let refused = record_authorized_window_states(
+        &first,
+        &[
+            item("stellar_pay_commit", 10),
+            item("stellar_pay_commit", 10),
+        ],
+        &profile,
+        name,
+    );
+    assert!(
+        matches!(refused, Err(WindowStoreError::PolicyDenied { reason })
+        if reason.wire_code() == "policy.deny.per_period_cap_exceeded")
+    );
+    assert_eq!(refresh(&first), (0, 0), "a refused batch leaves no prefix");
+    let own_rule = (
+        item("stellar_sep43_sign_transaction", 0).0,
+        ValueClass::ReadOnly,
+    );
+    record_authorized_window_states(
+        &first,
+        &[
+            item("stellar_pay_commit", 5),
+            own_rule,
+            item("stellar_pay_commit", 5),
+        ],
+        &profile,
+        name,
+    )
+    .unwrap();
+    assert_eq!(refresh(&first), (10, 2));
+    assert_eq!(
+        first
+            .state_store()
+            .query_window(&count_key(name), now_ms())
+            .unwrap(),
+        (1, 1),
+        "the own-rule count joins the value batch"
+    );
+    let refused = record_authorized_window_states(
+        &stale,
+        &[item("stellar_pay_commit", 4), item("stellar_pay_commit", 6)],
+        &profile,
+        name,
+    );
+    assert!(matches!(
+        refused,
+        Err(WindowStoreError::PolicyDenied { .. })
+    ));
+    assert_eq!(
+        refresh(&stale),
+        (10, 2),
+        "stale preparation cannot spend old headroom"
+    );
+    let failed = record_authorized_window_states(
+        &first,
+        &[
+            item("stellar_pay_commit", 5),
+            item("stellar_claim_commit", 1),
+        ],
+        &profile,
+        name,
+    );
+    assert!(matches!(failed, Err(WindowStoreError::Invalid { detail })
+        if detail.contains("verified policy digest")));
+    assert_eq!(
+        refresh(&first),
+        (10, 2),
+        "a later sizing failure persists nothing"
+    );
+    record_authorized_window_states(&first, &[item("stellar_pay_commit", 5)], &profile, name)
+        .unwrap();
+    assert_eq!(
+        refresh(&first),
+        (15, 3),
+        "refresh permits a valid retry at the exact cap"
+    );
+}
+
+#[test]
+#[serial]
+fn window_sums_beyond_the_range_refuse_without_writing() {
+    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+    for unlisted in [false, true] {
+        for mode in 0..4 {
+            let fx = fixture(&format!("overflow-{unlisted}-{mode}"));
+            let now = now_ms();
+            let key = if unlisted {
+                StateKey::new(&fx.profile_name, 1, "unlisted:native", 86_400)
+            } else {
+                amount_key(&fx.profile_name)
+            };
+            let limit = if unlisted {
+                WindowLimit::Unlisted {
+                    asset: "native".into(),
+                    window: "1d".into(),
+                    max_stroops: i128::MAX,
+                }
+            } else {
+                WindowLimit::Amount {
+                    asset: "native".into(),
+                    window: "1d".into(),
+                    max_stroops: i128::MAX,
+                }
+            };
+            let entry = |at, amount| WindowEntry::new(key.clone(), at, amount, limit.clone());
+            let initial = if mode == 1 {
+                vec![]
+            } else {
+                vec![entry(now, i128::MAX)]
+            };
+            fx.first.record_authorized(&fx.profile, &initial).unwrap();
+            assert_eq!(
+                fx.window(&key, now).0,
+                if mode == 1 { 0 } else { i128::MAX }
+            );
+            if mode == 2 {
+                // Older writers could store individually valid rows with an overflowing sum.
+                fx.first
+                    .record_and_persist(&fx.profile, &[entry(now, 1)])
+                    .unwrap();
+            }
+            let before = std::fs::read(fx.first.path()).unwrap();
+            let proposed = match mode {
+                0 => vec![entry(now, 1)],
+                1 => vec![entry(now, i128::MAX), entry(now, 1)],
+                2 => vec![entry(now, 0)],
+                _ => vec![entry(now + 86_400_001, 1), entry(now, 0)],
+            };
+            let result = fx.second.record_authorized(&fx.profile, &proposed);
+            let code = if unlisted {
+                "policy.accounting_overflow"
+            } else {
+                "policy.deny.per_period_cap_exceeded"
+            };
+            if unlisted {
+                let error = result.unwrap_err();
+                assert!(matches!(error, WindowStoreError::AccountingOverflow));
+                assert_eq!(error.operation_error().unwrap().code(), code, "mode {mode}");
+            } else {
+                assert!(
+                    matches!(result, Err(WindowStoreError::PolicyDenied { reason }) if reason.wire_code() == code),
+                    "mode {mode}"
+                );
+            }
+            assert_eq!(
+                std::fs::read(fx.first.path()).unwrap(),
+                before,
+                "overflow persists no usage"
+            );
+            if mode == 0 {
+                fx.second
+                    .record_authorized(&fx.profile, &[entry(now, 0)])
+                    .unwrap();
+                assert_eq!(fx.window(&key, now), (i128::MAX, 2));
+            }
+        }
+    }
+}
+
+/// Independent gate snapshots must share one durable authorization cap.
+#[test]
+#[serial]
 fn authorized_settlements_share_admission_and_refusal_records_nothing() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let _storage_home =

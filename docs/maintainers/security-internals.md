@@ -752,6 +752,35 @@ The value descriptor reaches the emission site through the policy engine's `eval
 
 The submission recorder writes the pending row in its pre-send step (`WalletSubmissionRecorder::pre_send` and its bound and authorized forms in `stellar-agent-network`), the same site on every surface. The DEX and DeFindex adapters write only the `sa_raw_invocation` row of a failed submit (`emit_sa_raw_invocation_failure` in `stellar-agent-smart-account`). The smart-account verbs also write their own `sa_*` domain rows.
 
+### Authorized accounting batches
+
+`record_authorized_window_states` prepares each tool's evaluated effects in order.
+It collects every accounting entry before calling durable admission once.
+Admission holds the window-state lock while rereading authenticated state and checking all entries.
+A refused batch adds no usage, including when a later item cannot be sized.
+Preparation can change memory; the next dispatch clears it and reloads durable state.
+The singular authorization helper retains its existing contract.
+
+The batch helper's durable admission runs generation work under the window-state lock.
+The lock is released when durable admission returns.
+The generation counter advances before replacing the file.
+A failed replacement leaves a generation mismatch and stops later use.
+No recovery verb repairs that mismatch; create a profile under a new name.
+
+Amount admission checks stored rows, fallback shares, bundle overlays, and proposed legs without saturation.
+Raw queries return typed overflow errors and keep the stored records.
+Callers with a governing period, total, or unlisted limit return that limit's denial code.
+Period and unlisted overflow payloads omit unrepresentable usage figures.
+Count, clock, and reporting projections retain their existing arithmetic.
+Authorized rows use existing window formats; the highest supported version remains 16.
+
+`opaque_signing_opted_in` reads the first matching rule's flag.
+It defaults to false and returns true for the Noop engine.
+The query supplies consent information; the rule's decision still governs the call.
+The signing audit constructor accepts ordered evaluated legs.
+An empty vector is omitted and historical rows deserialize with empty legs.
+Current transaction, auth-entry, and message-signing callers pass empty vectors.
+
 ### Key-write emission sites
 
 Each profile command that writes long-lived key material to the keyring records a `keyring_key_written` row after the write succeeds, naming the key slot (`key_purpose`) and the keyring coordinates. The signer and owner-key enroll commands additionally record a redacted (first-5-last-5) public address; the RPC credential enrollment and the HMAC-key rotations record none. The row NEVER carries a key value, seed, base64 material, or any derived secret.
