@@ -816,6 +816,8 @@ impl StellarRpcClient {
         expected_passphrase: &str,
         deadline: Instant,
     ) -> Result<EndpointIdentity, WalletError> {
+        #[cfg(feature = "test-hooks")]
+        IDENTITY_DEADLINES.with_borrow_mut(|deadlines| deadlines.push(deadline));
         let network = self
             .reported_network(&RetryPolicy::default(), deadline)
             .await?;
@@ -1184,6 +1186,14 @@ thread_local! {
     /// Calls to [`StellarRpcClient::new`] and [`StellarRpcClient::with_credential`]
     /// on this thread, failed ones included.
     static CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static IDENTITY_DEADLINES: std::cell::RefCell<Vec<Instant>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Takes the identity deadlines received by clients on the calling test thread.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub fn take_identity_deadlines_for_test() -> Vec<Instant> {
+    IDENTITY_DEADLINES.take()
 }
 
 /// Returns how many times [`StellarRpcClient::new`] or
