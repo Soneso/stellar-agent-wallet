@@ -555,7 +555,7 @@ not_applicable = "This claim covers payment queue intervals; other preparation p
 [[claim]]
 id = "approval.payment_authority_end"
 family = "approval"
-statement = "classic payment resolution preserves the captured decision end for policy and approval authority through delay and durable reopen"
+statement = "the classic payment resolver, called as each payment consumer, preserves the captured decision end for policy and approval authority through delay and durable reopen"
 applies = ["commit", "verb"]
 builds = "feature-on"
 
@@ -572,6 +572,85 @@ rows = ["mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit",
 not_applicable = "This claim is specific to classic payment consumers."
 
 # Cells: sizing.caps_refuse.
+
+[[claim]]
+id = "approval.payment_recovery"
+family = "approval"
+statement = "payment retries reuse the original consent and preserve terminal bindings across process restart and atomic store replacement"
+applies = ["prepare"]
+
+[[cell]]
+claim = "approval.payment_recovery"
+rows = ["mcp.pay"]
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "approval_cap_integration::payment_recovery_public_process_retry" },
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "approval_cap_integration::payment_recovery_public_terminal_statuses_survive_restart" },
+  { package = "stellar-agent-core", target = "lib", name = "approval::store::recovery::tests::payment_recovery_preserves_consent_and_each_key_component" },
+  { package = "stellar-agent-core", target = "lib", name = "approval::store::recovery::tests::payment_recovery_process_exit_preserves_atomic_pair" },
+  { package = "stellar-agent-core", target = "lib", name = "approval::store::recovery::tests::payment_recovery_schema_refuses_ambiguous_or_missing_facts" },
+  { package = "stellar-agent-core", target = "lib", name = "approval::store::recovery::tests::payment_recovery_survives_unrelated_inbox_writers" },
+  { package = "stellar-agent-core", target = "lib", name = "approval::store::recovery::tests::payment_recovery_terminal_writers_and_backward_clock_refuse" },
+  { package = "stellar-agent-core", target = "lib", name = "approval::store::recovery::tests::payment_recovery_attestation_checks_recorded_expiry" },
+  { package = "stellar-agent-core", target = "lib", name = "approval::store::recovery::tests::payment_recovery_link_failure_refuses_only_its_payment" },
+  { package = "stellar-agent-core", target = "lib", name = "approval::store::recovery::tests::payment_recovery_off_mainnet_retry_after_retention_gets_fresh_consent" },
+  { package = "stellar-agent-core", target = "lib", name = "approval::store::recovery::tests::payment_recovery_retry_interval_refuses_on_reuse" },
+  { package = "stellar-agent-core", target = "lib", name = "approval::store::recovery::tests::payment_recovery_remove_after_reject_keeps_rejection" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::common::tests::mainnet::payment_recovery_mainnet_witness_refuses_recorded_expiry", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::common::tests::mainnet::payment_recovery_concurrent_retries_after_commit_replay_with_one_effect", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::common::tests::mainnet::payment_process_recovery_and_replay", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "approval.payment_recovery"
+rows = ["mcp.create_account", "mcp.claim", "mcp.trustline"]
+not_applicable = "Recovery bindings apply to payment preparation only; these approval producers retain their existing lifecycle."
+
+[[claim]]
+id = "approval.payment_settlement_refusal"
+family = "approval"
+statement = "a refused new payment preserves committed settlement and audit evidence for an older retained operation without new payment effects"
+applies = ["prepare"]
+builds = "feature-on"
+
+[[cell]]
+claim = "approval.payment_settlement_refusal"
+rows = ["mcp.pay"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::common::tests::mainnet::preparation_refusal_preserves_prior_settlement", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "approval.payment_settlement_refusal"
+rows = ["mcp.create_account", "mcp.claim", "mcp.trustline"]
+not_applicable = "This proof covers the payment destination-read boundary after operation lookup."
+
+[[claim]]
+id = "audit.payment_destination"
+family = "audit"
+statement = "payment recorders retain literal complete-destination hashes and redaction with the gate-sized native or issued debit"
+applies = ["commit", "verb"]
+
+[[cell]]
+claim = "audit.payment_destination"
+rows = ["mcp.pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "muxed_destination_integration::mcp_payment_audit_leg_hashes_the_complete_destination" },
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "approval_cap_integration::every_payment_recorder_hashes_the_complete_destination" },
+]
+
+[[cell]]
+claim = "audit.payment_destination"
+rows = ["cli.pay"]
+tests = [
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "commands::submission_record::tests::payment_recorder_hashes_the_complete_destination_and_debit" },
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "commands::pay::tests::mainnet_full::every_payment_recorder_hashes_the_complete_destination", builds = "feature-on" },
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "commands::submission_record::tests::the_mainnet_recorder_hashes_the_complete_destination", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "audit.payment_destination"
+rows = ["mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "cli.claim", "cli.trustline", "cli.accounts_create"]
+not_applicable = "These tools do not record payment destination legs."
 
 [[cell]]
 claim = "sizing.caps_refuse"
@@ -826,16 +905,30 @@ pending = "status-views"
 
 [[cell]]
 claim = "status.retry_returns_stored"
-rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment"]
+rows = ["mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment"]
 tests = [
   { package = "stellar-agent-mcp", target = "lib", name = "tools::operation_replay_tests::retried_business_id_returns_the_stored_operation_for_every_kind", builds = "feature-on" },
 ]
 
 [[cell]]
 claim = "status.retry_returns_stored"
-rows = ["cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+rows = ["cli.claim", "cli.trustline", "cli.accounts_create"]
 tests = [
   { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "common::operation_replay_tests::every_value_verb_replays_its_business_id", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "status.retry_returns_stored"
+rows = ["mcp.pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::common::tests::mainnet::payment_process_recovery_and_replay", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "status.retry_returns_stored"
+rows = ["cli.pay"]
+tests = [
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "common::operation_replay_tests::payment_process_lost_response_replays_without_effects", builds = "feature-on" },
 ]
 
 # Cells: notification.committed_transition.

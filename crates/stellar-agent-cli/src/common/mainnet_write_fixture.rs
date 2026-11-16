@@ -225,6 +225,7 @@ pub(crate) struct Spec {
     oracle_removed: bool,
     testnet: bool,
     submit_timeout_seconds: Option<u64>,
+    record_keys: bool,
 }
 
 impl Spec {
@@ -250,6 +251,7 @@ impl Spec {
             oracle_removed: false,
             testnet: false,
             submit_timeout_seconds: None,
+            record_keys: false,
         }
     }
 
@@ -328,6 +330,12 @@ impl Spec {
         self
     }
 
+    /// Records fixture credentials for transfer to a fresh process.
+    pub(crate) fn record_process_keys(mut self) -> Self {
+        self.record_keys = true;
+        self
+    }
+
     /// Sets up the fixture.
     pub(crate) async fn build(self) -> MainnetFixture {
         MainnetFixture::new(self).await
@@ -337,12 +345,15 @@ impl Spec {
 /// Installs a fresh in-memory mock store and makes every keyring
 /// initialization keep it until dropped, then reinstalls a fresh mock store
 /// so no later test reaches this fixture's entries.
-struct MockKeyringScope;
+struct MockKeyringScope(Option<stellar_agent_test_support::keyring_mock::MutationLog>);
 
 impl MockKeyringScope {
-    fn set() -> Self {
+    fn set(record_keys: bool) -> Self {
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
-        Self
+        Self(
+            record_keys
+                .then(|| stellar_agent_test_support::keyring_mock::record_mutations().unwrap()),
+        )
     }
 }
 
@@ -384,6 +395,14 @@ fn require_runner(step: &str, code: i32) {
 }
 
 impl MainnetFixture {
+    /// Exports only this isolated fixture's credentials for a fresh child process.
+    pub(crate) fn save_process_keyring(&self, path: &std::path::Path) {
+        stellar_agent_core::approval::fixtures::save_process_keyring(
+            path,
+            self._keyring.0.as_ref().unwrap(),
+        );
+    }
+
     async fn new(mut spec: Spec) -> Self {
         crate::common::render::take_rendered_for_test();
         let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -395,7 +414,7 @@ impl MainnetFixture {
         );
         let home_guard = StellarAgentHomeGuard::new(home.path());
         let profile_var = ProfileEnvVarGuard::cleared();
-        let keyring = MockKeyringScope::set();
+        let keyring = MockKeyringScope::set(spec.record_keys);
         let agent = EnvSigner::new(AGENT_SEED, AGENT_VAR);
         let owner = EnvSigner::new(OWNER_SEED, OWNER_VAR);
         let name = spec.name;

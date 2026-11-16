@@ -922,7 +922,7 @@ mod enabled {
                     evaluation,
                     now,
                 )?;
-                check_policy_authority(context, policy, &approval.bound, now)?;
+                check_policy_authority(context, policy, approval.bound(), now)?;
             }
             MainnetAuthority::Policy(authority) => {
                 check_policy_authority(context, policy, authority, now)?;
@@ -1399,7 +1399,7 @@ mod enabled {
             .map_err(|_| refused(P::IntentShape))?;
         match req.authority {
             MainnetAuthority::Approval(approval) => {
-                let bound = &approval.bound;
+                let bound = approval.bound();
                 let approval = approval.witness();
                 require(
                     approval.profile() == req.context.profile_name(),
@@ -6006,6 +6006,100 @@ mod tests {
                 "tool": tool,
             })
         );
+    }
+
+    /// A valid x402 witness bounded by a classic-scope decision does not
+    /// cover a message: the resolver refuses with `authority_scope_mismatch`
+    /// and mints nothing, while the same witness under the matching scope
+    /// mints.
+    #[test]
+    #[serial_test::serial]
+    fn message_approval_refuses_a_classic_scope_decision() {
+        let f = x402_fixture();
+        let root = x402_root(&f);
+        let intent = x402_intent(&root, MainnetConsumer::X402Authenticated);
+        let message = message_facts([1; 32], EPHEMERAL);
+        let witness = f.x402_approval(&root, Some(MESSAGE_HOME_DOMAIN), f.now);
+        let bounded = |scope| {
+            MainnetDecision::for_test(
+                stellar_agent_core::policy::Decision::Allow,
+                None,
+                f.policy.digest(),
+                f.policy.sequence(),
+                0,
+                "operator",
+                "stellar:mainnet",
+                f.now,
+                600_000,
+                scope,
+            )
+        };
+        let classic = bounded(AuthorityScope::Classic);
+        let authority = MainnetAuthority::from_decision(&classic, Some(&witness)).unwrap();
+        let before = f.wire();
+        assert_refused(
+            resolve_message_sign(f.message_request(&intent, &message, &authority)),
+            P::AuthorityScopeMismatch,
+            &f,
+            &before,
+        );
+        let matching = bounded(AuthorityScope::X402Authenticated {
+            home_domain: MESSAGE_HOME_DOMAIN.to_owned(),
+            tool: "stellar_x402_authenticated_payment".to_owned(),
+        });
+        let authority = MainnetAuthority::from_decision(&matching, Some(&witness)).unwrap();
+        resolve_message_sign(f.message_request(&intent, &message, &authority)).unwrap();
+        assert_eq!(message_record(&f)["state"], "open");
+    }
+
+    /// A resolver clock before the decision's evaluation instant refuses
+    /// final resolution under both authority kinds with `not_yet_valid`,
+    /// while the witness itself is already valid, and mints nothing.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn final_resolution_refuses_a_clock_before_the_decision_instant() {
+        let f = ResolverFixture::new();
+        let server = f.server().await;
+        let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
+        let client = context.primary_client().unwrap();
+        let witness = f.approval(&f.envelope, f.now, 600_000);
+        let decision = MainnetDecision::for_test(
+            stellar_agent_core::policy::Decision::Allow,
+            None,
+            f.policy.digest(),
+            f.policy.sequence(),
+            0,
+            "operator",
+            "stellar:mainnet",
+            f.now + 5_000,
+            600_000,
+            AuthorityScope::Classic,
+        );
+        for approved in [false, true] {
+            f.clock.set(f.now + 1_000);
+            let authority =
+                MainnetAuthority::from_decision(&decision, approved.then_some(&witness)).unwrap();
+            assert_eq!(
+                matches!(authority, MainnetAuthority::Approval(_)),
+                approved,
+                "authority kind"
+            );
+            let before = f.wire();
+            assert_refused(
+                resolve_tx_sign(request(&f, &context, &client, &authority)).await,
+                P::NotYetValid,
+                &f,
+                &before,
+            );
+            assert!(
+                f.window
+                    .open_authorizations(&f.profile, f.now + 1_000)
+                    .unwrap()
+                    .is_empty(),
+                "approved {approved}: no mint"
+            );
+        }
+        f.clock.set(f.now);
     }
 
     /// A clock that cannot be read refuses the resolution with

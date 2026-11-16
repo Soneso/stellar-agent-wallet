@@ -191,6 +191,9 @@ pub fn load_and_validate_entry(
     identity: &ApproverIdentity,
     allowed_credentials: &[String],
 ) -> Result<PendingApproval, WalletError> {
+    store
+        .check_payment_recovery(nonce)
+        .map_err(|e| record_error(&e))?;
     let entry = store.get(nonce).cloned().ok_or_else(|| {
         // This operator-run path names a missing entry.
         // The MCP commit path reports missing and expired approvals as
@@ -1101,6 +1104,9 @@ pub(crate) fn refuse_unless_still_pending(
     validated: &PendingApproval,
     now_ms: u64,
 ) -> Result<(), WalletError> {
+    store
+        .check_payment_recovery(&validated.approval_nonce)
+        .map_err(|e| record_error(&e))?;
     let Some(current) = store.get(&validated.approval_nonce) else {
         return Err(record_error(&ApprovalError::NotFound));
     };
@@ -1469,16 +1475,19 @@ fn attest_mainnet_presence<const STRICT: bool>(
 
 /// Maps a pending-store failure to its `approval.*` refusal.
 ///
-/// `NotFound`, `Expired`, `AlreadyAttested`, and `WrongKind` keep their own codes, and a
-/// refused stored destination is `approval.entry_inconsistent`. Every other
+/// `NotFound`, `Expired`, `Rejected`, `Consumed`, `AlreadyAttested`, and `WrongKind` keep
+/// their own codes. A refused stored destination and an inconsistent payment
+/// recovery binding are `approval.entry_inconsistent`. Every other
 /// store failure is `approval.record_failed` with the store's message.
 #[must_use]
 pub fn record_error(e: &ApprovalError) -> WalletError {
     match e {
+        ApprovalError::Rejected => rejected_error(),
+        ApprovalError::Consumed => consumed_error(),
         ApprovalError::WrongKind { .. } => WalletError::Approval(ApprovalFailure::WrongKind {
             detail: e.to_string(),
         }),
-        ApprovalError::DestinationRefused { .. } => {
+        ApprovalError::DestinationRefused { .. } | ApprovalError::RecoveryInconsistent => {
             WalletError::Approval(ApprovalFailure::EntryInconsistent {
                 detail: e.to_string(),
             })

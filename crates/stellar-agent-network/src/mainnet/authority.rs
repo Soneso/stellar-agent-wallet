@@ -56,10 +56,16 @@ pub enum MainnetAuthority<'w> {
 #[derive(Debug)]
 pub struct ApprovalAuthority<'w> {
     witness: &'w ApprovalWitness,
-    pub(crate) bound: PolicyAuthority,
+    bound: PolicyAuthority,
 }
 
 impl ApprovalAuthority<'_> {
+    /// The policy decision that bounds the witness.
+    #[cfg(feature = "mainnet-write")]
+    pub(crate) fn bound(&self) -> &PolicyAuthority {
+        &self.bound
+    }
+
     /// The operator's verified proof, with its original attested lifetime.
     #[must_use]
     pub fn witness(&self) -> &ApprovalWitness {

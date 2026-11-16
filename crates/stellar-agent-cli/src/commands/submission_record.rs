@@ -1672,6 +1672,28 @@ mod tests {
         })
     }
 
+    #[test]
+    fn payment_recorder_hashes_the_complete_destination_and_debit() {
+        for tool in ["stellar_pay", "stellar_pay_commit"] {
+            for asset in [
+                "native",
+                "USD:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+            ] {
+                for (destination, hash, redacted) in HASHED_FORMS {
+                    let mut effects = payment_effects(destination);
+                    effects.legs[0].asset = Some(asset.to_owned());
+                    let legs = audit_legs(tool, Some(&effects)).unwrap();
+                    assert_eq!(legs.len(), 1);
+                    assert_eq!(legs[0].destination_sha256.as_deref(), Some(hash));
+                    assert_eq!(legs[0].destination_redacted.as_deref(), Some(redacted));
+                    assert_eq!(legs[0].amount, Some(10_000_000));
+                    assert_eq!(legs[0].asset.as_deref(), Some(asset));
+                    assert!(!serde_json::to_string(&legs).unwrap().contains(destination));
+                }
+            }
+        }
+    }
+
     /// `build_recorder` given a payment leg whose destination is lowercase
     /// refuses `validation.address_invalid` before it writes a receipt, a
     /// hold, or an audit row.
@@ -1804,15 +1826,32 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn the_mainnet_recorder_hashes_the_complete_destination() {
-        for (index, (destination, sha256, redacted)) in HASHED_FORMS.into_iter().enumerate() {
-            let name = ["recorder-hash-g", "recorder-hash-m0", "recorder-hash-mmax"][index];
-            let (legs, _) = mainnet_recorder_legs(name, &payment_effects(destination)).await;
-            let legs = legs.unwrap();
-            assert_eq!(legs.len(), 1, "{destination}");
-            assert_eq!(legs[0].destination_sha256.as_deref(), Some(sha256));
-            assert_eq!(legs[0].destination_redacted.as_deref(), Some(redacted));
-            assert_eq!(legs[0].amount, Some(10_000_000));
-            assert_eq!(legs[0].asset.as_deref(), Some("native"));
+        for asset in [
+            "native",
+            "USD:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+        ] {
+            for (index, (destination, sha256, redacted)) in HASHED_FORMS.into_iter().enumerate() {
+                let name = if asset == "native" {
+                    ["recorder-hash-g", "recorder-hash-m0", "recorder-hash-mmax"][index]
+                } else {
+                    [
+                        "recorder-hash-issued-g",
+                        "recorder-hash-issued-m0",
+                        "recorder-hash-issued-mmax",
+                    ][index]
+                };
+                let mut effects = payment_effects(destination);
+                effects.legs[0].asset = Some(asset.to_owned());
+                let (legs, fixture) = mainnet_recorder_legs(name, &effects).await;
+                let legs = legs.unwrap();
+                assert_eq!(legs.len(), 1, "{destination}");
+                assert_eq!(legs[0].destination_sha256.as_deref(), Some(sha256));
+                assert_eq!(legs[0].destination_redacted.as_deref(), Some(redacted));
+                assert_eq!(legs[0].amount, Some(10_000_000));
+                assert_eq!(legs[0].asset.as_deref(), Some(asset));
+                let log = std::fs::read_to_string(&fixture.profile().audit_log_path).unwrap();
+                assert!(!log.contains(destination));
+            }
         }
     }
 
@@ -1827,6 +1866,10 @@ mod tests {
         let effects = payment_effects(&HASHED_FORMS[2].0.to_lowercase());
         let (refused, fixture) =
             mainnet_recorder_legs("recorder-malformed-mainnet", &effects).await;
+        assert!(
+            refused.is_err(),
+            "malformed payment leg refuses before exposure"
+        );
         assert_eq!(refused.err().unwrap().code(), "validation.address_invalid");
         let name = "recorder-malformed-mainnet";
         let profile = fixture.profile();

@@ -9,6 +9,46 @@ use std::sync::{Arc, Mutex};
 use rmcp::model::CallToolResult;
 use stellar_agent_test_support::signed_envelope::{TESTNET_PASSPHRASE, get_network_result};
 
+/// Signed testnet provenance for a synthetic payment-approval engine's isolated fixture.
+#[allow(dead_code, clippy::expect_used, reason = "shared test fixture")]
+pub fn payment_recovery_policy(
+    server: &stellar_agent_mcp::server::WalletServer,
+) -> stellar_agent_core::mainnet::verified_policy::VerifiedPolicy {
+    use stellar_agent_core::policy::v1::{
+        PolicyStateStore,
+        verified::{OwnerKeySource, PinMode, PolicyLoad, load_verified_policy},
+    };
+    let dir = tempfile::tempdir().expect("fixture policy directory");
+    let path = dir.path().join("policy.toml");
+    let name = server.profile_name_for_approval();
+    let body = format!(
+        "version = 1\nscope = \"profile:{name}\"\n[[rules]]\nmatch = {{ tool = \"*\", chain = \"*\" }}\ncriteria = []\ndecision = \"allow\"\n"
+    );
+    let profile = stellar_agent_core::profile::schema::Profile::builder_testnet(
+        "fixture", "signer", "fixture", "nonce",
+    )
+    .build();
+    let owner = ed25519_dalek::SigningKey::from_bytes(&[61; 32]);
+    std::fs::write(
+        &path,
+        stellar_agent_core::approval::mainnet_fixtures::signed_policy_text(&body, &owner),
+    )
+    .expect("signed fixture policy");
+    load_verified_policy(
+        &PolicyLoad {
+            path: &path,
+            profile: &profile,
+            profile_name: &name,
+            owner_pubkey: &owner.verifying_key().to_bytes(),
+            owner_source: OwnerKeySource::Keyring,
+            window_path: &dir.path().join("window"),
+        },
+        PolicyStateStore::new(),
+        PinMode::CompareOnly,
+    )
+    .expect("fixture signature verifies")
+}
+
 /// The toolset pin key the toolset suites tag their install records under and
 /// hand the server through `set_toolset_pin_key_for_test`.
 #[allow(

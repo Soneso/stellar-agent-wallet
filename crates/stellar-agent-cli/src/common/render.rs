@@ -35,6 +35,12 @@ use stellar_agent_core::envelope::Envelope;
 ///
 /// Never panics.
 pub fn render_json<T: serde::Serialize>(envelope: &Envelope<T>) {
+    #[cfg(all(test, feature = "mainnet-write"))]
+    BEFORE_RENDER.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
     #[cfg(test)]
     if let Ok(json) = envelope.to_json_compact() {
         RENDERED.with(|rendered| rendered.borrow_mut().push(json));
@@ -46,9 +52,17 @@ pub fn render_json<T: serde::Serialize>(envelope: &Envelope<T>) {
 
 #[cfg(test)]
 thread_local! {
+    #[cfg(feature = "mainnet-write")]
+    static BEFORE_RENDER: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     /// Every envelope [`render_json`] printed on this thread, oldest first.
     static RENDERED: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Runs once before the public command writes its next response.
+#[cfg(all(test, feature = "mainnet-write"))]
+pub(crate) fn before_render_for_test(hook: impl FnOnce() + 'static) {
+    BEFORE_RENDER.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
 /// Drains and returns the envelopes [`render_json`] printed on the calling

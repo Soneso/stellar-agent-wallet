@@ -882,6 +882,9 @@ fn read_mainnet_record<'a>(
     profile_name: &'a str,
     nonce: &str,
 ) -> Result<RecordFacts<'a>, WalletError> {
+    pending
+        .check_payment_recovery(nonce)
+        .map_err(|e| super::attest::record_error(&e))?;
     let chain_id = profile.chain_id.caip2_str();
     if chain_id != MAINNET_CHAIN_ID || !profile.chain_id.is_mainnet() {
         return Err(WalletError::Approval(ApprovalFailure::BindingMismatch {
