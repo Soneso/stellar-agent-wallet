@@ -299,10 +299,32 @@ mod composed {
                     2
                 };
                 let before = l.bytes();
+                if kind == "unlisted" && next == 11 {
+                    // The unlisted allowance is approval-satisfiable: a policy
+                    // authority refuses with nothing written, and the
+                    // approval mints the full excess.
+                    let mut policy = rules.request(&l, later_id, later.clone());
+                    policy.authority = MintAuthority::Policy(PolicyAuthorityBinding {
+                        policy_digest: rules.digest,
+                        ..policy_binding(T0 + APPROVAL_MS)
+                    });
+                    assert!(
+                        matches!(l.mint(&policy), Err(WindowStoreError::UnlistedApprovalRequired)),
+                        "policy authority needs approval beyond the allowance"
+                    );
+                    assert_eq!(l.bytes(), before, "approval-needed writes nothing");
+                }
                 let result = l.mint(&rules.request(&l, later_id, later.clone()));
-                if next == 10 {
-                    let minted = result.expect("exact remaining headroom is permitted");
+                if next == 10 || kind == "unlisted" {
+                    let minted = result.expect("remaining headroom or an approval admits it");
                     assert_holds(&l, minted.id, &later);
+                    if kind == "unlisted" {
+                        assert_eq!(
+                            usage_with_holds(&l, &memory, later[0].key(), T0),
+                            (90 + next, 3),
+                            "the minted payment is charged in full"
+                        );
+                    }
                 } else {
                     assert!(
                         matches!(result, Err(WindowStoreError::PolicyDenied { .. })),

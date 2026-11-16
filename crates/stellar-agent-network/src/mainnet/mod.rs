@@ -45,7 +45,9 @@ pub mod soroban;
 pub mod test_support;
 pub(crate) mod types;
 
-pub use refusal::{MainnetAuthorizationError, MainnetPrecondition, TotalEpochRefusal};
+pub use refusal::{
+    AccountingRefusal, MainnetAuthorizationError, MainnetPrecondition, TotalEpochRefusal,
+};
 pub use types::{
     AuditFacts, AuthorizationDomain, AuthorizationId, ConsumeBindingKind, HoldOwner,
     MainnetConsumer, MessageDomain, RecomputedFacts, SignerRole,

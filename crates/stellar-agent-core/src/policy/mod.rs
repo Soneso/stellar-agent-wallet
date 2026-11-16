@@ -1380,6 +1380,16 @@ pub enum PolicyError {
         detail: String,
     },
 
+    /// The unlisted-recipient spending of a call, its window, and its bundle
+    /// overflow their sum, so the evaluation refuses.
+    #[error("the unlisted-recipient spending sum overflows")]
+    AccountingOverflow,
+
+    /// The unlisted-recipient window holds a negative amount, so the
+    /// evaluation refuses.
+    #[error("the unlisted-recipient window holds a negative amount")]
+    AccountingInvalid,
+
     /// A policy evaluation reached a state its own invariants exclude, such
     /// as a rule position that does not fit the provenance width.
     ///
@@ -1502,6 +1512,8 @@ impl PolicyError {
             Self::MissingOwnerKey { .. } => "policy.missing_owner_key",
             Self::ScopeResolutionFailed { .. } => "policy.scope_resolution_failed",
             Self::CriterionEvaluationFailed { .. } => "policy.criterion_evaluation_failed",
+            Self::AccountingOverflow => "policy.accounting_overflow",
+            Self::AccountingInvalid => "policy.accounting_invalid",
             Self::Internal { .. } => "policy.internal",
         }
     }
@@ -2312,6 +2324,8 @@ mod tests {
                 PolicyError::MissingOwnerKey { .. } => {}
                 PolicyError::ScopeResolutionFailed { .. } => {}
                 PolicyError::CriterionEvaluationFailed { .. } => {}
+                PolicyError::AccountingOverflow => {}
+                PolicyError::AccountingInvalid => {}
                 PolicyError::Internal { .. } => {}
             }
         }
@@ -2357,6 +2371,8 @@ mod tests {
             PolicyError::CriterionEvaluationFailed {
                 detail: detail.to_owned(),
             },
+            PolicyError::AccountingOverflow,
+            PolicyError::AccountingInvalid,
             PolicyError::Internal {
                 detail: detail.to_owned(),
             },
@@ -2385,6 +2401,8 @@ mod tests {
             PolicyError::MissingOwnerKey { .. } => "policy.missing_owner_key",
             PolicyError::ScopeResolutionFailed { .. } => "policy.scope_resolution_failed",
             PolicyError::CriterionEvaluationFailed { .. } => "policy.criterion_evaluation_failed",
+            PolicyError::AccountingOverflow => "policy.accounting_overflow",
+            PolicyError::AccountingInvalid => "policy.accounting_invalid",
             PolicyError::Internal { .. } => "policy.internal",
         }
     }

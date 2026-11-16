@@ -716,13 +716,13 @@ impl WalletServer {
         let destination = validate_payment_destination(&args.destination, "destination")?;
 
         // ── Parse memo (mutual exclusivity check) ─────────────────────────────
-        let memo = match parse_memo_fields(
+        let (memo, policy_memo) = match stellar_agent_network::memo::parse_memo_with_fact(
             args.memo_text.as_ref().map(McpMemoTextArgument::as_str),
             args.memo_id,
             args.memo_hash_hex.as_deref(),
             args.memo_return_hex.as_deref(),
         ) {
-            Ok(m) => m,
+            Ok(parsed) => parsed,
             Err(err) => {
                 let envelope = stellar_agent_core::envelope::Envelope::<()>::err(&err);
                 let json = envelope
@@ -733,11 +733,7 @@ impl WalletServer {
                 return Ok(result);
             }
         };
-        let policy_memo = stellar_agent_core::envelope_decode::ClassicMemo::try_from(&memo)
-            .map_err(|_| rmcp::ErrorData::invalid_params("memo text is not valid UTF-8", None))?;
-        for (key, value) in policy_memo.policy_fields() {
-            args_value[key] = value;
-        }
+        policy_memo.insert_policy_fields(&mut args_value);
         let memo_present = !matches!(memo, Memo::None);
 
         // ── Fetch source account state ────────────────────────────────────────
@@ -2363,6 +2359,39 @@ mod tests {
             assert_eq!(committed["ok"], true, "matching memo commit: {committed}");
             assert_eq!(run.control.sent().len(), 1);
         }
+
+        // A destination bound to a text memo accepts the bound text: the
+        // preparation's policy fact is the parsed text the envelope carries.
+        let run = ClassicRun::with(
+            Tool::Pay,
+            |raw| {
+                let mut doc = raw.parse::<toml_edit::DocumentMut>().unwrap();
+                for rule in doc["rules"].as_array_of_tables_mut().unwrap().iter_mut() {
+                    if !matches!(rule["match"]["tool"].as_str(), Some("stellar_pay" | "stellar_pay_commit")) {
+                        continue;
+                    }
+                    let criteria = rule["criteria"].as_array_mut().unwrap();
+                    let destination = criteria.iter().filter_map(toml_edit::Value::as_inline_table)
+                        .find(|c| c.get("kind").and_then(toml_edit::Value::as_str) == Some("counterparty_allowlist"))
+                        .unwrap().get("allowlist").unwrap().as_array().unwrap().get(0).unwrap().as_str().unwrap().to_owned();
+                    criteria.push(format!("{{kind = \"memo_binding\", bindings = [{{destination = \"{destination}\", kind = \"text\", value = \"支払\"}}]}}").parse::<toml_edit::Value>().unwrap());
+                }
+                doc.to_string()
+            },
+            |_| {},
+            |args| {
+                args["memo_text"] = json!("支払");
+            },
+        )
+        .await;
+        let facts = decode_authoritative_args(
+            run.args["envelope_xdr"].as_str().unwrap(),
+            "stellar_pay_commit",
+        )
+        .unwrap();
+        assert_eq!(facts["memo"], "支払");
+        let committed = run.commit().await;
+        assert_eq!(committed["ok"], true, "bound text memo commit: {committed}");
     }
 
     /// A commit whose gate-sized leg carries a lowercase destination refuses

@@ -2267,6 +2267,31 @@ pub enum ValidationError {
     )]
     TotalEpochRetired,
 
+    /// The unlisted-recipient allowance is spent, and the authorization runs
+    /// under policy authority. A per-payment approval covers the payment.
+    ///
+    /// # Wire code
+    ///
+    /// `"policy.approval_required"`.
+    #[error("the unlisted-recipient allowance is spent; this payment needs a per-payment approval")]
+    UnlistedApprovalRequired,
+
+    /// A spending sum exceeds its representation, so nothing was recorded.
+    ///
+    /// # Wire code
+    ///
+    /// `"policy.accounting_overflow"`.
+    #[error("the spending sum overflows; nothing was recorded")]
+    AccountingOverflow,
+
+    /// The spending window holds a negative unlisted-recipient amount.
+    ///
+    /// # Wire code
+    ///
+    /// `"policy.accounting_invalid"`.
+    #[error("the spending window holds a negative unlisted-recipient amount")]
+    AccountingInvalid,
+
     /// The reset refuses while approvals remain inside their waiting windows.
     ///
     /// # Wire code
@@ -2558,6 +2583,9 @@ impl ValidationError {
             Self::TotalEpochUnavailable { .. } => "policy.total_epoch_unavailable",
             Self::TotalEpochStale => "policy.total_epoch_stale",
             Self::TotalEpochRetired => "policy.total_epoch_retired",
+            Self::UnlistedApprovalRequired => "policy.approval_required",
+            Self::AccountingOverflow => "policy.accounting_overflow",
+            Self::AccountingInvalid => "policy.accounting_invalid",
             Self::ResetApprovalsPending { .. } => "reset.approvals_pending",
             Self::AuditAppendFailed { .. } => "audit.append_failed",
         }
@@ -4772,6 +4800,18 @@ mod tests {
                 "policy.total_epoch_retired",
             ),
             (
+                ValidationError::UnlistedApprovalRequired,
+                "policy.approval_required",
+            ),
+            (
+                ValidationError::AccountingOverflow,
+                "policy.accounting_overflow",
+            ),
+            (
+                ValidationError::AccountingInvalid,
+                "policy.accounting_invalid",
+            ),
+            (
                 ValidationError::ResetApprovalsPending { pending: 2 },
                 "reset.approvals_pending",
             ),
@@ -5121,6 +5161,11 @@ mod tests {
                 }
                 ValidationError::TotalEpochStale => ValidationError::TotalEpochStale,
                 ValidationError::TotalEpochRetired => ValidationError::TotalEpochRetired,
+                ValidationError::UnlistedApprovalRequired => {
+                    ValidationError::UnlistedApprovalRequired
+                }
+                ValidationError::AccountingOverflow => ValidationError::AccountingOverflow,
+                ValidationError::AccountingInvalid => ValidationError::AccountingInvalid,
                 ValidationError::ResetApprovalsPending { pending } => {
                     ValidationError::ResetApprovalsPending { pending: *pending }
                 }
@@ -6041,6 +6086,21 @@ mod tests {
             (
                 ValidationError::TotalEpochRetired.into(),
                 "policy.total_epoch_retired",
+                ErrorCategory::Validation,
+            ),
+            (
+                ValidationError::UnlistedApprovalRequired.into(),
+                "policy.approval_required",
+                ErrorCategory::Validation,
+            ),
+            (
+                ValidationError::AccountingOverflow.into(),
+                "policy.accounting_overflow",
+                ErrorCategory::Validation,
+            ),
+            (
+                ValidationError::AccountingInvalid.into(),
+                "policy.accounting_invalid",
                 ErrorCategory::Validation,
             ),
             (

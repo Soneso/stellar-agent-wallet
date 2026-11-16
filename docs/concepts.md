@@ -193,10 +193,15 @@ criteria = [
 `deny` keeps the `policy.deny.counterparty_denied` refusal unchanged.
 `approval` requests approval at any amount, with the default approval lifetime
 and a reason that names no address.
-`budget` admits such payments up to `per_tx_stroops` per call and
-`per_period_stroops` per rolling `window`.
-Beyond either bound the call is refused with
-`policy.deny.unlisted_budget_exceeded`.
+`budget` admits such payments without approval up to `per_tx_stroops` per call
+and `per_period_stroops` per rolling `window`.
+On a mainnet profile a payment beyond either bound requests a per-payment
+approval, and the approved payment counts in full against the budget.
+On every other network it is refused with
+`policy.deny.unlisted_budget_exceeded`, because no approval can complete it
+there.
+Every spelling of the budget asset, such as a classic asset and its asset
+contract, counts in one budget.
 `asset` sets the budget's asset and defaults to `native`. A debit in another
 asset keeps the counterparty refusal.
 `approval` and `budget` require `decision = "allow"`, and every other criterion
@@ -253,8 +258,9 @@ keeps the full amount through restarts, resets, and policy changes. A debit
 whose outcome is unresolved stays an individual record. An exhausted allocation refuses with
 `policy.deny.total_budget_exhausted`, which names the maximum and the
 remaining amount. The criterion requires `decision = "allow"`.
-An exhausted allocation or unlisted budget denies the payment; neither
-requests an approval.
+An exhausted allocation denies the payment and requests no approval. An
+approval for a payment beyond an unlisted budget never lifts an allocation,
+a cap, or a rate limit.
 `profile enable-mainnet --check` reports each signed bound's committed use
 and remaining amount in exact stroops, without changing wallet state. The
 report is `null` when the use is unknown, and never zero for unknown history.
@@ -306,7 +312,8 @@ the prepared bytes. An ID of zero is a present memo; IDs retain all 64 bits.
 Text, ID, hash and return memos remain distinct even when their values look
 alike. An empty text memo in an existing envelope remains text, while an empty
 text argument in payment preparation means no memo. Account creation prepares
-with no memo. A bound account therefore requires a payment carrying its memo.
+with no memo. Creating an account at a bound destination is refused, since
+creation carries no memo.
 
 `approval_above` permits amounts at or below its threshold and requests
 approval above it. It uses `asset` and `max_stroops`, with the same units and

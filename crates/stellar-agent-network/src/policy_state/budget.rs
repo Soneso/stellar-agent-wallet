@@ -378,11 +378,14 @@ fn rule_budget(
                 store::window_shares(wire, &key, now_ms, |share, amount, _| {
                     tally.add(share, amount);
                 })
-                .map_err(|reason| BudgetError::Clock {
-                    detail: match reason {
-                        DenyReason::EvaluationError { detail } => detail,
-                        other => other.code().to_owned(),
+                .map_err(|error| match error {
+                    WindowStoreError::PolicyDenied { reason } => BudgetError::Clock {
+                        detail: match *reason {
+                            DenyReason::EvaluationError { detail } => detail,
+                            other => other.code().to_owned(),
+                        },
                     },
+                    other => BudgetError::State(other),
                 })?;
                 Ok(tally.usage(descriptor.cap_stroops)?)
             }

@@ -1632,14 +1632,13 @@ decision = "allow"
         let server = WalletServer::new_with_policy_dir_for_test(profile.clone(), &policies)
             .expect("MCP signed policy");
         for amount in [50_000_000, 150_000_000] {
-            let memo = stellar_agent_network::parse_memo_fields(None, Some(u64::MAX), None, None)
-                .expect("parsed memo");
-            let memo = stellar_agent_core::envelope_decode::ClassicMemo::try_from(&memo)
-                .expect("memo fact");
+            let (_, memo) =
+                stellar_agent_network::memo::parse_memo_with_fact(None, Some(u64::MAX), None, None)
+                    .expect("parsed memo");
+            // Both halves read this one map: the comparison pins the core
+            // derivation, and each surface's own map has its own test.
             let mut policy_args = pay_policy_args(amount, "native", PARITY_DEST_G);
-            for (key, value) in memo.policy_fields() {
-                policy_args[key] = value;
-            }
+            memo.insert_policy_fields(&mut policy_args);
             let cli_result = evaluate_value_moving_policy(
                 cli.as_ref(),
                 &profile,

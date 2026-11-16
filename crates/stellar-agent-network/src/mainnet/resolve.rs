@@ -2519,7 +2519,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn resolve_muxed_unlisted_budget_records_and_refuses_exhaustion() {
+    async fn resolve_muxed_unlisted_budget_records_and_requires_approval_beyond_it() {
         assert_muxed_payees(true).await;
     }
 
@@ -2613,32 +2613,82 @@ mod tests {
                 }).collect();
                 assert_eq!(entries.len(), 1);
                 assert_eq!(entries[0].amount(), 10);
-                // The next payment is another intent: one stroop within the
-                // per-transaction cap that the exhausted shared window refuses.
-                let mut next = root.clone();
-                let SorobanAuthorizedFunction::ContractFn(call) = &mut next.function else {
-                    panic!("transfer");
+                // The next payment is another intent of `amount` beyond the
+                // spent shared window.
+                let next_of = |amount: u64| {
+                    let mut next = root.clone();
+                    let SorobanAuthorizedFunction::ContractFn(call) = &mut next.function else {
+                        panic!("transfer");
+                    };
+                    let mut args = call.args.to_vec();
+                    args[2] = ScVal::I128(stellar_xdr::Int128Parts { hi: 0, lo: amount });
+                    call.args = args.try_into().unwrap();
+                    next
                 };
-                let mut args = call.args.to_vec();
-                args[2] = ScVal::I128(stellar_xdr::Int128Parts { hi: 0, lo: 1 });
-                call.args = args.try_into().unwrap();
-                let before = f.wire();
                 let client = context.primary_client().unwrap();
-                let intent = intent(&next);
-                let approval = intent_approval(&f, &next, None);
+                // Under a policy authority the locked mint counts the open
+                // hold of the first payment, which evaluation does not see,
+                // finds the allowance spent, and writes nothing.
+                let next = next_of(1);
+                let next_intent = intent(&next);
+                let before = f.wire();
+                let policy = policy_authority(&f, AuthorityScope::Classic, f.now, 600_000);
                 let error = resolve_soroban_intent(intent_request(
                     &f,
                     &context,
                     &client,
-                    &intent,
+                    &next_intent,
+                    &policy,
+                ))
+                .await
+                .unwrap_err();
+                assert_eq!(
+                    error,
+                    MainnetAuthorizationError::Accounting(
+                        super::super::AccountingRefusal::ApprovalRequired
+                    )
+                );
+                assert_eq!(
+                    stellar_agent_core::error::WalletError::from(error).code(),
+                    "policy.approval_required"
+                );
+                assert_eq!(f.wire(), before);
+                // A per-payment approval covers the spent allowance and the
+                // payment is still counted in full.
+                let approval = intent_approval(&f, &next, None);
+                let approved = resolve_soroban_intent(intent_request(
+                    &f,
+                    &context,
+                    &client,
+                    &next_intent,
+                    &f.approval_authority(&approval),
+                ))
+                .await
+                .unwrap();
+                let held: Vec<_> = approved.entries().iter().filter(|entry| {
+                    matches!(entry.limit(), stellar_agent_core::policy::v1::criteria::state_store::WindowLimit::Unlisted { .. })
+                }).collect();
+                assert_eq!(held.len(), 1);
+                assert_eq!(held[0].amount(), 1);
+                assert_ne!(f.wire(), before);
+                // An approval never lifts the per-payment cap of 100.
+                let capped = next_of(101);
+                let capped_intent = intent(&capped);
+                let approval = intent_approval(&f, &capped, None);
+                let before = f.wire();
+                let error = resolve_soroban_intent(intent_request(
+                    &f,
+                    &context,
+                    &client,
+                    &capped_intent,
                     &f.approval_authority(&approval),
                 ))
                 .await
                 .unwrap_err();
                 let MainnetAuthorizationError::PolicyDenied(reason) = error else {
-                    panic!("expected budget denial: {error:?}");
+                    panic!("expected the per-payment cap: {error:?}");
                 };
-                assert_eq!(reason.wire_code(), "policy.deny.unlisted_budget_exceeded");
+                assert_eq!(reason.wire_code(), "policy.deny.per_tx_cap_exceeded");
                 assert_eq!(f.wire(), before);
             }
         }
