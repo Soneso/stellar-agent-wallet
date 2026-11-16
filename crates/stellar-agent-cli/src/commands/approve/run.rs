@@ -93,6 +93,12 @@ use stellar_agent_core::error::{ApprovalFailure, ValidationError, WalletError};
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_core::timefmt;
 use stellar_agent_network::keyring::init_platform_keyring_store;
+use stellar_agent_network::operation_entry::{
+    commit_consent, consent_completion, operation_refusal,
+};
+use stellar_agent_network::policy_state::{
+    ApprovalState, ApprovalStatus, ApprovalView, ConsentRow, PersistedWindowStore,
+};
 
 use crate::common::consent::{OperatorRowSink, acquire_operator_row_sink};
 use crate::common::mainnet_presence::{OpenMode, acquire_mainnet_presence_with_mode};
@@ -284,6 +290,13 @@ pub async fn run(args: RunArgs) -> i32 {
     };
 
     let identity = ApproverIdentity::OsUid(our_uid.clone());
+    store = match recover_durable_consent(store, &store_path, &context, &profile, &nonce) {
+        Ok(store) => store,
+        Err(error) => {
+            render::render_json(&Envelope::<()>::err(&error));
+            return 1;
+        }
+    };
     // The CLI only ever constructs an `OsUid` identity, so the allowlist is
     // never consulted; pass an empty slice.
     let entry = match load_and_validate_entry(&store, &nonce, &identity, &[]) {
@@ -409,12 +422,14 @@ struct MainnetApproved {
 /// policy is read again without advancing its pin, and the version 5 consent
 /// is recorded; the attester rechecks the entry, the policy and the
 /// ceremony's deadlines under the store lock.
+/// A linked value approval releases the inbox and commits durable consent
+/// before this function returns success.
 ///
 /// # Errors
 ///
 /// `approval.wrong_kind` for a kind without a mainnet consent path, the
 /// presence refusals of [`acquire_mainnet_presence_with_mode`], and the policy, key,
-/// sink and attester refusals.
+/// sink, attester and durable store refusals.
 async fn approve_mainnet(
     store: PendingApprovalStore,
     store_path: &Path,
@@ -432,6 +447,8 @@ async fn approve_mainnet(
     }
     mainnet_consent_subject(entry, &context.binding())?;
     let authority = MainnetApprovalAuthority::for_profile(&context.profile_name)?;
+    let window = PersistedWindowStore::for_profile(&context.profile_name);
+    let durable = durable_approval(&window, profile, context, entry)?;
     drop(store);
     #[allow(clippy::print_stderr, reason = "CLI operator consent instructions")]
     {
@@ -466,7 +483,7 @@ async fn approve_mainnet(
             profile,
         ),
     )?;
-    let (attestation, audit, _outbox_row) = record_consent(
+    let (attestation, audit, outbox_row) = record_consent(
         &mut store,
         entry,
         &key,
@@ -477,11 +494,153 @@ async fn approve_mainnet(
             policy: &policy,
         },
     )?;
+    let completion = durable
+        .map(|_| {
+            consent_completion(
+                &store,
+                &window,
+                profile,
+                &context.profile_name,
+                &entry.approval_nonce,
+                &policy,
+                outbox_row.map_or(ConsentRow::Written, ConsentRow::Queued),
+            )
+        })
+        .transpose()?;
+    drop(store);
+    if let Some(completion) = completion {
+        commit_consent(&window, profile, &completion)?;
+    }
     Ok(MainnetApproved {
         attestation,
         audit,
         presence: data,
     })
+}
+
+/// Reads the durable record only for mainnet value approvals.
+fn durable_approval(
+    window: &PersistedWindowStore,
+    profile: &Profile,
+    context: &ApprovalContext,
+    entry: &PendingApproval,
+) -> Result<Option<ApprovalView>, WalletError> {
+    if !profile.chain_id.is_mainnet()
+        || !matches!(
+            entry.kind,
+            ApprovalKind::PaymentSimulated { .. }
+                | ApprovalKind::ClaimSimulated { .. }
+                | ApprovalKind::TrustlineSimulated { .. }
+                | ApprovalKind::X402Payment { .. }
+        )
+    {
+        return Ok(None);
+    }
+    init_platform_keyring_store()?;
+    let view = ApprovalStatus::new(window, profile)
+        .find_by_nonce(&entry.approval_nonce)
+        .map_err(operation_refusal)?;
+    if let Some(view) = &view {
+        validate_durable_approval(view, entry, context)?;
+    }
+    Ok(view)
+}
+
+/// Checks the durable disposition and signed inbox facts before consent.
+fn validate_durable_approval(
+    view: &ApprovalView,
+    entry: &PendingApproval,
+    context: &ApprovalContext,
+) -> Result<(), WalletError> {
+    use stellar_agent_core::approval::witness::ApprovedKind;
+
+    let record = &view.record;
+    match record.state {
+        ApprovalState::Revoked => {
+            return Err(WalletError::Approval(ApprovalFailure::Revoked {
+                detail: "this approval has been revoked".to_owned(),
+            }));
+        }
+        ApprovalState::Consumed => {
+            return Err(WalletError::Approval(ApprovalFailure::Consumed {
+                detail: "this approval was already spent on a submission".to_owned(),
+            }));
+        }
+        ApprovalState::Pending => {}
+    }
+    let now = timefmt::now_unix_ms().map_err(|error| {
+        WalletError::Approval(ApprovalFailure::ClockError {
+            detail: error.to_string(),
+        })
+    })?;
+    if now < record.created_at_ms || now >= record.waiting_expires_at_ms {
+        return Err(WalletError::Approval(ApprovalFailure::Expired {
+            detail: "the consent is outside the waiting window".to_owned(),
+        }));
+    }
+    let kind_matches = matches!(
+        (&entry.kind, record.kind),
+        (ApprovalKind::PaymentSimulated { .. }, ApprovedKind::Payment)
+            | (ApprovalKind::ClaimSimulated { .. }, ApprovedKind::Claim)
+            | (
+                ApprovalKind::TrustlineSimulated { .. },
+                ApprovedKind::Trustline
+            )
+            | (ApprovalKind::X402Payment { .. }, ApprovedKind::X402Payment)
+    );
+    if !kind_matches || entry.subject_kind != record.subject_kind {
+        return Err(WalletError::Approval(ApprovalFailure::WrongKind {
+            detail: "the approval does not bind this kind of subject".to_owned(),
+        }));
+    }
+    if mainnet_consent_subject(entry, &context.binding())? != record.subject
+        || entry.created_at_unix_ms != record.created_at_ms
+        || entry.expires_at_unix_ms != record.waiting_expires_at_ms
+    {
+        return Err(WalletError::Approval(ApprovalFailure::AttestationInvalid {
+            detail: "the approval does not match the signed inbox facts".to_owned(),
+        }));
+    }
+    Ok(())
+}
+
+/// Completes an attested entry from its authenticated receipt before ordinary
+/// entry validation returns the existing attested refusal.
+fn recover_durable_consent(
+    store: PendingApprovalStore,
+    store_path: &Path,
+    context: &ApprovalContext,
+    profile: &Profile,
+    nonce: &str,
+) -> Result<PendingApprovalStore, WalletError> {
+    let Some(entry) = store
+        .get(nonce)
+        .filter(|entry| entry.attestation_blob_b64.is_some())
+    else {
+        return Ok(store);
+    };
+    let window = PersistedWindowStore::for_profile(&context.profile_name);
+    if durable_approval(&window, profile, context, entry)?
+        .is_none_or(|view| view.record.consent.is_some())
+    {
+        return Ok(store);
+    }
+    let policy = MainnetApprovalAuthority::for_profile(&context.profile_name)?
+        .load_current_compare_only()?
+        .into_policy();
+    let completion = consent_completion(
+        &store,
+        &window,
+        profile,
+        &context.profile_name,
+        nonce,
+        &policy,
+        ConsentRow::Recovered,
+    )?;
+    drop(store);
+    commit_consent(&window, profile, &completion)?;
+    open_with_retry(store_path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF)
+        .map_err(|error| super::common::approval_store_open_error(&error))
 }
 
 /// Where `approve --id` wrote its consent row, reported as the success
@@ -1342,6 +1501,910 @@ mod tests {
     use stellar_agent_core::profile::schema::KeyringEntryRef;
     use stellar_agent_test_support::{StellarAgentHomeGuard, keyring_mock};
     use tempfile::TempDir;
+
+    #[cfg(feature = "test-helpers")]
+    mod durable {
+        #![allow(clippy::panic, reason = "crash simulation and test assertions")]
+
+        use super::*;
+        use crate::common::mainnet_presence::driver;
+        use sha2::Digest as _;
+        use stellar_agent_core::approval::mainnet_fixtures::MainnetConsentFixture;
+        use stellar_agent_core::approval::witness::ApprovedKind;
+        use stellar_agent_core::audit_log::PolicyDecision;
+        use stellar_agent_network::operation_entry::pending_approval_facts;
+        use stellar_agent_network::policy_state::store::commit_faults::{
+            COMMIT_FAULT_AFTER_COUNTER, COMMIT_FAULT_AFTER_PREPARED, arm_accounting_fault,
+            observe_commit,
+        };
+        use stellar_agent_network::policy_state::{
+            ApprovalRecorder, BusinessId, IntentSlot, OpenOutcome, OpenRequest, OperationAudit,
+            OperationKind, OperationRecorder, OperationTool, RowProvenance, WireApproval,
+            X402Intent, approvals::facade_calls,
+        };
+
+        struct Rows;
+        impl OperationAudit for Rows {
+            fn append(
+                &mut self,
+                _: stellar_agent_core::audit_log::AuditEntry,
+            ) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        fn fixture(name: &str) -> MainnetConsentFixture {
+            let fixture = MainnetConsentFixture::new(name);
+            let key = &fixture.profile().audit_log_hash_chain_key_id;
+            stellar_agent_network::keyring::rotate_keyring_secret_32(&key.service, &key.account)
+                .unwrap();
+            fixture
+        }
+
+        fn park(fixture: &MainnetConsentFixture, entry: &PendingApproval) -> WireApproval {
+            let window = PersistedWindowStore::for_profile(fixture.name());
+            let (kind, tool, approved, intent, envelope) = match &entry.kind {
+                ApprovalKind::X402Payment {
+                    intent_digest,
+                    asset,
+                    payee,
+                    amount,
+                    ..
+                } => (
+                    OperationKind::X402Payment,
+                    OperationTool::X402CreatePayment,
+                    ApprovedKind::X402Payment,
+                    IntentSlot::X402 {
+                        intent_digest: *intent_digest,
+                        intent: X402Intent {
+                            network: fixture.profile().chain_id.caip2_str().to_owned(),
+                            asset: asset.clone(),
+                            payer: stellar_strkey::ed25519::PublicKey([1; 32])
+                                .to_string()
+                                .to_string(),
+                            pay_to: payee.clone(),
+                            amount: amount.clone(),
+                        },
+                    },
+                    None,
+                ),
+                other => {
+                    let (kind, tool, approved, xdr) = match other {
+                        ApprovalKind::PaymentSimulated {
+                            envelope_xdr_b64, ..
+                        } => (
+                            OperationKind::Pay,
+                            OperationTool::StellarPay,
+                            ApprovedKind::Payment,
+                            envelope_xdr_b64,
+                        ),
+                        ApprovalKind::ClaimSimulated {
+                            envelope_xdr_b64, ..
+                        } => (
+                            OperationKind::Claim,
+                            OperationTool::StellarClaim,
+                            ApprovedKind::Claim,
+                            envelope_xdr_b64,
+                        ),
+                        ApprovalKind::TrustlineSimulated {
+                            envelope_xdr_b64, ..
+                        } => (
+                            OperationKind::Trustline,
+                            OperationTool::StellarTrustline,
+                            ApprovedKind::Trustline,
+                            envelope_xdr_b64,
+                        ),
+                        _ => unreachable!(),
+                    };
+                    (
+                        kind,
+                        tool,
+                        approved,
+                        stellar_agent_network::operation_entry::envelope_slot(&[7; 32], xdr, 0),
+                        Some(xdr.clone()),
+                    )
+                }
+            };
+            let opened = OperationRecorder::new(&window, fixture.profile(), &mut Rows, "fixture")
+                .open(&OpenRequest {
+                    business_id: BusinessId::parse(fixture.name()).unwrap(),
+                    tool,
+                    kind,
+                    intent,
+                    envelope_xdr: envelope,
+                    prepared_decision: None,
+                    rule_ttl_ms: None,
+                })
+                .unwrap();
+            let OpenOutcome::New(handle) = opened else {
+                unreachable!()
+            };
+            let mut pending = PendingApprovalStore::open(fixture.store_path()).unwrap();
+            pending
+                .insert(entry.clone(), entry.created_at_unix_ms)
+                .unwrap();
+            drop(pending);
+            let facts = pending_approval_facts(
+                entry,
+                &handle,
+                approved,
+                mainnet_consent_subject(entry, &fixture.binding()).unwrap(),
+                entry.expires_at_unix_ms - entry.created_at_unix_ms,
+            );
+            ApprovalRecorder::new(&window, fixture.profile(), &mut Rows, "fixture")
+                .open_pending(handle.id(), &facts, PolicyDecision::RequireApproval)
+                .unwrap()
+                .record
+        }
+
+        fn record(fixture: &MainnetConsentFixture, nonce: &str) -> WireApproval {
+            ApprovalStatus::new(
+                &PersistedWindowStore::for_profile(fixture.name()),
+                fixture.profile(),
+            )
+            .find_by_nonce(nonce)
+            .unwrap()
+            .unwrap()
+            .record
+        }
+
+        fn stored(fixture: &MainnetConsentFixture, nonce: &str) -> PendingApproval {
+            PendingApprovalStore::open(fixture.store_path())
+                .unwrap()
+                .get(nonce)
+                .unwrap()
+                .clone()
+        }
+
+        async fn invoke(name: &str, nonce: &str, yes: bool) -> (i32, serde_json::Value) {
+            crate::common::render::take_rendered_for_test();
+            let code = run(RunArgs {
+                id: Some(nonce.to_owned()),
+                profile: Some(name.to_owned()),
+                yes,
+                open_by_operator: false,
+            })
+            .await;
+            let rendered = crate::common::render::take_rendered_for_test();
+            assert_eq!(rendered.len(), 1, "one terminal envelope");
+            (code, rendered[0].clone())
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn approve_run_records_durable_consent() {
+            for kind in 0..4 {
+                let fixture = fixture(&format!("approve-durable-{kind}"));
+                let uid = process_uid_for_attestation().unwrap();
+                let source = stellar_strkey::ed25519::PublicKey([1; 32]).to_string();
+                let issuer = stellar_strkey::ed25519::PublicKey([2; 32]).to_string();
+                let entry = match kind {
+                    0 => fixture.payment(300_000),
+                    1 => fixtures::claim_pending(
+                        &source,
+                        [3; 32],
+                        Some(("XLM", 10)),
+                        100,
+                        7,
+                        uid,
+                        300_000,
+                    ),
+                    2 => fixtures::trustline_pending(
+                        &source,
+                        "USD",
+                        &issuer,
+                        Some(10),
+                        100,
+                        7,
+                        uid,
+                        3_600_000,
+                    ),
+                    _ => PendingApproval::new_x402_pending(
+                        &sha2::Sha256::digest(
+                            fixture.profile().chain_id.network_passphrase().as_bytes(),
+                        )
+                        .into(),
+                        &stellar_agent_test_support::xdr_fixtures::destination_transfer(
+                            stellar_xdr::ScAddress::Account(stellar_xdr::AccountId(
+                                stellar_xdr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256(
+                                    [5; 32],
+                                )),
+                            )),
+                        ),
+                        None,
+                        uid,
+                        3_600_000,
+                    )
+                    .unwrap(),
+                };
+                let before = park(&fixture, &entry);
+                let _driver = driver::install(driver::fixture_credential());
+                let (code, output) = invoke(fixture.name(), &entry.approval_nonce, false).await;
+                assert_eq!(code, 0, "{output}");
+                let after = record(&fixture, &entry.approval_nonce);
+                assert!(after.consent.is_some(), "success requires durable consent");
+                assert_eq!(after.operation_id, before.operation_id);
+                assert_eq!(after.subject, before.subject);
+                let consent = after.consent.unwrap();
+                let attested = stored(&fixture, &entry.approval_nonce);
+                let receipt = attested.mainnet_presence.unwrap();
+                assert_eq!(consent.consent_at_ms, receipt.verified_at_unix_ms());
+                assert_eq!(
+                    consent.execution_expires_at_ms,
+                    consent.consent_at_ms + before.rule_ttl_ms.min(900_000)
+                );
+                let payload = consent.payload.unwrap();
+                assert_eq!(payload.receipt, receipt);
+                assert_eq!(payload.process_uid, attested.process_uid);
+                assert_eq!(
+                    URL_SAFE_NO_PAD.encode(payload.attestation),
+                    output["data"]["approval_attestation"]
+                );
+                assert_eq!(payload.row_provenance, Some(RowProvenance::Written));
+                assert_eq!(payload.outbox_row, None);
+                assert_eq!(consent_rows(fixture.profile()).len(), 1);
+                assert_eq!(driver::ceremonies().len(), 1);
+            }
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn approve_run_success_follows_the_durable_commit() {
+            for point in [COMMIT_FAULT_AFTER_PREPARED, COMMIT_FAULT_AFTER_COUNTER] {
+                let fixture = fixture(&format!("approve-commit-{point}"));
+                let entry = fixture.payment(300_000);
+                park(&fixture, &entry);
+                let _driver = driver::install(driver::fixture_credential());
+                let path = fixture.store_path();
+                let observed = observe_commit(move |_| {
+                    assert!(
+                        PendingApprovalStore::open(path.clone()).is_ok(),
+                        "inbox is released at commit"
+                    );
+                    assert!(
+                        crate::common::render::take_rendered_for_test().is_empty(),
+                        "commit precedes rendering"
+                    );
+                });
+                let fault = arm_accounting_fault(point);
+                let (code, output) = invoke(fixture.name(), &entry.approval_nonce, false).await;
+                drop(fault);
+                drop(observed);
+                assert_eq!(code, 1, "a failed commit refuses success");
+                assert_eq!(output["error"]["code"], "submission.record_unavailable");
+                assert!(output.get("data").is_none());
+                assert!(
+                    stored(&fixture, &entry.approval_nonce)
+                        .attestation_blob_b64
+                        .is_some()
+                );
+                assert_eq!(
+                    record(&fixture, &entry.approval_nonce).consent.is_some(),
+                    point == COMMIT_FAULT_AFTER_COUNTER
+                );
+                let (retry, output) = invoke(fixture.name(), &entry.approval_nonce, false).await;
+                assert_eq!(retry, 1);
+                assert_eq!(output["error"]["code"], "approval.already_attested");
+                assert!(record(&fixture, &entry.approval_nonce).consent.is_some());
+                assert_eq!(driver::ceremonies().len(), 1);
+                assert_eq!(consent_rows(fixture.profile()).len(), 1);
+            }
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn approve_run_recovers_an_attested_entry_without_a_ceremony() {
+            for offset in [-1_i64, 5_000, 4_000_000] {
+                let fixture = fixture(&format!("approve-recover-{offset}"));
+                let entry = fixture.payment(300_000);
+                park(&fixture, &entry);
+                let _driver = driver::install(driver::fixture_credential());
+                let fault = arm_accounting_fault(COMMIT_FAULT_AFTER_PREPARED);
+                assert_eq!(
+                    invoke(fixture.name(), &entry.approval_nonce, false).await.0,
+                    1
+                );
+                drop(fault);
+                let attested = stored(&fixture, &entry.approval_nonce);
+                let receipt = attested.mainnet_presence.as_ref().unwrap();
+                let expected = load_and_validate_entry(
+                    &PendingApprovalStore::open(fixture.store_path()).unwrap(),
+                    &entry.approval_nonce,
+                    &ApproverIdentity::OsUid(entry.process_uid.clone()),
+                    &[],
+                )
+                .unwrap_err();
+                let expected = serde_json::to_value(Envelope::<()>::err(&expected)).unwrap();
+                let clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(
+                    receipt
+                        .verified_at_unix_ms()
+                        .checked_add_signed(offset)
+                        .unwrap(),
+                );
+                let before = std::fs::read(fixture.store_path()).unwrap();
+                let path = fixture.store_path();
+                let commits = std::rc::Rc::new(std::cell::Cell::new(0));
+                let observed_commits = commits.clone();
+                let observed = observe_commit(move |_| {
+                    assert!(
+                        PendingApprovalStore::open(path.clone()).is_ok(),
+                        "recovery releases the inbox before durable commit"
+                    );
+                    observed_commits.set(observed_commits.get() + 1);
+                });
+                let (code, output) = invoke(fixture.name(), &entry.approval_nonce, false).await;
+                drop(observed);
+                assert!(commits.get() > 0, "recovery reaches durable commit");
+                assert_eq!(code, 1);
+                assert_eq!(
+                    serde_json::to_string(&output["error"]).unwrap(),
+                    serde_json::to_string(&expected["error"]).unwrap()
+                );
+                let consent = record(&fixture, &entry.approval_nonce)
+                    .consent
+                    .expect("recovery records consent");
+                assert_eq!(
+                    consent.consent_at_ms,
+                    receipt.verified_at_unix_ms(),
+                    "recovery keeps the receipt clock"
+                );
+                assert_eq!(
+                    consent.execution_expires_at_ms,
+                    receipt.verified_at_unix_ms() + 300_000
+                );
+                if offset < 300_000 {
+                    let payload = consent.payload.unwrap();
+                    assert_eq!(payload.receipt, *receipt);
+                    assert_eq!(payload.row_provenance, Some(RowProvenance::Recovered));
+                    assert_eq!(payload.outbox_row, None);
+                }
+                let window = PersistedWindowStore::for_profile(fixture.name());
+                let bytes = std::fs::read(window.path()).unwrap();
+                assert_eq!(
+                    invoke(fixture.name(), &entry.approval_nonce, false).await.1["error"],
+                    expected["error"]
+                );
+                assert_eq!(
+                    std::fs::read(window.path()).unwrap(),
+                    bytes,
+                    "repeat writes no generation"
+                );
+                assert_eq!(std::fs::read(fixture.store_path()).unwrap(), before);
+                assert_eq!(driver::ceremonies().len(), 1);
+                assert_eq!(consent_rows(fixture.profile()).len(), 1);
+                let view = ApprovalStatus::new(&window, fixture.profile())
+                    .find_by_nonce(&entry.approval_nonce)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(view.expired, offset >= 300_000);
+                drop(clock);
+            }
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn approve_run_recovery_installs_the_keyring_before_reading() {
+            use stellar_agent_test_support::env_guard::ScopedEnvVar;
+
+            let fixture = fixture("approve-keyring-recovery");
+            let entry = fixture.payment(300_000);
+            park(&fixture, &entry);
+            let credentials: Vec<_> = KeyringEntry::search(&std::collections::HashMap::new())
+                .unwrap()
+                .into_iter()
+                .filter_map(|entry| {
+                    entry.get_secret().ok().map(|secret| {
+                        (
+                            entry.get_specifiers().unwrap(),
+                            zeroize::Zeroizing::new(secret),
+                        )
+                    })
+                })
+                .collect();
+            let _backend = ScopedEnvVar::new(
+                "STELLAR_AGENT_KEYRING_BACKEND",
+                Some(std::ffi::OsStr::new("headless-env")),
+            );
+            let key = URL_SAFE_NO_PAD.encode([42; 32]);
+            let _key = ScopedEnvVar::new(
+                "STELLAR_AGENT_HEADLESS_KEYRING_KEY",
+                Some(std::ffi::OsStr::new(&key)),
+            );
+            let _store = keyring_mock::DefaultStoreGuard::cleared();
+            init_platform_keyring_store().unwrap();
+            for ((service, account), secret) in credentials {
+                KeyringEntry::new(&service, &account)
+                    .unwrap()
+                    .set_secret(&secret)
+                    .unwrap();
+            }
+            let _driver = driver::install(driver::fixture_credential());
+            let fault = arm_accounting_fault(COMMIT_FAULT_AFTER_PREPARED);
+            assert_eq!(
+                invoke(fixture.name(), &entry.approval_nonce, false).await.0,
+                1
+            );
+            drop(fault);
+            assert!(record(&fixture, &entry.approval_nonce).consent.is_none());
+            keyring_core::unset_default_store();
+            assert!(keyring_core::get_default_store().is_none());
+            let (code, output) = invoke(fixture.name(), &entry.approval_nonce, false).await;
+            assert_eq!(code, 1);
+            assert_eq!(
+                output["error"]["code"], "approval.already_attested",
+                "recovery installs the keyring before its first window read"
+            );
+            assert!(record(&fixture, &entry.approval_nonce).consent.is_some());
+            assert_eq!(driver::ceremonies().len(), 1);
+            assert_eq!(consent_rows(fixture.profile()).len(), 1);
+        }
+
+        fn edit_record(fixture: &MainnetConsentFixture, edit: impl FnOnce(&mut WireApproval)) {
+            use hmac::{KeyInit as _, Mac as _};
+
+            let window = PersistedWindowStore::for_profile(fixture.name());
+            let bytes = std::fs::read(window.path()).unwrap();
+            let wire: serde_json::Value = serde_json::from_slice(&bytes[32..]).unwrap();
+            assert!(wire.get("prepared").is_none());
+            let mut record: WireApproval =
+                serde_json::from_value(wire["approvals"]["records"][0].clone()).unwrap();
+            let original = serde_json::to_string(&record).unwrap();
+            edit(&mut record);
+            let body = std::str::from_utf8(&bytes[32..]).unwrap();
+            assert!(body.contains(&original));
+            let body = body.replace(&original, &serde_json::to_string(&record).unwrap());
+            let key = stellar_agent_network::keyring::load_hmac_key_32(
+                &fixture.profile().policy_window_state_key_id,
+            )
+            .unwrap();
+            let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(&key[..]).unwrap();
+            mac.update(b"stellar-agent-policy-window/v1/body\0");
+            mac.update(body.as_bytes());
+            let mut authenticated = mac.finalize().into_bytes().to_vec();
+            authenticated.extend_from_slice(body.as_bytes());
+            std::fs::write(window.path(), authenticated).unwrap();
+            let key_ref = &fixture.profile().policy_window_state_key_id;
+            KeyringEntry::new(
+                &key_ref.service,
+                &stellar_agent_core::profile::schema::generation_account(&key_ref.account),
+            )
+            .unwrap()
+            .set_password(&serde_json::json!({
+                "generation": wire["generation"],
+                "body_sha256": stellar_agent_core::hex::encode(&sha2::Sha256::digest(body.as_bytes())),
+            }).to_string())
+            .unwrap();
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn approve_run_refuses_invalid_records_before_consent_and_recovery() {
+            for recovery in [false, true] {
+                for (case, expected) in [
+                    ("revoked", "approval.revoked"),
+                    ("consumed", "approval.consumed"),
+                    ("expired", "approval.expired"),
+                    ("kind", "approval.wrong_kind"),
+                    ("subject_kind", "approval.wrong_kind"),
+                    ("subject", "approval.attestation_invalid"),
+                    ("clocks", "approval.attestation_invalid"),
+                ] {
+                    let fixture = fixture(&format!("approve-invalid-{case}-{recovery}"));
+                    let entry = fixture.payment(300_000);
+                    park(&fixture, &entry);
+                    let _driver = driver::install(driver::fixture_credential());
+                    if recovery || case == "consumed" {
+                        assert_eq!(
+                            invoke(fixture.name(), &entry.approval_nonce, false).await.0,
+                            0
+                        );
+                    }
+                    if !recovery && case == "consumed" {
+                        let mut inbox = PendingApprovalStore::open(fixture.store_path()).unwrap();
+                        inbox.remove(&entry.approval_nonce).unwrap();
+                        inbox
+                            .insert(entry.clone(), entry.created_at_unix_ms)
+                            .unwrap();
+                    }
+                    edit_record(&fixture, |record| {
+                        if recovery && case != "consumed" {
+                            record.consent = None;
+                        }
+                        match case {
+                            "revoked" => {
+                                record.state = ApprovalState::Revoked;
+                                record.revoked_at_ms = Some(record.created_at_ms);
+                            }
+                            "consumed" => {
+                                record.state = ApprovalState::Consumed;
+                                record.consumed_at_ms =
+                                    Some(record.consent.as_ref().unwrap().consent_at_ms);
+                            }
+                            "expired" => {
+                                record.created_at_ms -= 300_000;
+                                record.waiting_expires_at_ms -= 300_000;
+                            }
+                            "kind" => record.kind = ApprovedKind::Claim,
+                            "subject_kind" => {
+                                record.subject_kind =
+                                    stellar_agent_core::approval::subject::SubjectKind::IntentDigest
+                            }
+                            "subject" => record.subject = [8; 32],
+                            "clocks" => {
+                                record.created_at_ms -= 1;
+                                record.waiting_expires_at_ms -= 1;
+                            }
+                            _ => unreachable!(),
+                        }
+                    });
+                    let before = record(&fixture, &entry.approval_nonce);
+                    let inbox = std::fs::read(fixture.store_path()).unwrap();
+                    let rows = consent_rows(fixture.profile()).len();
+                    let ceremonies = driver::ceremonies().len();
+                    let (code, output) = invoke(fixture.name(), &entry.approval_nonce, false).await;
+                    assert_eq!(code, 1, "{case}, recovery={recovery}: {output}");
+                    assert_eq!(
+                        output["error"]["code"], expected,
+                        "durable state refuses before consent: {case}, recovery={recovery}"
+                    );
+                    assert_eq!(
+                        consent_rows(fixture.profile()).len(),
+                        rows,
+                        "refusal writes no consent row"
+                    );
+                    assert_eq!(
+                        driver::ceremonies().len(),
+                        ceremonies,
+                        "refusal starts no presence ceremony"
+                    );
+                    assert_eq!(
+                        std::fs::read(fixture.store_path()).unwrap(),
+                        inbox,
+                        "refusal changes no attestation"
+                    );
+                    assert_eq!(
+                        record(&fixture, &entry.approval_nonce),
+                        before,
+                        "refusal commits no consent"
+                    );
+                }
+            }
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn approve_run_row_only_crash_reuses_the_nonce() {
+            let fixture = fixture("approve-row-crash");
+            let entry = fixture.payment(300_000);
+            park(&fixture, &entry);
+            let _driver = driver::install(driver::fixture_credential());
+            stellar_agent_core::approval::attest::consent_test_seam::on_written(
+                &fixture.store_path(),
+                || {
+                    panic!("simulated row-only crash");
+                },
+            );
+            let mut future = Box::pin(invoke(fixture.name(), &entry.approval_nonce, false));
+            let crashed = std::future::poll_fn(|cx| {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    std::future::Future::poll(future.as_mut(), cx)
+                })) {
+                    Ok(std::task::Poll::Ready(_)) => std::task::Poll::Ready(false),
+                    Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+                    Err(_) => std::task::Poll::Ready(true),
+                }
+            })
+            .await;
+            assert!(crashed);
+            drop(future);
+            AuditWriterRegistry::remove_for_test(fixture.name());
+            assert!(
+                stored(&fixture, &entry.approval_nonce)
+                    .attestation_blob_b64
+                    .is_none()
+            );
+            assert!(record(&fixture, &entry.approval_nonce).consent.is_none());
+            assert_eq!(
+                invoke(fixture.name(), &entry.approval_nonce, false).await.0,
+                0
+            );
+            assert!(
+                record(&fixture, &entry.approval_nonce).consent.is_some(),
+                "the retry commits consent"
+            );
+            assert_eq!(driver::ceremonies().len(), 2);
+            let rows = consent_rows(fixture.profile());
+            assert_eq!(rows.len(), 2);
+            assert!(rows.iter().all(|row| {
+                entry
+                    .approval_nonce
+                    .starts_with(row["nonce_prefix"].as_str().unwrap())
+            }));
+            assert_eq!(
+                PendingApprovalStore::open(fixture.store_path())
+                    .unwrap()
+                    .snapshot(0)
+                    .len(),
+                1
+            );
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn contended_approve_run_records_durable_consent_and_queues_the_row() {
+            use std::io::{BufRead, Read};
+            use std::process::{Command, Stdio};
+            if let Some(path) = std::env::var_os("APPROVE_WRITER_CHILD") {
+                let path = PathBuf::from(path);
+                let lock = |suffix: &str| {
+                    let mut name = path.as_os_str().to_owned();
+                    name.push(suffix);
+                    stellar_agent_core::audit_log::test_helpers::hold_audit_lock(Path::new(&name))
+                        .unwrap()
+                };
+                let _writer = lock(".lock");
+                let _drain = lock(".drain.lock");
+                std::io::stdout().write_all(b"writer ready\n").unwrap();
+                std::io::stdout().flush().unwrap();
+                std::io::stdin().read_exact(&mut [0]).unwrap();
+                return;
+            }
+            let fixture = fixture("approve-contended");
+            let entry = fixture.payment(300_000);
+            park(&fixture, &entry);
+            let mut writer = AuditWriter::open(
+                fixture.audit_path(),
+                Some(
+                    stellar_agent_network::keyring::keyed_audit_access(
+                        fixture.profile(),
+                        fixture.name(),
+                        stellar_agent_core::audit_log::BindingCheck::Enforce,
+                    )
+                    .unwrap(),
+                ),
+            )
+            .unwrap();
+            writer.initialize_consent_evidence().unwrap();
+            drop(writer);
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "commands::approve::run::tests::durable::contended_approve_run_records_durable_consent_and_queues_the_row", "--nocapture"])
+                .env("APPROVE_WRITER_CHILD", fixture.audit_path())
+                .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+            let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+            loop {
+                let mut line = String::new();
+                assert_ne!(
+                    output.read_line(&mut line).unwrap(),
+                    0,
+                    "child acquires writer locks"
+                );
+                if line.contains("writer ready") {
+                    break;
+                }
+            }
+            let _driver = driver::install(driver::fixture_credential());
+            let (code, result) = invoke(fixture.name(), &entry.approval_nonce, false).await;
+            child.stdin.take().unwrap().write_all(&[1]).unwrap();
+            assert!(child.wait().unwrap().success());
+            assert_eq!(code, 0, "{result}");
+            assert_eq!(result["data"]["audit"], "queued");
+            assert_eq!(result["data"]["audit_code"], "audit.outbox_queued");
+            let consent = record(&fixture, &entry.approval_nonce)
+                .consent
+                .expect("queued consent commits in this process");
+            let payload = consent.payload.unwrap();
+            let reference = payload
+                .outbox_row
+                .expect("queued reference stays in the durable record");
+            assert_eq!(payload.row_provenance, None);
+            let bytes = std::fs::read(stellar_agent_core::audit_log::outbox_path(
+                &fixture.audit_path(),
+            ))
+            .unwrap();
+            let line = bytes
+                .split(|byte| *byte == b'\n')
+                .rfind(|line| !line.is_empty())
+                .unwrap();
+            let (_, digest) =
+                stellar_agent_core::audit_log::outbox::test_seam::delivered_row_digest(line)
+                    .unwrap();
+            let row: serde_json::Value = serde_json::from_slice(line).unwrap();
+            assert_eq!(*reference.digest(), digest);
+            assert_eq!(reference.generation(), row["g"].as_u64().unwrap());
+            assert_eq!(reference.sequence(), row["s"].as_u64().unwrap());
+            assert!(consent_rows(fixture.profile()).is_empty());
+            assert_eq!(inspect_outbox(&fixture.audit_path()).unwrap().pending, 1);
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn excluded_entries_keep_their_consent_path() {
+            let fixture = fixture("approve-excluded");
+            let entry = PendingApproval::new_trustline_clawback_opt_in_pending(
+                fixture.profile().chain_id.caip2_str().into(),
+                "USD".into(),
+                stellar_strkey::ed25519::PublicKey([2; 32])
+                    .to_string()
+                    .to_string(),
+                process_uid_for_attestation().unwrap(),
+                300_000,
+            )
+            .unwrap();
+            PendingApprovalStore::open(fixture.store_path())
+                .unwrap()
+                .insert(entry.clone(), entry.created_at_unix_ms)
+                .unwrap();
+            let _driver = driver::install(driver::fixture_credential());
+            let window = PersistedWindowStore::for_profile(fixture.name());
+            let before = facade_calls::count(window.path());
+            let (code, output) = invoke(fixture.name(), &entry.approval_nonce, false).await;
+            assert_eq!(code, 0, "{output}");
+            assert!(output["data"].get("approval_attestation").is_none());
+            assert_eq!(
+                invoke(fixture.name(), &entry.approval_nonce, false).await.1["error"]["code"],
+                "approval.already_attested"
+            );
+            assert_eq!(
+                facade_calls::count(window.path()),
+                before,
+                "excluded kinds make no facade call"
+            );
+            assert_eq!(consent_rows(fixture.profile()).len(), 1);
+            let registration = PendingApproval::new_register_passkey_pending(
+                "CAAAA...BBBBB".to_owned(),
+                vec![1],
+                [1; 32],
+                stellar_agent_core::approval::MAINNET_APPROVAL_RP_ID.to_owned(),
+                [2; 32],
+                process_uid_for_attestation().unwrap(),
+                300_000,
+            )
+            .unwrap();
+            PendingApprovalStore::open(fixture.store_path())
+                .unwrap()
+                .insert(registration.clone(), registration.created_at_unix_ms)
+                .unwrap();
+            let (code, output) = invoke(fixture.name(), &registration.approval_nonce, false).await;
+            assert_eq!(code, 1);
+            assert_eq!(output["error"]["code"], "approval.wrong_kind");
+            assert_eq!(facade_calls::count(window.path()), before);
+            assert_eq!(driver::ceremonies().len(), 1);
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn approve_run_refuses_a_forged_recovery() {
+            let fixture = fixture("approve-forged-recovery");
+            let entry = fixture.payment(300_000);
+            park(&fixture, &entry);
+            let _driver = driver::install(driver::fixture_credential());
+            let fault = arm_accounting_fault(COMMIT_FAULT_AFTER_PREPARED);
+            assert_eq!(
+                invoke(fixture.name(), &entry.approval_nonce, false).await.0,
+                1
+            );
+            drop(fault);
+            let attested = stored(&fixture, &entry.approval_nonce);
+            let text = std::fs::read_to_string(fixture.store_path()).unwrap();
+            std::fs::write(
+                fixture.store_path(),
+                text.replace(
+                    attested.attestation_blob_b64.as_ref().unwrap(),
+                    &URL_SAFE_NO_PAD.encode([9; 32]),
+                ),
+            )
+            .unwrap();
+            let window = PersistedWindowStore::for_profile(fixture.name());
+            let before = std::fs::read(window.path()).unwrap();
+            let (code, output) = invoke(fixture.name(), &entry.approval_nonce, false).await;
+            assert_eq!(code, 1);
+            assert_eq!(
+                output["error"]["code"], "approval.attestation_invalid",
+                "recovery authenticates the stored blob"
+            );
+            assert_eq!(std::fs::read(window.path()).unwrap(), before);
+            assert!(record(&fixture, &entry.approval_nonce).consent.is_none());
+            assert_eq!(driver::ceremonies().len(), 1);
+            assert_eq!(consent_rows(fixture.profile()).len(), 1);
+        }
+
+        #[test]
+        #[serial]
+        fn concurrent_approve_runs_keep_one_consent() {
+            let fixture = fixture("approve-concurrent");
+            let entry = fixture.payment(300_000);
+            let before = park(&fixture, &entry);
+            let (held_tx, held_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            stellar_agent_core::approval::attest::consent_test_seam::on_written(
+                &fixture.store_path(),
+                move || {
+                    held_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+                },
+            );
+            let name = fixture.name().to_owned();
+            let nonce = entry.approval_nonce.clone();
+            let first = std::thread::spawn(move || {
+                let _driver = driver::install(driver::fixture_credential());
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(invoke(&name, &nonce, false))
+            });
+            held_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let refusal = runtime.block_on(invoke(fixture.name(), &entry.approval_nonce, false));
+            release_tx.send(()).unwrap();
+            let approved = first.join().unwrap();
+            assert_eq!(refusal.0, 1);
+            assert_eq!(
+                refusal.1["error"]["code"], "approval.writer_locked",
+                "the concurrent run meets the held inbox"
+            );
+            assert_eq!(
+                refusal.1["error"]["message"],
+                "approval store is locked by another writer"
+            );
+            assert_eq!(approved.0, 0, "{:?}", approved.1);
+            let committed = record(&fixture, &entry.approval_nonce);
+            let repeat = runtime.block_on(invoke(fixture.name(), &entry.approval_nonce, false));
+            assert_eq!(repeat.0, 1);
+            assert_eq!(repeat.1["error"]["code"], "approval.already_attested");
+            let after = record(&fixture, &entry.approval_nonce);
+            assert_eq!(after, committed, "the repeat keeps the single consent");
+            assert_eq!(after.operation_id, before.operation_id);
+            let consent = after
+                .consent
+                .expect("concurrent approval retains durable consent");
+            assert_eq!(
+                consent.payload.unwrap().receipt,
+                stored(&fixture, &entry.approval_nonce)
+                    .mainnet_presence
+                    .unwrap()
+            );
+            assert_eq!(consent_rows(fixture.profile()).len(), 1);
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn testnet_consent_calls_no_facade() {
+            let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _home = StellarAgentHomeGuard::new(sandbox.path());
+            keyring_mock::install().unwrap();
+            let dir = TempDir::new().unwrap();
+            let name = "approve-testnet-durable";
+            let profile = consent_profile(name, &dir, true);
+            seed_key_32(
+                &profile.attestation_key_id.service,
+                &profile.attestation_key_id.account,
+            );
+            stellar_agent_core::profile::loader::save(name, &profile).unwrap();
+            let mut entry = make_entry(300_000);
+            entry.process_uid = process_uid_for_attestation().unwrap();
+            PendingApprovalStore::open(build_store_path(name).unwrap())
+                .unwrap()
+                .insert(entry.clone(), entry.created_at_unix_ms)
+                .unwrap();
+            let window = PersistedWindowStore::for_profile(name);
+            let before = facade_calls::count(window.path());
+            assert_eq!(invoke(name, &entry.approval_nonce, true).await.0, 0);
+            assert_eq!(
+                invoke(name, &entry.approval_nonce, true).await.1["error"]["code"],
+                "approval.already_attested"
+            );
+            assert_eq!(
+                facade_calls::count(window.path()),
+                before,
+                "testnet makes no facade call"
+            );
+            assert_eq!(consent_rows(&profile).len(), 1);
+        }
+    }
 
     #[derive(Parser)]
     struct Harness {

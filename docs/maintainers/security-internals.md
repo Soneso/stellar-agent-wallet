@@ -1965,6 +1965,20 @@ and record, and the waiting expiry ends both. A rerun therefore converges on
 one nonce per operation. A queued consent row's outbox reference stays in the
 payload. A payload without one names its row `written` or `recovered`.
 
+`approve --id` completes an existing mainnet value record after its consent row
+and inbox attestation persist. It releases the inbox before committing consent
+under the window lock, then reports success. A queued row retains its exact
+outbox reference, and this process commits consent while another process holds
+the audit writer. Reporting does not wait for delivery. A failed commit returns
+the store's refusal code and retains the attested entry. Repeating the command
+authenticates that entry's receipt and completes missing consent with its
+original timestamp and `recovered` provenance. It then returns
+`approval.already_attested`. A revoked, consumed or expired record, or one that
+does not match the inbox entry, refuses with its approval code before presence
+and before recovery. These refusals write nothing. An already consented record
+writes nothing on this path. Testnet, clawback opt-ins, and credential
+registration keep their consent paths without accessing durable approval records.
+
 Consent retains the attestation, receipt and signed process identifier for
 reconstruction. The record supplies the signed nonce, kind, subject and
 lifetime; the authenticated file supplies the profile and chain.
