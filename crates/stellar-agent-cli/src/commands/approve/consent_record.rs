@@ -60,7 +60,8 @@ mod tests {
     };
     use stellar_agent_core::approval::{
         ConsentAudit, ConsentAuthorization, PendingApproval, PendingApprovalStore, Surface,
-        approval_view_digest, attest_and_persist, mainnet_fixtures::ATTESTATION_KEY,
+        approval_view_digest, attest::attest_and_persist_with_row, attest_and_persist,
+        mainnet_fixtures::ATTESTATION_KEY, verify_consent_publication,
     };
     use stellar_agent_core::policy::state_lock::{lock_requests, window_lock_path};
     use stellar_agent_network::mainnet::MainnetPrecondition;
@@ -92,6 +93,30 @@ mod tests {
             |_, _| Err("no toolset grant in a mainnet consent".to_owned()),
         )
         .unwrap();
+        store.get(&f.entry.approval_nonce).unwrap().clone()
+    }
+
+    /// The state a strict `approve --id` leaves when it stops before the
+    /// durable consent: the entry attested with its anchored row and its
+    /// publication handoff, and the record without consent.
+    fn strictly_attested_without_consent(f: &Fixture) -> PendingApproval {
+        let policy = f.core.current_policy();
+        let mut store = PendingApprovalStore::open(f.core.store_path()).unwrap();
+        let (_, reference) = attest_and_persist_with_row(
+            &mut store,
+            &f.entry,
+            &ATTESTATION_KEY,
+            &f.core.binding(),
+            Surface::Cli,
+            ConsentAudit::Writer(&mut f.core.audit_writer()),
+            ConsentAuthorization::Mainnet {
+                presence: f.core.presence(&f.entry, &policy),
+                policy: &policy,
+            },
+            |_, _| Err("no toolset grant in a mainnet consent".to_owned()),
+        )
+        .unwrap();
+        assert!(reference.is_none(), "the direct writer anchors the row");
         store.get(&f.entry.approval_nonce).unwrap().clone()
     }
 
@@ -393,6 +418,67 @@ mod tests {
         assert_eq!(window(&f), bytes);
         assert_eq!(attested_rows(&f), 1);
         listener.shutdown().await;
+    }
+
+    /// The inbox's own consent is a compatibility consent and stores no
+    /// publication handoff, while its recording commits consent.
+    #[test]
+    #[serial_test::serial]
+    fn an_inbox_consent_stores_no_publication_handoff() {
+        let f = Fixture::new();
+        let outcome = approve(&f, &f.entry);
+        assert!(matches!(outcome, Outcome::Attested { .. }), "{outcome:?}");
+        let stored = PendingApprovalStore::open(f.core.store_path())
+            .unwrap()
+            .get(&f.entry.approval_nonce)
+            .unwrap()
+            .clone();
+        assert!(stored.mainnet_presence.is_some());
+        assert!(stored.consent_publication.is_none());
+        assert!(f.view().record.consent.unwrap().delivery.is_none());
+    }
+
+    /// A strict consent attested without its durable commit keeps the
+    /// publication handoff it stored beside the blob and receipt. A repeated
+    /// approve and the stored page complete the consent as `recovered`
+    /// without delivery facts, and leave the inbox file's bytes unchanged.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn inbox_recovery_keeps_a_stored_publication_handoff() {
+        let f = Fixture::new();
+        let stored = strictly_attested_without_consent(&f);
+        assert!(stored.consent_publication.is_some());
+        let verified =
+            verify_consent_publication(&stored, &ATTESTATION_KEY, &f.core.binding()).unwrap();
+        assert!(verified.is_direct_anchored());
+        assert!(f.view().record.consent.is_none());
+        let inbox = std::fs::read(f.core.store_path()).unwrap();
+        let outcome = approve(&f, &f.entry);
+        assert!(
+            matches!(
+                outcome,
+                Outcome::PresenceRefused {
+                    code: "approval.presence_consumed",
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        let consent = f.view().record.consent.expect("recovered consent");
+        assert_eq!(
+            consent.payload.as_ref().unwrap().row_provenance,
+            Some(RowProvenance::Recovered)
+        );
+        assert!(consent.delivery.is_none());
+        assert_eq!(std::fs::read(f.core.store_path()).unwrap(), inbox);
+        let bytes = window(&f);
+        let (listener, browser) = Browser::start(&f, false).await;
+        let blob = stored.attestation_blob_b64.clone().unwrap();
+        assert!(browser.page(&f.entry.approval_nonce).await.contains(&blob));
+        listener.shutdown().await;
+        assert_eq!(window(&f), bytes);
+        assert_eq!(std::fs::read(f.core.store_path()).unwrap(), inbox);
+        assert_eq!(attested_rows(&f), 1);
     }
 
     /// A crash after the generation commit leaves the consent durable, and

@@ -485,6 +485,14 @@ impl OutboxEvidence {
         self.floor_ms
     }
 
+    /// Whether a migration pin no authenticated grant adopted remains.
+    #[must_use]
+    pub fn holds_migration_pins(&self) -> bool {
+        self.records
+            .iter()
+            .any(|record| record.state == RecordState::LegacyPin)
+    }
+
     #[cfg(test)]
     pub(crate) fn records(&self) -> &[EvidenceRecord] {
         &self.records

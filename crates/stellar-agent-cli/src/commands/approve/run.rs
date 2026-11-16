@@ -181,6 +181,30 @@ struct ApproveRunData {
     presence: Option<PresenceData>,
 }
 
+impl ApproveRunData {
+    /// The success data of an attested approval. The consent row's outcome
+    /// alone names `audit_code`, so both chains report it alike.
+    fn attested(
+        approval_nonce: String,
+        process_uid: String,
+        expires_at_unix_ms: u64,
+        approval_attestation: Option<String>,
+        audit: ConsentRowOutcome,
+        presence: Option<PresenceData>,
+    ) -> Self {
+        Self {
+            approval_nonce,
+            attested: true,
+            process_uid,
+            expires_at_unix_ms,
+            approval_attestation,
+            audit,
+            audit_code: audit.code(),
+            presence,
+        }
+    }
+}
+
 /// The `presence` field of a mainnet success envelope.
 #[derive(Debug, Serialize)]
 struct PresenceData {
@@ -322,16 +346,14 @@ pub async fn run(args: RunArgs) -> i32 {
             Ok(approved) => {
                 let request_id = approved.presence.request_id.clone();
                 render::render_json(&Envelope::ok_with_request_id(
-                    ApproveRunData {
-                        approval_nonce: nonce,
-                        attested: true,
-                        process_uid: our_uid,
-                        expires_at_unix_ms: entry.expires_at_unix_ms,
-                        approval_attestation: approved.attestation,
-                        audit: approved.audit,
-                        audit_code: approved.audit.code(),
-                        presence: Some(approved.presence),
-                    },
+                    ApproveRunData::attested(
+                        nonce,
+                        our_uid,
+                        entry.expires_at_unix_ms,
+                        approved.attestation,
+                        approved.audit,
+                        Some(approved.presence),
+                    ),
                     request_id,
                 ));
                 0
@@ -394,16 +416,14 @@ pub async fn run(args: RunArgs) -> i32 {
     // key_bytes is Zeroizing; erased on drop after this point.
 
     // ── 9. Emit success envelope ──────────────────────────────────────────────
-    render::render_json(&Envelope::ok(ApproveRunData {
-        approval_nonce: nonce,
-        attested: true,
-        process_uid: our_uid,
-        expires_at_unix_ms: entry.expires_at_unix_ms,
+    render::render_json(&Envelope::ok(ApproveRunData::attested(
+        nonce,
+        our_uid,
+        entry.expires_at_unix_ms,
         approval_attestation,
         audit,
-        audit_code: audit.code(),
-        presence: None,
-    }));
+        None,
+    )));
     0
 }
 
@@ -2911,6 +2931,80 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), stored);
     }
 
+    /// A mainnet `approve --id` whose writer another holder keeps queues its
+    /// consent row and reports the queued code in its rendered envelope.
+    #[cfg(all(feature = "mainnet-write", feature = "test-helpers"))]
+    #[tokio::test]
+    #[serial]
+    async fn mainnet_success_reports_the_sink_code() {
+        use crate::common::mainnet_write_fixture::{
+            DESTINATION, ORACLE_HOST, PRIMARY_HOST, Spec, pay_rule,
+        };
+        use stellar_agent_mcp::server::WalletServer;
+        let name = "mainnet-sink-code";
+        let rule = pay_rule("require_approval", "");
+        let mut fixture = Spec::new(name)
+            .rules(vec![
+                rule.clone(),
+                rule.replace("stellar_pay", "stellar_pay_commit"),
+            ])
+            .build()
+            .await;
+        fixture.present_in_browser(5);
+        let profile = fixture.profile();
+        let server = WalletServer::new_with_selection_and_routes_for_test(
+            profile.clone(),
+            stellar_agent_core::profile::name::ProfileNameSource::Flag,
+            &stellar_agent_core::profile::schema::default_profile_dir().unwrap(),
+            &[
+                (PRIMARY_HOST, &fixture.primary.uri()),
+                (ORACLE_HOST, &fixture.oracle.uri()),
+            ],
+        )
+        .unwrap();
+        let args = serde_json::json!({"chain_id":"stellar:mainnet", "source":fixture.agent.g,
+            "destination":DESTINATION, "amount_in_stroops":"10", "asset":"native", "fee":"100",
+            "business_id": crate::common::business_entry::fresh_business_id()});
+        let response = server
+            .call_stellar_pay(serde_json::from_value(args).unwrap())
+            .await
+            .unwrap();
+        let response: serde_json::Value =
+            serde_json::from_str(&response.content[0].as_text().unwrap().text).unwrap();
+        let nonce = response["data"]["approval"]["approval_nonce"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        drop(server);
+        AuditWriterRegistry::remove_for_test(name);
+        let _holder = AuditWriterRegistry::get_or_open_keyed(
+            "mainnet-sink-holder",
+            &profile.audit_log_path,
+            stellar_agent_network::keyring::keyed_audit_access(
+                &profile,
+                name,
+                stellar_agent_core::audit_log::BindingCheck::Enforce,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        crate::common::render::take_rendered_for_test();
+        let code = run(RunArgs {
+            id: Some(nonce.clone()),
+            profile: Some(name.to_owned()),
+            yes: false,
+            open_by_operator: false,
+        })
+        .await;
+        let rendered = crate::common::render::take_rendered_for_test();
+        assert_eq!(code, 0, "{rendered:?}");
+        let data = &rendered[0]["data"];
+        assert_eq!(data["approval_nonce"], nonce.as_str());
+        assert_eq!(data["audit"], "queued");
+        assert_eq!(data["audit_code"], "audit.outbox_queued");
+        assert_eq!(data["presence"]["method"], "webauthn_uv");
+    }
+
     /// The MCP preparation completes through bare approval and the browser listener.
     #[cfg(all(feature = "mainnet-write", feature = "test-helpers"))]
     #[tokio::test]
@@ -3795,16 +3889,39 @@ mod tests {
             (ConsentRowOutcome::Written, "written"),
             (ConsentRowOutcome::Queued, "queued"),
         ] {
-            let data = ApproveRunData {
-                approval_nonce: "n".to_owned(),
-                attested: true,
-                process_uid: "501".to_owned(),
-                expires_at_unix_ms: 1,
-                approval_attestation: None,
-                audit: outcome,
-                audit_code: outcome.code(),
-                presence: None,
-            };
+            // The mainnet data names its sink's code exactly as the testnet
+            // data does, beside an unchanged request and presence.
+            let mainnet = serde_json::to_value(ApproveRunData::attested(
+                "n".to_owned(),
+                "501".to_owned(),
+                1,
+                Some("blob".to_owned()),
+                outcome,
+                Some(PresenceData {
+                    method: "webauthn_uv",
+                    credential_fingerprint: "fp".to_owned(),
+                    request_id: "req".to_owned(),
+                }),
+            ))
+            .unwrap();
+            assert_eq!(mainnet["audit"], wire);
+            assert_eq!(
+                mainnet
+                    .get("audit_code")
+                    .and_then(serde_json::Value::as_str),
+                outcome.code()
+            );
+            assert_eq!(mainnet["approval_attestation"], "blob");
+            assert_eq!(
+                mainnet["presence"],
+                serde_json::json!({
+                    "method": "webauthn_uv",
+                    "credential_fingerprint": "fp",
+                    "request_id": "req",
+                })
+            );
+            let data =
+                ApproveRunData::attested("n".to_owned(), "501".to_owned(), 1, None, outcome, None);
             let value = serde_json::to_value(&data).unwrap();
             assert_eq!(value["audit"], wire);
             let suffix = if outcome == ConsentRowOutcome::Queued {

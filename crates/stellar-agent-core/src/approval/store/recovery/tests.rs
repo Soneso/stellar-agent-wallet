@@ -342,6 +342,7 @@ fn payment_recovery_attestation_checks_recorded_expiry() {
             [9; 32],
             approver,
             receipt,
+            None,
             now + 60_000
         ),
         Err(ApprovalError::Expired)

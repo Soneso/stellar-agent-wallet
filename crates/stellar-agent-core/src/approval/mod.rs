@@ -83,6 +83,7 @@ pub mod mpp;
 pub mod operator_credentials;
 pub mod presence;
 pub mod presence_policy;
+pub mod publication;
 pub mod registration_input;
 pub mod remote_authorization;
 pub mod retry;
@@ -131,6 +132,10 @@ pub use presence::{
     mainnet_intent_consent_view_digest, mainnet_presence_origin, verify_mainnet_presence,
 };
 pub use presence_policy::{CurrentMainnetApprovalPolicy, MainnetApprovalAuthority};
+pub use publication::{
+    CONSENT_PUBLICATION_DOMAIN, ConsentPublicationV1, VerifiedConsentPublication,
+    verify_consent_publication,
+};
 pub use registration_input::RegistrationInput;
 pub use remote_authorization::{RemoteApprovalAuthority, RemoteApprovalAuthorization};
 pub use retry::{DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, open_with_retry};

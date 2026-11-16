@@ -10,29 +10,33 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use stellar_agent_core::approval::{
-    ClassicIntent, IntentAsset, IntentBase, IntentPayload, MemoFact, PendingApproval,
-    PendingApprovalStore,
+    AttestationBinding, ClassicIntent, IntentAsset, IntentBase, IntentPayload, MemoFact,
+    PendingApproval, PendingApprovalStore, load_attestation_key, verify_consent_publication,
     witness::{ApprovalExpectation, ApprovalWitness, ApprovedKind, verify_approval},
 };
-use stellar_agent_core::audit_log::AuditEntry;
+use stellar_agent_core::audit_log::{
+    AuditEntry, AuditOutbox, AuditWriter, EvidenceReservation, WriterError, audit_writer_refusal,
+};
 use stellar_agent_core::error::{
     ApprovalFailure, InternalError, SubmissionError, ValidationError, WalletError,
 };
 use stellar_agent_core::mainnet::verified_policy::VerifiedPolicy;
 use stellar_agent_core::profile::receipt::{DestinationFields, PaymentDestinations};
 use stellar_agent_core::profile::schema::Profile;
+use stellar_agent_core::profile::{name::profile_name_for_approval, owner_key::OwnerKeyContext};
 use stellar_xdr::{Limits, Memo, ReadXdr as _, TransactionEnvelope};
 
 use crate::fees::ClassicFeeChoice;
 use crate::mainnet::MainnetAuthorizationError;
 use crate::mainnet::canonical::{CanonicalPart, CanonicalRefusal};
+use crate::policy_state::approvals::{ConsentDeliveryV1, require_consent_evidence_inventory};
 use crate::policy_state::{
     ApprovalRecorder, ApprovalStatus, ApprovalView, AttemptAuthorization, AttemptEnvelope,
     AttemptRequest, BusinessId, CommitBinding, CommitTarget, CommittedBatch, ConsentPayload,
     ConsentRow, IntentSlot, LookupOutcome, OpenOutcome, OpenRequest, OperationAudit,
-    OperationHandle, OperationKind, OperationLink, OperationRecorder, OperationState,
+    OperationHandle, OperationId, OperationKind, OperationLink, OperationRecorder, OperationState,
     OperationStatus, OperationView, PendingApprovalFacts, PersistedWindowStore, SlotKind,
-    WindowStoreError,
+    WindowStoreError, WireApproval,
 };
 use crate::submission_record::{AuditWriterHandle, OperationAttempt};
 
@@ -1146,6 +1150,9 @@ pub struct ConsentCompletion {
     id: [u8; 32],
     witness: ApprovalWitness,
     payload: ConsentPayload,
+    /// The sink a verified publication handoff proves; `None` on the
+    /// compatibility completion.
+    delivery: Option<ConsentDeliveryV1>,
 }
 
 impl ConsentCompletion {
@@ -1204,6 +1211,82 @@ pub fn consent_completion(
     policy: &VerifiedPolicy,
     row: ConsentRow,
 ) -> Result<ConsentCompletion, WalletError> {
+    complete(pending, store, profile, name, nonce, policy, |_, _| {
+        Ok((row, None))
+    })
+}
+
+/// [`consent_completion`] for a strict consent: the sink and queued
+/// reference come only from the entry's verified publication handoff.
+///
+/// The handoff must bind the record's subject. A direct anchor completes as
+/// a written row with direct delivery, and a queued sink as its exact
+/// reference with queued delivery. A recovered or written row claim never
+/// supplies either.
+///
+/// # Errors
+///
+/// The refusals of [`consent_completion`], the attestation key's refusals,
+/// and `approval.attestation_invalid` for a missing, edited or foreign
+/// handoff.
+pub fn publication_completion(
+    pending: &PendingApprovalStore,
+    store: &PersistedWindowStore,
+    profile: &Profile,
+    name: &str,
+    nonce: &str,
+    policy: &VerifiedPolicy,
+) -> Result<ConsentCompletion, WalletError> {
+    complete(
+        pending,
+        store,
+        profile,
+        name,
+        nonce,
+        policy,
+        |record, entry| {
+            let key = load_attestation_key(
+                &profile.attestation_key_id,
+                &OwnerKeyContext::for_profile(name, profile),
+            )?;
+            let verified = verify_consent_publication(
+                entry,
+                &key,
+                &AttestationBinding::new(name, profile.chain_id.caip2_str()),
+            )?;
+            if verified.subject() != record.subject {
+                return Err(WalletError::Approval(ApprovalFailure::AttestationInvalid {
+                    detail: "the consent publication names another subject".to_owned(),
+                }));
+            }
+            Ok(match verified.outbox_row() {
+                Some(reference) => (
+                    ConsentRow::Queued(*reference),
+                    Some(ConsentDeliveryV1::queued(record.id)),
+                ),
+                None => (
+                    ConsentRow::Written,
+                    Some(ConsentDeliveryV1::direct_anchored(record.id)),
+                ),
+            })
+        },
+    )
+}
+
+/// The shared body of the completions: `sink` names the row and delivery
+/// from the authenticated record and the inbox entry.
+fn complete(
+    pending: &PendingApprovalStore,
+    store: &PersistedWindowStore,
+    profile: &Profile,
+    name: &str,
+    nonce: &str,
+    policy: &VerifiedPolicy,
+    sink: impl FnOnce(
+        &WireApproval,
+        &PendingApproval,
+    ) -> Result<(ConsentRow, Option<ConsentDeliveryV1>), WalletError>,
+) -> Result<ConsentCompletion, WalletError> {
     let not_found = || {
         WalletError::Approval(ApprovalFailure::NotFound {
             detail: "no durable approval record and inbox entry name this nonce".to_owned(),
@@ -1218,6 +1301,7 @@ pub fn consent_completion(
     let attestation = persisted_attestation(pending, nonce)?;
     let receipt = entry
         .mainnet_presence
+        .clone()
         .ok_or(WalletError::Approval(ApprovalFailure::PresenceRequired))?;
     let now = stellar_agent_core::timefmt::now_unix_ms().map_err(|error| {
         WalletError::Approval(ApprovalFailure::ClockError {
@@ -1237,10 +1321,12 @@ pub fn consent_completion(
         policy,
         now,
     )?;
+    let (row, delivery) = sink(&record, &entry)?;
     Ok(ConsentCompletion {
         id: record.id,
         witness,
         payload: ConsentPayload::new(attestation, receipt, entry.process_uid, row),
+        delivery,
     })
 }
 
@@ -1248,7 +1334,8 @@ pub fn consent_completion(
 /// for a consent its caller verified, or `None` when no record names it.
 ///
 /// The read holds no inbox lock. [`commit_consent`] then checks the witness
-/// against the record's kind, subject and clocks.
+/// against the record's kind, subject and clocks. The completion carries no
+/// delivery: the payload's row claim never supplies a sink.
 ///
 /// # Errors
 ///
@@ -1266,6 +1353,7 @@ pub fn witnessed_completion(
             id: view.record.id,
             witness,
             payload,
+            delivery: None,
         }))
 }
 
@@ -1283,25 +1371,110 @@ impl OperationAudit for ConsentOnlyAudit {
 ///
 /// The step takes no audit writer, so a process that cannot hold the writer
 /// still commits; the consent audit row keeps its own route. A repeated
-/// commit of the same receipt changes nothing.
+/// commit of the same receipt changes nothing. A completion from
+/// [`publication_completion`] commits its delivery with the consent.
 ///
 /// # Errors
 ///
-/// The refusals of [`ApprovalRecorder::record_consent`], rendered through
+/// The refusals of [`ApprovalRecorder::record_consent`] and
+/// [`ApprovalRecorder::record_consent_with_delivery`], rendered through
 /// [`operation_refusal`].
 pub fn commit_consent(
     store: &PersistedWindowStore,
     profile: &Profile,
     completion: &ConsentCompletion,
 ) -> Result<ApprovalView, WalletError> {
-    ApprovalRecorder::new(
-        store,
-        profile,
-        &mut ConsentOnlyAudit,
-        uuid::Uuid::new_v4().to_string(),
-    )
-    .record_consent(completion.id, &completion.witness, &completion.payload)
+    let mut audit = ConsentOnlyAudit;
+    let mut recorder =
+        ApprovalRecorder::new(store, profile, &mut audit, uuid::Uuid::new_v4().to_string());
+    match &completion.delivery {
+        Some(delivery) => recorder.record_consent_with_delivery(
+            completion.id,
+            &completion.witness,
+            &completion.payload,
+            delivery.clone(),
+        ),
+        None => recorder.record_consent(completion.id, &completion.witness, &completion.payload),
+    }
     .map_err(operation_refusal)
+}
+
+/// The stores an integrated approval request is admitted under.
+pub struct ConsentAdmission<'a> {
+    /// The policy-window store of the profile.
+    pub store: &'a PersistedWindowStore,
+    /// The profile of the request.
+    pub profile: &'a Profile,
+    /// The keyed audit writer that initializes the owner's evidence.
+    pub writer: &'a mut AuditWriter,
+    /// The keyed outbox that reserves the evidence slot.
+    pub outbox: &'a AuditOutbox,
+}
+
+impl ConsentAdmission<'_> {
+    /// Admits an integrated approval request for `operation`, then runs
+    /// `present` with the committed record and its reservation.
+    ///
+    /// In order: the owner-scope inventory, the pending record, the owner's
+    /// evidence initialization, and the reservation. The record is the one
+    /// already committed for the operation, else the one `open` commits from
+    /// `facts`, else the committed winner of a conflicting open. Its stored
+    /// nonce, clocks and facts govern a retry, never the retry's own facts.
+    /// Each step after the open runs outside the window lock. A refusal
+    /// keeps the committed record and any reservation.
+    ///
+    /// # Errors
+    ///
+    /// The refusals of [`require_consent_evidence_inventory`], of `open`
+    /// when no record names the operation, of evidence initialization,
+    /// `audit.outbox_evidence_unusable` while a migration pin remains, the
+    /// refusals of [`ApprovalRecorder::reserve_consent_evidence`], and those
+    /// of `present`.
+    pub fn admit<T>(
+        &mut self,
+        operation: OperationId,
+        facts: &PendingApprovalFacts,
+        open: impl FnOnce(&PendingApprovalFacts) -> Result<ApprovalView, WalletError>,
+        present: impl FnOnce(&WireApproval, &EvidenceReservation) -> Result<T, WalletError>,
+    ) -> Result<T, WalletError> {
+        let name = profile_name_for_approval(self.profile);
+        require_consent_evidence_inventory(&name)?;
+        let status = ApprovalStatus::new(self.store, self.profile);
+        let committed = || {
+            status
+                .find_by_operation(operation)
+                .map_err(operation_refusal)
+        };
+        let record = match committed()? {
+            Some(view) => view.record,
+            None => match open(facts) {
+                Ok(view) => view.record,
+                Err(error) => committed()?.ok_or(error)?.record,
+            },
+        };
+        let evidence_refusal = |error: WriterError| audit_writer_refusal(&name, &error);
+        self.writer
+            .initialize_consent_evidence()
+            .map_err(evidence_refusal)?;
+        if self
+            .writer
+            .outbox_evidence()
+            .map_err(evidence_refusal)?
+            .is_none_or(|evidence| evidence.holds_migration_pins())
+        {
+            return Err(evidence_refusal(WriterError::OutboxEvidenceUnusable {
+                reason: "unresolved migration pin",
+            }));
+        }
+        let reservation = ApprovalRecorder::new(
+            self.store,
+            self.profile,
+            &mut ConsentOnlyAudit,
+            uuid::Uuid::new_v4().to_string(),
+        )
+        .reserve_consent_evidence(record.operation_id, &record.facts(), self.outbox)?;
+        present(&record, &reservation)
+    }
 }
 
 /// How a classic commit proceeds under its business id.

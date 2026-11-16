@@ -2022,6 +2022,15 @@ after the commit. An entry that no record names keeps its inbox path and
 writes nothing durable. Clawback opt-in entries and other chains never reach
 the recording.
 
+A strict mainnet consent also stores a publication handoff in its inbox
+entry, in the replacement that stores the blob and receipt. Its HMAC under the
+attestation key binds the profile, chain, nonce, kind, subject, signed clocks,
+process identifier, attestation and receipt digests, and the successful sink
+with any queued reference. Compatibility, testnet and clawback opt-in consents
+store none. The integrated completion takes the sink only from a verified
+handoff and commits it as the record's delivery facts. Integrated admission
+refuses while no authenticated owner-scope inventory exists.
+
 Consent retains the attestation, receipt and signed process identifier for
 reconstruction. The record supplies the signed nonce, kind, subject and
 lifetime; the authenticated file supplies the profile and chain.

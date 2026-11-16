@@ -1409,6 +1409,20 @@ fn consent_store_crashes_preserve_atomic_replacement() {
                     "publication boundary: {step:?}"
                 );
                 assert_eq!(record.attestation_blob_b64.is_some(), published);
+                assert_eq!(
+                    record.consent_publication.is_some(),
+                    published,
+                    "the handoff shares the replacement: {step:?}"
+                );
+                if published {
+                    let verified = crate::approval::verify_consent_publication(
+                        record,
+                        &ATTESTATION_KEY,
+                        &fixture.binding(),
+                    )
+                    .unwrap();
+                    assert_eq!(verified.is_direct_anchored(), !queued);
+                }
                 if published {
                     let bytes = std::fs::read(fixture.store_path()).unwrap();
                     let error = crate::approval::attest::attest_and_persist_with_row(
@@ -3044,7 +3058,14 @@ fn mainnet_opt_in_reverifies_the_assertion() {
     let mut altered = PendingApprovalStore::open(fixture.home().join("altered.toml")).unwrap();
     altered.insert(entry.clone(), now_ms()).unwrap();
     altered
-        .record_mainnet_attestation_at(&entry.approval_nonce, blob, approver, receipt, now_ms())
+        .record_mainnet_attestation_at(
+            &entry.approval_nonce,
+            blob,
+            approver,
+            receipt,
+            None,
+            now_ms(),
+        )
         .unwrap();
     assert!(
         !altered

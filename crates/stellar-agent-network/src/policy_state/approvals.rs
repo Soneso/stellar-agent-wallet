@@ -21,7 +21,10 @@ use stellar_agent_core::approval::{
         ApprovalRecordFacts, ApprovalWitness, ApprovedKind,
     },
 };
-use stellar_agent_core::audit_log::{OutboxRowRef, PolicyDecision};
+use stellar_agent_core::audit_log::{
+    AuditOutbox, EvidenceReservation, OutboxRowRef, PolicyDecision, WriterError,
+    audit_writer_refusal,
+};
 use stellar_agent_core::policy::state_lock::WindowStoreLock;
 use stellar_agent_core::profile::{
     Profile, name::profile_name_for_approval, owner_key::OwnerKeyContext,
@@ -314,7 +317,7 @@ impl WireApproval {
         }
     }
 
-    fn facts(&self) -> PendingApprovalFacts {
+    pub(crate) fn facts(&self) -> PendingApprovalFacts {
         PendingApprovalFacts {
             nonce: self.nonce.clone(),
             kind: self.kind,
@@ -636,8 +639,8 @@ pub mod facade_calls {
 #[derive(Debug)]
 pub struct ApprovalRecorder<'a> {
     recorder: OperationRecorder<'a>,
-    #[cfg(any(test, feature = "test-helpers"))]
     store: &'a PersistedWindowStore,
+    profile: &'a Profile,
 }
 
 impl<'a> ApprovalRecorder<'a> {
@@ -651,8 +654,8 @@ impl<'a> ApprovalRecorder<'a> {
     ) -> Self {
         Self {
             recorder: OperationRecorder::new(store, profile, audit, request_id),
-            #[cfg(any(test, feature = "test-helpers"))]
             store,
+            profile,
         }
     }
 
@@ -760,6 +763,84 @@ impl<'a> ApprovalRecorder<'a> {
         self.record_consent_inner(id, witness, payload, None)
     }
 
+    /// [`Self::record_consent`] with the authenticated sink `delivery` of
+    /// `payload`'s row.
+    ///
+    /// A repeated commit returns the stored record only when its receipt,
+    /// delivery and queued reference equal these. After payload release it
+    /// refuses, as does a revoked record. After successful validation, a
+    /// failed commit stands unless an authenticated reread shows this exact
+    /// record committed.
+    ///
+    /// # Errors
+    ///
+    /// The refusals of [`Self::record_consent`], a delivery that does not
+    /// match the record identity or the payload's sink, and stored consent
+    /// with other delivery facts.
+    pub fn record_consent_with_delivery(
+        &mut self,
+        id: [u8; 32],
+        witness: &ApprovalWitness,
+        payload: &ConsentPayload,
+        delivery: ConsentDeliveryV1,
+    ) -> Result<ApprovalView, WindowStoreError> {
+        self.record_consent_inner(id, witness, payload, Some(delivery))
+    }
+
+    /// Reserves consent evidence for the committed pending record of
+    /// `operation`, after its window transaction ends.
+    ///
+    /// The authenticated record must hold `facts` exactly, link `operation`,
+    /// and be live. Its signed waiting expiry and rule lifetime fix the
+    /// deadline. The read takes no window lock.
+    ///
+    /// # Errors
+    ///
+    /// `internal.unexpected_state` for an absent, revoked, unlinked or
+    /// different record, `submission.record_unavailable` for store
+    /// failures, and the evidence refusals of
+    /// [`AuditOutbox::reserve_evidence`], including
+    /// `approval.evidence_capacity`.
+    pub fn reserve_consent_evidence(
+        &mut self,
+        operation: OperationId,
+        facts: &PendingApprovalFacts,
+        outbox: &AuditOutbox,
+    ) -> Result<EvidenceReservation, WalletError> {
+        self.observed();
+        let refusal = crate::operation_entry::operation_refusal;
+        let name = profile_name_for_approval(self.profile);
+        let id = record_id(&name, &facts.nonce);
+        let wire = self
+            .store
+            .read_for_inspection(self.profile)
+            .map_err(refusal)?
+            .unwrap_or_default();
+        let linked = wire.operations.as_ref().is_some_and(|s| {
+            s.records
+                .iter()
+                .any(|op| op.id == operation && op.approval_record_id == Some(id))
+        });
+        let record = records(&wire)
+            .iter()
+            .find(|r| {
+                r.id == id
+                    && r.operation_id == operation
+                    && r.facts() == *facts
+                    && r.state != ApprovalState::Revoked
+            })
+            .filter(|_| linked)
+            .ok_or_else(|| {
+                refusal(unexpected(
+                    "the committed approval does not match the admitted facts",
+                ))
+            })?;
+        let deadline =
+            EvidenceReservation::deadline(record.waiting_expires_at_ms, record.rule_ttl_ms)
+                .map_err(|error| audit_writer_refusal(&name, &error))?;
+        outbox.reserve_evidence(id, deadline, now_ms().map_err(refusal)?)
+    }
+
     fn record_consent_inner(
         &mut self,
         id: [u8; 32],
@@ -768,7 +849,9 @@ impl<'a> ApprovalRecorder<'a> {
         delivery: Option<ConsentDeliveryV1>,
     ) -> Result<ApprovalView, WindowStoreError> {
         self.observed();
-        self.recorder.run(None, |session| {
+        let integrated = delivery.is_some();
+        let mut expected = None;
+        let result = self.recorder.run(None, |session| {
             let profile = session.profile;
             let record = session
                 .wire
@@ -776,6 +859,9 @@ impl<'a> ApprovalRecorder<'a> {
                 .as_mut()
                 .and_then(|s| s.records.iter_mut().find(|r| r.id == id))
                 .ok_or_else(|| unexpected("the approval record is absent"))?;
+            if integrated && record.state == ApprovalState::Revoked {
+                return Err(unexpected("the approval record is revoked"));
+            }
             let digest = payload
                 .receipt
                 .digest()
@@ -840,8 +926,24 @@ impl<'a> ApprovalRecorder<'a> {
             if serialized_len(record) > APPROVAL_RECORD_MAX {
                 return Err(invalid("the approval record exceeds its allowance"));
             }
+            if integrated {
+                expected = Some(record.clone());
+            }
             session.changed = true;
             Ok(record.view(session.now))
+        });
+        result.or_else(|error| {
+            let Some(expected) = expected else {
+                return Err(error);
+            };
+            match ApprovalStatus::new(self.store, self.profile).view(id) {
+                Ok(Some(view))
+                    if view.record.state != ApprovalState::Revoked && view.record == expected =>
+                {
+                    Ok(view)
+                }
+                _ => Err(error),
+            }
         })
     }
 
@@ -1061,6 +1163,74 @@ pub fn consent_evidence_enforced(kind: ApprovedKind) -> bool {
         _ => false,
     }
 }
+
+/// Requires an authenticated inventory of every grant in the owner scope of
+/// `profile` before an integrated request is admitted.
+///
+/// The scope spans every profile that shares the owner coordinate, with its
+/// pending reservations, live and retryable consumed grants and unintegrated
+/// earlier grants. An initialized evidence image or an empty inbox does not
+/// account for them. This build holds no such inventory, so every scope
+/// refuses.
+///
+/// # Errors
+///
+/// `audit.outbox_evidence_unusable` naming the unavailable inventory.
+pub fn require_consent_evidence_inventory(profile: &str) -> Result<(), WalletError> {
+    #[cfg(any(test, feature = "test-helpers"))]
+    if inventory_test_override::enabled(profile) {
+        return Ok(());
+    }
+    Err(audit_writer_refusal(
+        profile,
+        &WriterError::OutboxEvidenceUnusable {
+            reason: "owner-scope inventory unavailable",
+        },
+    ))
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+mod inventory_test_override {
+    use std::sync::{Mutex, PoisonError};
+    static READY: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    pub(super) fn enabled(profile: &str) -> bool {
+        READY
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|name| name == profile)
+    }
+
+    /// Stands in for an authenticated complete inventory of one profile's
+    /// owner scope in a fixture, until dropped. Production builds exclude it.
+    #[derive(Debug)]
+    pub struct ConsentEvidenceInventoryGuard(String);
+
+    impl ConsentEvidenceInventoryGuard {
+        /// Installs the fixture inventory of `profile`.
+        #[must_use]
+        pub fn new(profile: &str) -> Self {
+            READY
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(profile.to_owned());
+            Self(profile.to_owned())
+        }
+    }
+
+    impl Drop for ConsentEvidenceInventoryGuard {
+        fn drop(&mut self) {
+            let mut ready = READY.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(index) = ready.iter().rposition(|name| *name == self.0) {
+                ready.remove(index);
+            }
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+pub use inventory_test_override::ConsentEvidenceInventoryGuard;
 
 fn delivery_enforced(profile: &str, kind: ApprovedKind) -> bool {
     #[cfg(any(test, feature = "test-helpers"))]
@@ -1385,6 +1555,8 @@ pub(super) fn consume(
 }
 
 #[cfg(test)]
+mod admission_tests;
+#[cfg(test)]
 pub(crate) mod durable_tests;
 
 #[cfg(test)]
@@ -1445,7 +1617,7 @@ pub(in crate::policy_state) mod tests {
         pub(in crate::policy_state) facts: PendingApprovalFacts,
         pub(in crate::policy_state) witness: ApprovalWitness,
         pub(in crate::policy_state) payload: ConsentPayload,
-        entry: PendingApproval,
+        pub(in crate::policy_state) entry: PendingApproval,
     }
 
     pub(super) fn proof(
@@ -1839,7 +2011,7 @@ pub(in crate::policy_state) mod tests {
             reference
         }
 
-        fn edit(&mut self, change: impl FnOnce(&mut WireFile)) {
+        pub(in crate::policy_state) fn edit(&mut self, change: impl FnOnce(&mut WireFile)) {
             OperationRecorder::new(
                 &self.store,
                 self.fixture.profile(),
@@ -2073,6 +2245,36 @@ pub(in crate::policy_state) mod tests {
             } else {
                 ConsentProvenance::DirectAnchored
             };
+            // A first consent whose delivery disagrees with its row refuses
+            // and writes nothing: queued without a reference, and direct
+            // with one.
+            let unconsented = fx.bytes();
+            for (row, delivery) in [
+                (ConsentRow::Written, ConsentDeliveryV1::queued(fx.id())),
+                (
+                    ConsentRow::Queued(queued_reference(1)),
+                    ConsentDeliveryV1::direct_anchored(fx.id()),
+                ),
+            ] {
+                let payload = ConsentPayload::new(
+                    fx.payload.attestation,
+                    fx.payload.receipt.clone(),
+                    fx.payload.process_uid.clone(),
+                    row,
+                );
+                let mut rows = Rows::default();
+                let refused =
+                    ApprovalRecorder::new(&fx.store, fx.fixture.profile(), &mut rows, "first")
+                        .record_consent_with_delivery(fx.id(), &fx.witness, &payload, delivery)
+                        .unwrap_err();
+                assert_eq!(
+                    refused.to_string(),
+                    unexpected("the consent delivery does not match its identity and sink")
+                        .to_string()
+                );
+                assert_eq!(fx.bytes(), unconsented);
+                assert!(fx.view().record.consent.is_none());
+            }
             let first = fx.delivery(provenance, reference).unwrap();
             let before = fx.bytes();
             assert_eq!(fx.delivery(provenance, reference).unwrap(), first);
@@ -2689,19 +2891,28 @@ pub(in crate::policy_state) mod tests {
     fn payload_drops_when_the_operation_ends_or_the_window_closes() {
         let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
-        for queued in [false, true] {
+        // No sink is the earlier consent without delivery facts; the other
+        // two decorate that same consent with authenticated delivery.
+        for queued in [None, Some(false), Some(true)] {
             let mut fx = Fx::new(300_000);
             fx.open();
-            let reference = queued.then(|| fx.reference("prune-delivery.log"));
-            fx.delivery(
-                if queued {
-                    ConsentProvenance::Queued
+            fx.consent();
+            if let Some(queued) = queued {
+                let reference = queued.then(|| fx.reference("prune-delivery.log"));
+                let delivery = if queued {
+                    ConsentDeliveryV1::queued(fx.id())
                 } else {
-                    ConsentProvenance::DirectAnchored
-                },
-                reference,
-            )
-            .unwrap();
+                    ConsentDeliveryV1::direct_anchored(fx.id())
+                };
+                let id = fx.id();
+                seed_existing_consent_delivery_for_test(
+                    &mut fx.recorder(),
+                    id,
+                    reference,
+                    delivery,
+                )
+                .unwrap();
+            }
             let request = fx.mint_request();
             fx.store
                 .mint_authorization(fx.fixture.profile(), &request)
@@ -2710,6 +2921,7 @@ pub(in crate::policy_state) mod tests {
             let record = &current.approvals.as_ref().unwrap().records[0];
             let consent = record.consent.as_ref().unwrap();
             assert!(consent.payload.is_some());
+            assert_eq!(consent.delivery.is_some(), queued.is_some());
             for terminal in [false, true] {
                 let mut wire = current.clone();
                 let now = if terminal {
@@ -2741,7 +2953,9 @@ pub(in crate::policy_state) mod tests {
     fn consumed_evidence_survives_same_operation_retry() {
         let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
-        for terminal in [false, true] {
+        // Each ending runs while both consent clocks are live, except the
+        // expiry itself, so only its own predicate classifies it as ended.
+        for ending in ["terminal", "expiry", "revoked", "tombstone"] {
             let mut fx = Fx::new(300_000);
             let _enabled =
                 ConsentEvidenceEnforcementGuard::new(fx.fixture.name(), ApprovedKind::Payment);
@@ -2786,22 +3000,53 @@ pub(in crate::policy_state) mod tests {
                     },
                 )
                 .expect("same-operation second mint remains live");
-            if terminal {
-                recorder
-                    .transition(
-                        fx.operation,
-                        Some(1),
-                        OperationState::NotSent,
-                        &TransitionEvidence::default(),
-                    )
-                    .unwrap();
-            } else {
-                fx.clock
-                    .set(fx.view().record.consent.unwrap().execution_expires_at_ms);
+            match ending {
+                "terminal" => {
+                    recorder
+                        .transition(
+                            fx.operation,
+                            Some(1),
+                            OperationState::NotSent,
+                            &TransitionEvidence::default(),
+                        )
+                        .unwrap();
+                }
+                "expiry" => fx
+                    .clock
+                    .set(fx.view().record.consent.unwrap().execution_expires_at_ms),
+                "revoked" => {
+                    let id = fx.id();
+                    fx.recorder().revoke(id).unwrap();
+                    assert_eq!(fx.view().record.state, ApprovalState::Revoked);
+                }
+                _ => {
+                    let now = fx.witness.consent_at_ms();
+                    fx.edit(|wire| {
+                        let section = wire.operations.as_mut().unwrap();
+                        let op = section.records.remove(0);
+                        section
+                            .tombstones
+                            .push(super::super::operations::WireTombstone {
+                                id: op.id,
+                                business_id: op.business_id,
+                                state: OperationState::NotSent,
+                                result: op.result,
+                                intent_digest: op.intent.intent_digest(),
+                                slot_kind: op.intent.kind(),
+                                closed_at_ms: now,
+                            });
+                    });
+                    assert_ne!(fx.view().record.state, ApprovalState::Revoked);
+                }
             }
+            assert!(
+                ending == "expiry" || !fx.view().expired,
+                "{ending} keeps live clocks"
+            );
             assert_eq!(
                 fx.classify().unwrap(),
-                VerifiedConsentDelivery::Ended { identity: fx.id() }
+                VerifiedConsentDelivery::Ended { identity: fx.id() },
+                "{ending}"
             );
             assert!(
                 fx.store
