@@ -1285,6 +1285,12 @@ For a payment-style approval the response also returns `approval_attestation`: t
 stellar-agent approve --id ABCxyzNonce --profile <name>
 ```
 
+Queued success exits zero and includes `audit_code: audit.outbox_queued`; Written omits `audit_code`.
+It returns immediately after persistence, without waiting for delivery.
+Legacy queues commit a count and chain head; owner queues authenticate tagged rows and commit delivered batches.
+An enforced kind additionally requires exact Delivered evidence before use.
+For an enforced kind, recoverable delivery and evidence errors retry the existing grant without another ceremony.
+
 ```json
 {"ok":true,"data":{"approval_nonce":"ABCxyzNonce","attested":true,"process_uid":"501","expires_at_unix_ms":1717000000000,"approval_attestation":"q83vEjRWeJq83v...","audit":"written"},"request_id":"..."}
 ```

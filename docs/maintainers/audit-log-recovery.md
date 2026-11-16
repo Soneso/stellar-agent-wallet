@@ -287,14 +287,18 @@ Three more rows record the entry tags:
 | `<log>.outbox.lock` | Held by every append and every drain while it touches the outbox. Waited on for up to 2 s, then `audit.outbox_busy`. |
 | `<log>.drain.lock` | Held for its whole life by every writer that drains: the MCP server, `approve serve`, and every keyed CLI verb. `approve --id` reads it once to tell a draining holder from one that does not drain. |
 
-**Keyring commitment.** The audit key's service stores the queue's count and SHA-256 chain head for each outbox generation. Below, `<tip-account>` stands for `<audit-account>-tip-<path-digest>`.
+**Legacy state only.** **Keyring commitment.** These rules hold while the log has no owner item.
+The audit key's service stores the queue's count and SHA-256 chain head for each outbox generation. Below, `<tip-account>` stands for `<audit-account>-tip-<path-digest>`.
 The active commitment uses `<tip-account>-outbox-g<G>`, where G is `generation` in `<tip-account>-carriers`.
 Without a carrier record, generation 0 uses `<tip-account>-outbox`.
 The retired watch reads the account selected by `retired.generation` using the same rule (section 8.4).
 Every append checks the committed prefix, syncs its new line, then stores the updated commitment.
 A failed state write truncates the line back and refuses the append.
 
-**Drain points.** For a queue without owner state, a draining writer checks the commitment, appends the committed queued rows, stores zero state, then truncates the outbox. Section 8.6 describes the drain of a queue under owner state. Only operator rows (`approval_attested`, `approval_attested_remote`, `profile_halted`, `profile_resumed`) drain; a committed row of any other kind refuses with `audit.outbox_unusable` (section 8.1). Drains run:
+**Legacy state only.** **Drain order.** A draining writer checks the commitment, appends committed rows, stores zero state, then truncates the outbox.
+Section 8.6 describes owner-state drains, including the validated tagged generation-zero suffix beyond a raw committed legacy prefix.
+Only operator rows (`approval_attested`, `approval_attested_remote`, `profile_halted`, `profile_resumed`) drain; other committed kinds refuse with `audit.outbox_unusable` (section 8.1).
+**Drain points for both states.** Drains run:
 
 - when it opens, right after the tip-anchor check;
 - on every keyed acquisition in a running process, under the same lock as that check;
@@ -303,13 +307,16 @@ A failed state write truncates the line back and refuses the append.
 
 A command that consumes an approval acquires the writer after it reads the approval and before it loads a signing key. A queued consent row is therefore in the log before the key is touched. `audit reanchor` drains after its repair rows. The repair writer never drains when it opens, and its reporting form never drains.
 
-**Delivery.** A crash between a drain's reset of the commitment and its truncation leaves a zero commitment and complete lines whose rows the log already ends with. The next drain recognizes that batch, truncates the outbox, and appends nothing. A crash between the appends and the reset appends the same rows again on the next drain; a repeated row keeps its `request_id`, which identifies it. An append that never returned `Ok` can leave a final segment with no newline; the next append or drain discards it with a warning.
+**Legacy state only.** **Delivery.** A crash between commitment reset and truncation leaves zero state and complete lines whose rows end the log.
+The next drain recognizes that batch, truncates the outbox, and appends nothing.
+A crash before reset can repeat appends; repeated rows retain their `request_id`.
+An append that never returned `Ok` can leave a torn final segment; the next append or drain discards it with a warning.
 
 **A row can record a consent that did not take effect.** The consent row is written, or queued, before the approval is persisted. A persist failure after the row, or a crash between the row and the persist, leaves an `approval_attested` row for an approval that never took effect. To tell, find the entry whose nonce starts with the row's `nonce_prefix` in `stellar-agent approve list --profile <name> --include-expired`. The approval took effect when the entry shows `attested: true` or kind `Consumed`. It did not when the entry still shows its original kind with `attested: false`, or is a `Rejected` tombstone. A listed toolset gate entry is inconclusive, because its removal after a persisted grant is best-effort. An entry already removed by `approve gc` cannot be judged from the store.
 
 **Timestamps.** A drained row keeps the timestamp of the operator action it records. Every draining writer drains before its own rows, so the log stays in time order. Three cases can still put an older timestamp after a newer one. The first is a row from a writer that does not drain: the CLI startup advisory, the zero-config path, or the `audit reanchor` repair rows. The second is a repeated row after a crash. The third is the adoption row an acquisition appends when its drain refuses. `audit verify` can then report `backward_timestamp_jump`; with the `request_id` of a repeated row, or the row's kind, that warning is explained.
 
-**Committed queue.** A missing, shortened, changed, or reordered committed prefix refuses with `audit.outbox_rows_missing` before any queued row is appended, and so does a complete line past the commitment.
+**Legacy state only.** **Committed queue.** A missing, shortened, changed, or reordered committed prefix refuses with `audit.outbox_rows_missing` before delivery, as does a complete line past the commitment.
 This blocks keyed acquisition and approval consumption until the operator acknowledges the loss.
 A line past the commitment is one an append left after a crash between its line sync and its commitment, or one written outside the wallet.
 An interrupted append can leave an uncommitted operator row.
@@ -635,6 +642,38 @@ Restore the most recent trusted owner value at its `-owner` account with the pla
 No command restores an owner value. Never fabricate an owner value or erase an evidence file.
 `audit acknowledge-outbox-loss` handles a classified queue loss and cannot clear an evidence refusal.
 `audit reanchor` repairs the log anchor, not the owner value.
+
+**Consumer boundary.** The active trusted owner selects the authenticated evidence image; a unique newest authenticated image can be recommitted across generation gaps.
+Distinct images at the highest newer generation refuse as `owner rollback`.
+An absent owner or an editable inbox never proves delivery.
+The authenticated window retains the full approval identity and explicit direct or queued provenance outside the releasable payload.
+Classification binds these facts, signed clocks, subject convention, and receipt digest to an already verified witness.
+Live consumed approvals retain their provenance for same-operation retries.
+Ended classification requires authenticated expiry, revocation, or linked-operation termination and grants no authority.
+
+Consumers hold one writer mutex through a fresh drain and the subsequent evidence query.
+Queued consent requires exact Delivered identity and full-digest membership; queue coordinates alone never suffice.
+Direct and ended classifications still require an initialized image and its floor.
+A deferred zero drain does not bypass the explicit query's integrity refusal.
+The consumer requires `consent_at <= max(wall_time, evidence_floor) < execution_expires_at` before readiness, mint, signing, or sending.
+MCP verifies proof before reading delivery status and hides integrity refusals behind its uniform approval-required response.
+Only proven missing membership exposes `approval.consent_undelivered` and its generation and row.
+Witness-free Allow performs no delivery-status or evidence query.
+All four production kind capabilities are disabled; metadata never enables enforcement.
+Activation requires every producer to reserve before ceremony and publish authenticated sink metadata before exposing a grant, plus complete lifecycle and inventory integration.
+Recoverable storage and publication errors retry the existing grant without another ceremony.
+
+For enforced kinds, the trust boundary is:
+
+An actor with file access and without the MAC key cannot forge, reorder or replay a queued row unnoticed, and cannot drop a consent row without the consumption refusing.
+
+An actor that holds the MAC key is inside the trust boundary of the audit log.
+
+It can append authentic rows by design, and the protocol claims nothing against it.
+
+A dropped tail of rows that carry no reference, such as halt and resume, is not detected before delivery.
+
+The CLI reports such a row as `queued`, never as `written`.
 
 ## 9. Tip anchor unavailable
 

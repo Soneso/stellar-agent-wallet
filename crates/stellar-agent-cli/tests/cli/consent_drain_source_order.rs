@@ -256,6 +256,14 @@ fn the_mainnet_drain_sits_between_the_confirmation_and_the_readiness_proof() {
         "async fn authorize_and_submit(",
         "cli_mainnet_authority(",
         "drain_consent_rows_before_signing(",
+        "consent_delivered(",
+    );
+    assert_called_between(
+        "common/mainnet_write.rs",
+        MAINNET_WRITE,
+        "async fn authorize_and_submit(",
+        "drain_consent_rows_before_signing(",
+        "consent_delivered(",
         "audit_readiness(",
     );
 }

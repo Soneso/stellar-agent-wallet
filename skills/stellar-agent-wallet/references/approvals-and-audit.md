@@ -312,13 +312,18 @@ loads a signing key for the approved action. The command refuses and persists no
 beside a process that does not drain the outbox (`audit.writer_locked`), and on
 any other audit failure. After upgrading, restart a running MCP server and
 `approve serve`: `approve --id` refuses beside an older one.
-The queue's count and chain head are committed in the platform keyring before approval persists. Removed or changed committed rows refuse acquisition with `audit.outbox_rows_missing`.
 A running MCP server also drains the outbox when it exits: on client EOF, on
 SIGINT or SIGTERM on Unix, and on Ctrl-C, Ctrl-Break, or console close on
 Windows. The exit drain waits at most two seconds for each writer's mutex; a
 writer still held keeps its rows queued for the next draining writer. A second
 shutdown signal or console event exits at once with exit code 3, and
 undelivered rows stay queued.
+
+Queued success exits zero and includes `audit_code: audit.outbox_queued`; Written omits `audit_code`.
+It returns immediately after persistence, without waiting for delivery.
+Legacy queues commit a count and chain head; owner queues authenticate tagged rows and commit delivered batches.
+An enforced kind additionally requires exact Delivered evidence before use.
+For an enforced kind, recoverable delivery and evidence errors retry the existing grant without another ceremony.
 
 ```json
 {"ok":true,"data":{"approval_nonce":"ABCxyzNonce","attested":true,"process_uid":"501","expires_at_unix_ms":1717000000000,"approval_attestation":"q83vEjRWeJq83v...","audit":"written"},"request_id":"..."}

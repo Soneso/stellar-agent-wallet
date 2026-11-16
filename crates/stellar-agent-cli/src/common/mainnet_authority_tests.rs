@@ -104,6 +104,215 @@ impl Verb {
     }
 }
 
+fn record_delivery_fixture(
+    profile: &stellar_agent_core::profile::Profile,
+    witness: &stellar_agent_core::approval::witness::ApprovalWitness,
+    queued: bool,
+    dropped: bool,
+) {
+    use stellar_agent_core::audit_log::{AuditEntry, AuditOutbox, BindingCheck};
+    use stellar_agent_network::policy_state::PersistedWindowStore;
+    use stellar_agent_network::policy_state::approvals::{
+        ApprovalRecorder, ApprovalStatus, ConsentDeliveryV1,
+        seed_existing_consent_delivery_for_test,
+    };
+    let name = witness.profile();
+    let store = PersistedWindowStore::for_profile(name);
+    let record = ApprovalStatus::new(&store, profile)
+        .find_by_nonce(witness.nonce())
+        .unwrap()
+        .unwrap()
+        .record;
+    let id = record.id;
+    let writer = crate::commands::value_audit::require_value_audit_writer(profile, name).unwrap();
+    let mut writer = writer.lock().unwrap();
+    writer.initialize_consent_evidence().unwrap();
+    let (key, anchor) =
+        stellar_agent_network::keyring::keyed_audit_access(profile, name, BindingCheck::Enforce)
+            .unwrap()
+            .into_parts();
+    let outbox = AuditOutbox::for_log_keyed(&profile.audit_log_path, anchor, key.clone());
+    let reservation = outbox
+        .reserve_evidence(
+            id,
+            stellar_agent_core::audit_log::EvidenceReservation::deadline(
+                record.waiting_expires_at_ms,
+                record.rule_ttl_ms,
+            )
+            .unwrap(),
+            witness.consent_at_ms(),
+        )
+        .unwrap();
+    let reference = queued.then(|| {
+        outbox
+            .clone()
+            .with_evidence_reservation(reservation)
+            .append_queued(&AuditEntry::new_approval_attested(
+                witness.kind().kind_name(),
+                "stellar_pay_commit",
+                None,
+                witness.nonce(),
+                "cli",
+                "delivery-fixture",
+            ))
+            .unwrap()
+    });
+    if dropped {
+        std::fs::write(
+            outbox.path(),
+            stellar_agent_core::audit_log::outbox::test_seam::generation_line(
+                &key,
+                reference.as_ref().unwrap().generation(),
+            ),
+        )
+        .unwrap();
+    }
+    let delivery = if queued {
+        ConsentDeliveryV1::queued(id)
+    } else {
+        ConsentDeliveryV1::direct_anchored(id)
+    };
+    seed_existing_consent_delivery_for_test(
+        &mut ApprovalRecorder::new(&store, profile, &mut *writer, "fixture"),
+        id,
+        reference,
+        delivery,
+    )
+    .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn all_value_verbs_require_delivered_consent() {
+    use stellar_agent_core::approval::witness::ApprovedKind;
+    use stellar_agent_network::policy_state::approvals::ConsentEvidenceEnforcementGuard;
+    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+    let names = [
+        [
+            "delivery-pay-missing",
+            "delivery-pay-queued",
+            "delivery-pay-direct",
+            "delivery-pay-allow",
+        ],
+        [
+            "delivery-claim-missing",
+            "delivery-claim-queued",
+            "delivery-claim-direct",
+            "delivery-claim-allow",
+        ],
+        [
+            "delivery-create-missing",
+            "delivery-create-queued",
+            "delivery-create-direct",
+            "delivery-create-allow",
+        ],
+        [
+            "delivery-trust-missing",
+            "delivery-trust-queued",
+            "delivery-trust-direct",
+            "delivery-trust-allow",
+        ],
+    ];
+    for (verb, names) in Verb::ALL.into_iter().zip(names) {
+        let kind = match verb {
+            Verb::Pay | Verb::Create => ApprovedKind::Payment,
+            Verb::Claim => ApprovedKind::Claim,
+            Verb::Trustline => ApprovedKind::Trustline,
+        };
+        for ((queued, dropped), name) in [(true, true), (true, false), (false, false)]
+            .into_iter()
+            .zip(names)
+        {
+            let fixture = verb.spec(name).build().await;
+            let _enabled = ConsentEvidenceEnforcementGuard::new(fixture.name, kind);
+            let _hook = crate::common::mainnet_write::consent_test::on_witness(
+                fixture.name,
+                move |profile, witness| record_delivery_fixture(profile, witness, queued, dropped),
+            );
+            let before = signer_resolutions_on_this_thread();
+            let (code, envelope) = verb.run(&fixture).await;
+            if dropped {
+                assert_eq!(code, 1, "missing delivery: {envelope}");
+                assert_eq!(
+                    envelope["error"]["code"], "approval.consent_undelivered",
+                    "{envelope}"
+                );
+                assert_eq!(
+                    signer_resolutions_on_this_thread(),
+                    before,
+                    "delivery precedes the signer"
+                );
+                assert!(fixture.sent_envelopes().await.is_empty());
+                assert!(
+                    fixture
+                        .open_authorizations(stellar_agent_core::timefmt::now_unix_ms().unwrap())
+                        .is_empty()
+                );
+            } else {
+                assert_eq!(code, 0, "delivered consent: {envelope}");
+                assert!(signer_resolutions_on_this_thread() > before);
+                assert_eq!(fixture.sent_envelopes().await.len(), 1);
+            }
+        }
+        let fixture = verb
+            .spec(names[3])
+            .rules(vec![verb.rule("allow", "")])
+            .build()
+            .await;
+        let profile = fixture.profile();
+        let _enabled = ConsentEvidenceEnforcementGuard::new(fixture.name, kind);
+        let writer =
+            crate::commands::value_audit::require_value_audit_writer(&profile, fixture.name)
+                .unwrap();
+        writer
+            .lock()
+            .unwrap()
+            .initialize_consent_evidence()
+            .unwrap();
+        let (key, anchor) = stellar_agent_network::keyring::keyed_audit_access(
+            &profile,
+            fixture.name,
+            stellar_agent_core::audit_log::BindingCheck::Enforce,
+        )
+        .unwrap()
+        .into_parts();
+        stellar_agent_core::audit_log::outbox::test_seam::conflicting_evidence(
+            &profile.audit_log_path,
+            &key,
+        )
+        .unwrap();
+        let outbox = stellar_agent_core::audit_log::AuditOutbox::for_log_keyed(
+            &profile.audit_log_path,
+            anchor,
+            key,
+        );
+        assert!(
+            outbox
+                .evidence_time_floor()
+                .unwrap_err()
+                .to_string()
+                .contains("owner rollback")
+        );
+        let queries = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = queries.clone();
+        let _query_hook = stellar_agent_core::audit_log::outbox::test_seam::on_delivery_query(
+            &profile.audit_log_path,
+            move || {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        );
+        let (code, result) = verb.run(&fixture).await;
+        assert_eq!(code, 0, "Allow beside rollback evidence: {result}");
+        assert_eq!(
+            queries.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "Allow reads no evidence"
+        );
+        fixture.assert_no_consent_ceremony();
+    }
+}
+
 /// Asserts the governing policy facts on the pending value row.
 pub(crate) fn assert_provenance(fixture: &MainnetFixture, approval: bool, index: u32) {
     let raw = std::fs::read_to_string(fixture.policy_path()).unwrap();

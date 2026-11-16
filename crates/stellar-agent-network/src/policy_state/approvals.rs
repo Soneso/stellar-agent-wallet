@@ -7,6 +7,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use stellar_agent_core::WalletError;
 use stellar_agent_core::approval::{
     AttestationBinding, AttestationScope, AttestedApprover, AttestedLifetime, load_attestation_key,
     mainnet_attestation_version,
@@ -174,6 +175,63 @@ impl std::fmt::Debug for ConsentPayload {
     }
 }
 
+/// The successful sink that produced a consent row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsentProvenance {
+    /// The direct writer anchored the row before returning success.
+    DirectAnchored,
+    /// The outbox returned a reference whose delivery must be checked.
+    Queued,
+}
+
+/// Delivery metadata authenticated by the enclosing window commitment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsentDeliveryV1 {
+    #[serde(deserialize_with = "delivery_version")]
+    v: u8,
+    #[serde(with = "hex32")]
+    identity: [u8; 32],
+    provenance: ConsentProvenance,
+}
+
+fn delivery_version<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u8, D::Error> {
+    let version = u8::deserialize(d)?;
+    if version != 1 {
+        return Err(serde::de::Error::custom(
+            "unsupported consent delivery version",
+        ));
+    }
+    Ok(version)
+}
+
+impl ConsentDeliveryV1 {
+    /// Records successful strict direct anchoring for an authenticated identity.
+    #[must_use]
+    pub fn direct_anchored(identity: [u8; 32]) -> Self {
+        Self {
+            v: 1,
+            identity,
+            provenance: ConsentProvenance::DirectAnchored,
+        }
+    }
+
+    /// Records a queued sink for an authenticated identity.
+    #[must_use]
+    pub fn queued(identity: [u8; 32]) -> Self {
+        Self {
+            v: 1,
+            identity,
+            provenance: ConsentProvenance::Queued,
+        }
+    }
+
+    fn matches(&self, id: [u8; 32], reference: Option<&OutboxRowRef>) -> bool {
+        self.identity == id && (self.provenance == ConsentProvenance::Queued) == reference.is_some()
+    }
+}
+
 /// The immutable consent clock and receipt identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -188,6 +246,9 @@ pub struct Consent {
     /// Reconstruction inputs, released when execution ends or the operation ends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<ConsentPayload>,
+    /// Authenticated sink provenance, retained after payload release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<ConsentDeliveryV1>,
 }
 
 /// One approval in the authenticated profile and chain scope.
@@ -694,6 +755,16 @@ impl<'a> ApprovalRecorder<'a> {
         witness: &ApprovalWitness,
         payload: &ConsentPayload,
     ) -> Result<ApprovalView, WindowStoreError> {
+        self.record_consent_inner(id, witness, payload, None)
+    }
+
+    fn record_consent_inner(
+        &mut self,
+        id: [u8; 32],
+        witness: &ApprovalWitness,
+        payload: &ConsentPayload,
+        delivery: Option<ConsentDeliveryV1>,
+    ) -> Result<ApprovalView, WindowStoreError> {
         self.observed();
         self.recorder.run(None, |session| {
             let profile = session.profile;
@@ -722,7 +793,26 @@ impl<'a> ApprovalRecorder<'a> {
                     "the approval witness does not match the record and receipt",
                 ));
             }
+            if delivery
+                .as_ref()
+                .is_some_and(|d| !d.matches(id, payload.outbox_row.as_ref()))
+            {
+                return Err(unexpected(
+                    "the consent delivery does not match its identity and sink",
+                ));
+            }
             if let Some(consent) = &record.consent {
+                if delivery.is_some()
+                    && (consent.delivery != delivery
+                        || consent
+                            .payload
+                            .as_ref()
+                            .is_none_or(|p| p.outbox_row != payload.outbox_row))
+                {
+                    return Err(unexpected(
+                        "the approval already holds different delivery facts",
+                    ));
+                }
                 if consent.receipt_sha256 == digest {
                     return Ok(record.view(session.now));
                 }
@@ -743,6 +833,7 @@ impl<'a> ApprovalRecorder<'a> {
                 execution_expires_at_ms: execution_expiry(at, record.rule_ttl_ms)?,
                 receipt_sha256: digest,
                 payload: Some(payload),
+                delivery,
             });
             if serialized_len(record) > APPROVAL_RECORD_MAX {
                 return Err(invalid("the approval record exceeds its allowance"));
@@ -778,6 +869,73 @@ impl<'a> ApprovalRecorder<'a> {
         self.recorder
             .run_held(lock, None, |session| revoke_step(session, id))
     }
+}
+
+/// Records explicit delivery through the ordinary consent transaction for fixtures.
+///
+/// # Errors
+/// Returns pending-record, witness, payload, delivery consistency and store refusals.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn record_consent_with_row_for_test(
+    recorder: &mut ApprovalRecorder<'_>,
+    operation: OperationId,
+    facts: &PendingApprovalFacts,
+    witness: &ApprovalWitness,
+    payload: &ConsentPayload,
+    outbox_row: Option<OutboxRowRef>,
+    delivery: ConsentDeliveryV1,
+) -> Result<ApprovalView, WindowStoreError> {
+    let id = recorder
+        .open_pending(operation, facts, PolicyDecision::RequireApproval)?
+        .record
+        .id;
+    let mut payload = payload.clone();
+    payload.outbox_row = outbox_row;
+    payload.row_provenance = outbox_row.is_none().then_some(RowProvenance::Written);
+    recorder.record_consent_inner(id, witness, &payload, Some(delivery))
+}
+
+/// Seeds delivery on an already consented fixture record, preserving its proof and clocks.
+/// The ordinary consent transaction still refuses replacing delivery facts.
+///
+/// # Errors
+/// Returns store errors and refuses missing consent, existing delivery or an inconsistent sink.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn seed_existing_consent_delivery_for_test(
+    recorder: &mut ApprovalRecorder<'_>,
+    id: [u8; 32],
+    outbox_row: Option<OutboxRowRef>,
+    delivery: ConsentDeliveryV1,
+) -> Result<ApprovalView, WindowStoreError> {
+    recorder.recorder.run(None, |session| {
+        if !delivery.matches(id, outbox_row.as_ref()) {
+            return Err(unexpected("the fixture delivery does not match its sink"));
+        }
+        let record = session
+            .wire
+            .approvals
+            .as_mut()
+            .and_then(|section| section.records.iter_mut().find(|record| record.id == id))
+            .ok_or_else(|| unexpected("the fixture approval is absent"))?;
+        let consent = record
+            .consent
+            .as_mut()
+            .ok_or_else(|| unexpected("the fixture consent is absent"))?;
+        if consent.delivery.is_some() {
+            return Err(unexpected(
+                "the fixture consent already holds delivery facts",
+            ));
+        }
+        let payload = consent
+            .payload
+            .as_mut()
+            .ok_or_else(|| unexpected("the fixture consent payload is absent"))?;
+        payload.outbox_row = outbox_row;
+        payload.row_provenance = outbox_row.is_none().then_some(RowProvenance::Written);
+        consent.delivery = Some(delivery);
+        session.changed = true;
+        Ok(record.view(session.now))
+    })
 }
 
 /// Revokes the live record `id` in `session`.
@@ -864,6 +1022,69 @@ fn verify_payload(
 pub struct ApprovalStatus<'a> {
     store: &'a PersistedWindowStore,
     profile: &'a Profile,
+}
+
+/// Delivery classification after binding an authenticated record to a verified witness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifiedConsentDelivery {
+    /// The compiled kind capability does not require delivery enforcement.
+    Unenforced,
+    /// Strict direct anchoring succeeded for this identity.
+    DirectAnchored {
+        /// The full approval identity.
+        identity: [u8; 32],
+    },
+    /// This exact queued reference needs Delivered membership.
+    Queued {
+        /// The full approval identity.
+        identity: [u8; 32],
+        /// The successful append's reference.
+        reference: OutboxRowRef,
+    },
+    /// Authenticated expiry, revocation or operation termination ends authority.
+    Ended {
+        /// The full approval identity.
+        identity: [u8; 32],
+    },
+}
+
+/// Whether all production paths of this kind enforce consent delivery.
+#[must_use]
+pub fn consent_evidence_enforced(kind: ApprovedKind) -> bool {
+    match kind {
+        ApprovedKind::Payment
+        | ApprovedKind::Claim
+        | ApprovedKind::Trustline
+        | ApprovedKind::X402Payment => false,
+        _ => false,
+    }
+}
+
+fn delivery_enforced(profile: &str, kind: ApprovedKind) -> bool {
+    #[cfg(any(test, feature = "test-helpers"))]
+    if delivery_test_override::enabled(profile, kind) {
+        return true;
+    }
+    let _ = profile;
+    consent_evidence_enforced(kind)
+}
+
+/// Requires the verified consent window at the greater of wall time and evidence floor.
+///
+/// # Errors
+/// Returns clock errors or the exclusive `ApprovalExpired` refusal.
+pub fn require_consent_evidence_time(
+    witness: &ApprovalWitness,
+    floor_ms: u64,
+) -> Result<(), WalletError> {
+    let now = crate::mainnet::clock::now_ms()?.max(floor_ms);
+    if now < witness.consent_at_ms() || now >= witness.execution_expires_at_ms() {
+        return Err(crate::mainnet::MainnetAuthorizationError::Refused(
+            MainnetPrecondition::ApprovalExpired,
+        )
+        .into());
+    }
+    Ok(())
 }
 
 impl<'a> ApprovalStatus<'a> {
@@ -966,7 +1187,127 @@ impl<'a> ApprovalStatus<'a> {
             )
         }))
     }
+
+    /// Binds retained delivery facts to a verified witness without pruning the inspected image.
+    /// Ended classification supplies no authority and does not release evidence.
+    ///
+    /// # Errors
+    /// Returns store errors or `ApprovalConsentMissing` for incomplete or inconsistent bindings.
+    pub fn consent_delivery(
+        &self,
+        witness: &ApprovalWitness,
+    ) -> Result<VerifiedConsentDelivery, WindowStoreError> {
+        let name = profile_name_for_approval(self.profile);
+        if !delivery_enforced(&name, witness.kind()) {
+            return Ok(VerifiedConsentDelivery::Unenforced);
+        }
+        let missing = || WindowStoreError::AuthorizationRefused {
+            precondition: MainnetPrecondition::ApprovalConsentMissing,
+        };
+        let wire = self
+            .store
+            .read_for_inspection(self.profile)?
+            .ok_or_else(missing)?;
+        let record = records(&wire)
+            .iter()
+            .find(|r| r.nonce == witness.nonce())
+            .ok_or_else(missing)?;
+        let consent = record.consent.as_ref().ok_or_else(missing)?;
+        let delivery = consent.delivery.as_ref().ok_or_else(missing)?;
+        if witness.profile() != name
+            || witness.chain() != self.profile.chain_id
+            || record.id != record_id(&name, witness.nonce())
+            || record.kind != witness.kind()
+            || record.subject_kind != witness.subject_kind()
+            || record.subject != witness.subject()
+            || record.created_at_ms != witness.created_at_ms()
+            || record.waiting_expires_at_ms != witness.expires_at_ms()
+            || consent.consent_at_ms != witness.consent_at_ms()
+            || consent.receipt_sha256 != witness.presence_receipt_digest()
+            || delivery.identity != record.id
+        {
+            return Err(missing());
+        }
+        let reference = consent.payload.as_ref().and_then(|p| p.outbox_row.as_ref());
+        if delivery.provenance == ConsentProvenance::DirectAnchored && reference.is_some() {
+            return Err(missing());
+        }
+        let ended = record.state == ApprovalState::Revoked
+            || now_ms()?
+                >= consent
+                    .execution_expires_at_ms
+                    .min(witness.execution_expires_at_ms())
+            || wire.operations.as_ref().is_some_and(|s| {
+                s.records
+                    .iter()
+                    .any(|op| op.id == record.operation_id && op.state.is_terminal())
+                    || s.tombstones.iter().any(|op| op.id == record.operation_id)
+            });
+        if ended {
+            return Ok(VerifiedConsentDelivery::Ended {
+                identity: record.id,
+            });
+        }
+        if consent.payload.is_none() {
+            return Err(missing());
+        }
+        Ok(match delivery.provenance {
+            ConsentProvenance::DirectAnchored => VerifiedConsentDelivery::DirectAnchored {
+                identity: record.id,
+            },
+            ConsentProvenance::Queued => VerifiedConsentDelivery::Queued {
+                identity: record.id,
+                reference: reference.cloned().ok_or_else(missing)?,
+            },
+        })
+    }
 }
+
+#[cfg(any(test, feature = "test-helpers"))]
+mod delivery_test_override {
+    use super::*;
+    use std::sync::{Mutex, PoisonError};
+    static ENABLED: Mutex<Vec<(String, u8)>> = Mutex::new(Vec::new());
+
+    pub(super) fn enabled(profile: &str, kind: ApprovedKind) -> bool {
+        ENABLED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|(name, tag)| name == profile && *tag == kind.tag())
+    }
+
+    /// Enables one profile and kind for a fixture, restoring its previous setting on drop.
+    #[derive(Debug)]
+    pub struct ConsentEvidenceEnforcementGuard(String, u8);
+
+    impl ConsentEvidenceEnforcementGuard {
+        /// Installs a profile-scoped override. Production builds exclude this API.
+        #[must_use]
+        pub fn new(profile: &str, kind: ApprovedKind) -> Self {
+            ENABLED
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((profile.to_owned(), kind.tag()));
+            Self(profile.to_owned(), kind.tag())
+        }
+    }
+
+    impl Drop for ConsentEvidenceEnforcementGuard {
+        fn drop(&mut self) {
+            let mut enabled = ENABLED.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(index) = enabled
+                .iter()
+                .rposition(|entry| entry == &(self.0.clone(), self.1))
+            {
+                enabled.remove(index);
+            }
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+pub use delivery_test_override::ConsentEvidenceEnforcementGuard;
 
 /// Consumes on the caller's successor image; its mint commits this change.
 pub(super) fn consume(
@@ -1280,6 +1621,372 @@ pub(in crate::policy_state) mod tests {
                 }),
                 native_reservation: None,
             }
+        }
+
+        fn delivery(
+            &mut self,
+            provenance: ConsentProvenance,
+            reference: Option<OutboxRowRef>,
+        ) -> Result<ApprovalView, WindowStoreError> {
+            let delivery = match provenance {
+                ConsentProvenance::Queued => ConsentDeliveryV1::queued(self.id()),
+                ConsentProvenance::DirectAnchored => {
+                    let path = self.fixture.home().join("strict-direct.log");
+                    if !path.exists() {
+                        use stellar_agent_core::audit_log::{
+                            AuditWriter, KeyedAuditAccess, tip_anchor::InMemoryTipAnchorStore,
+                        };
+                        let mut writer = AuditWriter::open(
+                            path,
+                            Some(KeyedAuditAccess::new(
+                                zeroize::Zeroizing::new([42; 32]),
+                                std::sync::Arc::new(InMemoryTipAnchorStore::new()),
+                            )),
+                        )
+                        .unwrap();
+                        writer
+                            .prepare_entry()
+                            .unwrap()
+                            .write_anchored(AuditEntry::new_approval_attested(
+                                self.witness.kind().kind_name(),
+                                "stellar_pay_commit",
+                                None,
+                                self.witness.nonce(),
+                                "cli",
+                                "strict-direct",
+                            ))
+                            .unwrap();
+                    }
+                    ConsentDeliveryV1::direct_anchored(self.id())
+                }
+            };
+            record_consent_with_row_for_test(
+                &mut ApprovalRecorder::new(
+                    &self.store,
+                    self.fixture.profile(),
+                    &mut self.rows,
+                    "delivery",
+                ),
+                self.operation,
+                &self.facts,
+                &self.witness,
+                &self.payload,
+                reference,
+                delivery,
+            )
+        }
+
+        fn reference(&self, file: &str) -> OutboxRowRef {
+            use stellar_agent_core::audit_log::{
+                AuditOutbox, AuditWriter, KeyedAuditAccess, tip_anchor::InMemoryTipAnchorStore,
+            };
+            let path = self.fixture.home().join(file);
+            let anchor = std::sync::Arc::new(InMemoryTipAnchorStore::new());
+            let mut writer = AuditWriter::open(
+                path.clone(),
+                Some(KeyedAuditAccess::new(
+                    zeroize::Zeroizing::new([42; 32]),
+                    anchor.clone(),
+                )),
+            )
+            .unwrap();
+            writer.initialize_consent_evidence().unwrap();
+            let outbox =
+                AuditOutbox::for_log_keyed(&path, anchor, zeroize::Zeroizing::new([42; 32]));
+            let reservation = outbox
+                .reserve_evidence(
+                    self.id(),
+                    self.facts.waiting_expires_at_ms + 300_000,
+                    self.witness.consent_at_ms(),
+                )
+                .unwrap();
+            let row = AuditEntry::new_approval_attested(
+                "PaymentSimulated",
+                "stellar_pay_commit",
+                None,
+                &self.facts.nonce,
+                "cli",
+                file,
+            );
+            let reference = outbox
+                .with_evidence_reservation(reservation)
+                .append_queued(&row)
+                .unwrap();
+            writer.drain_outbox().unwrap();
+            reference
+        }
+
+        fn edit(&mut self, change: impl FnOnce(&mut WireFile)) {
+            OperationRecorder::new(
+                &self.store,
+                self.fixture.profile(),
+                &mut self.rows,
+                "snapshot",
+            )
+            .run(None, |session| {
+                change(&mut session.wire);
+                session.changed = true;
+                Ok(())
+            })
+            .unwrap();
+        }
+
+        fn classify(&self) -> Result<VerifiedConsentDelivery, WindowStoreError> {
+            ApprovalStatus::new(&self.store, self.fixture.profile()).consent_delivery(&self.witness)
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn delivery_classifier_binds_witness() {
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        for field in [
+            "kind",
+            "convention",
+            "subject",
+            "created",
+            "waiting",
+            "receipt",
+            "identity",
+            "metadata",
+            "consent",
+            "reference",
+            "direct_row",
+            "record",
+        ] {
+            let mut fx = Fx::new(300_000);
+            let _enabled =
+                ConsentEvidenceEnforcementGuard::new(fx.fixture.name(), ApprovedKind::Payment);
+            fx.open();
+            let reference = fx.reference("delivery.log");
+            fx.delivery(ConsentProvenance::Queued, Some(reference))
+                .unwrap();
+            assert_eq!(
+                fx.classify().unwrap(),
+                VerifiedConsentDelivery::Queued {
+                    identity: fx.id(),
+                    reference
+                }
+            );
+            // Every edited snapshot passes the store's authenticated commit validation.
+            // Kind changes only kind, so its comparison cannot hide behind another mismatch.
+            fx.edit(|wire| {
+                let record = &mut wire.approvals.as_mut().unwrap().records[0];
+                match field {
+                    "kind" => record.kind = ApprovedKind::Claim,
+                    "convention" => {
+                        record.subject_kind = SubjectKind::IntentDigest;
+                        let consent = record.consent.as_mut().unwrap();
+                        consent.payload.as_mut().unwrap().challenge_subject = Some(record.subject);
+                    }
+                    "subject" => record.subject[0] ^= 1,
+                    "created" => {
+                        record.created_at_ms -= 1;
+                        record.rule_ttl_ms += 1;
+                        record.consent.as_mut().unwrap().execution_expires_at_ms += 1;
+                    }
+                    "waiting" => {
+                        record.waiting_expires_at_ms += 1;
+                        record.rule_ttl_ms += 1;
+                        record.consent.as_mut().unwrap().execution_expires_at_ms += 1;
+                    }
+                    "receipt" => {
+                        let consent = record.consent.as_mut().unwrap();
+                        let payload = consent.payload.as_mut().unwrap();
+                        let mut value = serde_json::to_value(&payload.receipt).unwrap();
+                        value["request_id"] = uuid::Uuid::new_v4().to_string().into();
+                        payload.receipt = serde_json::from_value(value).unwrap();
+                        consent.receipt_sha256 = payload.receipt.digest().unwrap();
+                    }
+                    "identity" => {
+                        record
+                            .consent
+                            .as_mut()
+                            .unwrap()
+                            .delivery
+                            .as_mut()
+                            .unwrap()
+                            .identity[0] ^= 1
+                    }
+                    "metadata" => record.consent.as_mut().unwrap().delivery = None,
+                    "consent" => record.consent = None,
+                    "reference" => {
+                        record
+                            .consent
+                            .as_mut()
+                            .unwrap()
+                            .payload
+                            .as_mut()
+                            .unwrap()
+                            .outbox_row = None
+                    }
+                    "direct_row" => {
+                        record.consent.as_mut().unwrap().delivery =
+                            Some(ConsentDeliveryV1::direct_anchored(record.id))
+                    }
+                    "record" => wire.approvals = None,
+                    _ => unreachable!(),
+                }
+            });
+            let classified = fx.classify();
+            assert!(
+                matches!(
+                    &classified,
+                    Err(WindowStoreError::AuthorizationRefused {
+                        precondition: MainnetPrecondition::ApprovalConsentMissing
+                    })
+                ),
+                "binding {field}: {classified:?}"
+            );
+        }
+        let mut fx = Fx::new(300_000);
+        let _enabled =
+            ConsentEvidenceEnforcementGuard::new(fx.fixture.name(), ApprovedKind::Payment);
+        fx.delivery(ConsentProvenance::DirectAnchored, None)
+            .unwrap();
+        assert_eq!(
+            fx.classify().unwrap(),
+            VerifiedConsentDelivery::DirectAnchored { identity: fx.id() }
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn enforcement_activation_requires_complete_producers() {
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let mut fx = Fx::new(300_000);
+        for kind in [
+            ApprovedKind::Payment,
+            ApprovedKind::Claim,
+            ApprovedKind::Trustline,
+            ApprovedKind::X402Payment,
+        ] {
+            assert!(!consent_evidence_enforced(kind));
+        }
+        assert_eq!(fx.classify().unwrap(), VerifiedConsentDelivery::Unenforced);
+        let enabled =
+            ConsentEvidenceEnforcementGuard::new(fx.fixture.name(), ApprovedKind::Payment);
+        assert!(
+            matches!(
+                fx.classify(),
+                Err(WindowStoreError::AuthorizationRefused {
+                    precondition: MainnetPrecondition::ApprovalConsentMissing
+                })
+            ),
+            "enabled absence refuses"
+        );
+        fx.open();
+        fx.consent();
+        assert!(fx.classify().is_err(), "legacy metadata is incomplete");
+        drop(enabled);
+        let id = fx.id();
+        fx.edit(|wire| {
+            wire.approvals.as_mut().unwrap().records[0]
+                .consent
+                .as_mut()
+                .unwrap()
+                .delivery = Some(ConsentDeliveryV1::direct_anchored(id))
+        });
+        assert_eq!(
+            fx.classify().unwrap(),
+            VerifiedConsentDelivery::Unenforced,
+            "metadata never enables a kind"
+        );
+        let _other = ConsentEvidenceEnforcementGuard::new("other-profile", ApprovedKind::Payment);
+        assert_eq!(fx.classify().unwrap(), VerifiedConsentDelivery::Unenforced);
+    }
+
+    #[test]
+    #[serial]
+    fn effective_floor_prevents_expired_use() {
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let mut fx = Fx::new(300_000);
+        let _enabled =
+            ConsentEvidenceEnforcementGuard::new(fx.fixture.name(), ApprovedKind::Payment);
+        fx.delivery(ConsentProvenance::DirectAnchored, None)
+            .unwrap();
+        assert!(matches!(
+            fx.classify().unwrap(),
+            VerifiedConsentDelivery::DirectAnchored { .. }
+        ));
+        let end = fx.witness.execution_expires_at_ms();
+        fx.clock.set(end - 1);
+        require_consent_evidence_time(&fx.witness, 0).unwrap();
+        for (wall, floor) in [
+            (end, 0),
+            (end + 1, 0),
+            (fx.witness.consent_at_ms(), end),
+            (fx.witness.consent_at_ms() - 1, 0),
+        ] {
+            fx.clock.set(wall);
+            let error = require_consent_evidence_time(&fx.witness, floor).unwrap_err();
+            assert_eq!(error.code(), "network.mainnet_authorization_refused");
+            assert!(
+                matches!(
+                    error,
+                    WalletError::Network(
+                        stellar_agent_core::error::NetworkError::MainnetAuthorizationRefused
+                    )
+                ),
+                "expired wall {wall}, floor {floor}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn same_receipt_cannot_replace_delivery() {
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        for queued in [false, true] {
+            let mut fx = Fx::new(300_000);
+            fx.open();
+            let reference = queued.then(|| fx.reference("first-delivery.log"));
+            let provenance = if queued {
+                ConsentProvenance::Queued
+            } else {
+                ConsentProvenance::DirectAnchored
+            };
+            let first = fx.delivery(provenance, reference).unwrap();
+            let before = fx.bytes();
+            assert_eq!(fx.delivery(provenance, reference).unwrap(), first);
+            assert_eq!(fx.bytes(), before);
+            let reopened = PersistedWindowStore::at_path(fx.store.path().to_owned());
+            assert_eq!(
+                ApprovalStatus::new(&reopened, fx.fixture.profile())
+                    .view(fx.id())
+                    .unwrap(),
+                Some(first)
+            );
+            let other = if queued {
+                None
+            } else {
+                Some(fx.reference("other-delivery.log"))
+            };
+            assert!(
+                fx.delivery(
+                    if queued {
+                        ConsentProvenance::DirectAnchored
+                    } else {
+                        ConsentProvenance::Queued
+                    },
+                    other
+                )
+                .is_err(),
+                "same receipt cannot replace provenance"
+            );
+            if queued {
+                let different = fx.reference("second-delivery.log");
+                assert!(
+                    fx.delivery(ConsentProvenance::Queued, Some(different))
+                        .is_err(),
+                    "same receipt cannot replace reference"
+                );
+            }
+            assert_eq!(fx.bytes(), before);
         }
     }
 
@@ -1857,35 +2564,128 @@ pub(in crate::policy_state) mod tests {
     #[test]
     #[serial]
     fn payload_drops_when_the_operation_ends_or_the_window_closes() {
-        let mut fx = Fx::new(300_000);
-        fx.open();
-        fx.consent();
-        let request = fx.mint_request();
-        fx.store
-            .mint_authorization(fx.fixture.profile(), &request)
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        for queued in [false, true] {
+            let mut fx = Fx::new(300_000);
+            fx.open();
+            let reference = queued.then(|| fx.reference("prune-delivery.log"));
+            fx.delivery(
+                if queued {
+                    ConsentProvenance::Queued
+                } else {
+                    ConsentProvenance::DirectAnchored
+                },
+                reference,
+            )
             .unwrap();
-        let current = fx.wire();
-        let record = &current.approvals.as_ref().unwrap().records[0];
-        let consent = record.consent.as_ref().unwrap();
-        assert!(consent.payload.is_some());
-        for terminal in [false, true] {
-            let mut wire = current.clone();
-            let now = if terminal {
-                consent.consent_at_ms
-            } else {
-                consent.execution_expires_at_ms
-            };
-            if terminal {
-                let op = &mut wire.operations.as_mut().unwrap().records[0];
-                op.state = OperationState::Succeeded;
-                op.closed_at_ms = Some(now);
+            let request = fx.mint_request();
+            fx.store
+                .mint_authorization(fx.fixture.profile(), &request)
+                .unwrap();
+            let current = fx.wire();
+            let record = &current.approvals.as_ref().unwrap().records[0];
+            let consent = record.consent.as_ref().unwrap();
+            assert!(consent.payload.is_some());
+            for terminal in [false, true] {
+                let mut wire = current.clone();
+                let now = if terminal {
+                    consent.consent_at_ms
+                } else {
+                    consent.execution_expires_at_ms
+                };
+                if terminal {
+                    let op = &mut wire.operations.as_mut().unwrap().records[0];
+                    op.state = OperationState::Succeeded;
+                    op.closed_at_ms = Some(now);
+                }
+                Approvals::prune(&mut wire, now);
+                let after = wire.approvals.unwrap().records.remove(0);
+                let mut expected = consent.clone();
+                expected.payload = None;
+                assert_eq!(
+                    after.consent,
+                    Some(expected),
+                    "provenance survives payload release"
+                );
+                assert_eq!(after.waiting_expires_at_ms, record.waiting_expires_at_ms);
             }
-            Approvals::prune(&mut wire, now);
-            let after = wire.approvals.unwrap().records.remove(0);
-            let mut expected = consent.clone();
-            expected.payload = None;
-            assert_eq!(after.consent, Some(expected));
-            assert_eq!(after.waiting_expires_at_ms, record.waiting_expires_at_ms);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn consumed_evidence_survives_same_operation_retry() {
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        for terminal in [false, true] {
+            let mut fx = Fx::new(300_000);
+            let _enabled =
+                ConsentEvidenceEnforcementGuard::new(fx.fixture.name(), ApprovedKind::Payment);
+            fx.open();
+            let reference = fx.reference("retry-delivery.log");
+            fx.delivery(ConsentProvenance::Queued, Some(reference))
+                .unwrap();
+            let request = fx.mint_request();
+            fx.store
+                .mint_authorization(fx.fixture.profile(), &request)
+                .unwrap();
+            assert_eq!(fx.view().record.state, ApprovalState::Consumed);
+            assert_eq!(
+                fx.classify().unwrap(),
+                VerifiedConsentDelivery::Queued {
+                    identity: fx.id(),
+                    reference
+                }
+            );
+            use super::super::operations::{
+                AttemptAuthorization, AttemptEnvelope, AttemptRequest, LookupOutcome,
+                TransitionEvidence,
+            };
+            let mut recorder =
+                OperationRecorder::new(&fx.store, fx.fixture.profile(), &mut fx.rows, "retry");
+            let Some(LookupOutcome::Resumable(handle)) = recorder
+                .lookup(&BusinessId::parse("order-1").unwrap())
+                .unwrap()
+            else {
+                panic!("live operation");
+            };
+            recorder
+                .begin_attempt(
+                    &handle,
+                    &AttemptRequest {
+                        envelope: Some(AttemptEnvelope {
+                            xdr: "AAAA".to_owned(),
+                            unsigned_envelope_sha256: [1; 32],
+                        }),
+                        authorization: AttemptAuthorization::Mint(Box::new(request.clone())),
+                        send_by_ms: u64::MAX,
+                    },
+                )
+                .expect("same-operation second mint remains live");
+            if terminal {
+                recorder
+                    .transition(
+                        fx.operation,
+                        Some(1),
+                        OperationState::NotSent,
+                        &TransitionEvidence::default(),
+                    )
+                    .unwrap();
+            } else {
+                fx.clock
+                    .set(fx.view().record.consent.unwrap().execution_expires_at_ms);
+            }
+            assert_eq!(
+                fx.classify().unwrap(),
+                VerifiedConsentDelivery::Ended { identity: fx.id() }
+            );
+            assert!(
+                fx.store
+                    .mint_authorization(fx.fixture.profile(), &request)
+                    .is_err(),
+                "ended authority cannot mint"
+            );
         }
     }
 
@@ -2012,6 +2812,8 @@ pub(in crate::policy_state) mod tests {
     #[test]
     #[serial]
     fn largest_approval_record_fits_its_bound() {
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
         let mut fx = Fx::new(86_400_000);
         fx.open();
         let mut record = fx.consent().record;
@@ -2025,6 +2827,7 @@ pub(in crate::policy_state) mod tests {
         record.revoked_at_ms = Some(u64::MAX);
         record.closed_at_ms = Some(u64::MAX);
         let c = record.consent.as_mut().unwrap();
+        c.delivery = Some(ConsentDeliveryV1::direct_anchored([255; 32]));
         c.consent_at_ms = u64::MAX;
         c.execution_expires_at_ms = u64::MAX;
         let payload = c.payload.as_mut().unwrap();
@@ -2148,6 +2951,66 @@ pub(in crate::policy_state) mod tests {
             Approvals::validate(&wire),
             Err(WindowStoreError::Invalid { .. })
         ));
+    }
+
+    #[test]
+    #[serial]
+    fn consent_delivery_codec_and_legacy_bytes() {
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let mut fx = Fx::new(300_000);
+        fx.open();
+        let consent = fx.consent().record.consent.unwrap();
+        let legacy = format!(
+            "{{\"consent_at_ms\":{},\"execution_expires_at_ms\":{},\"receipt_sha256\":\"{}\",\"payload\":{}}}",
+            consent.consent_at_ms,
+            consent.execution_expires_at_ms,
+            stellar_agent_core::hex::encode(&consent.receipt_sha256),
+            serde_json::to_string(consent.payload.as_ref().unwrap()).unwrap(),
+        );
+        assert_eq!(serde_json::to_string(&consent).unwrap(), legacy);
+        assert_eq!(serde_json::from_str::<Consent>(&legacy).unwrap(), consent);
+        for (name, value) in [
+            (
+                "direct_anchored",
+                ConsentDeliveryV1::direct_anchored([0xab; 32]),
+            ),
+            ("queued", ConsentDeliveryV1::queued([0xab; 32])),
+        ] {
+            let canonical = format!(
+                "{{\"v\":1,\"identity\":\"{}\",\"provenance\":\"{name}\"}}",
+                "ab".repeat(32)
+            );
+            assert_eq!(serde_json::to_string(&value).unwrap(), canonical);
+            assert_eq!(
+                serde_json::from_str::<ConsentDeliveryV1>(&canonical).unwrap(),
+                value
+            );
+            let reordered = format!(
+                "{{ \"provenance\":\"{name}\", \"identity\":\"{}\", \"v\":1 }}",
+                "ab".repeat(32)
+            );
+            assert_eq!(
+                serde_json::from_str::<ConsentDeliveryV1>(&reordered).unwrap(),
+                value
+            );
+            for invalid in [
+                canonical.replace("\"v\":1", "\"v\":2"),
+                canonical.replace("\"v\":1", "\"v\":0"),
+                canonical.replace("\"v\":1", "\"v\":256"),
+                canonical.replace("\"v\":1", "\"v\":1,\"v\":1"),
+                canonical.replace("\"v\":1,", ""),
+                canonical.replace("\"v\":1", "\"v\":1,\"extra\":0"),
+                canonical.replace("ab", "AB"),
+                canonical.replace(&"ab".repeat(32), "ab"),
+                canonical.replace(name, "written"),
+            ] {
+                assert!(
+                    serde_json::from_str::<ConsentDeliveryV1>(&invalid).is_err(),
+                    "reject {invalid}"
+                );
+            }
+        }
     }
 
     /// A window that holds a direct consent payload with neither a reference
