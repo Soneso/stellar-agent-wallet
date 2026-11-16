@@ -22,7 +22,8 @@ use crate::tools::common::{
 };
 use stellar_agent_core::amount::McpMemoTextArgument;
 use stellar_agent_core::amount::StellarAmount;
-use stellar_agent_core::approval::store::PendingApproval;
+use stellar_agent_core::approval::ApprovalError;
+use stellar_agent_core::approval::store::{PaymentRecoveryContext, PendingApproval};
 use stellar_agent_core::approval::user_id::process_uid_for_attestation;
 use stellar_agent_core::approval::{
     DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, open_with_retry,
@@ -478,15 +479,55 @@ fn resolve_payment_amount(
 // WalletServer — approval-spine helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// The internal-error prefix of a direct payment queueing failure.
+const STORE: &str = "approval.store_error";
+
+/// The internal-error prefix of a forced toolset queueing failure.
+const GATED_CREATE: &str = "toolset.gated_approval_create";
+
+/// Maps a queueing failure to its wire result; an error without a wire code
+/// is an internal error under the caller's `prefix`.
+fn payment_recovery_refusal(
+    error: &ApprovalError,
+    profile: &str,
+    prefix: &str,
+) -> Result<CallToolResult, rmcp::ErrorData> {
+    super::common::payment_recovery_wire_error(error, profile)
+        .ok_or_else(|| rmcp::ErrorData::internal_error(format!("{prefix}: {error}"), None))
+}
+
+/// The recovery binding a queued payment approval receives.
+#[derive(Clone, Copy)]
+pub(crate) enum PaymentQueue {
+    /// Direct preparation requires a verified policy; the winning operation
+    /// ID and waiting end are present on mainnet.
+    Direct(Option<([u8; 16], u64)>),
+    /// Forced toolset preparation binds under a verified policy and otherwise
+    /// queues an unbound entry.
+    Forced,
+}
+
+fn approval_storage_error(error: impl std::error::Error + Send + Sync + 'static) -> ApprovalError {
+    let source = std::io::Error::other(error);
+    ApprovalError::Io {
+        kind: source.kind(),
+        source,
+    }
+}
+
 impl WalletServer {
     /// Persists the retained payment envelope with its captured interval in
     /// the profile's approval store, under one lock and one clock observation.
+    /// A verified policy binds the entry for recovery; without one, only the
+    /// forced toolset path queues, as an unbound entry.
     ///
     /// # Errors
     ///
-    /// Returns a string error description on any I/O, store-lock, or clock
-    /// failure, invalid envelope or elapsed interval. The caller maps this to
-    /// an `internal_error` MCP response.
+    /// Returns typed storage, binding, and lifecycle refusals.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the operation and captured interval bind recovery"
+    )]
     pub(crate) fn persist_pay_pending_approval(
         &self,
         envelope_xdr: &str,
@@ -494,43 +535,62 @@ impl WalletServer {
         expires_at_ms: u64,
         profile_name: &str,
         request: &stellar_agent_core::policy::ApprovalRequest,
-    ) -> Result<PendingApproval, String> {
+        queue: PaymentQueue,
+    ) -> Result<PendingApproval, ApprovalError> {
+        let policy = match (self.verified_policy.as_deref(), queue) {
+            (Some(policy), _) => Some(policy),
+            (None, PaymentQueue::Forced) => None,
+            (None, PaymentQueue::Direct(_)) => {
+                return Err(ApprovalError::InvalidEntry {
+                    detail: "payment recovery requires a verified policy".to_owned(),
+                });
+            }
+        };
+        let operation = match queue {
+            PaymentQueue::Direct(operation) => operation,
+            PaymentQueue::Forced => None,
+        };
         #[cfg(any(test, feature = "test-helpers"))]
         let approvals_dir = match self.approval_dir_override {
             Some(ref override_dir) => override_dir.clone(),
-            None => default_approval_dir()
-                .map_err(|e| format!("approval dir resolution failed: {e}"))?,
+            None => default_approval_dir().map_err(approval_storage_error)?,
         };
         #[cfg(not(any(test, feature = "test-helpers")))]
-        let approvals_dir =
-            default_approval_dir().map_err(|e| format!("approval dir resolution failed: {e}"))?;
+        let approvals_dir = default_approval_dir().map_err(approval_storage_error)?;
         // Create the directory if it does not exist.
-        std::fs::create_dir_all(&approvals_dir)
-            .map_err(|e| format!("approval dir create_all failed: {e}"))?;
+        std::fs::create_dir_all(&approvals_dir).map_err(approval_storage_error)?;
         let store_path = approvals_dir.join(format!("{profile_name}.toml"));
-        let mut store = open_with_retry(&store_path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF)
-            .map_err(|e| format!("approval store open failed: {e}"))?;
+        let mut store =
+            open_with_retry(&store_path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF)?;
 
-        let uid =
-            process_uid_for_attestation().map_err(|e| format!("process UID unavailable: {e}"))?;
-        let now_ms = self
-            .clock
-            .now_unix_ms()
-            .map_err(|e| format!("approval store insert: current time unavailable: {e}"))?;
-        let entry = PendingApproval::new_payment_pending_until(
-            envelope_xdr.to_owned(),
+        let uid = process_uid_for_attestation()?;
+        let now_ms = self.clock.now_unix_ms().map_err(approval_storage_error)?;
+        let Some(policy) = policy else {
+            let entry = PendingApproval::new_payment_pending_until(
+                envelope_xdr.to_owned(),
+                uid,
+                created_at_ms,
+                expires_at_ms,
+                now_ms,
+                request.reason.clone(),
+            )?;
+            store.insert(entry.clone(), now_ms)?;
+            return Ok(entry);
+        };
+        store.recover_payment(
+            PaymentRecoveryContext {
+                profile: profile_name,
+                chain: self.context.chain_id,
+                policy,
+                operation,
+            },
+            envelope_xdr,
             uid,
             created_at_ms,
             expires_at_ms,
             now_ms,
             request,
         )
-        .map_err(|e| format!("payment approval construction failed: {e}"))?;
-        store
-            .insert(entry.clone(), now_ms)
-            .map_err(|e| format!("approval store insert failed: {e}"))?;
-
-        Ok(entry)
     }
 }
 
@@ -1088,17 +1148,17 @@ impl WalletServer {
                     .waiting_end
                     .map_or(policy_end, |end| policy_end.min(end));
                 let profile_name = self.profile_name_for_approval();
-                let entry = self
-                    .persist_pay_pending_approval(
-                        &envelope_xdr,
-                        created_at_ms,
-                        expires_at_ms,
-                        &profile_name,
-                        &approval.request,
-                    )
-                    .map_err(|e| {
-                        rmcp::ErrorData::internal_error(format!("approval.store_error: {e}"), None)
-                    })?;
+                let entry = match self.persist_pay_pending_approval(
+                    &envelope_xdr,
+                    created_at_ms,
+                    expires_at_ms,
+                    &profile_name,
+                    &approval.request,
+                    PaymentQueue::Direct(prepared.operation_id.zip(prepared.waiting_end)),
+                ) {
+                    Ok(entry) => entry,
+                    Err(error) => return payment_recovery_refusal(&error, &profile_name, STORE),
+                };
                 Some(json!({
                     "approval_nonce": entry.approval_nonce,
                     "profile": &profile_name,
@@ -2016,19 +2076,28 @@ impl WalletServer {
         let has_approval = args.approval_nonce.is_some() && args.approval_attestation.is_some();
 
         if !has_approval {
-            // Force per-action approval unconditionally.
-            // Synthesise a PaymentSimulated pending approval from the authoritative
-            // envelope params.
-            let _authoritative =
-                match decode_authoritative_args(&args.envelope_xdr, "stellar_pay_commit") {
-                    Ok(a) => a,
-                    Err(e) => {
-                        return Ok(crate::tools::common::business_error_result(
-                            "simulation.divergence",
-                            format!("toolset_gated envelope_xdr decode: {e}"),
-                        ));
-                    }
-                };
+            // Force per-action approval unconditionally. The pending payment
+            // approval holds one plain payment, so the decoder's path payments
+            // refuse here with the decode refusal's code and prefix.
+            use stellar_agent_core::envelope_decode::{
+                ClassicOperation, ClassicTransactionKind, classic_summary,
+            };
+            if let Err(e) = decode_authoritative_args(&args.envelope_xdr, "stellar_pay_commit") {
+                return Ok(crate::tools::common::business_error_result(
+                    "simulation.divergence",
+                    format!("toolset_gated envelope_xdr decode: {e}"),
+                ));
+            }
+            if !matches!(
+                classic_summary(&args.envelope_xdr, ClassicTransactionKind::Payment)
+                    .map(|summary| summary.operation),
+                Ok(ClassicOperation::Payment { .. })
+            ) {
+                return Ok(crate::tools::common::business_error_result(
+                    "simulation.divergence",
+                    "toolset_gated envelope_xdr decode: the forced approval needs one payment operation",
+                ));
+            }
 
             let now_ms = self.clock.now_unix_ms().map_err(|e| {
                 rmcp::ErrorData::internal_error(format!("approval.clock_error: {e}"), None)
@@ -2040,20 +2109,23 @@ impl WalletServer {
                 String::new(),
                 (DEFAULT_TTL_MS / 1000) as u32,
             );
-            let pending = self
-                .persist_pay_pending_approval(
-                    &args.envelope_xdr,
-                    now_ms,
-                    end,
-                    &self.profile_name_for_approval(),
-                    &request,
-                )
-                .map_err(|e| {
-                    rmcp::ErrorData::internal_error(
-                        format!("toolset.gated_approval_create: {e}"),
-                        None,
-                    )
-                })?;
+            let pending = match self.persist_pay_pending_approval(
+                &args.envelope_xdr,
+                now_ms,
+                end,
+                &self.profile_name_for_approval(),
+                &request,
+                PaymentQueue::Forced,
+            ) {
+                Ok(entry) => entry,
+                Err(error) => {
+                    return payment_recovery_refusal(
+                        &error,
+                        &self.profile_name_for_approval(),
+                        GATED_CREATE,
+                    );
+                }
+            };
 
             let approval_nonce = pending.approval_nonce.clone();
 

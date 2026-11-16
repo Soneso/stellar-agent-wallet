@@ -672,8 +672,9 @@ async fn signed_origin_resign_between_issuance_and_persistence_refuses() {
 /// gate with the uniform refusal; a server started on a policy re-signed at
 /// a higher sequence, with the credential revoked or kept, refuses the
 /// consent uniformly; an unsigned edit and an absent pin stop the start
-/// itself. A changed envelope and an altered stored expiry refuse uniformly
-/// on the running server. No row signs.
+/// itself. A changed envelope refuses uniformly; an altered stored expiry
+/// refuses the inconsistent recovery link, and on an unbound entry fails the
+/// attestation uniformly. No row signs.
 #[tokio::test]
 #[serial_test::serial(keyring)]
 #[serial_test::serial]
@@ -781,10 +782,35 @@ async fn mainnet_commit_rechecks_consent_after_policy_change() {
         let expires = entry["expires_at_unix_ms"].as_integer().unwrap();
         entry["expires_at_unix_ms"] = toml_edit::value(expires - 1_000);
     });
+    let inconsistent = std::fs::read(store_path(&run.f)).unwrap();
     let result = run.commit().await;
-    assert_uniform("altered expiry", &result);
-    diagnostics.assert_refused_with("altered expiry", "approval.attestation_invalid");
-    assert_classic_unsigned("altered expiry", &run, &run.entry);
+    assert_eq!(result["ok"], false, "altered expiry: {result}");
+    assert_eq!(
+        result["error"]["code"], "approval.entry_inconsistent",
+        "altered expiry: inconsistent recovery link"
+    );
+    diagnostics.assert_refused_with("altered expiry", "payment recovery binding refused");
+    assert_eq!(
+        std::fs::read(store_path(&run.f)).unwrap(),
+        inconsistent,
+        "the refused inconsistent entry remains unspent and byte-identical"
+    );
+    assert_eq!(run.seed_reads(), 0, "altered expiry");
+    assert_eq!(run.control.count("sendTransaction"), 0, "altered expiry");
+    assert!(authorizations(&run.f).is_empty(), "altered expiry");
+    assert_no_pre_send_entry(&run);
+
+    // The same edit on an unbound entry, as a build without recovery
+    // bindings writes it, reaches the attestation, which covers the expiry.
+    let path = store_path(&run.f);
+    let mut document: toml_edit::DocumentMut =
+        std::fs::read_to_string(&path).unwrap().parse().unwrap();
+    assert!(document.remove("payment_recovery").is_some());
+    std::fs::write(&path, document.to_string()).unwrap();
+    let result = run.commit().await;
+    assert_uniform("unbound altered expiry", &result);
+    diagnostics.assert_refused_with("unbound altered expiry", "approval.attestation_invalid");
+    assert_classic_unsigned("unbound altered expiry", &run, &run.entry);
 }
 
 /// Commits `args` on `run` and asserts that the commit read no seed and sent

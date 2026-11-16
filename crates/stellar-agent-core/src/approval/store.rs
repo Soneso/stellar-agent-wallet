@@ -2627,6 +2627,8 @@ impl<'de> Deserialize<'de> for StoredEntry {
 struct StoredFile {
     #[serde(default)]
     pending: Vec<StoredEntry>,
+    #[serde(default)]
+    payment_recovery: Option<toml::Value>,
 }
 
 impl PendingApproval {
@@ -3500,7 +3502,7 @@ impl PendingApproval {
         created_at_unix_ms: u64,
         expires_at_unix_ms: u64,
         now_ms: u64,
-        request: &crate::policy::ApprovalRequest,
+        reason: Option<String>,
     ) -> Result<Self, ApprovalError> {
         use crate::envelope_decode::{ClassicOperation, ClassicTransactionKind, classic_summary};
         if now_ms < created_at_unix_ms || now_ms >= expires_at_unix_ms {
@@ -3530,7 +3532,7 @@ impl PendingApproval {
             process_uid,
             created_at_unix_ms,
             expires_at_unix_ms,
-            reason: request.reason.clone(),
+            reason,
             kind: ApprovalKind::PaymentSimulated {
                 envelope_xdr_b64,
                 envelope_sha256_hex,
@@ -5308,7 +5310,12 @@ impl std::error::Error for RuleProposalGateError {}
 struct StoreFile {
     #[serde(default)]
     pending: Vec<PendingApproval>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    payment_recovery: Vec<recovery::Recovery>,
 }
+
+mod recovery;
+pub use recovery::PaymentRecoveryContext;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PendingApprovalStore
@@ -5339,6 +5346,7 @@ pub struct PendingApprovalStore {
     path: PathBuf,
     /// In-memory list of pending approvals.
     entries: Vec<PendingApproval>,
+    payment_recovery: Vec<recovery::Recovery>,
     /// Exclusive advisory lock on the sidecar `.lock` file.
     ///
     /// Held for the lifetime of `PendingApprovalStore`.  Released on drop.
@@ -5424,17 +5432,15 @@ impl PendingApprovalStore {
         let lock = LockHandle::acquire(&lock_path)?;
 
         // Load existing entries if the file exists.
-        let entries = if path.exists() {
+        let (entries, payment_recovery) = if path.exists() {
             let content = fs::read_to_string(&path).map_err(ApprovalError::from_io)?;
             check_receipt_lengths(&content)?;
-            let pending: Vec<PendingApproval> = toml::from_str::<StoredFile>(&content)
-                .map_err(|e| ApprovalError::Toml {
+            let stored =
+                toml::from_str::<StoredFile>(&content).map_err(|e| ApprovalError::Toml {
                     detail: super::error::toml_error_position(&content, e.span().map(|s| s.start)),
-                })?
-                .pending
-                .into_iter()
-                .map(|stored| stored.0)
-                .collect();
+                })?;
+            let pending: Vec<PendingApproval> =
+                stored.pending.into_iter().map(|stored| stored.0).collect();
             // Serde validators on approval_nonce and process_uid run during
             // TOML deserialisation.  Double-check nonce length for defence-in-depth.
             for entry in &pending {
@@ -5447,16 +5453,28 @@ impl PendingApprovalStore {
                     });
                 }
             }
-            pending
+            let recovery = stored
+                .payment_recovery
+                .map(|value| {
+                    value.try_into().map_err(|_| ApprovalError::InvalidEntry {
+                        detail: "the payment recovery section is malformed".to_owned(),
+                    })
+                })
+                .transpose()?
+                .unwrap_or_default();
+            (pending, recovery)
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
 
-        Ok(Self {
+        let store = Self {
             path,
             entries,
+            payment_recovery,
             _lock: lock,
-        })
+        };
+        store.validate_recovery()?;
+        Ok(store)
     }
 
     /// Inserts a new `PendingApproval` entry and persists the store.
@@ -5511,10 +5529,11 @@ impl PendingApprovalStore {
             });
         }
         // Step 1: prune expired entries in memory.
+        self.prune_recovery(now_unix_ms);
         self.entries.retain(|e| !e.is_expired(now_unix_ms));
 
         // Step 2: enforce the hard cap after pruning.
-        if self.entries.len() >= MAX_PENDING_APPROVALS {
+        if self.retained_count() >= MAX_PENDING_APPROVALS {
             // Persist the pruned state even on rejection so the next open sees
             // a clean store.
             self.persist()?;
@@ -5526,6 +5545,7 @@ impl PendingApprovalStore {
             .entries
             .iter()
             .any(|e| e.approval_nonce == entry.approval_nonce)
+            || self.binds_nonce(&entry.approval_nonce)
         {
             return Err(ApprovalError::duplicate_nonce(&entry.approval_nonce));
         }
@@ -5720,6 +5740,8 @@ impl PendingApprovalStore {
         now_ms: u64,
     ) -> Result<(), ApprovalError> {
         refuse_version_4_approver(&approver)?;
+        self.observe_recovery_expiry(approval_nonce, now_ms)?;
+        self.check_payment_recovery(approval_nonce)?;
         self.refuse_destination(approval_nonce)?;
         let entry = self
             .entries
@@ -5884,6 +5906,7 @@ impl PendingApprovalStore {
     ///
     /// - [`ApprovalError::Io`] / [`ApprovalError::Toml`] on persistence failure.
     pub fn remove(&mut self, approval_nonce: &str) -> Result<bool, ApprovalError> {
+        self.close_recovery(approval_nonce, recovery::Disposition::Collected);
         let before = self.entries.len();
         self.entries.retain(|e| e.approval_nonce != approval_nonce);
         let removed = self.entries.len() < before;
@@ -5930,6 +5953,7 @@ impl PendingApprovalStore {
 
         let original_kind_name = self.entries[idx].kind.kind_name().to_owned();
         let process_uid = self.entries[idx].process_uid.clone();
+        self.close_recovery(approval_nonce, recovery::Disposition::Rejected);
 
         self.entries[idx] = PendingApproval {
             approval_nonce: approval_nonce.to_owned(),
@@ -6023,6 +6047,7 @@ impl PendingApprovalStore {
         let original_kind_name = self.entries[idx].kind.kind_name().to_owned();
         validate_consumed_invariants(&original_kind_name, tx_hash, outcome.label())
             .map_err(|detail| ApprovalError::InvalidEntry { detail })?;
+        self.close_recovery(approval_nonce, recovery::Disposition::Consumed);
 
         let existing = &self.entries[idx];
         self.entries[idx] = PendingApproval {
@@ -6396,6 +6421,8 @@ impl PendingApprovalStore {
         receipt: MainnetPresenceReceipt,
         now_ms: u64,
     ) -> Result<(), ApprovalError> {
+        self.observe_recovery_expiry(approval_nonce, now_ms)?;
+        self.check_payment_recovery(approval_nonce)?;
         self.refuse_destination(approval_nonce)?;
         let AttestedApprover::MainnetPasskey {
             credential_id_b64url,
@@ -6451,10 +6478,11 @@ impl PendingApprovalStore {
     /// - [`ApprovalError::Io`] if the system clock is unavailable.
     /// - [`ApprovalError::Io`] / [`ApprovalError::Toml`] on persistence failure.
     pub fn gc_expired(&mut self, now_unix_ms: u64) -> Result<usize, ApprovalError> {
+        let recovery_changed = self.prune_recovery(now_unix_ms);
         let before = self.entries.len();
         self.entries.retain(|e| !e.is_expired(now_unix_ms));
         let removed = before - self.entries.len();
-        if removed > 0 {
+        if removed > 0 || recovery_changed {
             self.persist()?;
         }
         Ok(removed)
@@ -6474,12 +6502,13 @@ impl PendingApprovalStore {
     ///
     /// - [`ApprovalError::Io`] / [`ApprovalError::Toml`] on persistence failure.
     pub fn gc_expired_and_consumed(&mut self, now_unix_ms: u64) -> Result<usize, ApprovalError> {
+        let recovery_changed = self.prune_recovery(now_unix_ms);
         let before = self.entries.len();
         self.entries.retain(|e| {
             !(e.is_expired(now_unix_ms) || matches!(e.kind, ApprovalKind::Consumed { .. }))
         });
         let removed = before - self.entries.len();
-        if removed > 0 {
+        if removed > 0 || recovery_changed {
             self.persist()?;
         }
         Ok(removed)
@@ -6747,6 +6776,7 @@ impl PendingApprovalStore {
 
         let sf = StoreFile {
             pending: self.entries.clone(),
+            payment_recovery: self.payment_recovery.clone(),
         };
         let content = toml::to_string_pretty(&sf).map_err(|e| ApprovalError::Toml {
             detail: e.to_string(),
@@ -7453,7 +7483,7 @@ mod tests {
                 start,
                 end,
                 end - remaining,
-                &request,
+                request.reason.clone(),
             )
             .unwrap();
             assert_eq!(
@@ -7497,7 +7527,7 @@ mod tests {
                     created,
                     expires,
                     now,
-                    &request,
+                    request.reason.clone(),
                 ),
                 Err(ApprovalError::Expired)
             ));
@@ -7507,7 +7537,11 @@ mod tests {
 
     /// Writes `entries` to `path` as the store serializes them.
     fn write_entries(path: &std::path::Path, entries: Vec<PendingApproval>) -> String {
-        let text = toml::to_string_pretty(&StoreFile { pending: entries }).unwrap();
+        let text = toml::to_string_pretty(&StoreFile {
+            payment_recovery: Vec::new(),
+            pending: entries,
+        })
+        .unwrap();
         std::fs::write(path, &text).unwrap();
         text
     }
@@ -7614,7 +7648,11 @@ mod tests {
             .unwrap()
             .clone();
         expected.push(added);
-        let rewritten = toml::to_string_pretty(&StoreFile { pending: expected }).unwrap();
+        let rewritten = toml::to_string_pretty(&StoreFile {
+            payment_recovery: Vec::new(),
+            pending: expected,
+        })
+        .unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), rewritten);
         let mut store = PendingApprovalStore::open(path.clone()).unwrap();
         check(&mut store);
@@ -8631,6 +8669,7 @@ expires_at_unix_ms = 9999999999999
         // multi-kind spine must not see an unexpected field).
         let entry = make_payment_entry(DEFAULT_TTL_MS);
         let sf = StoreFile {
+            payment_recovery: Vec::new(),
             pending: vec![entry],
         };
         let toml_str = toml::to_string_pretty(&sf).unwrap();
@@ -9216,6 +9255,7 @@ signature_compact = [13,14,15,16]
         // the `register_passkey` sub-table key and not `sign_with_passkey`.
         let entry = make_register_passkey_entry(DEFAULT_TTL_MS);
         let sf = StoreFile {
+            payment_recovery: Vec::new(),
             pending: vec![entry.clone()],
         };
         let toml_str = toml::to_string_pretty(&sf).unwrap();
@@ -9656,6 +9696,7 @@ expires_at_unix_ms = 9999999999999
         // reload and assert field-for-field identity.
         let entry = make_claim_entry(DEFAULT_TTL_MS);
         let sf = StoreFile {
+            payment_recovery: Vec::new(),
             pending: vec![entry.clone()],
         };
         let toml_str = toml::to_string_pretty(&sf).unwrap();
@@ -10555,6 +10596,7 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
     fn toolset_gate_toml_contains_sub_table_key() {
         let entry = make_toolset_gate_entry(DEFAULT_TTL_MS);
         let sf = StoreFile {
+            payment_recovery: Vec::new(),
             pending: vec![entry],
         };
         let toml_str = toml::to_string_pretty(&sf).unwrap();
@@ -14285,6 +14327,7 @@ asset = "CADQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQP5KR"
         assert_eq!(std::fs::read_to_string(&path).unwrap(), CANONICAL_INBOX);
         assert_eq!(
             toml::to_string_pretty(&StoreFile {
+                payment_recovery: Vec::new(),
                 pending: canonical_inbox_entries(),
             })
             .unwrap(),
@@ -14414,6 +14457,7 @@ asset = "CADQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQP5KR"
         assert_eq!(
             written,
             toml::to_string_pretty(&StoreFile {
+                payment_recovery: Vec::new(),
                 pending: store.entries.clone(),
             })
             .unwrap(),
@@ -14521,6 +14565,7 @@ asset = "CADQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQP5KR"
         assert!(!BASE_INBOX.contains("subject_kind"));
         // The store's load decoding admits the released request 36.
         let load = |text: &str| StoreFile {
+            payment_recovery: Vec::new(),
             pending: toml::from_str::<StoredFile>(text)
                 .unwrap()
                 .pending
@@ -14671,6 +14716,7 @@ asset = "CADQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQP5KR"
         );
         assert_eq!(
             toml::to_string_pretty(&StoreFile {
+                payment_recovery: Vec::new(),
                 pending: base_inbox_entries(),
             })
             .unwrap(),

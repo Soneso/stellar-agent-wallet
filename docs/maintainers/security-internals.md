@@ -158,6 +158,33 @@ Consent views carry complete validated destinations. The payment view decodes `t
 
 The first-invoke grant suppresses only its re-prompt. Per-action `PaymentSimulated` approval fires on every toolset-routed payment and binds the executed envelope through `envelope_sha256`.
 
+### Payment approval recovery
+
+The approval file optionally stores `payment_recovery` beside its pending array.
+Each binding names a profile, chain, verified policy digest and sequence, exact
+envelope-text subject, and optional retained operation ID. It keeps the original
+nonce, creation time, expiry, retention end, and terminal disposition.
+
+The existing sidecar lock covers lookup and insertion. Both sections share the
+synced temporary file and atomic replacement. Operation maintenance completes
+before the approval store opens. No network call, signing key read, or operation
+write runs under the approval lock.
+
+Opening the store refuses a malformed binding and duplicate keys or nonces.
+Each binding's creation time, expiry, and subject are checked against its
+payload at use, so a broken link refuses only its own payment.
+
+Lookup precedes pruning and capacity checks. A binding past its retention end
+is absent, and the new entry's write drops it with its expired payload. A
+retained terminal binding refuses replacement even after its payload is
+collected. Proof consumers check recorded
+terminal state without writing; clock expiry still needs its ordinary interval
+check. Receipts and the authorization ledger enforce single use.
+
+Legacy files have no recovery section, and legacy entries gain no guessed policy
+binding. The metadata does not authenticate consent. Older executables may erase
+it when writing, so mixed-version writers cannot guarantee recovery.
+
 ## Audit hash-chain
 
 The audit log is a per-profile append-only JSONL file (`~/.local/share/stellar-agent/audit/<profile>.jsonl` on Linux; `~/Library/Application Support/Soneso.stellar-agent/audit/<profile>.jsonl` on macOS; `%LOCALAPPDATA%\Soneso\stellar-agent\data\audit\<profile>.jsonl` on Windows; see `stellar_agent_core::profile::schema::canonical_data_root` for the derivation). The entry schema and canonical-JSON rules live in `crates/stellar-agent-core/src/audit_log/entry.rs`; the chain primitives in `audit_log/chain.rs`; verification in `audit_log/verify.rs`.

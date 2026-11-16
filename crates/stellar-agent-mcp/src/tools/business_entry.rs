@@ -40,6 +40,8 @@ pub(crate) struct PreparedEnvelope {
     pub stored: Option<EnvelopeFacts>,
     /// The retained operation's waiting deadline, when an operation exists.
     pub waiting_end: Option<u64>,
+    /// The ID of the winning retained operation.
+    pub operation_id: Option<[u8; 16]>,
 }
 
 impl ClassicOperation {
@@ -225,21 +227,23 @@ impl WalletServer {
                 xdr: candidate,
                 stored: None,
                 waiting_end: None,
+                operation_id: None,
             });
         };
-        let stored = |xdr: &str, end| {
+        let stored = |xdr: &str, handle: &OperationHandle| {
             operation_entry::envelope_facts(xdr)
                 .map(|facts| PreparedEnvelope {
                     xdr: xdr.to_owned(),
                     stored: Some(facts),
-                    waiting_end: Some(end),
+                    waiting_end: Some(handle.waiting_expires_at_ms()),
+                    operation_id: Some(*handle.id().as_bytes()),
                 })
                 .map_err(|error| refusal(&error))
         };
         if let Some(handle) = &operation.resume
             && handle.envelope_xdr() == Some(candidate.as_str())
         {
-            return stored(&candidate, handle.waiting_expires_at_ms());
+            return stored(&candidate, handle);
         }
         let max_time =
             operation_entry::envelope_max_time(&candidate).map_err(|error| refusal(&error))?;
@@ -257,13 +261,12 @@ impl WalletServer {
         })?;
         match entry {
             OpenedEntry::Resume(handle) => match handle.envelope_xdr() {
-                Some(opened) if opened != candidate => {
-                    stored(opened, handle.waiting_expires_at_ms())
-                }
+                Some(opened) if opened != candidate => stored(opened, &handle),
                 _ => Ok(PreparedEnvelope {
                     xdr: candidate,
                     stored: None,
                     waiting_end: Some(handle.waiting_expires_at_ms()),
+                    operation_id: Some(*handle.id().as_bytes()),
                 }),
             },
             OpenedEntry::Replay(view) => Err(replay_result(&view)),

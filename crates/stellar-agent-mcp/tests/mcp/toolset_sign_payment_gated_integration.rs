@@ -534,6 +534,120 @@ async fn display_aliases_of_toolset_and_action_names_reach_no_route() {
     assert!(!rpc.received_requests().await.unwrap().is_empty());
 }
 
+/// A permissive testnet server with a valid payment grant for [`DEST_G`],
+/// and the toolsets directory it reads.
+fn forced_payment_server(approval_dir: &std::path::Path) -> (WalletServer, TempDir) {
+    let key = setup_mock_keyring();
+    let toolsets_dir = TempDir::new().unwrap();
+    let grant_file = approval_dir.join("grants.toml");
+    write_pin_with_sign_payment(toolsets_dir.path(), TOOLSET_NAME);
+    insert_valid_grant(
+        &grant_file,
+        TOOLSET_NAME,
+        CAPABILITY,
+        DEST_G,
+        ASSET_XLM,
+        0,
+        10_000_000,
+        &key,
+    );
+    let server = build_allow_server(approval_dir, &grant_file, toolsets_dir.path());
+    (server, toolsets_dir)
+}
+
+/// A profile without a verified policy queues the forced payment approval
+/// as an unbound entry: the call answers `policy.approval_required`, and the
+/// approval file holds one payment and no recovery binding.
+#[tokio::test]
+#[serial]
+async fn forced_approval_without_verified_policy_queues_unbound() {
+    let _root = crate::common::isolated_data_root();
+    let approval_dir = TempDir::new().unwrap();
+    let (server, _toolsets) = forced_payment_server(approval_dir.path());
+    let result = server
+        .call_stellar_toolset_invoke(payment_invoke("stellar_pay_commit", DEST_G, 10_000_000))
+        .await
+        .expect("a forced approval without a verified policy queues");
+    assert_eq!(
+        crate::common::assert_business_envelope(&result).0,
+        "policy.approval_required"
+    );
+    let path = approval_dir
+        .path()
+        .join(format!("{TEST_PROFILE_NAME}.toml"));
+    assert_eq!(
+        count_pending_approvals(approval_dir.path(), TEST_PROFILE_NAME),
+        1
+    );
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("envelope_xdr_b64"), "a payment entry: {text}");
+    assert!(
+        !text.contains("payment_recovery"),
+        "the unbound entry has no recovery binding"
+    );
+}
+
+/// The forced approval refuses an envelope the decoder accepts but a
+/// pending payment cannot hold, a path payment, with the decode refusal's
+/// business code and prefix, and queues nothing.
+#[tokio::test]
+#[serial]
+async fn forced_approval_refuses_a_path_payment_envelope() {
+    use stellar_xdr::{
+        Asset, Limits, Memo, MuxedAccount, Operation, OperationBody, PathPaymentStrictSendOp,
+        Preconditions, SequenceNumber, Transaction, TransactionEnvelope, TransactionExt,
+        TransactionV1Envelope, Uint256, VecM, WriteXdr,
+    };
+    let _root = crate::common::isolated_data_root();
+    let approval_dir = TempDir::new().unwrap();
+    let (server, _toolsets) = forced_payment_server(approval_dir.path());
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(g_bytes(SOURCE_G))),
+        fee: 100,
+        seq_num: SequenceNumber(101),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![Operation {
+            source_account: None,
+            body: OperationBody::PathPaymentStrictSend(PathPaymentStrictSendOp {
+                send_asset: Asset::Native,
+                send_amount: 10_000_000,
+                destination: MuxedAccount::Ed25519(Uint256(g_bytes(DEST_G))),
+                dest_asset: Asset::Native,
+                dest_min: 10_000_000,
+                path: VecM::default(),
+            }),
+        }]
+        .try_into()
+        .unwrap(),
+        ext: TransactionExt::V0,
+    };
+    let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    })
+    .to_xdr_base64(Limits::none())
+    .unwrap();
+    stellar_agent_core::envelope_decode::decode_authoritative_args(&envelope, "stellar_pay_commit")
+        .expect("the decoder accepts the path payment");
+    let mut invoke = payment_invoke("stellar_pay_commit", DEST_G, 10_000_000);
+    invoke.args["envelope_xdr"] = envelope.into();
+    let result = server
+        .call_stellar_toolset_invoke(invoke)
+        .await
+        .expect("a path payment refuses as a business error");
+    let (code, message, _) = crate::common::assert_business_envelope(&result);
+    assert_eq!(code, "simulation.divergence");
+    assert!(
+        message.starts_with("toolset_gated envelope_xdr decode:"),
+        "{message}"
+    );
+    assert_eq!(
+        count_pending_approvals(approval_dir.path(), TEST_PROFILE_NAME),
+        0
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn payment_outer_gate_memo_accepts_routed_id() {

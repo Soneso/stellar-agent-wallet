@@ -374,8 +374,23 @@ issuing a protocol nonce. Mainnet signing authority also ends at the earlier
 of the captured decision end and the operator witness expiry.
 
 A mainnet retry uses its retained envelope, including the original sequence.
-Repeated preparation can still create another approval request; this release
-does not deduplicate the approval queue or extend its retention period.
+Repeated preparation of the same envelope under the same verified policy,
+profile, chain, and retained operation returns the original approval nonce and
+interval. An attestation already recorded on that approval stays unchanged.
+The preparation may issue a new protocol nonce for committing that envelope.
+Direct preparation needs a signed, verified policy to queue a new payment
+approval. Without one, the forced toolset approval queues an entry with no
+recovery binding.
+
+Expired, rejected, consumed, or collected approvals retain their refusal while
+their recovery binding remains stored. A recorded terminal state stays terminal
+if the clock moves backward. Mainnet bindings last through the operation's
+waiting window; completed operations use their stored replay response.
+Off-mainnet bindings last through the original approval interval. Once a
+binding's retention ends, the same request receives new consent. A binding that
+no longer matches its stored approval refuses only that payment, with
+`approval.entry_inconsistent`. Legacy approvals remain usable by nonce and gain
+no recovery binding.
 
 ## Resources
 

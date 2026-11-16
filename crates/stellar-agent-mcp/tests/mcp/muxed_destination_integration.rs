@@ -593,6 +593,7 @@ fn gated_server(
     server.set_policy_engine_for_test(Arc::new(
         crate::common::policy_mock::MockPolicyEngine::allow(),
     ));
+    server.set_payment_recovery_policy_for_test(crate::common::payment_recovery_policy(&server));
     server.set_approval_dir_for_test(approvals.to_path_buf());
     server.set_grant_store_path_for_test(grants.to_path_buf());
     server.set_toolsets_root_for_test(toolsets.to_path_buf());
@@ -841,6 +842,8 @@ async fn muxed_original_address_records() {
         server.set_policy_engine_for_test(Arc::new(
             crate::common::policy_mock::MockPolicyEngine::require_approval(),
         ));
+        server
+            .set_payment_recovery_policy_for_test(crate::common::payment_recovery_policy(&server));
         let data = prepare(&server, &pay_args(&destination)).await;
         assert_eq!(data["simulation"]["operation"]["destination"], destination);
         assert_eq!(data["approval"]["summary"]["to"], destination);
@@ -1041,6 +1044,8 @@ async fn muxed_destination_safety_parity() {
         denied.set_policy_engine_for_test(Arc::new(
             crate::common::policy_mock::MockPolicyEngine::deny_explicit_rule(),
         ));
+        denied
+            .set_payment_recovery_policy_for_test(crate::common::payment_recovery_policy(&denied));
         seen.push(code_of(
             denied.call_stellar_pay(pay_args(&destination)).await,
         ));
@@ -1157,54 +1162,84 @@ async fn mcp_muxed_submission_receipt_keeps_original_address() {
 #[tokio::test]
 #[serial]
 async fn mcp_payment_audit_leg_hashes_the_complete_destination() {
-    use sha2::Digest as _;
-    let fx = Fixture::new();
-    let key = [0xD7; 32];
-    for id in [0, 17] {
-        let destination = m(key, id);
-        let rpc = endpoint(&[g(key)], Vec::new(), &[]).await;
-        let approvals = tempfile::TempDir::new().unwrap();
-        let mut server = fx.server(&rpc, approvals.path());
-        server.set_policy_engine_for_test(Arc::new(
-            crate::common::v1_engine_mock::minimum_reserve_engine(
-                &["stellar_pay", "stellar_pay_commit"],
-                0,
+    use stellar_agent_test_support::xdr_fixtures::{trustline_entry_xdr, trustline_ledger_key_xdr};
+    let trustline = (
+        trustline_ledger_key_xdr(&source_g(), "USDC", RESULT_ISSUER),
+        trustline_entry_xdr(&source_g(), "USDC", RESULT_ISSUER, 10_000_000_000),
+    );
+    for issued in [false, true] {
+        for (destination, expected, redacted) in [
+            (
+                RESULT_G,
+                "07c771942ac09608159b09c3073d4349690182de7c46322af475bb7a698ef992",
+                "GCTKN...KNG7S",
             ),
-        ));
-        let args = pay_args(&destination);
-        let data = prepare(&server, &args).await;
-        let committed = server
-            .call_stellar_pay_commit(commit_args(&args, &data))
-            .await
-            .unwrap();
-        assert_ne!(committed.is_error, Some(true), "{}", json_of(&committed));
-        assert_eq!(sent_payments(&rpc).await.len(), 1, "{destination}");
-        drop(server);
-
-        let redacted = stellar_agent_core::observability::redact_strkey_first5_last5(&destination);
-        let expected =
-            stellar_agent_core::hex::encode(&sha2::Sha256::digest(destination.as_bytes()));
-        let rows = crate::common::audit_rows(&fx.profile);
-        let legs: Vec<&serde_json::Value> = rows
-            .iter()
-            .filter_map(|row| row["legs"].as_array())
-            .flatten()
-            .filter(|leg| leg["destination_redacted"] == redacted.as_str())
-            .collect();
-        assert!(!legs.is_empty(), "{destination}: a payment leg: {rows:?}");
-        for leg in legs {
-            assert_eq!(leg["action"], "payment", "{destination}");
-            assert_eq!(
-                leg["destination_sha256"],
-                expected.as_str(),
-                "{destination}: the leg carries the complete destination's SHA-256"
+            (
+                RESULT_M0,
+                "87478b29542363dbd4b73c7638df3b56e554252fe53d66dce81e9aa905a8cf55",
+                "MCTKN...ABA5O",
+            ),
+            (
+                RESULT_MMAX,
+                "9ad4d124b64bfd959c317416ff7fe0937544a14c00b52d29012246b6ce209f53",
+                "MCTKN...76QHC",
+            ),
+        ] {
+            let fx = Fixture::new();
+            let rpc = endpoint(
+                &[RESULT_G.to_owned(), RESULT_ISSUER.to_owned()],
+                vec![trustline.clone()],
+                &[],
+            )
+            .await;
+            let approvals = tempfile::TempDir::new().unwrap();
+            let mut server = fx.server(&rpc, approvals.path());
+            server.set_policy_engine_for_test(Arc::new(
+                crate::common::v1_engine_mock::minimum_reserve_engine(
+                    &["stellar_pay", "stellar_pay_commit"],
+                    0,
+                ),
+            ));
+            server.set_payment_recovery_policy_for_test(crate::common::payment_recovery_policy(
+                &server,
+            ));
+            let mut args = pay_args(destination);
+            if issued {
+                args.asset = format!("USDC:{RESULT_ISSUER}");
+                args.amount = Some(serde_json::from_str(r#""10 USDC""#).unwrap());
+            }
+            let data = prepare(&server, &args).await;
+            let committed = server
+                .call_stellar_pay_commit(commit_args(&args, &data))
+                .await
+                .unwrap();
+            assert_ne!(committed.is_error, Some(true), "{}", json_of(&committed));
+            assert_eq!(sent_payments(&rpc).await.len(), 1, "{destination}");
+            drop(server);
+            let rows = crate::common::audit_rows(&fx.profile);
+            let legs: Vec<&serde_json::Value> = rows
+                .iter()
+                .filter_map(|row| row["legs"].as_array())
+                .flatten()
+                .filter(|leg| leg["destination_redacted"] == redacted)
+                .collect();
+            assert!(!legs.is_empty(), "{destination}: a payment leg: {rows:?}");
+            for leg in legs {
+                assert_eq!(leg["amount"], "100000000");
+                assert_eq!(leg["asset"], args.asset);
+                assert_eq!(leg["action"], "payment", "{destination}");
+                assert_eq!(
+                    leg["destination_sha256"], expected,
+                    "{destination}: complete destination hash"
+                );
+                assert_eq!(leg["destination_redacted"], redacted);
+            }
+            let log = std::fs::read_to_string(&fx.profile.audit_log_path).unwrap();
+            assert!(
+                !log.contains(destination),
+                "{destination}: no audit row holds the complete destination"
             );
         }
-        let log = std::fs::read_to_string(&fx.profile.audit_log_path).unwrap();
-        assert!(
-            !log.contains(&destination),
-            "{destination}: no audit row holds the complete destination"
-        );
     }
 }
 

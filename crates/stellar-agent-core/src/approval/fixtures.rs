@@ -10,6 +10,7 @@
 
 #![allow(
     clippy::expect_used,
+    clippy::panic,
     clippy::too_many_arguments,
     reason = "test fixtures: a malformed argument is a bug in the calling test"
 )]
@@ -22,6 +23,70 @@ use stellar_xdr::{
 };
 
 use super::store::PendingApproval;
+
+/// Saves fixture credentials touched since `mutations` began, retaining earlier snapshot entries.
+///
+/// # Panics
+/// Panics if fixture credentials or the snapshot cannot be read or written.
+pub fn save_process_keyring(
+    path: &std::path::Path,
+    mutations: &stellar_agent_test_support::keyring_mock::MutationLog,
+) {
+    use std::collections::BTreeSet;
+    type Entry = (String, String, Vec<u8>);
+    let old: Vec<Entry> = if path.exists() {
+        serde_json::from_slice(&std::fs::read(path).expect("read fixture keys"))
+            .expect("fixture keys")
+    } else {
+        Vec::new()
+    };
+    let coordinates: BTreeSet<(String, String)> = old
+        .into_iter()
+        .map(|(service, account, _)| (service, account))
+        .chain(
+            mutations
+                .mutations()
+                .into_iter()
+                .map(|m| (m.service, m.account)),
+        )
+        .collect();
+    let mut entries = Vec::new();
+    for (service, account) in coordinates {
+        match keyring_core::Entry::new(&service, &account)
+            .expect("fixture coordinate")
+            .get_secret()
+        {
+            Ok(secret) => entries.push((service, account, secret)),
+            Err(keyring_core::Error::NoEntry) => {}
+            Err(error) => panic!("fixture key read failed: {error}"),
+        }
+    }
+    std::fs::write(
+        path,
+        serde_json::to_vec(&entries).expect("fixture keys serialize"),
+    )
+    .expect("write fixture keys");
+}
+
+/// Restores an isolated process's fixture keyring and starts recording its changes.
+///
+/// # Panics
+/// Panics if a fixture snapshot cannot be read or installed.
+pub fn restore_process_keyring(
+    path: &std::path::Path,
+) -> stellar_agent_test_support::keyring_mock::MutationLog {
+    let entries: Vec<(String, String, Vec<u8>)> =
+        serde_json::from_slice(&std::fs::read(path).expect("read fixture keys"))
+            .expect("fixture keys");
+    stellar_agent_test_support::keyring_mock::install().expect("fixture keyring");
+    for (service, account, secret) in entries {
+        keyring_core::Entry::new(&service, &account)
+            .expect("fixture coordinate")
+            .set_secret(&secret)
+            .expect("restore fixture key");
+    }
+    stellar_agent_test_support::keyring_mock::record_mutations().expect("fixture key changes")
+}
 
 fn account_bytes(g_strkey: &str) -> [u8; 32] {
     stellar_strkey::ed25519::PublicKey::from_string(g_strkey)
