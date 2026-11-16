@@ -1309,6 +1309,54 @@ mod delivery_test_override {
 #[cfg(any(test, feature = "test-helpers"))]
 pub use delivery_test_override::ConsentEvidenceEnforcementGuard;
 
+/// The consent bound, including the signed expiry for an envelope approval.
+pub(super) fn record_cap(section: &Option<ApprovalsSection>, nonce: &str) -> Option<u64> {
+    let record = section
+        .as_ref()?
+        .records
+        .iter()
+        .find(|r| r.nonce == nonce)?;
+    let end = record.consent.as_ref()?.execution_expires_at_ms;
+    Some(if record.subject_kind == SubjectKind::EnvelopeText {
+        end.min(record.waiting_expires_at_ms)
+    } else {
+        end
+    })
+}
+
+/// Checks retained approval state on the caller's authenticated image.
+/// An absent record keeps the inbox authority path.
+pub(super) fn check_record(
+    wire: &WireFile,
+    nonce: &str,
+    operation: Option<OperationId>,
+    now: u64,
+) -> Result<Option<u64>, WindowStoreError> {
+    let Some(record) = records(wire).iter().find(|r| r.nonce == nonce) else {
+        return Ok(None);
+    };
+    let refuse = |precondition| WindowStoreError::AuthorizationRefused { precondition };
+    if record.state == ApprovalState::Revoked {
+        return Err(refuse(MainnetPrecondition::ApprovalRevoked));
+    }
+    let Some(consent) = &record.consent else {
+        return Err(refuse(if now < record.waiting_expires_at_ms {
+            MainnetPrecondition::ApprovalConsentMissing
+        } else {
+            MainnetPrecondition::ApprovalExpired
+        }));
+    };
+    let cap = record_cap(&wire.approvals, nonce);
+    if consent.payload.is_none() || now < consent.consent_at_ms || cap.is_some_and(|end| now >= end)
+    {
+        return Err(refuse(MainnetPrecondition::ApprovalExpired));
+    }
+    if operation != Some(record.operation_id) {
+        return Err(refuse(MainnetPrecondition::ApprovalNonceReused));
+    }
+    Ok(cap)
+}
+
 /// Consumes on the caller's successor image; its mint commits this change.
 pub(super) fn consume(
     wire: &mut WireFile,
@@ -1316,6 +1364,7 @@ pub(super) fn consume(
     operation: Option<OperationLink>,
     now: u64,
 ) -> Result<(), WindowStoreError> {
+    check_record(wire, nonce, operation.map(|link| link.operation_id), now)?;
     let Some(record) = wire
         .approvals
         .as_mut()
@@ -1323,23 +1372,6 @@ pub(super) fn consume(
     else {
         return Ok(());
     };
-    let refuse = |precondition| WindowStoreError::AuthorizationRefused { precondition };
-    if record.state == ApprovalState::Revoked {
-        return Err(refuse(MainnetPrecondition::ApprovalRevoked));
-    }
-    if operation.is_none_or(|link| link.operation_id != record.operation_id) {
-        return Err(refuse(MainnetPrecondition::ApprovalNonceReused));
-    }
-    if now >= record.expiry() {
-        return Err(refuse(MainnetPrecondition::ApprovalExpired));
-    }
-    let Some(consent) = &record.consent else {
-        return Err(refuse(MainnetPrecondition::ApprovalConsentMissing));
-    };
-    if now < consent.consent_at_ms {
-        // Mint time must be at or after the recorded consent time.
-        return Err(refuse(MainnetPrecondition::ApprovalExpired));
-    }
     if record.state == ApprovalState::Pending {
         record.state = ApprovalState::Consumed;
         record.consumed_at_ms = Some(now);
@@ -1348,7 +1380,7 @@ pub(super) fn consume(
 }
 
 #[cfg(test)]
-mod durable_tests;
+pub(crate) mod durable_tests;
 
 #[cfg(test)]
 pub(in crate::policy_state) mod tests {
@@ -1381,6 +1413,8 @@ pub(in crate::policy_state) mod tests {
     };
     use stellar_agent_core::audit_log::AuditEntry;
 
+    include!("approvals/mint_tests.rs");
+
     #[derive(Default)]
     pub(in crate::policy_state) struct Rows {
         pub(in crate::policy_state) entries: Vec<AuditEntry>,
@@ -1409,7 +1443,7 @@ pub(in crate::policy_state) mod tests {
         entry: PendingApproval,
     }
 
-    fn proof(
+    pub(super) fn proof(
         fixture: &MainnetConsentFixture,
         entry: &PendingApproval,
         name: &str,
@@ -1439,11 +1473,22 @@ pub(in crate::policy_state) mod tests {
         let attestation = URL_SAFE_NO_PAD.decode(blob).unwrap().try_into().unwrap();
         let approved = inbox.get(&entry.approval_nonce).unwrap();
         let receipt = approved.mainnet_presence.as_ref().unwrap().clone();
-        let subject = match &entry.kind {
+        let (kind, subject) = match &entry.kind {
             stellar_agent_core::approval::store::ApprovalKind::PaymentSimulated {
                 envelope_xdr_b64,
                 ..
-            } => approval_subject_classic(envelope_xdr_b64),
+            } => (
+                ApprovedKind::Payment,
+                approval_subject_classic(envelope_xdr_b64),
+            ),
+            stellar_agent_core::approval::store::ApprovalKind::X402Payment {
+                intent_digest,
+                home_domain: None,
+                ..
+            } => (
+                ApprovedKind::X402Payment,
+                stellar_agent_core::approval::subject::approval_subject_x402(intent_digest),
+            ),
             _ => panic!("expected payment"),
         };
         let witness = verify_approval(
@@ -1452,10 +1497,7 @@ pub(in crate::policy_state) mod tests {
             fixture.name(),
             &entry.approval_nonce,
             &attestation,
-            &ApprovalExpectation {
-                kind: ApprovedKind::Payment,
-                subject,
-            },
+            &ApprovalExpectation { kind, subject },
             &policy,
             receipt.verified_at_unix_ms(),
         )
@@ -1486,9 +1528,77 @@ pub(in crate::policy_state) mod tests {
         /// An entry of lifetime `ttl` and an operation over `intent` opened
         /// with `rule_ttl_ms`.
         fn with_intent(ttl: u64, intent: IntentSlot, rule_ttl_ms: Option<u64>) -> Self {
-            let intent_digest = intent.intent_digest();
             let fixture = MainnetConsentFixture::new("approvals");
-            let mut entry = fixture.payment(ttl);
+            let entry = fixture.payment(ttl);
+            Self::with_entry(fixture, entry, ttl, intent, rule_ttl_ms)
+        }
+
+        pub(super) fn x402(ttl: u64) -> Self {
+            use stellar_xdr::{
+                ContractId, Hash, Int128Parts, InvokeContractArgs, ScAddress, ScVal,
+                SorobanAuthorizedFunction, SorobanAuthorizedInvocation,
+            };
+            let fixture = MainnetConsentFixture::new("approvals");
+            let asset = ScAddress::Contract(ContractId(Hash([3; 32])));
+            let payer = ScAddress::Contract(ContractId(Hash([4; 32])));
+            let pay_to = ScAddress::Contract(ContractId(Hash([5; 32])));
+            let root = SorobanAuthorizedInvocation {
+                function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+                    contract_address: asset.clone(),
+                    function_name: "transfer".try_into().unwrap(),
+                    args: vec![
+                        ScVal::Address(payer.clone()),
+                        ScVal::Address(pay_to.clone()),
+                        ScVal::I128(Int128Parts { hi: 0, lo: 10 }),
+                    ]
+                    .try_into()
+                    .unwrap(),
+                }),
+                sub_invocations: vec![].try_into().unwrap(),
+            };
+            let mut entry = PendingApproval::new_x402_pending(
+                &<sha2::Sha256 as sha2::Digest>::digest(
+                    stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE.as_bytes(),
+                )
+                .into(),
+                &root,
+                None,
+                "1000".to_owned(),
+                ttl,
+            )
+            .unwrap();
+            // Keep the signed bound before the consent bound even within one clock tick.
+            entry.created_at_unix_ms -= 1;
+            entry.expires_at_unix_ms -= 1;
+            let stellar_agent_core::approval::store::ApprovalKind::X402Payment {
+                intent_digest,
+                ..
+            } = &entry.kind
+            else {
+                panic!("x402 entry")
+            };
+            let intent = IntentSlot::X402 {
+                intent_digest: *intent_digest,
+                intent: super::super::operations::X402Intent {
+                    network: fixture.profile().chain_id.to_string(),
+                    asset: asset.to_string(),
+                    payer: payer.to_string(),
+                    pay_to: pay_to.to_string(),
+                    amount: "10".to_owned(),
+                },
+            };
+            Self::with_entry(fixture, entry, ttl, intent, Some(ttl))
+        }
+
+        fn with_entry(
+            fixture: MainnetConsentFixture,
+            mut entry: PendingApproval,
+            ttl: u64,
+            intent: IntentSlot,
+            rule_ttl_ms: Option<u64>,
+        ) -> Self {
+            let intent_digest = intent.intent_digest();
+            let x402 = matches!(intent, IntentSlot::X402 { .. });
             entry.process_uid = "1000".to_owned();
             let (witness, payload) = proof(&fixture, &entry, "first.toml");
             let now = payload.receipt.verified_at_unix_ms();
@@ -1502,10 +1612,18 @@ pub(in crate::policy_state) mod tests {
             let opened = OperationRecorder::new(&store, fixture.profile(), &mut rows, "request")
                 .open(&OpenRequest {
                     business_id: BusinessId::parse("order-1").unwrap(),
-                    tool: OperationTool::CliPay,
-                    kind: OperationKind::Pay,
+                    tool: if x402 {
+                        OperationTool::X402CreatePayment
+                    } else {
+                        OperationTool::CliPay
+                    },
+                    kind: if x402 {
+                        OperationKind::X402Payment
+                    } else {
+                        OperationKind::Pay
+                    },
                     intent,
-                    envelope_xdr: Some("AAAA".to_owned()),
+                    envelope_xdr: (!x402).then(|| "AAAA".to_owned()),
                     prepared_decision: None,
                     rule_ttl_ms,
                 })

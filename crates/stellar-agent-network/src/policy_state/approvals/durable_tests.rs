@@ -205,6 +205,14 @@ fn durable_witness_state_matrix() {
     let original = facts(&fx);
     let at = original.record().consent.as_ref().unwrap().consent_at_ms;
     let blob = fx.payload.attestation;
+    let wrong_clock = changed(&original, |r| {
+        r.consent.as_mut().unwrap().consent_at_ms -= 1
+    });
+    refusal(
+        verify(&fx, Some(&wrong_clock), &blob, at),
+        "approval.attestation_invalid",
+        "the consent clocks do not match the signed facts",
+    );
     refusal(
         verify(&fx, None, &blob, at),
         "approval.not_found",
@@ -290,6 +298,20 @@ fn durable_scope_and_policy_are_current() {
         kind: fx.facts.kind,
         subject: fx.facts.subject,
     };
+    let (foreign, blob) = scope_proof(&original, &policy, fx.fixture.name(), Caip2::Testnet);
+    refusal(
+        verify_durable_approval(
+            Some(&foreign),
+            &blob,
+            &testnet,
+            fx.fixture.name(),
+            &expected,
+            &policy,
+            at,
+        ),
+        "approval.binding_mismatch",
+        "the durable approval has another profile or chain",
+    );
     for (kind, subject, code) in [
         (ApprovedKind::Claim, fx.facts.subject, "approval.wrong_kind"),
         (fx.facts.kind, [0x98; 32], "approval.attestation_invalid"),
@@ -535,17 +557,41 @@ fn missing_intent_challenge_refuses_before_retention() {
     assert_eq!(fx.bytes(), before);
 }
 
-struct IntentFx {
-    fixture: stellar_agent_core::approval::mainnet_fixtures::MainnetConsentFixture,
+#[test]
+#[serial]
+fn durable_x402_envelope_record_verifies() {
+    let mut fx = Fx::x402(300_000);
+    fx.open();
+    let id = fx.id();
+    let consent = ApprovalRecorder::new(&fx.store, fx.fixture.profile(), &mut fx.rows, "x402")
+        .record_consent(id, &fx.witness, &fx.payload);
+    assert!(
+        consent.is_ok(),
+        "durable x402 consent retains the kind scope"
+    );
+    let verified = verify(
+        &fx,
+        Some(&facts(&fx)),
+        &fx.payload.attestation,
+        fx.payload.receipt.verified_at_unix_ms(),
+    );
+    assert!(verified.is_ok(), "durable x402 envelope verifies");
+    let witness = verified.unwrap();
+    assert_eq!(witness.kind(), ApprovedKind::X402Payment);
+    assert_eq!(witness.kind().kind_name(), "X402Payment");
+}
+
+pub(crate) struct IntentFx {
+    pub(crate) fixture: stellar_agent_core::approval::mainnet_fixtures::MainnetConsentFixture,
     intent: ClassicIntent,
-    facts: ApprovalFacts,
-    policy: VerifiedPolicy,
+    pub(crate) facts: ApprovalFacts,
+    pub(crate) policy: VerifiedPolicy,
     blob: [u8; 32],
-    _clock: crate::mainnet::clock::TestClockGuard,
+    pub(crate) _clock: crate::mainnet::clock::TestClockGuard,
 }
 
 impl IntentFx {
-    fn new(ttl: u64) -> Self {
+    pub(crate) fn new(ttl: u64) -> Self {
         use super::super::operations::{
             BusinessId, IntentSlot, OpenOutcome, OpenRequest, OperationKind, OperationTool,
         };
@@ -648,7 +694,7 @@ impl IntentFx {
         }
     }
 
-    fn decision(&self, decision: Decision, ttl: u64, at: u64) -> MainnetDecision {
+    pub(crate) fn decision(&self, decision: Decision, ttl: u64, at: u64) -> MainnetDecision {
         MainnetDecision::for_test(
             decision,
             None,
@@ -667,7 +713,7 @@ impl IntentFx {
         self.facts.record().consent.as_ref().unwrap().consent_at_ms
     }
 
-    fn verify(
+    pub(crate) fn verify(
         &self,
         facts: &ApprovalFacts,
         decision: &MainnetDecision,
@@ -767,6 +813,18 @@ fn durable_intent_allow_preserves_approval_and_producer_contract() {
     for decision in [
         fx.fixture.decision(301_000),
         fx.decision(Decision::Deny(DenyReason::NoMatchingRule), 300_000, fx.at()),
+        MainnetDecision::for_test(
+            Decision::Allow,
+            None,
+            fx.policy.digest(),
+            fx.policy.sequence(),
+            0,
+            "another-profile",
+            Caip2::Mainnet.caip2_str(),
+            fx.at(),
+            300_000,
+            AuthorityScope::Classic,
+        ),
     ] {
         refusal(
             fx.verify(&fx.facts, &decision, fx.at()),

@@ -1921,14 +1921,37 @@ boundary. Consent before creation or at the waiting boundary refuses. The same
 receipt digest is idempotent; another consent refuses. Retries and remints
 extend neither clock.
 
+Transaction and Soroban resolvers read authenticated approval facts before
+checking witness bounds. A retained record refuses in this order: revoked,
+unconsented while waiting, expired, then bound to another operation.
+Expiry includes a released payload, time before consent, and the execution
+boundary. Envelope approvals also expire at their signed pending boundary.
+Nonce, kind, subject, signed times, policy digest and receipt digest each
+have a distinct refusal. Receipt mismatches use `approval_receipt_mismatch`
+under `network.mainnet_authorization_refused`.
+
+The mint repeats the state checks under the window lock after checking the
+chain. It inspects existing authenticated state without creating a key, before
+the remaining prechecks. Failed prechecks create no window key or state file.
+Policy authority reads no approval record. An absent record keeps the inbox
+authority path for producers that create no durable record.
+
 The first mint consumes the approval in the authorization's generation commit.
 Only the linked operation can remint within the execution window. A missing
 operation link or another operation refuses with `approval_nonce_reused`. The
 record protects single use independently of retained authorization history.
-Pending records without consent refuse with `approval_consent_missing`.
+Pending records without consent refuse with `approval_consent_missing` while
+the waiting window is open. After the waiting window closes, they refuse with
+`approval_expired`.
 Revocation records its time and refuses later first mints and unused-carrier
 remints at the durable check with `approval_revoked`, before expiry refusal.
-Child mints under used parents and submissions already sent retain their behavior.
+Child mints under used parents retain their state exemption. Every approval
+authorization with a retained durable record, including a child, ends by the
+durable consent bound and any earlier signed envelope-approval expiry.
+An approval without a retained durable record keeps its existing bound.
+Operation adoption uses the same bound
+without renewing an earlier execution expiry. Consent alone leaves the operation
+awaiting approval until a linked mint supplies authority.
 The recorder creates no operation transition or audit row.
 
 `approve revoke --id <nonce> --profile <name>` resolves the nonce through authenticated status.

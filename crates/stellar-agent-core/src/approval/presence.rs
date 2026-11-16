@@ -828,7 +828,7 @@ impl ReceiptEntry for super::witness::ApprovalFacts {
             .ok_or_else(presence_invalid)?;
         Ok(SignedEntry {
             nonce: &record.nonce,
-            kind: super::witness::inbox_kind(record.kind),
+            kind: record.kind.kind_name(),
             uid: &payload.process_uid,
             created: record.created_at_ms,
             expires: record.expires_at_ms,
