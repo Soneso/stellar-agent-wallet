@@ -3030,7 +3030,7 @@ pub(crate) async fn verify_attestation_subject_gate(
             );
             return Err(approval_required_indistinguishable(&profile_name));
         };
-        return stellar_agent_core::approval::witness::verify_approval(
+        let witness = stellar_agent_core::approval::witness::verify_approval(
             &store,
             server.security_profile(),
             &profile_name,
@@ -3040,7 +3040,6 @@ pub(crate) async fn verify_attestation_subject_gate(
             policy,
             now_ms_attest,
         )
-        .map(Some)
         .map_err(|error| {
             // Steps 5b and 5c above already answered a rejected or consumed
             // entry with its own code, so every refusal here is uniform.
@@ -3053,7 +3052,55 @@ pub(crate) async fn verify_attestation_subject_gate(
                 tracing::warn!(code = error.code(), "attestation owner key refused");
             }
             approval_required_indistinguishable(&profile_name)
-        });
+        })?;
+        drop(store);
+        #[cfg(all(test, feature = "mainnet-write"))]
+        tests::mainnet::delivery_fault(&profile_name);
+        use stellar_agent_network::policy_state::approvals::{
+            ApprovalStatus, VerifiedConsentDelivery, require_consent_evidence_time,
+        };
+        let delivery = ApprovalStatus::new(&server.window_store, server.security_profile())
+            .consent_delivery(&witness)
+            .map_err(|_| approval_required_indistinguishable(&profile_name))?;
+        let (identity, reference) = match &delivery {
+            VerifiedConsentDelivery::Unenforced => return Ok(Some(witness)),
+            VerifiedConsentDelivery::Queued {
+                identity,
+                reference,
+            } => (identity, Some(reference)),
+            VerifiedConsentDelivery::DirectAnchored { identity }
+            | VerifiedConsentDelivery::Ended { identity } => (identity, None),
+        };
+        let checked = (|| -> Result<(), stellar_agent_core::WalletError> {
+            let (writer, _readiness) = server.write_audit()?;
+            let mut writer = writer.lock().map_err(|_| {
+                stellar_agent_core::WalletError::from(
+                    stellar_agent_core::error::ValidationError::AuditWriterOpenFailed {
+                        profile: profile_name.clone(),
+                    },
+                )
+            })?;
+            let floor = stellar_agent_core::audit_log::require_consent_delivered(
+                &mut writer,
+                identity,
+                reference,
+                &profile_name,
+            )?;
+            require_consent_evidence_time(&witness, floor)
+        })();
+        checked.map_err(|error| {
+            if matches!(
+                error,
+                stellar_agent_core::WalletError::Approval(
+                    stellar_agent_core::ApprovalFailure::ConsentUndelivered { .. }
+                )
+            ) {
+                business_error_result(error.code(), error.message())
+            } else {
+                approval_required_indistinguishable(&profile_name)
+            }
+        })?;
+        return Ok(Some(witness));
     }
 
     // The tool accepts only its own approval kind and subject.
@@ -8960,6 +9007,184 @@ pub(crate) mod tests {
         }
 
         impl ClassicRun {
+            fn delivery_fixture(
+                &self,
+                queued: bool,
+                dropped: bool,
+            ) -> Option<stellar_agent_core::audit_log::OutboxRowRef> {
+                use base64::Engine as _;
+                use stellar_agent_core::approval::witness::{ApprovalExpectation, verify_approval};
+                use stellar_agent_core::audit_log::{
+                    AuditEntry, AuditOutbox, BindingCheck, EvidenceReservation,
+                };
+                use stellar_agent_network::policy_state::approvals::{
+                    ApprovalRecorder, ConsentDeliveryV1, ConsentPayload, PendingApprovalFacts,
+                    record_consent_with_row_for_test,
+                };
+                use stellar_agent_network::policy_state::{BusinessId, OperationStatus};
+                let server = &self.f.server;
+                let profile = server.security_profile();
+                let name = server.profile_name_for_approval();
+                let operation = OperationStatus::new(&server.window_store, profile)
+                    .view(&BusinessId::parse(self.args["business_id"].as_str().unwrap()).unwrap())
+                    .unwrap()
+                    .unwrap();
+                let inbox = stellar_agent_core::approval::PendingApprovalStore::open(
+                    server
+                        .resolve_approval_dir()
+                        .unwrap()
+                        .join(format!("{name}.toml")),
+                )
+                .unwrap();
+                let entry = inbox.get(&self.entry.approval_nonce).unwrap().clone();
+                let attestation = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(entry.attestation_blob_b64.as_ref().unwrap())
+                    .unwrap()
+                    .try_into()
+                    .unwrap();
+                let subject = stellar_agent_core::approval::mainnet_consent_subject(
+                    &entry,
+                    &stellar_agent_core::approval::AttestationBinding::new(
+                        &name,
+                        profile.chain_id.caip2_str(),
+                    ),
+                )
+                .unwrap();
+                let kind = match self.tool {
+                    Tool::Pay | Tool::CreateAccount => {
+                        stellar_agent_core::approval::witness::ApprovedKind::Payment
+                    }
+                    Tool::Claim => stellar_agent_core::approval::witness::ApprovedKind::Claim,
+                    Tool::Trustline => {
+                        stellar_agent_core::approval::witness::ApprovedKind::Trustline
+                    }
+                };
+                let witness = verify_approval(
+                    &inbox,
+                    profile,
+                    &name,
+                    &entry.approval_nonce,
+                    &attestation,
+                    &ApprovalExpectation { kind, subject },
+                    server.current_mainnet_policy().unwrap(),
+                    stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+                )
+                .unwrap();
+                drop(inbox);
+                let payload = ConsentPayload {
+                    attestation,
+                    receipt: entry.mainnet_presence.unwrap(),
+                    process_uid: entry.process_uid,
+                    outbox_row: None,
+                    challenge_subject: None,
+                    row_provenance: Some(
+                        stellar_agent_network::policy_state::RowProvenance::Written,
+                    ),
+                };
+                let facts = PendingApprovalFacts {
+                    nonce: witness.nonce().to_owned(),
+                    kind,
+                    subject_kind: witness.subject_kind(),
+                    subject,
+                    intent_digest: operation.intent_digest,
+                    created_at_ms: witness.created_at_ms(),
+                    waiting_expires_at_ms: witness.expires_at_ms(),
+                    rule_ttl_ms: witness.expires_at_ms() - witness.created_at_ms(),
+                };
+                let (writer, _readiness) = server.write_audit().unwrap();
+                let mut writer = writer.lock().unwrap();
+                writer.initialize_consent_evidence().unwrap();
+                let id =
+                    ApprovalRecorder::new(&server.window_store, profile, &mut *writer, "fixture")
+                        .open_pending(
+                            operation.operation_id,
+                            &facts,
+                            stellar_agent_core::audit_log::PolicyDecision::RequireApproval,
+                        )
+                        .unwrap()
+                        .record
+                        .id;
+                let (key, anchor) = stellar_agent_network::keyring::keyed_audit_access(
+                    profile,
+                    &name,
+                    BindingCheck::Enforce,
+                )
+                .unwrap()
+                .into_parts();
+                let outbox =
+                    AuditOutbox::for_log_keyed(&profile.audit_log_path, anchor, key.clone());
+                let token = outbox
+                    .reserve_evidence(
+                        id,
+                        EvidenceReservation::deadline(
+                            facts.waiting_expires_at_ms,
+                            facts.rule_ttl_ms,
+                        )
+                        .unwrap(),
+                        witness.consent_at_ms(),
+                    )
+                    .unwrap();
+                let reference = queued.then(|| {
+                    outbox
+                        .clone()
+                        .with_evidence_reservation(token)
+                        .append_queued(&AuditEntry::new_approval_attested(
+                            kind.kind_name(),
+                            self.tool.commit_name(),
+                            None,
+                            witness.nonce(),
+                            "mcp",
+                            "delivery-fixture",
+                        ))
+                        .unwrap()
+                });
+                if !queued {
+                    writer
+                        .prepare_entry()
+                        .unwrap()
+                        .write_anchored(AuditEntry::new_approval_attested(
+                            kind.kind_name(),
+                            self.tool.commit_name(),
+                            None,
+                            witness.nonce(),
+                            "mcp",
+                            "strict-direct",
+                        ))
+                        .unwrap();
+                }
+                if dropped {
+                    std::fs::write(
+                        outbox.path(),
+                        stellar_agent_core::audit_log::outbox::test_seam::generation_line(
+                            &key,
+                            reference.as_ref().unwrap().generation(),
+                        ),
+                    )
+                    .unwrap();
+                }
+                let delivery = if queued {
+                    ConsentDeliveryV1::queued(id)
+                } else {
+                    ConsentDeliveryV1::direct_anchored(id)
+                };
+                record_consent_with_row_for_test(
+                    &mut ApprovalRecorder::new(
+                        &server.window_store,
+                        profile,
+                        &mut *writer,
+                        "fixture",
+                    ),
+                    operation.operation_id,
+                    &facts,
+                    &witness,
+                    &payload,
+                    reference,
+                    delivery,
+                )
+                .unwrap();
+                reference
+            }
+
             pub(crate) async fn new(tool: Tool) -> Self {
                 Self::with(tool, |raw| raw, |_| {}, |_| {}).await
             }
@@ -9261,6 +9486,258 @@ pub(crate) mod tests {
                 args["approval_attestation"] = serde_json::json!(blob);
                 args
             }
+        }
+
+        type DeliveryFault = Box<dyn FnOnce()>;
+        thread_local! {
+            static DELIVERY_FAULT: std::cell::RefCell<Option<(String, DeliveryFault)>> = const { std::cell::RefCell::new(None) };
+        }
+        struct DeliveryFaultGuard;
+        impl Drop for DeliveryFaultGuard {
+            fn drop(&mut self) {
+                DELIVERY_FAULT.with_borrow_mut(|slot| *slot = None);
+            }
+        }
+        pub(crate) fn delivery_fault(name: &str) {
+            let fault = DELIVERY_FAULT.with_borrow_mut(|slot| {
+                if slot.as_ref().is_some_and(|(armed, _)| armed == name) {
+                    slot.take()
+                } else {
+                    None
+                }
+            });
+            if let Some((_, fault)) = fault {
+                fault();
+            }
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn mcp_delivery_gate_precedes_seed() {
+            use base64::Engine as _;
+            use stellar_agent_core::approval::witness::ApprovedKind;
+            use stellar_agent_network::policy_state::approvals::ConsentEvidenceEnforcementGuard;
+            let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+            for case in [
+                "dropped",
+                "delivered",
+                "direct",
+                "invalid",
+                "store",
+                "image",
+                "writer",
+                "poison",
+            ] {
+                let run = ClassicRun::new(Tool::Pay).await;
+                let reference = run.delivery_fixture(case != "direct", case == "dropped");
+                let name = run.f.server.profile_name_for_approval();
+                let _enabled = ConsentEvidenceEnforcementGuard::new(&name, ApprovedKind::Payment);
+                let lookups = Arc::new(AtomicU32::new(0));
+                let count = lookups.clone();
+                observe(&run.f.on_window_key_read, move || {
+                    count.fetch_add(1, Ordering::SeqCst);
+                });
+                let mut args = run.args.clone();
+                if case == "invalid" {
+                    args["approval_attestation"] = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .encode([0; 32])
+                        .into();
+                }
+                let window_path = run.f.server.window_store.path().to_owned();
+                let profile = run.f.server.security_profile().clone();
+                let poison_writer =
+                    (case == "poison").then(|| run.f.server.write_audit().unwrap().0);
+                let saved_window = Arc::new(std::sync::Mutex::new(None));
+                let saved = saved_window.clone();
+                let _fault_guard = DeliveryFaultGuard;
+                DELIVERY_FAULT.with_borrow_mut(|slot| {
+                    *slot = Some((
+                        name.clone(),
+                        Box::new(move || match case {
+                            "store" => {
+                                *saved.lock().unwrap() = Some(std::fs::read(&window_path).unwrap());
+                                std::fs::write(window_path, b"invalid store").unwrap();
+                            }
+                            "image" => {
+                                for suffix in [".outbox.evidence.0", ".outbox.evidence.1"] {
+                                    let mut path =
+                                        profile.audit_log_path.as_os_str().to_os_string();
+                                    path.push(suffix);
+                                    std::fs::write(
+                                        std::path::PathBuf::from(path),
+                                        b"invalid image",
+                                    )
+                                    .unwrap();
+                                }
+                            }
+                            "writer" => {
+                                put(&profile.audit_log_hash_chain_key_id, "invalid-audit-key")
+                            }
+                            "poison" => {
+                                let writer = poison_writer.unwrap();
+                                std::thread::spawn(move || {
+                                    let _held = writer.lock().unwrap();
+                                    panic!("fixture writer poison");
+                                })
+                                .join()
+                                .unwrap_err();
+                            }
+                            _ => {}
+                        }),
+                    ))
+                });
+                if case == "invalid" {
+                    let outcome = run
+                        .f
+                        .server
+                        .dispatch_gate("stellar_pay_commit", &run.f.args(), "stellar:mainnet")
+                        .await
+                        .unwrap();
+                    let before = lookups.load(Ordering::SeqCst);
+                    let refused = verify_attestation_gate(
+                        &run.f.server,
+                        &outcome,
+                        GatedApprovalKind::Payment,
+                        args["envelope_xdr"].as_str().unwrap(),
+                        args["approval_nonce"].as_str(),
+                        args["approval_attestation"].as_str(),
+                        "stellar_pay_commit",
+                    )
+                    .await
+                    .unwrap_err();
+                    assert_eq!(
+                        wire(&refused)["error"],
+                        wire(&approval_required_indistinguishable(&name))["error"]
+                    );
+                    assert_eq!(
+                        lookups.load(Ordering::SeqCst),
+                        before,
+                        "invalid proof performs no delivery lookup"
+                    );
+                }
+                let result = run.commit_with(args).await;
+                if case == "delivered" || case == "direct" {
+                    assert_eq!(result["ok"], true, "{case}: {result}");
+                    assert!(run.seed_reads() > 0);
+                } else {
+                    let code = if case == "dropped" {
+                        "approval.consent_undelivered"
+                    } else {
+                        "policy.approval_required"
+                    };
+                    assert_eq!(result["error"]["code"], code, "{case}: {result}");
+                    if case == "dropped" {
+                        let row = reference.unwrap();
+                        let message = result["error"]["message"].as_str().unwrap();
+                        assert!(message.contains(&format!(
+                            "generation {}, row {}",
+                            row.generation(),
+                            row.sequence()
+                        )));
+                    }
+                    assert_eq!(run.seed_reads(), 0, "{case}");
+                    assert!(run.control.sent().is_empty(), "{case}");
+                    if let Some(bytes) = saved_window.lock().unwrap().take() {
+                        // Restore only the injected file fault; the trusted counter stays as observed.
+                        std::fs::write(run.f.server.window_store.path(), bytes).unwrap();
+                    }
+                    assert!(
+                        run.f
+                            .server
+                            .window_store
+                            .open_authorizations(
+                                run.f.server.security_profile(),
+                                stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+                            )
+                            .unwrap()
+                            .is_empty(),
+                        "{case}: delivery refusal mints no authorization"
+                    );
+                }
+            }
+            let run = ClassicRun::allowed(Tool::Pay).await;
+            let name = run.f.server.profile_name_for_approval();
+            let _enabled = ConsentEvidenceEnforcementGuard::new(&name, ApprovedKind::Payment);
+            let profile = run.f.server.security_profile();
+            let (writer, _readiness) = run.f.server.write_audit().unwrap();
+            writer
+                .lock()
+                .unwrap()
+                .initialize_consent_evidence()
+                .unwrap();
+            let (key, anchor) = stellar_agent_network::keyring::keyed_audit_access(
+                profile,
+                &name,
+                stellar_agent_core::audit_log::BindingCheck::Enforce,
+            )
+            .unwrap()
+            .into_parts();
+            stellar_agent_core::audit_log::outbox::test_seam::conflicting_evidence(
+                &profile.audit_log_path,
+                &key,
+            )
+            .unwrap();
+            let outbox = stellar_agent_core::audit_log::AuditOutbox::for_log_keyed(
+                &profile.audit_log_path,
+                anchor,
+                key,
+            );
+            assert!(
+                outbox
+                    .evidence_time_floor()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("owner rollback")
+            );
+            let outcome = run
+                .f
+                .server
+                .dispatch_gate("stellar_pay_commit", &run.f.args(), "stellar:mainnet")
+                .await
+                .unwrap();
+            let lookups = Arc::new(AtomicU32::new(0));
+            let count = lookups.clone();
+            observe(&run.f.on_window_key_read, move || {
+                count.fetch_add(1, Ordering::SeqCst);
+            });
+            let queries = Arc::new(AtomicU32::new(0));
+            let count = queries.clone();
+            let _query_hook = stellar_agent_core::audit_log::outbox::test_seam::on_delivery_query(
+                &profile.audit_log_path,
+                move || {
+                    count.fetch_add(1, Ordering::SeqCst);
+                },
+            );
+            let mut witness = None;
+            assert!(matches!(
+                mainnet_authority(
+                    &run.f.server,
+                    &outcome,
+                    GatedApprovalKind::Payment.expectation(
+                        stellar_agent_core::approval::subject::approval_subject_classic(
+                            run.args["envelope_xdr"].as_str().unwrap()
+                        )
+                    ),
+                    &SuppliedProof::default(),
+                    "stellar_pay_commit",
+                    &mut witness,
+                )
+                .await
+                .unwrap(),
+                stellar_agent_network::mainnet::authority::MainnetAuthority::Policy(_)
+            ));
+            assert_eq!(
+                lookups.load(Ordering::SeqCst),
+                0,
+                "Allow reads no delivery status"
+            );
+            assert_eq!(
+                run.commit().await["ok"],
+                true,
+                "Allow beside rollback evidence"
+            );
+            assert_eq!(queries.load(Ordering::SeqCst), 0, "Allow reads no evidence");
         }
 
         /// A pending approval of the kind `tool` commits, for the envelope

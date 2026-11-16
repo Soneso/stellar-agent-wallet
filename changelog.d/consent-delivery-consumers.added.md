@@ -1,0 +1,3 @@
+- Consent records carry authenticated delivery metadata, and consumers check exact queued delivery and evidence time. Production kinds remain unenforced until their integration prerequisites hold.
+- `approve --id` reports a queued approval success with `audit_code: audit.outbox_queued`; a directly written success omits the field.
+- Mainnet confirmation and `approve --id` record consent through the attesters that return a delivery reference, so a direct consent needs a current audit tip anchor and a queued consent requests delivery evidence.

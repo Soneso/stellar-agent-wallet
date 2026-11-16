@@ -83,8 +83,8 @@ use stellar_agent_core::approval::{
     ConsentAuthorization, ContextRuleProposalSnapshot, DEFAULT_RETRY_ATTEMPTS,
     DEFAULT_RETRY_BACKOFF, MainnetApprovalAuthority, PendingApproval, PendingApprovalStore,
     RuleProposalContextType, RuleProposalSignerKind, Surface, ToolsetGrantRequest,
-    attest_and_persist, classic_entry_summary, load_and_validate_entry, load_attestation_key,
-    mainnet_consent_subject, open_with_retry, process_uid_for_attestation,
+    attest::attest_and_persist_with_row, classic_entry_summary, load_and_validate_entry,
+    load_attestation_key, mainnet_consent_subject, open_with_retry, process_uid_for_attestation,
     try_decode_spending_limit_params,
 };
 use stellar_agent_core::envelope::Envelope;
@@ -167,6 +167,9 @@ struct ApproveRunData {
     /// in the audit outbox for the draining writer of a running MCP server or
     /// approval inbox.
     audit: ConsentRowOutcome,
+    /// The queued-row diagnostic; omitted for a directly written row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audit_code: Option<&'static str>,
     /// The presence ceremony of a mainnet consent; absent on testnet.
     #[serde(skip_serializing_if = "Option::is_none")]
     presence: Option<PresenceData>,
@@ -313,6 +316,7 @@ pub async fn run(args: RunArgs) -> i32 {
                         expires_at_unix_ms: entry.expires_at_unix_ms,
                         approval_attestation: approved.attestation,
                         audit: approved.audit,
+                        audit_code: approved.audit.code(),
                         presence: Some(approved.presence),
                     },
                     request_id,
@@ -384,6 +388,7 @@ pub async fn run(args: RunArgs) -> i32 {
         expires_at_unix_ms: entry.expires_at_unix_ms,
         approval_attestation,
         audit,
+        audit_code: audit.code(),
         presence: None,
     }));
     0
@@ -461,7 +466,7 @@ async fn approve_mainnet(
             profile,
         ),
     )?;
-    let (attestation, audit) = record_consent(
+    let (attestation, audit, _outbox_row) = record_consent(
         &mut store,
         entry,
         &key,
@@ -492,6 +497,15 @@ enum ConsentRowOutcome {
     Queued,
 }
 
+impl ConsentRowOutcome {
+    fn code(self) -> Option<&'static str> {
+        match self {
+            Self::Written => None,
+            Self::Queued => Some(stellar_agent_core::error::AUDIT_OUTBOX_QUEUED),
+        }
+    }
+}
+
 /// Writes the consent row and persists the testnet approval of the local
 /// operator, in that order.
 ///
@@ -513,6 +527,7 @@ fn approve_with_consent_row(
         profile,
         ConsentAuthorization::Standard(&AttestedApprover::Local),
     )
+    .map(|(attestation, outcome, _row)| (attestation, outcome))
 }
 
 /// Writes the consent row and persists the approval `authorization` admits,
@@ -521,7 +536,7 @@ fn approve_with_consent_row(
 /// # Errors
 ///
 /// The acquisition refusal of [`acquire_operator_row_sink`], a poisoned writer
-/// mutex, or any error of `attest_and_persist`. Nothing is persisted when the
+/// mutex, or any error of `attest_and_persist_with_row`. Nothing is persisted when the
 /// row is refused.
 fn record_consent(
     store: &mut PendingApprovalStore,
@@ -530,7 +545,14 @@ fn record_consent(
     context: &ApprovalContext,
     profile: &Profile,
     authorization: ConsentAuthorization<'_>,
-) -> Result<(Option<String>, ConsentRowOutcome), WalletError> {
+) -> Result<
+    (
+        Option<String>,
+        ConsentRowOutcome,
+        Option<stellar_agent_core::audit_log::OutboxRowRef>,
+    ),
+    WalletError,
+> {
     let profile_name = context.profile_name.as_str();
     let persist_grant = |req: &ToolsetGrantRequest<'_>, key: &[u8; 32]| {
         stellar_agent_toolsets_runtime::record_first_invoke_grant(
@@ -572,7 +594,7 @@ fn record_consent(
             (ConsentAudit::Outbox(outbox), ConsentRowOutcome::Queued)
         }
     };
-    let attestation = attest_and_persist(
+    let (attestation, outbox_row) = attest_and_persist_with_row(
         store,
         entry,
         key_bytes,
@@ -582,7 +604,7 @@ fn record_consent(
         authorization,
         persist_grant,
     )?;
-    Ok((attestation, outcome))
+    Ok((attestation, outcome, outbox_row))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2717,10 +2739,22 @@ mod tests {
                 expires_at_unix_ms: 1,
                 approval_attestation: None,
                 audit: outcome,
+                audit_code: outcome.code(),
                 presence: None,
             };
             let value = serde_json::to_value(&data).unwrap();
             assert_eq!(value["audit"], wire);
+            let suffix = if outcome == ConsentRowOutcome::Queued {
+                ",\"audit_code\":\"audit.outbox_queued\""
+            } else {
+                ""
+            };
+            assert_eq!(
+                serde_json::to_string(&data).unwrap(),
+                format!(
+                    "{{\"approval_nonce\":\"n\",\"attested\":true,\"process_uid\":\"501\",\"expires_at_unix_ms\":1,\"audit\":\"{wire}\"{suffix}}}"
+                )
+            );
             assert!(
                 value.get("presence").is_none(),
                 "testnet data has no presence"
@@ -2798,8 +2832,36 @@ mod tests {
         );
 
         let (mut store, entry) = pending_store(&dir);
-        let (attestation, audit) =
-            approve_in_process("approve-queued", &profile, &mut store, &entry).unwrap();
+        let context = ApprovalContext::from_profile("approve-queued", &profile);
+        let (attestation, audit, reference) = record_consent(
+            &mut store,
+            &entry,
+            &[0x42; 32],
+            &context,
+            &profile,
+            ConsentAuthorization::Standard(&AttestedApprover::Local),
+        )
+        .unwrap();
+        let reference =
+            reference.expect("the producer boundary retains the actual append reference");
+        let queue = std::fs::read(stellar_agent_core::audit_log::outbox_path(
+            &profile.audit_log_path,
+        ))
+        .unwrap();
+        let line = queue
+            .split(|byte| *byte == b'\n')
+            .rfind(|line| !line.is_empty())
+            .unwrap();
+        let (_, digest) =
+            stellar_agent_core::audit_log::outbox::test_seam::delivered_row_digest(line).unwrap();
+        assert_eq!(
+            *reference.digest(),
+            digest,
+            "the exact queued digest is returned"
+        );
+        let wire: serde_json::Value = serde_json::from_slice(line).unwrap();
+        assert_eq!(reference.generation(), wire["g"].as_u64().unwrap());
+        assert_eq!(reference.sequence(), wire["s"].as_u64().unwrap());
         assert_eq!(audit, ConsentRowOutcome::Queued);
         assert!(attestation.is_some(), "the approval is persisted");
         assert_eq!(inspect_outbox(&profile.audit_log_path).unwrap().pending, 1);
@@ -2823,6 +2885,63 @@ mod tests {
             "the next acquisition logs it"
         );
         assert_eq!(inspect_outbox(&profile.audit_log_path).unwrap().pending, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn queued_report_does_not_wait_for_delivery() {
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let name = "queued-report";
+        let profile = consent_profile(name, &dir, true);
+        seed_key_32(
+            &profile.attestation_key_id.service,
+            &profile.attestation_key_id.account,
+        );
+        stellar_agent_core::profile::loader::save(name, &profile).unwrap();
+        let mut entry = make_entry(DEFAULT_TTL_MS);
+        entry.process_uid = process_uid_for_attestation().unwrap();
+        let mut pending = PendingApprovalStore::open(
+            default_approval_dir().unwrap().join(format!("{name}.toml")),
+        )
+        .unwrap();
+        pending
+            .insert(entry.clone(), timefmt::now_unix_ms().unwrap())
+            .unwrap();
+        drop(pending);
+        let _holder = AuditWriterRegistry::get_or_open_keyed(
+            "queued-holder",
+            &profile.audit_log_path,
+            stellar_agent_network::keyring::keyed_audit_access(
+                &profile,
+                name,
+                stellar_agent_core::audit_log::BindingCheck::Enforce,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let before = std::fs::read(&profile.audit_log_path).unwrap();
+        crate::common::render::take_rendered_for_test();
+        let code = run(RunArgs {
+            id: Some(entry.approval_nonce),
+            profile: Some(name.to_owned()),
+            yes: true,
+            open_by_operator: false,
+        })
+        .await;
+        let rendered = crate::common::render::take_rendered_for_test();
+        assert_eq!(code, 0, "queued approval exits zero: {rendered:?}");
+        assert_eq!(rendered.len(), 1);
+        assert_eq!(rendered[0]["data"]["audit"], "queued");
+        assert_eq!(rendered[0]["data"]["audit_code"], "audit.outbox_queued");
+        assert_eq!(
+            std::fs::read(&profile.audit_log_path).unwrap(),
+            before,
+            "queued reporting never waits for delivery"
+        );
+        assert_eq!(inspect_outbox(&profile.audit_log_path).unwrap().pending, 1);
     }
 
     #[test]
