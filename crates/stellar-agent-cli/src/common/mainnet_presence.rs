@@ -939,9 +939,27 @@ mod tests {
         .unwrap()
     }
 
+    fn wall_clock() -> (
+        std::sync::Arc<std::sync::atomic::AtomicU64>,
+        stellar_agent_core::timefmt::test_clock::Guard,
+    ) {
+        use std::sync::{Arc, atomic::AtomicU64};
+        let now = Arc::new(AtomicU64::new(
+            stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+        ));
+        let read = Arc::clone(&now);
+        let guard = stellar_agent_core::timefmt::test_clock::install(Arc::new(
+            stellar_agent_core::timefmt::MockClock::new(move || {
+                Ok(read.load(std::sync::atomic::Ordering::SeqCst))
+            }),
+        ));
+        (now, guard)
+    }
+
     async fn expire_at_armed_deadline(
         ceremony: impl std::future::Future<Output = Result<VerifiedMainnetPresence, WalletError>>,
         expires_at: u64,
+        wall: &std::sync::atomic::AtomicU64,
     ) -> Result<VerifiedMainnetPresence, WalletError> {
         use std::{future::poll_fn, task::Poll, time::Duration};
         use stellar_agent_core::timefmt::now_unix_ms;
@@ -952,7 +970,7 @@ mod tests {
         tokio::time::pause();
         let _clock = ClockHold::new();
         let mut ceremony = std::pin::pin!(ceremony);
-        let w0 = now_unix_ms().unwrap();
+        let remaining = Duration::from_millis(expires_at - now_unix_ms().unwrap());
         let i0 = std::time::Instant::now();
         assert!(
             poll_fn(|cx| Poll::Ready(ceremony.as_mut().poll(cx)))
@@ -960,14 +978,13 @@ mod tests {
                 .is_pending()
         );
         let i1 = std::time::Instant::now();
-        let w1 = now_unix_ms().unwrap();
         let armed = expiry_trace::armed().expect("the presence deadline is armed");
         assert!(
-            armed >= i0 + Duration::from_millis(expires_at - w1) - Duration::from_millis(1),
+            armed >= i0 + remaining,
             "the armed deadline is not shortened"
         );
         assert!(
-            armed <= i1 + Duration::from_millis(expires_at - w0) + Duration::from_millis(1),
+            armed <= i1 + remaining,
             "the armed deadline is not extended"
         );
         let before = Instant::from_std(armed) - Duration::from_millis(1);
@@ -984,6 +1001,7 @@ mod tests {
             "presence is pending before the armed tick"
         );
         let at = Instant::from_std(armed) + Duration::from_nanos(999_999);
+        wall.store(expires_at + 1, std::sync::atomic::Ordering::SeqCst);
         tokio::time::advance(at.duration_since(Instant::now())).await;
         let polled = poll_fn(|cx| Poll::Ready(ceremony.as_mut().poll(cx))).await;
         wait_until("presence is decided at the armed tick", || {
@@ -1032,6 +1050,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn open_by_operator_keeps_presence_and_expiry() {
+        let (wall, _wall_clock) = wall_clock();
         let ending = async |cancel: bool| {
             let fixture = MainnetConsentFixture::new("main");
             let entry = fixture.payment(600_000);
@@ -1057,7 +1076,7 @@ mod tests {
             let result = if cancel {
                 drive_call(ceremony, |_| async {}).await
             } else {
-                expire_at_armed_deadline(ceremony, entry.expires_at_unix_ms).await
+                expire_at_armed_deadline(ceremony, entry.expires_at_unix_ms, &wall).await
             }
             .unwrap_err();
             assert_eq!(
@@ -1241,6 +1260,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn the_ceremony_ends_at_the_entry_expiry() {
+        let (wall, _wall_clock) = wall_clock();
         let fixture = MainnetConsentFixture::new("main");
         let entry = fixture.payment(600_000);
         let mut store =
@@ -1272,6 +1292,7 @@ mod tests {
                 std::future::pending(),
             ),
             entry.expires_at_unix_ms,
+            &wall,
         )
         .await;
         assert_eq!(ended.unwrap_err().code(), "approval.presence_expired");

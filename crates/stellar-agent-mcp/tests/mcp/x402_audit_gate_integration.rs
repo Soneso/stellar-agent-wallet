@@ -2897,33 +2897,63 @@ async fn mcp_x402_client_construction_failure_is_rpc_unreachable() {
 }
 
 /// The identity check runs under the profile's submit timeout. A configured
-/// one second refuses an answer that takes three, whatever the requirement's
-/// `maxTimeoutSeconds`. The default of sixty seconds waits for it, even under
-/// a one-second `maxTimeoutSeconds`.
+/// one second reaches the RPC client as its identity deadline. The default
+/// is sixty seconds, even under a one-second `maxTimeoutSeconds`.
 #[tokio::test]
 #[serial]
 async fn mcp_x402_identity_uses_profile_timeout() {
-    let slow = NetworkAnswer::Delayed(TESTNET_PASSPHRASE, std::time::Duration::from_secs(3));
+    use std::time::Duration;
+    use stellar_agent_network::client::take_identity_deadlines_for_test;
+    use stellar_agent_test_support::timing::ClockHold;
+
+    tokio::time::pause();
+    let _clock = ClockHold::new();
     let mut seed = 0xd5;
     for tool in [Tool::CreatePayment, Tool::AuthenticatedPayment] {
-        seed += 1;
-        let answer = slow.clone();
-        let configured = fixture_with_profile(
-            &format!("x402-timeout-set-{seed:x}"),
-            [seed; 32],
-            |rpc| rpc.network = answer,
-            |profile| profile.submit_timeout_seconds = Some(1),
-        )
-        .await;
-        let started = std::time::Instant::now();
-        let result = call_with(&configured, tool, &payment_required_with(|_| {})).await;
-        let (code, _message, _text) = crate::common::assert_business_envelope(&result);
-        assert_eq!(code, "network.endpoint_identity_unavailable", "{tool:?}");
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(3),
-            "{tool:?}: the configured timeout ends the check"
-        );
+        for (configured, expected) in [(Some(1), 1), (None, 60)] {
+            seed += 1;
+            let fixture = fixture_with_profile(
+                &format!("x402-timeout-{seed:x}"),
+                [seed; 32],
+                |_| {},
+                |profile| profile.submit_timeout_seconds = configured,
+            )
+            .await;
+            // Setup can consume more than the identity timeout before it is armed.
+            tokio::time::advance(Duration::from_secs(4)).await;
+            take_identity_deadlines_for_test();
+            let started = tokio::time::Instant::now();
+            let result = call_with(
+                &fixture,
+                tool,
+                &payment_required_with(|requirements| {
+                    requirements["maxTimeoutSeconds"] = serde_json::json!(1);
+                }),
+            )
+            .await;
+            assert_eq!(
+                take_identity_deadlines_for_test(),
+                vec![started + Duration::from_secs(expected)],
+                "{tool:?}: the client receives the profile identity timeout"
+            );
+            let envelope = result_json(&result);
+            assert_ne!(result.is_error, Some(true), "{tool:?}: {envelope}");
+            assert!(
+                envelope["data"]["paymentSignature"].is_string(),
+                "{tool:?}: {envelope}"
+            );
+        }
+    }
+}
 
+/// The default identity timeout permits a three-second network answer even
+/// when the payment requirement's `maxTimeoutSeconds` is one second.
+#[tokio::test]
+#[serial]
+async fn mcp_x402_identity_is_not_bounded_by_max_timeout_seconds() {
+    let slow = NetworkAnswer::Delayed(TESTNET_PASSPHRASE, std::time::Duration::from_secs(3));
+    let mut seed = 0x4b;
+    for tool in [Tool::CreatePayment, Tool::AuthenticatedPayment] {
         seed += 1;
         let answer = slow.clone();
         let default = fixture_with_profile(

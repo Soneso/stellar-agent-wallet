@@ -35,6 +35,7 @@
 use std::{
     fmt, io,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    time::Duration,
 };
 
 use axum::Router;
@@ -449,6 +450,33 @@ impl PairServer {
         second??;
         Ok(())
     }
+
+    /// Waits for both servers, aborting both if `timeout` expires.
+    ///
+    /// A timeout waits for both task cancellations before returning, so neither
+    /// task still owns a listener. Dropping this future aborts without waiting.
+    ///
+    /// # Errors
+    ///
+    /// The outer error reports an expired timeout after both tasks have ended.
+    /// The inner result carries the errors of [`Self::join`].
+    pub async fn join_with_timeout(
+        self,
+        timeout: Duration,
+    ) -> Result<io::Result<()>, tokio::time::error::Elapsed> {
+        let aborts = self.tasks.each_ref().map(|task| task.0.abort_handle());
+        let mut join = std::pin::pin!(self.join());
+        match tokio::time::timeout(timeout, &mut join).await {
+            Ok(result) => Ok(result),
+            Err(elapsed) => {
+                for task in aborts {
+                    task.abort();
+                }
+                let _canceled = join.await;
+                Err(elapsed)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -460,12 +488,9 @@ mod tests {
         reason = "test-only; panics acceptable in unit tests"
     )]
 
-    use std::{
-        sync::{
-            Arc, Mutex,
-            atomic::{AtomicUsize, Ordering},
-        },
-        time::Duration,
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
     };
 
     use axum::{extract::State, routing::get};
@@ -809,6 +834,41 @@ mod tests {
             .unwrap();
         assert!(!accepts(v4(port)).await);
         assert!(!accepts(v6(port)).await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_join_timeout_closes_listeners_that_ignore_shutdown() {
+        for ignores in [[true, true], [false, true], [true, false]] {
+            let pair = LoopbackPair::bind(0).await.unwrap();
+            let port = pair.port();
+            let (observed, mut observations) = tokio::sync::mpsc::unbounded_channel();
+            let server = PairServer::spawn(pair, |listener, signal| {
+                let observed = observed.clone();
+                async move {
+                    let index = usize::from(listener.local_addr()?.is_ipv6());
+                    signal.requested().await;
+                    observed.send(()).unwrap();
+                    if ignores[index] {
+                        std::future::pending::<()>().await;
+                    }
+                    drop(listener);
+                    Ok(())
+                }
+            });
+            server.shutdown();
+            for _ in 0..2 {
+                observations.recv().await.unwrap();
+            }
+
+            assert!(server.join_with_timeout(Duration::ZERO).await.is_err());
+            // Synchronous probes cannot give an unawaited cancellation a turn.
+            for addr in [v4(port), v6(port)] {
+                assert!(
+                    std::net::TcpStream::connect(addr).is_err(),
+                    "both listeners are closed when the timed join returns: {ignores:?}, {addr}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

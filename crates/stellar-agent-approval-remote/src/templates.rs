@@ -2084,7 +2084,11 @@ mod tests {
     /// The remote page shows the complete G and maximum-ID M destination of
     /// a toolset grant, with a base row for M only.
     #[test]
+    #[serial_test::serial]
     fn toolset_consent_shows_the_complete_destination() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let html = remote_page(gate_to(CONSENT_G));
         assert!(
             html.contains(&format!(
@@ -2112,7 +2116,11 @@ mod tests {
     /// The remote page of a payment to the maximum-ID M shows the complete
     /// address and its base row.
     #[test]
+    #[serial_test::serial]
     fn payment_consent_shows_the_complete_destination() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let html = remote_page(stellar_agent_core::approval::fixtures::payment_pending(
             SOURCE_G,
             CONSENT_MMAX,
@@ -2136,7 +2144,11 @@ mod tests {
     /// Control and multibyte toolset text renders escaped on the remote
     /// page beside the complete destination.
     #[test]
+    #[serial_test::serial]
     fn malformed_consent_terms_render_escaped() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = TempDir::new().unwrap();
         let mut store = PendingApprovalStore::open(dir.path().join("consent.toml")).unwrap();
         store.insert(gate_to(CONSENT_MMAX), NOW_MS).unwrap();

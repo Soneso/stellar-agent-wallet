@@ -24,7 +24,8 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 /// The real time [`wait_until`] waits before it reports a hang.
-pub const HANG_LIMIT: Duration = Duration::from_secs(10);
+/// Real I/O and blocking-pool scheduling share this allowance on loaded test hosts.
+pub const HANG_LIMIT: Duration = Duration::from_secs(300);
 
 /// The first instant a boundary was reached, shared between the observer
 /// that reaches it and the test that reads it.

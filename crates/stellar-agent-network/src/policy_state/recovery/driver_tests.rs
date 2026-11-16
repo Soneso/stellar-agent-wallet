@@ -2414,6 +2414,10 @@ async fn driver_four_timed_attempts_share_one_prefix() {
     let fx = Fixture::new(5, NOW / 1000 - 10);
     let pair = fx.pair([60, 60], NOW, 0).await;
     let untouched = serde_json::to_vec(&fx.fx.record(fx.ids[4])).unwrap();
+    // The mounted peers provide the shared observations before the attempts run.
+    // Their freshness and the pass budget stay fixed while real I/O completes.
+    tokio::time::pause();
+    let _clock = stellar_agent_test_support::timing::ClockHold::new();
     let report = fx.run(&pair).await.unwrap();
     assert_eq!(report.evaluated, 4);
     assert_eq!(report.attempts.len(), 4);

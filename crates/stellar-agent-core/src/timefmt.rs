@@ -227,6 +227,10 @@ pub fn current_iso8601_utc() -> String {
 /// assert!(now > 0);
 /// ```
 pub fn now_unix_ms() -> Result<u64, WalletLifecycleError> {
+    #[cfg(any(test, feature = "test-helpers"))]
+    if let Some(clock) = test_clock::current() {
+        return clock.now_unix_ms();
+    }
     std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .map_err(|e| WalletLifecycleError::ClockError {
@@ -239,6 +243,44 @@ pub fn now_unix_ms() -> Result<u64, WalletLifecycleError> {
                 source: None,
             })
         })
+}
+
+/// Scoped wall-clock overrides for current-thread tests.
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod test_clock {
+    use super::Clock;
+    use std::{cell::RefCell, marker::PhantomData, rc::Rc, sync::Arc};
+
+    thread_local! {
+        static CLOCK: RefCell<Option<Arc<dyn Clock>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn current() -> Option<Arc<dyn Clock>> {
+        CLOCK.with_borrow(Clone::clone)
+    }
+
+    /// Restores the calling thread's previous clock on drop.
+    ///
+    /// The guard stays on its installing thread because the override is thread-local.
+    #[must_use]
+    pub struct Guard {
+        previous: Option<Arc<dyn Clock>>,
+        thread: PhantomData<Rc<()>>,
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            CLOCK.set(self.previous.take());
+        }
+    }
+
+    /// Uses `clock` for wall-clock reads on this thread until the guard drops.
+    pub fn install(clock: Arc<dyn Clock>) -> Guard {
+        Guard {
+            previous: CLOCK.replace(Some(clock)),
+            thread: PhantomData,
+        }
+    }
 }
 
 /// Convert Unix epoch seconds to `(year, month, day, hour, min, sec)`.

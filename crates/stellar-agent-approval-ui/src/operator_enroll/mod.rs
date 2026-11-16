@@ -413,7 +413,7 @@ impl OperatorEnrollHandle {
     ///   panicked or ended with an I/O error.
     pub async fn shutdown(self) -> Result<(), OperatorEnrollShutdownError> {
         self.server.shutdown();
-        match tokio::time::timeout(SHUTDOWN_DEADLINE, self.server.join()).await {
+        match self.server.join_with_timeout(SHUTDOWN_DEADLINE).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(join_err)) => Err(OperatorEnrollShutdownError::JoinFailed {
                 detail: join_err.to_string(),

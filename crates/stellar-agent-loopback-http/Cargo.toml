@@ -21,8 +21,8 @@ name = "stellar_agent_loopback_http"
 axum = { workspace = true, features = ["matched-path"] }
 
 # The two loopback listeners of a pair (`net`), their shared shutdown signal
-# (`sync`), and the task per listener (`rt`).
-tokio = { workspace = true, features = ["net", "sync", "rt"] }
+# (`sync`), the task per listener (`rt`), and the bounded join (`time`).
+tokio = { workspace = true, features = ["net", "sync", "rt", "time"] }
 
 # Layer/Service traits the middleware implements.
 tower = { workspace = true }
