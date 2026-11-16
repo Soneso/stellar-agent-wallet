@@ -116,7 +116,7 @@ fn toolset_payment_value(
     args: &serde_json::Value,
     chain: Option<&str>,
     has_mainnet_context: bool,
-) -> Option<stellar_agent_core::policy::v1::ValueClass> {
+) -> Option<Result<stellar_agent_core::policy::v1::ValueClass, super::common::ToolError>> {
     use stellar_agent_core::envelope_decode::decode_authoritative_args;
     use stellar_agent_core::policy::v1::value::derive_value_class;
     if has_mainnet_context {
@@ -128,7 +128,7 @@ fn toolset_payment_value(
             .get("envelope_xdr")
             .and_then(serde_json::Value::as_str)
             .and_then(|envelope| decode_authoritative_args(envelope, "stellar_pay_commit").ok())
-            .map(|authoritative| derive_value_class("stellar_pay_commit", &authoritative)),
+            .map(|authoritative| Ok(derive_value_class("stellar_pay_commit", &authoritative))),
         "stellar_pay" => {
             let mut merged = object.clone();
             if let Some(chain) = chain.filter(|chain| !chain.is_empty()) {
@@ -145,10 +145,74 @@ fn toolset_payment_value(
                 "amount_stroops".into(),
                 amount.as_stroops().to_string().into(),
             );
-            Some(derive_value_class(
+            if let Err(err) =
+                super::common::validate_g_strkey(object.get("source")?.as_str()?, "source")
+            {
+                return Some(Err(super::common::ToolError::Protocol(err)));
+            }
+            if let Err(err) = super::common::validate_payment_destination(
+                object.get("destination")?.as_str()?,
+                "destination",
+            ) {
+                return Some(Err(super::common::ToolError::Protocol(err)));
+            }
+            let memo_text = match object
+                .get("memo_text")
+                .and_then(serde_json::Value::as_str)
+                .map(stellar_agent_core::amount::McpMemoTextArgument::try_from)
+                .transpose()
+            {
+                Ok(memo_text) => memo_text,
+                Err(err) => {
+                    let err = <serde_json::Error as serde::de::Error>::custom(err);
+                    return Some(Err(super::common::ToolError::Protocol(
+                        rmcp::ErrorData::invalid_params(
+                            format!(
+                                "toolset.args_deserialise: stellar_pay: {}",
+                                describe_args_error(&err)
+                            ),
+                            None,
+                        ),
+                    )));
+                }
+            };
+            let memo = match stellar_agent_network::parse_memo_fields(
+                memo_text
+                    .as_ref()
+                    .map(stellar_agent_core::amount::McpMemoTextArgument::as_str),
+                object.get("memo_id").and_then(serde_json::Value::as_u64),
+                object
+                    .get("memo_hash_hex")
+                    .and_then(serde_json::Value::as_str),
+                object
+                    .get("memo_return_hex")
+                    .and_then(serde_json::Value::as_str),
+            ) {
+                Ok(memo) => memo,
+                Err(err) => {
+                    return Some(Err(super::common::ToolError::Business(
+                        super::common::ledger_err_result(&err),
+                    )));
+                }
+            };
+            let policy_memo =
+                match stellar_agent_core::envelope_decode::ClassicMemo::try_from(&memo) {
+                    Ok(memo) => memo,
+                    Err(_) => {
+                        return Some(Err(super::common::ToolError::Protocol(
+                            rmcp::ErrorData::invalid_params("memo text is not valid UTF-8", None),
+                        )));
+                    }
+                };
+            // Only the parsed routed memo supplies policy facts.
+            for key in ["memo_kind", "memo", "memo_id", "memo_hash", "memo_return"] {
+                merged.remove(key);
+            }
+            merged.extend(policy_memo.policy_fields());
+            Some(Ok(derive_value_class(
                 "stellar_pay",
                 &serde_json::Value::Object(merged),
-            ))
+            )))
         }
         _ => None,
     }
@@ -346,10 +410,11 @@ impl WalletServer {
             self.mainnet_context.is_some(),
         );
         let outer = match payment_value {
-            Some(value) => {
+            Some(Ok(value)) => {
                 self.dispatch_gate_provisional("stellar_toolset_invoke", &args_value, "", value)
                     .await
             }
+            Some(Err(err)) => return err.into_result(),
             None => {
                 self.dispatch_gate("stellar_toolset_invoke", &args_value, "")
                     .await
@@ -1423,6 +1488,7 @@ mod tests {
     #[test]
     fn mainnet_context_keeps_raw_outer_gate() {
         let args = serde_json::json!({
+            "source": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
             "destination": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
             "asset": "native", "amount_in_stroops": "10",
         });
@@ -1433,7 +1499,7 @@ mod tests {
         let value =
             super::toolset_payment_value("stellar_pay", &args, Some("stellar:testnet"), false);
         assert!(
-            matches!(value, Some(stellar_agent_core::policy::v1::ValueClass::Value(ref effects)) if effects.legs()[0].amount == Some(10))
+            matches!(value, Some(Ok(stellar_agent_core::policy::v1::ValueClass::Value(ref effects))) if effects.legs()[0].amount == Some(10))
         );
         for args in [serde_json::Value::Null, serde_json::json!([])] {
             assert!(super::toolset_payment_value("stellar_pay", &args, None, false).is_none());

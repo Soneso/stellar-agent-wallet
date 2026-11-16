@@ -642,7 +642,7 @@ impl WalletServer {
         )?;
 
         // ── Dispatch gate ─────────────────────────────────────────────────────
-        let args_value = json!({
+        let mut args_value = json!({
             "chain_id": &args.chain_id,
             "source": &args.source,
             "destination": &args.destination,
@@ -673,6 +673,11 @@ impl WalletServer {
                 return Ok(result);
             }
         };
+        let policy_memo = stellar_agent_core::envelope_decode::ClassicMemo::try_from(&memo)
+            .map_err(|_| rmcp::ErrorData::invalid_params("memo text is not valid UTF-8", None))?;
+        for (key, value) in policy_memo.policy_fields() {
+            args_value[key] = value;
+        }
         let memo_present = !matches!(memo, Memo::None);
 
         // ── Fetch source account state ────────────────────────────────────────
@@ -1335,10 +1340,8 @@ impl WalletServer {
         // Failure modes:
         // - XDR decode failure → `simulation.divergence` (covers base64 errors,
         //   malformed XDR, wrong op count, op-kind mismatch).
-        // - `Memo::Hash` / `Memo::Return` → decode succeeds with `memo: null`.
-        //   A tampered Hash memo XDR is caught by the envelope-rebuild divergence
-        //   check below instead (the re-built envelope uses `Memo::None`,
-        //   differing from the Hash-memo XDR).
+        // - Every memo kind keeps its exact signed value in policy facts.
+        //   The envelope rebuild also checks the caller's memo against the XDR.
         //
         // The `chain_id` field is not encoded in XDR; it is injected from
         // `args.chain_id` after the decode.  The CAIP-2 check in dispatch_gate
@@ -2178,6 +2181,104 @@ mod tests {
 
     use super::*;
     use stellar_xdr::{Hash, StringM};
+
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[allow(clippy::unwrap_used, reason = "test fixtures and assertions")]
+    async fn pay_memo_policy_prepare_commit_parity() {
+        use crate::tools::common::tests::mainnet::{ClassicRun, Tool, authorizations, wire};
+        use stellar_xdr::{Limits, ReadXdr, TransactionEnvelope, WriteXdr};
+        for muxed_id in [None, Some(0), Some(u64::MAX)] {
+            let run = ClassicRun::with(
+                Tool::Pay,
+                |raw| {
+                    let mut doc = raw.parse::<toml_edit::DocumentMut>().unwrap();
+                    for rule in doc["rules"].as_array_of_tables_mut().unwrap().iter_mut() {
+                        if !matches!(rule["match"]["tool"].as_str(), Some("stellar_pay" | "stellar_pay_commit")) {
+                            continue;
+                        }
+                        let criteria = rule["criteria"].as_array_mut().unwrap();
+                        let destination = criteria.iter().filter_map(toml_edit::Value::as_inline_table)
+                            .find(|c| c.get("kind").and_then(toml_edit::Value::as_str) == Some("counterparty_allowlist"))
+                            .unwrap().get("allowlist").unwrap().as_array().unwrap().get(0).unwrap().as_str().unwrap().to_owned();
+                        criteria.push(format!("{{kind = \"memo_binding\", bindings = [{{destination = \"{destination}\", kind = \"id\", value = \"0\"}}]}}").parse::<toml_edit::Value>().unwrap());
+                    }
+                    doc.to_string()
+                },
+                |_| {},
+                |args| {
+                    args["memo_id"] = json!(0);
+                    if let Some(id) = muxed_id {
+                        let key = stellar_strkey::ed25519::PublicKey::from_string(args["destination"].as_str().unwrap()).unwrap().0;
+                        args["destination"] = json!(stellar_strkey::ed25519::MuxedAccount { ed25519: key, id }.to_string().as_str());
+                    }
+                },
+            ).await;
+            let facts = decode_authoritative_args(
+                run.args["envelope_xdr"].as_str().unwrap(),
+                "stellar_pay_commit",
+            )
+            .unwrap();
+            assert_eq!(facts["memo_id"], "0");
+            assert_eq!(facts["destination"], run.args["destination"]);
+            for text in ["0", "支払"] {
+                let mut wrong = run.args.clone();
+                wrong["business_id"] = json!(crate::tools::common::tests::fresh_business_id());
+                wrong["memo_id"] = serde_json::Value::Null;
+                wrong["memo_text"] = json!(text);
+                let result = Tool::Pay.prepare(&run.f.server, &wrong).await;
+                assert_eq!(result.is_error, Some(true));
+                let result = wire(&result);
+                assert_eq!(
+                    result["error"]["code"], "policy.deny.memo_binding_mismatch",
+                    "{result}"
+                );
+                assert!(!result["error"]["message"].as_str().unwrap().contains(text));
+            }
+            assert_eq!(run.seed_reads(), 0);
+            assert!(run.control.sent().is_empty());
+            assert!(authorizations(&run.f).is_empty());
+
+            let mut forged = run.args.clone();
+            forged["memo_id"] = serde_json::Value::Null;
+            forged["memo_text"] = json!("0");
+            let refused = run.commit_with(forged).await;
+            assert_eq!(
+                refused["error"]["code"], "simulation.divergence",
+                "signed memo governs policy: {refused}"
+            );
+            assert_eq!(run.seed_reads(), 0);
+            assert!(run.control.sent().is_empty());
+
+            let TransactionEnvelope::Tx(mut changed) = TransactionEnvelope::from_xdr_base64(
+                run.args["envelope_xdr"].as_str().unwrap(),
+                Limits::none(),
+            )
+            .unwrap() else {
+                panic!("v1");
+            };
+            changed.tx.memo = Memo::Text(b"0".to_vec().try_into().unwrap());
+            let changed = TransactionEnvelope::Tx(changed)
+                .to_xdr_base64(Limits::none())
+                .unwrap();
+            let mut forged = run.args.clone();
+            forged["business_id"] = json!(run.bind_business_id_for(&changed));
+            forged["envelope_xdr"] = json!(changed);
+            let refused = run.commit_with(forged).await;
+            assert_eq!(
+                refused["error"]["code"], "policy.deny.memo_binding_mismatch",
+                "caller memo cannot replace signed facts: {refused}"
+            );
+            assert_eq!(run.seed_reads(), 0);
+            assert!(run.control.sent().is_empty());
+            assert!(authorizations(&run.f).is_empty());
+
+            let committed = run.commit().await;
+            assert_eq!(committed["ok"], true, "matching memo commit: {committed}");
+            assert_eq!(run.control.sent().len(), 1);
+        }
+    }
 
     /// A commit whose gate-sized leg carries a lowercase destination refuses
     /// `validation.address_invalid` before the nonce, the hold, and the send,

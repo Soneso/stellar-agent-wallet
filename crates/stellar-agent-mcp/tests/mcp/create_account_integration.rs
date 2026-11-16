@@ -2174,6 +2174,55 @@ async fn prepare_and_commit_send_the_primary_credential() {
     .await;
 }
 
+#[tokio::test]
+#[serial]
+async fn create_account_preparation_supplies_known_no_memo() {
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().expect("mock keyring");
+    install_test_nonce_key(204);
+    let source = gstrkey_for_seed([0x44; 32]);
+    let rpc = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(CreateAccountSubmitSuccessRpcResponder {
+            account_key_xdr: account_ledger_key_xdr(&source),
+            account_xdr: account_entry_xdr_with_balance(&source, 100_000_000_000_000),
+            network: crate::common::EndpointNetwork::testnet(),
+        })
+        .mount(&rpc)
+        .await;
+    let mut server = WalletServer::new(testnet_profile_with_rpc(&rpc.uri())).expect("server");
+    let engine = crate::common::policy_mock::CapturingPolicyEngine::new();
+    server.set_policy_engine_for_test(std::sync::Arc::new(engine.clone()));
+    let result = server
+        .call_stellar_create_account(StellarCreateAccountArgs {
+            chain_id: "stellar:testnet".into(),
+            source,
+            destination: DEST_G.into(),
+            starting_balance: serde_json::from_str(r#""100 XLM""#).expect("amount"),
+            classic_base: None,
+            business_id: None,
+        })
+        .await
+        .expect("prepare");
+    assert_ne!(result.is_error, Some(true), "{}", call_result_json(&result));
+    let evaluated = engine.arguments_for("stellar_create_account");
+    assert!(!evaluated.is_empty());
+    for args in evaluated {
+        let stellar_agent_core::policy::v1::ValueClass::Value(effects) =
+            stellar_agent_core::policy::v1::value::derive_value_class(
+                "stellar_create_account",
+                &args,
+            )
+        else {
+            panic!("creation effects");
+        };
+        assert_eq!(
+            effects.memo(),
+            Some(&stellar_agent_core::envelope_decode::ClassicMemo::None)
+        );
+    }
+}
+
 async fn witness_create_case(amount: &str, mode: &str, expected: &str) {
     use std::sync::{
         Arc,

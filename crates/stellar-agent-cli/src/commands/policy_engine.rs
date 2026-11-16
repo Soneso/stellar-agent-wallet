@@ -820,6 +820,8 @@ pub(crate) fn create_policy_args(
     serde_json::json!({
         "starting_balance_stroops": starting_balance_stroops.to_string(),
         "destination": destination,
+        "memo_kind": "none",
+        "memo": null,
     })
 }
 
@@ -1630,13 +1632,21 @@ decision = "allow"
         let server = WalletServer::new_with_policy_dir_for_test(profile.clone(), &policies)
             .expect("MCP signed policy");
         for amount in [50_000_000, 150_000_000] {
+            let memo = stellar_agent_network::parse_memo_fields(None, Some(u64::MAX), None, None)
+                .expect("parsed memo");
+            let memo = stellar_agent_core::envelope_decode::ClassicMemo::try_from(&memo)
+                .expect("memo fact");
+            let mut policy_args = pay_policy_args(amount, "native", PARITY_DEST_G);
+            for (key, value) in memo.policy_fields() {
+                policy_args[key] = value;
+            }
             let cli_result = evaluate_value_moving_policy(
                 cli.as_ref(),
                 &profile,
                 "stellar_pay",
                 ToolValueKind::MovesValue,
                 profile.chain_id.caip2_str(),
-                &pay_policy_args(amount, "native", PARITY_DEST_G),
+                &policy_args,
                 "pay",
                 None,
                 None,
@@ -1644,7 +1654,7 @@ decision = "allow"
             let args: StellarPayArgs = serde_json::from_value(json!({
                 "chain_id": profile.chain_id.caip2_str(),
                 "source": SOURCE, "destination": PARITY_DEST_G,
-                "amount_in_stroops": amount.to_string(), "asset": "native"
+                "amount_in_stroops": amount.to_string(), "asset": "native", "memo_id": u64::MAX
             }))
             .expect("payment arguments");
             let mcp_result = server.call_stellar_pay(args).await.expect("MCP response");
@@ -1655,6 +1665,16 @@ decision = "allow"
                 assert!(cli_result.is_ok(), "{cli_result:?}");
                 assert_eq!(mcp["ok"], true, "{mcp}");
                 assert!(mcp["data"]["nonce"].as_str().is_some());
+                assert_eq!(
+                    cli_result.as_ref().unwrap().as_ref().unwrap().memo(),
+                    Some(&memo)
+                );
+                let decoded = stellar_agent_core::envelope_decode::decode_authoritative_args(
+                    mcp["data"]["envelope_xdr"].as_str().unwrap(),
+                    "stellar_pay_commit",
+                )
+                .expect("prepared memo");
+                assert_eq!(decoded["memo_id"], "18446744073709551615");
             } else {
                 assert_eq!(
                     envelope_code(&cli_result),
@@ -1803,6 +1823,10 @@ decision = "allow"
         else {
             panic!("stellar_create_account must derive a value-moving descriptor");
         };
+        assert_eq!(
+            expected.memo(),
+            Some(&stellar_agent_core::envelope_decode::ClassicMemo::None)
+        );
         assert_eq!(
             result.expect("50 XLM starting balance under a 100 XLM cap must allow"),
             Some(expected),

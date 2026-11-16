@@ -265,64 +265,6 @@ fn xdr_asset_to_string(asset: &stellar_xdr::Asset) -> Result<String, EnvelopeDec
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Memo re-derivation
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Extracts the memo from a `stellar_xdr::Memo` to an
-/// `Option<String>` suitable for the policy-engine args JSON.
-///
-/// - `Memo::None` → `Ok(None)`.
-/// - `Memo::Text(bytes)` → `Ok(Some(utf8_string))` when bytes are valid UTF-8;
-///   `Err(XdrDecode)` when bytes are not valid UTF-8.
-/// - `Memo::Id(u64)` → `Ok(None)` (numeric memos are not forwarded through the
-///   policy path; the envelope divergence check is the integrity backstop).
-/// - `Memo::Hash(_)` → `Ok(None)` for the legacy `memo` text field.
-/// - `Memo::Return(_)` → `Ok(None)` for the legacy `memo` text field.
-///
-/// # Rationale for strict UTF-8 enforcement on `Memo::Text`
-///
-/// Stellar `Memo::Text` is XDR `string<28>` — opaque bytes, not UTF-8
-/// constrained.  Using `String::from_utf8_lossy` would silently substitute
-/// U+FFFD for malformed bytes, allowing a forger to craft an envelope whose
-/// on-chain memo bytes differ from the string the policy engine evaluates.
-/// `String::from_utf8` with an explicit error path closes this attack surface.
-///
-/// # Rationale for `Memo::Id` / `Memo::Hash` / `Memo::Return` in `memo`
-///
-/// Returning `Ok(None)` keeps `memo` either a UTF-8 string or `null`.
-/// Payment decoding carries ID, hash and return memos in separate fields.
-fn memo_to_optional_string(
-    memo: &stellar_xdr::Memo,
-) -> Result<Option<String>, EnvelopeDecodeError> {
-    match memo {
-        stellar_xdr::Memo::None => Ok(None),
-        stellar_xdr::Memo::Text(bytes) => {
-            // Strict UTF-8: reject malformed bytes rather than substituting
-            // U+FFFD — see module-level rationale above.
-            String::from_utf8(bytes.as_slice().to_vec())
-                .map(Some)
-                .map_err(|_| EnvelopeDecodeError::XdrDecode {
-                    detail: "memo text is not valid UTF-8".to_owned(),
-                })
-        }
-        // The decimal ID belongs to the structured payment facts.
-        stellar_xdr::Memo::Id(_) => Ok(None),
-        // Hash and Return memos remain absent from the legacy text `memo`
-        // field. `decode_pay_args` surfaces their bytes separately.
-        stellar_xdr::Memo::Hash(_) | stellar_xdr::Memo::Return(_) => Ok(None),
-    }
-}
-
-fn structured_memo_field(memo: &stellar_xdr::Memo) -> Option<(&'static str, String)> {
-    match memo {
-        stellar_xdr::Memo::Id(id) => Some(("memo_id", id.to_string())),
-        stellar_xdr::Memo::Hash(hash) => Some(("memo_hash", crate::hex::encode(&hash.0))),
-        stellar_xdr::Memo::Return(hash) => Some(("memo_return", crate::hex::encode(&hash.0))),
-        _ => None,
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Public entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -528,11 +470,16 @@ fn decode_single_operation(
 ///   "amount_stroops": "<decimal i64 stroops>",
 ///   "asset": "XLM" | "CODE:Gissuer",
 ///   "memo": "text" | null,
-///   "memo_id": "<decimal u64, only for Memo::Id>",
+///   "memo_kind": "none" | "text" | "id" | "hash" | "return",
+///   "memo_id": "<canonical u64 decimal, only for Memo::Id>",
 ///   "memo_hash": "<64 lowercase hex chars, only for Memo::Hash>",
 ///   "memo_return": "<64 lowercase hex chars, only for Memo::Return>"
 /// }
 /// ```
+///
+/// Every supported operation also carries these memo facts. A known no-memo
+/// envelope has `memo_kind = "none"` and `memo = null`. Payload fields for other
+/// kinds are absent. Text must be valid UTF-8 and retains its exact bytes.
 ///
 /// `chain_id` is **not** encoded in the XDR and must be supplied separately
 /// by the caller (it is present in the outer `*CommitArgs` struct and is
@@ -621,10 +568,8 @@ pub fn decode_authoritative_args(
     let op = &op;
 
     // 6. Dispatch by tool.
-    match tool {
-        "stellar_pay_commit" => {
-            decode_pay_args(&tx.memo, tx.fee, tx.seq_num.0, op, &source_strkey, tool)
-        }
+    let mut args = match tool {
+        "stellar_pay_commit" => decode_pay_args(tx.fee, tx.seq_num.0, op, &source_strkey, tool),
         "stellar_create_account_commit" => {
             decode_create_account_args(tx.fee, op, &source_strkey, tool)
         }
@@ -632,7 +577,11 @@ pub fn decode_authoritative_args(
         "stellar_claim_commit" => decode_claim_args(tx.fee, op, &source_strkey, tool),
         // The validation above is exhaustive; this arm is unreachable.
         _ => unreachable!("tool name validated in step 1"),
+    }?;
+    for (key, value) in ClassicMemo::try_from(&tx.memo)?.policy_fields() {
+        args[key] = value;
     }
+    Ok(args)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -658,7 +607,6 @@ pub fn decode_authoritative_args(
 /// recipient account regardless of which asset is debited, so counterparty
 /// checks are unaffected by this distinction.
 fn decode_pay_args(
-    memo: &stellar_xdr::Memo,
     total_fee_stroops: u32,
     sequence_number: i64,
     op: &stellar_xdr::Operation,
@@ -723,8 +671,6 @@ fn decode_pay_args(
         }
     };
 
-    let memo_opt = memo_to_optional_string(memo)?;
-
     let mut args = match shape {
         PayShape::Simple {
             dest,
@@ -739,7 +685,6 @@ fn decode_pay_args(
                 "destination": dest_strkey,
                 "amount_stroops": amount.to_string(),
                 "asset": asset_str,
-                "memo": memo_opt,
             })
         }
         PayShape::PathPayment {
@@ -760,17 +705,10 @@ fn decode_pay_args(
                 "asset": send_asset_str,
                 "dest_amount_stroops": dest_amount.to_string(),
                 "dest_asset": dest_asset_str,
-                "memo": memo_opt,
             })
         }
     };
     args["sequence_number"] = sequence_number.into();
-    if let Some((field, value)) = structured_memo_field(memo)
-        && let Some(obj) = args.as_object_mut()
-    {
-        obj.insert(field.to_owned(), serde_json::Value::String(value));
-    }
-
     Ok(args)
 }
 
@@ -993,6 +931,54 @@ pub enum ClassicMemo {
 }
 
 impl ClassicMemo {
+    /// The authoritative policy facts, retaining the legacy text-or-null
+    /// `memo` field. IDs are canonical decimal strings and hashes are lowercase
+    /// hex, so neither integer precision nor the memo kind is lost.
+    #[must_use]
+    pub fn policy_fields(&self) -> serde_json::Map<String, serde_json::Value> {
+        use serde_json::Value;
+        let (kind, payload) = match self {
+            Self::None => ("none", None),
+            Self::Text(text) => ("text", Some(("memo", text.clone()))),
+            Self::Id(id) => ("id", Some(("memo_id", id.to_string()))),
+            Self::Hash(hash) => ("hash", Some(("memo_hash", crate::hex::encode(hash)))),
+            Self::Return(hash) => ("return", Some(("memo_return", crate::hex::encode(hash)))),
+        };
+        let mut fields = serde_json::Map::from_iter([
+            ("memo_kind".to_owned(), Value::String(kind.to_owned())),
+            ("memo".to_owned(), Value::Null),
+        ]);
+        if let Some((key, value)) = payload {
+            fields.insert(key.to_owned(), Value::String(value));
+        }
+        fields
+    }
+
+    /// Missing, malformed or contradictory facts carry no known memo.
+    pub(crate) fn from_policy_args(args: &serde_json::Value) -> Option<Self> {
+        let memo = match args.get("memo_kind")?.as_str()? {
+            "none" => Self::None,
+            "text" => {
+                let text = args.get("memo")?.as_str()?;
+                if text.len() > 28 {
+                    return None;
+                }
+                Self::Text(text.to_owned())
+            }
+            "id" => Self::Id(args.get("memo_id")?.as_str()?.parse().ok()?),
+            "hash" => Self::Hash(crate::hex::decode_hex32(args.get("memo_hash")?.as_str()?).ok()?),
+            "return" => {
+                Self::Return(crate::hex::decode_hex32(args.get("memo_return")?.as_str()?).ok()?)
+            }
+            _ => return None,
+        };
+        let expected = memo.policy_fields();
+        ["memo_kind", "memo", "memo_id", "memo_hash", "memo_return"]
+            .iter()
+            .all(|key| args.get(*key) == expected.get(*key))
+            .then_some(memo)
+    }
+
     /// Formats the memo with its signed type. The caller escapes this text
     /// for its output surface.
     #[must_use]
@@ -1004,6 +990,28 @@ impl ClassicMemo {
             Self::Hash(hash) => format!("hash {}", crate::hex::encode(hash)),
             Self::Return(hash) => format!("return {}", crate::hex::encode(hash)),
         }
+    }
+}
+
+impl TryFrom<&stellar_xdr::Memo> for ClassicMemo {
+    type Error = EnvelopeDecodeError;
+
+    /// Preserves the signed kind and bytes, refusing text that is not UTF-8.
+    fn try_from(memo: &stellar_xdr::Memo) -> Result<Self, Self::Error> {
+        use stellar_xdr::Memo;
+        Ok(match memo {
+            Memo::None => Self::None,
+            Memo::Text(bytes) => {
+                Self::Text(String::from_utf8(bytes.as_slice().to_vec()).map_err(|_| {
+                    EnvelopeDecodeError::XdrDecode {
+                        detail: "memo text is not valid UTF-8".to_owned(),
+                    }
+                })?)
+            }
+            Memo::Id(id) => Self::Id(*id),
+            Memo::Hash(hash) => Self::Hash(hash.0),
+            Memo::Return(hash) => Self::Return(hash.0),
+        })
     }
 }
 
@@ -1104,15 +1112,7 @@ pub fn classic_summary(
     use stellar_xdr::{ChangeTrustAsset, ClaimableBalanceId, OperationBody};
 
     let (tx, op, source) = decode_single_operation(envelope_xdr_b64)?;
-    let memo = match &tx.memo {
-        stellar_xdr::Memo::None => ClassicMemo::None,
-        text @ stellar_xdr::Memo::Text(_) => {
-            ClassicMemo::Text(memo_to_optional_string(text)?.unwrap_or_default())
-        }
-        stellar_xdr::Memo::Id(id) => ClassicMemo::Id(*id),
-        stellar_xdr::Memo::Hash(hash) => ClassicMemo::Hash(hash.0),
-        stellar_xdr::Memo::Return(hash) => ClassicMemo::Return(hash.0),
-    };
+    let memo = ClassicMemo::try_from(&tx.memo)?;
     let mismatch = |tool: &'static str, expected: &'static str, body: &OperationBody| {
         EnvelopeDecodeError::OperationKindMismatch {
             tool,
@@ -1753,9 +1753,11 @@ mod tests {
         for (id, decimal) in [(0, "0"), (42, "42"), (u64::MAX, "18446744073709551615")] {
             let env = build_envelope(SOURCE_G, op.clone(), Memo::Id(id));
             let xdr_b64 = to_b64(&env);
-            let result = decode_authoritative_args(&xdr_b64, "stellar_pay_commit").unwrap();
-            assert_eq!(result["memo_id"], decimal);
+            let result = decode_authoritative_args(&xdr_b64, "stellar_pay_commit")
+                .expect("Memo::Id must not cause a decode error");
             assert_eq!(result["memo"], serde_json::Value::Null);
+            assert_eq!(result["memo_kind"], "id");
+            assert_eq!(result["memo_id"], decimal);
             assert!(result.get("memo_hash").is_none());
             assert!(result.get("memo_return").is_none());
         }
@@ -1764,6 +1766,239 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────────────
     // Memo::Text with invalid UTF-8 → XdrDecode error
     // ─────────────────────────────────────────────────────────────────────────
+
+    fn memo_evaluation(
+        args: &serde_json::Value,
+        tool_name: &'static str,
+        requirement: Option<crate::policy::v1::criteria::memo_binding::MemoRequirement>,
+    ) -> crate::policy::Evaluation {
+        use crate::policy::v1::criteria::memo_binding::{MemoBinding, MemoBindingCriterion};
+        use crate::policy::v1::loader::{PolicyDocument, PolicyRule, RuleMatch, ScopeId};
+        use crate::policy::{
+            Decision, McpToolRegistration, PolicyEngine, ToolDescriptor, ToolValueKind,
+        };
+        let engine = crate::policy::v1::PolicyEngineV1::new(
+            PolicyDocument {
+                version: 1,
+                scope: ScopeId::AllProfiles,
+                rules: vec![PolicyRule {
+                    r#match: RuleMatch {
+                        tool: "*".into(),
+                        chain: "*".into(),
+                    },
+                    criteria: requirement.map_or_else(Vec::new, |requirement| {
+                        vec![Box::new(MemoBindingCriterion::new(vec![
+                            MemoBinding::new(DEST_G, requirement).unwrap(),
+                        ]))
+                            as Box<dyn crate::policy::v1::criteria::Criterion>]
+                    }),
+                    decision: Decision::Allow,
+                    allow_opaque_signing: false,
+                }],
+                signature: None,
+            },
+            "memo".into(),
+        );
+        let mut tool = ToolDescriptor::from_registration(&McpToolRegistration {
+            name: tool_name,
+            destructive_hint: true,
+            read_only_hint: false,
+            chain_id_required: true,
+            value_kind: ToolValueKind::MovesValue,
+        });
+        tool.chain_id = "stellar:testnet".into();
+        let profile =
+            crate::profile::Profile::builder_testnet("memo", "acct", "svc", "nonce").build();
+        engine
+            .evaluate_full(&tool, args, &profile, None, None, None, None, None, 1000)
+            .unwrap()
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn classic_policy_memo_facts_match_signed_xdr() {
+        use crate::policy::Decision;
+        use crate::policy::v1::criteria::memo_binding::MemoRequirement;
+        use stellar_xdr::{
+            CreateAccountOp, Hash, MuxedAccountMed25519, PathPaymentStrictReceiveOp,
+            PathPaymentStrictSendOp,
+        };
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let cases = [
+            (Memo::None, ClassicMemo::None, MemoRequirement::Any),
+            (
+                Memo::Text(Vec::new().try_into().unwrap()),
+                ClassicMemo::Text(String::new()),
+                MemoRequirement::Text(String::new()),
+            ),
+            (
+                Memo::Text("支払\n".as_bytes().to_vec().try_into().unwrap()),
+                ClassicMemo::Text("支払\n".into()),
+                MemoRequirement::Text("支払\n".into()),
+            ),
+            (Memo::Id(0), ClassicMemo::Id(0), MemoRequirement::Id(0)),
+            (
+                Memo::Id(u64::MAX),
+                ClassicMemo::Id(u64::MAX),
+                MemoRequirement::Id(u64::MAX),
+            ),
+            (
+                Memo::Hash(Hash([0xab; 32])),
+                ClassicMemo::Hash([0xab; 32]),
+                MemoRequirement::Hash([0xab; 32]),
+            ),
+            (
+                Memo::Return(Hash([0xab; 32])),
+                ClassicMemo::Return([0xab; 32]),
+                MemoRequirement::Return([0xab; 32]),
+            ),
+        ];
+        for id in [None, Some(0), Some(u64::MAX)] {
+            let destination = id.map_or_else(
+                || g_to_muxed(DEST_G),
+                |id| {
+                    MuxedAccount::MuxedEd25519(MuxedAccountMed25519 {
+                        id,
+                        ed25519: Uint256(g_to_bytes(DEST_G)),
+                    })
+                },
+            );
+            let full_destination = id.map_or_else(
+                || DEST_G.to_owned(),
+                |id| {
+                    stellar_strkey::ed25519::MuxedAccount {
+                        ed25519: g_to_bytes(DEST_G),
+                        id,
+                    }
+                    .to_string()
+                    .to_string()
+                },
+            );
+            for (memo, expected, requirement) in &cases {
+                for body in [
+                    OperationBody::Payment(PaymentOp {
+                        destination: destination.clone(),
+                        asset: Asset::Native,
+                        amount: 17,
+                    }),
+                    OperationBody::PathPaymentStrictSend(PathPaymentStrictSendOp {
+                        send_asset: Asset::Native,
+                        send_amount: 17,
+                        destination: destination.clone(),
+                        dest_asset: Asset::Native,
+                        dest_min: 3,
+                        path: Default::default(),
+                    }),
+                    OperationBody::PathPaymentStrictReceive(PathPaymentStrictReceiveOp {
+                        send_asset: Asset::Native,
+                        send_max: 17,
+                        destination: destination.clone(),
+                        dest_asset: Asset::Native,
+                        dest_amount: 3,
+                        path: Default::default(),
+                    }),
+                    OperationBody::CreateAccount(CreateAccountOp {
+                        destination: g_to_account_id(DEST_G),
+                        starting_balance: 17,
+                    }),
+                ] {
+                    let create = matches!(body, OperationBody::CreateAccount(_));
+                    let tool = if create {
+                        "stellar_create_account_commit"
+                    } else {
+                        "stellar_pay_commit"
+                    };
+                    let xdr = to_b64(&build_envelope(
+                        SOURCE_G,
+                        Operation {
+                            source_account: None,
+                            body,
+                        },
+                        memo.clone(),
+                    ));
+                    let args = decode_authoritative_args(&xdr, tool).unwrap();
+                    let evaluation = memo_evaluation(&args, tool, None);
+                    let effects = evaluation.value_effects.unwrap();
+                    assert_eq!(effects.memo(), Some(expected), "signed memo {memo:?}");
+                    assert_eq!(effects.legs()[0].amount, Some(17));
+                    assert_eq!(effects.legs()[0].asset.as_deref(), Some("native"));
+                    assert_eq!(
+                        effects.legs()[0].destination.as_deref(),
+                        Some(if create { DEST_G } else { &full_destination })
+                    );
+                    if effects.legs().len() == 2 {
+                        assert_eq!(effects.legs()[1].amount, Some(3));
+                        assert!(!effects.legs()[1].kind.carries_debit());
+                    }
+                    let decision = memo_evaluation(&args, tool, Some(requirement.clone())).decision;
+                    if *expected == ClassicMemo::None {
+                        assert!(matches!(
+                            decision,
+                            Decision::Deny(crate::policy::DenyReason::MemoBindingMismatch { .. })
+                        ));
+                    } else {
+                        assert_eq!(decision, Decision::Allow, "signed memo binding {memo:?}");
+                    }
+                    let wrong_kind = match expected {
+                        ClassicMemo::Id(id) => MemoRequirement::Text(id.to_string()),
+                        ClassicMemo::Hash(bytes) => MemoRequirement::Return(*bytes),
+                        ClassicMemo::Return(bytes) => MemoRequirement::Hash(*bytes),
+                        _ => MemoRequirement::Id(1),
+                    };
+                    assert!(matches!(
+                        memo_evaluation(&args, tool, Some(wrong_kind)).decision,
+                        Decision::Deny(crate::policy::DenyReason::MemoBindingMismatch { .. })
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn classic_policy_malformed_memo_facts_are_absent() {
+        use crate::policy::v1::criteria::memo_binding::MemoRequirement;
+        use serde_json::json;
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        for facts in [
+            json!({}),
+            json!({"memo": null}),
+            json!({"memo_kind": "none"}),
+            json!({"memo_kind": "none", "memo": "forged"}),
+            json!({"memo_kind": "none", "memo": null, "memo_id": "0"}),
+            json!({"memo_kind": "unknown", "memo": null}),
+            json!({"memo_kind": "id", "memo": null, "memo_id": "18446744073709551616"}),
+            json!({"memo_kind": "id", "memo": null, "memo_id": "-1"}),
+            json!({"memo_kind": "id", "memo": null, "memo_id": "+1"}),
+            json!({"memo_kind": "id", "memo": null, "memo_id": "01"}),
+            json!({"memo_kind": "id", "memo": null, "memo_id": 1}),
+            json!({"memo_kind": "text", "memo": "x".repeat(29)}),
+            json!({"memo_kind": "hash", "memo": null, "memo_hash": "AB".repeat(32)}),
+            json!({"memo_kind": "return", "memo": null, "memo_return": "ab".repeat(31)}),
+            json!({"memo_kind": "hash", "memo": null, "memo_hash": "ab".repeat(32), "memo_return": "ab".repeat(32)}),
+        ] {
+            let mut args = json!({"destination": DEST_G, "asset": "native", "amount_stroops": "1"});
+            args.as_object_mut()
+                .unwrap()
+                .extend(facts.as_object().unwrap().clone());
+            assert_eq!(
+                memo_evaluation(&args, "stellar_pay", None)
+                    .value_effects
+                    .unwrap()
+                    .memo(),
+                None,
+                "{facts}"
+            );
+            assert!(matches!(
+                memo_evaluation(&args, "stellar_pay", Some(MemoRequirement::Any)).decision,
+                crate::policy::Decision::Deny(
+                    crate::policy::DenyReason::MemoBindingMismatch { .. }
+                )
+            ));
+        }
+    }
 
     #[test]
     fn invalid_utf8_memo_text_returns_xdr_decode_error() {
