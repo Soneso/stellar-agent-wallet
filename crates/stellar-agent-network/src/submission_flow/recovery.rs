@@ -2620,4 +2620,544 @@ pub(crate) mod tests {
             "a policy authority authenticates the approval's absence"
         );
     }
+
+    /// Native obligations scheduled by dispatch and targeted status.
+    mod obligations {
+        use super::*;
+        use crate::policy_state::operations::OperationState;
+        use crate::policy_state::operations::tests::{Sink, terminal_classic, x402_exposed};
+        use crate::policy_state::recovery::RecoveryReason;
+        use crate::policy_state::recovery::driver_tests::on_release;
+        use crate::policy_state::store::{COMMIT_FAULT_AFTER_COUNTER, COMMIT_FAULT_AFTER_PREPARED};
+        use crate::policy_state::{BusinessId, CommittedBatch, OperationId, WindowObservation};
+        use crate::submission_flow::reconcile_pass_committed;
+
+        /// The fixture clock's latest close time, in seconds.
+        const CLOSE: u64 = T0 / 1_000;
+
+        /// A rig under a marked wallet home. The tuple drops the rig first,
+        /// then the home guard, then the sandbox.
+        fn homed() -> (
+            Rig,
+            StellarAgentHomeGuard,
+            stellar_agent_test_support::sandbox::StateSandbox,
+        ) {
+            let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let guard = StellarAgentHomeGuard::new(home.path());
+            (Rig::new(), guard, home)
+        }
+
+        /// A mainnet endpoint at `ledger` whose latest ledger closed at
+        /// `close` seconds; it answers every hash with `NOT_FOUND`.
+        async fn chain(ledger: u32, close: u64) -> (MockServer, StellarRpcClient) {
+            let (server, client) = endpoint().await;
+            for (name, answer) in [
+                (
+                    "getNetwork",
+                    stellar_agent_test_support::signed_envelope::get_network_result(
+                        stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE,
+                    ),
+                ),
+                (
+                    "getHealth",
+                    json!({"status":"healthy", "latestLedger":ledger, "oldestLedger":1,
+                        "ledgerRetentionWindow":ledger, "latestLedgerCloseTime":close,
+                        "oldestLedgerCloseTime":1}),
+                ),
+            ] {
+                Mock::given(method("POST"))
+                    .and(body_partial_json(json!({"method": name})))
+                    .respond_with(EchoIdResponder::new(answer))
+                    .mount(&server)
+                    .await;
+            }
+            (server, client)
+        }
+
+        type Pair = [(MockServer, StellarRpcClient); 2];
+
+        async fn pair(primary: (u32, u64), oracle: (u32, u64)) -> Pair {
+            [
+                chain(primary.0, primary.1).await,
+                chain(oracle.0, oracle.1).await,
+            ]
+        }
+
+        /// The method of every request `server` received, in order.
+        async fn methods(server: &MockServer) -> Vec<String> {
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| {
+                    serde_json::from_slice::<serde_json::Value>(&r.body).unwrap()["method"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                })
+                .collect()
+        }
+
+        async fn count(server: &MockServer, name: &str) -> usize {
+            methods(server).await.iter().filter(|m| *m == name).count()
+        }
+
+        /// One dispatch pass over `pair`, with its committed transitions.
+        async fn dispatch_on(
+            rig: &Rig,
+            pair: &Pair,
+        ) -> (ReconcilePass, Vec<(OperationId, OperationState)>) {
+            let mut committed = CommittedBatch::default();
+            let pass = reconcile_pass_committed(
+                &rig.fx.profile,
+                &rig.fx.store,
+                &pair[0].1,
+                Some(&pair[1].1),
+                Some(&rig.receipts),
+                T0,
+                || Ok(Arc::clone(&rig.writer)),
+                &mut committed,
+            )
+            .await;
+            let edges = committed
+                .into_iter()
+                .map(|edge| (edge.operation_id(), edge.state()))
+                .collect();
+            (pass, edges)
+        }
+
+        async fn status_on(rig: &Rig, n: u8, pair: &Pair) -> StatusOutcome {
+            let hex = tx_hex(n);
+            let approvals = rig.home.path().join("approvals");
+            transaction_status(
+                StatusRequest {
+                    profile: &rig.fx.profile,
+                    profile_name: "ops",
+                    tx_hash: &hex,
+                    window: &rig.fx.store,
+                    client: &pair[0].1,
+                    oracle: Some(&pair[1].1),
+                    retry_recovery: false,
+                },
+                || Ok(approvals),
+                || Ok(Arc::clone(&rig.writer)),
+            )
+            .await
+            .unwrap()
+        }
+
+        /// The operations that still owe a native release, sorted.
+        fn owed(rig: &Rig) -> Vec<OperationId> {
+            let mut owed: Vec<_> = OperationStatus::new(&rig.fx.store, &rig.fx.profile)
+                .release_candidates(None)
+                .unwrap()
+                .into_iter()
+                .map(|candidate| candidate.operation_id)
+                .collect();
+            owed.sort_by_key(OperationId::to_hex);
+            owed
+        }
+
+        fn sorted(mut ids: Vec<OperationId>) -> Vec<OperationId> {
+            ids.sort_by_key(OperationId::to_hex);
+            ids
+        }
+
+        fn state(rig: &Rig, business_id: &str) -> OperationState {
+            OperationStatus::new(&rig.fx.store, &rig.fx.profile)
+                .view(&BusinessId::parse(business_id).unwrap())
+                .unwrap()
+                .unwrap()
+                .state
+        }
+
+        /// A store with no classic work and only pre-due or untimed
+        /// obligations spends one identity and one health read per endpoint,
+        /// or none, and writes nothing. A runnable classic attempt beside due
+        /// obligations shares that one prefix.
+        #[tokio::test]
+        #[serial]
+        async fn recovery_candidate_only_pass_shares_prefix() {
+            let (mut rig, _guard, _home) = homed();
+            let idle = pair((500, CLOSE), (500, CLOSE)).await;
+            let (pass, _) = dispatch_on(&rig, &idle).await;
+            assert!(matches!(pass, ReconcilePass::Recovered { .. }), "{pass:?}");
+            for (server, _) in &idle {
+                assert!(
+                    methods(server).await.is_empty(),
+                    "an empty store reads nothing"
+                );
+            }
+            let untimed = terminal_classic(&mut rig.fx, 1, 0);
+            let (pass, _) = dispatch_on(&rig, &idle).await;
+            assert!(matches!(pass, ReconcilePass::Recovered { .. }), "{pass:?}");
+            for (server, _) in &idle {
+                assert!(
+                    methods(server).await.is_empty(),
+                    "an untimed release starts no pass"
+                );
+            }
+
+            let x402 = x402_exposed(&mut rig.fx, 2, OperationState::SentOutcomeUnknown);
+            let timed = terminal_classic(&mut rig.fx, 3, CLOSE);
+            let before = rig.window_bytes();
+            let (pass, edges) = dispatch_on(&rig, &idle).await;
+            assert!(matches!(pass, ReconcilePass::Recovered { .. }), "{pass:?}");
+            for (server, _) in &idle {
+                assert_eq!(
+                    methods(server).await,
+                    ["getNetwork", "getHealth"],
+                    "pre-due candidates read the shared prefix only"
+                );
+            }
+            assert!(edges.is_empty());
+            assert_eq!(rig.window_bytes(), before, "a candidate is no proof");
+            assert_eq!(
+                owed(&rig),
+                sorted(vec![untimed.id(), x402.id(), timed.id()])
+            );
+
+            unknown_due(&mut rig.fx, 4);
+            let due = pair((501, CLOSE + 1), (501, CLOSE + 1)).await;
+            let (_, edges) = dispatch_on(&rig, &due).await;
+            for (server, _) in &due {
+                assert_eq!(count(server, "getNetwork").await, 1);
+                assert_eq!(count(server, "getHealth").await, 1);
+                assert_eq!(count(server, "getTransaction").await, 1);
+            }
+            assert_eq!(edges, vec![(x402.id(), OperationState::Expired)]);
+            assert_eq!(owed(&rig), vec![untimed.id()]);
+        }
+
+        /// Release needs both endpoints past the bound: the smaller paired
+        /// ledger and close time decide, equality holds, and the local clock
+        /// proves nothing in either direction. The call deadline stops later
+        /// releases; committed ones stand and the next pass completes.
+        #[tokio::test]
+        #[serial]
+        async fn recovery_schedule_clock_and_limits() {
+            let (mut rig, _guard, _home) = homed();
+            let x402 = x402_exposed(&mut rig.fx, 1, OperationState::SentOutcomeUnknown);
+            let timed = terminal_classic(&mut rig.fx, 2, CLOSE);
+            let both = sorted(vec![x402.id(), timed.id()]);
+            for (label, primary, oracle, clock) in [
+                (
+                    "oracle ledger and primary close",
+                    (501, CLOSE),
+                    (500, CLOSE + 1),
+                    T0,
+                ),
+                (
+                    "primary ledger and oracle close",
+                    (500, CLOSE + 1),
+                    (501, CLOSE),
+                    T0,
+                ),
+                ("equality", (500, CLOSE), (500, CLOSE), T0),
+                (
+                    "a later local clock",
+                    (500, CLOSE),
+                    (500, CLOSE),
+                    T0 + 59_000,
+                ),
+            ] {
+                rig.fx.clock.set(clock);
+                let before = rig.window_bytes();
+                let (pass, edges) = dispatch_on(&rig, &pair(primary, oracle).await).await;
+                assert!(
+                    matches!(pass, ReconcilePass::Recovered { .. }),
+                    "{label}: {pass:?}"
+                );
+                assert!(edges.is_empty(), "{label}");
+                assert_eq!(owed(&rig), both, "{label}");
+                assert_eq!(rig.window_bytes(), before, "{label}");
+            }
+            // An earlier local clock blocks no chain proof.
+            rig.fx.clock.set(T0 - 59_000);
+            let (pass, edges) =
+                dispatch_on(&rig, &pair((501, CLOSE + 1), (501, CLOSE + 1)).await).await;
+            assert!(matches!(pass, ReconcilePass::Recovered { .. }), "{pass:?}");
+            assert_eq!(edges, vec![(x402.id(), OperationState::Expired)]);
+            assert!(owed(&rig).is_empty());
+            assert_eq!(state(&rig, "order-x1"), OperationState::Expired);
+            assert_eq!(state(&rig, "order-2"), OperationState::Expired);
+
+            // The deadline passes before the second release.
+            rig.fx.clock.set(T0);
+            let first = x402_exposed(&mut rig.fx, 3, OperationState::SentOutcomeUnknown);
+            let second = x402_exposed(&mut rig.fx, 4, OperationState::SentOutcomeUnknown);
+            let due = pair((501, CLOSE), (501, CLOSE)).await;
+            let armed = on_release(|index, deadline| {
+                if index == 1 {
+                    *deadline = tokio::time::Instant::now();
+                }
+            });
+            let (pass, edges) = dispatch_on(&rig, &due).await;
+            drop(armed);
+            let ReconcilePass::RecoveryFailed {
+                error, recovery, ..
+            } = &pass
+            else {
+                panic!("the deadline leaves evidence missing: {pass:?}");
+            };
+            assert_eq!(error.code(), "recovery.needs_evidence");
+            assert_eq!(
+                recovery.missing.map(|m| m.reason),
+                Some(RecoveryReason::Deadline)
+            );
+            assert_eq!(edges, vec![(first.id(), OperationState::Expired)]);
+            assert_eq!(owed(&rig), vec![second.id()]);
+            let (pass, edges) = dispatch_on(&rig, &due).await;
+            assert!(matches!(pass, ReconcilePass::Recovered { .. }), "{pass:?}");
+            assert_eq!(edges, vec![(second.id(), OperationState::Expired)]);
+            assert!(owed(&rig).is_empty());
+        }
+
+        /// A fault inside a release commit selects the complete old or the
+        /// complete new unit, and the repeated pass completes each release
+        /// exactly once. A later release's refusal keeps the earlier
+        /// release's transition in the caller's batch.
+        #[tokio::test]
+        #[serial]
+        async fn recovery_schedule_crash_boundaries() {
+            for seam in [COMMIT_FAULT_AFTER_PREPARED, COMMIT_FAULT_AFTER_COUNTER] {
+                let (mut rig, _guard, _home) = homed();
+                let x402 = x402_exposed(&mut rig.fx, 1, OperationState::SentOutcomeUnknown);
+                let timed = terminal_classic(&mut rig.fx, 2, CLOSE - 10);
+                let due = pair((501, CLOSE), (501, CLOSE)).await;
+                let armed = arm_accounting_fault(seam);
+                let (pass, edges) = dispatch_on(&rig, &due).await;
+                drop(armed);
+                let ReconcilePass::RecoveryFailed { error, .. } = &pass else {
+                    panic!("seam {seam}: the release refuses: {pass:?}");
+                };
+                let committed = usize::from(seam == COMMIT_FAULT_AFTER_COUNTER);
+                assert!(
+                    error
+                        .to_string()
+                        .contains(&format!("native releases: {committed} of 2")),
+                    "seam {seam}: {error}"
+                );
+                assert!(
+                    edges.is_empty(),
+                    "seam {seam}: no success reached the batch"
+                );
+                rig.reopen();
+                if committed == 1 {
+                    assert_eq!(owed(&rig), vec![timed.id()], "seam {seam}: new unit");
+                    assert_eq!(state(&rig, "order-x1"), OperationState::Expired);
+                } else {
+                    assert_eq!(
+                        owed(&rig),
+                        sorted(vec![x402.id(), timed.id()]),
+                        "seam {seam}: old unit"
+                    );
+                    assert_eq!(state(&rig, "order-x1"), OperationState::SentOutcomeUnknown);
+                }
+                let (pass, edges) = dispatch_on(&rig, &due).await;
+                assert!(matches!(pass, ReconcilePass::Recovered { .. }), "{pass:?}");
+                assert!(owed(&rig).is_empty(), "seam {seam}");
+                assert_eq!(state(&rig, "order-x1"), OperationState::Expired);
+                assert_eq!(
+                    edges,
+                    if committed == 1 {
+                        Vec::new()
+                    } else {
+                        vec![(x402.id(), OperationState::Expired)]
+                    },
+                    "seam {seam}: each edge commits once"
+                );
+                let before = rig.window_bytes();
+                let (pass, edges) = dispatch_on(&rig, &due).await;
+                assert!(matches!(pass, ReconcilePass::Recovered { .. }), "{pass:?}");
+                assert!(edges.is_empty());
+                assert_eq!(
+                    rig.window_bytes(),
+                    before,
+                    "seam {seam}: a repeat writes nothing"
+                );
+            }
+
+            let (mut rig, _guard, _home) = homed();
+            let x402 = x402_exposed(&mut rig.fx, 1, OperationState::SentOutcomeUnknown);
+            let timed = terminal_classic(&mut rig.fx, 2, CLOSE - 10);
+            let fault = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let held = fault.clone();
+            let armed = on_release(move |index, _| {
+                if index == 1 {
+                    *held.borrow_mut() = Some(arm_accounting_fault(COMMIT_FAULT_AFTER_PREPARED));
+                }
+            });
+            let (pass, edges) = dispatch_on(&rig, &pair((501, CLOSE), (501, CLOSE)).await).await;
+            drop(armed);
+            drop(fault);
+            assert!(
+                matches!(pass, ReconcilePass::RecoveryFailed { .. }),
+                "{pass:?}"
+            );
+            assert_eq!(edges, vec![(x402.id(), OperationState::Expired)]);
+            assert_eq!(owed(&rig), vec![timed.id()]);
+        }
+
+        /// Dispatch releases due obligations beside four classic attempts,
+        /// which keep their slots. Targeted status releases only its own
+        /// attempt's obligation.
+        #[tokio::test]
+        #[serial]
+        async fn recovery_four_classics_beside_targeted_obligations() {
+            let (mut rig, _guard, _home) = homed();
+            for n in 1..=4 {
+                unknown_due(&mut rig.fx, n);
+            }
+            let x402 = x402_exposed(&mut rig.fx, 5, OperationState::SentOutcomeUnknown);
+            terminal_classic(&mut rig.fx, 6, CLOSE - 10);
+            let untimed = terminal_classic(&mut rig.fx, 7, 0);
+            let due = pair((501, CLOSE), (501, CLOSE)).await;
+            let (_, edges) = dispatch_on(&rig, &due).await;
+            assert_eq!(edges, vec![(x402.id(), OperationState::Expired)]);
+            assert_eq!(owed(&rig), vec![untimed.id()]);
+            for (server, _) in &due {
+                assert_eq!(count(server, "getHealth").await, 1);
+                assert_eq!(
+                    count(server, "getTransaction").await,
+                    4,
+                    "every classic slot is used"
+                );
+            }
+
+            drop(rig);
+            let (mut rig, _guard, _home) = homed();
+            let x402 = x402_exposed(&mut rig.fx, 5, OperationState::SentOutcomeUnknown);
+            terminal_classic(&mut rig.fx, 6, CLOSE - 10);
+            let due = pair((501, CLOSE), (501, CLOSE)).await;
+            let outcome = status_on(&rig, 6, &due).await;
+            assert_eq!(outcome.recovery.refusal, None);
+            assert_eq!(owed(&rig), vec![x402.id()], "the other obligation stays");
+            assert_eq!(state(&rig, "order-x5"), OperationState::SentOutcomeUnknown);
+            for (server, _) in &due {
+                assert_eq!(
+                    methods(server).await,
+                    ["getNetwork", "getHealth"],
+                    "status adds no request for a terminal attempt"
+                );
+            }
+        }
+
+        /// Due native work completes while checked receipt repair refuses
+        /// another decision; the repair refusal keeps its precedence.
+        #[tokio::test]
+        #[serial]
+        async fn recovery_due_obligation_during_repair() {
+            let (mut rig, _guard, _home) = homed();
+            let (_, missing) =
+                historical_without(&mut rig.fx, 2, Checked::NotIncluded, "submission_ledger");
+            let x402 = x402_exposed(&mut rig.fx, 1, OperationState::SentOutcomeUnknown);
+            rig.reopen();
+            let due = pair((501, CLOSE), (501, CLOSE)).await;
+            // A stored business id replays through the legacy-only pass.
+            let before = rig.window_bytes();
+            reconcile_legacy_pass(
+                &rig.fx.profile,
+                &rig.fx.store,
+                &due[0].1,
+                Some(&due[1].1),
+                Some(&rig.receipts),
+                T0,
+                || Ok(Arc::clone(&rig.writer)),
+            )
+            .await;
+            for (server, _) in &due {
+                assert!(methods(server).await.is_empty(), "replay reads nothing");
+            }
+            assert_eq!(rig.window_bytes(), before);
+            let (pass, edges) = dispatch_on(&rig, &due).await;
+            let ReconcilePass::RecoveryFailed { error, .. } = &pass else {
+                panic!("repair refuses: {pass:?}");
+            };
+            let detail = error.to_string();
+            assert!(
+                detail.contains("sequence recovery completed; checked receipt repair")
+                    && detail.contains(&missing.to_hex()),
+                "{detail}"
+            );
+            assert_eq!(edges, vec![(x402.id(), OperationState::Expired)]);
+            assert!(owed(&rig).is_empty());
+        }
+
+        /// A second writer releases the obligation between this pass's
+        /// enumeration and its commit. The commit rechecks under the window
+        /// lock, refuses, and writes no second release.
+        #[tokio::test]
+        #[serial]
+        async fn recovery_schedule_two_processes() {
+            let (mut rig, _guard, _home) = homed();
+            let x402 = x402_exposed(&mut rig.fx, 1, OperationState::SentOutcomeUnknown);
+            let path = rig.fx.store.path().to_owned();
+            let profile = rig.fx.profile.clone();
+            let id = x402.id();
+            let armed = on_release(move |_, _| {
+                let other = PersistedWindowStore::at_path(path.clone());
+                let mut sink = Sink::default();
+                OperationRecorder::new(&other, &profile, &mut sink, "other")
+                    .release_obligation(
+                        id,
+                        1,
+                        WindowObservation {
+                            ledger: 501,
+                            close_time_floor_ms: T0,
+                            observed_at_ms: T0,
+                        },
+                        false,
+                    )
+                    .unwrap();
+            });
+            let (pass, edges) = dispatch_on(&rig, &pair((501, CLOSE), (501, CLOSE)).await).await;
+            drop(armed);
+            let ReconcilePass::RecoveryFailed { error, .. } = &pass else {
+                panic!("the stale release refuses: {pass:?}");
+            };
+            assert_eq!(error.code(), "submission.record_unavailable");
+            assert!(
+                error.to_string().contains("native releases: 1 of 1"),
+                "{error}"
+            );
+            assert!(edges.is_empty(), "this pass committed nothing");
+            assert!(owed(&rig).is_empty());
+            assert_eq!(state(&rig, "order-x1"), OperationState::Expired);
+        }
+
+        /// A release refusal in targeted status keeps the status answer and
+        /// reports the store's own code in the shared recovery projection.
+        #[tokio::test]
+        #[serial]
+        async fn recovery_schedule_refusal_surfaces() {
+            let (mut rig, _guard, _home) = homed();
+            let timed = terminal_classic(&mut rig.fx, 2, CLOSE - 10);
+            let due = pair((501, CLOSE), (501, CLOSE)).await;
+            let armed = arm_accounting_fault(COMMIT_FAULT_AFTER_PREPARED);
+            let outcome = status_on(&rig, 2, &due).await;
+            drop(armed);
+            let code = WindowStoreError::Io {
+                kind: std::io::ErrorKind::Interrupted,
+            }
+            .submission_code();
+            assert_eq!(
+                outcome
+                    .recovery
+                    .refusal
+                    .as_ref()
+                    .map(|r| (r.code, r.state_unavailable)),
+                Some((code, false))
+            );
+            assert_eq!(
+                outcome.recovery.status_json().unwrap()["refusal"]["code"],
+                code
+            );
+            assert_eq!(owed(&rig), vec![timed.id()]);
+            let outcome = status_on(&rig, 2, &due).await;
+            assert_eq!(outcome.recovery.refusal, None);
+            assert!(owed(&rig).is_empty());
+        }
+    }
 }

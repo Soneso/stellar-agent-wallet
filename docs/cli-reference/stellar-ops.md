@@ -736,6 +736,16 @@ deadline or interruption stop. It refuses a live lease, an earlier clock and
 unusable metadata with the `recovery.retry_refused` refusal code. It reads
 evidence only and never resubmits.
 
+On mainnet, status for a terminal classic transaction also frees its native
+hold once both endpoints report a latest ledger that closed strictly after the
+envelope's `maxTime`. The reconciliation pass before each value verb does the
+same for every such transaction and for x402 payments whose signatures expired
+on both endpoints, also when no classic recovery work exists. A release never
+uses the local clock. An untimed transaction keeps its hold until
+`stellar-agent tx receipt clear <ENVELOPE_HASH> --acknowledge --acknowledge-unbounded`.
+A refused release keeps the status answer and reports its code as the
+`recovery` `refusal`.
+
 Once the accounting horizon passes, the verb commits the accounting expiry and
 projects it onto the receipt. A `pending` or `ambiguous` receipt becomes
 `ambiguous`, with `release_code` `submission.accounting_expired` and the

@@ -1968,6 +1968,20 @@ It keeps the saved scan only after a request budget, deadline or
 interruption stop. History loss stays sticky because it lives outside the
 run record.
 
+The same call releases native obligations after its shared prefix and before
+any classic attempt. Candidates are exposed x402 entries and terminal classic
+attempts whose authorization has no release row and no checked decision. A
+store with candidates and no classic work still reads the prefix, so x402-only
+and terminal-only stores free capacity. Each release uses the smaller paired
+ledger and the smaller paired close time, never the local clock or one
+endpoint. It commits through the window's own strict due check and atomic
+release, without the operator's clear. An untimed terminal attempt starts no
+pass and keeps its hold until `tx receipt clear --acknowledge
+--acknowledge-unbounded`. Targeted status releases only its own attempt's
+obligation. Releases take no classic slot. Each starts only before the call
+deadline and while both observations are fresh; a committed release stands
+when a later one refuses.
+
 Ordinary status and dispatch respect the stored retry class and time.
 Automatic work resumes on a later eligible call; there is no background timer.
 An explicit stop requires the reported configuration, record or evidence to

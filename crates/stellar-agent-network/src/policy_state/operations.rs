@@ -4214,13 +4214,13 @@ fn same_policy_as_predecessor(
 /// What one exposed authorization still owes its native release row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObligationKind {
-    /// Signed x402 entries strictly past their expiration ledger.
+    /// Signed x402 entries, due strictly past their expiration ledger.
     X402Expired {
         /// The ledger after which the signatures expire.
         signature_expiration_ledger: u32,
     },
-    /// A terminal classic attempt whose `max_time` the close-time floor has
-    /// strictly passed.
+    /// A terminal classic attempt, due once the close-time floor strictly
+    /// passes its `max_time`.
     TerminalTimed {
         /// The release bound: the attempt's `max_time` in milliseconds.
         release_after_ms: u64,
@@ -4241,16 +4241,14 @@ pub struct ReleaseObligation {
     pub kind: ObligationKind,
 }
 
-/// The obligation of `attempt` in `record` at `observation`, when the
-/// attempt is exposed, its authorization has no release row, and no checked
-/// decision owns its release. An x402 obligation is due only strictly past
-/// its expiration ledger, a timed classic one only on a terminal record
-/// whose close-time floor is strictly past `max_time`.
-fn obligation_of(
+/// The obligation `attempt` in `record` owes before any proof: the attempt
+/// is exposed, its authorization has no release row, no checked decision
+/// owns its release, and it is x402 or on a terminal classic record. A
+/// classic `max_time` whose milliseconds overflow owes no release.
+fn obligation_candidate(
     wire: &WireFile,
     record: &WireOperation,
     attempt: &WireAttempt,
-    observation: Option<&WindowObservation>,
 ) -> Option<ReleaseObligation> {
     let exposure = attempt.exposure.as_ref()?;
     let unreleased = wire
@@ -4264,19 +4262,15 @@ fn obligation_of(
         ExposureIdentity::X402 {
             signature_expiration_ledger,
             ..
-        } => {
-            let ledger = observation?.ledger;
-            (ledger > signature_expiration_ledger).then_some(ObligationKind::X402Expired {
-                signature_expiration_ledger,
-            })?
+        } => ObligationKind::X402Expired {
+            signature_expiration_ledger,
+        },
+        ExposureIdentity::Classic { max_time: 0, .. } if record.state.is_terminal() => {
+            ObligationKind::TerminalUntimed
         }
         ExposureIdentity::Classic { max_time, .. } if record.state.is_terminal() => {
-            if max_time == 0 {
-                ObligationKind::TerminalUntimed
-            } else {
-                let release_after_ms = max_time.checked_mul(1000)?;
-                (observation?.close_time_floor_ms > release_after_ms)
-                    .then_some(ObligationKind::TerminalTimed { release_after_ms })?
+            ObligationKind::TerminalTimed {
+                release_after_ms: max_time.checked_mul(1000)?,
             }
         }
         ExposureIdentity::Classic { .. } => return None,
@@ -4286,6 +4280,30 @@ fn obligation_of(
         attempt_index: attempt.index,
         kind,
     })
+}
+
+/// The obligation of `attempt` in `record` that `observation` proves due.
+/// An x402 obligation is due only strictly past its expiration ledger, a
+/// timed classic one only when the close-time floor is strictly past
+/// `max_time`. An untimed one is always due; its release needs the
+/// operator's acknowledged clear.
+fn obligation_of(
+    wire: &WireFile,
+    record: &WireOperation,
+    attempt: &WireAttempt,
+    observation: Option<&WindowObservation>,
+) -> Option<ReleaseObligation> {
+    let obligation = obligation_candidate(wire, record, attempt)?;
+    let due = match obligation.kind {
+        ObligationKind::X402Expired {
+            signature_expiration_ledger,
+        } => observation?.ledger > signature_expiration_ledger,
+        ObligationKind::TerminalTimed { release_after_ms } => {
+            observation?.close_time_floor_ms > release_after_ms
+        }
+        ObligationKind::TerminalUntimed => true,
+    };
+    due.then_some(obligation)
 }
 
 /// The account a classic attempt's authorization binds: the transaction
@@ -5584,6 +5602,44 @@ impl<'a> OperationStatus<'a> {
                     .filter_map(|attempt| {
                         obligation_of(&wire, record, attempt, observation.as_ref())
                     })
+                    .collect::<Vec<_>>()
+            })
+            .collect())
+    }
+
+    /// Every release obligation the verified window holds before its proof,
+    /// with the structural checks of [`Self::release_obligations`] and no
+    /// observation. A transaction hash selects only the classic attempt
+    /// that exposed it. A candidate proves nothing and adopts nothing; only
+    /// [`Self::release_obligations`] at a verified observation names the
+    /// due ones.
+    ///
+    /// # Errors
+    ///
+    /// Every integrity, keyring and I/O error of the verified window read.
+    pub fn release_candidates(
+        &self,
+        tx_hash: Option<&[u8; 32]>,
+    ) -> Result<Vec<ReleaseObligation>, WindowStoreError> {
+        let Some(wire) = self.read()? else {
+            return Ok(Vec::new());
+        };
+        let selected = |attempt: &WireAttempt| {
+            tx_hash.is_none_or(|hash| {
+                matches!(
+                    attempt.exposure.as_ref().map(|exposure| &exposure.identity),
+                    Some(ExposureIdentity::Classic { tx_hash: stored, .. }) if stored == hash
+                )
+            })
+        };
+        Ok(records(&wire)
+            .iter()
+            .flat_map(|record| {
+                record
+                    .attempts
+                    .iter()
+                    .filter(|attempt| selected(attempt))
+                    .filter_map(|attempt| obligation_candidate(&wire, record, attempt))
                     .collect::<Vec<_>>()
             })
             .collect())
@@ -13039,7 +13095,7 @@ pub(crate) mod tests {
 
     /// An x402 operation `order-x{n}` exposed with entries expiring after
     /// ledger 500 and moved to `to`, without window entries.
-    fn x402_exposed(fx: &mut Fx, n: u8, to: OperationState) -> OperationHandle {
+    pub(crate) fn x402_exposed(fx: &mut Fx, n: u8, to: OperationState) -> OperationHandle {
         let handle = fx.open_new(&request(&format!("order-x{n}"), x402([n; 32])));
         let mint = fx.mint_request(soroban(n), fx.approval(), vec![]);
         let started = fx.begin_mint(&handle, &mint).unwrap();
@@ -13064,7 +13120,7 @@ pub(crate) mod tests {
 
     /// A classic operation exposed with `max_time` and moved from its
     /// unknown outcome to `Expired`.
-    fn terminal_classic(fx: &mut Fx, n: u8, max_time: u64) -> OperationHandle {
+    pub(crate) fn terminal_classic(fx: &mut Fx, n: u8, max_time: u64) -> OperationHandle {
         let handle = unknown_with(fx, n, max_time, vec![]);
         fx.recorder()
             .transition(
@@ -13327,6 +13383,154 @@ pub(crate) mod tests {
                 .is_err()
         );
         assert_eq!(fs::read(fx.store.path()).unwrap(), bytes);
+    }
+
+    /// The operation, attempt and kind of every release candidate, sorted.
+    fn candidates(fx: &Fx, tx_hash: Option<&[u8; 32]>) -> Vec<(OperationId, u32, ObligationKind)> {
+        let mut found: Vec<_> = OperationStatus::new(&fx.store, &fx.profile)
+            .release_candidates(tx_hash)
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.operation_id, c.attempt_index, c.kind))
+            .collect();
+        found.sort_by_key(|(id, index, _)| (id.to_hex(), *index));
+        found
+    }
+
+    /// Candidates come from the verified window without any observation:
+    /// x402 and terminal classic exposures whose authorization has no
+    /// release row and no checked decision. A hash selects only the classic
+    /// attempt that exposed it, including a superseded attempt index. A
+    /// missing or unusable run record changes nothing; due enumeration and
+    /// release keep their strict proofs.
+    #[test]
+    #[serial]
+    fn release_candidates_are_authenticated_and_pre_due() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let mut fx = Fx::new();
+        let live = x402_exposed(&mut fx, 1, OperationState::SentOutcomeUnknown);
+        let paid = x402_exposed(&mut fx, 2, OperationState::PayloadReleased);
+        let timed = terminal_classic(&mut fx, 3, T0 / 1_000 + 10);
+        let untimed = terminal_classic(&mut fx, 4, 0);
+        let unknown = unknown_named(&mut fx, 5);
+        let released = x402_exposed(&mut fx, 6, OperationState::PayloadReleased);
+        let unexposed = fx.open_new(&request("order-x8", x402([8; 32])));
+        let mint = fx.mint_request(soroban(8), fx.approval(), vec![]);
+        fx.begin_mint(&unexposed, &mint).unwrap();
+        let overflowing = terminal_classic(&mut fx, 9, u64::MAX / 1000 + 1);
+        // The timed attempt keeps a run record this build cannot interpret.
+        let mut wire = fx.wire();
+        wire.version = wire
+            .version
+            .max(super::super::store::WIRE_VERSION_RECOVERY_RUN);
+        for record in &mut section_mut(&mut wire).records {
+            if record.id == timed.id() {
+                record.attempts[0].recovery_run =
+                    Some(serde_json::from_str(r#"{"version":99}"#).unwrap());
+            }
+        }
+        fx.store.seal_unchecked_for_test(&fx.profile, &wire);
+        assert!(fx.record(timed.id()).attempts[0].recovery_run.is_some());
+        let deadline = (T0 / 1_000 + 10) * 1_000;
+        let at = |ledger: u32, close_ms: u64| WindowObservation {
+            ledger,
+            close_time_floor_ms: close_ms,
+            observed_at_ms: T0,
+        };
+        fx.recorder()
+            .release_obligation(released.id(), 1, at(501, 0), false)
+            .unwrap();
+        assert_eq!(fx.wire().last_observation.map(|o| o.ledger), Some(501));
+        fx.rewrite(|wire| wire.last_observation = None);
+
+        let x402 = ObligationKind::X402Expired {
+            signature_expiration_ledger: 500,
+        };
+        let mut all = vec![
+            (live.id(), 1, x402),
+            (paid.id(), 1, x402),
+            (
+                timed.id(),
+                1,
+                ObligationKind::TerminalTimed {
+                    release_after_ms: deadline,
+                },
+            ),
+            (untimed.id(), 1, ObligationKind::TerminalUntimed),
+        ];
+        all.sort_by_key(|(id, index, _)| (id.to_hex(), *index));
+        // No stored observation: the due query finds only the untimed clear.
+        assert_eq!(candidates(&fx, None), all, "no stored observation");
+        assert_eq!(
+            obligations_at(&fx, at(500, deadline)),
+            vec![(untimed.id(), ObligationKind::TerminalUntimed)],
+            "equality is not due"
+        );
+        assert_eq!(candidates(&fx, None), all, "candidates are pre-due");
+        for unselected in [&unknown, &unexposed, &released, &overflowing] {
+            assert!(
+                all.iter().all(|(id, _, _)| *id != unselected.id()),
+                "{:?}",
+                unselected.id()
+            );
+        }
+
+        // Hash selection: exactly one classic exposure, never an x402 one.
+        assert_eq!(
+            candidates(&fx, Some(&[3 ^ 0x80; 32])),
+            vec![(
+                timed.id(),
+                1,
+                ObligationKind::TerminalTimed {
+                    release_after_ms: deadline
+                }
+            )]
+        );
+        assert!(candidates(&fx, Some(&[5 ^ 0x80; 32])).is_empty());
+        assert!(candidates(&fx, Some(&[0x42; 32])).is_empty());
+        // A successor's terminal attempt 2: its own hash selects index 2.
+        // The first attempt's checked decision owns its release, so that
+        // hash selects nothing.
+        let successor = projected_not_included(&mut fx, 10);
+        let mint = fx.mint_request(tx(21), fx.policy(), vec![]);
+        let started = fx.begin_mint(&successor, &mint).unwrap();
+        fx.claim(&mint, started.minted.as_ref().unwrap());
+        fx.recorder()
+            .expose(successor.id(), 2, &classic_exposure(21), None)
+            .unwrap();
+        for to in [OperationState::SentOutcomeUnknown, OperationState::Expired] {
+            fx.recorder()
+                .transition(successor.id(), Some(2), to, &TransitionEvidence::default())
+                .unwrap();
+        }
+        assert_eq!(
+            candidates(&fx, Some(&[21 ^ 0x80; 32])),
+            vec![(successor.id(), 2, ObligationKind::TerminalUntimed)]
+        );
+        assert!(candidates(&fx, Some(&[10 ^ 0x80; 32])).is_empty());
+    }
+
+    /// A malformed authentic file refuses the candidate query with the same
+    /// typed error as the due query, never with an empty success.
+    #[test]
+    #[serial]
+    fn release_candidates_reject_invalid_state() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let mut fx = Fx::new();
+        terminal_classic(&mut fx, 1, T0 / 1_000 + 10);
+        let mut wire = fx.wire();
+        let copy = section_mut(&mut wire).records[0].clone();
+        section_mut(&mut wire).records.push(copy);
+        fx.store.seal_unchecked_for_test(&fx.profile, &wire);
+        let status = OperationStatus::new(&fx.store, &fx.profile);
+        let candidates = status.release_candidates(None).unwrap_err();
+        let due = status.release_obligations(None).unwrap_err();
+        assert_eq!(candidates.submission_code(), due.submission_code());
+        assert_eq!(format!("{candidates:?}"), format!("{due:?}"));
     }
 
     /// Total-budget debits across operation steps: only an unclaimed hold
