@@ -387,6 +387,48 @@ impl<G: ConsentSessionGate> PresenceState<G> {
         }
     }
 
+    /// The refusal `error` of an inbox assertion for `nonce`. An assertion
+    /// whose challenge is already consumed, for an attested value entry,
+    /// first completes that entry's durable consent from its verified stored
+    /// proof. It issues no challenge and writes no row; a failed completion
+    /// answers with its own refusal.
+    fn recover_consumed(
+        &self,
+        nonce: &str,
+        admission: PolicyAdmission,
+        error: WalletError,
+    ) -> WalletError {
+        let Mode::Inbox(context) = &self.mode else {
+            return error;
+        };
+        if error.code() != "approval.presence_consumed" {
+            return error;
+        }
+        let Ok((store, current)) = self.snapshot(nonce, false, Some(&admission)) else {
+            return error;
+        };
+        if !store.get(nonce).is_some_and(|entry| {
+            entry.attestation_blob_b64.is_some()
+                && crate::decision::needs_durable_consent(context, &entry.kind)
+        }) {
+            return error;
+        }
+        match crate::decision::complete_consent(
+            context,
+            store,
+            &current,
+            nonce,
+            admission,
+            crate::decision::ConsentRowSource::Recovered,
+        ) {
+            Ok(()) => error,
+            Err(completion) => {
+                tracing::warn!(code = %completion.code(), "assertion: consent completion failed");
+                completion
+            }
+        }
+    }
+
     /// The attestation key the reshow of an attested trustline clawback
     /// opt-in verifies its blob with, or `None` for any other entry.
     ///
@@ -1021,15 +1063,51 @@ fn render_detail<G: ConsentSessionGate>(
             .into_response());
     };
     if view.attested {
-        let key = key.as_ref().map(|key| key.as_slice());
-        let blob = match verified_blob(state, &store, &current, nonce, key, &admission) {
+        let blob = match verified_blob(
+            state,
+            &store,
+            &current,
+            nonce,
+            key.as_ref().map(|key| key.as_slice()),
+            &admission,
+        ) {
             Ok(blob) => Some(blob),
             Err(error) if crate::decision::presence_refusal(&error).is_some() => {
                 return Err(error);
             }
             Err(_) => None,
         };
-        drop(store);
+        let blob = match &state.mode {
+            Mode::Inbox(context)
+                if blob.is_some()
+                    && store.get(nonce).is_some_and(|entry| {
+                        crate::decision::needs_durable_consent(context, &entry.kind)
+                    }) =>
+            {
+                // The inbox shows a value attestation only once its durable
+                // consent is complete; the commit runs after the store and
+                // the guard drop.
+                drop(key);
+                match crate::decision::complete_consent(
+                    context,
+                    store,
+                    &current,
+                    nonce,
+                    admission,
+                    crate::decision::ConsentRowSource::Recovered,
+                ) {
+                    Ok(()) => blob,
+                    Err(error) => {
+                        tracing::warn!(code = %error.code(), "stored page: consent completion failed");
+                        None
+                    }
+                }
+            }
+            _ => {
+                drop(store);
+                blob
+            }
+        };
         return Ok(state.settled_page(&view, session, blob.as_deref()));
     }
     if view.expired
@@ -1146,7 +1224,7 @@ fn signed_action<G: ConsentSessionGate>(
             context,
             decision(nonce),
             RequestIdentity::SignedOrigin(presence),
-            &admission,
+            admission,
         )))
     })();
     match result {
@@ -1185,10 +1263,6 @@ fn verified_blob<G: ConsentSessionGate>(
     key: Option<&[u8]>,
     admission: &PolicyAdmission,
 ) -> Result<String, WalletError> {
-    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-    use stellar_agent_core::approval::witness::{
-        ApprovalExpectation, ApprovedKind, verify_approval_admitted,
-    };
     let entry = store
         .get(nonce)
         .ok_or_else(|| failure(Failure::PresenceChanged))?;
@@ -1201,16 +1275,7 @@ fn verified_blob<G: ConsentSessionGate>(
         .attestation_blob_b64
         .as_ref()
         .ok_or_else(|| failure(Failure::PresenceInvalid))?;
-    let blob: [u8; 32] = URL_SAFE_NO_PAD
-        .decode(encoded)
-        .ok()
-        .and_then(|bytes| bytes.try_into().ok())
-        .ok_or_else(|| failure(Failure::PresenceInvalid))?;
-    let kind = match &entry.kind {
-        ApprovalKind::PaymentSimulated { .. } => ApprovedKind::Payment,
-        ApprovalKind::ClaimSimulated { .. } => ApprovedKind::Claim,
-        ApprovalKind::TrustlineSimulated { .. } => ApprovedKind::Trustline,
-        ApprovalKind::X402Payment { .. } => ApprovedKind::X402Payment,
+    match &entry.kind {
         ApprovalKind::TrustlineClawbackOptIn { code, issuer, .. } => {
             // The entry became an attested opt-in after the key was read:
             // the page is stale.
@@ -1229,28 +1294,11 @@ fn verified_blob<G: ConsentSessionGate>(
             )? {
                 return Err(failure(Failure::PresenceInvalid));
             }
-            return Ok(encoded.clone());
         }
-        _ => return Err(failure(Failure::PresenceInvalid)),
-    };
-    let expected = ApprovalExpectation {
-        kind,
-        subject: stellar_agent_core::approval::mainnet_consent_subject(
-            entry,
-            &state.context.binding(),
-        )?,
-    };
-    verify_approval_admitted(
-        store,
-        current.profile(),
-        &state.context.profile_name,
-        nonce,
-        &blob,
-        &expected,
-        current.policy(),
-        now_ms()?,
-        admission,
-    )?;
+        _ => {
+            crate::decision::verified_consent(&state.context, store, current, nonce, admission)?;
+        }
+    }
     Ok(encoded.clone())
 }
 
@@ -1414,10 +1462,12 @@ fn verified_presence<G: ConsentSessionGate>(
 ///
 /// The gate takes the shared policy admission after its cookie and CSRF
 /// checks, before the challenge is consumed and the counter recorded. The
-/// request holds that one guard until the response is ready, and reads the
-/// policy only through it. A busy lock answers `503` before anything
+/// request holds that one guard until the attestation persists, and reads
+/// the policy only through it. A busy lock answers `503` before anything
 /// changes, and the same body succeeds later. Lock order: policy-state
-/// lock, challenge map, credential store, pending store.
+/// lock, challenge map, credential store, pending store. The durable
+/// consent commit of an inbox approve then takes the window lock after the
+/// guard and the pending store are released.
 async fn assertion<G: ConsentSessionGate>(
     State(state): State<Arc<PresenceState<G>>>,
     headers: HeaderMap,
@@ -1443,7 +1493,10 @@ async fn assertion<G: ConsentSessionGate>(
     }
     let result = (|| {
         let (presence, view_digest) =
-            verified_presence(&state, &session, &nonce, &body, &admission)?;
+            match verified_presence(&state, &session, &nonce, &body, &admission) {
+                Ok(verified) => verified,
+                Err(error) => return Err(state.recover_consumed(&nonce, admission, error)),
+            };
         let (store, current) = state.snapshot(&nonce, false, Some(&admission))?;
         let entry = state.live_entry(&store, &nonce)?;
         if hex::encode(mainnet_consent_view_digest(
@@ -1469,7 +1522,7 @@ async fn assertion<G: ConsentSessionGate>(
                     Site::Loopback => RequestIdentity::Mainnet(presence),
                     Site::Signed(_) => RequestIdentity::SignedOrigin(presence),
                 },
-                &admission,
+                admission,
             ))),
             Mode::OneShot { completion, .. } => {
                 let request_id = presence.request_id().to_owned();

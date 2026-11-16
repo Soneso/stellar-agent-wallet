@@ -227,6 +227,41 @@ fn uid() -> String {
     process_uid_for_attestation().expect("uid on test host")
 }
 
+/// One [`RecordingConsent`] completion: the witnessed nonce and the row
+/// source.
+pub(crate) type CompletionCall = (String, crate::decision::ConsentRowSource);
+
+/// A consent recording that notes each completion and refuses every one
+/// while `refuse` is set.
+#[derive(Default)]
+pub(crate) struct RecordingConsent {
+    pub(crate) calls: StdMutex<Vec<CompletionCall>>,
+    pub(crate) refuse: std::sync::atomic::AtomicBool,
+}
+impl RecordingConsent {
+    pub(crate) fn calls(&self) -> Vec<CompletionCall> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+impl crate::decision::ConsentRecording for RecordingConsent {
+    fn complete(
+        &self,
+        consent: crate::decision::VerifiedConsent,
+        row: crate::decision::ConsentRowSource,
+    ) -> Result<(), stellar_agent_core::error::WalletError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((consent.witness.nonce().to_owned(), row));
+        if self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(stellar_agent_core::error::WalletError::Approval(
+                stellar_agent_core::ApprovalFailure::PresenceUnavailable,
+            ));
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct CountingRevocations {
     pub(crate) calls: std::sync::atomic::AtomicUsize,
 }

@@ -364,6 +364,8 @@ impl WindowStoreReadLock {
 /// `create` is set. The lock is taken on the open handle before any content
 /// check: a check made before the lock is a time-of-check race.
 fn open_lock_file(path: &Path, create: bool) -> Result<std::fs::File, StateLockError> {
+    #[cfg(any(test, feature = "test-helpers"))]
+    lock_requests::note(path);
     let mut options = OpenOptions::new();
     options.create(create).write(true).truncate(false);
     #[cfg(unix)]
@@ -374,6 +376,48 @@ fn open_lock_file(path: &Path, create: bool) -> Result<std::fs::File, StateLockE
     options
         .open(path)
         .map_err(|e| StateLockError::Io { kind: e.kind() })
+}
+
+/// An observer of window-state lock requests, for tests of their callers'
+/// lock order. Every shared or exclusive acquisition attempt reports its lock
+/// file before it opens it, on any thread.
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod lock_requests {
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    type Observer = Box<dyn Fn(&Path) + Send>;
+
+    static OBSERVER: Mutex<Option<Observer>> = Mutex::new(None);
+
+    /// Removes the observer when dropped.
+    #[must_use = "the observer is removed when the guard drops"]
+    pub struct Observed;
+
+    impl Drop for Observed {
+        fn drop(&mut self) {
+            if let Ok(mut observer) = OBSERVER.lock() {
+                *observer = None;
+            }
+        }
+    }
+
+    /// Runs `observer` with the lock file of every request until the
+    /// returned guard drops.
+    pub fn observe(observer: impl Fn(&Path) + Send + 'static) -> Observed {
+        if let Ok(mut slot) = OBSERVER.lock() {
+            *slot = Some(Box::new(observer));
+        }
+        Observed
+    }
+
+    pub(super) fn note(path: &Path) {
+        if let Ok(observer) = OBSERVER.lock()
+            && let Some(observer) = observer.as_ref()
+        {
+            observer(path);
+        }
+    }
 }
 
 /// Maps a failed non-blocking lock attempt: contention is

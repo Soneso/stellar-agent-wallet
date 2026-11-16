@@ -1244,6 +1244,31 @@ pub fn consent_completion(
     })
 }
 
+/// The completion of the durable record that names the nonce of `witness`,
+/// for a consent its caller verified, or `None` when no record names it.
+///
+/// The read holds no inbox lock. [`commit_consent`] then checks the witness
+/// against the record's kind, subject and clocks.
+///
+/// # Errors
+///
+/// The store's refusals, rendered through [`operation_refusal`].
+pub fn witnessed_completion(
+    store: &PersistedWindowStore,
+    profile: &Profile,
+    witness: ApprovalWitness,
+    payload: ConsentPayload,
+) -> Result<Option<ConsentCompletion>, WalletError> {
+    Ok(ApprovalStatus::new(store, profile)
+        .find_by_nonce(witness.nonce())
+        .map_err(operation_refusal)?
+        .map(|view| ConsentCompletion {
+            id: view.record.id,
+            witness,
+            payload,
+        }))
+}
+
 /// The audit sink of a consent commit, which appends no row. An append is a
 /// defect and fails the step as `audit.append_failed`.
 pub(crate) struct ConsentOnlyAudit;
