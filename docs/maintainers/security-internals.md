@@ -2279,6 +2279,24 @@ The mint compares the digest with the stored slot and the predecessor with the l
 The x402 parent retains its separate meaning. Malformed canonical content refuses resolution while lifecycle operations remain available.
 Current commands create envelope slots; canonical slot creation is not exposed by the command or tool surfaces.
 
+The shared staging helpers can open canonical records with the full intent digest
+and the prepare audit decision. A retained claim retry uses its stored asset and
+amount before any balance read. A compacted partial claim refuses with
+`operation.business_id_conflict`; inspect the recorded transaction with `tx status`.
+Full-facts requests still compare the tombstone digest.
+
+Canonical pending entries use `IntentDigest` before insertion and retain their
+original challenge envelope and signed timestamps. Their durable record uses the
+signed interval as its rule TTL, including explicit deadline clipping.
+Orphan recovery compares the retained envelope hash and preserves linked entries.
+The MCP payment producer keeps its separate payment-recovery path.
+
+The authenticated intent handoff resolves the inbox nonce, approval record and
+operation link from one verified image. It checks the full slot against the
+admitted chain, source and current policy, and separately checks the original
+challenge envelope. This read grants no signing authority. Canonical consent
+transport and completion remain separate from preparation staging.
+
 `approve revoke --id <nonce> --profile <name>` resolves the nonce through authenticated status.
 Only `ApprovalRecorder::revoke` changes the durable record.
 The profile owner can revoke consumed records inside execution, including after inbox collection.
