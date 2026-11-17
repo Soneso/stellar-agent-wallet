@@ -75,6 +75,12 @@ use super::store::{
 use crate::mainnet::MainnetPrecondition;
 use crate::mainnet::types::{AuthorizationId, hex32};
 
+mod projection;
+pub use projection::{
+    ApprovalLink, AttemptProjection, HoldProjection, OperationProjection, StatusSelectors,
+    StatusTarget, TransitionProjection,
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Limits
 // ─────────────────────────────────────────────────────────────────────────────
@@ -6373,6 +6379,7 @@ pub(crate) mod tests {
     use crate::policy_state::{ChainScope, WatchClass, WatchedOperation};
 
     pub(crate) mod progress;
+    mod projection;
     include!("operations_canonical_tests.rs");
     mod preparation_tests;
 

@@ -684,7 +684,7 @@ submission. The reservation holds the operator's caps through its
 accounting horizon or, without a time bound, until an operator clears it. A
 pending receipt holds the wallet's duplicate check.
 
-### `stellar-agent tx status <HASH> [flags]`
+### `stellar-agent tx status [<HASH>] [flags]`
 
 A receipt records `destination` when all payments share one M address.
 Differing destinations with at least one M address appear in `destinations`, with each payment's zero-based operation index and complete G or M address.
@@ -703,10 +703,36 @@ reservation. The reservation ends at its accounting horizon, which owes one
 
 | Flag / arg | Meaning | Required | Default |
 |---|---|---|---|
-| `<HASH>` (positional) | Transaction hash, 64 lowercase hex characters: the `error.details.tx_hash` a timed-out submission reports | yes | none |
+| `<HASH>` (positional) | Transaction hash, 64 lowercase hex characters: the `error.details.tx_hash` a timed-out submission reports | one of `<HASH>` and `--business-id` | none |
+| `--business-id <ID>` | Business id of the mainnet operation to report; with `<HASH>`, both must name the same operation | one of `<HASH>` and `--business-id` | none |
 | `--profile <NAME>` | Profile whose submission records and spending window are reconciled | optional | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--output <FORMAT>` | `json` or `table` | optional | `json` |
 | `--retry-recovery` | Start one new bounded evidence run for a stopped mainnet recovery attempt | optional | off |
+
+Neither selector refuses with `validation.usage_error`, a malformed hash with
+`validation.address_invalid`, and a malformed business id with
+`validation.business_id_required` or `validation.business_id_invalid`. On
+mainnet the selectors resolve from the authenticated window before recovery.
+An unknown business id refuses with `operation.unknown`, and a hash of another
+operation with `validation.usage_error`. A business id alone targets the
+operation's latest exposed classic hash, including after a retry. An operation
+with no exposed classic hash, or a compacted one, is reported without the hash
+keys (MCP reports them as null) and reads no network. On testnet a business id is checked and echoed as
+`business_id`, `operation`, `chain`, `receipt` and `reservation`, the last four
+null, because testnet keeps no operation records.
+
+Every success payload adds `operation`. It is `null` on testnet and for a hash
+that no retained mainnet operation exposed. Otherwise it projects the stored
+record from one authenticated read after reconciliation: `business_id`,
+`state`, `compacted`, `attempts[]` with `index`, `state`, `tx_hash`, `sequence`,
+`max_time` and `auth_entry_sha256`, `last_transition` with `kind`, `at_ms`,
+`ledger_primary` and `ledger_witness`, `hold.held`, `approval` with the
+approval nonce as `id` and its state while awaiting approval, and `result`.
+Identity fields are null before exposure and when inapplicable; an x402
+attempt has a null `tx_hash`. A compacted record has empty `attempts` and null
+`last_transition` and `hold`. The object carries no amounts. It carries no
+`next` action and no recovery outcome; the payload's `recovery` field reports
+recovery results.
 
 What it changes:
 

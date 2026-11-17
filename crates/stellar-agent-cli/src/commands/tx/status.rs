@@ -62,6 +62,18 @@
 //! It collects evidence only: it never resubmits and authorizes no
 //! successor.
 //!
+//! # Selectors
+//!
+//! `HASH`, `--business-id`, or both select the submission. Neither refuses
+//! with `validation.usage_error`. On mainnet the selectors resolve from the
+//! authenticated window before recovery: both must name one operation, an
+//! unknown business id refuses with `operation.unknown`, and a business id
+//! alone targets the operation's latest exposed classic hash, or reads no
+//! network when it has none. `operation` projects the stored state,
+//! attempts, last transition, bucket hold, awaiting approval and result, or
+//! is null for a hash no operation exposed. On testnet a business id is
+//! checked and echoed, since testnet keeps no operation records.
+//!
 //! # Concurrency
 //!
 //! Delivering an accounting audit event needs the audit writer's exclusive
@@ -84,7 +96,9 @@ use serde::Serialize;
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::WalletError;
 use stellar_agent_core::profile::receipt::{ReceiptStatus, ReleaseEvidence, SubmissionReceipt};
-use stellar_agent_network::policy_state::PersistedWindowStore;
+use stellar_agent_network::policy_state::{
+    BusinessId, OperationProjection, PersistedWindowStore, StatusSelectors,
+};
 use stellar_agent_network::submission_flow::{self, StatusFailure, StatusRequest, is_tx_hash};
 
 use crate::common::profile_access::load_profile_or_synthesize_testnet;
@@ -98,9 +112,14 @@ pub struct StatusArgs {
     /// Transaction hash to reconcile, 64 lowercase hex characters.
     ///
     /// This is the `details.tx_hash` a `submission.tx_timeout` response
-    /// carries.
+    /// carries. Optional when `--business-id` is given.
     #[arg(value_name = "HASH")]
-    pub tx_hash: String,
+    pub tx_hash: Option<String>,
+
+    /// Business id of the mainnet operation to report. With HASH, both must
+    /// name the same operation. On testnet it is checked and echoed only.
+    #[arg(long = "business-id", value_name = "ID")]
+    pub business_id: Option<String>,
 
     /// Profile whose submission records and spending window are reconciled.
     #[arg(long, value_name = "NAME")]
@@ -163,14 +182,20 @@ struct ReservationView {
 }
 
 /// Success payload for the `tx status` envelope.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 #[serde(rename_all = "snake_case")]
 struct StatusData {
-    /// The transaction hash that was reconciled.
-    tx_hash: String,
+    /// The transaction hash that was reconciled; absent when a business id
+    /// names an operation with no exposed hash.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tx_hash: Option<String>,
+    /// The business id the call named.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    business_id: Option<BusinessId>,
     /// What the endpoint reported (`SUCCESS`, `FAILED` or `NOT_FOUND`); for a
     /// managed mainnet attempt, the cached recovery result or `UNKNOWN`.
-    chain_status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chain_status: Option<String>,
     /// The ledger the endpoint reports the transaction in.
     #[serde(skip_serializing_if = "Option::is_none")]
     ledger: Option<u32>,
@@ -183,19 +208,33 @@ struct StatusData {
     /// Typed recovery results and any refusal for managed mainnet attempts.
     #[serde(skip_serializing_if = "Option::is_none")]
     recovery: Option<serde_json::Value>,
+    /// The stored mainnet operation the selectors name; null otherwise.
+    operation: Option<OperationProjection>,
 }
 
 /// Runs `tx status`.
 ///
 /// Returns an exit code: `0` on success, `1` on any error.
 pub async fn run(args: &StatusArgs) -> i32 {
-    if !is_tx_hash(&args.tx_hash) {
+    if args
+        .tx_hash
+        .as_deref()
+        .is_some_and(|hash| !is_tx_hash(hash))
+    {
         render_json(&Envelope::<()>::err_raw(
             "validation.address_invalid",
             "HASH must be 64 lowercase hex characters",
         ));
         return 1;
     }
+    let selectors =
+        match StatusSelectors::parse(args.tx_hash.as_deref(), args.business_id.as_deref()) {
+            Ok(selectors) => selectors,
+            Err(e) => {
+                render_json(&Envelope::<()>::err(&e));
+                return 1;
+            }
+        };
 
     let resolved = resolve_profile_name(args.profile.as_deref());
     // The same origin rule the value verbs use. A zero-config operator's
@@ -210,6 +249,18 @@ pub async fn run(args: &StatusArgs) -> i32 {
             return 1;
         }
     };
+    if !profile.chain_id.is_mainnet()
+        && let (None, Some(business_id)) = (&selectors.tx_hash, &selectors.business_id)
+    {
+        render_json(&Envelope::ok(serde_json::json!({
+            "business_id": business_id,
+            "operation": null,
+            "chain": null,
+            "receipt": null,
+            "reservation": null,
+        })));
+        return 0;
+    }
 
     if let Err(e) = stellar_agent_network::keyring::init_platform_keyring_store() {
         render_json(&Envelope::<()>::err(&e));
@@ -217,57 +268,96 @@ pub async fn run(args: &StatusArgs) -> i32 {
     }
 
     let window = PersistedWindowStore::for_profile(&resolved.name);
+    let target = match submission_flow::select_status(&profile, &window, &selectors) {
+        Ok(target) => target,
+        Err(error) => {
+            render_json(&status_error_envelope(error));
+            return 1;
+        }
+    };
+    let data = match target.tx_hash.as_deref() {
+        Some(tx_hash) => {
+            match hash_status(args, tx_hash, &profile, &resolved.name, origin, &window).await {
+                Ok(data) => data,
+                Err(code) => return code,
+            }
+        }
+        None => StatusData::default(),
+    };
+    match submission_flow::operation_projection(&profile, &window, &target) {
+        Ok(operation) => {
+            render_json(&Envelope::ok(StatusData {
+                business_id: selectors.business_id,
+                operation,
+                ..data
+            }));
+            0
+        }
+        Err(error) => {
+            render_json(&status_error_envelope(error));
+            1
+        }
+    }
+}
 
-    let context = crate::common::network::profile_network_context(&profile);
+/// Reconciles `tx_hash` into its hash view, or renders the refusal and
+/// returns its exit code.
+async fn hash_status(
+    args: &StatusArgs,
+    tx_hash: &str,
+    profile: &stellar_agent_core::profile::schema::Profile,
+    profile_name: &str,
+    origin: stellar_agent_core::profile::loader::ProfileOrigin,
+    window: &PersistedWindowStore,
+) -> Result<StatusData, i32> {
+    let context = crate::common::network::profile_network_context(profile);
     let client = match context.primary_client() {
         Ok(c) => c,
         Err(e) => {
             // An unreadable window file refuses before a client failure, as
             // the window is read first.
-            if let Err(error) = window.pending_reservations(&profile) {
+            if let Err(error) = window.pending_reservations(profile) {
                 render_json(&status_error_envelope(StatusFailure::WindowUnreadable(
                     error,
                 )));
             } else {
                 render_json(&Envelope::<()>::err(&e));
             }
-            return 1;
+            return Err(1);
         }
     };
 
-    let oracle = crate::commands::submission_record::settlement_oracle_in(&profile, &context);
-    let outcome = match submission_flow::transaction_status(
+    let oracle = crate::commands::submission_record::settlement_oracle_in(profile, &context);
+    let outcome = submission_flow::transaction_status(
         status_request(
             args,
-            &profile,
-            &resolved.name,
-            &window,
+            tx_hash,
+            profile,
+            profile_name,
+            window,
             &client,
             oracle.as_ref(),
         ),
         stellar_agent_core::profile::schema::default_approval_dir,
         || {
             crate::commands::submission_record::accounting_audit_writer(
-                &profile,
-                &resolved.name,
+                profile,
+                profile_name,
                 origin,
             )
         },
     )
     .await
-    {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            render_json(&status_error_envelope(error));
-            return 1;
-        }
-    };
-    render_json(&Envelope::ok(status_data(args, outcome)));
-    0
+    .map_err(|error| {
+        render_json(&status_error_envelope(error));
+        1
+    })?;
+    Ok(status_data(tx_hash, outcome))
 }
 
 fn status_request<'a>(
     args: &'a StatusArgs,
+    tx_hash: &'a str,
     profile: &'a stellar_agent_core::profile::schema::Profile,
     profile_name: &'a str,
     window: &'a PersistedWindowStore,
@@ -277,7 +367,7 @@ fn status_request<'a>(
     StatusRequest {
         profile,
         profile_name,
-        tx_hash: &args.tx_hash,
+        tx_hash,
         window,
         client,
         oracle,
@@ -285,20 +375,21 @@ fn status_request<'a>(
     }
 }
 
-fn status_data(args: &StatusArgs, outcome: submission_flow::StatusOutcome) -> StatusData {
+fn status_data(tx_hash: &str, outcome: submission_flow::StatusOutcome) -> StatusData {
     StatusData {
-        tx_hash: args.tx_hash.clone(),
+        tx_hash: Some(tx_hash.to_owned()),
         record: outcome
             .record
             .as_ref()
             .map(|settled| record_view(settled, outcome.reservation_open)),
         recovery: outcome.recovery.status_json(),
-        chain_status: outcome.chain_status,
+        chain_status: Some(outcome.chain_status),
         ledger: outcome.ledger,
         reservation: outcome.reservation.map(|r| ReservationView {
             envelope_hash: r.id,
             operator_required: r.operator_required,
         }),
+        ..StatusData::default()
     }
 }
 
@@ -376,6 +467,7 @@ fn status_error_envelope(error: StatusFailure) -> Envelope<()> {
         StatusFailure::ReconcileRefused(e) => Envelope::err_raw(e.submission_code(), e.to_string()),
         StatusFailure::RepairRefused(e) => Envelope::err(&e),
         StatusFailure::ChainQueryFailed(e) => Envelope::err(&WalletError::Network(e)),
+        StatusFailure::SelectorRefused(e) => Envelope::err(&e),
     }
 }
 
@@ -441,11 +533,10 @@ mod tests {
         for (extra, expected) in [(&[][..], false), (&["--retry-recovery"][..], true)] {
             let args = parse(extra).expect("parse");
             assert_eq!(args.retry_recovery, expected);
-            let request = super::status_request(&args, &profile, "p", &window, &client, None);
+            let request = super::status_request(&args, HASH, &profile, "p", &window, &client, None);
             assert_eq!(request.retry_recovery, expected);
         }
         assert!(parse(&["--retry-recovery=true"]).is_err());
-        let args = parse(&[]).expect("parse");
         let mut recovery = RecoveryReport::default();
         let outcome = |recovery| stellar_agent_network::submission_flow::StatusOutcome {
             recovery,
@@ -456,14 +547,14 @@ mod tests {
             reservation: None,
             reservation_open: false,
         };
-        let value = serde_json::to_value(super::status_data(&args, outcome(recovery.clone())))
+        let value = serde_json::to_value(super::status_data(HASH, outcome(recovery.clone())))
             .expect("payload");
         assert!(value.get("recovery").is_none(), "unmanaged: {value}");
         recovery.refusal = Some(RecoveryRefusal {
             code: "submission.record_unavailable",
             state_unavailable: true,
         });
-        let value = serde_json::to_value(super::status_data(&args, outcome(recovery.clone())))
+        let value = serde_json::to_value(super::status_data(HASH, outcome(recovery.clone())))
             .expect("payload");
         assert_eq!(value["chain_status"], "UNKNOWN");
         assert_eq!(value["recovery"], recovery.status_json().expect("refusal"));
@@ -533,7 +624,8 @@ mod tests {
             async move {
                 crate::common::render::take_rendered_for_test();
                 let code = super::run(&super::StatusArgs {
-                    tx_hash,
+                    tx_hash: Some(tx_hash),
+                    business_id: None,
                     profile: Some(fixture.name.to_owned()),
                     output: OutputFormat::Json,
                     retry_recovery,
@@ -556,7 +648,8 @@ mod tests {
         let mcp = |chain_id: &str, retry_recovery| {
             let args = stellar_agent_mcp::server::StellarTransactionStatusArgs {
                 chain_id: chain_id.to_owned(),
-                tx_hash: tx_hash.clone(),
+                tx_hash: Some(tx_hash.clone()),
+                business_id: None,
                 retry_recovery,
             };
             let server = &server;
@@ -647,6 +740,246 @@ mod tests {
         );
     }
 
+    /// Runs `tx status` and `stellar_transaction_status` with the same
+    /// selectors and returns the CLI exit code with its envelope, then the
+    /// MCP error flag with its envelope.
+    #[cfg(feature = "mainnet-write")]
+    async fn both_surfaces(
+        fixture: &crate::common::mainnet_write_fixture::MainnetFixture,
+        tx_hash: Option<&str>,
+        business_id: Option<&str>,
+    ) -> ((i32, serde_json::Value), (bool, serde_json::Value)) {
+        use crate::common::mainnet_write_fixture::{ORACLE_HOST, PRIMARY_HOST};
+        crate::common::render::take_rendered_for_test();
+        let code = super::run(&super::StatusArgs {
+            tx_hash: tx_hash.map(str::to_owned),
+            business_id: business_id.map(str::to_owned),
+            profile: Some(fixture.name.to_owned()),
+            output: stellar_agent_core::envelope::OutputFormat::Json,
+            retry_recovery: false,
+        })
+        .await;
+        let cli = (code, crate::test_rpc::last_rendered());
+        let server =
+            stellar_agent_mcp::server::WalletServer::new_with_selection_and_routes_for_test(
+                fixture.profile(),
+                stellar_agent_core::profile::name::ProfileNameSource::Flag,
+                &stellar_agent_core::profile::schema::default_profile_dir().expect("profile dir"),
+                &[
+                    (PRIMARY_HOST, &fixture.primary.uri()),
+                    (ORACLE_HOST, &fixture.oracle.uri()),
+                ],
+            )
+            .expect("server");
+        let result = server
+            .call_stellar_transaction_status(
+                stellar_agent_mcp::server::StellarTransactionStatusArgs {
+                    chain_id: fixture.profile().chain_id.to_string(),
+                    tx_hash: tx_hash.map(str::to_owned),
+                    business_id: business_id.map(str::to_owned),
+                    retry_recovery: false,
+                },
+            )
+            .await
+            .expect("tool result");
+        let text = &result.content[0].as_text().expect("text").text;
+        let mcp = (
+            result.is_error == Some(true),
+            serde_json::from_str(text).expect("envelope"),
+        );
+        (cli, mcp)
+    }
+
+    /// On testnet a business id is checked and echoed with the fixed null
+    /// keys, with no request and no window file; a hash keeps its lookup and
+    /// adds `operation: null`; both surfaces refuse the same malformed or
+    /// missing selectors with the same code.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn status_selector_matrix_testnet() {
+        use crate::common::mainnet_write_fixture::{DESTINATION, ISSUER, Spec, pay_rule};
+        use crate::test_rpc::ClassicRpc;
+        let status_rule = "[[rules]]\nmatch = { tool = \"stellar_transaction_status\", \
+                           chain = \"stellar:mainnet\" }\ncriteria = []\ndecision = \"allow\"\n";
+        let fixture = Spec::new("status-selectors-testnet")
+            .testnet()
+            .rules(vec![pay_rule("allow", ""), status_rule.to_owned()])
+            .primary(ClassicRpc::testnet(&[DESTINATION, ISSUER]))
+            .build()
+            .await;
+        let window = fixture.window_path().exists();
+        let methods = fixture.primary_methods().await.len();
+        let ((code, cli), (failed, mcp)) = both_surfaces(&fixture, None, Some("Order-7")).await;
+        let echo = serde_json::json!({
+            "business_id": "Order-7",
+            "operation": null,
+            "chain": null,
+            "receipt": null,
+            "reservation": null,
+        });
+        assert_eq!((code, &cli["data"]), (0, &echo), "{cli}");
+        assert_eq!((failed, &mcp["data"]), (false, &echo), "{mcp}");
+        assert_eq!(fixture.primary_methods().await.len(), methods, "no request");
+        assert_eq!(fixture.window_path().exists(), window, "no storage");
+
+        for (tx_hash, business_id, expected) in [
+            (None, None, "validation.usage_error"),
+            (None, Some("has space"), "validation.business_id_invalid"),
+            (
+                None,
+                Some("\u{0}\u{1F600}"),
+                "validation.business_id_invalid",
+            ),
+            (Some(&*"AB".repeat(32)), None, "validation.address_invalid"),
+        ] {
+            let ((code, cli), (failed, mcp)) = both_surfaces(&fixture, tx_hash, business_id).await;
+            assert_eq!(
+                (code, &cli["error"]["code"]),
+                (1, &serde_json::json!(expected))
+            );
+            assert_eq!(
+                (failed, &mcp["error"]["code"]),
+                (true, &serde_json::json!(expected))
+            );
+        }
+
+        let hash = "ab".repeat(32);
+        let ((code, cli), (failed, mcp)) =
+            both_surfaces(&fixture, Some(&hash), Some("Order-7")).await;
+        assert_eq!((code, failed), (0, false), "{cli} {mcp}");
+        for view in [&cli["data"], &mcp["data"]] {
+            assert_eq!(view["tx_hash"], hash.as_str(), "{view}");
+            assert_eq!(view["business_id"], "Order-7", "{view}");
+            assert!(
+                view["chain_status"].is_string(),
+                "the hash lookup ran: {view}"
+            );
+            assert_eq!(
+                view.get("operation"),
+                Some(&serde_json::Value::Null),
+                "{view}"
+            );
+        }
+    }
+
+    /// On mainnet the selectors resolve before recovery. A business id
+    /// alone, both selectors, and the hash alone report the same stored
+    /// operation on both surfaces; the managed attempt's chain status comes
+    /// from cached recovery evidence with no request. A mismatched hash and
+    /// an unknown business id refuse typed; an unrecorded hash keeps its
+    /// lookup and reports `operation: null`.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn status_selector_matrix_mainnet() {
+        use crate::commands::pay::tests::mainnet_full as pay;
+        use crate::common::mainnet_write_fixture::{
+            AGENT_SEED, DESTINATION, ISSUER, Spec, pay_rule,
+        };
+        use crate::test_rpc::ClassicRpc;
+        let agent = stellar_agent_test_support::signed_envelope::account_id_for_seed(AGENT_SEED);
+        let status_rule = "[[rules]]\nmatch = { tool = \"stellar_transaction_status\", \
+                           chain = \"stellar:mainnet\" }\ncriteria = []\ndecision = \"allow\"\n";
+        let fixture = Spec::new("status-selectors-mainnet")
+            .rules(vec![
+                pay_rule("require_approval", ""),
+                status_rule.to_owned(),
+            ])
+            .primary(ClassicRpc::mainnet(&[&agent, DESTINATION, ISSUER]))
+            .oracle(ClassicRpc::mainnet(&[&agent, DESTINATION, ISSUER]))
+            .build()
+            .await;
+        let args = pay::mainnet_args(&fixture);
+        let business_id = args.business_id.clone().expect("business id");
+        let paid = pay::run(&fixture, &args).await;
+        assert_eq!(paid.code, 0, "{}", paid.envelope);
+        let tx_hash = paid.envelope["data"]["tx_hash"]
+            .as_str()
+            .expect("hash")
+            .to_owned();
+        let methods = fixture.primary_methods().await.len();
+        let mut operations = Vec::new();
+        for (hash, id) in [
+            (None, Some(business_id.as_str())),
+            (Some(tx_hash.as_str()), Some(business_id.as_str())),
+            (Some(tx_hash.as_str()), None),
+        ] {
+            let ((code, cli), (failed, mcp)) = both_surfaces(&fixture, hash, id).await;
+            assert_eq!((code, failed), (0, false), "{cli} {mcp}");
+            assert_eq!(cli["data"]["operation"], mcp["data"]["operation"], "parity");
+            for view in [&cli["data"], &mcp["data"]] {
+                assert_eq!(view["tx_hash"], tx_hash.as_str(), "{view}");
+                assert_eq!(view["chain_status"], "UNKNOWN", "cached evidence: {view}");
+                assert_eq!(view.get("business_id").and_then(|v| v.as_str()), id);
+            }
+            operations.push(cli["data"]["operation"].clone());
+        }
+        assert_eq!(
+            fixture.primary_methods().await.len(),
+            methods,
+            "a managed attempt sends no lookup for its hash"
+        );
+        let operation = &operations[0];
+        assert!(operations.iter().all(|other| other == operation));
+        assert_eq!(operation["business_id"], business_id.as_str());
+        assert_eq!(operation["state"], "sent_outcome_unknown");
+        assert_eq!(operation["compacted"], false);
+        assert_eq!(operation["attempts"][0]["tx_hash"], tx_hash.as_str());
+        assert_eq!(
+            operation["attempts"][0]["auth_entry_sha256"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            operation["hold"],
+            serde_json::json!({"held": false}),
+            "a criteria-free rule holds no bucket: {operation}"
+        );
+
+        let other = "cd".repeat(32);
+        for (hash, id, expected) in [
+            (
+                Some(other.as_str()),
+                Some(business_id.as_str()),
+                "validation.usage_error",
+            ),
+            (None, Some("never-opened"), "operation.unknown"),
+        ] {
+            let ((code, cli), (failed, mcp)) = both_surfaces(&fixture, hash, id).await;
+            assert_eq!(
+                (code, &cli["error"]["code"]),
+                (1, &serde_json::json!(expected))
+            );
+            assert_eq!(
+                (failed, &mcp["error"]["code"]),
+                (true, &serde_json::json!(expected))
+            );
+        }
+        assert_eq!(
+            fixture.primary_methods().await.len(),
+            methods,
+            "refusals read no network"
+        );
+
+        let ((code, cli), (failed, mcp)) = both_surfaces(&fixture, Some(&other), None).await;
+        assert_eq!((code, failed), (0, false), "{cli} {mcp}");
+        for view in [&cli["data"], &mcp["data"]] {
+            assert_eq!(
+                view.get("operation"),
+                Some(&serde_json::Value::Null),
+                "{view}"
+            );
+        }
+        let sent = fixture.primary_methods().await[methods..].to_vec();
+        assert_eq!(
+            sent.iter()
+                .filter(|method| *method == "getTransaction")
+                .count(),
+            2,
+            "an unrecorded hash keeps one lookup per surface: {sent:?}"
+        );
+    }
+
     #[test]
     fn status_help_names_recovery_retry() {
         let help = parse(&["--help"]).expect_err("help").to_string();
@@ -656,6 +989,8 @@ mod tests {
             "never sends a transaction",
             "`recovery` reports the typed recovery result",
             "it never resubmits",
+            "--business-id",
+            "both must name the same operation",
         ] {
             assert!(help.contains(phrase), "{phrase}: {help}");
         }

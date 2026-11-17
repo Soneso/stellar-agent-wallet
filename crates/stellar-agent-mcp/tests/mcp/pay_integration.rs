@@ -4715,7 +4715,8 @@ async fn transaction_status_confirms_a_timed_out_submission() {
     let status = server
         .call_stellar_transaction_status(stellar_agent_mcp::server::StellarTransactionStatusArgs {
             chain_id: "stellar:testnet".to_owned(),
-            tx_hash: tx_hash.clone(),
+            tx_hash: Some(tx_hash.clone()),
+            business_id: None,
             retry_recovery: false,
         })
         .await
@@ -4821,7 +4822,8 @@ async fn transaction_status_retains_a_submission_the_endpoint_cannot_find() {
     let status = server
         .call_stellar_transaction_status(stellar_agent_mcp::server::StellarTransactionStatusArgs {
             chain_id: "stellar:testnet".to_owned(),
-            tx_hash,
+            tx_hash: Some(tx_hash),
+            business_id: None,
             retry_recovery: false,
         })
         .await
@@ -4985,7 +4987,8 @@ async fn a_resend_after_a_lost_receipt_is_refused_and_the_original_settles_later
             .call_stellar_transaction_status(
                 stellar_agent_mcp::server::StellarTransactionStatusArgs {
                     chain_id: "stellar:testnet".to_owned(),
-                    tx_hash: tx_hash.clone(),
+                    tx_hash: Some(tx_hash.clone()),
+                    business_id: None,
                     retry_recovery: false,
                 },
             )

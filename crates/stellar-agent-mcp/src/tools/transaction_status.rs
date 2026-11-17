@@ -33,6 +33,11 @@
 //! new bounded evidence run for a stopped attempt and resets its run count
 //! to one. It never resubmits and authorizes no successor.
 //!
+//! `business_id` selects a mainnet operation by its business id, alone or
+//! with a `tx_hash` of one of its attempts. The selectors are resolved from
+//! the authenticated window before any recovery, and `operation` projects the
+//! stored record afterwards. On testnet the id is checked and echoed only.
+//!
 //! # Why a read tool is not read-only
 //!
 //! The lookup changes wallet state: it records a reported success on the
@@ -52,7 +57,9 @@ use serde_json::json;
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::profile::receipt::{ReceiptStatus, ReleaseEvidence, SubmissionReceipt};
 use stellar_agent_mcp_macros::mcp_tool_router;
-use stellar_agent_network::policy_state::PersistedWindowStore;
+use stellar_agent_network::policy_state::{
+    BusinessId, OperationProjection, PersistedWindowStore, StatusSelectors,
+};
 use stellar_agent_network::submission_flow::{self, StatusFailure, StatusRequest, is_tx_hash};
 
 use crate::server::WalletServer;
@@ -67,7 +74,15 @@ pub struct StellarTransactionStatusArgs {
 
     /// The transaction hash to reconcile, 64 lowercase hex characters. This is
     /// the `details.tx_hash` a `submission.tx_timeout` response carries.
-    pub tx_hash: String,
+    /// Optional when `business_id` is given.
+    #[serde(default)]
+    pub tx_hash: Option<String>,
+
+    /// The business id of a mainnet operation to report. With `tx_hash`,
+    /// both must name the same operation. On testnet it is checked for shape
+    /// and echoed, since testnet keeps no operation records.
+    #[serde(default)]
+    pub business_id: Option<String>,
 
     /// Starts one new bounded recovery run for this hash's stopped mainnet
     /// attempt, also before its retry time or after its runs are exhausted.
@@ -112,6 +127,12 @@ impl WalletServer {
                        one new bounded evidence run for a stopped attempt, also before its retry \
                        time or after RetriesExhausted; it never resubmits and authorizes no \
                        successor. \
+                       Select by tx_hash, business_id, or both naming one operation; neither \
+                       gives validation.usage_error. On mainnet an unknown business_id gives \
+                       operation.unknown, and operation carries the stored state, attempts, \
+                       last transition, hold and result, or null for an unrecorded hash. A \
+                       business_id without an exposed hash reads no network. On testnet a \
+                       business_id is only echoed. \
                        This is the only way to resolve a timed-out submission: never \
                        re-simulate or resubmit, because \
                        the transaction may still apply and its sequence may already be spent. \
@@ -131,15 +152,43 @@ impl WalletServer {
             return error.into_result();
         }
 
-        if !is_tx_hash(&args.tx_hash) {
+        if args
+            .tx_hash
+            .as_deref()
+            .is_some_and(|hash| !is_tx_hash(hash))
+        {
             return Ok(business_error_result(
                 "validation.address_invalid",
                 "tx_hash must be 64 lowercase hex characters",
             ));
         }
+        let selectors =
+            match StatusSelectors::parse(args.tx_hash.as_deref(), args.business_id.as_deref()) {
+                Ok(selectors) => selectors,
+                Err(error) => return Ok(business_error_result(error.code(), error.message())),
+            };
+        if !self.profile.chain_id.is_mainnet()
+            && let (None, Some(business_id)) = (&selectors.tx_hash, &selectors.business_id)
+        {
+            return Ok(success_result(testnet_business_view(business_id)));
+        }
 
         let profile_name = self.profile_name_for_approval();
         let window = PersistedWindowStore::for_profile(&profile_name);
+        let target = match submission_flow::select_status(&self.profile, &window, &selectors) {
+            Ok(target) => target,
+            Err(error) => return Ok(status_error_result(error)),
+        };
+        let Some(tx_hash) = target.tx_hash.as_deref() else {
+            return Ok(
+                match submission_flow::operation_projection(&self.profile, &window, &target) {
+                    Ok(operation) => {
+                        success_result(selected_view(&selectors, None, operation.as_ref()))
+                    }
+                    Err(error) => status_error_result(error),
+                },
+            );
+        };
         let client = match self.context.primary_client() {
             Ok(client) => client,
             Err(err) => {
@@ -156,6 +205,7 @@ impl WalletServer {
         let outcome = match submission_flow::transaction_status(
             status_request(
                 &args,
+                tx_hash,
                 &self.profile,
                 &profile_name,
                 &window,
@@ -176,17 +226,63 @@ impl WalletServer {
             Ok(outcome) => outcome,
             Err(error) => return Ok(status_error_result(error)),
         };
-
-        let envelope = Envelope::ok(status_view(&args.tx_hash, &outcome));
-        let json_out = envelope
-            .to_json_pretty()
-            .unwrap_or_else(|_| String::from("{}"));
-        Ok(CallToolResult::success(vec![Content::text(json_out)]))
+        Ok(
+            match submission_flow::operation_projection(&self.profile, &window, &target) {
+                Ok(operation) => success_result(selected_view(
+                    &selectors,
+                    Some(status_view(tx_hash, &outcome)),
+                    operation.as_ref(),
+                )),
+                Err(error) => status_error_result(error),
+            },
+        )
     }
+}
+
+fn success_result(view: serde_json::Value) -> CallToolResult {
+    let json_out = Envelope::ok(view)
+        .to_json_pretty()
+        .unwrap_or_else(|_| String::from("{}"));
+    CallToolResult::success(vec![Content::text(json_out)])
+}
+
+/// A testnet business-only call: the echoed id and the fixed null keys.
+fn testnet_business_view(business_id: &BusinessId) -> serde_json::Value {
+    json!({
+        "business_id": business_id,
+        "operation": null,
+        "chain": null,
+        "receipt": null,
+        "reservation": null,
+    })
+}
+
+/// The hash view, or null hash keys when no exposed hash was targeted, with
+/// the operation projection and any supplied business id.
+fn selected_view(
+    selectors: &StatusSelectors,
+    hash_view: Option<serde_json::Value>,
+    operation: Option<&OperationProjection>,
+) -> serde_json::Value {
+    let mut view = hash_view.unwrap_or_else(|| {
+        json!({
+            "tx_hash": null,
+            "chain_status": null,
+            "ledger": null,
+            "record": null,
+            "reservation": null,
+        })
+    });
+    view["operation"] = json!(operation);
+    if let Some(business_id) = &selectors.business_id {
+        view["business_id"] = json!(business_id);
+    }
+    view
 }
 
 fn status_request<'a>(
     args: &'a StellarTransactionStatusArgs,
+    tx_hash: &'a str,
     profile: &'a stellar_agent_core::profile::schema::Profile,
     profile_name: &'a str,
     window: &'a PersistedWindowStore,
@@ -196,7 +292,7 @@ fn status_request<'a>(
     StatusRequest {
         profile,
         profile_name,
-        tx_hash: &args.tx_hash,
+        tx_hash,
         window,
         client,
         oracle,
@@ -293,6 +389,7 @@ fn status_error_result(error: StatusFailure) -> CallToolResult {
             "network.rpc_unreachable",
             format!("the endpoint could not be asked about this transaction: {e}"),
         ),
+        StatusFailure::SelectorRefused(e) => business_error_result(e.code(), e.message()),
     }
 }
 
@@ -362,7 +459,7 @@ mod tests {
         ] {
             let args = parse(value).expect("arguments");
             assert_eq!(args.retry_recovery, expected);
-            let request = super::status_request(&args, &profile, "p", &window, &client, None);
+            let request = super::status_request(&args, HASH, &profile, "p", &window, &client, None);
             assert_eq!(request.retry_recovery, expected);
         }
         for wrong in [json!("true"), json!(1), json!(null)] {

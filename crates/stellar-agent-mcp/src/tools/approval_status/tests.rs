@@ -251,6 +251,96 @@ async fn approval_status_dispatch_uses_one_snapshot_and_preserves_refusals() {
     assert_eq!(reads.load(Ordering::SeqCst), 0);
 }
 
+/// A real V1 rule that rate-limits approval status evaluates the frame the
+/// facade's image hydrates, at the facade's read instant: one recorded call
+/// inside the hour at that instant denies, and one millisecond later the same
+/// call is outside the hour and the status answers.
+#[tokio::test]
+#[serial(keyring, mainnet_clock)]
+#[serial]
+async fn approval_status_frame_feeds_a_real_policy_at_the_read_instant() {
+    use stellar_agent_core::policy::v1::PolicyEngineV1;
+    use stellar_agent_core::policy::v1::criteria::{
+        per_period_cap::Window, rate_limit::RateLimitCriterion,
+    };
+    use stellar_agent_core::policy::v1::loader::{PolicyDocument, PolicyRule, RuleMatch, ScopeId};
+    use stellar_agent_core::timefmt::MockClock;
+    let root = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(root.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
+    let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+    let _store_clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(now);
+    let profile =
+        Profile::builder_testnet_named("rated", "rated-sign", "key", "rated-nonce", "key")
+            .with_noop_engine()
+            .build();
+    PersistedWindowStore::for_profile("rated")
+        .record_and_persist(
+            &profile,
+            &[WindowEntry::new(
+                StateKey::new("rated", 1, "rate_limit", 3600),
+                now - 3_600_000,
+                1,
+                WindowLimit::Count {
+                    window: "1h".into(),
+                    max_calls: 1,
+                },
+            )],
+        )
+        .unwrap();
+    let entry = fixtures::payment_pending(
+        ALLOWED_DESTINATION,
+        ALLOWED_DESTINATION,
+        "XLM",
+        10,
+        None,
+        100,
+        7,
+        "123".into(),
+        600_000,
+    );
+    let mut server = WalletServer::new(profile).unwrap();
+    let inbox = server.resolve_approval_dir().unwrap().join("rated.toml");
+    PendingApprovalStore::open(inbox)
+        .unwrap()
+        .insert(entry.clone(), now)
+        .unwrap();
+    let document = PolicyDocument {
+        version: 2,
+        scope: ScopeId::AllProfiles,
+        rules: vec![PolicyRule {
+            r#match: RuleMatch {
+                tool: "stellar_approval_status".into(),
+                chain: "*".into(),
+            },
+            criteria: vec![Box::new(RateLimitCriterion::new(
+                Window::parse("1h").unwrap(),
+                1,
+            ))],
+            decision: Decision::Allow,
+            allow_opaque_signing: false,
+        }],
+        signature: None,
+    };
+    server.set_policy_engine_for_test(Arc::new(PolicyEngineV1::new(document, "rated".into())));
+    for (at, denied) in [(now, true), (now + 1, false)] {
+        server.set_clock_for_test(Arc::new(MockClock::new(move || Ok(at))));
+        let result = server
+            .approval_status_for_test(entry.approval_nonce.clone())
+            .await
+            .unwrap();
+        let view = value(&result);
+        assert_eq!(
+            (
+                result.is_error == Some(true),
+                view["error"]["code"].as_str()
+            ),
+            (denied, denied.then_some("policy.deny.rate_limit_exceeded")),
+            "the frame holds the recorded call at the read instant {at}: {view}"
+        );
+    }
+}
+
 #[tokio::test]
 #[serial(keyring)]
 #[serial]

@@ -158,7 +158,8 @@ async fn check(case: Case) {
     let result = server
         .call_stellar_transaction_status(StellarTransactionStatusArgs {
             chain_id: "stellar:testnet".to_owned(),
-            tx_hash: TX_HASH.to_owned(),
+            tx_hash: Some(TX_HASH.to_owned()),
+            business_id: None,
             retry_recovery: false,
         })
         .await
