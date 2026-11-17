@@ -983,7 +983,9 @@ per-transaction or per-period cap, refuses them with
 without criteria returns its own decision. The two transaction tools then
 decide each payment in the transaction under its payment tool's rule; see
 [SEP-43 transaction effects](#sep-43-transaction-effects). The auth-entry tool
-has no such decision. `stellar_pay_commit` renders a
+decides each token transfer the signing account authorizes under the
+`stellar_pay_commit` rule; see
+[SEP-43 auth-entry effects](#sep-43-auth-entry-effects). `stellar_pay_commit` renders a
 payment, `stellar_rule_create_commit` renders a full rule definition, and so
 on. An arbitrary-invocation `execute` tool on the agent surface would have no
 such preview: it would sign whatever contract, function, and `ScVal` arguments
@@ -1018,7 +1020,7 @@ Credentialed input URLs are refused. On a mainnet profile the three tools refuse
 | `stellar_sep43_get_address` | Return the active wallet address. | Read-only. |
 | `stellar_sep43_get_network` | Return the active network name and passphrase. | Read-only. |
 | `stellar_sep43_sign_transaction` | Sign a `TransactionEnvelope` XDR; return `signedTxXdr` and `signerAddress`. | Signs; does not submit. Decides each payment under its payment tool's rule and charges the policy windows when it signs. Requires the audit chain key (refuses `audit.chain_key_unavailable` before signing) and records an `opaque_payload_signed` audit row with the allowed payment legs. An approval requirement returns `approval` first; the attested repeat with `approval_nonce` and `approval_attestation` signs and spends the approval. |
-| `stellar_sep43_sign_auth_entry` | Sign the base64 `HashIdPreimage` of a Soroban authorization entry (envelope type 9, or type 10 bound to the signing key's account); return the raw signature as `signedAuthEntry` and `signerAddress`. | Signs; does not submit. Requires the audit chain key (refuses `audit.chain_key_unavailable` before signing) and records an `opaque_payload_signed` audit row. |
+| `stellar_sep43_sign_auth_entry` | Sign the base64 `HashIdPreimage` of a Soroban authorization entry (envelope type 9, or type 10 bound to the signing key's account); return the raw signature as `signedAuthEntry` and `signerAddress`. | Signs; does not submit. Decides each token transfer the signing account authorizes under the `stellar_pay_commit` rule and charges the policy windows when it signs. Requires the audit chain key (refuses `audit.chain_key_unavailable` before signing) and records an `opaque_payload_signed` audit row with the allowed legs. An approval requirement refuses with `policy.approval_required_unsupported`. |
 | `stellar_sep43_sign_message` | Sign an arbitrary UTF-8 message via `SHA-256("Stellar Signed Message:\n" + message)` then ed25519; return `signedMessage` (base64) and `signerAddress`. | Signs; does not submit. Refuses an overlaid or out-of-scope signer. Requires the audit chain key (refuses `audit.chain_key_unavailable` before signing) and records an `opaque_payload_signed` audit row. |
 | `stellar_sep43_sign_and_submit_transaction` | Sign a `TransactionEnvelope` XDR, submit it, and poll until confirmed; return `signedTxXdr`, `txHash`, and `status`. | Signs and submits; policy gate. Decides each payment under its payment tool's rule and charges the policy windows before it signs; the pending row carries the allowed legs. An approval requirement returns `approval` first; the attested repeat with `approval_nonce` and `approval_attestation` submits, and the send spends the approval. |
 
@@ -1099,6 +1101,39 @@ A spent approval refuses with `policy.approval_consumed`. The submitting tool's
 send spends the approval. The sign-only tool spends it before it returns the
 signature; a failed spend returns `submission.record_unavailable` and no
 signature. Its `opaque_payload_signed` row records `require_approval`.
+
+#### SEP-43 auth-entry effects
+
+After the tool's own rule allows, `stellar_sep43_sign_auth_entry` decides the
+invocation tree of the preimage. The order is: mainnet refusal, address forms,
+own rule, preimage checks, effects decision, audit pre-flight, admission,
+signer, signature.
+
+- The preimage passes the signing checks for the profile signer's G-key before
+  any read: base64 and bounded XDR (`sep43.invalid_xdr`), envelope type 9 or
+  10 (`sep43.malformed_auth_entry`), the profile network
+  (`sep43.invalid_network_passphrase`) and a type 10 binding to that account
+  (`sep43.invalid_address`). A profile signer that is not a G-strkey refuses
+  with `policy.engine_required`, since the debited account is unknown.
+- Each `transfer`, `transfer_from`, `approve` and `burn` or `burn_from` call
+  the signer's account authorizes, at any depth, is a payment of the contract
+  asset decided by the `stellar_pay_commit` rule. Each decision uses the signed
+  contract address, the exact `i128` quantity and the recipient, with no memo
+  and no fee, inside the own rule's policy state and instant. A zero transfer
+  is a payment; a zero allowance has no payment. A memo binding on the
+  recipient refuses, since a preimage carries no memo.
+- A call the wallet cannot value, a negative quantity or a call another
+  account authorizes needs `allow_opaque_signing = true` on the tool's own
+  rule, and the token transfers beside it are still decided. A contract
+  creation has no payment.
+- An approval requirement of the own rule or of the pay rule refuses with
+  `policy.approval_required_unsupported`. No pending approval is stored.
+
+Admission records every allowed payment and the tool's own count in one
+durable batch before the signer loads. A refused batch records nothing. A
+signer or signing failure keeps the admitted usage, and each call charges
+again, identical bytes included. The `opaque_payload_signed` row records the
+allowed legs with their contract asset and redacted recipients.
 
 Both `stellar_sep43_sign_message` and `stellar_sep53_sign_message` use these
 refusals before loading the signer:

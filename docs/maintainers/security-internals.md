@@ -780,7 +780,7 @@ It defaults to false and returns true for the Noop engine.
 The query supplies consent information; the rule's decision still governs the call.
 The signing audit constructor accepts ordered evaluated legs.
 An empty vector is omitted and historical rows deserialize with empty legs.
-Transaction signing passes its allowed payment legs; auth-entry and message-signing callers pass empty vectors.
+Transaction and auth-entry signing pass their allowed payment legs; message-signing callers pass empty vectors.
 
 ### SEP-43 transaction effects
 
@@ -858,6 +858,44 @@ A native asset contract transfer keeps its contract address, so reserve
 criteria count no debit for it and known-issuer checks fail closed. A fee paid
 by another account has no cap and no reserve debit in this gate. Address
 credentials carry their own signatures and add no effect.
+
+### SEP-43 auth-entry effects
+
+Invariant: an auth-entry signature leaves the wallet only after the tool's own
+rule and the `stellar_pay_commit` rule of every token leg the signing account
+authorizes permit the same contract asset, quantity and recipient. The
+authorizing account is the profile signer's G-key. One durable admission of
+those legs and the own count precedes seed access and is never refunded.
+
+`sep43_auth_entry_gate` in `crates/stellar-agent-mcp/src/tools/sep43_effects.rs`
+runs after the own rule allows and before the audit pre-flight:
+
+1. Parse the profile signer account. A value that is not a G-strkey refuses
+   with `policy.engine_required`: the debited account is unknown, and an
+   empty valuation would sign unbounded transfers.
+2. Run `stellar_agent_sep43::signing::validate_soroban_auth_entry` for that
+   key: the signing checks for base64, bounded XDR, envelope type, network,
+   mainnet and the type 10 binding, without a signer. Signing repeats them
+   and compares the signer's actual key. A caller `address` that is not that
+   G-key refuses with `sep43.invalid_address` here, before any read or
+   admission.
+3. Walk the invocation with `authorized_invocation_effects` for
+   `ScAddress::Account` of that key. An unvalued node requires
+   `opaque_signing_opted_in` on the tool's own descriptor; its token children
+   stay legs.
+4. Stage the own rule's count. Evaluate each leg on the pay route through the
+   shared leg evaluation of the transaction gate: the outer frame, a zero
+   fee, no memo, one wallet read and one read per recipient base account.
+   Without a leg nothing is read.
+5. Refuse a leg's `RequireApproval` with `policy.approval_required_unsupported`.
+   No pending approval is stored, so the transaction approval wrapper is never
+   reached.
+
+The handler then runs the audit pre-flight, `sep43_admit` and the signer. The
+row passes the admitted legs. The lock order is the audit writer sidecar, the
+window-state lock inside admission, released before signer acquisition. No
+approval lock is taken. A repeated preimage is a new signature and charges
+again; there is no idempotency key or stored signature.
 
 ### Key-write emission sites
 

@@ -588,9 +588,10 @@ binding still refuses with `audit.log_binding_changed` before signing or submiss
 The SEP-43 sign-only pair (`signTransaction`, `signAuthEntry`) runs the same
 preflight. It writes `opaque_payload_signed` when it produces the signature,
 recording the redacted payload digest and signer. The caller broadcasts externally.
-A transaction signature also records the allowed payment legs with amount,
-asset and redacted destination. Empty legs are omitted, so auth-entry and
-message signatures keep their serialized row shape.
+A transaction or auth-entry signature also records the allowed payment legs
+with amount, asset and redacted destination. Empty legs are omitted, so
+message signatures and signatures without a payment keep their serialized row
+shape.
 
 Both SEP-43 transaction tools decide each payment the transaction authorizes
 under the rule of its payment tool, after the tool's own rule allows. They
@@ -604,6 +605,14 @@ no value effect. An approval requirement of one payment, path payment,
 account creation or trustline change returns a pending approval, and the
 attested repeat signs and spends it. See
 [the MCP guide](./mcp.md#sep-43-transaction-effects).
+
+The auth-entry tool decides each token transfer, allowance and burn that the
+signer's account authorizes in the preimage's invocation tree under the
+`stellar_pay_commit` rule, with the contract asset, the exact quantity and the
+recipient. It charges those payments and its own count before the signer
+loads. A call it cannot value needs `allow_opaque_signing = true`, and an
+approval requirement refuses with `policy.approval_required_unsupported`. See
+[the MCP guide](./mcp.md#sep-43-auth-entry-effects).
 
 ## Emergency stop
 

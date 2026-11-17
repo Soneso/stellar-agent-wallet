@@ -12,6 +12,10 @@
 //!   ed25519 signature via `sign_message` over
 //!   `SHA256("Stellar Signed Message:\n" ‖ message)`.
 //!
+//! [`validate_soroban_auth_entry`] runs the `signAuthEntry` input checks
+//! without a signer, so a caller can decide the authorized invocation before
+//! it loads a key.
+//!
 //! # Canonical byte-layout references
 //!
 //! - stellar-xdr `TransactionEnvelope`: `Tx` variant carries
@@ -62,8 +66,10 @@ use stellar_agent_network::mainnet::{
 #[cfg(feature = "mainnet-write")]
 use stellar_agent_network::signing::AuthorizedPayloadError;
 use stellar_agent_network::signing::{MessagePayload, Signer, SorobanAuthPayload};
-use stellar_agent_soroban_auth::preimage_parts;
-use stellar_xdr::{AccountId, HashIdPreimage, PublicKey, ReadXdr, ScAddress, Uint256};
+use stellar_agent_soroban_auth::{preimage_invocation, preimage_parts};
+use stellar_xdr::{
+    AccountId, HashIdPreimage, PublicKey, ReadXdr, ScAddress, SorobanAuthorizedInvocation, Uint256,
+};
 
 use crate::error::Sep43Error;
 
@@ -229,18 +235,14 @@ async fn sign_soroban_auth_entry_inner(
     network_passphrase_override: Option<&str>,
     admission: Option<&MuxedContractAdmission>,
 ) -> Result<String, Sep43Error> {
-    let received = decode_preimage(
+    let preimage = checked_preimage(
         preimage_xdr,
+        expected_signer,
         expected_network_passphrase,
         network_passphrase_override,
         admission,
     )?;
-    if received.network_id == mainnet_network_id() {
-        return Err(mainnet_signing_forbidden());
-    }
-    check_bound_address(&received.preimage, &expected_signer.0)?;
-    let payload =
-        SorobanAuthPayload::from_preimage(&received.preimage).map_err(wallet_error_to_sep43)?;
+    let payload = SorobanAuthPayload::from_preimage(&preimage).map_err(wallet_error_to_sep43)?;
 
     // Sign the preimage's payload with the auth-entry signing primitive.
     let sig_bytes = signer
@@ -398,6 +400,72 @@ async fn sign_soroban_auth_entry_authorized_inner(
     ))
 }
 
+/// Validates a `signAuthEntry` request for `expected_signer` and returns the
+/// invocation its preimage authorizes.
+///
+/// Runs the checks 1 to 6 of [`sign_soroban_auth_entry`] without a signer.
+/// Validation grants no signing authority: the signing functions repeat
+/// every check, and the signer's actual key must still be `expected_signer`.
+///
+/// # Errors
+///
+/// The input errors of [`sign_soroban_auth_entry`]:
+/// [`Sep43Error::InvalidNetworkPassphrase`], [`Sep43Error::InvalidXdr`],
+/// [`Sep43Error::MalformedAuthEntry`], [`Sep43Error::MainnetSigningForbidden`]
+/// and [`Sep43Error::InvalidAddress`].
+///
+/// # Panics
+///
+/// Never panics.
+pub fn validate_soroban_auth_entry(
+    preimage_xdr: &str,
+    expected_signer: &stellar_strkey::ed25519::PublicKey,
+    expected_network_passphrase: &str,
+    network_passphrase_override: Option<&str>,
+) -> Result<SorobanAuthorizedInvocation, Sep43Error> {
+    let preimage = checked_preimage(
+        preimage_xdr,
+        expected_signer,
+        expected_network_passphrase,
+        network_passphrase_override,
+        None,
+    )?;
+    preimage_invocation(&preimage)
+        .cloned()
+        .ok_or_else(not_an_auth_preimage)
+}
+
+/// Runs the checks 1 to 6 of [`sign_soroban_auth_entry`] and returns the
+/// decoded preimage.
+fn checked_preimage(
+    preimage_xdr: &str,
+    expected_signer: &stellar_strkey::ed25519::PublicKey,
+    expected_network_passphrase: &str,
+    network_passphrase_override: Option<&str>,
+    admission: Option<&MuxedContractAdmission>,
+) -> Result<HashIdPreimage, Sep43Error> {
+    let received = decode_preimage(
+        preimage_xdr,
+        expected_network_passphrase,
+        network_passphrase_override,
+        admission,
+    )?;
+    if received.network_id == mainnet_network_id() {
+        return Err(mainnet_signing_forbidden());
+    }
+    check_bound_address(&received.preimage, &expected_signer.0)?;
+    Ok(received.preimage)
+}
+
+/// The refusal of a `HashIdPreimage` that is neither envelope type 9 nor 10.
+fn not_an_auth_preimage() -> Sep43Error {
+    Sep43Error::MalformedAuthEntry {
+        detail: "preimage is not a Soroban authorization HashIdPreimage \
+                 (envelope type 9 or 10)"
+            .to_owned(),
+    }
+}
+
 /// A received authorization-entry preimage that passed the input checks.
 struct ReceivedPreimage {
     /// The decoded preimage.
@@ -446,11 +514,7 @@ fn decode_preimage(
         });
     }
     let Some((_, network_id, _)) = preimage_parts(&preimage) else {
-        return Err(Sep43Error::MalformedAuthEntry {
-            detail: "preimage is not a Soroban authorization HashIdPreimage \
-                     (envelope type 9 or 10)"
-                .to_owned(),
-        });
+        return Err(not_an_auth_preimage());
     };
     let expected_network_id: [u8; 32] =
         Sha256::digest(expected_network_passphrase.as_bytes()).into();
@@ -1386,6 +1450,79 @@ mod tests {
             0,
             "a refused preimage must not be signed"
         );
+    }
+
+    /// The validator returns the invocation of a type 9 preimage and of a
+    /// type 10 preimage bound to the key, and refuses every other input with
+    /// the code signing gives it.
+    #[test]
+    fn validate_soroban_auth_entry_runs_the_signing_checks() {
+        use stellar_xdr::{
+            Hash, HashIdPreimageOperationId, Limits, SequenceNumber, SorobanAuthorizedInvocation,
+            WriteXdr,
+        };
+        const MAINNET: &str = "Public Global Stellar Network ; September 2015";
+        let key = stellar_strkey::ed25519::PublicKey([0x76u8; 32]);
+        let validate = |xdr: &str, network: &str, passphrase: Option<&str>| {
+            validate_soroban_auth_entry(xdr, &key, network, passphrase)
+        };
+        let code = |xdr: &str| validate(xdr, TESTNET, None).unwrap_err().wire_code();
+        assert_eq!(
+            validate(&minimal_soroban_auth_preimage_xdr(TESTNET), TESTNET, None).unwrap(),
+            minimal_invocation()
+        );
+        let bound = minimal_soroban_auth_v2_preimage_xdr(TESTNET, account_address(&key));
+        assert_eq!(
+            validate(&bound, TESTNET, None).unwrap(),
+            minimal_invocation()
+        );
+        let other = stellar_strkey::ed25519::PublicKey([0x99u8; 32]);
+        for address in [
+            account_address(&other),
+            ScAddress::Contract(stellar_xdr::ContractId(Hash(key.0))),
+            ScAddress::MuxedAccount(stellar_xdr::MuxedEd25519Account {
+                id: 7,
+                ed25519: Uint256(key.0),
+            }),
+        ] {
+            let xdr = minimal_soroban_auth_v2_preimage_xdr(TESTNET, address);
+            assert_eq!(code(&xdr), "sep43.invalid_address");
+        }
+        assert_eq!(code("not base64!"), "sep43.invalid_xdr");
+        assert_eq!(code("AAAAAQAA"), "sep43.invalid_xdr");
+        let operation_id = HashIdPreimage::OpId(HashIdPreimageOperationId {
+            source_account: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(key.0))),
+            seq_num: SequenceNumber(1),
+            op_num: 0,
+        })
+        .to_xdr_base64(Limits::none())
+        .unwrap();
+        assert_eq!(code(&operation_id), "sep43.malformed_auth_entry");
+        let foreign = minimal_soroban_auth_preimage_xdr("wrong passphrase");
+        assert_eq!(code(&foreign), "sep43.invalid_network_passphrase");
+        let testnet = minimal_soroban_auth_preimage_xdr(TESTNET);
+        let mismatch = validate(&testnet, TESTNET, Some(MAINNET)).unwrap_err();
+        assert_eq!(mismatch.wire_code(), "sep43.invalid_network_passphrase");
+        let mainnet = minimal_soroban_auth_preimage_xdr(MAINNET);
+        let refused = validate(&mainnet, MAINNET, None).unwrap_err();
+        assert_eq!(refused.wire_code(), "sep43.mainnet_signing_forbidden");
+        let mut deep = minimal_invocation();
+        for _ in 0..600 {
+            deep = SorobanAuthorizedInvocation {
+                function: minimal_invocation().function,
+                sub_invocations: vec![deep].try_into().unwrap(),
+            };
+        }
+        let deep =
+            HashIdPreimage::SorobanAuthorization(stellar_xdr::HashIdPreimageSorobanAuthorization {
+                network_id: Hash(Sha256::digest(TESTNET.as_bytes()).into()),
+                nonce: 1,
+                signature_expiration_ledger: 1,
+                invocation: deep,
+            })
+            .to_xdr_base64(Limits::none())
+            .unwrap();
+        assert_eq!(code(&deep), "sep43.invalid_xdr");
     }
 
     // ── sign_message_bytes ────────────────────────────────────────────────────
