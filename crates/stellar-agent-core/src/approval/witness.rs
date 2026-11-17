@@ -712,15 +712,48 @@ pub fn verify_intent_approval(
         nonce,
         attestation,
         intent,
-        decision,
+        Some(decision),
         policy,
         now_ms,
         |name| MainnetApprovalAuthority::for_profile(name)?.load_current_compare_only(),
     )
 }
 
-/// [`verify_intent_approval`] with the current policy read by `current`
-/// from the profile name.
+/// Verifies first consent to an authenticated stored intent under `admission`.
+/// The caller validates the durable operation and approval link before calling.
+/// The signed waiting interval supplies the lifetime; this witness records
+/// consent and does not replace a fresh execution decision.
+///
+/// # Errors
+/// Returns the subject, attestation, receipt, policy and clock refusals of
+/// [`verify_intent_approval`]. No policy lock is acquired inside the inbox lock.
+#[allow(clippy::too_many_arguments, reason = "each ceremony input is explicit")]
+pub fn verify_intent_consent_admitted(
+    pending: &PendingApprovalStore,
+    profile: &Profile,
+    profile_name: &str,
+    nonce: &str,
+    attestation: &[u8; 32],
+    intent: &ClassicIntent,
+    policy: &VerifiedPolicy,
+    now_ms: u64,
+    admission: &super::presence_policy::PolicyAdmission,
+) -> Result<ApprovalWitness, WalletError> {
+    verify_intent_approval_with(
+        pending,
+        profile,
+        profile_name,
+        nonce,
+        attestation,
+        intent,
+        None,
+        policy,
+        now_ms,
+        |name| MainnetApprovalAuthority::for_profile(name)?.load_admitted(admission),
+    )
+}
+
+/// Shared V6 and receipt verification for execution and admitted ceremony completion.
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -733,7 +766,7 @@ pub(crate) fn verify_intent_approval_with(
     nonce: &str,
     attestation: &[u8; 32],
     intent: &ClassicIntent,
-    decision: &MainnetDecision,
+    decision: Option<&MainnetDecision>,
     policy: &VerifiedPolicy,
     now_ms: u64,
     current: impl FnOnce(&str) -> Result<CurrentMainnetApprovalPolicy, WalletError>,
@@ -776,14 +809,18 @@ pub(crate) fn verify_intent_approval_with(
     }
     let signed_lifetime = record
         .expires_at_unix_ms
-        .checked_sub(record.created_at_unix_ms);
-    if !matches!(decision.decision(), Decision::RequireApproval(_))
-        || *decision.scope() != AuthorityScope::Classic
-        || decision.profile() != profile_name
-        || decision.chain_id() != binding.chain_id
-        || decision.policy_digest() != policy.digest()
+        .checked_sub(record.created_at_unix_ms)
+        .ok_or_else(|| invalid("the signed waiting interval is reversed"))?;
+    if intent.base().chain_id() != binding.chain_id
         || *intent.base().policy_digest() != policy.digest()
-        || signed_lifetime != Some(decision.governing_ttl_ms())
+        || decision.is_some_and(|decision| {
+            !matches!(decision.decision(), Decision::RequireApproval(_))
+                || *decision.scope() != AuthorityScope::Classic
+                || decision.profile() != profile_name
+                || decision.chain_id() != binding.chain_id
+                || decision.policy_digest() != policy.digest()
+                || signed_lifetime != decision.governing_ttl_ms()
+        })
     {
         return Err(invalid("the decision does not govern this approval"));
     }
@@ -792,7 +829,7 @@ pub(crate) fn verify_intent_approval_with(
         record.created_at_unix_ms,
         record.expires_at_unix_ms,
         consent_at_ms,
-        decision.governing_ttl_ms(),
+        signed_lifetime,
         now_ms,
     )?;
     let current = current(profile_name)?;
@@ -825,6 +862,10 @@ pub(crate) fn verify_intent_approval_with(
         challenge_subject: Some(super::presence::mainnet_consent_subject(record, &binding)?),
     })
 }
+
+#[cfg(test)]
+#[path = "witness/ceremony_tests.rs"]
+mod ceremony_tests;
 
 /// The clocks of an intent approval, from signed inputs only.
 ///

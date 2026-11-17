@@ -145,6 +145,7 @@ fn failed_publication_reread_requires_complete_match() {
         &fx.facts.nonce,
         &fx.fixture.current_policy(),
         ConsentRow::Written,
+        &fx.fixture.authority().admit().unwrap(),
     )
     .unwrap()
     .into_witness();
@@ -854,6 +855,7 @@ fn publication_commits_receipt_reference_and_provenance() {
             &fx.facts.nonce,
             &fx.fixture.current_policy(),
             ConsentRow::Recovered,
+            &fx.fixture.authority().admit().unwrap(),
         )
         .unwrap();
         assert!(commit_consent(&fx.store, fx.fixture.profile(), &compatibility).is_ok());
@@ -941,6 +943,7 @@ fn publication_refuses_revoked_retry() {
         &fx.facts.nonce,
         &fx.fixture.current_policy(),
         ConsentRow::Recovered,
+        &fx.fixture.authority().admit().unwrap(),
     )
     .unwrap();
     drop(inbox);

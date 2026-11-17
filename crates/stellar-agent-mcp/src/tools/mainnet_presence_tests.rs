@@ -1982,6 +1982,7 @@ async fn mcp_approve_browser_round_trip_records_before_signing() {
     let context = ApprovalContext::from_profile(PROFILE, profile);
     let authority = MainnetApprovalAuthority::for_profile(PROFILE).unwrap();
     let mut handle = start_mainnet_presence(MainnetPresenceConfig {
+        intent: None,
         entry: entry.clone(),
         context: context.clone(),
         authority: authority.clone(),

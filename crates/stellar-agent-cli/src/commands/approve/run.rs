@@ -458,7 +458,6 @@ async fn approve_mainnet(
     profile: &Profile,
     mode: OpenMode,
 ) -> Result<MainnetApproved, WalletError> {
-    render_summary(entry, context);
     stellar_agent_core::approval::verify_entry_terms(&entry.kind)?;
     // The stored payment destination refuses before presence starts.
     stellar_agent_core::approval::verify_stored_destination(&entry.kind)?;
@@ -466,10 +465,19 @@ async fn approve_mainnet(
         return Err(error);
     }
     mainnet_consent_subject(entry, &context.binding())?;
-    let authority = MainnetApprovalAuthority::for_profile(&context.profile_name)?;
-    let window = PersistedWindowStore::for_profile(&context.profile_name);
-    let durable = durable_approval(&window, profile, context, entry)?;
     drop(store);
+    init_platform_keyring_store()?;
+    let authority = MainnetApprovalAuthority::for_profile(&context.profile_name)?;
+    let current = authority.load_current()?;
+    let intent =
+        crate::common::mainnet_presence::stored_intent(entry, &context.profile_name, &current)?;
+    if let Some(intent) = intent.as_ref() {
+        let _ = crate::common::intent_summary::write(intent, &mut std::io::stderr());
+    } else {
+        render_summary(entry, context);
+    }
+    let window = PersistedWindowStore::for_profile(&context.profile_name);
+    let durable = durable_approval(&window, profile, context, entry, intent.as_ref())?;
     let integrated = durable.as_ref().is_some_and(|view| {
         stellar_agent_network::policy_state::approvals::delivery_enforced(
             &context.profile_name,
@@ -505,7 +513,6 @@ async fn approve_mainnet(
             }
         );
     }
-    init_platform_keyring_store()?;
     let presence =
         acquire_mainnet_presence_with_mode(entry, context, &authority, store_path, mode).await?;
     let data = PresenceData {
@@ -513,14 +520,10 @@ async fn approve_mainnet(
         credential_fingerprint: presence.credential_fingerprint().to_owned(),
         request_id: presence.request_id().to_owned(),
     };
-    let admission = integrated.then(|| authority.admit()).transpose()?;
+    let admission = authority.admit()?;
     let mut store = open_with_retry(store_path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF)
         .map_err(|e| super::common::approval_store_open_error(&e))?;
-    let policy = match &admission {
-        Some(admission) => authority.load_admitted(admission)?,
-        None => authority.load_current_compare_only()?,
-    }
-    .into_policy();
+    let policy = authority.load_admitted(&admission)?.into_policy();
     let key = load_attestation_key(
         &profile.attestation_key_id,
         &stellar_agent_core::profile::owner_key::OwnerKeyContext::for_profile(
@@ -534,20 +537,14 @@ async fn approve_mainnet(
         &key,
         context,
         profile,
-        match &admission {
-            Some(admission) => ConsentAuthorization::MainnetAdmitted {
-                presence,
-                policy: &policy,
-                admission,
-            },
-            None => ConsentAuthorization::Mainnet {
-                presence,
-                policy: &policy,
-            },
+        ConsentAuthorization::MainnetAdmitted {
+            presence,
+            policy: &policy,
+            admission: &admission,
         },
         reservation,
     )?;
-    let completion = if let Some(admission) = admission {
+    let completion = if integrated {
         Some(crate::common::consent::publication_completion(
             store,
             profile,
@@ -567,10 +564,12 @@ async fn approve_mainnet(
                     &entry.approval_nonce,
                     &policy,
                     outbox_row.map_or(ConsentRow::Written, ConsentRow::Queued),
+                    &admission,
                 )
             })
             .transpose()?;
         drop(store);
+        drop(admission);
         completion
     };
     if let Some(completion) = completion {
@@ -589,6 +588,7 @@ fn durable_approval(
     profile: &Profile,
     context: &ApprovalContext,
     entry: &PendingApproval,
+    intent: Option<&stellar_agent_core::approval::ClassicIntent>,
 ) -> Result<Option<ApprovalView>, WalletError> {
     if !profile.chain_id.is_mainnet()
         || !matches!(
@@ -606,7 +606,7 @@ fn durable_approval(
         .find_by_nonce(&entry.approval_nonce)
         .map_err(operation_refusal)?;
     if let Some(view) = &view {
-        validate_durable_approval(view, entry, context)?;
+        validate_durable_approval(view, entry, context, intent)?;
     }
     Ok(view)
 }
@@ -616,6 +616,7 @@ fn validate_durable_approval(
     view: &ApprovalView,
     entry: &PendingApproval,
     context: &ApprovalContext,
+    intent: Option<&stellar_agent_core::approval::ClassicIntent>,
 ) -> Result<(), WalletError> {
     use stellar_agent_core::approval::witness::ApprovedKind;
 
@@ -638,7 +639,8 @@ fn validate_durable_approval(
             detail: error.to_string(),
         })
     })?;
-    if now < record.created_at_ms || now >= record.waiting_expires_at_ms {
+    let recovering_intent = intent.is_some() && entry.attestation_blob_b64.is_some();
+    if !recovering_intent && (now < record.created_at_ms || now >= record.waiting_expires_at_ms) {
         return Err(WalletError::Approval(ApprovalFailure::Expired {
             detail: "the consent is outside the waiting window".to_owned(),
         }));
@@ -658,7 +660,11 @@ fn validate_durable_approval(
             detail: "the approval does not bind this kind of subject".to_owned(),
         }));
     }
-    if mainnet_consent_subject(entry, &context.binding())? != record.subject
+    let subject = match intent {
+        Some(intent) => *intent.digest().as_bytes(),
+        None => mainnet_consent_subject(entry, &context.binding())?,
+    };
+    if subject != record.subject
         || entry.created_at_unix_ms != record.created_at_ms
         || entry.expires_at_unix_ms != record.waiting_expires_at_ms
     {
@@ -681,11 +687,31 @@ fn recover_durable_consent(
     let Some(entry) = store
         .get(nonce)
         .filter(|entry| entry.attestation_blob_b64.is_some())
+        .cloned()
     else {
         return Ok(store);
     };
+    if !profile.chain_id.is_mainnet() {
+        return Ok(store);
+    }
     let window = PersistedWindowStore::for_profile(&context.profile_name);
-    let durable = durable_approval(&window, profile, context, entry)?;
+    // Keep legacy non-value and already-completed entries outside the ceremony.
+    if entry.subject_kind == stellar_agent_core::approval::subject::SubjectKind::EnvelopeText
+        && durable_approval(&window, profile, context, &entry, None)?
+            .is_none_or(|view| view.record.consent.is_some())
+    {
+        return Ok(store);
+    }
+    drop(store);
+    init_platform_keyring_store()?;
+    let authority = MainnetApprovalAuthority::for_profile(&context.profile_name)?;
+    let admission = authority.admit()?;
+    let current = authority.load_admitted(&admission)?;
+    let intent =
+        crate::common::mainnet_presence::stored_intent(&entry, &context.profile_name, &current)?;
+    let store = open_with_retry(store_path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF)
+        .map_err(|error| super::common::approval_store_open_error(&error))?;
+    let durable = durable_approval(&window, profile, context, &entry, intent.as_ref())?;
     if durable
         .as_ref()
         .is_none_or(|view| view.record.consent.is_some())
@@ -698,7 +724,10 @@ fn recover_durable_consent(
             view.record.kind,
         )
     }) {
+        // The reservation is reacquired before admission, as on the ceremony path.
         drop(store);
+        drop(current);
+        drop(admission);
         let outbox = crate::common::consent::consent_outbox(profile, &context.profile_name)?;
         stellar_agent_network::operation_entry::ConsentAdmission::reacquire(
             &window,
@@ -724,9 +753,7 @@ fn recover_durable_consent(
         return open_with_retry(store_path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF)
             .map_err(|error| super::common::approval_store_open_error(&error));
     }
-    let policy = MainnetApprovalAuthority::for_profile(&context.profile_name)?
-        .load_current_compare_only()?
-        .into_policy();
+    let policy = current.into_policy();
     let completion = consent_completion(
         &store,
         &window,
@@ -735,8 +762,10 @@ fn recover_durable_consent(
         nonce,
         &policy,
         ConsentRow::Recovered,
+        &admission,
     )?;
     drop(store);
+    drop(admission);
     commit_consent(&window, profile, &completion)?;
     open_with_retry(store_path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF)
         .map_err(|error| super::common::approval_store_open_error(&error))

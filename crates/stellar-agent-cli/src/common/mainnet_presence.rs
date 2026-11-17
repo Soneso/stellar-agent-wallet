@@ -20,6 +20,57 @@ use stellar_agent_core::approval::{
 };
 use stellar_agent_core::error::{ApprovalFailure, WalletError};
 
+/// The serving binary's authenticated source for persistent consent pages.
+pub(crate) struct StoredIntents {
+    path: std::path::PathBuf,
+    name: String,
+}
+
+impl StoredIntents {
+    pub(crate) fn new(path: &Path, name: &str) -> Self {
+        Self {
+            path: path.to_owned(),
+            name: name.to_owned(),
+        }
+    }
+}
+
+impl stellar_agent_approval_ui::decision::IntentLookup for StoredIntents {
+    fn lookup(
+        &self,
+        nonce: &str,
+        current: &stellar_agent_core::approval::CurrentMainnetApprovalPolicy,
+    ) -> Result<Option<stellar_agent_core::approval::ClassicIntent>, WalletError> {
+        let pending = stellar_agent_core::approval::open_with_retry(
+            &self.path,
+            stellar_agent_core::approval::DEFAULT_RETRY_ATTEMPTS,
+            stellar_agent_core::approval::DEFAULT_RETRY_BACKOFF,
+        )
+        .map_err(|error| stellar_agent_core::approval::attest::record_error(&error))?;
+        let entry = pending.get(nonce).cloned();
+        drop(pending);
+        entry
+            .as_ref()
+            .map_or(Ok(None), |entry| stored_intent(entry, &self.name, current))
+    }
+}
+
+pub(crate) fn stored_intent(
+    entry: &PendingApproval,
+    name: &str,
+    current: &stellar_agent_core::approval::CurrentMainnetApprovalPolicy,
+) -> Result<Option<stellar_agent_core::approval::ClassicIntent>, WalletError> {
+    if entry.subject_kind != stellar_agent_core::approval::subject::SubjectKind::IntentDigest {
+        return Ok(None);
+    }
+    stellar_agent_network::operation_entry::consent_intent(
+        &stellar_agent_network::policy_state::PersistedWindowStore::for_profile(name),
+        current.profile(),
+        entry,
+        current.policy(),
+    )
+}
+
 /// How the operator receives a mainnet ceremony URL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OpenMode {
@@ -90,17 +141,25 @@ pub(crate) async fn acquire_mainnet_presence_with_mode(
     store_path: &Path,
     mode: OpenMode,
 ) -> Result<VerifiedMainnetPresence, WalletError> {
+    let current = authority.load_current()?;
+    let config = stellar_agent_approval_ui::MainnetPresenceConfig {
+        entry: entry.clone(),
+        intent: stored_intent(entry, &context.profile_name, &current)?,
+        context: context.clone(),
+        authority: authority.clone(),
+        store_path: store_path.to_path_buf(),
+        page_identity: crate::common::served_pages::page_identity_for(current.profile()),
+    };
     #[cfg(test)]
-    if let Some(result) = driver::drive(entry, context, authority) {
+    if let Some(result) = driver::drive(entry, context, authority, config.intent.as_ref()) {
         return result;
     }
-    let current = authority.load_current()?;
     if current
         .policy()
         .mainnet()
         .is_some_and(|body| body.approval_origin.is_some())
     {
-        return acquire_signed_presence(entry, context, authority, store_path, &current).await;
+        return acquire_signed_presence(config).await;
     }
     #[cfg(test)]
     let browser_driver = mode == OpenMode::Private && listener_driver::is_installed();
@@ -111,13 +170,6 @@ pub(crate) async fn acquire_mainnet_presence_with_mode(
             ApprovalFailure::PresenceBrowserRequired,
         ));
     }
-    let config = stellar_agent_approval_ui::MainnetPresenceConfig {
-        entry: entry.clone(),
-        context: context.clone(),
-        authority: authority.clone(),
-        store_path: store_path.to_path_buf(),
-        page_identity: crate::common::served_pages::page_identity_for(current.profile()),
-    };
     let handle = stellar_agent_approval_ui::start_mainnet_presence(config)
         .await
         .map_err(|error| {
@@ -152,20 +204,10 @@ pub(crate) async fn acquire_mainnet_presence_with_mode(
 }
 
 async fn acquire_signed_presence(
-    entry: &PendingApproval,
-    context: &ApprovalContext,
-    authority: &MainnetApprovalAuthority,
-    store_path: &Path,
-    current: &stellar_agent_core::approval::CurrentMainnetApprovalPolicy,
+    config: stellar_agent_approval_ui::MainnetPresenceConfig,
 ) -> Result<VerifiedMainnetPresence, WalletError> {
     let interrupt = register_interrupt().await;
-    let config = stellar_agent_approval_ui::MainnetPresenceConfig {
-        entry: entry.clone(),
-        context: context.clone(),
-        authority: authority.clone(),
-        store_path: store_path.to_path_buf(),
-        page_identity: crate::common::served_pages::page_identity_for(current.profile()),
-    };
+    let entry = config.entry.clone();
     let handle = stellar_agent_approval_remote::start_remote_presence(config)
         .await
         .map_err(|error| error.into_wallet_error())?;
@@ -517,8 +559,8 @@ pub(crate) mod driver {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use stellar_agent_core::approval::{
         ApprovalContext, AssertionInput, MAINNET_APPROVAL_RP_ID, MainnetApprovalAuthority,
-        PendingApproval, VerifiedMainnetPresence, issue_mainnet_presence, mainnet_presence_origin,
-        verify_mainnet_presence,
+        PendingApproval, VerifiedMainnetPresence, issue_mainnet_intent_presence,
+        mainnet_presence_origin, verify_mainnet_presence,
     };
     use stellar_agent_core::error::{ApprovalFailure, WalletError};
 
@@ -576,9 +618,10 @@ pub(crate) mod driver {
         entry: &PendingApproval,
         context: &ApprovalContext,
         authority: &MainnetApprovalAuthority,
+        intent: Option<&stellar_agent_core::approval::ClassicIntent>,
     ) -> Option<Result<VerifiedMainnetPresence, WalletError>> {
         let mut driver = DRIVER.with(|slot| slot.borrow_mut().take())?;
-        let result = ceremony(&mut driver, entry, context, authority);
+        let result = ceremony(&mut driver, entry, context, authority, intent);
         DRIVER.with(|slot| {
             let mut slot = slot.borrow_mut();
             if slot.is_none() {
@@ -593,6 +636,7 @@ pub(crate) mod driver {
         entry: &PendingApproval,
         context: &ApprovalContext,
         authority: &MainnetApprovalAuthority,
+        intent: Option<&stellar_agent_core::approval::ClassicIntent>,
     ) -> Result<VerifiedMainnetPresence, WalletError> {
         let clock = || {
             stellar_agent_core::timefmt::now_unix_ms().map_err(|error| {
@@ -603,11 +647,12 @@ pub(crate) mod driver {
         };
         let policy = authority.load_current()?.into_policy();
         let origin = mainnet_presence_origin(TEST_ORIGIN_PORT);
-        let pending = issue_mainnet_presence(
+        let pending = issue_mainnet_intent_presence(
             entry,
             &context.binding(),
             &policy,
-            &origin,
+            stellar_agent_core::approval::PresenceListener::Loopback(&origin),
+            intent,
             clock()?,
             Instant::now(),
         )?;
@@ -731,6 +776,7 @@ mod tests {
                 .unwrap();
             let handle = stellar_agent_approval_remote::start_remote_presence(
                 stellar_agent_approval_ui::MainnetPresenceConfig {
+                    intent: None,
                     entry: entry.clone(),
                     context: context(&fixture),
                     authority: fixture.authority(),
@@ -928,6 +974,7 @@ mod tests {
         drop(store);
         stellar_agent_approval_ui::start_mainnet_presence(
             stellar_agent_approval_ui::MainnetPresenceConfig {
+                intent: None,
                 entry: entry.clone(),
                 context: context(fixture),
                 authority: fixture.authority(),
@@ -1179,6 +1226,7 @@ mod tests {
             .unwrap();
         drop(store);
         let config = stellar_agent_approval_ui::MainnetPresenceConfig {
+            intent: None,
             entry: entry.clone(),
             context: context(&fixture),
             authority: fixture.authority(),
@@ -1211,6 +1259,7 @@ mod tests {
         drop(store);
         let handle = stellar_agent_approval_ui::start_mainnet_presence(
             stellar_agent_approval_ui::MainnetPresenceConfig {
+                intent: None,
                 entry: entry.clone(),
                 context: context(&fixture),
                 authority: fixture.authority(),
@@ -1274,6 +1323,7 @@ mod tests {
         drop(store);
         let handle = stellar_agent_approval_ui::start_mainnet_presence(
             stellar_agent_approval_ui::MainnetPresenceConfig {
+                intent: None,
                 entry: entry.clone(),
                 context: context(&fixture),
                 authority: fixture.authority(),

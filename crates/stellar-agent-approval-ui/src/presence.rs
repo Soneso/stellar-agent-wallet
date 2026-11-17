@@ -57,18 +57,23 @@ use stellar_agent_core::{
         ListenerIdentity, MainnetApprovalAuthority, MainnetAssertionWire, PendingApproval,
         PendingApprovalStore, PendingApprovalView, PendingMainnetPresence, PresenceListener,
         VerifiedMainnetPresence, approval_view_digest, issue_mainnet_intent_presence,
-        issue_mainnet_presence, load_and_validate_entry, mainnet_consent_view_digest,
-        mainnet_intent_consent_view_digest, mainnet_presence_origin, open_with_retry,
-        presence_policy::PolicyAdmission, process_uid_for_attestation, verify_mainnet_presence,
+        load_and_validate_entry, mainnet_intent_consent_view_digest, mainnet_presence_origin,
+        open_with_retry, presence_policy::PolicyAdmission, process_uid_for_attestation,
+        verify_mainnet_presence,
     },
 };
 use stellar_agent_loopback_http::{LoopbackPair, PairBindError, PairServer};
 use tokio::sync::oneshot;
 
+#[cfg(test)]
+use stellar_agent_core::approval::{issue_mainnet_presence, mainnet_consent_view_digest};
+
 /// Trusted inputs for a single mainnet consent page.
 pub struct MainnetPresenceConfig {
     /// The pending entry the command presents.
     pub entry: PendingApproval,
+    /// The authenticated stored intent, absent for legacy envelope consent.
+    pub intent: Option<ClassicIntent>,
     /// Persisted profile and network context.
     pub context: ApprovalContext,
     /// The owner-signed credential authority.
@@ -95,6 +100,7 @@ enum Mode {
     /// verified presence or a refusal, goes to `completion`.
     OneShot {
         nonce: String,
+        intent: Option<Box<ClassicIntent>>,
         expires_at: u64,
         completion: Mutex<Option<Completion>>,
     },
@@ -316,7 +322,14 @@ impl<G: ConsentSessionGate> PresenceState<G> {
         nonce: &str,
         advance: bool,
         admission: Option<&PolicyAdmission>,
-    ) -> Result<(PendingApprovalStore, CurrentMainnetApprovalPolicy), WalletError> {
+    ) -> Result<
+        (
+            PendingApprovalStore,
+            CurrentMainnetApprovalPolicy,
+            Option<ClassicIntent>,
+        ),
+        WalletError,
+    > {
         if !self.mode.serves(nonce) {
             return Err(failure(Failure::PresenceChanged));
         }
@@ -325,7 +338,6 @@ impl<G: ConsentSessionGate> PresenceState<G> {
             None if advance => self.authority.load_current()?,
             None => self.authority.load_current_compare_only()?,
         };
-        let store = self.open_store()?;
         if current
             .policy()
             .mainnet()
@@ -353,7 +365,23 @@ impl<G: ConsentSessionGate> PresenceState<G> {
         {
             return Err(failure(Failure::ListenerPolicyStale));
         }
-        Ok((store, current))
+        let intent = match &self.mode {
+            Mode::Inbox(context) => context.lookup_intent(nonce, &current)?,
+            Mode::OneShot { intent, .. } => intent.as_deref().cloned(),
+        };
+        let store = self.open_store()?;
+        if let Some(entry) = store.get(nonce)
+            && ((entry.subject_kind
+                == stellar_agent_core::approval::subject::SubjectKind::IntentDigest)
+                != intent.is_some()
+                || intent.as_ref().is_some_and(|intent| {
+                    intent.base().chain_id() != self.context.chain_id
+                        || *intent.base().policy_digest() != current.policy().digest()
+                }))
+        {
+            return Err(failure(Failure::PresenceChanged));
+        }
+        Ok((store, current, intent))
     }
 
     fn open_store(&self) -> Result<PendingApprovalStore, WalletError> {
@@ -404,7 +432,7 @@ impl<G: ConsentSessionGate> PresenceState<G> {
         if error.code() != "approval.presence_consumed" {
             return error;
         }
-        let Ok((store, current)) = self.snapshot(nonce, false, Some(&admission)) else {
+        let Ok((store, current, _)) = self.snapshot(nonce, false, Some(&admission)) else {
             return error;
         };
         if !store.get(nonce).is_some_and(|entry| {
@@ -655,6 +683,7 @@ where
         challenges: Mutex::new(HashMap::new()),
         mode: Mode::OneShot {
             nonce: config.entry.approval_nonce.clone(),
+            intent: config.intent.map(Box::new),
             expires_at: config.entry.expires_at_unix_ms,
             completion: Mutex::new(Some(sender)),
         },
@@ -701,17 +730,19 @@ fn check_presented<G: ConsentSessionGate>(
     state: &PresenceState<G>,
     presented: &PendingApproval,
 ) -> Result<(), ServeStartError> {
-    let (store, current) = state
+    let (store, current, intent) = state
         .snapshot(&presented.approval_nonce, true, None)
         .map_err(|error| start_refusal(&error))?;
     let entry = state
         .live_entry(&store, &presented.approval_nonce)
         .map_err(|error| start_refusal(&error))?;
     let binding = state.context.binding();
-    let stored = mainnet_consent_view_digest(&entry, &binding, current.policy())
-        .map_err(|error| start_refusal(&error))?;
-    let presented = mainnet_consent_view_digest(presented, &binding, current.policy())
-        .map_err(|error| start_refusal(&error))?;
+    let stored =
+        mainnet_intent_consent_view_digest(&entry, &binding, current.policy(), intent.as_ref())
+            .map_err(|error| start_refusal(&error))?;
+    let presented =
+        mainnet_intent_consent_view_digest(presented, &binding, current.policy(), intent.as_ref())
+            .map_err(|error| start_refusal(&error))?;
     if stored != presented {
         return Err(ServeStartError::Presence(PresenceStartRefusal::Changed));
     }
@@ -861,6 +892,7 @@ pub fn signed_origin_consent<G: ConsentSessionGate>(
                 challenges: Mutex::new(HashMap::new()),
                 mode: Mode::OneShot {
                     nonce: config.entry.approval_nonce.clone(),
+                    intent: config.intent.map(Box::new),
                     expires_at: config.entry.expires_at_unix_ms,
                     completion: Mutex::new(Some(sender)),
                 },
@@ -1034,8 +1066,7 @@ pub(crate) fn detail<G: ConsentSessionGate>(
 ///
 /// The island carries the consent view digest of the entry with that
 /// intent, [`mainnet_intent_consent_view_digest`], so the page stands for
-/// the intent it renders and for no other. The inbox and the ceremony of
-/// one command pass no intent and render the legacy page.
+/// the intent it renders and for no other.
 fn render_detail<G: ConsentSessionGate>(
     state: &PresenceState<G>,
     session: &G::Session,
@@ -1049,7 +1080,8 @@ fn render_detail<G: ConsentSessionGate>(
     // the pending store.
     let admission = state.authority.admit()?;
     let key = state.reshow_key(nonce, &admission)?;
-    let (store, current) = state.snapshot(nonce, false, Some(&admission))?;
+    let (store, current, stored_intent) = state.snapshot(nonce, false, Some(&admission))?;
+    let intent = intent.or(stored_intent.as_ref());
     let Some(view) = store
         .snapshot(now_ms()?)
         .into_iter()
@@ -1070,6 +1102,7 @@ fn render_detail<G: ConsentSessionGate>(
             nonce,
             key.as_ref().map(|key| key.as_slice()),
             &admission,
+            intent,
         ) {
             Ok(blob) => Some(blob),
             Err(error) if crate::decision::presence_refusal(&error).is_some() => {
@@ -1262,6 +1295,7 @@ fn verified_blob<G: ConsentSessionGate>(
     nonce: &str,
     key: Option<&[u8]>,
     admission: &PolicyAdmission,
+    intent: Option<&ClassicIntent>,
 ) -> Result<String, WalletError> {
     let entry = store
         .get(nonce)
@@ -1296,7 +1330,14 @@ fn verified_blob<G: ConsentSessionGate>(
             }
         }
         _ => {
-            crate::decision::verified_consent(&state.context, store, current, nonce, admission)?;
+            crate::decision::verified_consent(
+                &state.context,
+                store,
+                current,
+                nonce,
+                admission,
+                intent,
+            )?;
         }
     }
     Ok(encoded.clone())
@@ -1344,12 +1385,13 @@ async fn challenge<G: ConsentSessionGate>(
         let session = session_again(state.auth.as_ref(), &headers)?;
         let request: PresenceChallengeRequest =
             serde_json::from_slice(&body).map_err(|_| failure(Failure::PresenceChanged))?;
-        let (store, current) = state.snapshot(&nonce, true, None)?;
+        let (store, current, intent) = state.snapshot(&nonce, true, None)?;
         let entry = state.live_entry(&store, &nonce)?;
-        let view_digest = hex::encode(mainnet_consent_view_digest(
+        let view_digest = hex::encode(mainnet_intent_consent_view_digest(
             &entry,
             &state.context.binding(),
             current.policy(),
+            intent.as_ref(),
         )?);
         if request.consent_view_digest != view_digest {
             return Err(failure(Failure::PresenceChanged));
@@ -1357,11 +1399,12 @@ async fn challenge<G: ConsentSessionGate>(
         let now = now_ms()?;
         let instant = Instant::now();
         let pending = match &state.site {
-            Site::Loopback => issue_mainnet_presence(
+            Site::Loopback => issue_mainnet_intent_presence(
                 &entry,
                 &state.context.binding(),
                 current.policy(),
-                &state.origin,
+                PresenceListener::Loopback(&state.origin),
+                intent.as_ref(),
                 now,
                 instant,
             )?,
@@ -1371,7 +1414,7 @@ async fn challenge<G: ConsentSessionGate>(
                     &state.context.binding(),
                     current.policy(),
                     PresenceListener::SignedOrigin(listener),
-                    None,
+                    intent.as_ref(),
                     now,
                     instant,
                 )?;
@@ -1497,12 +1540,13 @@ async fn assertion<G: ConsentSessionGate>(
                 Ok(verified) => verified,
                 Err(error) => return Err(state.recover_consumed(&nonce, admission, error)),
             };
-        let (store, current) = state.snapshot(&nonce, false, Some(&admission))?;
+        let (store, current, intent) = state.snapshot(&nonce, false, Some(&admission))?;
         let entry = state.live_entry(&store, &nonce)?;
-        if hex::encode(mainnet_consent_view_digest(
+        if hex::encode(mainnet_intent_consent_view_digest(
             &entry,
             &state.context.binding(),
             current.policy(),
+            intent.as_ref(),
         )?) != view_digest
         {
             return Err(failure(Failure::PresenceChanged));

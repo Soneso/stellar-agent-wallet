@@ -899,6 +899,11 @@ mod tests {
     #![allow(clippy::unwrap_used, reason = "test assertions")]
 
     use super::*;
+    #[cfg(feature = "mainnet-write")]
+    #[allow(clippy::expect_used, reason = "behavior assertions")]
+    mod canonical_consent_tests {
+        include!("canonical_consent_tests.rs");
+    }
     use stellar_agent_core::profile::receipt::{OperationDestination, PaymentDestinations};
     use stellar_agent_network::policy_state::{
         OperationId, OperationResult, OperationState, OperationView, SlotKind,
