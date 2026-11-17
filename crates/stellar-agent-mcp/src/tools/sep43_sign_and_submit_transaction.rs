@@ -27,6 +27,13 @@
 //!
 //! # Signing path
 //!
+//! Before the signer, the order is: mainnet refusal, address forms, the
+//! tool's own rule, the effects decision of [`crate::tools::sep43_effects`],
+//! audit pre-flight, admission. Admission charges each payment route; the
+//! submission recorder charges the tool's own count limits with an opaque
+//! value class, so no value is charged twice. A signer, signing or send
+//! failure keeps the admitted usage.
+//!
 //! 1. Loads the signer from `profile.mcp_signer_default` via
 //!    `stellar_agent_network::keyring::enrolled_keyring_signer`.
 //! 2. Dispatches to `stellar_agent_sep43::StellarAgentModule::sign_transaction`.
@@ -240,6 +247,25 @@ impl WalletServer {
                 return Ok(crate::tools::common::single_shot_require_approval_error());
             }
         }
+        // The recorder charges this tool's own count limits, so admission
+        // charges only the payment routes.
+        let snapshot = match dispatch_outcome.snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => return error.into_result(),
+        };
+        let effects = match self
+            .sep43_effects_gate(
+                "stellar_sep43_sign_and_submit_transaction",
+                &args.transaction_xdr,
+                &args.chain_id,
+                false,
+                snapshot,
+            )
+            .await
+        {
+            Ok(effects) => effects,
+            Err(error) => return error.into_result(),
+        };
 
         // ── Audit pre-flight (fail-closed) ────────────────────────────────────
         // Runs AFTER the dispatch gate: a policy denial or approval escalation
@@ -267,6 +293,12 @@ impl WalletServer {
             xdr_len = args.transaction_xdr.len(),
             "sep43_sign_and_submit: dispatch gate passed",
         );
+
+        // Admission precedes the signer: a signer, signing or send failure
+        // keeps the admitted usage.
+        if let Err(result) = self.sep43_admit(&effects) {
+            return Ok(result);
+        }
 
         let account = self.profile.mcp_signer_default.account.as_str();
 
@@ -388,7 +420,7 @@ impl WalletServer {
                 profile_name: profile_name.clone(),
                 tool: "stellar_sep43_sign_and_submit_transaction",
                 chain_id: self.context.chain_id.caip2_str().to_owned(),
-                legs: Vec::new(),
+                legs: effects.legs,
                 engine: self.policy_engine.as_ref(),
                 registry: &self.tool_registry,
                 value_class: stellar_agent_core::policy::v1::ValueClass::Opaque(
@@ -946,7 +978,9 @@ mod tests {
     fn mainnet_submit_args() -> Sep43SignAndSubmitTransactionArgs {
         Sep43SignAndSubmitTransactionArgs {
             chain_id: "stellar:mainnet".into(),
-            transaction_xdr: "AAAAAQAA".into(),
+            // Decodable and without a value effect, so the call reaches the
+            // signer load.
+            transaction_xdr: crate::tools::sep43_effects::tests::bump_sequence([0; 32]),
             network_passphrase: None,
             address: None,
         }

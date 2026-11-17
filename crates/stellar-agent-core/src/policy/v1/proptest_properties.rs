@@ -359,8 +359,12 @@ fn enumerate_deny_reason_for_test(v: &DenyReason) -> &'static str {
     // Exhaustive match with no `_` arm: the compiler will reject any new
     // `DenyReason` variant added to the enum until this helper is updated.
     match v {
-        DenyReason::PerTxCapExceeded { .. } => "per_tx_cap_exceeded",
-        DenyReason::ApprovalAboveExceeded { .. } => "approval_above_exceeded",
+        DenyReason::PerTxCapExceeded { .. } | DenyReason::PerTxCapOverflow { .. } => {
+            "per_tx_cap_exceeded"
+        }
+        DenyReason::ApprovalAboveExceeded { .. } | DenyReason::ApprovalAboveOverflow { .. } => {
+            "approval_above_exceeded"
+        }
         DenyReason::PerPeriodCapExceeded { .. } | DenyReason::PerPeriodCapOverflow { .. } => {
             "per_period_cap_exceeded"
         }

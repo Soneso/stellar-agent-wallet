@@ -228,10 +228,12 @@ A missing destination or asset, an unverified home domain, a reserved kind,
 or a gated-inflow failure refuses in every mode.
 Other strkey forms and malformed strings return evaluation errors.
 Raw arguments keep their denials in every mode.
-Opaque SEP-43 signing, undecodable staged pay or claim envelopes, and exempted
-generic bundle inners refuse under an address criterion.
-These transactions come from a third party and have no evaluated effects.
-No recipient class or amount exists for a budget or approval threshold to bind.
+The own-rule check of SEP-43 signing, undecodable staged pay or claim envelopes,
+and exempted generic bundle inners refuse under an address criterion.
+That check has no evaluated effects: no recipient class or amount exists for a
+budget or approval threshold to bind. The SEP-43 transaction tools then decide
+each decoded payment under its payment tool's rule, where these criteria
+apply to the signed recipient and amount.
 
 `total_budget` bounds the debits of one asset over the life of the signed
 policy:
@@ -527,7 +529,7 @@ The event-writing paths include:
 
 - Transaction submission and reconciliation: payment, account creation,
   claim, trustline, DEX, DeFindex, pool, and smart-account operations.
-- Signing and payment protocols: opaque SEP-43 transaction/auth-entry signing,
+- Signing and payment protocols: SEP-43 transaction and auth-entry signing,
   x402 authorization, and MPP authorization, receipt, settlement, and state operations.
 - Operator decisions: approvals and rejections, including remote consent.
 - Key and lifecycle changes: signer/owner enrollment, HMAC-key rotation,
@@ -580,8 +582,17 @@ binding still refuses with `audit.log_binding_changed` before signing or submiss
 The SEP-43 sign-only pair (`signTransaction`, `signAuthEntry`) runs the same
 preflight. It writes `opaque_payload_signed` when it produces the signature,
 recording the redacted payload digest and signer. The caller broadcasts externally.
-The audit schema accepts optional evaluated value legs on this row.
-Empty legs are omitted, so existing signing tools retain their serialized row shape.
+A transaction signature also records the allowed payment legs with amount,
+asset and redacted destination. Empty legs are omitted, so auth-entry and
+message signatures keep their serialized row shape.
+
+Both SEP-43 transaction tools decide each payment the transaction authorizes
+under the rule of its payment tool, after the tool's own rule allows. They
+charge the policy windows for that usage before the signer loads; a later
+signer, signing or send failure keeps the charge. Effects the wallet cannot
+value need `allow_opaque_signing = true` on the tool's own rule. Account
+merges and signer or threshold changes always refuse. See
+[the MCP guide](./mcp.md#sep-43-transaction-effects).
 
 ## Emergency stop
 

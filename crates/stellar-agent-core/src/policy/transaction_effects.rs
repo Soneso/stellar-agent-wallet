@@ -27,7 +27,7 @@ use crate::envelope_decode::{
     decode_authoritative_args, read_envelope,
 };
 use crate::policy::v1::value::{ActionKind, ValueEffects, ValueLeg};
-use crate::sc_address::{scaddress_destination_strkey, scaddress_to_strkey};
+use crate::sc_address::scaddress_destination_strkey;
 
 /// The token legs and unknown calls in an authorized invocation tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,7 +41,8 @@ pub struct InvocationEffects {
 /// Values SEP-41 calls authorized for `account`, in depth-first tree order.
 ///
 /// Every leg retains its token contract address, including native asset contracts.
-/// The envelope decoder bounds the tree depth before this function runs.
+/// The walk keeps pending nodes on an explicit stack, so a deep tree from any caller
+/// uses no recursion; this function sets no depth limit of its own.
 ///
 /// # Examples
 ///
@@ -82,10 +83,13 @@ pub fn authorized_invocation_effects(
 }
 
 fn token_leg(call: &InvokeContractArgs, account: &ScAddress) -> Result<Option<ValueLeg>, ()> {
-    if !matches!(call.contract_address, ScAddress::Contract(_)) {
+    let ScAddress::Contract(contract) = &call.contract_address else {
         return Err(());
-    }
-    let asset = scaddress_to_strkey(&call.contract_address).map_err(|_| ())?;
+    };
+    let asset = stellar_strkey::Contract(contract.0.0)
+        .to_string()
+        .as_str()
+        .to_owned();
     let function = call.function_name.0.as_slice();
     let (authorizer, destination, amount) = match (function, call.args.as_slice()) {
         (
@@ -197,7 +201,7 @@ pub enum UnvaluedEffect {
     LiquidityPoolDeposit,
     /// Sponsorship of future reserves.
     ReserveSponsorship,
-    /// A host function invocation.
+    /// An authorized contract call the wallet cannot value; `valued_legs` holds its valued legs.
     ContractInvocation,
     /// A clawback from the wallet account.
     Clawback,
@@ -749,6 +753,8 @@ fn decode_operation(
             }
         }
         OperationBody::InvokeHostFunction(op) => {
+            // The authorization entries decide the value effect for every host function.
+            // The exhaustive match makes a new host function variant fail to compile until reviewed.
             match &op.host_function {
                 HostFunction::InvokeContract(_)
                 | HostFunction::CreateContract(_)

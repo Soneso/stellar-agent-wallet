@@ -43,10 +43,11 @@
 //! Missing destinations are unverifiable. Other strkey forms and malformed
 //! strings return an evaluation error without the input or decoder detail.
 //! Raw arguments receive a denial for an unlisted address in every mode.
-//! Opaque SEP-43 signing, undecodable staged pay or claim envelopes, and
-//! generic bundle inners refuse even under `allow_opaque_signing`.
-//! These transactions come from a third party and have no evaluated effects.
-//! No recipient class or amount exists for a budget or approval threshold to bind.
+//! The opaque own-rule check of SEP-43 signing, undecodable staged pay or claim
+//! envelopes, and generic bundle inners refuse even under `allow_opaque_signing`.
+//! That check has no evaluated effects: no recipient class or amount exists for
+//! a budget or approval threshold to bind. Each decoded SEP-43 payment then
+//! reaches its payment tool's rule with evaluated effects.
 //! A budget refuses generic bundle inners before evaluating any inner.
 //!
 //! # KNOWN_ISSUER logic

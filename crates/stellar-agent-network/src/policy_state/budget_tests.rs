@@ -570,6 +570,42 @@ mod budget {
         assert_eq!(error.code(), admission.code());
     }
 
+    /// Exposure of one authorization in another window falls back to its
+    /// summed rows. Rows of `i128::MAX` and 1 refuse the projection with the
+    /// typed invalid-state error, not a clock error.
+    #[test]
+    #[serial]
+    fn budget_fallback_history_overflow_refuses_typed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let fx = Fx::new();
+        fx.store
+            .record_and_persist(&fx.profile, &[hold(12)])
+            .unwrap();
+        let now = fx.now();
+        let mut wire = fx.wire();
+        find_or_insert_bucket(
+            &mut wire.entries,
+            &StateKey::new("ops", 1, "native", 604_800),
+        )
+        .records
+        .extend([
+            row("fallback", i128::MAX, RecordStatus::Pending, now),
+            row("fallback", 1, RecordStatus::Pending, now),
+        ]);
+        seal(&fx, wire);
+        let error = project(&fx, &policy(vec![period("native", "1d", 100)])).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                BudgetError::State(WindowStoreError::Invalid { detail })
+                    if *detail == stellar_agent_core::policy::v1::criteria::state_store::StateStoreError::SumOverflow.to_string()
+            ),
+            "{error:?}"
+        );
+    }
+
     /// Missing native amounts stay disclosed until an admissible observation
     /// proves a bounded release, or an `Always` row releases unconditionally.
     #[test]

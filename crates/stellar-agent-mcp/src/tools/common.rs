@@ -3404,17 +3404,20 @@ impl WalletServer {
         fee: u32,
         source: stellar_agent_core::error::FeeSource,
     ) -> Result<(), stellar_agent_core::WalletError> {
-        let signed = self
-            .verified_policy
-            .as_ref()
-            .and_then(|policy| policy.mainnet())
-            .map(|body| body.classic_max_fee_per_op_stroops);
         stellar_agent_network::fees::check_classic_fee_cap_signed(
             fee,
             source,
             self.security_profile(),
-            signed,
+            self.signed_classic_fee_cap(),
         )
+    }
+
+    /// The classic per-operation fee cap of the verified mainnet policy.
+    pub(crate) fn signed_classic_fee_cap(&self) -> Option<u32> {
+        self.verified_policy
+            .as_ref()
+            .and_then(|policy| policy.mainnet())
+            .map(|body| body.classic_max_fee_per_op_stroops)
     }
 
     pub(crate) async fn classic_witness(

@@ -2796,6 +2796,53 @@ fn leg_sums_refuse_overflow_without_losing_asset_equivalence() {
     }
 }
 
+/// Debit legs of `i128::MAX` and 1 under a per-transaction cap or approval
+/// threshold of `i128::MAX` refuse or escalate; `i128::MAX - 1` and 1 pass.
+#[test]
+#[serial_test::serial]
+fn per_transaction_limits_refuse_an_overflowing_leg_sum() {
+    use stellar_agent_core::policy::Decision;
+    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+    let tool = pay();
+    let profile = profile();
+    let store = PolicyStateStore::new();
+    let max = format!("\"{}\"", i128::MAX);
+    for kind in ["per_tx_cap", "approval_above"] {
+        let text = format!("{{ kind = \"{kind}\", asset = \"native\", max_stroops = {max} }}");
+        let document = load(&v2(&rule(&text, "allow")));
+        let criterion = document.rules[0].criteria[0].as_ref();
+        for (first, exceeded) in [(i128::MAX, true), (i128::MAX - 1, false)] {
+            let value = ValueClass::Value(ValueEffects::new(vec![
+                leg(ActionKind::Payment, first, "native", Some(UNLISTED)),
+                leg(ActionKind::Payment, 1, "native", Some(UNLISTED)),
+            ]));
+            let ctx = EvalContext::new(&tool, &Value::Null, "operator", &profile, &store, NOW_MS)
+                .with_value(value);
+            let reason = criterion.evaluate(&ctx).unwrap();
+            assert_eq!(
+                reason.as_ref().map(DenyReason::wire_code),
+                exceeded
+                    .then(|| format!("policy.deny.{kind}_exceeded"))
+                    .as_deref(),
+                "{kind}"
+            );
+            let decision = criterion.evaluate_decision(&ctx).unwrap();
+            match (kind, exceeded) {
+                (_, false) => assert_eq!(decision, Decision::Allow),
+                ("per_tx_cap", true) => assert!(
+                    matches!(&decision, Decision::Deny(reason) if reason.wire_code() == "policy.deny.per_tx_cap_exceeded"),
+                    "{decision:?}"
+                ),
+                _ => assert!(
+                    matches!(&decision, Decision::RequireApproval(_)),
+                    "{decision:?}"
+                ),
+            }
+        }
+    }
+}
+
 #[test]
 fn window_and_fallback_queries_refuse_overflow() {
     use stellar_agent_core::policy::v1::criteria::state_store::StateStoreError;
