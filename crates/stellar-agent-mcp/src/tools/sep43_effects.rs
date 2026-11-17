@@ -19,6 +19,12 @@
 //! exact envelope text and signs nothing. The repeat with the attested proof
 //! signs, and the signature spends the approval. Every other shape refuses
 //! with `policy.approval_required_unsupported`.
+//!
+//! The auth-entry tool runs the same steps for an authorization preimage.
+//! The preimage passes the SEP-43 input checks for the profile signer before
+//! anything is read. Each token leg the signer's account authorizes in the
+//! invocation tree is decided by the pay rule; an approval requirement
+//! refuses with `policy.approval_required_unsupported`.
 
 use std::collections::HashMap;
 
@@ -32,20 +38,21 @@ use stellar_agent_core::error::FeeSource;
 use stellar_agent_core::payment_accounts::PaymentAccount;
 use stellar_agent_core::policy::transaction_effects::{
     FeeEffect, PaymentRoute, RefusedEffect, TransactionEffects, TransactionEffectsError,
-    transaction_effects,
+    UnvaluedEffect, ValuedOperation, authorized_invocation_effects, transaction_effects,
 };
-use stellar_agent_core::policy::v1::value::derive_value_class;
+use stellar_agent_core::policy::v1::value::{ValueLeg, derive_value_class};
 use stellar_agent_core::policy::v1::{
     AccountObservation, AccountReserveLookupError, AccountReservesView, ValueClass, ValueEffects,
 };
 use stellar_agent_core::policy::{ApprovalRequest, Decision, DenyReason, ToolDescriptor};
 use stellar_agent_network::AccountView;
 use stellar_agent_network::policy_state::{WindowStoreError, record_authorized_window_states};
+use stellar_xdr::{AccountId, PublicKey, ScAddress, Uint256};
 
 use crate::policy_adapter::AccountViewAdapter;
 use crate::server::WalletServer;
 use crate::tools::common::{
-    ApprovalOutcome, DispatchOutcome, GatedApprovalKind, SuppliedProof, ToolError,
+    ApprovalOutcome, DispatchOutcome, GateSnapshot, GatedApprovalKind, SuppliedProof, ToolError,
     business_error_result, endpoint_refusal_result, ledger_err_result, policy_denial_error_result,
     rpc_client_failure, single_shot_require_approval_error, verify_attestation_gate,
 };
@@ -143,6 +150,43 @@ fn decoder_refusal(error: TransactionEffectsError) -> ToolError {
     }
 }
 
+/// Refuses a caller `address` that is not the signer `account`, with the
+/// shape and match refusals of the SEP-43 module's own address check.
+fn sep43_check_address(
+    address: &str,
+    account: &str,
+) -> Result<(), stellar_agent_sep43::Sep43Error> {
+    stellar_agent_sep43::validate_strkey(address)?;
+    if address == account {
+        return Ok(());
+    }
+    Err(stellar_agent_sep43::Sep43Error::InvalidAddress {
+        detail: format!("provided address does not match the signing key (expected {account:?})"),
+        expected_type: "G-strkey matching the signing key",
+    })
+}
+
+/// The pay-route evaluation of a token leg `account` authorizes in an
+/// authorization entry: the signed asset, quantity and recipient, with no
+/// memo, since a preimage carries none.
+fn auth_entry_leg(account: &str, leg: ValueLeg) -> ValuedOperation {
+    let mut policy_args = serde_json::json!({
+        "source": account,
+        "amount_stroops": leg.amount.map(|amount| amount.to_string()),
+        "asset": leg.asset,
+        "memo": null,
+    });
+    if let Some(destination) = &leg.destination {
+        policy_args["destination"] = destination.as_str().into();
+    }
+    ValuedOperation {
+        operation_index: 0,
+        route: PaymentRoute::Pay,
+        policy_args,
+        value: Some(ValueEffects::single(leg)),
+    }
+}
+
 /// The account view after the wallet's fee and earlier native debits.
 ///
 /// The `balance_floor` and `minimum_reserve` criteria read the fee from
@@ -226,16 +270,9 @@ impl WalletServer {
             }
             DispatchOutcome::Allow(_) => None,
         };
-        let mut operation_requirement: Option<(Requirement, Option<ValueEffects>)> = None;
         let descriptor = self.registered_descriptor(tool)?;
-        if let Some(operation) = effects.unvalued.first()
-            && !self.policy_engine.opaque_signing_opted_in(&descriptor)
-        {
-            return Err(unsizable(format!(
-                "the transaction holds an effect the wallet cannot value ({}); the rule for \
-                 this tool does not set allow_opaque_signing",
-                operation.effect.label()
-            )));
+        if let Some(operation) = effects.unvalued.first() {
+            self.sep43_require_opt_in(&descriptor, "transaction", operation.effect)?;
         }
         if let Some(fee) = &effects.fee {
             self.sep43_fee_check(fee)?;
@@ -249,11 +286,201 @@ impl WalletServer {
         if charge_own_rule {
             gated.admissions.push((descriptor, ValueClass::ReadOnly));
         }
-        let payment_legs = effects.payment_legs();
-        if payment_legs.is_empty() {
-            return Ok(gated);
+        let spent_stroops = i128::from(effects.fee.as_ref().map_or(0, |fee| fee.total_stroops));
+        let operation_requirement = self
+            .sep43_decide_legs(
+                effects.payment_legs(),
+                chain_id,
+                spent_stroops,
+                shape.is_some(),
+                snapshot,
+                &mut gated,
+            )
+            .await?;
+        // The shorter lifetime governs; on a tie, the operation's request.
+        let (operation_requirement, value_effects) = operation_requirement.unzip();
+        let ((request, governing_ttl_ms), value_effects) =
+            match (tool_requirement, operation_requirement) {
+                (None, None) => return Ok(gated),
+                (Some(own), Some(operation)) if own.0.ttl_seconds < operation.0.ttl_seconds => {
+                    (own, None)
+                }
+                (_, Some(operation)) => (operation, value_effects.flatten()),
+                (Some(own), None) => (own, None),
+            };
+        let Some(shape) = shape else {
+            return Err(refusal(single_shot_require_approval_error()));
+        };
+        let now_ms = snapshot.now_ms();
+        if proof.nonce.is_none() && proof.attestation.is_none() {
+            return Err(refusal(self.sep43_pending_approval(
+                transaction_xdr,
+                &shape,
+                &request,
+                now_ms,
+                governing_ttl_ms,
+            )?));
         }
+        let kind = match shape {
+            Approvable::Payment(_) => GatedApprovalKind::Payment,
+            Approvable::Trustline(_) => GatedApprovalKind::Trustline,
+        };
+        let required = DispatchOutcome::RequireApproval(ApprovalOutcome {
+            request,
+            governing_ttl_ms,
+            value_effects,
+            now_ms: Some(now_ms),
+            decision: None,
+            snapshot: None,
+        });
+        verify_attestation_gate(
+            self,
+            &required,
+            kind,
+            transaction_xdr,
+            proof.nonce.as_deref(),
+            proof.attestation.as_deref(),
+            tool,
+        )
+        .await
+        .map_err(refusal)?;
+        gated.approval_nonce.clone_from(&proof.nonce);
+        gated.decision = PolicyDecision::RequireApproval;
+        Ok(gated)
+    }
 
+    /// Decides the authorization entry `preimage_xdr` before the audit
+    /// pre-flight, for the account of the profile signer.
+    ///
+    /// The preimage passes the SEP-43 input checks for that account first,
+    /// and a caller `address` must name that account before any read or
+    /// admission. Every token leg the account authorizes is then decided by the pay rule
+    /// in the outer allowed dispatch's `snapshot`, with the signed asset,
+    /// quantity and recipient and without a memo or fee. A call the wallet
+    /// cannot value needs the tool rule's `allow_opaque_signing`. Admission
+    /// always charges the tool's own count limits. An approval requirement of
+    /// a pay rule refuses with `policy.approval_required_unsupported`.
+    ///
+    /// # Errors
+    ///
+    /// `policy.engine_required` when the profile signer is not a G-strkey;
+    /// the SEP-43 refusals of an invalid preimage; `sep43.invalid_address`
+    /// when `address` is not the profile signer's G-strkey; business refusals for
+    /// unopted calls, account reads and pay-rule decisions; protocol errors
+    /// for registry and argument faults.
+    pub(crate) async fn sep43_auth_entry_gate(
+        &self,
+        tool: &'static str,
+        preimage_xdr: &str,
+        network_passphrase: Option<&str>,
+        address: Option<&str>,
+        chain_id: &str,
+        outcome: &DispatchOutcome,
+    ) -> Result<Sep43Effects, ToolError> {
+        let snapshot = outcome.snapshot()?;
+        let account = &self.profile.mcp_signer_default.account;
+        let Ok(signer) = stellar_strkey::ed25519::PublicKey::from_string(account) else {
+            return Err(refusal(business_error_result(
+                "policy.engine_required",
+                "the profile signer account is not a G-strkey, so the account an \
+                 authorization entry debits is unknown",
+            )));
+        };
+        let invocation = stellar_agent_sep43::signing::validate_soroban_auth_entry(
+            preimage_xdr,
+            &signer,
+            self.context.network_passphrase(),
+            network_passphrase,
+        )
+        .map_err(|error| refusal(business_error_result(error.wire_code(), error.to_string())))?;
+        if let Some(address) = address {
+            sep43_check_address(address, account).map_err(|error| {
+                refusal(business_error_result(error.wire_code(), error.to_string()))
+            })?;
+        }
+        let effects = authorized_invocation_effects(
+            &invocation,
+            &ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+                signer.0,
+            )))),
+        );
+        let descriptor = self.registered_descriptor(tool)?;
+        if effects.unvalued {
+            self.sep43_require_opt_in(
+                &descriptor,
+                "authorization entry",
+                UnvaluedEffect::ContractInvocation,
+            )?;
+        }
+        let mut gated = Sep43Effects {
+            legs: Vec::new(),
+            admissions: vec![(descriptor, ValueClass::ReadOnly)],
+            approval_nonce: None,
+            decision: PolicyDecision::Allow,
+        };
+        let legs: Vec<ValuedOperation> = effects
+            .legs
+            .into_iter()
+            .map(|leg| auth_entry_leg(account, leg))
+            .collect();
+        self.sep43_decide_legs(
+            legs.iter().collect(),
+            chain_id,
+            0,
+            false,
+            snapshot,
+            &mut gated,
+        )
+        .await?;
+        Ok(gated)
+    }
+
+    /// Refuses an effect the wallet cannot value unless the first rule that
+    /// matches `descriptor` sets `allow_opaque_signing`.
+    fn sep43_require_opt_in(
+        &self,
+        descriptor: &ToolDescriptor,
+        subject: &str,
+        effect: UnvaluedEffect,
+    ) -> Result<(), ToolError> {
+        if self.policy_engine.opaque_signing_opted_in(descriptor) {
+            return Ok(());
+        }
+        Err(unsizable(format!(
+            "the {subject} holds an effect the wallet cannot value ({}); the rule for this \
+             tool does not set allow_opaque_signing",
+            effect.label()
+        )))
+    }
+
+    /// Decides each payment leg under the rule of its route in `snapshot` and
+    /// stages the returned effects of every allowed leg in `gated`.
+    ///
+    /// `spent_stroops` is the native amount the wallet already pays, such as
+    /// the fee. Each native debit reduces the balance later legs see. A
+    /// wallet account the profile names is read once; each recipient base
+    /// account at most once. Without a leg, nothing is read.
+    ///
+    /// An approval requirement of a leg is returned when `approvable`;
+    /// otherwise it refuses with `policy.approval_required_unsupported` and
+    /// the result is `None`.
+    async fn sep43_decide_legs(
+        &self,
+        payment_legs: Vec<&ValuedOperation>,
+        chain_id: &str,
+        mut spent_stroops: i128,
+        approvable: bool,
+        snapshot: &GateSnapshot,
+        gated: &mut Sep43Effects,
+    ) -> Result<Option<(Requirement, Option<ValueEffects>)>, ToolError> {
+        let mut operation_requirement = None;
+        if payment_legs.is_empty() {
+            return Ok(operation_requirement);
+        }
+        let wallet = stellar_strkey::ed25519::PublicKey::from_string(
+            &self.profile.mcp_signer_default.account,
+        )
+        .ok();
         let client =
             self.write_primary_client()
                 .map_err(|error| match rpc_client_failure(&error) {
@@ -279,7 +506,6 @@ impl WalletServer {
             None => None,
         };
         let source = source.as_ref().map(AccountViewAdapter::new);
-        let mut spent_stroops = i128::from(effects.fee.as_ref().map_or(0, |fee| fee.total_stroops));
         let mut recipients: HashMap<String, Option<AccountView>> = HashMap::new();
 
         for operation in payment_legs {
@@ -334,7 +560,7 @@ impl WalletServer {
             match evaluation.decision {
                 Decision::Allow => {}
                 Decision::Deny(reason) => return Err(refusal(policy_denial_error_result(&reason))),
-                Decision::RequireApproval(_) if shape.is_none() => {
+                Decision::RequireApproval(_) if !approvable => {
                     return Err(refusal(single_shot_require_approval_error()));
                 }
                 // An approvable transaction holds this one leg.
@@ -370,56 +596,7 @@ impl WalletServer {
                 ValueClass::Value(value),
             ));
         }
-        // The shorter lifetime governs; on a tie, the operation's request.
-        let (operation_requirement, value_effects) = operation_requirement.unzip();
-        let ((request, governing_ttl_ms), value_effects) =
-            match (tool_requirement, operation_requirement) {
-                (None, None) => return Ok(gated),
-                (Some(own), Some(operation)) if own.0.ttl_seconds < operation.0.ttl_seconds => {
-                    (own, None)
-                }
-                (_, Some(operation)) => (operation, value_effects.flatten()),
-                (Some(own), None) => (own, None),
-            };
-        let Some(shape) = shape else {
-            return Err(refusal(single_shot_require_approval_error()));
-        };
-        let now_ms = snapshot.now_ms();
-        if proof.nonce.is_none() && proof.attestation.is_none() {
-            return Err(refusal(self.sep43_pending_approval(
-                transaction_xdr,
-                &shape,
-                &request,
-                now_ms,
-                governing_ttl_ms,
-            )?));
-        }
-        let kind = match shape {
-            Approvable::Payment(_) => GatedApprovalKind::Payment,
-            Approvable::Trustline(_) => GatedApprovalKind::Trustline,
-        };
-        let required = DispatchOutcome::RequireApproval(ApprovalOutcome {
-            request,
-            governing_ttl_ms,
-            value_effects,
-            now_ms: Some(now_ms),
-            decision: None,
-            snapshot: None,
-        });
-        verify_attestation_gate(
-            self,
-            &required,
-            kind,
-            transaction_xdr,
-            proof.nonce.as_deref(),
-            proof.attestation.as_deref(),
-            tool,
-        )
-        .await
-        .map_err(refusal)?;
-        gated.approval_nonce.clone_from(&proof.nonce);
-        gated.decision = PolicyDecision::RequireApproval;
-        Ok(gated)
+        Ok(operation_requirement)
     }
 
     /// Stores the pending approval of an approvable transaction and returns

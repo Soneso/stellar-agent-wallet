@@ -4,6 +4,13 @@
 //! (envelope type 9 or 10) and returns the raw signature, which the requester
 //! assembles into the entry, with the signer's address.
 //!
+//! The steps run in order: mainnet refusal, address forms, the tool's own
+//! rule, preimage validation and the pay-rule decision of every token leg
+//! the signer's account authorizes, audit pre-flight, admission, signer,
+//! signature. Admission charges the legs and the tool's own count limits in
+//! one durable batch before the signer is loaded; a later failure keeps that
+//! usage, and every call charges again.
+//!
 //! Per `sep-0043.md` lines :77-89.
 
 use rmcp::{
@@ -84,7 +91,11 @@ pub struct Sep43SignAuthEntryArgs {
 ///
 /// Returns a tool-level error when:
 /// - `chain_id` does not match the profile.
+/// - The profile signer account is not a G-strkey (`policy.engine_required`).
 /// - `auth_entry_xdr` is not a valid base64 `HashIdPreimage`.
+/// - The tree holds a call the wallet cannot value and the tool rule does
+///   not set `allow_opaque_signing`, a pay rule denies a token leg, or a
+///   rule requires approval (`policy.approval_required_unsupported`).
 /// - The preimage is neither envelope type 9 nor type 10
 ///   (`sep43.malformed_auth_entry`).
 /// - A type 10 preimage is bound to an address other than the signing key's
@@ -163,6 +174,20 @@ impl WalletServer {
                 return Ok(crate::tools::common::single_shot_require_approval_error());
             }
         }
+        let effects = match self
+            .sep43_auth_entry_gate(
+                "stellar_sep43_sign_auth_entry",
+                &args.auth_entry_xdr,
+                args.network_passphrase.as_deref(),
+                args.address.as_deref(),
+                &args.chain_id,
+                &dispatch_outcome,
+            )
+            .await
+        {
+            Ok(effects) => effects,
+            Err(e) => return e.into_result(),
+        };
 
         // ── Audit pre-flight: prove the writer is acquirable BEFORE signing ──
         // Runs AFTER the dispatch gate: a policy denial or approval
@@ -185,6 +210,11 @@ impl WalletServer {
                 ));
             }
         };
+        // The signature can exist once the signer runs, so the admitted usage
+        // stays on every later failure.
+        if let Err(refusal) = self.sep43_admit(&effects) {
+            return Ok(refusal);
+        }
 
         use std::sync::Arc;
         use stellar_agent_network::keyring::enrolled_keyring_signer;
@@ -258,7 +288,7 @@ impl WalletServer {
                         stellar_agent_network::submit::redact_tx_hash(&payload_digest),
                         stellar_agent_core::observability::RedactedStrkey::from_full(&signer_g),
                         uuid::Uuid::new_v4().to_string(),
-                        Vec::new(),
+                        effects.legs,
                         stellar_agent_core::audit_log::PolicyDecision::Allow,
                     );
                 crate::tools::value_audit::emit_value_audit_row_with_writer(
@@ -574,19 +604,39 @@ mod tests {
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().ok();
         // Unique coordinates; the audit chain-root key is deliberately NOT
-        // seeded at this profile's derived coordinate.
-        let profile = Profile::builder_testnet(
-            "svc-s43ae-unminted",
-            "acct-s43ae-unminted",
-            "n-svc",
-            "n-acct",
-        )
-        .with_noop_engine()
-        .build();
+        // seeded at this profile's derived coordinate. The signer account is
+        // a G-strkey and the preimage is valid, so the call passes the
+        // preimage checks and reaches the pre-flight.
+        let account = stellar_strkey::ed25519::PublicKey([0x5A; 32]).to_string();
+        let profile =
+            Profile::builder_testnet("svc-s43ae-unminted", account.as_str(), "n-svc", "n-acct")
+                .with_noop_engine()
+                .build();
         let server = crate::server::WalletServer::new(profile).expect("WalletServer::new in tests");
+        let preimage = {
+            use sha2::{Digest, Sha256};
+            use stellar_xdr::WriteXdr;
+            stellar_xdr::HashIdPreimage::SorobanAuthorization(
+                stellar_xdr::HashIdPreimageSorobanAuthorization {
+                    network_id: stellar_xdr::Hash(
+                        Sha256::digest(b"Test SDF Network ; September 2015").into(),
+                    ),
+                    nonce: 7,
+                    signature_expiration_ledger: 100,
+                    invocation: stellar_xdr::SorobanAuthorizedInvocation {
+                        function: stellar_xdr::SorobanAuthorizedFunction::CreateContractHostFn(
+                            Default::default(),
+                        ),
+                        sub_invocations: Default::default(),
+                    },
+                },
+            )
+            .to_xdr_base64(stellar_xdr::Limits::none())
+            .unwrap()
+        };
         let args = Sep43SignAuthEntryArgs {
             chain_id: "stellar:testnet".to_owned(),
-            auth_entry_xdr: "AAAAAQAA".to_owned(),
+            auth_entry_xdr: preimage,
             network_passphrase: None,
             address: None,
         };

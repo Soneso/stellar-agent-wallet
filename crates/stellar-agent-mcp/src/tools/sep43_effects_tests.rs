@@ -353,6 +353,8 @@ pub(crate) struct Fixture {
     pub ledger: Arc<Ledger>,
     pub rpc: MockServer,
     seed_reads: Arc<AtomicUsize>,
+    /// The count of the seed read that fails; 0 fails none.
+    failing_seed_read: Arc<AtomicUsize>,
     pub audit: std::path::PathBuf,
     pub dir: tempfile::TempDir,
     _home: stellar_agent_test_support::StellarAgentHomeGuard,
@@ -375,12 +377,25 @@ impl Fixture {
         let wallet = g(key);
         let seed_reads = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&seed_reads);
+        let failing_seed_read = Arc::new(AtomicUsize::new(0));
+        let failing = Arc::clone(&failing_seed_read);
+        let seed_account = wallet.clone();
         stellar_agent_test_support::keyring_mock::install_with_read_hooks(vec![
             stellar_agent_test_support::keyring_mock::ReadHook::new(
                 "svc-s43fx",
                 &wallet,
                 Arc::new(move || {
-                    counter.fetch_add(1, Ordering::SeqCst);
+                    let read = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                    if read == failing.load(Ordering::SeqCst) {
+                        stellar_agent_test_support::keyring_mock::inject_error(
+                            "svc-s43fx",
+                            &seed_account,
+                            keyring_core::Error::NoStorageAccess(
+                                std::io::Error::other("locked").into(),
+                            ),
+                        )
+                        .unwrap();
+                    }
                 }),
             ),
         ])
@@ -436,6 +451,7 @@ impl Fixture {
             ledger,
             rpc,
             seed_reads,
+            failing_seed_read,
             audit,
             dir,
             _home: home,
@@ -545,6 +561,12 @@ impl Fixture {
 
     pub(crate) fn seed_reads(&self) -> usize {
         self.seed_reads.load(Ordering::SeqCst)
+    }
+
+    /// Fails the seed read that follows the next `skipped` seed reads.
+    pub(crate) fn fail_seed_read_after(&self, skipped: usize) {
+        self.failing_seed_read
+            .store(self.seed_reads() + skipped + 1, Ordering::SeqCst);
     }
 
     /// Durable usage of the daily window of `bucket`.
@@ -1977,10 +1999,11 @@ async fn a_valued_submission_records_its_legs() {
 // ─── Frame ───────────────────────────────────────────────────────────────────
 
 /// Records the instant of every evaluation and moves the policy clock after
-/// the tool's own decision.
+/// the decision of the `outer` tool.
 struct FrameEngine {
     seen: Mutex<Vec<(String, u64)>>,
     later: u64,
+    outer: &'static str,
 }
 
 impl PolicyEngine for FrameEngine {
@@ -1997,7 +2020,7 @@ impl PolicyEngine for FrameEngine {
         now_ms: u64,
     ) -> Result<Decision, stellar_agent_core::policy::PolicyError> {
         self.seen.lock().unwrap().push((tool.name.clone(), now_ms));
-        if tool.name == SIGN {
+        if tool.name == self.outer {
             // The caller's guard restores the clock when the test ends.
             std::mem::forget(
                 stellar_agent_core::policy::v1::criteria::state_store::set_query_time_for_test(
@@ -2022,6 +2045,7 @@ async fn effects_share_the_tool_gate_snapshot() {
     let engine = Arc::new(FrameEngine {
         seen: Mutex::new(Vec::new()),
         later: now + 60_000,
+        outer: SIGN,
     });
     fx.server.set_policy_engine_for_test(engine.clone());
     signed(
@@ -2609,4 +2633,657 @@ async fn an_approval_outside_its_interval_refuses() {
         fx.entry(&nonce).kind,
         ApprovalKind::PaymentSimulated { .. }
     ));
+}
+
+// ─── Authorization entries ───────────────────────────────────────────────────
+
+const AUTH: &str = "stellar_sep43_sign_auth_entry";
+
+fn network_id() -> Hash {
+    use sha2::Digest as _;
+    Hash(sha2::Sha256::digest(TESTNET_PASSPHRASE.as_bytes()).into())
+}
+
+/// A type 9 preimage of `root` on the test network.
+fn auth_preimage(root: SorobanAuthorizedInvocation) -> String {
+    stellar_xdr::HashIdPreimage::SorobanAuthorization(
+        stellar_xdr::HashIdPreimageSorobanAuthorization {
+            network_id: network_id(),
+            nonce: 7,
+            signature_expiration_ledger: 100,
+            invocation: root,
+        },
+    )
+    .to_xdr_base64(Limits::none())
+    .unwrap()
+}
+
+/// A type 10 preimage of `root` bound to `address`.
+fn bound_preimage(address: ScAddress, root: SorobanAuthorizedInvocation) -> String {
+    stellar_xdr::HashIdPreimage::SorobanAuthorizationWithAddress(
+        stellar_xdr::HashIdPreimageSorobanAuthorizationWithAddress {
+            network_id: network_id(),
+            nonce: 7,
+            signature_expiration_ledger: 100,
+            address,
+            invocation: root,
+        },
+    )
+    .to_xdr_base64(Limits::none())
+    .unwrap()
+}
+
+fn with_children(
+    mut root: SorobanAuthorizedInvocation,
+    children: Vec<SorobanAuthorizedInvocation>,
+) -> SorobanAuthorizedInvocation {
+    root.sub_invocations = children.try_into().unwrap();
+    root
+}
+
+/// A call the wallet cannot value: a function without a token shape.
+fn unknown_call() -> SorobanAuthorizedInvocation {
+    call([0xE5; 32], "swap", vec![])
+}
+
+/// A tree without a call: a contract creation.
+fn create_contract() -> SorobanAuthorizedInvocation {
+    SorobanAuthorizedInvocation {
+        function: SorobanAuthorizedFunction::CreateContractHostFn(Default::default()),
+        sub_invocations: Default::default(),
+    }
+}
+
+/// A muxed account address of `key` with `id`.
+fn muxed_address(key: [u8; 32], id: u64) -> ScAddress {
+    ScAddress::MuxedAccount(stellar_xdr::MuxedEd25519Account {
+        id,
+        ed25519: Uint256(key),
+    })
+}
+
+/// A native asset contract transfer the wallet authorizes to `to`.
+fn transfer_to(fx: &Fixture, to: ScAddress, amount: i128) -> SorobanAuthorizedInvocation {
+    call(
+        native_contract(),
+        "transfer",
+        vec![
+            ScVal::Address(account_address(fx.key)),
+            ScVal::Address(to),
+            ScVal::from(amount),
+        ],
+    )
+}
+
+/// The auth tool's own rule and a pay rule with `criteria`.
+fn auth_rules(opt_in: bool, criteria: Vec<Box<dyn Criterion>>) -> Vec<PolicyRule> {
+    vec![rule(AUTH, vec![], opt_in), rule(PAY, criteria, false)]
+}
+
+async fn auth_call(
+    server: &WalletServer,
+    auth_entry_xdr: String,
+    address: Option<String>,
+) -> CallToolResult {
+    server
+        .call_stellar_sep43_sign_auth_entry(
+            crate::tools::sep43_sign_auth_entry::Sep43SignAuthEntryArgs {
+                chain_id: "stellar:testnet".into(),
+                auth_entry_xdr,
+                network_passphrase: None,
+                address,
+            },
+        )
+        .await
+        .expect("a business result")
+}
+
+impl Fixture {
+    async fn auth(&self, preimage: String) -> CallToolResult {
+        auth_call(&self.server, preimage, None).await
+    }
+}
+
+/// The refusal code; asserts that no signature was returned.
+fn auth_refused(result: &CallToolResult) -> String {
+    let (code, _, text) = assert_business_envelope(result);
+    assert!(!text.contains("signedAuthEntry"), "{text}");
+    code
+}
+
+/// Asserts a returned signature and returns it.
+fn auth_signed(result: &CallToolResult) -> String {
+    let text = &result.content[0].as_text().unwrap().text;
+    assert_ne!(result.is_error, Some(true), "{text}");
+    serde_json::from_str::<Value>(text).unwrap()["data"]["signedAuthEntry"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a signature: {text}"))
+        .to_owned()
+}
+
+/// Every invalid preimage refuses with its SEP-43 code before any account
+/// read, admission or seed read; a valid type 9 and type 10 preimage sign.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn auth_preimage_validation_precedes_external_work() {
+    let fx = Fixture::new(vec![rule(AUTH, vec![rate(10)], false)]).await;
+    let paying = transfer_to(&fx, account_address(A), XLM.into());
+    let operation_id = stellar_xdr::HashIdPreimage::OpId(stellar_xdr::HashIdPreimageOperationId {
+        source_account: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(fx.key))),
+        seq_num: SequenceNumber(1),
+        op_num: 0,
+    })
+    .to_xdr_base64(Limits::none())
+    .unwrap();
+    let foreign = stellar_xdr::HashIdPreimage::SorobanAuthorization(
+        stellar_xdr::HashIdPreimageSorobanAuthorization {
+            network_id: Hash([9; 32]),
+            nonce: 7,
+            signature_expiration_ledger: 100,
+            invocation: paying.clone(),
+        },
+    )
+    .to_xdr_base64(Limits::none())
+    .unwrap();
+    let mut deep = paying.clone();
+    for _ in 0..600 {
+        deep = with_children(unknown_call(), vec![deep]);
+    }
+    let cases = [
+        ("not base64!".to_owned(), "sep43.invalid_xdr"),
+        (
+            base64::engine::general_purpose::STANDARD.encode([0xFF; 12]),
+            "sep43.invalid_xdr",
+        ),
+        (operation_id, "sep43.malformed_auth_entry"),
+        (foreign, "sep43.invalid_network_passphrase"),
+        (
+            bound_preimage(account_address(A), paying.clone()),
+            "sep43.invalid_address",
+        ),
+        (
+            bound_preimage(
+                ScAddress::Contract(ContractId(Hash(fx.key))),
+                paying.clone(),
+            ),
+            "sep43.invalid_address",
+        ),
+        (
+            bound_preimage(muxed_address(fx.key, 1), paying.clone()),
+            "sep43.invalid_address",
+        ),
+        (auth_preimage(deep), "sep43.invalid_xdr"),
+    ];
+    for (preimage, expected) in cases {
+        assert_eq!(auth_refused(&fx.auth(preimage).await), expected);
+    }
+    assert_eq!(fx.requests().await, 0, "no account read");
+    assert_eq!(fx.seed_reads(), 0, "no seed read");
+    assert_eq!(fx.usage("rate_limit").1, 0, "no admission");
+    auth_signed(&fx.auth(auth_preimage(create_contract())).await);
+    auth_signed(
+        &fx.auth(bound_preimage(account_address(fx.key), create_contract()))
+            .await,
+    );
+    assert_eq!(fx.usage("rate_limit").1, 2);
+}
+
+/// A profile signer that is not a G-strkey refuses with
+/// `policy.engine_required` before any read, even for a valued tree.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn auth_missing_authorizer_fails_before_seed() {
+    let fx = Fixture::with(auth_rules(true, vec![]), |profile| {
+        profile.mcp_signer_default.account = "acct-not-a-key".into();
+    })
+    .await;
+    let result = fx.auth(auth_preimage(transfer(OTHER, A, XLM.into()))).await;
+    let (code, message, _) = assert_business_envelope(&result);
+    assert_eq!(code, "policy.engine_required");
+    assert!(message.contains("not a G-strkey"), "{message}");
+    assert_eq!(fx.requests().await, 0);
+    assert_eq!(fx.seed_reads(), 0);
+}
+
+/// An unknown root does not hide its token children: without the opt-in
+/// it refuses; with it the second, over-cap leg refuses; both legs within
+/// the cap sign. A fully known tree needs no opt-in.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn auth_mixed_tree_keeps_every_leg_and_needs_consent() {
+    let cap = || vec![per_tx(10 * i128::from(XLM))];
+    let mixed = |fx: &Fixture, second: i64| {
+        auth_preimage(with_children(
+            unknown_call(),
+            vec![
+                fx.transfer(A, (5 * XLM).into()),
+                fx.transfer(B, second.into()),
+            ],
+        ))
+    };
+    let fx = Fixture::new(auth_rules(false, cap())).await;
+    assert_eq!(
+        auth_refused(&fx.auth(mixed(&fx, 5 * XLM)).await),
+        "policy.deny.unsizable_value_effect"
+    );
+    assert_eq!(fx.requests().await, 0);
+    let known = with_children(
+        fx.transfer(A, (5 * XLM).into()),
+        vec![fx.transfer(B, (5 * XLM).into())],
+    );
+    auth_signed(&fx.auth(auth_preimage(known)).await);
+    drop(fx);
+
+    let fx = Fixture::new(auth_rules(true, cap())).await;
+    assert_eq!(
+        auth_refused(&fx.auth(mixed(&fx, 11 * XLM)).await),
+        "policy.deny.per_tx_cap_exceeded"
+    );
+    assert_eq!(fx.seed_reads(), 0);
+    auth_signed(&fx.auth(mixed(&fx, 5 * XLM)).await);
+    let rows = fx.rows("opaque_payload_signed");
+    let legs = rows[0]["legs"].as_array().unwrap();
+    let redacted = |key| stellar_agent_core::observability::redact_strkey_first5_last5(&g(key));
+    assert_eq!(legs.len(), 2, "{legs:?}");
+    assert_eq!(legs[0]["destination_redacted"], redacted(A));
+    assert_eq!(legs[1]["destination_redacted"], redacted(B));
+}
+
+/// Each leg is decided by the pay rule, not the tool rule, in the outer
+/// frame: the cap admits its equal and refuses one unit more, a memo
+/// binding refuses the memo-less entry, and two muxed recipients of one
+/// account share one read.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn auth_legs_obey_the_pay_rule_in_the_outer_frame() {
+    use stellar_agent_core::policy::v1::criteria::memo_binding::{
+        MemoBinding, MemoBindingCriterion, MemoRequirement,
+    };
+    let cap = 10 * i128::from(XLM);
+    let fx = Fixture::new(auth_rules(false, vec![per_tx(cap)])).await;
+    auth_signed(&fx.auth(auth_preimage(fx.transfer(A, cap))).await);
+    let seed_reads = fx.seed_reads();
+    assert_eq!(
+        auth_refused(&fx.auth(auth_preimage(fx.transfer(A, cap + 1))).await),
+        "policy.deny.per_tx_cap_exceeded"
+    );
+    assert_eq!(fx.seed_reads(), seed_reads);
+    let two = with_children(
+        transfer_to(&fx, muxed_address(B, 1), XLM.into()),
+        vec![transfer_to(&fx, muxed_address(B, 2), XLM.into())],
+    );
+    auth_signed(&fx.auth(auth_preimage(two)).await);
+    assert_eq!(fx.reads(B), 1, "one read of the shared base account");
+    drop(fx);
+
+    let fx = Fixture::new(auth_rules(
+        false,
+        vec![Box::new(MemoBindingCriterion::new(vec![
+            MemoBinding::new(&g(A), MemoRequirement::Id(7)).unwrap(),
+        ]))],
+    ))
+    .await;
+    assert_eq!(
+        auth_refused(&fx.auth(auth_preimage(fx.transfer(A, XLM.into()))).await),
+        "policy.deny.memo_binding_mismatch"
+    );
+    auth_signed(&fx.auth(auth_preimage(fx.transfer(B, XLM.into()))).await);
+    drop(fx);
+
+    let mut fx = Fixture::new(auth_rules(false, vec![])).await;
+    let now = stellar_agent_core::policy::policy_now_ms().unwrap();
+    let _clock =
+        stellar_agent_core::policy::v1::criteria::state_store::set_query_time_for_test(now);
+    let engine = Arc::new(FrameEngine {
+        seen: Mutex::new(Vec::new()),
+        later: now + 60_000,
+        outer: AUTH,
+    });
+    fx.server.set_policy_engine_for_test(engine.clone());
+    let two = with_children(fx.transfer(A, XLM.into()), vec![fx.transfer(B, XLM.into())]);
+    auth_signed(&fx.auth(auth_preimage(two)).await);
+    assert_eq!(
+        *engine.seen.lock().unwrap(),
+        vec![
+            (AUTH.to_owned(), now),
+            (PAY.to_owned(), now),
+            (PAY.to_owned(), now)
+        ]
+    );
+}
+
+/// Quantities stay exact through decision, admission and audit: `i128::MAX`
+/// fits a `MAX` period cap, while `MAX` and one more refuse in one batch.
+/// A zero transfer reaches the pay rule; a zero allowance has no leg; a
+/// negative amount is unvalued.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn auth_exact_quantities_and_overflow_refuse() {
+    let rules = || auth_rules(false, vec![per_day(i128::MAX)]);
+    let fx = Fixture::new(rules()).await;
+    let above_i64 = i128::from(i64::MAX) + 1;
+    auth_signed(&fx.auth(auth_preimage(fx.transfer(A, above_i64))).await);
+    assert_eq!(
+        fx.rows("opaque_payload_signed")[0]["legs"][0]["amount"],
+        above_i64.to_string()
+    );
+    drop(fx);
+    let fx = Fixture::new(rules()).await;
+    auth_signed(&fx.auth(auth_preimage(fx.transfer(A, i128::MAX))).await);
+    assert_eq!(fx.usage("native"), (i128::MAX, 1));
+    drop(fx);
+    let fx = Fixture::new(rules()).await;
+    let over = with_children(fx.transfer(A, i128::MAX), vec![fx.transfer(B, 1)]);
+    assert_eq!(
+        auth_refused(&fx.auth(auth_preimage(over)).await),
+        "policy.deny.per_period_cap_exceeded"
+    );
+    assert_eq!(fx.usage("native"), (0, 0));
+    assert_eq!(fx.seed_reads(), 0);
+    drop(fx);
+
+    let fx = Fixture::new(vec![rule(AUTH, vec![], false)]).await;
+    assert_eq!(
+        auth_refused(&fx.auth(auth_preimage(fx.transfer(A, 0))).await),
+        "policy.deny.no_matching_rule"
+    );
+    let approve = |amount: i128| {
+        call(
+            native_contract(),
+            "approve",
+            vec![
+                ScVal::Address(account_address(fx.key)),
+                ScVal::Address(account_address(A)),
+                ScVal::from(amount),
+                ScVal::U32(100),
+            ],
+        )
+    };
+    let requests = fx.requests().await;
+    auth_signed(&fx.auth(auth_preimage(approve(0))).await);
+    assert_eq!(
+        fx.requests().await,
+        requests,
+        "a zero allowance reads nothing"
+    );
+    assert_eq!(
+        auth_refused(&fx.auth(auth_preimage(fx.transfer(A, -1))).await),
+        "policy.deny.unsizable_value_effect"
+    );
+}
+
+/// One durable batch admits every leg and the tool's own count: 10 and 10
+/// under 15 add nothing; 5 and 5 add both legs and one count; a stale
+/// second server cannot add another 10; a tree without a leg reaches the
+/// tool's count limit without a read.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn auth_admission_is_atomic_and_charges_its_own_rule() {
+    let rules = || {
+        vec![
+            rule(AUTH, vec![rate(5)], false),
+            rule(PAY, vec![per_day(15 * i128::from(XLM))], false),
+        ]
+    };
+    let mut fx = Fixture::new(rules()).await;
+    let pair = |fx: &Fixture, amount: i64| {
+        auth_preimage(with_children(
+            fx.transfer(A, amount.into()),
+            vec![fx.transfer(B, amount.into())],
+        ))
+    };
+    let stale = WalletServer::new(fx.profile.clone()).unwrap();
+    assert_eq!(
+        auth_refused(&fx.auth(pair(&fx, 10 * XLM)).await),
+        "policy.deny.per_period_cap_exceeded"
+    );
+    assert_eq!(fx.usage("native"), (0, 0));
+    assert_eq!(fx.usage("rate_limit").1, 0);
+    auth_signed(&fx.auth(pair(&fx, 5 * XLM)).await);
+    fx.restart(rules());
+    assert_eq!(fx.usage("native"), (10 * i128::from(XLM), 2));
+    assert_eq!(fx.usage("rate_limit").1, 1);
+    let mut stale = stale;
+    let name = stale.profile_name_for_approval();
+    stale.set_policy_engine_for_test(Arc::new(engine(&name, rules())));
+    assert_eq!(
+        auth_refused(&auth_call(&stale, pair(&fx, 5 * XLM), None).await),
+        "policy.deny.per_period_cap_exceeded"
+    );
+    assert_eq!(fx.usage("native"), (10 * i128::from(XLM), 2));
+    drop(fx);
+
+    let fx = Fixture::new(vec![rule(AUTH, vec![rate(1)], false)]).await;
+    auth_signed(&fx.auth(auth_preimage(create_contract())).await);
+    assert_eq!(
+        auth_refused(&fx.auth(auth_preimage(create_contract())).await),
+        "policy.deny.rate_limit_exceeded"
+    );
+    assert_eq!(fx.requests().await, 0, "no payment read");
+}
+
+/// Admitted usage stays after a signing or signer failure and a restart;
+/// identical bytes charge each call; a refused call adds nothing, also when
+/// the caller's address is not the signer.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn auth_failures_and_repeats_keep_authorized_spend() {
+    let rules = || auth_rules(false, vec![per_day(15 * i128::from(XLM))]);
+    let mut fx = Fixture::new(rules()).await;
+    let ten = auth_preimage(fx.transfer(A, (10 * XLM).into()));
+    assert_eq!(
+        auth_refused(&auth_call(&fx.server, ten.clone(), Some(g(A))).await),
+        "sep43.invalid_address"
+    );
+    assert_eq!(
+        fx.usage("native"),
+        (0, 0),
+        "a foreign address charges nothing"
+    );
+    assert_eq!(fx.requests().await, 0);
+    assert_eq!(fx.seed_reads(), 0);
+    // The signer load reads the seed once; the read at signing fails.
+    fx.fail_seed_read_after(1);
+    assert_eq!(
+        auth_refused(&fx.auth(ten.clone()).await),
+        "sep43.user_rejected"
+    );
+    assert_eq!(fx.usage("native"), (10 * i128::from(XLM), 1));
+    fx.restart(rules());
+    assert_eq!(
+        auth_refused(&fx.auth(ten).await),
+        "policy.deny.per_period_cap_exceeded"
+    );
+    assert_eq!(fx.usage("native"), (10 * i128::from(XLM), 1));
+    drop(fx);
+
+    let mut fx = Fixture::new(rules()).await;
+    keyring_core::Entry::new("svc-s43fx", &g(fx.key))
+        .unwrap()
+        .delete_credential()
+        .unwrap();
+    let ten = auth_preimage(fx.transfer(A, (10 * XLM).into()));
+    assert_eq!(
+        auth_refused(&fx.auth(ten.clone()).await),
+        "sep43.wallet_unlock_failed"
+    );
+    fx.restart(rules());
+    assert_eq!(fx.usage("native"), (10 * i128::from(XLM), 1));
+    drop(fx);
+
+    let fx = Fixture::new(vec![rule(AUTH, vec![rate(2)], false)]).await;
+    let bytes = auth_preimage(create_contract());
+    auth_signed(&fx.auth(bytes.clone()).await);
+    auth_signed(&fx.auth(bytes.clone()).await);
+    assert_eq!(fx.usage("rate_limit").1, 2);
+    assert_eq!(
+        auth_refused(&fx.auth(bytes.clone()).await),
+        "policy.deny.rate_limit_exceeded"
+    );
+    assert_eq!(
+        auth_refused(&fx.auth(bytes).await),
+        "policy.deny.rate_limit_exceeded"
+    );
+    assert_eq!(fx.usage("rate_limit").1, 2, "a refusal adds no count");
+}
+
+/// The signature covers SHA-256 of the supplied bytes, and the row records
+/// the admitted legs in order with the contract asset and redacted
+/// recipients, never a full address, the preimage or the signature.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn auth_signature_audits_the_admitted_legs() {
+    use sha2::Digest as _;
+    let fx = Fixture::new(auth_rules(false, vec![])).await;
+    let muxed =
+        stellar_strkey::Strkey::MuxedAccountEd25519(stellar_strkey::ed25519::MuxedAccount {
+            ed25519: B,
+            id: 9,
+        })
+        .to_string()
+        .as_str()
+        .to_owned();
+    let preimage = auth_preimage(with_children(
+        fx.transfer(A, (5 * XLM).into()),
+        vec![transfer_to(&fx, muxed_address(B, 9), (3 * XLM).into())],
+    ));
+    let signature = auth_signed(&auth_call(&fx.server, preimage.clone(), Some(g(fx.key))).await);
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&preimage)
+        .unwrap();
+    let digest: [u8; 32] = sha2::Sha256::digest(&bytes).into();
+    let raw: [u8; 64] = base64::engine::general_purpose::STANDARD
+        .decode(&signature)
+        .unwrap()
+        .try_into()
+        .unwrap();
+    ed25519_dalek::VerifyingKey::from_bytes(&fx.key)
+        .unwrap()
+        .verify_strict(&digest, &ed25519_dalek::Signature::from_bytes(&raw))
+        .expect("the signature covers the supplied preimage");
+    let rows = fx.rows("opaque_payload_signed");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["tool"], AUTH);
+    let redacted = stellar_agent_core::observability::redact_strkey_first5_last5;
+    let contract = stellar_strkey::Contract(native_contract()).to_string();
+    let expected = json!([
+        {"action": "payment", "amount": (5 * XLM).to_string(), "asset": contract.as_str(),
+         "destination_redacted": redacted(&g(A))},
+        {"action": "payment", "amount": (3 * XLM).to_string(), "asset": contract.as_str(),
+         "destination_redacted": redacted(&muxed)},
+    ]);
+    assert_eq!(rows[0]["legs"], expected);
+    let log = std::fs::read_to_string(&fx.audit).unwrap();
+    for secret in [g(A), muxed, g(fx.key), preimage, signature] {
+        assert!(!log.contains(&secret), "the row holds no {secret}");
+    }
+    auth_signed(&fx.auth(auth_preimage(create_contract())).await);
+    let empty = &fx.rows("opaque_payload_signed")[1];
+    assert!(empty.get("legs").is_none(), "{empty}");
+}
+
+/// An approval requirement of the tool rule or of a pay rule refuses as
+/// unsupported without a pending approval, a seed read or a signature.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn auth_escalation_never_enters_transaction_approval() {
+    let pending_store = |fx: &Fixture| {
+        fx.dir
+            .path()
+            .join("approvals")
+            .join(format!("{}.toml", fx.server.profile_name_for_approval()))
+    };
+    let fx = Fixture::approving(auth_rules(
+        false,
+        vec![Box::new(
+            stellar_agent_core::policy::v1::criteria::approval_above::ApprovalAboveCriterion::new(
+                "native".into(),
+                10 * i128::from(XLM),
+            ),
+        )],
+    ))
+    .await;
+    assert_eq!(
+        auth_refused(
+            &fx.auth(auth_preimage(fx.transfer(A, (11 * XLM).into())))
+                .await
+        ),
+        "policy.approval_required_unsupported"
+    );
+    assert_eq!(fx.seed_reads(), 0);
+    assert!(!pending_store(&fx).exists(), "no pending approval");
+    auth_signed(
+        &fx.auth(auth_preimage(fx.transfer(A, (10 * XLM).into())))
+            .await,
+    );
+    drop(fx);
+
+    let fx = Fixture::approving(vec![approval_rule(AUTH, 120), rule(PAY, vec![], false)]).await;
+    assert_eq!(
+        auth_refused(&fx.auth(auth_preimage(fx.transfer(A, XLM.into()))).await),
+        "policy.approval_required_unsupported"
+    );
+    assert_eq!(fx.seed_reads(), 0);
+    assert!(!pending_store(&fx).exists(), "no pending approval");
+}
+
+/// Auth legs and classic payments share one asset limit: a contract 10
+/// then a classic 10 refuse under 15, and a classic 5 fits.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn auth_and_classic_payments_share_one_asset_limit() {
+    let mut rules = auth_rules(false, vec![per_day(15 * i128::from(XLM))]);
+    rules.push(rule(SIGN, vec![], false));
+    let fx = Fixture::new(rules).await;
+    auth_signed(
+        &fx.auth(auth_preimage(fx.transfer(A, (10 * XLM).into())))
+            .await,
+    );
+    assert_eq!(
+        refused(
+            &fx.sign(fx.tx(vec![payment(muxed(A, None), 10 * XLM)]))
+                .await
+        )
+        .0,
+        "policy.deny.per_period_cap_exceeded"
+    );
+    signed(&fx.sign(fx.tx(vec![payment(muxed(A, None), 5 * XLM)])).await);
+    assert_eq!(fx.usage("native"), (15 * i128::from(XLM), 2));
+}
+
+/// A failed wallet read and unavailable accounting refuse before the seed;
+/// the next call after recovery signs without a person.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn auth_retry_after_transient_failure_works() {
+    let mut fx = Fixture::new(auth_rules(false, vec![])).await;
+    let one = || auth_preimage(fx.transfer(A, XLM.into()));
+    fx.failing(fx.key);
+    let code = auth_refused(&fx.auth(one()).await);
+    assert!(code.starts_with("network."), "{code}");
+    assert_eq!(fx.seed_reads(), 0);
+    fx.account(fx.key, WALLET_BALANCE, None);
+    auth_signed(&fx.auth(one()).await);
+    let seed_reads = fx.seed_reads();
+
+    fx.server
+        .set_policy_engine_for_test(Arc::new(UnrecordableEngine));
+    let result = fx.auth(auth_preimage(create_contract())).await;
+    let (code, message, _) = assert_business_envelope(&result);
+    assert_eq!(code, "policy.engine_required");
+    assert_eq!(message, "authorized payment accounting is unavailable");
+    assert_eq!(fx.seed_reads(), seed_reads);
+    fx.restart(auth_rules(false, vec![]));
+    auth_signed(&fx.auth(auth_preimage(create_contract())).await);
 }

@@ -360,8 +360,8 @@ loads. The SEP-43 sign-only pair
 same pre-flight and, once the signature is produced, records an
 `opaque_payload_signed` audit row (redacted payload digest and redacted
 signer; the caller broadcasts externally, so the row records signature
-production, not confirmation). A transaction row also carries the allowed
-payment legs with amount, asset and redacted destination.
+production, not confirmation). A transaction or auth-entry row also carries
+the allowed payment legs with amount, asset and redacted destination.
 
 ## chain_id requirement
 
@@ -808,7 +808,7 @@ decimal strings, not JSON numbers.
 | `stellar_sep43_get_address` | Return the active wallet address. | Read-only. |
 | `stellar_sep43_get_network` | Return the active network name and passphrase. | Read-only. |
 | `stellar_sep43_sign_transaction` | Sign a `TransactionEnvelope` XDR; return `signedTxXdr` and `signerAddress`. | Signs; no submit. Each payment decided by its payment tool's rule and charged at signing. Audit pre-flight + `opaque_payload_signed` row with the allowed legs. Approval: first call returns `approval`; the attested repeat signs and spends it. |
-| `stellar_sep43_sign_auth_entry` | Sign the base64 `HashIdPreimage` of a Soroban authorization entry (envelope type 9, or type 10 bound to the signing key's account); return the raw signature as `signedAuthEntry` and `signerAddress`. | Signs; no submit. Audit pre-flight + `opaque_payload_signed` row. |
+| `stellar_sep43_sign_auth_entry` | Sign the base64 `HashIdPreimage` of a Soroban authorization entry (envelope type 9, or type 10 bound to the signing key's account); return the raw signature as `signedAuthEntry` and `signerAddress`. | Signs; no submit. Decides each token transfer the signer's account authorizes under the `stellar_pay_commit` rule and charges it before signing. Audit pre-flight + `opaque_payload_signed` row with the allowed legs. Approval requirements refuse with `policy.approval_required_unsupported`. |
 | `stellar_sep43_sign_message` | Sign an arbitrary UTF-8 message via `SHA-256("Stellar Signed Message:\n" + message)` then ed25519; return `signedMessage` (base64) and `signerAddress`. | Signs; does not submit. Refuses an overlaid or out-of-scope signer. Requires the audit chain key (refuses `audit.chain_key_unavailable` before signing) and records an `opaque_payload_signed` audit row. |
 | `stellar_sep43_sign_and_submit_transaction` | Sign a `TransactionEnvelope` XDR, submit, poll until confirmed; return `signedTxXdr`, `txHash`, `status`. | Signs and submits; policy gate. Each payment decided by its payment tool's rule and charged before signing; the pending row carries the allowed legs. Approval: first call returns `approval`; the attested repeat submits and spends it. |
 
@@ -843,7 +843,12 @@ Arguments:
   (the base64 `HashIdPreimage` of the authorization entry, envelope type 9 or
   10; a type 10 preimage must be bound to the signing key's account); optional
   `network_passphrase`, optional `address`. Returns the raw signature the
-  requester assembles into the entry.
+  requester assembles into the entry. Each `transfer`, `transfer_from`,
+  `approve`, `burn` or `burn_from` the signing account authorizes is a payment
+  of the contract asset under the `stellar_pay_commit` rule, without a memo.
+  Another call in the tree needs `allow_opaque_signing = true` on the tool's
+  rule. A profile signer that is not a G-strkey refuses with
+  `policy.engine_required`.
 - `stellar_sep43_sign_message`: required `chain_id`, required `message` (UTF-8
   string); optional `network_passphrase`, optional `address`.
 
