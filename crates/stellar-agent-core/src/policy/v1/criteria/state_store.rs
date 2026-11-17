@@ -16,8 +16,11 @@
 //! The recorded amount is `i128`, exact across the full range a token
 //! quantity or an aggregated per-period stroop total can take (a Soroban SAC
 //! transfer, or a rolling-window sum across many legs, can exceed
-//! `i64::MAX`). `query_window` uses checked addition and refuses overflow.
-//! The call-count field stays `u32` with its existing saturation.
+//! `i64::MAX`). `query_window` sums the amounts of every bucket, including the
+//! retained fallback totals, with checked addition and refuses an overflow
+//! with `StateStoreError::SumOverflow`. An `unlisted:` bucket also refuses a
+//! negative contributor with `StateStoreError::NegativeAmount`. The call-count
+//! field stays `u32` and saturates.
 //!
 //! # Sliding-window API pattern
 //!
@@ -640,10 +643,10 @@ impl PolicyStateStore {
     ///   previous panic.
     /// - [`StateStoreError::ClockSkewExceeded`] — a pending entry is more than 30
     ///   seconds in the future relative to `now_ms`.
-    /// - [`StateStoreError::SumOverflow`]: the amounts of an `unlisted:`
-    ///   bucket overflow their sum. Other buckets saturate.
+    /// - [`StateStoreError::SumOverflow`]: the checked sum of a bucket's
+    ///   amounts, including the retained fallback totals, overflows.
     /// - [`StateStoreError::NegativeAmount`]: an `unlisted:` bucket holds a
-    ///   negative amount.
+    ///   negative contributor.
     ///
     /// # Examples
     ///

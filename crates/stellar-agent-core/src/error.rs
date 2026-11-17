@@ -2284,12 +2284,12 @@ pub enum ValidationError {
     #[error("the spending sum overflows; nothing was recorded")]
     AccountingOverflow,
 
-    /// The spending window holds a negative unlisted-recipient amount.
+    /// An accounting contributor or native fee is invalid.
     ///
     /// # Wire code
     ///
     /// `"policy.accounting_invalid"`.
-    #[error("the spending window holds a negative unlisted-recipient amount")]
+    #[error("a policy accounting amount or fee is invalid")]
     AccountingInvalid,
 
     /// The reset refuses while approvals remain inside their waiting windows.

@@ -309,7 +309,10 @@ mod composed {
                         ..policy_binding(T0 + APPROVAL_MS)
                     });
                     assert!(
-                        matches!(l.mint(&policy), Err(WindowStoreError::UnlistedApprovalRequired)),
+                        matches!(
+                            l.mint(&policy),
+                            Err(WindowStoreError::UnlistedApprovalRequired)
+                        ),
                         "policy authority needs approval beyond the allowance"
                     );
                     assert_eq!(l.bytes(), before, "approval-needed writes nothing");
@@ -564,7 +567,7 @@ mod composed {
         }
     }
 
-    fn process_ledger(dir: &std::path::Path) -> Ledger {
+    pub(super) fn process_ledger(dir: &std::path::Path) -> Ledger {
         let mut l = Ledger::new();
         l.store = PersistedWindowStore::at_path(dir.join("composed.window"));
         l.profile.audit_log_path = dir.join("audit.jsonl");
@@ -687,7 +690,7 @@ mod composed {
         assert_eq!(l.bytes(), before);
     }
 
-    fn handshake() {
+    pub(super) fn handshake() {
         use std::io::Write as _;
         writeln!(std::io::stdout(), "COMPOSED_READY").unwrap();
         std::io::stdout().flush().unwrap();
@@ -696,7 +699,11 @@ mod composed {
         assert_eq!(signal, "continue\n");
     }
 
-    fn child_at_boundary(dir: &std::path::Path, mode: &str, test: &str) -> std::process::Child {
+    pub(super) fn child_at_boundary(
+        dir: &std::path::Path,
+        mode: &str,
+        test: &str,
+    ) -> std::process::Child {
         use std::io::BufRead as _;
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", test, "--nocapture"])
@@ -723,7 +730,7 @@ mod composed {
         child
     }
 
-    fn release_child(mut child: std::process::Child) -> std::process::Output {
+    pub(super) fn release_child(mut child: std::process::Child) -> std::process::Output {
         use std::io::Write as _;
         child
             .stdin

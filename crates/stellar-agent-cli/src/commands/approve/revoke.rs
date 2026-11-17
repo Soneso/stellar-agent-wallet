@@ -648,6 +648,7 @@ pub(super) mod tests {
                     operation_id: self.handle.id(),
                     attempt_index: 1,
                 }),
+                floor: None,
                 native_reservation: None,
             }
         }

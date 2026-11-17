@@ -6055,6 +6055,30 @@ impl<'a> OperationStatus<'a> {
         Ok(native_reserved(&wire, observation.as_ref()))
     }
 
+    /// The retained native exposure usable with this exact balance observation.
+    ///
+    /// Missing amounts refuse only this projection. Lifecycle and diagnostic
+    /// reads remain available. Unlinked history can leave retention, so callers
+    /// must establish history coverage before activating a balance floor.
+    ///
+    /// # Errors
+    ///
+    /// `account.unread` for a missing observation, deficient release coverage,
+    /// or an unquantifiable retained obligation; `policy.accounting_overflow`
+    /// for an unrepresentable sum; and every verified read error.
+    pub fn floor_reserved_stroops(
+        &self,
+        observation: Option<WindowObservation>,
+    ) -> Result<u64, WindowStoreError> {
+        let observation = observation.ok_or_else(|| WindowStoreError::PolicyDenied {
+            reason: Box::new(stellar_agent_core::policy::DenyReason::AccountUnread),
+        })?;
+        let Some(wire) = self.read()? else {
+            return Ok(0);
+        };
+        super::accounting::floor_reserved(&wire, &observation)
+    }
+
     /// The window's admissible floors.
     ///
     /// # Errors
@@ -6513,6 +6537,7 @@ pub(crate) mod tests {
     const TTL_MS: u64 = 120_000;
     const SOURCE: &str = "GAAQEAYEAUDAOCAJBIFQYDIOB4IBCEQTCQKRMFYYDENBWHA5DYPSABGM";
     const REQUEST_ID: &str = "6f9619ff-8b86-4d11-b42d-00c04fc964ff";
+    include!("operations_floor_tests.rs");
 
     /// An audit sink that keeps its rows, or refuses every append.
     #[derive(Default)]
@@ -6709,6 +6734,7 @@ pub(crate) mod tests {
                 holds,
                 parent: None,
                 operation: None,
+                floor: None,
                 native_reservation: None,
             }
         }
@@ -8553,11 +8579,21 @@ pub(crate) mod tests {
             fee_stroops: 1,
         });
         let first = fx.store.mint_authorization(&fx.profile, &linked).unwrap();
+        assert_eq!(
+            observed_floor_sum(&fx).unwrap(),
+            71,
+            "the linked mint reserves once"
+        );
         let handle = match fx.open(&request("order-1", canonical(1))).unwrap() {
             OpenOutcome::Resumable(handle) => handle,
             other => panic!("expected the adopted record, got {other:?}"),
         };
         assert_eq!(handle.state(), OperationState::Authorized);
+        assert_eq!(
+            observed_floor_sum(&fx).unwrap(),
+            71,
+            "adoption does not reserve again"
+        );
         let before = fx.generation();
 
         let refused =
@@ -8576,6 +8612,11 @@ pub(crate) mod tests {
         let mut remint = fx.operation_mint_request(&handle, tx(2), authority, vec![hold(70)]);
         remint.native_reservation = linked.native_reservation;
         let started = fx.begin_mint(&handle, &remint).unwrap();
+        assert_eq!(
+            observed_floor_sum(&fx).unwrap(),
+            71,
+            "unused predecessor release and remint count once"
+        );
         assert_eq!(fx.generation(), before + 1);
         let retired = fx.auth(first.id);
         assert_eq!(retired.state, AuthorizationState::Invalidated);
@@ -8963,6 +9004,11 @@ pub(crate) mod tests {
         let kept = fx.auth(started.authorization_id);
         assert_eq!(kept.native_release, None);
         assert!(
+            matches!(observed_floor_sum(&fx), Err(WindowStoreError::PolicyDenied { reason })
+            if matches!(*reason, stellar_agent_core::policy::DenyReason::AccountUnread)),
+            "retained unquantifiable linked exposure blocks floor use after pruning"
+        );
+        assert!(
             tombstones(&wire)
                 .iter()
                 .any(|tombstone| tombstone.id == released.id())
@@ -9036,6 +9082,11 @@ pub(crate) mod tests {
                 ledger: Some(5_000),
                 close_time_ms: Some(T0 + 9),
             }
+        );
+        assert!(
+            matches!(observed_floor_sum(&fx), Err(WindowStoreError::PolicyDenied { reason })
+            if matches!(*reason, stellar_agent_core::policy::DenyReason::AccountUnread)),
+            "a balance older than pruned releases cannot establish floor exposure"
         );
 
         // A lower bound leaves the floor; a higher one raises it.

@@ -14,15 +14,15 @@
   "steps": [
     {
       "provisional": true,
-      "args": { "amount_stroops": "1", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+      "args": { "total_fee_stroops": 0, "amount_stroops": "1", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
       "expected": { "kind": "Allow" }
     },
     {
-      "args": { "amount_stroops": "1", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+      "args": { "total_fee_stroops": 0, "amount_stroops": "1", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
       "expected": { "kind": "Deny", "deny_reason": "account.unread", "wire_code": "account.unread", "reason": "AccountUnread" }
     },
     {
-      "args": { "amount_stroops": "1", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+      "args": { "total_fee_stroops": 0, "amount_stroops": "1", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
       "account": { "balance_stroops": 10000, "observed_age_ms": 5000, "reservations_stroops": 0 },
       "expected": { "kind": "Allow" }
     }

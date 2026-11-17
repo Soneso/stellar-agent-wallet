@@ -1943,6 +1943,7 @@ pub(in crate::policy_state) mod tests {
                     operation_id: self.operation,
                     attempt_index: 1,
                 }),
+                floor: None,
                 native_reservation: None,
             }
         }
