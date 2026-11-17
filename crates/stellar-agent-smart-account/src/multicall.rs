@@ -509,23 +509,11 @@ impl MulticallRegistry {
         // Honour the env-var override (test isolation + operator flexibility).
         // The const `STELLAR_AGENT_MULTICALL_REGISTRY_TOML_ENV` is the canonical
         // env-var name; rustdoc on the const describes this behaviour.
-        #[cfg(any(test, feature = "test-helpers"))]
-        let actual_path: std::borrow::Cow<'_, Path> =
-            stellar_agent_core::profile::schema::sandboxed_override(
-                STELLAR_AGENT_MULTICALL_REGISTRY_TOML_ENV,
-            )
+        let actual_path: std::borrow::Cow<'_, Path> = crate::verifiers::networks_toml_override()
             .map_or(
                 std::borrow::Cow::Borrowed(config_path),
                 std::borrow::Cow::Owned,
             );
-        #[cfg(not(any(test, feature = "test-helpers")))]
-        let actual_path: std::borrow::Cow<'_, Path> =
-            match std::env::var(STELLAR_AGENT_MULTICALL_REGISTRY_TOML_ENV) {
-                Ok(override_str) if !override_str.is_empty() => {
-                    std::borrow::Cow::Owned(PathBuf::from(override_str))
-                }
-                _ => std::borrow::Cow::Borrowed(config_path),
-            };
         let actual_path: &Path = actual_path.as_ref();
 
         let mut registry = Self {
