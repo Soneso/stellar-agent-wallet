@@ -9,7 +9,7 @@
 
 use crate::policy::v1::EvalContext;
 use crate::policy::v1::criteria::Criterion;
-use crate::policy::v1::criteria::per_tx_cap::{AssetDebitSum, asset_debit_sum};
+use crate::policy::v1::criteria::per_tx_cap::{AssetDebitSum, checked_asset_debit_sum};
 use crate::policy::v1::loader::DEFAULT_APPROVAL_TTL_SECONDS;
 use crate::policy::{ApprovalRequest, Decision, DenyReason, PolicyError};
 
@@ -40,7 +40,11 @@ impl Criterion for ApprovalAboveCriterion {
     }
 
     fn evaluate(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
-        let sum = match asset_debit_sum(ctx, &self.asset, self.kind())? {
+        let overflow = DenyReason::ApprovalAboveOverflow {
+            asset: self.asset.clone(),
+            max_stroops: self.max_stroops,
+        };
+        let sum = match checked_asset_debit_sum(ctx, &self.asset, self.kind(), &overflow)? {
             AssetDebitSum::NotApplicable => return Ok(None),
             AssetDebitSum::Deny(reason) => return Ok(Some(reason)),
             AssetDebitSum::Amount(sum) => sum,
@@ -68,6 +72,15 @@ impl Criterion for ApprovalAboveCriterion {
                     ),
                 ),
             ),
+            Some(DenyReason::ApprovalAboveOverflow { asset, max_stroops }) => {
+                Decision::RequireApproval(
+                    ApprovalRequest::new(String::new(), DEFAULT_APPROVAL_TTL_SECONDS).with_reason(
+                        format!(
+                            "approval_above: the debit total of {asset} exceeds the representable amount and threshold {max_stroops} stroops"
+                        ),
+                    ),
+                )
+            }
             Some(reason) => Decision::Deny(reason),
         })
     }

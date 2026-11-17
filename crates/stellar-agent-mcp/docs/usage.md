@@ -470,4 +470,6 @@ No recovery path sends a transaction again.
 
 Every submitting tool reports these codes, `stellar_dex_trade`, the two vault tools and `stellar_sep43_sign_and_submit_transaction` included. The SEP-43 tool keeps its own `status: "pending"` response shape for a timeout and records the submission the same way, so `stellar_transaction_status` reconciles it too.
 
+Both SEP-43 transaction tools decide each payment in a caller-supplied transaction under its payment tool's rule and charge the policy windows before the signer loads. The charge stands through a signer, signing or send failure, and repeated sign-only calls charge again. The pending row of the submitting tool and the `opaque_payload_signed` row of the sign-only tool carry the allowed payment legs. The SEP-43 library interface itself evaluates no policy; this decision belongs to the MCP tools.
+
 An operator policy that lists tools explicitly must include `stellar_transaction_status`, or a timed-out submission cannot be resolved through this server.
