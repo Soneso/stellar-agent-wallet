@@ -570,6 +570,15 @@ pub enum DenyReason {
         #[serde(with = "crate::wire_stroops::i128")]
         attempted_stroops: i128,
     },
+    /// A per-transaction debit sum exceeds i128 and every representable cap.
+    /// Uses the same refusal code as [`Self::PerTxCapExceeded`].
+    PerTxCapOverflow {
+        /// The configured asset identifier.
+        asset: String,
+        /// The exceeded cap.
+        #[serde(with = "crate::wire_stroops::i128")]
+        max_stroops: i128,
+    },
     /// The `approval_above` threshold requires approval through the decision interface.
     ApprovalAboveExceeded {
         /// The configured asset identifier.
@@ -580,6 +589,15 @@ pub enum DenyReason {
         /// The attempted debit total, serialized as a decimal string.
         #[serde(with = "crate::wire_stroops::i128")]
         attempted_stroops: i128,
+    },
+    /// A debit sum above i128 exceeds the `approval_above` threshold.
+    /// Uses the same refusal code as [`Self::ApprovalAboveExceeded`].
+    ApprovalAboveOverflow {
+        /// The configured asset identifier.
+        asset: String,
+        /// The exceeded threshold.
+        #[serde(with = "crate::wire_stroops::i128")]
+        max_stroops: i128,
     },
     /// The per-period aggregate cap was exceeded.
     PerPeriodCapExceeded {
@@ -988,8 +1006,10 @@ impl DenyReason {
     pub fn code(&self) -> &'static str {
         match self {
             Self::AssetNotAllowlisted => "asset_not_allowlisted",
-            Self::PerTxCapExceeded { .. } => "per_tx_cap_exceeded",
-            Self::ApprovalAboveExceeded { .. } => "approval_above_exceeded",
+            Self::PerTxCapExceeded { .. } | Self::PerTxCapOverflow { .. } => "per_tx_cap_exceeded",
+            Self::ApprovalAboveExceeded { .. } | Self::ApprovalAboveOverflow { .. } => {
+                "approval_above_exceeded"
+            }
             Self::PerPeriodCapExceeded { .. } | Self::PerPeriodCapOverflow { .. } => {
                 "per_period_cap_exceeded"
             }
@@ -1052,8 +1072,12 @@ impl DenyReason {
     pub fn wire_code(&self) -> &'static str {
         match self {
             Self::AssetNotAllowlisted => "policy.deny.asset_not_allowlisted",
-            Self::PerTxCapExceeded { .. } => "policy.deny.per_tx_cap_exceeded",
-            Self::ApprovalAboveExceeded { .. } => "policy.deny.approval_above_exceeded",
+            Self::PerTxCapExceeded { .. } | Self::PerTxCapOverflow { .. } => {
+                "policy.deny.per_tx_cap_exceeded"
+            }
+            Self::ApprovalAboveExceeded { .. } | Self::ApprovalAboveOverflow { .. } => {
+                "policy.deny.approval_above_exceeded"
+            }
             Self::PerPeriodCapExceeded { .. } | Self::PerPeriodCapOverflow { .. } => {
                 "policy.deny.per_period_cap_exceeded"
             }

@@ -636,7 +636,9 @@ fn confirmed_ledger_time_ahead_of_host_counts_at_admission_and_gate() {
     assert_eq!(fx.window(&amount_key(&fx.profile_name), now), (1_000, 2));
 }
 
-/// Independent gate snapshots must share one durable authorization cap.
+/// A batch admits all of its entries or none, including the own-rule count.
+/// A later sizing failure persists nothing, and an exact-cap retry succeeds
+/// after refresh.
 #[test]
 #[serial]
 fn authorized_states_are_admitted_in_one_step() {
