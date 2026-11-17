@@ -1071,6 +1071,41 @@ fn unix_duration_to_ms(duration: Result<Duration, std::time::SystemTimeError>) -
     duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
+/// Returns the override path of `networks.toml` that both registry path
+/// resolvers honor, or `None` when no override applies.
+///
+/// A build with `test` or the `test-helpers` feature reads it through
+/// [`sandboxed::read_override`]; every other build reads it through
+/// [`read_override`].
+pub(crate) fn networks_toml_override() -> Option<PathBuf> {
+    #[cfg(any(test, feature = "test-helpers"))]
+    use sandboxed::read_override;
+    read_override()
+}
+
+/// Returns the non-empty value of [`STELLAR_AGENT_NETWORKS_TOML_ENV`] as a
+/// path, or `None` when the variable is unset, empty, or not valid Unicode.
+#[cfg_attr(feature = "test-helpers", allow(dead_code))]
+fn read_override() -> Option<PathBuf> {
+    std::env::var(STELLAR_AGENT_NETWORKS_TOML_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The override reader of builds with `test` or the `test-helpers` feature.
+#[cfg(any(test, feature = "test-helpers"))]
+mod sandboxed {
+    /// Returns the [`super::STELLAR_AGENT_NETWORKS_TOML_ENV`] path only when
+    /// it lies inside a marked sandbox, so a test never reads or writes an
+    /// operator's registry.
+    pub(super) fn read_override() -> Option<std::path::PathBuf> {
+        stellar_agent_core::profile::schema::sandboxed_override(
+            super::STELLAR_AGENT_NETWORKS_TOML_ENV,
+        )
+    }
+}
+
 /// Resolves the canonical `networks.toml` registry path.
 ///
 /// The single derivation point for this file's path: [`VerifierRegistry::open`],
@@ -1092,12 +1127,8 @@ fn unix_duration_to_ms(duration: Result<Duration, std::time::SystemTimeError>) -
 /// Returns [`SaError::NetworksTomlIo`] if the env-var override is unset (or
 /// empty) and the canonical data root cannot be determined.
 pub fn default_networks_toml_path() -> Result<PathBuf, SaError> {
-    #[cfg(any(test, feature = "test-helpers"))]
     let env_override =
-        stellar_agent_core::profile::schema::sandboxed_override(STELLAR_AGENT_NETWORKS_TOML_ENV)
-            .and_then(|path| path.into_os_string().into_string().ok());
-    #[cfg(not(any(test, feature = "test-helpers")))]
-    let env_override = std::env::var(STELLAR_AGENT_NETWORKS_TOML_ENV).ok();
+        networks_toml_override().and_then(|path| path.into_os_string().into_string().ok());
     default_networks_toml_path_with_override(env_override.as_deref())
 }
 
@@ -1754,6 +1785,40 @@ mod tests {
         assert_eq!(
             default_networks_toml_path().unwrap(),
             sandbox.path().join("networks.toml")
+        );
+    }
+
+    /// The reader of builds without `test` and `test-helpers` returns any
+    /// non-empty override, inside or outside a marked sandbox.
+    #[test]
+    #[serial_test::serial]
+    fn read_override_returns_a_non_empty_value_without_a_sandbox() {
+        let temporary = tempfile::tempdir().unwrap();
+        let override_path = temporary.path().join("override.toml");
+        {
+            let _override = stellar_agent_test_support::env_guard::ScopedEnvVar::new(
+                STELLAR_AGENT_NETWORKS_TOML_ENV,
+                Some(override_path.as_os_str()),
+            );
+            assert_eq!(
+                read_override(),
+                Some(override_path.clone()),
+                "an override outside a marked sandbox must be used verbatim"
+            );
+            assert_eq!(
+                networks_toml_override(),
+                None,
+                "this build reads the override only inside a marked sandbox"
+            );
+        }
+        let _empty = stellar_agent_test_support::env_guard::ScopedEnvVar::new(
+            STELLAR_AGENT_NETWORKS_TOML_ENV,
+            Some(std::ffi::OsStr::new("")),
+        );
+        assert_eq!(
+            read_override(),
+            None,
+            "an empty override must read as unset"
         );
     }
 
