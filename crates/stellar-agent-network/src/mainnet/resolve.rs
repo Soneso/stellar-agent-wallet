@@ -7153,6 +7153,8 @@ mod tests {
             holds: vec![],
             parent: None,
             operation: None,
+            intent_digest: None,
+            predecessor: None,
             native_reservation: Some(crate::policy_state::NativeReservation {
                 debit_stroops: 40,
                 fee_stroops: 10,
