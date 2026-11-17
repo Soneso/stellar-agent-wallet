@@ -590,6 +590,595 @@ mod producers {
             "testnet calls no approval facade"
         );
     }
+
+    mod payment {
+        use super::*;
+        use stellar_agent_core::approval::ApprovalError;
+        use stellar_agent_core::error::WalletError;
+
+        type Produced = Result<Result<PendingApproval, ApprovalError>, WalletError>;
+
+        /// Runs the payment producer for `handle` with `entry`'s interval as
+        /// the call's captured interval.
+        fn produce(
+            run: &ClassicRun,
+            handle: &OperationHandle,
+            entry: &PendingApproval,
+            persist: impl FnOnce() -> Result<PendingApproval, ApprovalError>,
+        ) -> Produced {
+            run.f.server.payment_pending_approval(
+                Some(handle),
+                PolicyDecision::RequireApproval,
+                (entry.created_at_unix_ms, entry.expires_at_unix_ms),
+                persist,
+            )
+        }
+
+        /// Opens the durable record of `entry` for `handle`'s operation, with
+        /// its signed facts changed by `edit`.
+        fn open_record(
+            run: &ClassicRun,
+            handle: &OperationHandle,
+            entry: &PendingApproval,
+            edit: impl FnOnce(&mut stellar_agent_network::policy_state::approvals::PendingApprovalFacts),
+        ) {
+            let mut facts = operation_entry::pending_approval_facts(
+                entry,
+                handle,
+                ApprovedKind::Payment,
+                mainnet_consent_subject(entry, &binding()).unwrap(),
+                entry.expires_at_unix_ms - entry.created_at_unix_ms,
+            );
+            edit(&mut facts);
+            run.f
+                .server
+                .approval_step(|recorder| {
+                    recorder
+                        .open_pending(handle.id(), &facts, PolicyDecision::RequireApproval)
+                        .map_err(operation_entry::operation_refusal)
+                })
+                .unwrap();
+        }
+
+        fn set_clocks(run: &mut ClassicRun, now: u64) {
+            run.f.server.clock =
+                std::sync::Arc::new(stellar_agent_core::timefmt::MockClock::new(move || Ok(now)));
+        }
+
+        #[tokio::test]
+        #[serial_test::serial(keyring)]
+        #[serial_test::serial]
+        async fn payment_opens_one_record_with_its_signed_interval() {
+            use super::super::super::common::tests::mainnet::{ledger, require_approval_rules};
+            let run = ClassicRun::with(
+                Tool::Pay,
+                |raw| {
+                    require_approval_rules(
+                        &raw,
+                        &[Tool::Pay.prepare_name(), Tool::Pay.commit_name()],
+                        300,
+                    )
+                },
+                |_| {},
+                |_| {},
+            )
+            .await;
+            let record = status(&run)
+                .find_by_nonce(&run.entry.approval_nonce)
+                .unwrap();
+            assert!(
+                record.is_some(),
+                "the payment producer opens a durable record"
+            );
+            let record = record.unwrap().record;
+            let signed = run.entry.expires_at_unix_ms - run.entry.created_at_unix_ms;
+            assert!(
+                signed <= 120_000,
+                "the operation deadline shortens the 300-second request: {signed}"
+            );
+            assert_eq!(
+                record.rule_ttl_ms, signed,
+                "the signed interval is the record lifetime"
+            );
+            assert_eq!(record.kind, ApprovedKind::Payment);
+            assert_eq!(
+                record.subject,
+                mainnet_consent_subject(&run.entry, &binding()).unwrap()
+            );
+            assert_eq!(
+                (record.created_at_ms, record.waiting_expires_at_ms),
+                (run.entry.created_at_unix_ms, run.entry.expires_at_unix_ms),
+                "the record keeps the entry's original timestamps"
+            );
+            assert!(
+                record.consent.is_some(),
+                "fixture consent completes the record"
+            );
+            let window = ledger(&run.f).unwrap();
+            let operations = window["operations"]["records"].as_array().unwrap();
+            assert_eq!(operations.len(), 1);
+            assert_eq!(operations[0]["state"], "awaiting_approval");
+            assert_eq!(
+                operations[0]["prepared_decision"], "require_approval",
+                "the prepare decision is retained"
+            );
+            assert_eq!(window["approvals"]["records"].as_array().unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        #[serial_test::serial(keyring)]
+        #[serial_test::serial]
+        async fn payment_retry_checks_the_linked_entry() {
+            let mut run = ClassicRun::new(Tool::Pay).await;
+            let original = run.prepared["approval"].clone();
+            let inbox = std::fs::read(store_path(&run.f)).unwrap();
+            let window = std::fs::read(run.f.server.window_store.path()).unwrap();
+            for restart in [false, true] {
+                if restart {
+                    run.restart().unwrap();
+                }
+                let response = wire(&Tool::Pay.prepare(&run.f.server, &run.args).await);
+                assert_eq!(
+                    response["data"]["approval"], original,
+                    "a retry returns the linked approval block: {response}"
+                );
+                assert_eq!(std::fs::read(store_path(&run.f)).unwrap(), inbox);
+                assert_eq!(
+                    std::fs::read(run.f.server.window_store.path()).unwrap(),
+                    window,
+                    "a linked retry writes no window state"
+                );
+            }
+            let created = run.entry.created_at_unix_ms;
+            let end = run.entry.expires_at_unix_ms;
+            let policy_time =
+                stellar_agent_core::policy::v1::criteria::state_store::set_query_time_for_test(
+                    created - 1,
+                );
+            set_clocks(&mut run, created - 1);
+            let early = wire(&Tool::Pay.prepare(&run.f.server, &run.args).await);
+            assert_eq!(
+                early["error"]["code"], "policy.approval_required",
+                "a clock before the stored creation refuses: {early}"
+            );
+            for now in [end, created + 1] {
+                policy_time.set(now);
+                set_clocks(&mut run, now);
+                let expired = wire(&Tool::Pay.prepare(&run.f.server, &run.args).await);
+                assert_eq!(
+                    expired["error"]["code"], "policy.approval_required",
+                    "an observed expiry refuses at {now}: {expired}"
+                );
+            }
+            drop(policy_time);
+            assert!(
+                matches!(
+                    PendingApprovalStore::open(store_path(&run.f))
+                        .unwrap()
+                        .check_payment_recovery(&run.entry.approval_nonce),
+                    Err(ApprovalError::Expired)
+                ),
+                "the linked check persists the observed expiry"
+            );
+            assert!(
+                stored_approval(&run.f, &run.entry.approval_nonce).is_some(),
+                "an expired entry is never replaced"
+            );
+            drop(run);
+
+            // A handle retained while the record was live observes its expiry.
+            let mut run = ClassicRun::with(
+                Tool::Pay,
+                |raw| {
+                    super::super::super::common::tests::mainnet::require_approval_rules(
+                        &raw,
+                        &[Tool::Pay.prepare_name(), Tool::Pay.commit_name()],
+                        60,
+                    )
+                },
+                |_| {},
+                |_| {},
+            )
+            .await;
+            let id = BusinessId::parse(run.args["business_id"].as_str().unwrap()).unwrap();
+            let digest =
+                OperationStatus::new(&run.f.server.window_store, run.f.server.security_profile())
+                    .view(&id)
+                    .unwrap()
+                    .unwrap()
+                    .intent_digest;
+            let ClassicEntry::Resume(handle) = run
+                .f
+                .server
+                .operation_step(|recorder| operation_entry::lookup_classic(recorder, &id, &digest))
+                .unwrap()
+            else {
+                panic!("a live operation resumes")
+            };
+            let record = status(&run)
+                .find_by_nonce(&run.entry.approval_nonce)
+                .unwrap()
+                .unwrap()
+                .record;
+            let consent = record.consent.as_ref().unwrap();
+            let rollback = consent.consent_at_ms + 1;
+            let end = consent
+                .execution_expires_at_ms
+                .max(run.entry.expires_at_unix_ms);
+            let stored = std::fs::read_to_string(store_path(&run.f))
+                .unwrap()
+                .parse::<toml_edit::DocumentMut>()
+                .unwrap();
+            let retained = stored["payment_recovery"]
+                .as_array_of_tables()
+                .unwrap()
+                .iter()
+                .find(|b| b["nonce"].as_str() == Some(run.entry.approval_nonce.as_str()))
+                .unwrap()["retain_until"]
+                .as_integer()
+                .unwrap();
+            assert!(
+                end < u64::try_from(retained).unwrap(),
+                "the observation stays inside retained history"
+            );
+            let window_time = stellar_agent_network::mainnet::clock::set_now_ms_for_test(end);
+            set_clocks(&mut run, end);
+            assert!(
+                matches!(
+                    produce(&run, &handle, &run.entry, || panic!(
+                        "a linked retry persists nothing"
+                    )),
+                    Ok(Err(ApprovalError::Expired))
+                ),
+                "an expired record refuses its retained handle"
+            );
+            let policy_time =
+                stellar_agent_core::policy::v1::criteria::state_store::set_query_time_for_test(end);
+            for now in [end, rollback] {
+                window_time.set(now);
+                policy_time.set(now);
+                run.restart().unwrap();
+                set_clocks(&mut run, now);
+                assert!(
+                    matches!(
+                        PendingApprovalStore::open(store_path(&run.f))
+                            .unwrap()
+                            .check_payment_recovery(&run.entry.approval_nonce),
+                        Err(ApprovalError::Expired)
+                    ),
+                    "an observed record expiry survives restart and rollback at {now}"
+                );
+            }
+            let prepared = wire(&Tool::Pay.prepare(&run.f.server, &run.args).await);
+            let committed = run.commit().await;
+            assert_eq!(
+                prepared["error"]["code"], "policy.approval_required",
+                "a rolled-back clock refuses the expired record: {prepared}"
+            );
+            assert_eq!(
+                run.control.count("sendTransaction"),
+                0,
+                "an expired record admits no send: {committed}"
+            );
+            drop((policy_time, window_time));
+        }
+
+        #[tokio::test]
+        #[serial_test::serial(keyring)]
+        #[serial_test::serial]
+        async fn payment_linked_entry_matches_its_operation() {
+            use stellar_xdr::{Limits, ReadXdr as _, TransactionEnvelope, WriteXdr as _};
+            let run = ClassicRun::new(Tool::Pay).await;
+            let (args, handle) = fresh(&run);
+            let TransactionEnvelope::Tx(mut envelope) = TransactionEnvelope::from_xdr_base64(
+                handle.envelope_xdr().unwrap(),
+                Limits::none(),
+            )
+            .unwrap() else {
+                panic!("a classic envelope")
+            };
+            envelope.tx.seq_num.0 += 1;
+            let other = TransactionEnvelope::Tx(envelope)
+                .to_xdr_base64(Limits::none())
+                .unwrap();
+            let entry = approval_for(Tool::Pay, &run.f, &other, 60_000);
+            PendingApprovalStore::open(store_path(&run.f))
+                .unwrap()
+                .insert(entry.clone(), now_ms())
+                .unwrap();
+            open_record(&run, &handle, &entry, |_| {});
+            let result = wire(&Tool::Pay.prepare(&run.f.server, &args).await);
+            assert_eq!(
+                result["error"]["code"], "approval.entry_inconsistent",
+                "an entry and record for another envelope refuse: {result}"
+            );
+        }
+
+        #[tokio::test]
+        #[serial_test::serial(keyring)]
+        #[serial_test::serial]
+        async fn payment_retry_keeps_terminal_decisions() {
+            for decision in ["rejected", "revoked"] {
+                let mut run = ClassicRun::new(Tool::Pay).await;
+                let nonce = run.entry.approval_nonce.clone();
+                let now = now_ms();
+                let expected = if decision == "rejected" {
+                    PendingApprovalStore::open(store_path(&run.f))
+                        .unwrap()
+                        .reject(&nonce, now, 1)
+                        .unwrap();
+                    "policy.approval_rejected"
+                } else {
+                    let id = status(&run)
+                        .find_by_nonce(&nonce)
+                        .unwrap()
+                        .unwrap()
+                        .record
+                        .id;
+                    run.f
+                        .server
+                        .approval_step(|recorder| {
+                            recorder
+                                .revoke(id)
+                                .map_err(operation_entry::operation_refusal)
+                        })
+                        .unwrap();
+                    "approval.revoked"
+                };
+                for clock in [now, run.entry.created_at_unix_ms + 1] {
+                    set_clocks(&mut run, clock);
+                    let refused = wire(&Tool::Pay.prepare(&run.f.server, &run.args).await);
+                    assert_eq!(
+                        refused["error"]["code"], expected,
+                        "{decision} survives an earlier clock: {refused}"
+                    );
+                }
+                if decision == "rejected" {
+                    PendingApprovalStore::open(store_path(&run.f))
+                        .unwrap()
+                        .gc_expired(now + 2)
+                        .unwrap();
+                    set_clocks(&mut run, now + 2);
+                    let collected = wire(&Tool::Pay.prepare(&run.f.server, &run.args).await);
+                    assert_eq!(
+                        collected["error"]["code"], "approval.not_found",
+                        "a collected linked payload is never recreated: {collected}"
+                    );
+                    assert!(
+                        PendingApprovalStore::open(store_path(&run.f))
+                            .unwrap()
+                            .is_empty()
+                    );
+                }
+            }
+        }
+
+        #[tokio::test]
+        #[serial_test::serial(keyring)]
+        #[serial_test::serial]
+        async fn payment_open_errors_keep_the_recovered_pair() {
+            let mut run = ClassicRun::new(Tool::Pay).await;
+            let mut known = vec![run.entry.approval_nonce.clone()];
+            for seam in [COMMIT_FAULT_AFTER_PREPARED, COMMIT_FAULT_AFTER_COUNTER] {
+                let (args, handle) = fresh(&run);
+                let path = store_path(&run.f);
+                let observed = std::rc::Rc::new(std::cell::RefCell::new(None));
+                let capture = observed.clone();
+                let skip = known.clone();
+                let observer = observe_commit(move |_| {
+                    *capture.borrow_mut() = PendingApprovalStore::open(path.clone())
+                        .unwrap()
+                        .snapshot(now_ms())
+                        .into_iter()
+                        .find(|entry| !skip.contains(&entry.approval_nonce))
+                        .map(|entry| entry.approval_nonce);
+                });
+                let armed = arm_accounting_fault(seam);
+                let response = wire(&Tool::Pay.prepare(&run.f.server, &args).await);
+                drop(armed);
+                drop(observer);
+                assert_eq!(
+                    response["error"]["code"], "submission.record_unavailable",
+                    "{response}"
+                );
+                let nonce = observed.borrow().clone().unwrap();
+                known.push(nonce.clone());
+                assert!(
+                    stored_approval(&run.f, &nonce).is_some(),
+                    "a recovered pair outlives an unresolved open"
+                );
+                assert_eq!(
+                    status(&run)
+                        .find_by_operation(handle.id())
+                        .unwrap()
+                        .is_some(),
+                    seam == COMMIT_FAULT_AFTER_COUNTER
+                );
+                run.restart().unwrap();
+                let retried = wire(&Tool::Pay.prepare(&run.f.server, &args).await);
+                assert_eq!(
+                    retried["data"]["approval"]["approval_nonce"], nonce,
+                    "a retry recovers the same nonce: {retried}"
+                );
+                assert_eq!(
+                    status(&run)
+                        .find_by_operation(handle.id())
+                        .unwrap()
+                        .unwrap()
+                        .record
+                        .nonce,
+                    nonce
+                );
+            }
+            assert_eq!(
+                PendingApprovalStore::open(store_path(&run.f))
+                    .unwrap()
+                    .len(),
+                known.len(),
+                "each operation keeps one entry"
+            );
+        }
+
+        #[tokio::test]
+        #[serial_test::serial(keyring)]
+        #[serial_test::serial]
+        async fn payment_adopts_no_unindexed_entry() {
+            let run = ClassicRun::new(Tool::Pay).await;
+            let (args, handle) = fresh(&run);
+            let unindexed =
+                approval_for(Tool::Pay, &run.f, handle.envelope_xdr().unwrap(), 300_000);
+            PendingApprovalStore::open(store_path(&run.f))
+                .unwrap()
+                .insert(unindexed.clone(), now_ms())
+                .unwrap();
+            let response = wire(&Tool::Pay.prepare(&run.f.server, &args).await);
+            assert_eq!(response["ok"], true, "{response}");
+            assert_ne!(
+                response["data"]["approval"]["approval_nonce"],
+                unindexed.approval_nonce.as_str(),
+                "an unindexed entry is never adopted"
+            );
+            let mut inbox = PendingApprovalStore::open(store_path(&run.f)).unwrap();
+            assert!(
+                inbox.get(&unindexed.approval_nonce).is_some(),
+                "an unindexed entry keeps its lifecycle"
+            );
+            assert!(
+                inbox
+                    .reject(&unindexed.approval_nonce, now_ms(), 300)
+                    .unwrap()
+            );
+        }
+
+        #[tokio::test]
+        #[serial_test::serial(keyring)]
+        #[serial_test::serial]
+        async fn payment_winners_pass_the_linked_check() {
+            let run = ClassicRun::new(Tool::Pay).await;
+            let pending = || {
+                approval_for(
+                    Tool::Pay,
+                    &run.f,
+                    run.args["envelope_xdr"].as_str().unwrap(),
+                    300_000,
+                )
+            };
+            let insert = |entry: &PendingApproval| {
+                PendingApprovalStore::open(store_path(&run.f))
+                    .unwrap()
+                    .insert(entry.clone(), now_ms())
+                    .unwrap();
+            };
+
+            let (_, handle) = fresh(&run);
+            let (winner, loser) = (pending(), pending());
+            let result = produce(&run, &handle, &winner, || {
+                insert(&winner);
+                insert(&loser);
+                open_record(&run, &handle, &winner, |_| {});
+                Ok(loser.clone())
+            });
+            assert_eq!(
+                result.unwrap().unwrap().approval_nonce,
+                winner.approval_nonce,
+                "an open conflict returns the checked winner"
+            );
+            assert!(stored_approval(&run.f, &loser.approval_nonce).is_none());
+            let raw = std::fs::read_to_string(store_path(&run.f)).unwrap();
+            let mut file = raw.parse::<toml_edit::DocumentMut>().unwrap();
+            let pending_entries = file["pending"].as_array_of_tables_mut().unwrap();
+            let copy = pending_entries
+                .iter()
+                .find(|e| e["approval_nonce"].as_str() == Some(winner.approval_nonce.as_str()))
+                .unwrap()
+                .clone();
+            pending_entries.push(copy);
+            std::fs::write(store_path(&run.f), file.to_string()).unwrap();
+            assert!(
+                matches!(
+                    produce(&run, &handle, &winner, || panic!(
+                        "a linked retry persists nothing"
+                    )),
+                    Ok(Err(ApprovalError::RecoveryInconsistent))
+                ),
+                "a duplicated linked payload refuses"
+            );
+            std::fs::write(store_path(&run.f), raw).unwrap();
+
+            for differs in ["clocks", "kind", "subject"] {
+                let (_, handle) = fresh(&run);
+                let (winner, loser) = (pending(), pending());
+                let result = produce(&run, &handle, &winner, || {
+                    insert(&winner);
+                    insert(&loser);
+                    open_record(&run, &handle, &winner, |facts| match differs {
+                        "clocks" => {
+                            facts.waiting_expires_at_ms -= 1;
+                            facts.rule_ttl_ms -= 1;
+                        }
+                        "kind" => facts.kind = ApprovedKind::Claim,
+                        _ => facts.subject[0] ^= 1,
+                    });
+                    Ok(loser.clone())
+                });
+                let Ok(Err(error)) = result else {
+                    panic!("a winner whose {differs} differ from its record refuses: {result:?}")
+                };
+                assert!(matches!(error, ApprovalError::RecoveryInconsistent));
+                let refusal =
+                    super::super::super::common::payment_recovery_wire_error(&error, PROFILE)
+                        .unwrap();
+                assert_eq!(
+                    wire(&refusal)["error"]["code"],
+                    "approval.entry_inconsistent"
+                );
+            }
+
+            let (_, handle) = fresh(&run);
+            let (winner, loser) = (pending(), pending());
+            let result = produce(&run, &handle, &winner, || {
+                insert(&loser);
+                open_record(&run, &handle, &winner, |_| {});
+                Ok(loser.clone())
+            });
+            let Err(error) = result else {
+                panic!("a removed winner refuses: {result:?}")
+            };
+            assert_eq!(error.code(), "approval.not_found");
+            assert!(
+                stored_approval(&run.f, &winner.approval_nonce).is_none(),
+                "a missing winner is never recreated"
+            );
+
+            let (_, handle) = fresh(&run);
+            let entry = pending();
+            let path = store_path(&run.f);
+            let nonce = entry.approval_nonce.clone();
+            let observer = observe_commit(move |_| {
+                PendingApprovalStore::open(path.clone())
+                    .unwrap()
+                    .reject(&nonce, now_ms(), 300_000)
+                    .unwrap();
+            });
+            let result = produce(&run, &handle, &entry, || {
+                insert(&entry);
+                Ok(entry.clone())
+            });
+            drop(observer);
+            assert!(
+                matches!(result, Ok(Err(ApprovalError::Rejected))),
+                "a rejection during the open refuses the opened entry: {result:?}"
+            );
+            let record = status(&run)
+                .find_by_operation(handle.id())
+                .unwrap()
+                .unwrap();
+            assert!(
+                record.record.consent.is_none(),
+                "rejection writes no consent"
+            );
+        }
+    }
 }
 
 fn binding() -> AttestationBinding<'static> {
