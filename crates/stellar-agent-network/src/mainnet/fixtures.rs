@@ -150,6 +150,8 @@ pub(crate) fn mint_header(header: &mut Header, binding: &DomainBinding, holds: &
         .mint_authorization(
             &target.profile,
             &MintRequest {
+                intent_digest: None,
+                predecessor: None,
                 chain: header.chain,
                 binding: binding.clone(),
                 consumer: header.consumer,
@@ -194,6 +196,9 @@ pub(crate) fn header(
     now: u64,
 ) -> Header {
     Header {
+        operation: None,
+        intent_digest: None,
+        predecessor: None,
         claim,
         id: AuthorizationId::from_bytes([0xab; 32]),
         profile: profile.to_owned(),
@@ -630,6 +635,8 @@ impl LedgerFixture {
             .mint_authorization(
                 &self.profile,
                 &MintRequest {
+                    intent_digest: None,
+                    predecessor: None,
                     chain: Caip2::Mainnet,
                     binding: binding.clone(),
                     consumer: header.consumer,
@@ -659,6 +666,7 @@ impl LedgerFixture {
             )
             .unwrap();
         header.id = minted.id;
+        header.operation = operation;
         if let AuthorityBinding::Approval(approval) = &mut header.authority {
             approval.nonce = nonce.to_owned();
         }
@@ -995,6 +1003,7 @@ impl ResolverFixture {
                 let tool = match rule["match"]["tool"].as_str().unwrap() {
                     "stellar_pay" => "stellar_pay",
                     "stellar_pay_commit" => "stellar_pay_commit",
+                    "stellar_claim" => "stellar_claim",
                     "stellar_x402_create_payment" => "stellar_x402_create_payment",
                     "stellar_x402_authenticated_payment" => "stellar_x402_authenticated_payment",
                     name => panic!("unsupported fixture tool: {name}"),
@@ -1018,7 +1027,7 @@ impl ResolverFixture {
                             .and_then(|a| a.get(0))
                             .and_then(toml_edit::Value::as_str)
                     })
-                    .unwrap();
+                    .unwrap_or("native");
                 let scope = if tool == "stellar_x402_authenticated_payment" {
                     EvaluationScope::X402Authenticated {
                         home_domain: MESSAGE_HOME_DOMAIN.to_owned(),
@@ -1051,6 +1060,8 @@ impl ResolverFixture {
                         value: Some(ValueClass::single(ValueLeg {
                             kind: if tool.starts_with("stellar_pay") {
                                 ActionKind::Payment
+                            } else if tool == "stellar_claim" {
+                                ActionKind::Claim
                             } else {
                                 ActionKind::X402Payment
                             },
@@ -1160,6 +1171,33 @@ impl ResolverFixture {
         kind: stellar_agent_core::approval::witness::ApprovedKind,
         subject: [u8; 32],
     ) -> stellar_agent_core::approval::witness::ApprovalWitness {
+        self.attested_subject(entry, kind, subject, None)
+    }
+
+    pub(crate) fn attested_intent(
+        &self,
+        entry: &stellar_agent_core::approval::PendingApproval,
+        intent: &stellar_agent_core::approval::intent::ClassicIntent,
+        decision: &stellar_agent_core::mainnet::decision::MainnetDecision,
+    ) -> stellar_agent_core::approval::witness::ApprovalWitness {
+        self.attested_subject(
+            entry,
+            intent.approved_kind(),
+            *intent.digest().as_bytes(),
+            Some((intent, decision)),
+        )
+    }
+
+    fn attested_subject(
+        &self,
+        entry: &stellar_agent_core::approval::PendingApproval,
+        kind: stellar_agent_core::approval::witness::ApprovedKind,
+        subject: [u8; 32],
+        intent: Option<(
+            &stellar_agent_core::approval::intent::ClassicIntent,
+            &stellar_agent_core::mainnet::decision::MainnetDecision,
+        )>,
+    ) -> stellar_agent_core::approval::witness::ApprovalWitness {
         use base64::Engine as _;
         use stellar_agent_core::approval::{
             AttestationBinding, ConsentAudit, ConsentAuthorization, MainnetApprovalAuthority,
@@ -1191,14 +1229,27 @@ impl ResolverFixture {
             .load_current()
             .unwrap()
             .into_policy();
-        let challenge = issue_mainnet_presence(
-            entry,
-            &binding,
-            &policy,
-            &MainnetConsentFixture::origin(),
-            wall(),
-            std::time::Instant::now(),
-        )
+        let origin = MainnetConsentFixture::origin();
+        let challenge = if let Some((intent, _)) = intent {
+            stellar_agent_core::approval::issue_mainnet_intent_presence(
+                entry,
+                &binding,
+                &policy,
+                stellar_agent_core::approval::PresenceListener::Loopback(&origin),
+                Some(intent),
+                wall(),
+                std::time::Instant::now(),
+            )
+        } else {
+            issue_mainnet_presence(
+                entry,
+                &binding,
+                &policy,
+                &MainnetConsentFixture::origin(),
+                wall(),
+                std::time::Instant::now(),
+            )
+        }
         .unwrap();
         let assertion = MainnetConsentFixture::sign(
             &stellar_agent_test_support::webauthn::fixture_authenticator(),
@@ -1237,6 +1288,20 @@ impl ResolverFixture {
             .unwrap()
             .try_into()
             .unwrap();
+        if let Some((intent, decision)) = intent {
+            return stellar_agent_core::approval::witness::verify_intent_approval(
+                &store,
+                &self.profile,
+                "operator",
+                &entry.approval_nonce,
+                &blob,
+                intent,
+                decision,
+                &policy,
+                wall(),
+            )
+            .unwrap();
+        }
         verify_approval(
             &store,
             &self.profile,

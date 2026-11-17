@@ -158,5 +158,8 @@ fn assemble(
         issued_at_ms: minted.issued_at_ms,
         expires_at_ms: minted.expires_at_ms,
         bindings_digest: minted.bindings_digest,
+        operation: request.operation,
+        intent_digest: request.intent_digest,
+        predecessor: request.predecessor,
     }
 }

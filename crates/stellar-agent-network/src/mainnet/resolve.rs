@@ -1072,6 +1072,8 @@ mod enabled {
         chain_deadline_ms: Option<u64>,
     ) -> MintRequest {
         MintRequest {
+            intent_digest: None,
+            predecessor: None,
             chain: context.chain(),
             binding,
             consumer,
@@ -1106,6 +1108,84 @@ mod enabled {
             MuxedAccount::Ed25519(key) => Some(key.0),
             MuxedAccount::MuxedEd25519(_) => None,
         }
+    }
+
+    struct CanonicalResolution {
+        digest: [u8; 32],
+        predecessor: Option<super::super::AuthorizationId>,
+    }
+
+    async fn canonical_resolution(
+        req: &TxSignRequest<'_>,
+        tx: &stellar_xdr::TransactionV1Envelope,
+        source: &str,
+        fee_cap: u32,
+        now_ms: u64,
+    ) -> Result<Option<CanonicalResolution>, MainnetAuthorizationError> {
+        use crate::mainnet::canonical::{CanonicalCheck, match_envelope};
+        use crate::operation_entry::{CanonicalUse, canonical_slot_intent};
+        use crate::policy_state::{IntentSlot, OperationStatus};
+        use stellar_xdr::{LedgerEntryData, LedgerKey, LedgerKeyClaimableBalance};
+        let Some(link) = req.operation else {
+            return Ok(None);
+        };
+        let (slot, predecessor) = OperationStatus::new(req.store, req.context.profile())
+            .intent_for_resolution(link.operation_id)
+            .map_err(mint::store_error)?;
+        if !matches!(slot, IntentSlot::Canonical { .. }) {
+            return Ok(None);
+        }
+        let intent = canonical_slot_intent(
+            &slot,
+            &CanonicalUse {
+                chain_id: req.context.chain().caip2_str(),
+                source,
+                policy_digest: req.policy.digest(),
+            },
+        )
+        .map_err(|_| refused(P::IntentMismatch))?;
+        let claim_entry = if let Some(OperationBody::ClaimClaimableBalance(claim)) =
+            tx.tx.operations.first().map(|operation| &operation.body)
+        {
+            let key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
+                balance_id: claim.balance_id.clone(),
+            });
+            let response = req
+                .client
+                .get_ledger_entries(&[key])
+                .await
+                .map_err(|_| refused(P::IntentMismatch))?;
+            response
+                .entries
+                .unwrap_or_default()
+                .first()
+                .map(|entry| {
+                    match LedgerEntryData::from_xdr_base64(
+                        &entry.xdr,
+                        stellar_agent_xdr_limits::untrusted_decode_limits(entry.xdr.len()),
+                    ) {
+                        Ok(LedgerEntryData::ClaimableBalance(balance)) => Ok(balance),
+                        _ => Err(refused(P::IntentMismatch)),
+                    }
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let matched = match_envelope(
+            req.unsigned_envelope_xdr,
+            &CanonicalCheck {
+                intent: &intent,
+                fee_cap_stroops: fee_cap,
+                now_ms,
+                claim_entry: claim_entry.as_ref(),
+            },
+        )
+        .map_err(|_| refused(P::IntentMismatch))?;
+        Ok(Some(CanonicalResolution {
+            digest: *matched.digest.as_bytes(),
+            predecessor,
+        }))
     }
     /// Authorizes the signature of one classic mainnet transaction.
     ///
@@ -1158,6 +1238,9 @@ mod enabled {
         let view = fetch_account(req.client, &source, &[])
             .await
             .map_err(|_| refused(P::AccountUnavailable))?;
+        let canonical =
+            canonical_resolution(&req, tx, &source, body.classic_max_fee_per_op_stroops, now)
+                .await?;
         let descriptor = descriptor(policy_tool);
         let engine = req.policy.engine();
         let evaluation = engine
@@ -1227,7 +1310,7 @@ mod enabled {
             req.context,
             req.policy,
             req.authority,
-            digest,
+            canonical.as_ref().map_or(digest, |c| c.digest),
             kind,
             &evaluation,
             &req.audit,
@@ -1257,6 +1340,8 @@ mod enabled {
             Some(chain_deadline.saturating_mul(1000)),
         );
         request.operation = req.operation;
+        request.intent_digest = canonical.as_ref().map(|c| c.digest);
+        request.predecessor = canonical.as_ref().and_then(|c| c.predecessor);
         // The native debit is the action's native amount, zero for another
         // asset; the fee is the envelope's own fee cap.
         request.native_reservation = Some(NativeReservation {
@@ -1541,6 +1626,8 @@ mod enabled {
         )?;
         let message = req.message;
         let request = MintRequest {
+            intent_digest: None,
+            predecessor: None,
             chain: req.context.chain(),
             binding: DomainBinding::Message {
                 domain: message.domain.clone(),
@@ -1716,6 +1803,8 @@ mod enabled {
         )?;
         let parent = header.id;
         let request = MintRequest {
+            intent_digest: None,
+            predecessor: None,
             chain: header.chain,
             binding: DomainBinding::X402Submit {
                 final_envelope_sha256: approval_subject_classic(req.final_envelope_xdr),
@@ -1793,6 +1882,15 @@ mod tests {
     use stellar_agent_core::approval::witness::ApprovalWitness;
 
     include!("resolve_approval_tests.rs");
+
+    #[allow(
+        clippy::expect_used,
+        reason = "test assertions identify the refused boundary"
+    )]
+    mod canonical_cases {
+        use super::*;
+        include!("resolve_canonical_tests.rs");
+    }
 
     /// The entry nonce every intent request in this module names.
     const INTENT_NONCE: i64 = 41;

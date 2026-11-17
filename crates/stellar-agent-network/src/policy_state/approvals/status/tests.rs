@@ -79,6 +79,9 @@ fn approval_status_durable_lifecycle_and_clock_views() {
                     fx.fixture.profile(),
                     minted.id,
                     &crate::policy_state::ClaimExpect {
+                        operation: request.operation,
+                        intent_digest: request.intent_digest,
+                        predecessor: request.predecessor,
                         domain: request.binding.domain(),
                         consumer: request.consumer,
                         bindings_digest: minted.bindings_digest,
