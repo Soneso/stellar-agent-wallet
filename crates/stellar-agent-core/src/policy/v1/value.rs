@@ -327,8 +327,8 @@ impl ValueLeg {
     /// Whether this leg is a native-XLM debit — a debit-carrying leg
     /// ([`ActionKind::carries_debit`]) whose asset is the canonical `"native"`.
     ///
-    /// The minimum-reserve criterion counts only these legs: a token-only move
-    /// does not reduce the native reserve.
+    /// This network-free predicate recognizes native aliases. Account balance
+    /// criteria also recognize the native asset contract on their network.
     #[must_use]
     pub fn is_native_debit(&self) -> bool {
         self.kind.carries_debit()

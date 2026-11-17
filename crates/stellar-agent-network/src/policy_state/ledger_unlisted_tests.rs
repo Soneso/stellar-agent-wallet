@@ -72,7 +72,10 @@ fn policy(l: &Ledger, binding: DomainBinding, holds: Vec<WindowEntry>) -> MintRe
 }
 
 fn approval_required<T>(result: Result<T, WindowStoreError>) -> bool {
-    matches!(result.err(), Some(WindowStoreError::UnlistedApprovalRequired))
+    matches!(
+        result.err(),
+        Some(WindowStoreError::UnlistedApprovalRequired)
+    )
 }
 
 fn denied_by<T>(result: Result<T, WindowStoreError>, reason: fn(&DenyReason) -> bool) -> bool {
@@ -219,8 +222,16 @@ fn approved_unlisted_mint_at_capacity() {
     l.store
         .invalidate_authorization(&l.profile, live[0].id, "make room")
         .unwrap();
-    assert!(approval_required(l.mint(&policy(&l, tx(3), payment(ALLOWANCE)))));
-    assert_eq!(open(), MAX_OPEN_AUTHORIZATIONS - 1, "approval-needed takes no capacity");
+    assert!(approval_required(l.mint(&policy(
+        &l,
+        tx(3),
+        payment(ALLOWANCE)
+    ))));
+    assert_eq!(
+        open(),
+        MAX_OPEN_AUTHORIZATIONS - 1,
+        "approval-needed takes no capacity"
+    );
     l.mint(&l.request(tx(4), payment(ALLOWANCE))).unwrap();
     let full = l.request(tx(5), payment(1));
     assert_eq!(refusal(l.mint(&full)), MainnetPrecondition::TooManyOpen);
@@ -237,7 +248,11 @@ fn approved_unlisted_mint_at_capacity() {
 #[test]
 #[serial]
 fn approved_unlisted_mint_crash_matrix() {
-    for point in [COMMIT_FAULT_AFTER_PREPARED, COMMIT_FAULT_AFTER_COUNTER] {
+    for point in [
+        COMMIT_FAULT_AFTER_PREPARED,
+        COMMIT_FAULT_AFTER_COUNTER,
+        crate::policy_state::store::COMMIT_FAULT_COMPACTION,
+    ] {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
@@ -246,10 +261,18 @@ fn approved_unlisted_mint_crash_matrix() {
         let approved = l.request(tx(2), payment(6));
         {
             let _fault = arm_accounting_fault(point);
-            assert!(
-                matches!(l.mint(&approved), Err(WindowStoreError::Io { .. })),
-                "{point}"
-            );
+            let result = l.mint(&approved);
+            if point == crate::policy_state::store::COMMIT_FAULT_COMPACTION {
+                assert!(
+                    result.is_ok(),
+                    "optional compaction retains the committed result"
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(WindowStoreError::Io { .. })),
+                    "{point}"
+                );
+            }
         }
         let restarted = Ledger {
             store: PersistedWindowStore::at_path(l.store.path().to_path_buf()),
@@ -313,6 +336,117 @@ fn unlisted_legacy_rows_keep_lifecycle() {
     l.mint(&policy(&l, tx(1), vec![unlisted_at(&canonical, T0, 5)]))
         .unwrap();
     assert!(l.wire().entries.iter().any(|b| b.bucket == legacy));
+    l.pin(8, [8; 32]);
+    let mut resigned = policy(&l, tx(2), vec![unlisted_at(&legacy, T0, 1)]);
+    resigned.policy_sequence = 8;
+    resigned.policy_digest = [8; 32];
+    if let MintAuthority::Policy(authority) = &mut resigned.authority {
+        authority.policy_sequence = 8;
+        authority.policy_digest = [8; 32];
+    }
+    assert!(
+        approval_required(l.mint(&resigned)),
+        "re-signing an alias does not refill rolling allowance"
+    );
+    let id = l.wire().authorizations[0].id;
+    l.store
+        .invalidate_authorization(&l.profile, id, "unused")
+        .unwrap();
+    assert_eq!(
+        l.record(id).state,
+        AuthorizationState::Invalidated,
+        "legacy alias keeps revocation"
+    );
+    l.mint(&resigned).unwrap();
+}
+
+#[test]
+#[serial]
+fn unlisted_pending_future_skew_refuses_admission() {
+    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+    let l = Ledger::new();
+    sealed_reservation(&l, &[5]);
+    l.clock.set(T0 - 3_600_000);
+    let request = l.request(
+        tx(1),
+        vec![unlisted_at("unlisted:native", T0 - 3_600_000, 0)],
+    );
+    let before = l.bytes();
+    assert!(
+        denied_by(l.mint(&request), |reason| matches!(
+            reason,
+            DenyReason::EvaluationError { .. }
+        )),
+        "pending future timestamps refuse before allowance admission"
+    );
+    assert_eq!(l.bytes(), before);
+    l.clock.set(T0);
+    let mut refreshed = request;
+    refreshed.holds = vec![unlisted(0)];
+    l.mint(&refreshed).unwrap();
+}
+
+#[test]
+#[serial]
+fn unlisted_malformed_file_admission_refuses() {
+    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+    let l = Ledger::new();
+    l.mint(&policy(&l, tx(1), vec![unlisted(1)])).unwrap();
+    let mut wire = l.wire();
+    wire.authorizations.push(wire.authorizations[0].clone());
+    seal_floor(&l, wire);
+    let bytes = l.bytes();
+    assert!(
+        malformed_floor(&l.mint(&policy(&l, tx(2), vec![unlisted(1)])).unwrap_err()),
+        "duplicate authorization refuses admission"
+    );
+    assert_eq!(l.bytes(), bytes);
+}
+
+#[test]
+#[serial]
+fn unlisted_descriptor_and_engine_key_share_durable_bucket() {
+    use stellar_agent_core::policy::v1::criteria::Criterion;
+    use stellar_agent_core::policy::v1::criteria::counterparty_allowlist::{
+        CounterpartyAllowlistCriterion, CounterpartyKind, UnlistedBudget, UnlistedMode,
+    };
+    use stellar_agent_core::policy::v1::criteria::per_period_cap::Window;
+    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+    let l = Ledger::new();
+    let classic = "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
+    let criterion = CounterpartyAllowlistCriterion::new(vec![CounterpartyKind::GAccount], vec![])
+        .with_unlisted(UnlistedMode::Budget(UnlistedBudget::new(
+            classic.to_owned(),
+            10,
+            10,
+            Window::parse("1d").unwrap(),
+        )));
+    let described = criterion
+        .descriptors()
+        .into_iter()
+        .find_map(|descriptor| descriptor.state_key("ledger"))
+        .unwrap();
+    let canonical = format!(
+        "unlisted:{}",
+        stellar_agent_core::policy::v1::asset_equivalence::total_budget_identity(
+            classic,
+            Caip2::Mainnet.network_passphrase()
+        )
+    );
+    l.store
+        .record_and_persist(&l.profile, &[unlisted_at(&canonical, T0, 6)])
+        .unwrap();
+    assert!(
+        approval_required(l.mint(&policy(
+            &l,
+            tx(1),
+            vec![unlisted_at(described.bucket(), T0, 5)]
+        ))),
+        "descriptor and canonical engine key spend the same allowance"
+    );
 }
 
 /// Rows under two spellings across a restart with the clock earlier than
@@ -355,7 +489,10 @@ fn unlisted_canonical_window_under_clock_shift() {
     l.clock.set(later);
     assert_eq!(hydrated(later), (0, 0));
     l.mint(&under_policy(
-        l.request(tx(2), vec![unlisted_at("unlisted:native", later, ALLOWANCE)]),
+        l.request(
+            tx(2),
+            vec![unlisted_at("unlisted:native", later, ALLOWANCE)],
+        ),
         later + APPROVAL_MS,
     ))
     .unwrap();
@@ -378,10 +515,15 @@ fn unlisted_store_sums_refuse() {
     let batch = l.request(tx(1), vec![unlisted(i128::MAX), unlisted(1)]);
     assert!(overflow(l.mint(&batch)));
     // A held amount at i128::MAX and one stroop more.
-    l.mint(&l.request(tx(2), vec![unlisted(i128::MAX)])).unwrap();
+    l.mint(&l.request(tx(2), vec![unlisted(i128::MAX)]))
+        .unwrap();
     let before = l.bytes();
     assert!(overflow(l.mint(&l.request(tx(3), vec![unlisted(1)]))));
-    assert!(approval_required(l.mint(&policy(&l, tx(4), vec![unlisted(0)]))));
+    assert!(approval_required(l.mint(&policy(
+        &l,
+        tx(4),
+        vec![unlisted(0)]
+    ))));
     assert_eq!(l.bytes(), before);
 
     let n = Ledger::new();

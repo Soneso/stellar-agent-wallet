@@ -18,7 +18,7 @@
 //!
 //! ```text
 //! reserve_required = account.reserves_stroops(BASE_RESERVE_STROOPS) + margin_stroops
-//! post_balance     = pre_balance - (amount_stroops + total_fee_stroops) [saturating]
+//! post_balance     = pre_balance - (amount_stroops + total_fee_stroops) [checked]
 //!
 //! if post_balance < reserve_required → DenyReason::MinimumReserveBreached
 //! ```
@@ -43,6 +43,7 @@
 //! `AccountReservesView::reserves_stroops` at protocol release.
 
 use crate::policy::v1::EvalContext;
+use crate::policy::v1::asset_equivalence::assets_equivalent;
 use crate::policy::v1::criteria::Criterion;
 use crate::policy::v1::value::{ValueGate, classify_value};
 use crate::policy::{DenyReason, PolicyError};
@@ -147,6 +148,9 @@ impl Criterion for MinimumReserveCriterion {
     /// - [`PolicyError::CriterionEvaluationFailed`] when a native-XLM debit leg
     ///   of the value descriptor carries no resolvable amount — an unresolvable
     ///   native debit refuses rather than passing as a zero debit.
+    /// - [`PolicyError::AccountingInvalid`] for negative debit or fee facts,
+    ///   or a malformed or missing classic fee.
+    /// - [`PolicyError::AccountingOverflow`] when native arithmetic overflows.
     fn evaluate(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
         // A provisional evaluation reads no account; the strict evaluation
         // before signing applies this check.
@@ -184,15 +188,19 @@ impl Criterion for MinimumReserveCriterion {
             AmountOutcome::Debit(amount) => amount,
             AmountOutcome::Deny(reason) => return Ok(Some(reason)),
         };
-        let total_fee_stroops = extract_total_fee_stroops(ctx);
+        let total_fee_stroops = extract_total_fee_stroops(ctx)?;
 
         // The reserve compare and the `DenyReason` payload are i128 end to end.
         // `amount_stroops` may carry an i128 token quantity. The balance, the fee,
         // and the reserve requirement are i64 at their sources and are promoted
         // here, so the debit is never narrowed.
         let pre_balance = i128::from(pre_balance);
-        let debit = amount_stroops.saturating_add(i128::from(total_fee_stroops));
-        let post_balance = pre_balance.saturating_sub(debit);
+        let debit = amount_stroops
+            .checked_add(i128::from(total_fee_stroops))
+            .ok_or(PolicyError::AccountingOverflow)?;
+        let post_balance = pre_balance
+            .checked_sub(debit)
+            .ok_or(PolicyError::AccountingOverflow)?;
 
         let reserve_required_stroops = i128::from(
             account_view
@@ -239,8 +247,8 @@ pub(super) enum AmountOutcome {
 ///   cannot be sized (an unpopulated `MovesValue` tool, or an opaque-sign call
 ///   under a matched rule); the criterion returns this reason directly rather
 ///   than computing a debit.
-/// - [`ValueGate::Effects`] → sums only the debit legs whose asset is the
-///   canonical `"native"` ([`crate::policy::v1::value::ValueLeg::is_native_debit`]).
+/// - [`ValueGate::Effects`] → sums the debit legs whose asset is native,
+///   including aliases and the current network's native asset contract.
 ///   A non-native leg (a token-only move) contributes 0 to the reserve debit —
 ///   it does not reduce the native reserve. A native debit leg with an
 ///   unresolvable (`None`) amount is refused fail-closed: an unresolvable
@@ -250,7 +258,8 @@ pub(super) enum AmountOutcome {
 /// # Errors
 ///
 /// Returns [`PolicyError::CriterionEvaluationFailed`] when a native debit leg
-/// carries no resolvable amount.
+/// carries no resolvable amount, [`PolicyError::AccountingInvalid`] for a
+/// negative native debit, and [`PolicyError::AccountingOverflow`] on overflow.
 pub(super) fn extract_amount_stroops(ctx: &EvalContext<'_>) -> Result<AmountOutcome, PolicyError> {
     let effects = match classify_value(ctx) {
         ValueGate::NotApplicable => return Ok(AmountOutcome::Debit(0)),
@@ -260,7 +269,11 @@ pub(super) fn extract_amount_stroops(ctx: &EvalContext<'_>) -> Result<AmountOutc
 
     let mut sum: i128 = 0;
     for leg in effects.legs() {
-        if !leg.is_native_debit() {
+        if !leg.kind.carries_debit()
+            || !leg.asset.as_deref().is_some_and(|asset| {
+                assets_equivalent(asset, "native", ctx.profile.chain_id.network_passphrase())
+            })
+        {
             // A non-native debit (or a non-debit leg such as Claim/Trustline)
             // does not reduce the native reserve.
             continue;
@@ -273,7 +286,12 @@ pub(super) fn extract_amount_stroops(ctx: &EvalContext<'_>) -> Result<AmountOutc
                     ctx.tool.name
                 ),
             })?;
-        sum = sum.saturating_add(amount);
+        if amount < 0 {
+            return Err(PolicyError::AccountingInvalid);
+        }
+        sum = sum
+            .checked_add(amount)
+            .ok_or(PolicyError::AccountingOverflow)?;
     }
 
     Ok(AmountOutcome::Debit(sum))
@@ -282,12 +300,28 @@ pub(super) fn extract_amount_stroops(ctx: &EvalContext<'_>) -> Result<AmountOutc
 /// Extracts the decoded envelope's total transaction fee in stroops.
 ///
 /// `decode_authoritative_args` and the CLI full-mode argument maps write this
-/// value as a JSON number. Arguments without it count the fee as 0.
-pub(super) fn extract_total_fee_stroops(ctx: &EvalContext<'_>) -> i64 {
-    ctx.args
-        .get("total_fee_stroops")
-        .and_then(serde_json::Value::as_i64)
-        .unwrap_or(0)
+/// value as a JSON number. A missing fee is allowed only for a value-less
+/// action or x402 authorization, whose payer pays no envelope fee here.
+pub(super) fn extract_total_fee_stroops(ctx: &EvalContext<'_>) -> Result<i64, PolicyError> {
+    let fee = match ctx.args.get("total_fee_stroops") {
+        Some(value) => value.as_i64().ok_or(PolicyError::AccountingInvalid)?,
+        None => match classify_value(ctx) {
+            ValueGate::NotApplicable => 0,
+            ValueGate::Effects(effects)
+                if effects
+                    .legs()
+                    .iter()
+                    .all(|leg| leg.kind == crate::policy::v1::value::ActionKind::X402Payment) =>
+            {
+                0
+            }
+            _ => return Err(PolicyError::AccountingInvalid),
+        },
+    };
+    if fee < 0 {
+        return Err(PolicyError::AccountingInvalid);
+    }
+    Ok(fee)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -410,7 +444,7 @@ mod tests {
             balance: 2_000_000_000, // 200 XLM
             subentries: 0,
         };
-        let args = json!({ "amount": "100 XLM", "asset": "native" });
+        let args = json!({ "total_fee_stroops": 0, "amount": "100 XLM", "asset": "native" });
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let ctx = make_ctx(&tool, &profile, &args, &store, Some(&view));
@@ -437,7 +471,7 @@ mod tests {
             balance: 120_000_000, // 12 XLM
             subentries: 0,
         };
-        let args = json!({ "amount": "11 XLM", "asset": "native" });
+        let args = json!({ "total_fee_stroops": 0, "amount": "11 XLM", "asset": "native" });
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let ctx = make_ctx(&tool, &profile, &args, &store, Some(&view));
@@ -450,27 +484,27 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn saturating_sub_on_amount_exceeding_balance_still_catches_breach() {
+    fn amount_exceeding_balance_still_catches_breach() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let store = PolicyStateStore::new();
         let criterion = MinimumReserveCriterion::new(0); // no margin
 
-        // Sending more than balance: saturating_sub floors to 0 which is
-        // below the protocol reserve of 10_000_000 stroops.
+        // Sending more than the balance leaves a negative result, below
+        // the protocol reserve of 10_000_000 stroops.
         let view = MockAccountView {
             balance: 50_000_000, // 5 XLM
             subentries: 0,
         };
-        let args = json!({ "amount": "100 XLM", "asset": "native" });
+        let args = json!({ "total_fee_stroops": 0, "amount": "100 XLM", "asset": "native" });
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let ctx = make_ctx(&tool, &profile, &args, &store, Some(&view));
         let result = criterion.evaluate(&ctx).unwrap();
         assert!(
             matches!(result, Some(DenyReason::MinimumReserveBreached { .. })),
-            "amount > balance with saturating_sub should still breach reserve"
+            "amount greater than balance must breach reserve"
         );
     }
 
@@ -491,7 +525,7 @@ mod tests {
             balance: 300_000_000,
             subentries: 0,
         };
-        let args = json!({ "amount": "10 XLM", "asset": "native" });
+        let args = json!({ "total_fee_stroops": 0, "amount": "10 XLM", "asset": "native" });
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let ctx = make_ctx(&tool, &profile, &args, &store, Some(&view));
@@ -544,7 +578,7 @@ mod tests {
             balance: 120_000_000,
             subentries: 0,
         };
-        let args = json!({ "starting_balance": "11 XLM" });
+        let args = json!({ "total_fee_stroops": 0, "starting_balance": "11 XLM" });
         let tool = make_tool("stellar_create_account");
         let profile = make_profile();
         let ctx = make_ctx(&tool, &profile, &args, &store, Some(&view));
@@ -603,7 +637,7 @@ mod tests {
         let profile = make_profile();
         let ctx = make_ctx(&tool, &profile, &args, &store, None);
 
-        assert_eq!(extract_total_fee_stroops(&ctx), 12_345);
+        assert_eq!(extract_total_fee_stroops(&ctx).unwrap(), 12_345);
     }
 
     #[test]
@@ -663,10 +697,12 @@ mod tests {
 
         args.as_object_mut().unwrap().remove("total_fee_stroops");
         let ctx = make_ctx(&tool, &profile, &args, &store, Some(&view));
-        assert_eq!(
-            criterion.evaluate(&ctx).unwrap(),
-            None,
-            "a payment without the fee key must allow at the reserve boundary"
+        assert!(
+            matches!(
+                criterion.evaluate(&ctx),
+                Err(PolicyError::AccountingInvalid)
+            ),
+            "a decoded classic action without its fee cannot establish the reserve"
         );
     }
 
@@ -728,7 +764,7 @@ mod tests {
             balance: 120_000_000,
             subentries: 0,
         };
-        let args = json!({
+        let args = json!({ "total_fee_stroops": 0,
             "chain_id": "stellar:testnet",
             "source": "GAAA",
             "destination": "GBBB",
@@ -789,7 +825,7 @@ mod tests {
             balance: 120_000_000,
             subentries: 0,
         };
-        let args = json!({ "starting_balance": "11 XLM" });
+        let args = json!({ "total_fee_stroops": 0, "starting_balance": "11 XLM" });
         let tool = make_tool("stellar_create_account");
         let profile = make_profile();
         let ctx = make_ctx(&tool, &profile, &args, &store, Some(&view));
@@ -815,7 +851,8 @@ mod tests {
             balance: 120_000_000,
             subentries: 0,
         };
-        let args = json!({ "amount_stroops": 110_000_000i64, "asset": "native" });
+        let args =
+            json!({ "total_fee_stroops": 0, "amount_stroops": 110_000_000i64, "asset": "native" });
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let ctx = make_ctx(&tool, &profile, &args, &store, Some(&view));
@@ -1014,7 +1051,7 @@ mod tests {
             asset: Some("USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN".to_owned()),
             destination: Some("GBBB".to_owned()),
         };
-        let args = json!({});
+        let args = json!({ "total_fee_stroops": 0 });
         let tool = make_tool("stellar_multicall");
         let profile = make_profile();
         let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)

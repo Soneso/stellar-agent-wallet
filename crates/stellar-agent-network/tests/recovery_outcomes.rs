@@ -182,6 +182,7 @@ impl Fixture {
                     operation_id: handle.id(),
                     attempt_index: 1,
                 }),
+                floor: None,
                 native_reservation: Some(NativeReservation {
                     debit_stroops: 100,
                     fee_stroops: 100,

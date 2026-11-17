@@ -15,8 +15,8 @@ use crate::server::WalletServer;
 use crate::tools::common::{
     APPROVAL_TTL_MS, CLASSIC_SINGLE_OPERATION_COUNT, DEFAULT_NONCE_TTL_MS, DispatchOutcome,
     commit_envelope_and_verify_nonce, commit_path_error_result, ledger_err_result, nonce_id_prefix,
-    redacted_wallet_error_envelope, resolve_classic_fee_per_op_stroops, total_classic_fee_stroops,
-    validate_g_strkey, validate_plain_account, verify_attestation_gate,
+    redacted_wallet_error_envelope, total_classic_fee_stroops, validate_g_strkey,
+    validate_plain_account, verify_attestation_gate,
 };
 use stellar_agent_core::amount::McpAmountArgument;
 use stellar_agent_core::approval::retry::{
@@ -26,10 +26,7 @@ use stellar_agent_core::approval::store::PendingApproval;
 use stellar_agent_core::approval::user_id::process_uid_for_attestation;
 use stellar_agent_core::envelope_decode::decode_authoritative_args;
 use stellar_agent_core::timefmt::now_unix_ms;
-use stellar_agent_network::{
-    BASE_RESERVE_STROOPS, ClassicOpBuilder, classic_fee_source, parse_classic_fee_choice,
-    resolve_classic_fee_selection, submit::SubmissionResult,
-};
+use stellar_agent_network::{BASE_RESERVE_STROOPS, ClassicOpBuilder, submit::SubmissionResult};
 
 /// Computes the create-account pre-flight required balance in stroops:
 /// `starting_balance + BASE_RESERVE + fee`.
@@ -384,7 +381,7 @@ impl WalletServer {
         Parameters(args): Parameters<StellarCreateAccountArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         // ── dispatch gate ────────────────────────────────────────────────────
-        let args_value = json!({
+        let mut args_value = json!({
             "chain_id": &args.chain_id,
             "source": &args.source,
             "destination": &args.destination,
@@ -432,7 +429,8 @@ impl WalletServer {
         {
             Some(id) => {
                 let fee_choice =
-                    parse_classic_fee_choice(args.classic_base.as_deref()).map_err(|err| {
+                    stellar_agent_network::parse_classic_fee_choice(args.classic_base.as_deref())
+                        .map_err(|err| {
                         rmcp::ErrorData::invalid_params(
                             format!("invalid fee: {}", err.code()),
                             None,
@@ -496,6 +494,17 @@ impl WalletServer {
         // `identity_view` is therefore `None` (a `home_domain_resolved` criterion
         // configured for this tool fails closed, which is correct — a not-yet-
         // existent account has no home_domain to resolve).
+        let fee_selection = match self
+            .resolve_classic_policy_fee(&client, args.classic_base.as_deref())
+            .await
+        {
+            Ok(selection) => selection,
+            Err(error) => return error.into_result(),
+        };
+        let fee_per_op_stroops = fee_selection.per_op_stroops;
+        let total_fee_stroops =
+            total_classic_fee_stroops(fee_per_op_stroops, CLASSIC_SINGLE_OPERATION_COUNT)?;
+        args_value["total_fee_stroops"] = json!(total_fee_stroops);
         let source_adapter = crate::policy_adapter::AccountViewAdapter::new(&account_view);
         let dispatch_outcome = match self
             .dispatch_gate_with_views(
@@ -534,39 +543,7 @@ impl WalletServer {
         // base_reserve (new account creation) + fee.
         let source_reserves = account_view.reserves_stroops(BASE_RESERVE_STROOPS);
         let starting_balance_stroops = args.starting_balance.as_stroops();
-        let fee_choice = parse_classic_fee_choice(args.classic_base.as_deref()).map_err(|err| {
-            rmcp::ErrorData::invalid_params(format!("invalid fee: {}", err.code()), None)
-        })?;
-        let fee_selection = match resolve_classic_fee_selection(
-            &client,
-            resolve_classic_fee_per_op_stroops(self.security_profile()),
-            fee_choice,
-        )
-        .await
-        {
-            Ok(selection) => selection,
-            Err(err @ stellar_agent_core::WalletError::Network(_)) => {
-                return Ok(ledger_err_result(&err));
-            }
-            Err(err) => {
-                return Err(rmcp::ErrorData::invalid_params(
-                    format!("invalid fee: {}", err.code()),
-                    None,
-                ));
-            }
-        };
-        if let Err(err) = self.check_write_fee(
-            fee_selection.per_op_stroops,
-            classic_fee_source(
-                fee_choice,
-                stellar_agent_core::error::FeeSource::ProfileDefault,
-            ),
-        ) {
-            return Ok(ledger_err_result(&err));
-        }
-        let fee_per_op_stroops = fee_selection.per_op_stroops;
-        let total_fee_stroops =
-            total_classic_fee_stroops(fee_per_op_stroops, CLASSIC_SINGLE_OPERATION_COUNT)?;
+
         let fee_stroops = i64::from(total_fee_stroops);
 
         // saturating_sub: under-reserved accounts (balance < reserves) yield

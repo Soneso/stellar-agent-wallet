@@ -586,6 +586,7 @@ fn header_preserves_bindings_and_bounds() {
         holds: vec![],
         parent: None,
         operation: Some(link),
+        floor: None,
         native_reservation: None,
     };
     let minted = f.window.mint_authorization(&f.profile, &request).unwrap();
@@ -742,6 +743,7 @@ fn intent_restart_seam() {
         holds: vec![],
         parent: None,
         operation: None,
+        floor: None,
         native_reservation: None,
     };
     let mut first = mint.clone();

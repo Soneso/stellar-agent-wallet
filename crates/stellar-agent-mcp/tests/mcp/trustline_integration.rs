@@ -911,6 +911,39 @@ fn trustline_args(source_g: &str) -> StellarTrustlineArgs {
     }
 }
 
+#[tokio::test]
+#[serial]
+async fn trustline_reserve_uses_the_selected_fee() {
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key(215);
+    let (rpc, source) = trustline_endpoint([0x4d; 32]).await;
+    let mut profile = testnet_profile_with_rpc(&rpc.uri());
+    profile.classic_fee_per_op_stroops = Some(500);
+    profile.classic_max_fee_per_op_stroops = Some(1_000);
+    let mut server = WalletServer::new(profile).unwrap();
+    server.set_policy_engine_for_test(std::sync::Arc::new(
+        crate::common::v1_engine_mock::minimum_reserve_engine(
+            &["stellar_trustline"],
+            100_000_000_000_000 - 10_000_000 - 500,
+        ),
+    ));
+    let mut args = trustline_args(&source);
+    let exact = server.call_stellar_trustline(args.clone()).await.unwrap();
+    assert_ne!(
+        exact.is_error,
+        Some(true),
+        "the selected fee meets the reserve exactly"
+    );
+    args.classic_base = Some("501".to_owned());
+    let below = server.call_stellar_trustline(args).await.unwrap();
+    assert_eq!(
+        call_result_json(&below)["error"]["code"],
+        "policy.deny.minimum_reserve_breached",
+        "one more selected fee stroop breaches the reserve"
+    );
+}
+
 /// The prepare's profile fee above the cap refuses with the profile-fee text.
 #[tokio::test]
 #[serial]

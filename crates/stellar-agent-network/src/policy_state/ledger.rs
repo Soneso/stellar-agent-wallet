@@ -1204,6 +1204,9 @@ pub struct MintRequest {
     /// The native amounts the authorization reserves, stored with the
     /// record whether or not it holds window entries.
     pub native_reservation: Option<NativeReservation>,
+    /// Checked observed facts for a signed balance floor. Existing callers
+    /// without observed reads refuse configured floors during evaluation.
+    pub floor: Option<super::accounting::CheckedFloor>,
 }
 
 /// How a mint inside an operation step relaxes the stand-alone rules.
@@ -1996,6 +1999,9 @@ pub(super) fn mint_into(
         MintAuthority::Policy(_) => Admission::Policy,
     };
     admit_as(wire, &request.holds, mode)?;
+    if let Some(floor) = &request.floor {
+        floor.check(wire, profile, request, now)?;
+    }
 
     let id = loop {
         let candidate = AuthorizationId::random();
@@ -2822,6 +2828,7 @@ mod tests {
     };
 
     include!("ledger_composed_tests.rs");
+    include!("ledger_floor_tests.rs");
 
     struct Ledger {
         _dir: TempDir,
@@ -2912,6 +2919,7 @@ mod tests {
                 holds,
                 parent: None,
                 operation: None,
+                floor: None,
                 native_reservation: None,
             }
         }
@@ -7633,6 +7641,10 @@ mod tests {
         l.mint(&plain).unwrap();
         let wire = l.wire();
         assert_eq!(native_reserved(&wire, None), 325);
+        assert!(
+            floor_unread(floor_sum(&l, Some(floor_seen()))),
+            "the diagnostic skips absent amounts but floor use refuses"
+        );
         let at = |ledger: u32, close: u64| WindowObservation {
             ledger,
             close_time_floor_ms: close,
@@ -7700,6 +7712,11 @@ mod tests {
         assert_eq!(record.state, AuthorizationState::Used);
         assert_eq!(record.native_reservation, Some(NATIVE));
         assert_eq!(record.native_release, None);
+        assert_eq!(
+            floor_sum(&l, Some(floor_seen())).unwrap(),
+            325,
+            "consumption does not release strict native exposure"
+        );
         assert_eq!(
             super::super::operations::native_reserved(&l.wire(), None),
             325

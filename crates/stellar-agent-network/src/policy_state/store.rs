@@ -18710,6 +18710,7 @@ mod tests {
             holds: vec![],
             parent: None,
             operation: None,
+            floor: None,
             native_reservation: None,
         }
     }

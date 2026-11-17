@@ -204,8 +204,7 @@ fn minimum_reserve_pay_above_reserve_allows() {
         balance: 2_000_000_000,
         subentries: 0,
     };
-    let args =
-        json!({ "amount_stroops": "1000000000", "asset": "native", "destination": G_ALLOWED });
+    let args = json!({ "total_fee_stroops": 0, "amount_stroops": "1000000000", "asset": "native", "destination": G_ALLOWED });
     let ctx = descriptor_ctx(&tool, &args, &profile, &store).with_account_view(&view);
     assert!(
         criterion.evaluate(&ctx).unwrap().is_none(),
@@ -227,8 +226,7 @@ fn minimum_reserve_pay_breach_denies() {
         balance: 120_000_000, // 12 XLM
         subentries: 0,
     };
-    let args =
-        json!({ "amount_stroops": "110000000", "asset": "native", "destination": G_ALLOWED });
+    let args = json!({ "total_fee_stroops": 0, "amount_stroops": "110000000", "asset": "native", "destination": G_ALLOWED });
     let ctx = descriptor_ctx(&tool, &args, &profile, &store).with_account_view(&view);
     assert!(
         matches!(

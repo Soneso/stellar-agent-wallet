@@ -13,7 +13,7 @@
   "profile_name": "default",
   "steps": [
     {
-      "args": { "amount_stroops": "1", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+      "args": { "total_fee_stroops": 0, "amount_stroops": "1", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
       "account": { "balance_stroops": 1000000, "observed_age_ms": 120001, "reservations_stroops": 0 },
       "expected": {
         "kind": "Deny",
@@ -23,7 +23,7 @@
       }
     },
     {
-      "args": { "amount_stroops": "1", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+      "args": { "total_fee_stroops": 0, "amount_stroops": "1", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
       "account": { "balance_stroops": 1000000, "observed_age_ms": 0, "reservations_stroops": 0 },
       "expected": { "kind": "Allow" }
     }

@@ -17,7 +17,7 @@
 //! The balance comes from a live account read the caller supplies as an
 //! [`crate::policy::v1::FloorInput`]: the observed account and the native
 //! reservations of the profile's open authorizations. A missing view,
-//! observation, reservation sum, or balance refuses with
+//! observation, reservation sum, balance, or a future observation refuses with
 //! [`DenyReason::AccountUnread`]; an observation older than 120 seconds
 //! refuses with [`DenyReason::AccountStale`]. The debit and the fee are
 //! resolved as `minimum_reserve` resolves them.
@@ -83,8 +83,10 @@ impl Criterion for BalanceFloorCriterion {
     /// # Errors
     ///
     /// Returns [`PolicyError::CriterionEvaluationFailed`] when a native debit
-    /// leg carries no resolvable amount. The observation's age is measured at
-    /// the evaluation instant `ctx.now_ms`.
+    /// leg carries no resolvable amount, [`PolicyError::AccountingInvalid`]
+    /// for negative or malformed debit/fee facts, and
+    /// [`PolicyError::AccountingOverflow`] on unrepresentable arithmetic.
+    /// The observation's age is measured at the evaluation instant `ctx.now_ms`.
     fn evaluate(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
         if ctx.provisional {
             return Ok(None);
@@ -105,7 +107,9 @@ impl Criterion for BalanceFloorCriterion {
             return Ok(Some(DenyReason::AccountUnread));
         };
 
-        let age_ms = ctx.now_ms.saturating_sub(observation.observed_at_ms);
+        let Some(age_ms) = ctx.now_ms.checked_sub(observation.observed_at_ms) else {
+            return Ok(Some(DenyReason::AccountUnread));
+        };
         if age_ms > MAX_OBSERVATION_AGE_MS {
             return Ok(Some(DenyReason::AccountStale { age_ms }));
         }
@@ -114,10 +118,11 @@ impl Criterion for BalanceFloorCriterion {
             AmountOutcome::Debit(amount) => amount,
             AmountOutcome::Deny(reason) => return Ok(Some(reason)),
         };
-        let fee = i128::from(extract_total_fee_stroops(ctx));
+        let fee = i128::from(extract_total_fee_stroops(ctx)?);
         let balance_after_stroops = i128::from(balance)
-            .saturating_sub(i128::from(reservations))
-            .saturating_sub(debit.saturating_add(fee));
+            .checked_sub(i128::from(reservations))
+            .and_then(|after| after.checked_sub(debit.checked_add(fee)?))
+            .ok_or(PolicyError::AccountingOverflow)?;
         if balance_after_stroops < self.min_stroops {
             return Ok(Some(DenyReason::AccountFloorRefused {
                 min_stroops: self.min_stroops,
