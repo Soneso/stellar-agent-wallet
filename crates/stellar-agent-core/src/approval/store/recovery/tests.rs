@@ -488,6 +488,83 @@ fn payment_recovery_link_failure_refuses_only_its_payment() {
     }
 }
 
+/// The clock-aware check persists an observed expiry before it refuses, keeps
+/// recorded terminal states under an earlier clock, refuses a broken link
+/// before any write, and passes unindexed entries unchanged.
+#[test]
+#[serial_test::serial]
+fn payment_recovery_check_at_persists_expiry_and_keeps_terminal_state() {
+    let fixture = MainnetConsentFixture::new("recovery");
+    let policy = fixture.current_policy();
+    for case in ["expired", "rejected", "broken link"] {
+        let path = fixture.home().join(format!("check-at-{case}.toml"));
+        let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+        let first = queue(&mut store, &policy, START).unwrap();
+        let live = std::fs::read(&path).unwrap();
+        store
+            .check_payment_recovery_at(&first.approval_nonce, END - 1)
+            .unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            live,
+            "a live check writes nothing"
+        );
+        match case {
+            "expired" => assert!(matches!(
+                store.check_payment_recovery_at(&first.approval_nonce, END),
+                Err(ApprovalError::Expired)
+            )),
+            "rejected" => {
+                store.reject(&first.approval_nonce, START + 1, 300).unwrap();
+            }
+            "broken link" => {
+                let mut file: toml::Value =
+                    toml::from_str(&String::from_utf8(live).unwrap()).unwrap();
+                file["payment_recovery"][0]["created"] = (START as i64 + 1).into();
+                std::fs::write(&path, toml::to_string(&file).unwrap()).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        drop(store);
+        let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+        let stored = std::fs::read(&path).unwrap();
+        for now in [START, END] {
+            let error = store
+                .check_payment_recovery_at(&first.approval_nonce, now)
+                .unwrap_err();
+            assert!(
+                match case {
+                    "expired" => matches!(error, ApprovalError::Expired),
+                    "rejected" => matches!(error, ApprovalError::Rejected),
+                    _ => matches!(error, ApprovalError::RecoveryInconsistent),
+                },
+                "{case} at {now}: {error:?}"
+            );
+        }
+        if case == "expired" {
+            assert!(
+                matches!(
+                    store.check_payment_recovery(&first.approval_nonce),
+                    Err(ApprovalError::Expired)
+                ),
+                "the observed expiry persists"
+            );
+        }
+        if case == "broken link" {
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                stored,
+                "a broken link refuses before any write"
+            );
+        }
+        const UNRELATED: &str = "unrelated0000000000000";
+        let mut unrelated = first.clone();
+        unrelated.approval_nonce = UNRELATED.to_owned();
+        store.insert(unrelated, START).unwrap();
+        store.check_payment_recovery_at(UNRELATED, END + 1).unwrap();
+    }
+}
+
 /// A queue call with an explicit chain, operation, and interval.
 fn queue_with(
     store: &mut PendingApprovalStore,

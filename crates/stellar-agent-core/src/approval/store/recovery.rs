@@ -154,6 +154,26 @@ impl PendingApprovalStore {
         Ok(())
     }
 
+    /// Checks a recovery binding at `now`, persisting its expiry when `now`
+    /// reaches the signed end; unindexed legacy entries stay unchanged.
+    ///
+    /// # Errors
+    /// Returns [`ApprovalError::RecoveryInconsistent`] when the binding does
+    /// not match its payload, before any write. Otherwise returns the recorded
+    /// or newly observed expiry, rejection, consumption, or a persistence error.
+    pub fn check_payment_recovery_at(
+        &mut self,
+        nonce: &str,
+        now: u64,
+    ) -> Result<(), ApprovalError> {
+        let Some(index) = self.payment_recovery.iter().position(|b| b.nonce == nonce) else {
+            return Ok(());
+        };
+        self.payment_recovery[index].check_link(&self.entries)?;
+        self.observe_recovery_expiry(nonce, now)?;
+        self.payment_recovery[index].status()
+    }
+
     pub(super) fn binds_nonce(&self, nonce: &str) -> bool {
         self.payment_recovery.iter().any(|b| b.nonce == nonce)
     }

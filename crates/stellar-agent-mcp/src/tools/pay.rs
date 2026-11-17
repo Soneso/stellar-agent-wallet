@@ -494,6 +494,25 @@ fn payment_recovery_refusal(
         .ok_or_else(|| rmcp::ErrorData::internal_error(format!("{prefix}: {error}"), None))
 }
 
+/// Maps a direct payment queueing failure to its wire result. A full store
+/// names how retained bindings release their capacity.
+fn payment_store_refusal(
+    error: &ApprovalError,
+    profile: &str,
+) -> Result<CallToolResult, rmcp::ErrorData> {
+    if matches!(error, ApprovalError::PendingStoreFull { .. }) {
+        return Err(rmcp::ErrorData::internal_error(
+            format!(
+                "{STORE}: {error}; retained payment bindings occupy capacity until their \
+                 retention ends, and `stellar-agent approve gc --profile {profile}` frees \
+                 them afterward"
+            ),
+            None,
+        ));
+    }
+    payment_recovery_refusal(error, profile, STORE)
+}
+
 /// The recovery binding a queued payment approval receives.
 #[derive(Clone, Copy)]
 pub(crate) enum PaymentQueue {
@@ -1122,16 +1141,27 @@ impl WalletServer {
                     .waiting_end
                     .map_or(policy_end, |end| policy_end.min(end));
                 let profile_name = self.profile_name_for_approval();
-                let entry = match self.persist_pay_pending_approval(
-                    &envelope_xdr,
-                    created_at_ms,
-                    expires_at_ms,
-                    &profile_name,
-                    &approval.request,
-                    PaymentQueue::Direct(prepared.operation_id.zip(prepared.waiting_end)),
+                let entry = match self.payment_pending_approval(
+                    prepared.handle.as_ref(),
+                    dispatch_outcome.audit_decision(),
+                    (created_at_ms, expires_at_ms),
+                    || {
+                        self.persist_pay_pending_approval(
+                            &envelope_xdr,
+                            created_at_ms,
+                            expires_at_ms,
+                            &profile_name,
+                            &approval.request,
+                            PaymentQueue::Direct(prepared.operation_id.zip(prepared.waiting_end)),
+                        )
+                    },
                 ) {
                     Ok(entry) => entry,
-                    Err(error) => return payment_recovery_refusal(&error, &profile_name, STORE),
+                    Err(error) => return Ok(super::common::ledger_err_result(&error)),
+                };
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => return payment_store_refusal(&error, &profile_name),
                 };
                 Some(json!({
                     "approval_nonce": entry.approval_nonce,
@@ -2239,6 +2269,36 @@ mod tests {
 
     use super::*;
     use stellar_xdr::{Hash, StringM};
+
+    /// A full store keeps `approval.store_error` and names how retained
+    /// payment bindings release their capacity.
+    #[test]
+    fn payment_capacity_refusal_names_the_retention_release() {
+        let Err(refusal) =
+            payment_store_refusal(&ApprovalError::PendingStoreFull { max: 4096 }, "operator")
+        else {
+            panic!("a full store is an internal error");
+        };
+        assert_eq!(
+            refusal.message,
+            "approval.store_error: pending approval store full: maximum 4096 entries reached; \
+             retained payment bindings occupy capacity until their retention ends, and \
+             `stellar-agent approve gc --profile operator` frees them afterward",
+            "the capacity refusal names the retention release"
+        );
+        let Err(other) = payment_store_refusal(
+            &ApprovalError::InvalidEntry {
+                detail: "bad".to_owned(),
+            },
+            "operator",
+        ) else {
+            panic!("an unclassified error is an internal error");
+        };
+        assert_eq!(
+            other.message, "approval.store_error: invalid approval store entry: bad",
+            "an unclassified error keeps its text"
+        );
+    }
 
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
