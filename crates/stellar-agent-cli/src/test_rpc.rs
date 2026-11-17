@@ -77,6 +77,8 @@ pub(crate) struct ClassicRpc {
     health_lead_secs: Arc<Mutex<u64>>,
     /// The status `getHealth` reports.
     health_status: Arc<Mutex<String>>,
+    /// The latest ledger `getLedgerEntries` reports.
+    entries_ledger: u32,
 }
 
 impl ClassicRpc {
@@ -107,6 +109,7 @@ impl ClassicRpc {
             close_clock: now_secs,
             health_lead_secs: Arc::default(),
             health_status: Arc::new(Mutex::new("healthy".to_owned())),
+            entries_ledger: 1001,
             accounts: Arc::new(accounts.iter().map(|a| (*a).to_owned()).collect()),
             accepted_sends: Arc::default(),
             entries: Arc::new(
@@ -191,6 +194,14 @@ impl ClassicRpc {
         server
     }
 
+    /// Answers `getLedgerEntries` at the readiness ledger 2000, as an
+    /// endpoint whose account reads cover its readiness report does.
+    #[cfg(feature = "mainnet-write")]
+    pub(crate) fn entries_at_readiness_ledger(mut self) -> Self {
+        self.entries_ledger = 2000;
+        self
+    }
+
     /// Uses the test's clock for readiness ledger close times.
     #[cfg(feature = "mainnet-write")]
     pub(crate) fn with_close_clock(mut self, clock: fn() -> u64) -> Self {
@@ -233,7 +244,7 @@ impl ClassicRpc {
                 json!({ "key": key, "xdr": entry, "lastModifiedLedgerSeq": 1000 })
             })
             .collect();
-        json!({ "entries": entries, "latestLedger": 1001 })
+        json!({ "entries": entries, "latestLedger": self.entries_ledger })
     }
 }
 

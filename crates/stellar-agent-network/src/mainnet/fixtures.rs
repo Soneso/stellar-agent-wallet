@@ -987,13 +987,25 @@ impl ResolverFixture {
             AccountReserveLookupError, AccountReservesView, ActionKind, ValueClass, ValueLeg,
         };
         use stellar_agent_core::policy::{McpToolRegistration, ToolDescriptor, ToolValueKind};
-        struct Funded;
+        /// A funded account observed at the fixture's instant, with no
+        /// reservations, so a floor rule decides as funded.
+        struct Funded(u64);
         impl AccountReservesView for Funded {
             fn reserves_stroops(&self, _: i64) -> i64 {
                 10_000_000
             }
             fn balance_stroops(&self) -> Result<i64, AccountReserveLookupError> {
                 Ok(i64::MAX)
+            }
+            fn observation(&self) -> Option<stellar_agent_core::policy::v1::AccountObservation> {
+                Some(stellar_agent_core::policy::v1::AccountObservation {
+                    ledger_sequence: 100,
+                    observed_at_ms: self.0,
+                    close_time_floor_ms: self.0,
+                })
+            }
+            fn effective_native_reservations_stroops(&self) -> Option<u64> {
+                Some(0)
             }
         }
         let doc: toml_edit::DocumentMut = raw.parse().unwrap();
@@ -1071,7 +1083,7 @@ impl ResolverFixture {
                             asset: Some(asset.to_owned()),
                             destination: Some(destination.to_owned()),
                         })),
-                        account_view: Some(&Funded),
+                        account_view: Some(&Funded(now)),
                         identity_view: None,
                         counterparty_cache: None,
                         sep10_sessions: None,

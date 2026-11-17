@@ -6016,8 +6016,9 @@ impl<'a> OperationStatus<'a> {
     /// The retained native exposure usable with this exact balance observation.
     ///
     /// Missing amounts refuse only this projection. Lifecycle and diagnostic
-    /// reads remain available. Unlinked history can leave retention, so callers
-    /// must establish history coverage before activating a balance floor.
+    /// reads remain available. Unlinked history can leave retention, so the
+    /// sum is a lower bound: a floor that passes on it refuses through
+    /// [`super::refuse_unproved_floor`].
     ///
     /// # Errors
     ///

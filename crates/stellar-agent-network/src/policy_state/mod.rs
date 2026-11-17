@@ -203,7 +203,11 @@
 //! Reset refuses pending approvals inside their waiting windows and preserves every other approval record.
 
 mod accounting;
-pub use accounting::CheckedFloor;
+#[cfg(feature = "mainnet-write")]
+pub(crate) use accounting::unproved_floor_use;
+pub use accounting::{
+    CheckedFloor, FloorSource, FloorSourceError, floor_rule_matches, refuse_unproved_floor,
+};
 pub mod approvals;
 pub mod budget;
 pub mod ledger;

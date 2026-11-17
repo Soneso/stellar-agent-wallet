@@ -35,7 +35,8 @@ use stellar_agent_core::approval::{
 use stellar_agent_core::envelope_decode::decode_authoritative_args;
 use stellar_agent_core::timefmt::now_unix_ms;
 use stellar_agent_network::{
-    BASE_RESERVE_STROOPS, BalanceView, ClassicOpBuilder, submit::SubmissionResult,
+    BASE_RESERVE_STROOPS, BalanceView, ClassicOpBuilder, policy_state::FloorSource,
+    submit::SubmissionResult,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -461,13 +462,21 @@ impl WalletServer {
         let total_fee_stroops =
             total_classic_fee_stroops(fee_per_op_stroops, CLASSIC_SINGLE_OPERATION_COUNT)?;
         args_value["total_fee_stroops"] = json!(total_fee_stroops);
+        let floor = match self
+            .classic_floor_source(&client, &source, &["stellar_claim", "stellar_claim_commit"])
+            .await
+        {
+            Ok(floor) => floor,
+            Err(error) => return error.into_result(),
+        };
         let source_adapter = crate::policy_adapter::AccountViewAdapter::new(&account_view);
+        let source_view = FloorSource::view_or(floor.as_ref(), &source_adapter);
         let dispatch_outcome = match self
             .dispatch_gate_with_views(
                 "stellar_claim",
                 &args_value,
                 &args.chain_id,
-                Some(&source_adapter),
+                Some(source_view),
                 None,
             )
             .await
@@ -620,7 +629,7 @@ impl WalletServer {
                 &envelope_xdr,
                 "stellar_claim_commit",
                 &args.chain_id,
-                Some(&source_adapter),
+                Some(source_view),
                 None,
             )
             .await
@@ -897,13 +906,21 @@ impl WalletServer {
         // `identity_view` stays `None`, matching `stellar_claim`'s simulate
         // phase: claim has no counterparty identity to feed
         // `home_domain_resolved`.
+        let floor = match self
+            .classic_floor_source(&client, &source, &["stellar_claim_commit", "stellar_claim"])
+            .await
+        {
+            Ok(floor) => floor,
+            Err(error) => return error.into_result(),
+        };
         let source_adapter = crate::policy_adapter::AccountViewAdapter::new(&account_view);
+        let source_view = FloorSource::view_or(floor.as_ref(), &source_adapter);
         let dispatch_outcome = match self
             .dispatch_gate_with_views(
                 "stellar_claim_commit",
                 &authoritative_args,
                 &args.chain_id,
-                Some(&source_adapter),
+                Some(source_view),
                 None,
             )
             .await
@@ -919,7 +936,7 @@ impl WalletServer {
                 "stellar_claim",
                 &authoritative_args,
                 &args.chain_id,
-                Some(&source_adapter),
+                Some(source_view),
                 None,
             )
             .await

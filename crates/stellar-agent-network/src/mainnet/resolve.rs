@@ -627,7 +627,7 @@ fn report_detail<T>(
 mod enabled {
     use super::super::authority::PolicyAuthority;
     use super::super::{
-        AuthorizationDomain, MainnetPrecondition as P, RecomputedFacts,
+        AccountingRefusal, AuthorizationDomain, MainnetPrecondition as P, RecomputedFacts,
         authorization::{SorobanIntentInner, SubmitInner, TxSignInner},
         digest::{BindingFacts, content_digest, entries_digest},
         mint,
@@ -639,8 +639,8 @@ mod enabled {
         endpoint_identity::EndpointIdentity,
         keyring::EnrolledRole,
         policy_state::{
-            ApprovalStatus, ConsumptionBinding, DomainBinding, MintAuthority, MintRequest,
-            NativeReservation,
+            ApprovalStatus, ConsumptionBinding, DomainBinding, FloorSource, FloorSourceError,
+            MintAuthority, MintRequest, NativeReservation, floor_rule_matches, unproved_floor_use,
         },
         policy_view::AccountViewAdapter,
     };
@@ -665,8 +665,12 @@ mod enabled {
         error::{FeeSource, NetworkError, WalletError, WitnessUnavailableReason},
         mainnet::{enablement::normalize_endpoint_host, verified_policy::MainnetBody},
         policy::{
-            Decision, Evaluation, McpToolRegistration, PolicyEngine, ToolDescriptor, ToolValueKind,
-            v1::{ActionKind, ValueClass, ValueLeg, criteria::state_store::WindowEntry},
+            Decision, DenyReason, Evaluation, McpToolRegistration, PolicyEngine, PolicyError,
+            ToolDescriptor, ToolValueKind,
+            v1::{
+                ActionKind, PolicyEngineV1, ValueClass, ValueLeg,
+                criteria::state_store::WindowEntry,
+            },
         },
         profile::schema::same_provider_host,
     };
@@ -764,8 +768,12 @@ mod enabled {
     /// Under an approval, a denial refuses with the policy's code and both
     /// permitting decisions proceed, as the approval covers the requirement.
     /// Under a policy authority, only a fresh `Allow` proceeds: an approval
-    /// requirement or a denial needs an approval the action does not carry.
+    /// requirement or a denial needs an approval the action does not carry,
+    /// except that an account denial keeps its reason under either authority.
+    /// A permitting decision whose rule carries a balance floor refuses as
+    /// [`unproved_floor_use`] states.
     fn check_evaluation(
+        engine: &PolicyEngineV1,
         evaluation: &Evaluation,
         authority: &MainnetAuthority<'_>,
     ) -> Result<ValueClass, MainnetAuthorizationError> {
@@ -775,16 +783,53 @@ mod enabled {
                 .clone()
                 .map_or(ValueClass::ReadOnly, ValueClass::Value)
         };
+        if !matches!(evaluation.decision, Decision::Deny(_))
+            && let Some(reason) = evaluation
+                .rule_ordinal
+                .and_then(|ordinal| unproved_floor_use(engine, ordinal))
+        {
+            return Err(MainnetAuthorizationError::PolicyDenied(Box::new(reason)));
+        }
         match (authority, &evaluation.decision) {
-            (MainnetAuthority::Approval(_), Decision::Deny(reason)) => Err(
-                MainnetAuthorizationError::PolicyDenied(Box::new(reason.clone())),
-            ),
+            (MainnetAuthority::Approval(_), Decision::Deny(reason))
+            | (
+                MainnetAuthority::Policy(_),
+                Decision::Deny(
+                    reason @ (DenyReason::AccountUnread
+                    | DenyReason::AccountStale { .. }
+                    | DenyReason::AccountFloorRefused { .. }),
+                ),
+            ) => Err(MainnetAuthorizationError::PolicyDenied(Box::new(
+                reason.clone(),
+            ))),
             (MainnetAuthority::Approval(_), Decision::Allow | Decision::RequireApproval(_))
             | (MainnetAuthority::Policy(_), Decision::Allow) => Ok(value()),
             (MainnetAuthority::Policy(_), Decision::RequireApproval(_) | Decision::Deny(_)) => {
                 Err(refused(P::FreshDecisionRequiresApproval))
             }
             _ => Err(refused(P::PolicyEvaluationFailed)),
+        }
+    }
+
+    /// The refusal of a floor source that could not be read: the account read
+    /// fails as unavailable, and the projection keeps its store refusal.
+    fn floor_refusal(error: FloorSourceError) -> MainnetAuthorizationError {
+        match error {
+            FloorSourceError::Read(_) => refused(P::AccountUnavailable),
+            FloorSourceError::Store(error) => mint::store_error(error),
+        }
+    }
+
+    /// The refusal of an engine error: an accounting error keeps its code.
+    fn engine_refusal(error: &PolicyError) -> MainnetAuthorizationError {
+        match error {
+            PolicyError::AccountingOverflow => {
+                MainnetAuthorizationError::Accounting(AccountingRefusal::Overflow)
+            }
+            PolicyError::AccountingInvalid => {
+                MainnetAuthorizationError::Accounting(AccountingRefusal::Invalid)
+            }
+            _ => refused(P::PolicyEvaluationFailed),
         }
     }
 
@@ -1244,20 +1289,38 @@ mod enabled {
                 .await?;
         let descriptor = descriptor(policy_tool);
         let engine = req.policy.engine();
+        let floor = if floor_rule_matches(&engine, &descriptor) {
+            Some(
+                FloorSource::read(
+                    req.client,
+                    &source,
+                    req.store,
+                    req.context.profile(),
+                    crate::operational::readiness_deadline(),
+                )
+                .await
+                .map_err(floor_refusal)?,
+            )
+        } else {
+            None
+        };
+        // The evaluation instant follows every awaited read.
+        let now = self::now()?;
+        let adapter = AccountViewAdapter::new(&view);
         let evaluation = engine
             .evaluate_full(
                 &descriptor,
                 &args,
                 req.context.profile(),
-                Some(&AccountViewAdapter::new(&view)),
+                Some(FloorSource::view_or(floor.as_ref(), &adapter)),
                 None,
                 None,
                 None,
                 None,
                 now,
             )
-            .map_err(|_| refused(P::PolicyEvaluationFailed))?;
-        check_evaluation(&evaluation, req.authority)?;
+            .map_err(|error| engine_refusal(&error))?;
+        check_evaluation(&engine, &evaluation, req.authority)?;
         let entries = crate::mainnet::holds::size_evaluated_holds(
             &engine,
             req.context.profile(),
@@ -1265,7 +1328,7 @@ mod enabled {
             None,
             now,
         )
-        .map_err(|_| refused(P::PolicyEvaluationFailed))?;
+        .map_err(|error| engine_refusal(&error))?;
         let asset = match req.consumer {
             MainnetConsumer::CliPay | MainnetConsumer::McpPay => {
                 Some(match args["asset"].as_str().unwrap_or("") {
@@ -1469,7 +1532,7 @@ mod enabled {
                 now,
             )
             .map_err(|_| refused(P::PolicyEvaluationFailed))?;
-        let value = check_evaluation(&evaluation, req.authority)?;
+        let value = check_evaluation(&engine, &evaluation, req.authority)?;
         let entries = engine
             .size_window_entries(&descriptor, req.context.profile(), &value, now)
             .map_err(|_| refused(P::PolicyEvaluationFailed))?;
@@ -6892,6 +6955,217 @@ mod tests {
                 MainnetAuthorizationError::Refused(P::Expired)
             );
         }
+    }
+
+    // ── Balance floor ───────────────────────────────────────────────────
+
+    use stellar_agent_core::policy::DenyReason;
+
+    /// The native balance the fixture's account answer reports.
+    const FIXTURE_BALANCE_STROOPS: i64 = 100_000_000_000;
+
+    /// A fixture whose payment rule carries a `balance_floor` of `min_stroops`.
+    fn floor_fixture(min_stroops: i64) -> ResolverFixture {
+        ResolverFixture::configured(
+            |_| {},
+            |raw| {
+                raw.replace(
+                    "criteria = [",
+                    &format!(
+                        "criteria = [\n    {{ kind = \"balance_floor\", min_stroops = \"{min_stroops}\" }},"
+                    ),
+                )
+            },
+        )
+    }
+
+    /// Answers the fixture's account read and moves the fixed clock to `at`,
+    /// as time passes while a read is in flight.
+    struct AccountReadTakesTime {
+        at: u64,
+        result: serde_json::Value,
+    }
+
+    impl wiremock::Respond for AccountReadTakesTime {
+        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            std::mem::forget(super::super::clock::set_now_ms_for_test(self.at));
+            wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"jsonrpc": "2.0", "id": body["id"], "result": self.result}),
+            )
+        }
+    }
+
+    /// The fixture's endpoint, healthy at the ledger of its account answer
+    /// and closed now. Each account read ends one second after the
+    /// fixture's instant.
+    async fn floor_server(f: &ResolverFixture) -> wiremock::MockServer {
+        use stellar_agent_test_support::EchoIdResponder;
+        use wiremock::matchers::{body_partial_json, method};
+        let server = f.server().await;
+        wiremock::Mock::given(method("POST"))
+            .and(body_partial_json(
+                serde_json::json!({"method": "getLedgerEntries"}),
+            ))
+            .respond_with(AccountReadTakesTime {
+                at: f.now + 1_000,
+                result: f.source.ledger_entries_result(),
+            })
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let close = stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1_000;
+        for (rpc, result) in [
+            (
+                "getHealth",
+                serde_json::json!({
+                    "status": "healthy", "latestLedger": 100, "oldestLedger": 1,
+                    "ledgerRetentionWindow": 99, "oldestLedgerCloseTime": 1,
+                    "latestLedgerCloseTime": close
+                }),
+            ),
+            (
+                "getLedgers",
+                serde_json::json!({
+                    "latestLedger": 100, "oldestLedger": 1,
+                    "latestLedgerCloseTime": close.to_string(),
+                    "oldestLedgerCloseTime": 1, "cursor": "100", "ledgers": []
+                }),
+            ),
+        ] {
+            wiremock::Mock::given(method("POST"))
+                .and(body_partial_json(serde_json::json!({"method": rpc})))
+                .respond_with(EchoIdResponder::new(result))
+                .mount(&server)
+                .await;
+        }
+        server
+    }
+
+    /// A funded payment under a matched floor reads the operating account
+    /// and still refuses `account.unread` under either authority, minting
+    /// nothing: retained history cannot show that it counts every native
+    /// obligation in effect, an empty history included.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn public_floor_refuses_unproved_history() {
+        let f = floor_fixture(1);
+        let server = floor_server(&f).await;
+        let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
+        let client = context.primary_client().unwrap();
+        let approval = f.approval(&f.envelope, f.now, 600_000);
+        let policy = policy_authority(&f, AuthorityScope::Classic, f.now, 600_000);
+        let before = f.wire();
+        for authority in [f.approval_authority(&approval), policy] {
+            let result = resolve_tx_sign(request(&f, &context, &client, &authority)).await;
+            assert_eq!(
+                result.unwrap_err(),
+                MainnetAuthorizationError::PolicyDenied(Box::new(DenyReason::AccountUnread)),
+                "a funded floor refuses without proved history coverage"
+            );
+        }
+        assert_eq!(f.wire(), before, "nothing is minted");
+        let methods = received_methods(&server).await;
+        assert_eq!(
+            methods.iter().filter(|m| *m == "getHealth").count(),
+            2,
+            "each resolution checks readiness for its observed read: {methods:?}"
+        );
+    }
+
+    /// The resolver's floor counts the observed balance, the retained native
+    /// exposure at that read, this payment's native debit and its envelope
+    /// fee, and keeps the account denial under either authority.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn resolver_floor_counts_observed_exposure() {
+        let f = floor_fixture(FIXTURE_BALANCE_STROOPS);
+        let server = floor_server(&f).await;
+        let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
+        let client = context.primary_client().unwrap();
+        let envelope = changed_envelope(&f, |tx| tx.tx.fee = 157);
+        let TransactionEnvelope::Tx(tx) =
+            TransactionEnvelope::from_xdr_base64(&envelope, Limits::none()).unwrap()
+        else {
+            unreachable!()
+        };
+        let stellar_xdr::OperationBody::Payment(payment) = &tx.tx.operations[0].body else {
+            panic!("the fixture pays natively")
+        };
+        let debit = payment.amount;
+        let after = async |authority: &MainnetAuthority<'_>| {
+            let mut req = request(&f, &context, &client, authority);
+            req.unsigned_envelope_xdr = &envelope;
+            match resolve_tx_sign(req).await {
+                Err(MainnetAuthorizationError::PolicyDenied(reason)) => match *reason {
+                    DenyReason::AccountFloorRefused {
+                        min_stroops,
+                        balance_after_stroops,
+                    } => {
+                        assert_eq!(min_stroops, i128::from(FIXTURE_BALANCE_STROOPS));
+                        balance_after_stroops
+                    }
+                    other => panic!("floor refusal required: {other:?}"),
+                },
+                other => panic!("floor refusal required: {other:?}"),
+            }
+        };
+        assert_eq!(
+            after(&policy_authority(
+                &f,
+                AuthorityScope::Classic,
+                f.now,
+                600_000
+            ))
+            .await,
+            i128::from(FIXTURE_BALANCE_STROOPS - debit - 157),
+            "balance minus the debit and the envelope fee"
+        );
+        let retained = crate::policy_state::MintRequest {
+            chain: f.profile.chain_id,
+            binding: crate::policy_state::DomainBinding::Transaction {
+                unsigned_envelope_sha256: [1; 32],
+                tx_hash: [2; 32],
+                source: stellar_strkey::ed25519::PublicKey(f.signer.public_key())
+                    .to_string()
+                    .to_string(),
+                sequence: 1,
+            },
+            consumer: MainnetConsumer::CliPay,
+            policy_sequence: f.policy.sequence(),
+            policy_digest: f.policy.digest(),
+            authority: crate::policy_state::MintAuthority::Approval {
+                nonce: "retained-floor".to_owned(),
+                expires_at_ms: f.now + 120_000,
+            },
+            chain_deadline_ms: None,
+            authorization_ttl_ms: 120_000,
+            bindings: super::super::digest::BindingFacts {
+                endpoint: None,
+                signer: f.signer.fact_digest(),
+                policy: f.policy.fact_digest(),
+                enablement: [4; 32],
+                witness: None,
+                reservation: None,
+                authority: [7; 32],
+                audit: [8; 32],
+            },
+            holds: vec![],
+            parent: None,
+            operation: None,
+            native_reservation: Some(crate::policy_state::NativeReservation {
+                debit_stroops: 40,
+                fee_stroops: 10,
+            }),
+            floor: None,
+        };
+        f.window.mint_authorization(&f.profile, &retained).unwrap();
+        let approval = f.approval(&envelope, f.now, 600_000);
+        assert_eq!(
+            after(&f.approval_authority(&approval)).await,
+            i128::from(FIXTURE_BALANCE_STROOPS - debit - 157 - 50),
+            "a retained authorization's debit and fee count once"
+        );
     }
 }
 

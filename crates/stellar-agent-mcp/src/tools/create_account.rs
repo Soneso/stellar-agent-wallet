@@ -26,7 +26,9 @@ use stellar_agent_core::approval::store::PendingApproval;
 use stellar_agent_core::approval::user_id::process_uid_for_attestation;
 use stellar_agent_core::envelope_decode::decode_authoritative_args;
 use stellar_agent_core::timefmt::now_unix_ms;
-use stellar_agent_network::{BASE_RESERVE_STROOPS, ClassicOpBuilder, submit::SubmissionResult};
+use stellar_agent_network::{
+    BASE_RESERVE_STROOPS, ClassicOpBuilder, policy_state::FloorSource, submit::SubmissionResult,
+};
 
 /// Computes the create-account pre-flight required balance in stroops:
 /// `starting_balance + BASE_RESERVE + fee`.
@@ -505,13 +507,25 @@ impl WalletServer {
         let total_fee_stroops =
             total_classic_fee_stroops(fee_per_op_stroops, CLASSIC_SINGLE_OPERATION_COUNT)?;
         args_value["total_fee_stroops"] = json!(total_fee_stroops);
+        let floor = match self
+            .classic_floor_source(
+                &client,
+                &account_view.account_id,
+                &["stellar_create_account", "stellar_create_account_commit"],
+            )
+            .await
+        {
+            Ok(floor) => floor,
+            Err(error) => return error.into_result(),
+        };
         let source_adapter = crate::policy_adapter::AccountViewAdapter::new(&account_view);
+        let source_view = FloorSource::view_or(floor.as_ref(), &source_adapter);
         let dispatch_outcome = match self
             .dispatch_gate_with_views(
                 "stellar_create_account",
                 &args_value,
                 &args.chain_id,
-                Some(&source_adapter),
+                Some(source_view),
                 None,
             )
             .await
@@ -676,7 +690,7 @@ impl WalletServer {
                 &envelope_xdr,
                 "stellar_create_account_commit",
                 &args.chain_id,
-                Some(&source_adapter),
+                Some(source_view),
                 None,
             )
             .await
@@ -1013,13 +1027,25 @@ impl WalletServer {
         // destination has no on-chain state yet (that is the point of this
         // operation), so there is no counterparty identity to feed
         // `home_domain_resolved`.
+        let floor = match self
+            .classic_floor_source(
+                &client,
+                &account_view.account_id,
+                &["stellar_create_account_commit", "stellar_create_account"],
+            )
+            .await
+        {
+            Ok(floor) => floor,
+            Err(error) => return error.into_result(),
+        };
         let source_adapter = crate::policy_adapter::AccountViewAdapter::new(&account_view);
+        let source_view = FloorSource::view_or(floor.as_ref(), &source_adapter);
         let dispatch_outcome = match self
             .dispatch_gate_with_views(
                 "stellar_create_account_commit",
                 &authoritative_args,
                 &args.chain_id,
-                Some(&source_adapter),
+                Some(source_view),
                 None,
             )
             .await
@@ -1035,7 +1061,7 @@ impl WalletServer {
                 "stellar_create_account",
                 &authoritative_args,
                 &args.chain_id,
-                Some(&source_adapter),
+                Some(source_view),
                 None,
             )
             .await

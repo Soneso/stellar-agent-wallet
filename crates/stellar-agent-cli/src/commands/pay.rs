@@ -162,7 +162,7 @@ use stellar_agent_network::{
 use crate::commands::policy_engine::{
     build_v1_policy_engine, effective_classic_fee_cap, envelope_total_fee, evaluate_mainnet_policy,
     evaluate_opaque_signing_policy, evaluate_value_moving_policy, load_mainnet_policy_engine,
-    pay_policy_args, with_total_fee,
+    mainnet_floor_source, pay_policy_args, with_total_fee,
 };
 use crate::common::business_entry::{
     BoundEnvelope, ClassicStart, bind_envelope, classic_start, entry_business_id,
@@ -186,7 +186,7 @@ use crate::common::signer_ceremony::{
 };
 use crate::common::{ResolvedProfileName, resolve_profile_name};
 use stellar_agent_core::profile::receipt::{DestinationFields, PaymentDestinations};
-use stellar_agent_network::policy_state::{OperationKind, OperationTool};
+use stellar_agent_network::policy_state::{FloorSource, OperationKind, OperationTool};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -2476,6 +2476,18 @@ where
         total_fee,
     );
     built.memo.insert_policy_fields(&mut policy_args);
+    let floor = match mainnet_floor_source(
+        &context,
+        &client,
+        &policy.verified,
+        "stellar_pay",
+        &built.source_account_view.account_id,
+    )
+    .await
+    {
+        Ok(floor) => floor,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
     let source_adapter =
         stellar_agent_network::policy_view::AccountViewAdapter::new(&built.source_account_view);
     let dest_adapter = built
@@ -2490,7 +2502,7 @@ where
         stellar_agent_core::policy::ToolValueKind::MovesValue,
         chain_id,
         &policy_args,
-        Some(&source_adapter),
+        Some(FloorSource::view_or(floor.as_ref(), &source_adapter)),
         dest_adapter.as_ref().map(|a| a as &dyn AccountIdentityView),
     ) {
         Ok(evaluation) => evaluation,
@@ -6937,8 +6949,8 @@ pub(crate) mod tests {
         };
         use crate::common::mainnet_write_fixture::{
             AGENT_SEED, AGENT_VAR, CLOCK_LEAD_MS, DESTINATION, ISSUER, MainnetFixture, Spec,
-            install_ledger_double, minimum_reserve, open_authorizations_of, pay_rule,
-            pay_rule_capped, refusal_warnings,
+            balance_floor, install_ledger_double, minimum_reserve, open_authorizations_of,
+            pay_rule, pay_rule_capped, refusal_warnings,
         };
         use crate::common::signer_ceremony::signer_resolutions_on_this_thread;
         use crate::test_rpc::{ACCOUNT_SEQUENCE, ClassicRpc, last_rendered};
@@ -8797,6 +8809,42 @@ pub(crate) mod tests {
                 "policy.deny.minimum_reserve_breached",
             )
             .await;
+        }
+
+        /// A matched balance floor reads the operating account after the
+        /// build. A balance the debit and fee take below the floor refuses
+        /// `account.floor_refused`; a funded one refuses `account.unread`,
+        /// as retained history cannot prove its native exposure complete.
+        /// Neither confirms, records, nor sends.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_floor_reads_the_observed_account_on_mainnet() {
+            for (name, min_stroops, code) in [
+                ("mainnet-pay-floor-low", BALANCE, "account.floor_refused"),
+                ("mainnet-pay-floor-funded", 1, "account.unread"),
+            ] {
+                let agent =
+                    stellar_agent_test_support::signed_envelope::account_id_for_seed(AGENT_SEED);
+                let fixture = Spec::new(name)
+                    .primary(
+                        ClassicRpc::mainnet(&[&agent, DESTINATION, ISSUER])
+                            .entries_at_readiness_ledger(),
+                    )
+                    .rules(vec![pay_rule("allow", &balance_floor(min_stroops))])
+                    .build()
+                    .await;
+
+                let run = run(&fixture, &memo_args(&fixture)).await;
+
+                assert_refused_before_confirmation(&fixture, &run, code).await;
+                let methods = fixture.primary_methods().await;
+                assert_eq!(
+                    methods.iter().filter(|m| *m == "getHealth").count(),
+                    2,
+                    "the floor read checks readiness again, and the refusal precedes signing \
+                     resolution: {methods:?}"
+                );
+            }
         }
 
         /// A testnet payment from the fixture's agent through its primary,

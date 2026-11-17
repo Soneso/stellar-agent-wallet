@@ -658,8 +658,10 @@ Review it before you sign it with `profile sign-policy`:
   `profile sign-policy` assigns the next sequence, so each signing starts
   another allocation; only identical canonical bytes keep it.
 - Floor: `stellar_pay` and `stellar_pay_commit` carry a native balance floor.
-  It needs an observed account read that the shipped payment paths do not
-  supply, so a matched floor refuses with `account.unread`.
+  Mainnet `stellar-agent pay` reads the operating account for it and refuses
+  `account.floor_refused` when the payment would breach the floor. A floor
+  the balance meets still refuses `account.unread`, because retained history
+  cannot prove that it counts every native obligation.
 - Approval: shop and business presets request approval for a payment above
   their threshold.
 

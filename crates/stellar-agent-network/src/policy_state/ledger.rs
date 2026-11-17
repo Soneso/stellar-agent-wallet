@@ -1204,8 +1204,9 @@ pub struct MintRequest {
     /// The native amounts the authorization reserves, stored with the
     /// record whether or not it holds window entries.
     pub native_reservation: Option<NativeReservation>,
-    /// Checked observed facts for a signed balance floor. Existing callers
-    /// without observed reads refuse configured floors during evaluation.
+    /// Checked observed facts for a signed balance floor. Public callers
+    /// refuse a passing floor during evaluation, as
+    /// [`super::refuse_unproved_floor`] states, and pass `None`.
     pub floor: Option<super::accounting::CheckedFloor>,
 }
 

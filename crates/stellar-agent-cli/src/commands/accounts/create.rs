@@ -151,7 +151,7 @@ use stellar_agent_network::{FriendbotResult, fund_with_friendbot};
 use crate::commands::policy_engine::{
     build_v1_policy_engine, create_policy_args, effective_classic_fee_cap, envelope_total_fee,
     evaluate_mainnet_policy, evaluate_value_moving_policy, load_mainnet_policy_engine,
-    with_total_fee,
+    mainnet_floor_source, with_total_fee,
 };
 use crate::common::business_entry::{
     BoundEnvelope, ClassicStart, bind_envelope, classic_start, entry_business_id,
@@ -175,7 +175,7 @@ use crate::common::signer_ceremony::{
 };
 use crate::common::{ResolvedProfileName, resolve_profile_name};
 use stellar_agent_network::operational::read_within_readiness_deadline;
-use stellar_agent_network::policy_state::{OperationKind, OperationTool};
+use stellar_agent_network::policy_state::{FloorSource, OperationKind, OperationTool};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -1590,6 +1590,18 @@ where
         create_policy_args(starting_balance_stroops, &new_account.g_strkey),
         total_fee,
     );
+    let floor = match mainnet_floor_source(
+        &context,
+        &client,
+        &policy.verified,
+        "stellar_create_account",
+        &sponsor_account_view.account_id,
+    )
+    .await
+    {
+        Ok(floor) => floor,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
     let sponsor_adapter =
         stellar_agent_network::policy_view::AccountViewAdapter::new(&sponsor_account_view);
     let evaluation = match evaluate_mainnet_policy(
@@ -1599,7 +1611,7 @@ where
         stellar_agent_core::policy::ToolValueKind::MovesValue,
         context.chain().caip2_str(),
         &policy_args,
-        Some(&sponsor_adapter),
+        Some(FloorSource::view_or(floor.as_ref(), &sponsor_adapter)),
         None,
     ) {
         Ok(evaluation) => evaluation,
@@ -3682,8 +3694,8 @@ pub(crate) mod tests {
         };
         use crate::common::mainnet_write_fixture::{
             AGENT_SEED, AGENT_VAR, CLOCK_LEAD_MS, DESTINATION, ISSUER, MainnetFixture, NEW_ACCOUNT,
-            Spec, create_rule, install_ledger_double, minimum_reserve, open_authorizations_of,
-            refusal_warnings,
+            Spec, balance_floor, create_rule, install_ledger_double, minimum_reserve,
+            open_authorizations_of, refusal_warnings,
         };
         use crate::common::signer_ceremony::signer_resolutions_on_this_thread;
         use crate::test_rpc::{ClassicRpc, last_rendered};
@@ -4209,6 +4221,31 @@ pub(crate) mod tests {
                 "policy.deny.minimum_reserve_breached",
             )
             .await;
+        }
+
+        /// A matched balance floor reads the sponsoring operating account:
+        /// the starting balance and the fee take the observed balance below a
+        /// floor at that balance.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_floor_reads_the_observed_account_on_mainnet() {
+            let agent =
+                stellar_agent_test_support::signed_envelope::account_id_for_seed(AGENT_SEED);
+            let fixture = Spec::new("mainnet-create-floor")
+                .primary(
+                    ClassicRpc::mainnet(&[&agent, DESTINATION, ISSUER])
+                        .entries_at_readiness_ledger(),
+                )
+                .rules(vec![create_rule(
+                    "require_approval",
+                    &balance_floor(BALANCE),
+                )])
+                .build()
+                .await;
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_refused_before_confirmation(&fixture, &run, "account.floor_refused").await;
         }
 
         /// Fee in the policy arguments, testnet.
