@@ -205,6 +205,12 @@ fn floor_checked_input_uses_verified_first_rule_and_operating_source() {
             "chain, policy and consumer binding"
         );
     }
+    // The window's first write establishes native coverage before the
+    // observation's close time.
+    f.clock
+        .set(f.now - 5_000 - crate::policy_state::store::ESTABLISHMENT_ALLOWANCE_MS);
+    f.window.record_and_persist(&f.profile, &[]).unwrap();
+    f.clock.set(f.now);
     request.floor = Some(floor);
     f.window.mint_authorization(&f.profile, &request).unwrap();
     let mut second = request.clone();

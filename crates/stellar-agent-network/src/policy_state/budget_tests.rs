@@ -188,6 +188,7 @@ pub(crate) mod budget {
         let now = fx.now();
         let mut wire = fx.wire();
         wire.version = WIRE_VERSION_TOTAL_INTENTS;
+        crate::policy_state::store::strip_native_coverage_for_test(&mut wire);
         let day = StateKey::new("ops", 1, "native", 86_400);
         find_or_insert_bucket(&mut wire.entries, &day)
             .records
@@ -1134,6 +1135,7 @@ pub(crate) mod budget {
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
+        cover(&fx);
         let handle = fx.open_new(&request("budget-class", canonical(1)));
         let mut minted = fx.operation_mint_request(&handle, tx(1), fx.policy(), vec![]);
         minted.native_reservation = Some(NativeReservation {

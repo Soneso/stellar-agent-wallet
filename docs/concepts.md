@@ -304,13 +304,18 @@ floor refuses there with `account.unread`.
 The store can recheck bound floor facts under the mint lock against its latest
 authenticated reservations. A retained value obligation with missing amounts,
 or a zero Soroban reservation without a bound non-native payment intent,
-refuses floor use. Listing and recovery remain available. This projection covers
-retained history only: unlinked obligations can leave that history under existing
-retention. No retained image proves that no unreleased obligation was lost, so a
-floor that passes on the retained reservations still refuses with
-`account.unread`. Only a breach that the retained reservations already show
-refuses with `account.floor_refused`. Re-signing and resetting do not
-reconstruct missing exposure.
+refuses floor use. Listing and recovery remain available. Retention and reset
+keep every value obligation without a release row, and the store records this
+with a native coverage marker. A store without the marker, or a balance read
+that closed before its admissible floors, refuses with `account.unread`. The
+first write that sets the marker requires a read closed at least 300 seconds
+later, past any envelope signed earlier. A transaction signed before the marker
+by a host whose clock later moved backward lies outside the coverage guarantee.
+A legacy claimed obligation without amounts keeps floor use refused on its
+profile; use a new profile. A floor that passes on the retained reservations
+still refuses with `account.unread`. Only a breach that the retained
+reservations already show refuses with `account.floor_refused`. Re-signing and
+resetting do not reconstruct missing exposure.
 
 `memo_binding` requires the memo a destination expects, such as an exchange
 deposit's customer memo:

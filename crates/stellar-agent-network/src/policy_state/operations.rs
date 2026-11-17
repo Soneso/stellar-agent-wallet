@@ -1613,17 +1613,20 @@ pub struct AdmissibleFloors {
 /// Removes every authorization `remove` selects. Each removed release row
 /// with a ledger or close-time bound raises the matching admissible floor to
 /// at least that bound; an `Always` bound raises nothing. Floors never
-/// decrease here.
+/// decrease here. Removing an [`unreleased_native`] row clears the native
+/// coverage marker.
 pub(super) fn remove_authorizations(
     wire: &mut WireFile,
     remove: impl Fn(&WireAuthorization) -> bool,
 ) {
     let mut floor_ledger = wire.admissible_floor_ledger;
     let mut floor_close = wire.admissible_floor_close_time_ms;
+    let mut uncovered = false;
     wire.authorizations.retain(|auth| {
         if !remove(auth) {
             return true;
         }
+        uncovered |= unreleased_native(auth);
         match auth.native_release.map(|row| row.bound) {
             Some(ReleaseBound::Ledger(bound)) => {
                 floor_ledger = Some(floor_ledger.map_or(bound, |floor| floor.max(bound)));
@@ -1637,12 +1640,22 @@ pub(super) fn remove_authorizations(
     });
     wire.admissible_floor_ledger = floor_ledger;
     wire.admissible_floor_close_time_ms = floor_close;
+    if uncovered {
+        wire.native_coverage = None;
+    }
 }
 
 /// Whether `auth` serves an operation and has no release row, which protects
 /// it and its record from pruning and compaction.
 pub(super) fn unreleased_link(auth: &WireAuthorization) -> bool {
     auth.operation.is_some() && auth.native_release.is_none()
+}
+
+/// Whether `auth` belongs to a value-holding or fee-holding domain and has
+/// no release row. Only its release row can show that its native obligation
+/// ended, so retention and reset keep it whatever its link, age or clock.
+pub(super) fn unreleased_native(auth: &WireAuthorization) -> bool {
+    auth.native_release.is_none() && auth.domain.hold_owner() != crate::mainnet::HoldOwner::NoHolds
 }
 
 /// Whether `row` releases its reservation at `observation`. `Always`
@@ -6082,25 +6095,26 @@ impl<'a> OperationStatus<'a> {
     /// The retained native exposure usable with this exact balance observation.
     ///
     /// Missing amounts refuse only this projection. Lifecycle and diagnostic
-    /// reads remain available. Unlinked history can leave retention, so the
-    /// sum is a lower bound: a floor that passes on it refuses through
-    /// [`super::refuse_unproved_floor`].
+    /// reads remain available. The sum counts every native obligation in
+    /// effect only on a file that carries the native coverage marker, at an
+    /// observation at or past both admissible floors. Public callers still
+    /// refuse a floor that passes on it through [`super::refuse_unproved_floor`].
     ///
     /// # Errors
     ///
-    /// `account.unread` for a missing observation, deficient release coverage,
-    /// or an unquantifiable retained obligation; `policy.accounting_overflow`
-    /// for an unrepresentable sum; and every verified read error.
+    /// `account.unread` for a missing observation, a missing file or marker,
+    /// deficient release coverage, or an unquantifiable retained obligation;
+    /// `policy.accounting_overflow` for an unrepresentable sum; and every
+    /// verified read error.
     pub fn floor_reserved_stroops(
         &self,
         observation: Option<WindowObservation>,
     ) -> Result<u64, WindowStoreError> {
-        let observation = observation.ok_or_else(|| WindowStoreError::PolicyDenied {
+        let unread = || WindowStoreError::PolicyDenied {
             reason: Box::new(stellar_agent_core::policy::DenyReason::AccountUnread),
-        })?;
-        let Some(wire) = self.read()? else {
-            return Ok(0);
         };
+        let observation = observation.ok_or_else(unread)?;
+        let wire = self.read()?.ok_or_else(unread)?;
         super::accounting::floor_reserved(&wire, &observation)
     }
 
@@ -8155,7 +8169,10 @@ pub(crate) mod tests {
                 wire.entries.last_mut().unwrap().bucket = "p".repeat(padding);
                 assert_eq!(serialized_len(wire), size);
             });
-            assert_eq!(fx.wire().version, 12);
+            assert_eq!(
+                fx.wire().version,
+                super::super::store::WIRE_VERSION_NATIVE_COVERAGE
+            );
             let error = fx.open(&request("capacity", canonical(2))).unwrap_err();
             assert_eq!(code(&error), "operation.capacity");
             assert!(matches!(
@@ -8546,7 +8563,10 @@ pub(crate) mod tests {
         fx.clock.set(T0 + TTL_MS);
         fx.prune_now();
         let wire = fx.wire();
-        assert_eq!(wire.version, super::super::store::WIRE_VERSION_TOTAL_EPOCH);
+        assert_eq!(
+            wire.version,
+            super::super::store::WIRE_VERSION_NATIVE_COVERAGE
+        );
         assert!(wire.holds.is_empty());
         let unused = fx.auth(unused.id);
         assert_eq!(unused.state, AuthorizationState::Expired);
@@ -8593,6 +8613,7 @@ pub(crate) mod tests {
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
+        cover(&fx);
         let handle = fx.open_new(&request("order-1", canonical(1)));
         let authority = fx.approval();
         let mut linked =
@@ -9073,6 +9094,7 @@ pub(crate) mod tests {
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let fx = Fx::new();
+        cover(&fx);
         let ledger_bound = fx
             .store
             .mint_authorization(
@@ -9096,7 +9118,11 @@ pub(crate) mod tests {
         let status = OperationStatus::new(&fx.store, &fx.profile);
         assert_eq!(
             status.admissible_floors().unwrap(),
-            AdmissibleFloors::default()
+            AdmissibleFloors {
+                ledger: None,
+                close_time_ms: Some(T0 - 125_000),
+            },
+            "only the establishment floor before any removal"
         );
 
         fx.clock.set(T0 + TERMINAL_RETENTION_MS + 1);
@@ -9139,7 +9165,7 @@ pub(crate) mod tests {
 
     #[test]
     #[serial]
-    fn mainnet_reset_clears_the_floors() {
+    fn mainnet_reset_keeps_the_floors() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
@@ -9157,6 +9183,8 @@ pub(crate) mod tests {
             wire.admissible_floor_ledger = Some(9_000);
             wire.admissible_floor_close_time_ms = Some(T0 + 50);
         });
+        let marker = fx.wire().native_coverage;
+        assert!(marker.is_some());
         let name = stellar_agent_core::profile::name::profile_name_for_approval(&fx.profile);
         fx.store
             .reset(
@@ -9170,13 +9198,16 @@ pub(crate) mod tests {
             )
             .unwrap();
         let wire = fx.wire();
-        assert_eq!(wire.admissible_floor_ledger, None);
-        assert_eq!(wire.admissible_floor_close_time_ms, None);
+        assert_eq!(wire.native_coverage, marker, "the reset keeps the marker");
         assert_eq!(
             OperationStatus::new(&fx.store, &fx.profile)
                 .admissible_floors()
                 .unwrap(),
-            AdmissibleFloors::default()
+            AdmissibleFloors {
+                ledger: Some(9_000),
+                close_time_ms: Some(T0 + 50),
+            },
+            "the reset keeps both floors"
         );
         assert_eq!(fx.record(ended.id()).state, OperationState::Expired);
     }
@@ -10500,7 +10531,7 @@ pub(crate) mod tests {
             .unwrap();
         auth.state = AuthorizationState::Open;
         auth.claimed_ms = None;
-        let survivors = super::super::ledger::reset_survivors(&wire, fx.now());
+        let survivors = super::super::ledger::reset_survivors(&mut wire, fx.now());
         let kept = survivors.iter().find(|auth| auth.id == auth_id).unwrap();
         assert_eq!(kept.state, AuthorizationState::Expired);
         assert_eq!(kept.disposition, None);
@@ -14620,6 +14651,7 @@ pub(crate) mod tests {
             let handle = fx.open_new(&request("order-1", canonical(1)));
             let mut wire = fx.wire();
             wire.version = super::super::super::store::WIRE_VERSION_OPERATIONS;
+            super::super::super::store::strip_native_coverage_for_test(&mut wire);
             fx.store.seal_unchecked_for_test(&fx.profile, &wire);
             hydrated(&fx);
             assert_eq!(fx.wire().retired_total_epoch, Some(P7));

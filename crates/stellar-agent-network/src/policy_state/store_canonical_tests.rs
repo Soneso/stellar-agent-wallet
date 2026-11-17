@@ -20,6 +20,7 @@ fn canonical_wire_compatibility_and_lifecycle() {
     let mut original = store.read_for_inspection(&profile).unwrap().unwrap();
     let legacy_bytes = serde_json::to_vec(&original.authorizations[0]).unwrap();
     original.version = WIRE_VERSION_TOTAL_INTENTS;
+    strip_native_coverage_for_test(&mut original);
     store.seal_unchecked_for_test(&profile, &original);
     let mut audit = OperationRows::default();
     let handle = open_operation(&store, &profile, &mut audit, "canonical", 2);
@@ -32,7 +33,14 @@ fn canonical_wire_compatibility_and_lifecycle() {
     let minted = store.mint_authorization(&profile, &mint).unwrap();
     let wire = store.read_for_inspection(&profile).unwrap().unwrap();
     assert_eq!(
-        wire.version, WIRE_VERSION_CANONICAL_LINEAGE,
+        wire.version, WIRE_VERSION_NATIVE_COVERAGE,
+        "a canonical mint carries the native coverage marker"
+    );
+    let mut unmarked = wire.clone();
+    strip_native_coverage_for_test(&mut unmarked);
+    assert_eq!(
+        select_wire_version(&unmarked, Some(WIRE_VERSION_TOTAL_INTENTS)),
+        WIRE_VERSION_CANONICAL_LINEAGE,
         "canonical mint selects version 17"
     );
     assert_eq!(
@@ -73,6 +81,7 @@ fn canonical_wire_compatibility_and_lifecycle() {
     for field in ["intent_digest", "predecessor"] {
         let mut earlier = wire.clone();
         earlier.version = WIRE_VERSION_TOTAL_INTENTS;
+        strip_native_coverage_for_test(&mut earlier);
         let auth = earlier
             .authorizations
             .iter_mut()
@@ -132,7 +141,14 @@ fn canonical_wire_compatibility_and_lifecycle() {
         "expired authorizations are collected"
     );
     assert_eq!(
-        collected.version, WIRE_VERSION_CANONICAL_LINEAGE,
+        collected.version, WIRE_VERSION_NATIVE_COVERAGE,
+        "collection retains the version floor"
+    );
+    let mut unmarked = collected.clone();
+    strip_native_coverage_for_test(&mut unmarked);
+    assert_eq!(
+        select_wire_version(&unmarked, Some(WIRE_VERSION_CANONICAL_LINEAGE)),
+        WIRE_VERSION_CANONICAL_LINEAGE,
         "collection retains the version floor"
     );
 }

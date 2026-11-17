@@ -6,7 +6,8 @@ use crate::policy_state::operations::{
     EvidenceInput, OperationStatus, RecoveryAttempt, RecoveryUpdate,
 };
 use crate::policy_state::store::{
-    WIRE_VERSION_RECOVERY_RUN, WIRE_VERSION_TOTAL_EPOCH, WireFile, generation_entry_ref,
+    WIRE_VERSION_NATIVE_COVERAGE, WIRE_VERSION_RECOVERY_RUN, WireFile, generation_entry_ref,
+    select_wire_version, strip_native_coverage_for_test,
 };
 use serde_json::{Value, json};
 use serial_test::serial;
@@ -233,7 +234,7 @@ fn run_wire_and_exposure() {
     .id();
     let attempt = fx.record(id).attempts[0].clone();
     let before = std::fs::read(fx.store.path()).unwrap();
-    assert_eq!(fx.wire().version, WIRE_VERSION_TOTAL_EPOCH);
+    assert_eq!(fx.wire().version, WIRE_VERSION_NATIVE_COVERAGE);
     let view = OperationStatus::new(&fx.store, &fx.profile)
         .recovery_run_view(id, 1, 0)
         .unwrap()
@@ -242,12 +243,27 @@ fn run_wire_and_exposure() {
     assert_eq!(view.earliest_retry_ms, Some(16000));
     assert_eq!(std::fs::read(fx.store.path()).unwrap(), before);
     let raw = running(id, &attempt).to_string();
+    let unmarked = |fx: &Fx| {
+        let mut wire = fx.wire();
+        strip_native_coverage_for_test(&mut wire);
+        wire
+    };
     fx.rewrite(|wire| install(wire, id, &raw));
-    assert_eq!(fx.wire().version, WIRE_VERSION_RECOVERY_RUN);
+    assert_eq!(fx.wire().version, WIRE_VERSION_NATIVE_COVERAGE);
+    assert_eq!(
+        select_wire_version(&unmarked(&fx), None),
+        WIRE_VERSION_RECOVERY_RUN,
+        "a recovery run selects version 13"
+    );
     assert!(selected(&fx).recovery_run.unwrap().record().is_some());
     fx.rewrite(|wire| wire.operations.as_mut().unwrap().records[0].attempts[0].recovery_run = None);
     assert_eq!(
         fx.wire().version,
+        WIRE_VERSION_NATIVE_COVERAGE,
+        "the committed floor survives removal"
+    );
+    assert_eq!(
+        select_wire_version(&unmarked(&fx), Some(WIRE_VERSION_RECOVERY_RUN)),
         WIRE_VERSION_RECOVERY_RUN,
         "the committed floor survives removal"
     );
@@ -265,7 +281,12 @@ fn run_wire_and_exposure() {
     let mut future = running(id, &attempt);
     future["version"] = json!(2);
     fx.rewrite(|wire| install(wire, id, &future.to_string()));
-    assert_eq!(fx.wire().version, WIRE_VERSION_RECOVERY_RUN);
+    assert_eq!(fx.wire().version, WIRE_VERSION_NATIVE_COVERAGE);
+    assert_eq!(
+        select_wire_version(&unmarked(&fx), None),
+        WIRE_VERSION_RECOVERY_RUN,
+        "a recovery run of a later version selects version 13"
+    );
     assert!(selected(&fx).recovery_run.unwrap().record().is_none());
 }
 

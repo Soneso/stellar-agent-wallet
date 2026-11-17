@@ -268,7 +268,7 @@ pub(super) const WIRE_VERSION_LEDGER: u32 = 4;
 /// A file written by a newer build carries records this one cannot account
 /// for, so it is refused rather than read with the fields it happens to
 /// recognise.
-pub(super) const WIRE_VERSION_MAX: u32 = WIRE_VERSION_CANONICAL_LINEAGE;
+pub(super) const WIRE_VERSION_MAX: u32 = WIRE_VERSION_NATIVE_COVERAGE;
 
 /// Wire version binding the accounting network on every snapshot.
 #[cfg_attr(
@@ -325,9 +325,17 @@ pub(crate) const WIRE_VERSION_TOTAL_INTENTS: u32 = 16;
 /// Wire version carrying canonical intent digests and attempt predecessors.
 pub(crate) const WIRE_VERSION_CANONICAL_LINEAGE: u32 = 17;
 
+/// Wire version carrying the native coverage marker. Builds capped at 17
+/// refuse it, so no build without the retention rule rewrites a covered file.
+pub(crate) const WIRE_VERSION_NATIVE_COVERAGE: u32 = 18;
+
 /// Selects the format required by stored fields and retains each committed floor.
-fn select_wire_version(wire: &WireFile, committed: Option<u32>) -> u32 {
-    if committed.is_some_and(|version| version >= WIRE_VERSION_CANONICAL_LINEAGE)
+pub(in crate::policy_state) fn select_wire_version(wire: &WireFile, committed: Option<u32>) -> u32 {
+    if committed.is_some_and(|version| version >= WIRE_VERSION_NATIVE_COVERAGE)
+        || wire.native_coverage.is_some()
+    {
+        WIRE_VERSION_NATIVE_COVERAGE
+    } else if committed.is_some_and(|version| version >= WIRE_VERSION_CANONICAL_LINEAGE)
         || wire
             .authorizations
             .iter()
@@ -1188,6 +1196,9 @@ pub(super) struct WireTotalSum {
 /// payment destination provenance at version 14. [`WIRE_VERSION_TOTAL_SUMS`]
 /// carries final total-budget charges and their settled sums at version 15.
 /// [`WIRE_VERSION_TOTAL_INTENTS`] carries epoch-bearing intent legs at version 16.
+/// [`WIRE_VERSION_CANONICAL_LINEAGE`] carries canonical intent digests and
+/// attempt predecessors at version 17, and [`WIRE_VERSION_NATIVE_COVERAGE`]
+/// the native coverage marker at version 18.
 /// Optional fields
 /// preserve the serialized shape of legacy snapshots for integrity checks;
 /// missing network provenance refuses at the authenticated read boundary.
@@ -1231,6 +1242,11 @@ pub(super) struct WireFile {
     /// The last chain observation an operation step stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) last_observation: Option<WindowObservation>,
+    /// Present while this file retains every native obligation written since
+    /// the marker and every earlier one an observation at or past the
+    /// admissible floors still shows; see [`NativeCoverage`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) native_coverage: Option<NativeCoverage>,
     /// The policy digest whose total budget an earlier build's state retired.
     /// It admits no further total-budget debit.
     #[serde(
@@ -1247,6 +1263,63 @@ pub(super) struct WireFile {
     /// The keyring counter selects exactly one side of the atomic commit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) prepared: Option<Box<WireFile>>,
+}
+
+/// The latest on-chain validity end any mainnet signing path allows, counted
+/// from its signing host's clock: a classic envelope's 120 s deadline, and an
+/// x402 intent's 60 ledgers at about 5 s each.
+pub(super) const ESTABLISHMENT_ALLOWANCE_MS: u64 = 300_000;
+
+/// The marker that this file holds every native obligation still in effect
+/// at an observation at or past both admissible floors.
+///
+/// Retention, compaction and reset keep every value-holding or fee-holding
+/// authorization without a release row, and a removal of such a row clears
+/// the marker. A write that finds no marker establishes one and raises the
+/// close-time floor [`ESTABLISHMENT_ALLOWANCE_MS`] past its clock. That floor
+/// bounds an obligation signed before the marker only while the signing
+/// host's clock did not run behind the store's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct NativeCoverage {
+    /// The generation whose write established the marker.
+    pub(super) since_generation: u64,
+    /// The store clock of that write, in Unix milliseconds.
+    pub(super) since_ms: u64,
+}
+
+/// Removes the native coverage marker and the close-time floor its
+/// establishment set, which no build below version 18 writes, so that a
+/// fixture can seal what an earlier build wrote.
+#[cfg(any(test, feature = "test-helpers"))]
+pub(super) fn strip_native_coverage_for_test(wire: &mut WireFile) {
+    if let Some(marker) = wire.native_coverage.take()
+        && wire.admissible_floor_close_time_ms == Some(marker.since_ms + ESTABLISHMENT_ALLOWANCE_MS)
+    {
+        wire.admissible_floor_close_time_ms = None;
+    }
+}
+
+/// Establishes the native coverage marker on `wire`, the successor of a
+/// write at `now_ms`, when it carries none.
+fn establish_native_coverage(wire: &mut WireFile, now_ms: u64) -> Result<(), WindowStoreError> {
+    if wire.native_coverage.is_some() {
+        return Ok(());
+    }
+    let floor = now_ms
+        .checked_add(ESTABLISHMENT_ALLOWANCE_MS)
+        .ok_or_else(|| WindowStoreError::Invalid {
+            detail: "the native coverage floor overflows the store clock".to_owned(),
+        })?;
+    wire.admissible_floor_close_time_ms = Some(
+        wire.admissible_floor_close_time_ms
+            .map_or(floor, |raised| raised.max(floor)),
+    );
+    wire.native_coverage = Some(NativeCoverage {
+        since_generation: wire.generation,
+        since_ms: now_ms,
+    });
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1719,9 +1792,13 @@ struct ResetSnapshot {
     /// Acknowledged accounting-expiry records whose receipt projection is
     /// incomplete; the successor keeps them.
     retained_expiries: Vec<AccountingExpiryRecord>,
-    /// Authorization records whose approval can still be presented on the
-    /// store clock; the successor keeps them.
+    /// The authorization records [`ledger::reset_survivors`] keeps.
     retained_authorizations: Vec<WireAuthorization>,
+    /// The admissible floors of the retired working copy, raised by the
+    /// records the reset drops.
+    retained_floors: operations::AdmissibleFloors,
+    /// The native coverage marker of the retired working copy.
+    retained_coverage: Option<NativeCoverage>,
     /// The total-budget buckets the successor keeps: every total row of the
     /// retired working copy, plus each claimed or exposed total hold as a
     /// counted row.
@@ -1989,6 +2066,7 @@ impl PersistedWindowStore {
         let mut wire = self.read_verified(profile, &key, &generation)?;
         wire.version = WIRE_VERSION_OPERATIONS;
         wire.retired_total_epoch = None;
+        strip_native_coverage_for_test(&mut wire);
         self.write_atomic(&key, &wire)?;
         write_generation(&generation, &wire)
     }
@@ -2389,6 +2467,8 @@ impl PersistedWindowStore {
         }
 
         prune_stale(&mut wire, now_ms)?;
+        wire.generation = next_generation(&gen_entry)?;
+        establish_native_coverage(&mut wire, now_ms)?;
         wire.version = select_wire_version(&wire, committed);
         #[cfg(test)]
         if let Some(hook) = tests::RECORD_SETTLED_BEFORE_VALIDATE.with_borrow_mut(Option::take) {
@@ -2399,7 +2479,6 @@ impl PersistedWindowStore {
         // This debit may already be on chain, so it never goes through the
         // prepared image: the counter moves first, and a failed file write
         // refuses later spends instead of reading a total without it.
-        wire.generation = next_generation(&gen_entry)?;
         write_generation(&gen_entry, &wire)?;
         self.write_atomic(&key, &wire)?;
         Ok(mint_outcome)
@@ -3441,8 +3520,10 @@ impl PersistedWindowStore {
     /// A window that holds an operation record that has not ended refuses with
     /// [`WindowStoreError::OperationsOpen`] before either callback runs. The
     /// successor keeps terminal operation records, tombstones and every
-    /// authorization an operation links without a release row. It clears the
-    /// admissible floors.
+    /// authorization an operation links, or of a value-holding or fee-holding
+    /// domain, without a release row. It keeps the admissible floors, raised
+    /// by the release bounds of the records it drops, and the native coverage
+    /// marker.
     ///
     /// A mainnet profile in a build with mainnet writes also refuses while an
     /// effective open or claimed authorization remains. Expiry releases
@@ -3551,6 +3632,9 @@ impl PersistedWindowStore {
                 reset_consent,
                 accounting_expiries: snapshot.retained_expiries,
                 authorizations: snapshot.retained_authorizations,
+                admissible_floor_ledger: snapshot.retained_floors.ledger,
+                admissible_floor_close_time_ms: snapshot.retained_floors.close_time_ms,
+                native_coverage: snapshot.retained_coverage,
                 operations: retained_operations,
                 approvals: retained_approvals,
                 ..WireFile::default()
@@ -3615,6 +3699,8 @@ impl PersistedWindowStore {
                 original: None,
                 retained_expiries: Vec::new(),
                 retained_authorizations: Vec::new(),
+                retained_floors: operations::AdmissibleFloors::default(),
+                retained_coverage: None,
                 retained_totals: Vec::new(),
                 retained_sums: Vec::new(),
                 retired_total_epoch: None,
@@ -3697,7 +3783,7 @@ impl PersistedWindowStore {
             }
         }
         ledger::sweep_expired(&mut wire, clock);
-        let retained_authorizations = ledger::reset_survivors(&wire, clock);
+        let retained_authorizations = ledger::reset_survivors(&mut wire, clock);
         // Open authorization holds count as pending spend in the reset row.
         for hold in std::mem::take(&mut wire.holds) {
             let key = StateKey::new("", hold.scope_specificity, &hold.bucket, hold.window_secs);
@@ -3720,6 +3806,11 @@ impl PersistedWindowStore {
             original: Some(original),
             retained_expiries,
             retained_authorizations,
+            retained_floors: operations::AdmissibleFloors {
+                ledger: wire.admissible_floor_ledger,
+                close_time_ms: wire.admissible_floor_close_time_ms,
+            },
+            retained_coverage: wire.native_coverage,
             retained_totals,
             retained_sums,
             retired_total_epoch,
@@ -3904,6 +3995,7 @@ impl PersistedWindowStore {
         if original.generation != 0 && original.version < WIRE_VERSION_TOTAL_SUMS {
             promote_final_totals(&mut next);
         }
+        establish_native_coverage(&mut next, now_ms()?)?;
         // The successor's version participates in its commitment.
         // The current snapshot retains its committed version and digest.
         next.version = select_wire_version(
@@ -4396,6 +4488,7 @@ impl PersistedWindowStore {
                 })?;
         wire.version = WIRE_VERSION_OPERATIONS;
         wire.retired_total_epoch = None;
+        strip_native_coverage_for_test(&mut wire);
         if let Some(amount) = total {
             wire.entries.push(WireBucket {
                 scope_specificity: 1,
@@ -5151,6 +5244,7 @@ fn authenticated_scope(wire: &WireFile) -> Result<ChainScope, WindowStoreError> 
 /// [`WIRE_VERSION_TOTAL_SUMS`] (15). Builds capped at 12 refuse version 13;
 /// builds capped at 13 refuse version 14; builds capped at 14 refuse 15.
 /// Total-budget intent legs require version 16, which readers capped at 15 refuse.
+/// Canonical lineage requires version 17 and the native coverage marker 18.
 fn check_snapshot(wire: &WireFile) -> Result<(), WindowStoreError> {
     let max_version = WIRE_VERSION_MAX;
     #[cfg(test)]
@@ -5227,6 +5321,11 @@ fn check_snapshot(wire: &WireFile) -> Result<(), WindowStoreError> {
             detail: format!(
                 "canonical lineage requires wire version {WIRE_VERSION_CANONICAL_LINEAGE}"
             ),
+        });
+    }
+    if wire.version < WIRE_VERSION_NATIVE_COVERAGE && wire.native_coverage.is_some() {
+        return Err(WindowStoreError::Invalid {
+            detail: format!("native coverage requires wire version {WIRE_VERSION_NATIVE_COVERAGE}"),
         });
     }
     check_total_fields(wire)?;
@@ -7901,7 +8000,7 @@ pub mod commit_faults {
 
 #[cfg(test)]
 thread_local! {
-    static DESTINATION_READER_CAP: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    pub(in crate::policy_state) static DESTINATION_READER_CAP: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
     static DESTINATION_BEFORE_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
@@ -7933,7 +8032,9 @@ mod tests {
                 max_time: 0,
             },
         );
-        let current = fx.wire();
+        let mut current = fx.wire();
+        current.version = WIRE_VERSION_TOTAL_EPOCH;
+        strip_native_coverage_for_test(&mut current);
         let (key, _) = fx.store.load_or_mint_key(&fx.profile).unwrap();
         let verify = |body: &[u8]| {
             let mut bytes = compute_tag(&key[..], body).unwrap().to_vec();
@@ -8363,7 +8464,7 @@ mod tests {
         let _clock = crate::mainnet::clock::set_now_ms_for_test(1000);
         let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
         let successor = store.read_for_inspection(&profile).unwrap().unwrap();
-        assert_eq!(successor.version, WIRE_VERSION_TOTAL_EPOCH);
+        assert_eq!(successor.version, WIRE_VERSION_NATIVE_COVERAGE);
         let key = crate::keyring::load_hmac_key_32(&profile.policy_window_state_key_id).unwrap();
         let encode = |wire: &WireFile| {
             let body = serde_json::to_vec(wire).unwrap();
@@ -8374,6 +8475,7 @@ mod tests {
         let mut parent = successor.clone();
         parent.signed_intents.clear();
         parent.version = 8;
+        strip_native_coverage_for_test(&mut parent);
         assert!(decode_version_eight(&key, &encode(&parent)).is_ok());
         assert!(matches!(
             decode_version_eight(&key, &encode(&successor)),
@@ -8382,7 +8484,7 @@ mod tests {
         parent.prepared = Some(Box::new(successor));
         assert_eq!(
             parent.prepared.as_ref().unwrap().version,
-            WIRE_VERSION_TOTAL_EPOCH
+            WIRE_VERSION_NATIVE_COVERAGE
         );
         assert!(matches!(
             decode_version_eight(&key, &encode(&parent)),
@@ -8419,7 +8521,10 @@ mod tests {
         let mut cases: Vec<Case> = vec![
             (
                 "signed intent state requires version 9",
-                Box::new(|v| v["version"] = 8.into()),
+                Box::new(|v| {
+                    v["version"] = 8.into();
+                    v.as_object_mut().unwrap().remove("native_coverage");
+                }),
             ),
             (
                 "signed intent identifier does not match",
@@ -10907,7 +11012,13 @@ mod tests {
         let valid = f.store.read_for_inspection(&f.profile).unwrap().unwrap();
         type Mutation = (&'static str, Box<dyn Fn(&mut WireFile)>);
         let mutate: Vec<Mutation> = vec![
-            ("version", Box::new(|wire| wire.version = 8)),
+            (
+                "version",
+                Box::new(|wire| {
+                    wire.version = 8;
+                    strip_native_coverage_for_test(wire);
+                }),
+            ),
             (
                 "id",
                 Box::new(|wire| wire.signed_intents[0].intent_id = "intent-00".into()),
@@ -11086,6 +11197,7 @@ mod tests {
                 Box::new(|wire| {
                     let mut next = wire.clone();
                     next.version = 8;
+                    strip_native_coverage_for_test(&mut next);
                     next.generation += 1;
                     wire.prepared = Some(Box::new(next));
                 }),
@@ -11219,7 +11331,10 @@ mod tests {
         for defect in 0..6 {
             let mut bad = linked.clone();
             match defect {
-                0 => bad.version = 8,
+                0 => {
+                    bad.version = 8;
+                    strip_native_coverage_for_test(&mut bad);
+                }
                 1 => bad.signed_intents.clear(),
                 2 => {
                     let intent = &mut bad.signed_intents[0];
@@ -12340,7 +12455,9 @@ mod tests {
     fn rewrite_body_version(store: &PersistedWindowStore, profile: &Profile, version: u32) {
         let key = crate::keyring::load_hmac_key_32(&profile.policy_window_state_key_id).unwrap();
         let bytes = fs::read(&store.path).unwrap();
-        let mut wire: serde_json::Value = serde_json::from_slice(&bytes[HMAC_TAG_LEN..]).unwrap();
+        let mut written: WireFile = serde_json::from_slice(&bytes[HMAC_TAG_LEN..]).unwrap();
+        strip_native_coverage_for_test(&mut written);
+        let mut wire = serde_json::to_value(&written).unwrap();
         wire["version"] = serde_json::json!(version);
         let gen_entry = generation_entry_ref(profile);
         keyring_core::Entry::new(&gen_entry.service, &gen_entry.account)
@@ -12392,7 +12509,7 @@ mod tests {
         let dest = PolicyStateStore::new();
         store.load_into("v1-read", &profile, &dest).unwrap();
         let retired = store.read_for_inspection(&profile).unwrap().unwrap();
-        assert_eq!(retired.version, WIRE_VERSION_TOTAL_EPOCH);
+        assert_eq!(retired.version, WIRE_VERSION_NATIVE_COVERAGE);
         let original = fs::read(&store.path).unwrap();
         store
             .load_into("v1-read", &profile, &PolicyStateStore::new())
@@ -12724,7 +12841,7 @@ mod tests {
         // The hydration retires the earlier build's state once and keeps
         // every record it held.
         let retired = store.read_for_inspection(&profile).unwrap().unwrap();
-        assert_eq!(retired.version, WIRE_VERSION_TOTAL_EPOCH);
+        assert_eq!(retired.version, WIRE_VERSION_NATIVE_COVERAGE);
         assert_eq!(
             serde_json::to_value(&retired.entries).unwrap(),
             serde_json::to_value(&original.entries).unwrap()
@@ -13676,7 +13793,7 @@ mod tests {
                     stellar_agent_core::profile::owner_key::owner_key_fingerprint(&owner_of(0xa1))
                 );
                 assert_eq!(record.consumed_at_ms, time);
-                assert_eq!(wire.version, WIRE_VERSION_TOTAL_EPOCH);
+                assert_eq!(wire.version, WIRE_VERSION_NATIVE_COVERAGE);
                 prune_stale(&mut wire, u64::MAX).unwrap();
                 assert_eq!(wire.reset_consent, Some(record));
                 assert!(serde_json::to_value(&wire).unwrap()["reset_consent"].is_object());
@@ -14083,7 +14200,7 @@ mod tests {
                 .unwrap();
             let after = store.read_for_inspection(&profile).unwrap().unwrap();
             assert_eq!(after.generation, before.generation + 1);
-            assert_eq!(after.version, WIRE_VERSION_TOTAL_EPOCH);
+            assert_eq!(after.version, WIRE_VERSION_NATIVE_COVERAGE);
             assert_eq!(
                 serde_json::to_vec(&after.operations).unwrap(),
                 serde_json::to_vec(&before.operations).unwrap()
@@ -14134,8 +14251,16 @@ mod tests {
                     None
                 ))
             );
-            assert_eq!(after.admissible_floor_ledger, None);
-            assert_eq!(after.admissible_floor_close_time_ms, None);
+            assert_eq!(
+                after.admissible_floor_ledger,
+                before.admissible_floor_ledger
+            );
+            assert_eq!(
+                after.admissible_floor_close_time_ms,
+                before.admissible_floor_close_time_ms
+            );
+            assert!(before.native_coverage.is_some());
+            assert_eq!(after.native_coverage, before.native_coverage);
             let mut unreleased = after.clone();
             unreleased
                 .authorizations
@@ -14426,7 +14551,7 @@ mod tests {
                 assert_eq!(pair.version, version);
                 assert_eq!(
                     pair.prepared.as_ref().unwrap().version,
-                    WIRE_VERSION_TOTAL_EPOCH
+                    WIRE_VERSION_NATIVE_COVERAGE
                 );
                 pair.prepared = None;
                 assert_eq!(serde_json::to_vec(&pair).unwrap(), bytes[HMAC_TAG_LEN..]);
@@ -14441,13 +14566,14 @@ mod tests {
                 assert_eq!(
                     selected.version,
                     if committed {
-                        WIRE_VERSION_TOTAL_EPOCH
+                        WIRE_VERSION_NATIVE_COVERAGE
                     } else {
                         version
                     }
                 );
                 let mut no_content = selected.clone();
                 no_content.reset_consent = None;
+                strip_native_coverage_for_test(&mut no_content);
                 assert_eq!(
                     select_wire_version(&no_content, Some(11)),
                     WIRE_VERSION_TOTAL_EPOCH
@@ -14483,7 +14609,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn owner_reset_clears_floors_only_after_commit() {
+    fn owner_reset_keeps_floors_and_establishes_coverage_after_commit() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
@@ -14508,13 +14634,34 @@ mod tests {
             let committed = seam != COMMIT_FAULT_AFTER_PREPARED;
             assert_eq!(
                 selected.admissible_floor_ledger,
-                if committed { None } else { Some(77) }
+                Some(77),
+                "the reset keeps the ledger floor at {seam}"
             );
+            let established = selected
+                .native_coverage
+                .map(|marker| marker.since_ms + ESTABLISHMENT_ALLOWANCE_MS);
+            assert_eq!(established.is_some(), committed, "marker at {seam}");
             assert_eq!(
                 selected.admissible_floor_close_time_ms,
-                if committed { None } else { Some(88) }
+                established.or(Some(88)),
+                "the successor raises the kept close-time floor at {seam}"
             );
         }
+    }
+
+    #[test]
+    fn native_coverage_floor_overflow_refuses_typed() {
+        let mut wire = WireFile::default();
+        let result =
+            establish_native_coverage(&mut wire, u64::MAX - ESTABLISHMENT_ALLOWANCE_MS + 1);
+        assert!(
+            matches!(&result, Err(WindowStoreError::Invalid { .. })),
+            "an unrepresentable floor refuses: {result:?}"
+        );
+        assert_eq!(wire.native_coverage, None);
+        assert_eq!(wire.admissible_floor_close_time_ms, None);
+        establish_native_coverage(&mut wire, u64::MAX - ESTABLISHMENT_ALLOWANCE_MS).unwrap();
+        assert_eq!(wire.admissible_floor_close_time_ms, Some(u64::MAX));
     }
 
     #[test]
@@ -16675,7 +16822,7 @@ mod tests {
             .expire_accounting(&fx.profile, None, &fx.hold, fx.expire_at)
             .unwrap();
         let wire = fx.store.read_for_inspection(&fx.profile).unwrap().unwrap();
-        assert_eq!(wire.version, WIRE_VERSION_TOTAL_EPOCH);
+        assert_eq!(wire.version, WIRE_VERSION_NATIVE_COVERAGE);
         check_snapshot(&wire).unwrap();
         let refused = |change: &dyn Fn(&mut WireFile)| {
             let mut changed = wire.clone();
@@ -16710,13 +16857,18 @@ mod tests {
             let copy = wire.accounting_expiries[0].clone();
             wire.accounting_expiries.push(copy);
         });
-        let mut without = wire.clone();
+        let mut unmarked = wire.clone();
+        strip_native_coverage_for_test(&mut unmarked);
+        let mut without = unmarked.clone();
         without.accounting_expiries.clear();
         assert_eq!(
             select_wire_version(&without, None),
             WIRE_VERSION_TOTAL_EPOCH
         );
-        assert_eq!(select_wire_version(&wire, None), WIRE_VERSION_TOTAL_EPOCH);
+        assert_eq!(
+            select_wire_version(&unmarked, None),
+            WIRE_VERSION_TOTAL_EPOCH
+        );
         let body = serde_json::to_string(&without).unwrap();
         assert!(!body.contains("accounting_expiries"), "{body}");
     }
@@ -17371,7 +17523,7 @@ mod tests {
         assert_eq!(record.generation, generation + 1);
         assert_eq!(record.disposition, RecordStatus::AccountingExpired);
         assert!(!record.audit_acknowledged && !record.receipt_projected);
-        assert_eq!(wire.version, WIRE_VERSION_TOTAL_EPOCH);
+        assert_eq!(wire.version, WIRE_VERSION_NATIVE_COVERAGE);
         let event = stellar_agent_core::audit_log::AuditEntry::new_submission_accounting_expired(
             ACCOUNTING_EXPIRY_TOOL,
             "stellar:testnet",
@@ -17968,9 +18120,10 @@ mod tests {
                 auth.claimed_ms = claimed_ms;
                 wire.authorizations.push(auth);
                 // These fields select the current write version without
-                // a recovery run or destination provenance.
+                // a recovery run or destination provenance, and every
+                // write carries the native coverage marker.
                 let _ = version;
-                let expected = WIRE_VERSION_TOTAL_EPOCH;
+                let expected = WIRE_VERSION_NATIVE_COVERAGE;
                 let (key, _) = f.store.load_or_mint_key(&f.profile).unwrap();
                 f.store
                     .commit_generation(
@@ -18033,6 +18186,7 @@ mod tests {
                 _ => {
                     let mut wire = store.read_for_inspection(&profile).unwrap().unwrap();
                     wire.version = current_version;
+                    strip_native_coverage_for_test(&mut wire);
                     if current_version >= WIRE_VERSION_LEDGER {
                         wire.authorizations.push(settled_authorization(1));
                     }
@@ -18074,7 +18228,7 @@ mod tests {
             let retired = store.read_for_inspection(&profile).unwrap().unwrap();
             assert_eq!(
                 (retired.version, retired.generation),
-                (WIRE_VERSION_TOTAL_EPOCH, current.generation + 1),
+                (WIRE_VERSION_NATIVE_COVERAGE, current.generation + 1),
                 "{pair}: the hydration retires the current snapshot"
             );
             store.write_atomic(&hmac_key, &container).unwrap();
@@ -18117,7 +18271,7 @@ mod tests {
                 .unwrap();
             let written = store.read_for_inspection(&profile).unwrap().unwrap();
             assert_eq!(
-                written.version, WIRE_VERSION_TOTAL_EPOCH,
+                written.version, WIRE_VERSION_NATIVE_COVERAGE,
                 "{pair}: the next write uses the current write version"
             );
         }
@@ -18130,6 +18284,7 @@ mod tests {
                 crate::keyring::load_hmac_key_32(&profile.policy_window_state_key_id).unwrap();
             let gen_entry = generation_entry_ref(&profile);
             let mut successor = store.read_for_inspection(&profile).unwrap().unwrap();
+            strip_native_coverage_for_test(&mut successor);
             let mut parent = successor.clone();
             parent.signed_intents.clear();
             parent.version = 8;
@@ -18290,6 +18445,7 @@ mod tests {
         } else {
             WIRE_VERSION_INTENT
         };
+        strip_native_coverage_for_test(&mut sealed);
         store.write_atomic(&hmac_key, &sealed).unwrap();
         write_generation(&gen_entry, &sealed).unwrap();
         let written = store.read_for_inspection(&profile).unwrap().unwrap();
@@ -18358,7 +18514,7 @@ mod tests {
             .unwrap();
         let bytes = fs::read(store.path()).unwrap();
         let loaded = store.read_for_inspection(&profile).unwrap().unwrap();
-        assert_eq!(loaded.version, WIRE_VERSION_TOTAL_EPOCH);
+        assert_eq!(loaded.version, WIRE_VERSION_NATIVE_COVERAGE);
         assert_eq!(body_digest(&loaded).unwrap(), committed_digest(&profile));
         assert_reserializes_byte_identically(&store, &profile);
         assert_eq!(fs::read(store.path()).unwrap(), bytes);
@@ -18480,7 +18636,7 @@ mod tests {
                 assert_eq!(
                     (selected.version, selected.generation),
                     if committed {
-                        (WIRE_VERSION_TOTAL_EPOCH, current.generation + 1)
+                        (WIRE_VERSION_NATIVE_COVERAGE, current.generation + 1)
                     } else {
                         (current_version, current.generation)
                     },
@@ -18506,7 +18662,7 @@ mod tests {
                         .unwrap();
                 assert_eq!(
                     body["prepared"]["version"],
-                    serde_json::json!(WIRE_VERSION_TOTAL_EPOCH),
+                    serde_json::json!(WIRE_VERSION_NATIVE_COVERAGE),
                     "{pair}: the stop leaves the prepared image beside its parent"
                 );
                 assert_eq!(
@@ -18548,7 +18704,7 @@ mod tests {
             .unwrap();
         let after = store.read_for_inspection(&profile).unwrap().unwrap();
         assert_eq!(after.generation, before.generation + 1);
-        assert_eq!(after.version, WIRE_VERSION_TOTAL_EPOCH);
+        assert_eq!(after.version, WIRE_VERSION_NATIVE_COVERAGE);
         assert_eq!(
             serde_json::to_vec(&after.signed_intents).unwrap(),
             serde_json::to_vec(&before.signed_intents).unwrap()
@@ -18867,7 +19023,7 @@ mod tests {
             .unwrap();
         let after = store.read_for_inspection(&profile).unwrap().unwrap();
         assert_eq!(after.generation, before.generation + 1);
-        assert_eq!(after.version, WIRE_VERSION_TOTAL_EPOCH);
+        assert_eq!(after.version, WIRE_VERSION_NATIVE_COVERAGE);
         assert_eq!(after.operations, before.operations);
         let section = after.operations.as_ref().unwrap();
         let mut kept: Vec<_> = section
@@ -18914,8 +19070,16 @@ mod tests {
                 None
             ))
         );
-        assert_eq!(after.admissible_floor_ledger, None);
-        assert_eq!(after.admissible_floor_close_time_ms, None);
+        assert_eq!(
+            after.admissible_floor_ledger,
+            before.admissible_floor_ledger
+        );
+        assert_eq!(
+            after.admissible_floor_close_time_ms,
+            before.admissible_floor_close_time_ms
+        );
+        assert!(before.native_coverage.is_some());
+        assert_eq!(after.native_coverage, before.native_coverage);
         let mut unreleased = after.clone();
         unreleased
             .authorizations
@@ -19022,7 +19186,7 @@ mod tests {
             .load_into("intent", &profile, &PolicyStateStore::new())
             .unwrap();
         let retired = store.read_for_inspection(&profile).unwrap().unwrap();
-        assert_eq!(retired.version, WIRE_VERSION_TOTAL_EPOCH);
+        assert_eq!(retired.version, WIRE_VERSION_NATIVE_COVERAGE);
         fs::write(&store.path, &bytes).unwrap();
         write_generation(&generation_entry_ref(&profile), &current).unwrap();
         assert_eq!(fs::read(&store.path).unwrap(), bytes);
@@ -19044,7 +19208,7 @@ mod tests {
             )
             .unwrap();
         let after = store.read_for_inspection(&profile).unwrap().unwrap();
-        assert_eq!(after.version, WIRE_VERSION_TOTAL_EPOCH);
+        assert_eq!(after.version, WIRE_VERSION_NATIVE_COVERAGE);
         assert_eq!(after.generation, current.generation + 1);
         assert_eq!(after.chain_scope, current.chain_scope);
         assert_eq!(after.last_observation.map(|o| o.ledger), Some(900));
@@ -19105,7 +19269,7 @@ mod tests {
             .load_into("intent", &profile, &PolicyStateStore::new())
             .unwrap();
         let retired = store.read_for_inspection(&profile).unwrap().unwrap();
-        assert_eq!(retired.version, WIRE_VERSION_TOTAL_EPOCH);
+        assert_eq!(retired.version, WIRE_VERSION_NATIVE_COVERAGE);
         assert_eq!(retired.generation, current.generation + 1);
         fs::write(&store.path, &bytes).unwrap();
         write_generation(&generation_entry_ref(&profile), &golden).unwrap();
@@ -19121,7 +19285,7 @@ mod tests {
             .commit_generation(&key, &generation_entry_ref(&profile), current.clone(), next)
             .unwrap();
         let after = store.read_for_inspection(&profile).unwrap().unwrap();
-        assert_eq!(after.version, WIRE_VERSION_TOTAL_EPOCH);
+        assert_eq!(after.version, WIRE_VERSION_NATIVE_COVERAGE);
         assert_eq!(after.generation, current.generation + 1);
         for (name, section) in [
             ("chain_scope", serde_json::to_string(&after.chain_scope)),
@@ -19163,8 +19327,9 @@ mod tests {
         });
         store.mint_authorization(&profile, &held).unwrap();
         let wire = store.read_for_inspection(&profile).unwrap().unwrap();
-        assert_eq!(wire.version, WIRE_VERSION_TOTAL_EPOCH);
+        assert_eq!(wire.version, WIRE_VERSION_NATIVE_COVERAGE);
         let mut native_only = wire.clone();
+        native_only.native_coverage = None;
         native_only.authorizations[0].policy_authority = None;
         assert_eq!(
             select_wire_version(&native_only, None),
@@ -19189,12 +19354,13 @@ mod tests {
         let mut audit = OperationRows::default();
         open_operation(&store, &profile, &mut audit, "order-1", 1);
         let eleven = store.read_for_inspection(&profile).unwrap().unwrap();
-        assert_eq!(eleven.version, WIRE_VERSION_TOTAL_EPOCH);
+        assert_eq!(eleven.version, WIRE_VERSION_NATIVE_COVERAGE);
         assert_eq!(
             eleven.authorizations[0].native_reservation,
             held.native_reservation
         );
         let mut emptied = eleven.clone();
+        emptied.native_coverage = None;
         emptied.operations = None;
         assert_eq!(
             select_wire_version(&emptied, Some(WIRE_VERSION_OPERATIONS)),
@@ -19224,13 +19390,13 @@ mod tests {
         held.holds = vec![entry(key("ops-store", "native", 86_400), OPERATION_T0, 9)];
         store.mint_authorization(&profile, &held).unwrap();
         let before = store.read_for_inspection(&profile).unwrap().unwrap();
-        assert_eq!(before.version, WIRE_VERSION_TOTAL_EPOCH);
+        assert_eq!(before.version, WIRE_VERSION_NATIVE_COVERAGE);
         assert_eq!(before.holds.len(), 1);
 
         let mut audit = OperationRows::default();
         open_operation(&store, &profile, &mut audit, "order-1", 1);
         let after = store.read_for_inspection(&profile).unwrap().unwrap();
-        assert_eq!(after.version, WIRE_VERSION_TOTAL_EPOCH);
+        assert_eq!(after.version, WIRE_VERSION_NATIVE_COVERAGE);
         assert_eq!(after.generation, before.generation + 1);
         assert_eq!(after.chain_scope, before.chain_scope);
         for (stored, kept) in [
@@ -19254,6 +19420,7 @@ mod tests {
 
         let mut unscoped = before.clone();
         unscoped.version = 4;
+        strip_native_coverage_for_test(&mut unscoped);
         unscoped.chain_scope = None;
         unscoped.authorizations.clear();
         unscoped.holds.clear();
@@ -19313,6 +19480,7 @@ mod tests {
                     // Seal the version 11 file an earlier build wrote.
                     let mut sealed = store.read_for_inspection(&profile).unwrap().unwrap();
                     sealed.version = WIRE_VERSION_OPERATIONS;
+                    strip_native_coverage_for_test(&mut sealed);
                     store.write_atomic(&hmac_key, &sealed).unwrap();
                     write_generation(&gen_entry, &sealed).unwrap();
                 }
@@ -19344,7 +19512,11 @@ mod tests {
                         selected.last_observation.map(|o| o.ledger)
                     ),
                     if committed {
-                        (WIRE_VERSION_TOTAL_EPOCH, current.generation + 1, Some(900))
+                        (
+                            WIRE_VERSION_NATIVE_COVERAGE,
+                            current.generation + 1,
+                            Some(900),
+                        )
                     } else {
                         (
                             current_version,
@@ -19370,7 +19542,7 @@ mod tests {
                         .unwrap();
                 assert_eq!(
                     body["prepared"]["version"],
-                    serde_json::json!(WIRE_VERSION_TOTAL_EPOCH),
+                    serde_json::json!(WIRE_VERSION_NATIVE_COVERAGE),
                     "{pair}: the stop leaves the prepared image beside its parent"
                 );
                 assert_eq!(
@@ -19412,10 +19584,11 @@ mod tests {
             .commit_generation(&hmac_key, &gen_entry, ten, eleven)
             .unwrap();
         let committed = store.read_for_inspection(&profile).unwrap().unwrap();
-        assert_eq!(committed.version, WIRE_VERSION_TOTAL_EPOCH);
+        assert_eq!(committed.version, WIRE_VERSION_NATIVE_COVERAGE);
 
         let mut plain = committed.clone();
         plain.last_observation = None;
+        strip_native_coverage_for_test(&mut plain);
         assert!(!operations::has_content(&plain));
         store
             .commit_generation(&hmac_key, &gen_entry, committed.clone(), plain)
@@ -19423,14 +19596,14 @@ mod tests {
         let after = store.read_for_inspection(&profile).unwrap().unwrap();
         assert_eq!(after.generation, committed.generation + 1);
         assert_eq!(after.last_observation, None);
-        assert_eq!(after.version, WIRE_VERSION_TOTAL_EPOCH);
+        assert_eq!(after.version, WIRE_VERSION_NATIVE_COVERAGE);
 
         store
             .record_and_persist(&profile, &[entry(key("intent", "other", 3600), 1000, 9)])
             .unwrap();
         let settled = store.read_for_inspection(&profile).unwrap().unwrap();
         assert_eq!(settled.generation, after.generation + 1);
-        assert_eq!(settled.version, WIRE_VERSION_TOTAL_EPOCH);
+        assert_eq!(settled.version, WIRE_VERSION_NATIVE_COVERAGE);
         assert_reserializes_byte_identically(&store, &profile);
     }
 
@@ -19623,6 +19796,7 @@ mod tests {
         ten.version = WIRE_VERSION_POLICY_AUTHORITY;
         ten.operations = None;
         ten.approvals = None;
+        strip_native_coverage_for_test(&mut ten);
         fx.store.seal_unchecked_for_test(fx.fixture.profile(), &ten);
         let current = fx.wire();
         assert_eq!(current.version, 10);
@@ -19641,7 +19815,7 @@ mod tests {
                 next,
             )
             .unwrap();
-        assert_eq!(fx.wire().version, WIRE_VERSION_TOTAL_EPOCH);
+        assert_eq!(fx.wire().version, WIRE_VERSION_NATIVE_COVERAGE);
         assert!(fx.view().record.consent.is_none());
     }
 
@@ -19661,6 +19835,7 @@ mod tests {
                 let mut current = fx.wire();
                 current.operations = None;
                 current.version = version;
+                strip_native_coverage_for_test(&mut current);
                 current.approvals = (version == 11).then(|| ApprovalsSection {
                     records: vec![pending],
                 });
@@ -19689,7 +19864,7 @@ mod tests {
                 assert_eq!(
                     after.version,
                     if committed {
-                        WIRE_VERSION_TOTAL_EPOCH
+                        WIRE_VERSION_NATIVE_COVERAGE
                     } else {
                         version
                     }
@@ -20070,6 +20245,7 @@ mod tests {
             open.expires_ms = now + 60_000;
             wire.authorizations.push(open);
             wire.version = 4;
+            strip_native_coverage_for_test(&mut wire);
             store.write_atomic(&hmac_key, &wire).unwrap();
             write_generation(&gen_entry, &wire).unwrap();
             let bytes = fs::read(&store.path).unwrap();
@@ -20255,6 +20431,7 @@ mod tests {
         fs::remove_file(receipts.file_path().unwrap()).unwrap();
         let mut wire = store.read_for_inspection(&profile).unwrap().unwrap();
         wire.version = 3;
+        strip_native_coverage_for_test(&mut wire);
         wire.chain_scope = None;
         for record in wire
             .entries
@@ -20635,6 +20812,7 @@ mod tests {
             fn seal_v11(&self, mut wire: WireFile) {
                 wire.version = WIRE_VERSION_OPERATIONS;
                 wire.retired_total_epoch = None;
+                strip_native_coverage_for_test(&mut wire);
                 assert!(wire.generation >= 1);
                 self.store.seal_unchecked_for_test(&self.profile, &wire);
             }
@@ -21934,7 +22112,7 @@ mod tests {
             enrolled_reset_owner(&f, 0xa1);
             authorized_reset(&f, "preserve-total", |_, _| Ok(())).unwrap();
             let committed = f.store.read_for_inspection(&f.profile).unwrap().unwrap();
-            assert_eq!(committed.version, WIRE_VERSION_TOTAL_INTENTS);
+            assert_eq!(committed.version, WIRE_VERSION_NATIVE_COVERAGE);
             assert_eq!(
                 serde_json::to_value(&committed.entries).unwrap(),
                 serde_json::to_value(vec![total]).unwrap()
@@ -22251,7 +22429,7 @@ mod tests {
             empty.earlier_build_file();
             empty.hydrated(D1);
             let wire = empty.wire();
-            assert_eq!(wire.version, WIRE_VERSION_TOTAL_EPOCH);
+            assert_eq!(wire.version, WIRE_VERSION_NATIVE_COVERAGE);
             assert_eq!(wire.retired_total_epoch, None);
         }
 
@@ -22360,7 +22538,7 @@ mod tests {
 
         #[test]
         #[serial]
-        fn this_build_always_writes_version_twelve() {
+        fn unmarked_content_selects_twelve_and_writes_carry_the_marker() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
             assert!(
                 guard_home
@@ -22391,7 +22569,7 @@ mod tests {
             }
             f.pending(1, &[f.windowed(1)]).unwrap();
             let written = f.wire();
-            assert_eq!(written.version, WIRE_VERSION_TOTAL_EPOCH);
+            assert_eq!(written.version, WIRE_VERSION_NATIVE_COVERAGE);
             assert_eq!(written.retired_total_epoch, None);
             f.hydrated(D1);
             f.hydrated(D1);
@@ -22410,7 +22588,7 @@ mod tests {
                 stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             assert_eq!(WIRE_VERSION_TOTAL_EPOCH, 12);
             assert_eq!(WIRE_VERSION_TOTAL_SUMS, WIRE_VERSION_DESTINATION + 1);
-            assert_eq!(WIRE_VERSION_MAX, WIRE_VERSION_CANONICAL_LINEAGE);
+            assert_eq!(WIRE_VERSION_MAX, WIRE_VERSION_NATIVE_COVERAGE);
             let f = fx("total-sums-version");
             let mut marked = version_twelve();
             f.push_final(&mut marked, 1, "total:native", 1, D1);
@@ -22444,9 +22622,9 @@ mod tests {
             assert!(earlier_build(&twelve));
             f.pin(D1);
             f.authorized(&[f.total(1, D1)]).unwrap();
-            assert_eq!(f.wire().version, WIRE_VERSION_TOTAL_SUMS);
+            assert_eq!(f.wire().version, WIRE_VERSION_NATIVE_COVERAGE);
             f.touch(1).unwrap();
-            assert_eq!(f.wire().version, WIRE_VERSION_TOTAL_SUMS);
+            assert_eq!(f.wire().version, WIRE_VERSION_NATIVE_COVERAGE);
         }
 
         #[test]
@@ -22675,7 +22853,7 @@ mod tests {
             f.store.seal_unchecked_for_test(&f.profile, &wire);
             f.clock.set(FOLD_AT);
             f.touch(1).unwrap();
-            assert_eq!(f.wire().version, WIRE_VERSION_TOTAL_SUMS);
+            assert_eq!(f.wire().version, WIRE_VERSION_NATIVE_COVERAGE);
             assert_eq!(f.rows(), vec![(RecordStatus::Confirmed, 6)]);
             assert_eq!(f.sums(), vec![(1, "total:native".to_owned(), D1, 2)]);
             assert_eq!(f.sum(D1), 8);
@@ -22930,7 +23108,7 @@ mod tests {
             assert_eq!(f.wire().generation, 1, "hydration writes nothing");
             f.touch(1).unwrap();
             let upgraded = f.wire();
-            assert_eq!(upgraded.version, WIRE_VERSION_TOTAL_SUMS);
+            assert_eq!(upgraded.version, WIRE_VERSION_NATIVE_COVERAGE);
             assert_eq!(upgraded.retired_total_epoch, None);
             assert_eq!(f.sum(D1), 6);
             f.authorized(&[f.total(4, D1)]).unwrap();
@@ -22959,6 +23137,7 @@ mod tests {
                 .unwrap();
             let mut wire = f.wire();
             wire.version = WIRE_VERSION_TOTAL_EPOCH;
+            strip_native_coverage_for_test(&mut wire);
             f.push_row(&mut wire, 2, Some(D1));
             f.store.seal_unchecked_for_test(&f.profile, &wire);
             assert_eq!(f.rows(), vec![(RecordStatus::Confirmed, 2)]);
@@ -22971,7 +23150,7 @@ mod tests {
                     .is_some()
             );
             let expired = f.wire();
-            assert_eq!(expired.version, WIRE_VERSION_TOTAL_SUMS);
+            assert_eq!(expired.version, WIRE_VERSION_NATIVE_COVERAGE);
             assert_eq!(expired.accounting_expiries.len(), 1);
             assert_eq!(f.rows(), vec![(RecordStatus::FinalTotal, 2)]);
             f.clock.set(FOLD_AT);
@@ -23007,7 +23186,7 @@ mod tests {
             let f = fx("total-older-current");
             f.pin(D1);
             f.authorized(&[f.total(1, D1)]).unwrap();
-            assert_eq!(f.wire().version, WIRE_VERSION_TOTAL_SUMS);
+            assert_eq!(f.wire().version, WIRE_VERSION_NATIVE_COVERAGE);
             assert!(matches!(
                 older(&f),
                 Err(WindowStoreError::UnsupportedVersion)

@@ -880,6 +880,17 @@ impl MainnetFixture {
             .len()
     }
 
+    /// Commits the window store's first write 310 s before now, so that the
+    /// native coverage marker it establishes covers a balance read that the
+    /// endpoint reports closed now.
+    pub(crate) fn cover_native_history(&self) {
+        let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+        let _clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(now - 310_000);
+        PersistedWindowStore::for_profile(self.name)
+            .record_and_persist(&self.profile(), &[])
+            .unwrap();
+    }
+
     /// The window store file of the profile.
     pub(crate) fn window_path(&self) -> PathBuf {
         stellar_agent_core::profile::schema::default_policy_window_state_path_for(self.name)
