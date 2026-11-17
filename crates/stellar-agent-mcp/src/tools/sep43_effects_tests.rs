@@ -2644,33 +2644,37 @@ fn network_id() -> Hash {
     Hash(sha2::Sha256::digest(TESTNET_PASSPHRASE.as_bytes()).into())
 }
 
+/// A base64 preimage of `version` over `root` on the network `network_id`,
+/// with nonce 7 and expiration ledger 100. A type 9 preimage omits `address`.
+fn preimage_xdr(
+    version: stellar_agent_soroban_auth::AuthCredentialsVersion,
+    network_id: [u8; 32],
+    address: &ScAddress,
+    root: SorobanAuthorizedInvocation,
+) -> String {
+    stellar_agent_soroban_auth::build_auth_preimage(version, network_id, 7, 100, address, root)
+        .to_xdr_base64(Limits::none())
+        .unwrap()
+}
+
 /// A type 9 preimage of `root` on the test network.
 fn auth_preimage(root: SorobanAuthorizedInvocation) -> String {
-    stellar_xdr::HashIdPreimage::SorobanAuthorization(
-        stellar_xdr::HashIdPreimageSorobanAuthorization {
-            network_id: network_id(),
-            nonce: 7,
-            signature_expiration_ledger: 100,
-            invocation: root,
-        },
+    preimage_xdr(
+        stellar_agent_soroban_auth::AuthCredentialsVersion::V1,
+        network_id().0,
+        &account_address(A),
+        root,
     )
-    .to_xdr_base64(Limits::none())
-    .unwrap()
 }
 
 /// A type 10 preimage of `root` bound to `address`.
-fn bound_preimage(address: ScAddress, root: SorobanAuthorizedInvocation) -> String {
-    stellar_xdr::HashIdPreimage::SorobanAuthorizationWithAddress(
-        stellar_xdr::HashIdPreimageSorobanAuthorizationWithAddress {
-            network_id: network_id(),
-            nonce: 7,
-            signature_expiration_ledger: 100,
-            address,
-            invocation: root,
-        },
+fn bound_preimage(address: &ScAddress, root: SorobanAuthorizedInvocation) -> String {
+    preimage_xdr(
+        stellar_agent_soroban_auth::AuthCredentialsVersion::V2,
+        network_id().0,
+        address,
+        root,
     )
-    .to_xdr_base64(Limits::none())
-    .unwrap()
 }
 
 fn with_children(
@@ -2776,16 +2780,12 @@ async fn auth_preimage_validation_precedes_external_work() {
     })
     .to_xdr_base64(Limits::none())
     .unwrap();
-    let foreign = stellar_xdr::HashIdPreimage::SorobanAuthorization(
-        stellar_xdr::HashIdPreimageSorobanAuthorization {
-            network_id: Hash([9; 32]),
-            nonce: 7,
-            signature_expiration_ledger: 100,
-            invocation: paying.clone(),
-        },
-    )
-    .to_xdr_base64(Limits::none())
-    .unwrap();
+    let foreign = preimage_xdr(
+        stellar_agent_soroban_auth::AuthCredentialsVersion::V1,
+        [9; 32],
+        &account_address(fx.key),
+        paying.clone(),
+    );
     let mut deep = paying.clone();
     for _ in 0..600 {
         deep = with_children(unknown_call(), vec![deep]);
@@ -2799,18 +2799,18 @@ async fn auth_preimage_validation_precedes_external_work() {
         (operation_id, "sep43.malformed_auth_entry"),
         (foreign, "sep43.invalid_network_passphrase"),
         (
-            bound_preimage(account_address(A), paying.clone()),
+            bound_preimage(&account_address(A), paying.clone()),
             "sep43.invalid_address",
         ),
         (
             bound_preimage(
-                ScAddress::Contract(ContractId(Hash(fx.key))),
+                &ScAddress::Contract(ContractId(Hash(fx.key))),
                 paying.clone(),
             ),
             "sep43.invalid_address",
         ),
         (
-            bound_preimage(muxed_address(fx.key, 1), paying.clone()),
+            bound_preimage(&muxed_address(fx.key, 1), paying.clone()),
             "sep43.invalid_address",
         ),
         (auth_preimage(deep), "sep43.invalid_xdr"),
@@ -2823,7 +2823,7 @@ async fn auth_preimage_validation_precedes_external_work() {
     assert_eq!(fx.usage("rate_limit").1, 0, "no admission");
     auth_signed(&fx.auth(auth_preimage(create_contract())).await);
     auth_signed(
-        &fx.auth(bound_preimage(account_address(fx.key), create_contract()))
+        &fx.auth(bound_preimage(&account_address(fx.key), create_contract()))
             .await,
     );
     assert_eq!(fx.usage("rate_limit").1, 2);
