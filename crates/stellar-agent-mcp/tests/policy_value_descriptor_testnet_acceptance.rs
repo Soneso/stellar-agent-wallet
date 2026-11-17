@@ -502,6 +502,8 @@ async fn value_gate_deny_opaque_unsizable_blocks_raw_signing() {
             transaction_xdr: envelope_xdr,
             network_passphrase: None,
             address: None,
+            approval_nonce: None,
+            approval_attestation: None,
         })
         .await
         .expect(
@@ -525,10 +527,11 @@ async fn value_gate_deny_opaque_unsizable_blocks_raw_signing() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// The same broad `tool = "*"` value rule as scenario 3, but with the explicit
-/// operator opt-in `allow_opaque_signing = true`: the engine downgrades the
-/// opaque value class to read-only for this rule, the `per_tx_cap` criterion
-/// treats the call as not-applicable, and the rule's own `Allow` decision
-/// governs — the call proceeds to sign and submit on the live testnet ledger.
+/// operator opt-in `allow_opaque_signing = true`. The opt-in covers only the
+/// tool's own opaque value class. The self-payment inside the envelope is a
+/// wallet payment, so the same rule decides it through `stellar_pay_commit`
+/// with its `per_tx_cap`. Under a cap below 1 XLM the call refuses; under the
+/// 10 000 XLM cap it signs and submits on the live testnet ledger.
 #[tokio::test]
 #[serial]
 async fn value_gate_allow_opaque_signing_exemption_permits_raw_signing() {
@@ -553,6 +556,26 @@ async fn value_gate_allow_opaque_signing_exemption_permits_raw_signing() {
     let mut server = WalletServer::new(profile).expect("WalletServer::new");
     let envelope_xdr = simulate_self_payment_envelope(&server, &g_strkey).await;
 
+    let over = per_tx_cap_document(vec![("*", PER_TX_CAP_LOW_STROOPS, true)]);
+    server.set_policy_engine_for_test(Arc::new(PolicyEngineV1::new(over, g_strkey.clone())));
+    let refused = server
+        .call_stellar_sep43_sign_and_submit_transaction(Sep43SignAndSubmitTransactionArgs {
+            chain_id: TESTNET_CHAIN_ID.to_owned(),
+            transaction_xdr: envelope_xdr.clone(),
+            network_passphrase: None,
+            address: None,
+            approval_nonce: None,
+            approval_attestation: None,
+        })
+        .await
+        .expect("an over-cap payment leg must return the business-error envelope");
+    let (code, _message, text) = common::assert_business_envelope(&refused);
+    assert_eq!(
+        code, "policy.deny.per_tx_cap_exceeded",
+        "the opt-in does not exempt the payment leg from its cap; got: {text}"
+    );
+    assert!(!text.contains("signedTxXdr"), "{text}");
+
     let doc = per_tx_cap_document(vec![("*", PER_TX_CAP_MAX_STROOPS, true)]);
     server.set_policy_engine_for_test(Arc::new(PolicyEngineV1::new(doc, g_strkey.clone())));
 
@@ -562,6 +585,8 @@ async fn value_gate_allow_opaque_signing_exemption_permits_raw_signing() {
             transaction_xdr: envelope_xdr,
             network_passphrase: None,
             address: None,
+            approval_nonce: None,
+            approval_attestation: None,
         })
         .await
         .expect("the allow_opaque_signing exemption must pass the value gate and reach signing");

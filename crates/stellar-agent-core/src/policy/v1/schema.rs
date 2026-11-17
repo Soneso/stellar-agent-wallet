@@ -200,7 +200,6 @@ pub fn validate_policy_keys(doc: &DocumentMut) -> Result<(), PolicyError> {
     };
     reject_unknown_keys(doc.as_table(), root, None, "the policy file")?;
     signed_engine(doc)?;
-    contract_transfer_max_fee_stroops(doc)?;
     if let Some(mainnet) = doc.get("mainnet").and_then(Item::as_table_like) {
         reject_unknown_keys(mainnet, MAINNET_KEYS, Some("mainnet"), "the mainnet table")?;
         super::approval_credentials::reject_unknown_fields(mainnet.get("approval_credentials"))?;

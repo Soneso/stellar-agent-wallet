@@ -32,7 +32,8 @@
 //! audit pre-flight, admission. Admission charges each payment route; the
 //! submission recorder charges the tool's own count limits with an opaque
 //! value class, so no value is charged twice. A signer, signing or send
-//! failure keeps the admitted usage.
+//! failure keeps the admitted usage. The recorder spends a verified approval
+//! with the send.
 //!
 //! 1. Loads the signer from `profile.mcp_signer_default` via
 //!    `stellar_agent_network::keyring::enrolled_keyring_signer`.
@@ -94,7 +95,9 @@ use crate::tools::common::redact_rpc_error_detail;
 ///   configured passphrase.
 /// - `address` — optional signer address (G-strkey); if provided must match
 ///   the active signer enrolled in the profile.
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+/// - `approval_nonce`, `approval_attestation`: the approval proof of the
+///   repeat call after an approval response.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(crate = "rmcp::serde")]
 pub struct Sep43SignAndSubmitTransactionArgs {
     /// CAIP-2 chain identifier (`"stellar:pubnet"` or `"stellar:testnet"`).
@@ -121,6 +124,32 @@ pub struct Sep43SignAndSubmitTransactionArgs {
     /// (`InvalidAddress`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
+
+    /// The `approval_nonce` of the approval response this call repeats.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_nonce: Option<String>,
+
+    /// The operator's attestation for `approval_nonce`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_attestation: Option<String>,
+}
+
+/// Prints every field but the attestation, which shows only whether it is
+/// set: the attestation is the operator's approval credential.
+impl std::fmt::Debug for Sep43SignAndSubmitTransactionArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Sep43SignAndSubmitTransactionArgs")
+            .field("chain_id", &self.chain_id)
+            .field("transaction_xdr", &self.transaction_xdr)
+            .field("network_passphrase", &self.network_passphrase)
+            .field("address", &self.address)
+            .field("approval_nonce", &self.approval_nonce)
+            .field(
+                "approval_attestation",
+                &crate::tools::common::AttestationPresence(&self.approval_attestation),
+            )
+            .finish()
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -227,9 +256,9 @@ impl WalletServer {
             "transaction_xdr_len": args.transaction_xdr.len(),
         });
 
-        // The gate performs registry lookup, chain validation, and policy evaluation.
-        // Single-shot sign tool: a RequireApproval verdict is fail-closed.
-        // The two-phase approval flow is not supported on this path.
+        // The gate performs registry lookup, chain validation, and policy
+        // evaluation; the effects gate decides an approval requirement of the
+        // tool rule.
         let dispatch_outcome = match self
             .dispatch_gate(
                 "stellar_sep43_sign_and_submit_transaction",
@@ -241,17 +270,11 @@ impl WalletServer {
             Ok(o) => o,
             Err(e) => return e.into_result(),
         };
-        match dispatch_outcome {
-            crate::tools::common::DispatchOutcome::Allow(_) => {}
-            crate::tools::common::DispatchOutcome::RequireApproval(_) => {
-                return Ok(crate::tools::common::single_shot_require_approval_error());
-            }
-        }
         // The recorder charges this tool's own count limits, so admission
         // charges only the payment routes.
-        let snapshot = match dispatch_outcome.snapshot() {
-            Ok(snapshot) => snapshot,
-            Err(error) => return error.into_result(),
+        let proof = crate::tools::common::SuppliedProof {
+            nonce: args.approval_nonce.clone(),
+            attestation: args.approval_attestation.clone(),
         };
         let effects = match self
             .sep43_effects_gate(
@@ -259,7 +282,8 @@ impl WalletServer {
                 &args.transaction_xdr,
                 &args.chain_id,
                 false,
-                snapshot,
+                &dispatch_outcome,
+                &proof,
             )
             .await
         {
@@ -415,7 +439,7 @@ impl WalletServer {
         };
         let recorder = match crate::tools::submission_record::build_recorder(
             crate::tools::submission_record::CommitRecord {
-                policy_decision: dispatch_outcome.audit_decision(),
+                policy_decision: effects.decision,
                 profile: &self.profile,
                 profile_name: profile_name.clone(),
                 tool: "stellar_sep43_sign_and_submit_transaction",
@@ -428,8 +452,9 @@ impl WalletServer {
                 ),
                 audit: audit_writer,
                 nonce_id: None,
-                approval_nonce: None,
-                approval_dir: None,
+                // The recorder tombstones a verified approval with the send.
+                approval_nonce: effects.approval_nonce,
+                approval_dir: self.resolve_approval_dir().ok(),
                 now_ms,
                 provenance: None,
             },
@@ -810,6 +835,8 @@ mod tests {
                 transaction_xdr: stellar_agent_test_support::xdr_fixtures::muxed_contract_envelope(
                 ),
                 address: None,
+                approval_nonce: None,
+                approval_attestation: None,
                 network_passphrase: None,
             })
             .await
@@ -885,11 +912,15 @@ mod tests {
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         stellar_agent_test_support::keyring_mock::install().ok();
         let server = make_require_approval_server();
+        // A bump sequence: no payment leg, so only the tool-rule guard
+        // refuses it.
         let args = Sep43SignAndSubmitTransactionArgs {
             chain_id: "stellar:testnet".to_owned(),
-            transaction_xdr: "AAAAAQAA".to_owned(),
+            transaction_xdr: crate::tools::sep43_effects::tests::bump_sequence([0; 32]),
             network_passphrase: None,
             address: None,
+            approval_nonce: None,
+            approval_attestation: None,
         };
         let result = server
             .call_stellar_sep43_sign_and_submit_transaction(args)
@@ -941,6 +972,8 @@ mod tests {
             transaction_xdr: "AAAAAQAA".to_owned(),
             network_passphrase: None,
             address: None,
+            approval_nonce: None,
+            approval_attestation: None,
         };
         let result = server
             .call_stellar_sep43_sign_and_submit_transaction(args)
@@ -983,6 +1016,8 @@ mod tests {
             transaction_xdr: crate::tools::sep43_effects::tests::bump_sequence([0; 32]),
             network_passphrase: None,
             address: None,
+            approval_nonce: None,
+            approval_attestation: None,
         }
     }
 

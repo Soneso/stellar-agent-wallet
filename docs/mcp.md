@@ -41,7 +41,9 @@ before signing.
 `stellar_mpp_reconcile_transaction`, and `stellar_mpp_authorization_status`
 run without a policy verdict. Tools with an approval flow wait for operator
 consent; single-shot signing tools refuse `RequireApproval` with
-`policy.approval_required_unsupported`.
+`policy.approval_required_unsupported`. The two SEP-43 transaction tools
+approve one payment, path payment, account creation or trustline change in two
+calls.
 Builds from this repository and releases from v0.1.0-alpha.14 on carry
 `mainnet-write`. Mainnet writes also require operator setup and per-action
 authorization. The four classic commit tools use independent signing and
@@ -634,7 +636,9 @@ How a `RequireApproval` verdict is satisfied depends on the tool shape:
 - One-shot signing verbs sign in a single call. If the policy returns
   `RequireApproval` for one of these tools, the call is refused fail-closed with
   `policy.approval_required_unsupported`; the wallet never signs without a
-  verified approval.
+  verified approval. The SEP-43 transaction tools use the two-call flow of
+  [SEP-43 transaction effects](#sep-43-transaction-effects) for a transaction
+  an approval surface shows.
 - `stellar_rule_create` / `stellar_rule_create_commit` (Package D, GH issue
   #8) is a two-phase pair with a DIFFERENT approval-block contract. Unlike the
   signing verbs above, there is no envelope fallback for the commit step to
@@ -1013,10 +1017,10 @@ Credentialed input URLs are refused. On a mainnet profile the three tools refuse
 | --- | --- | --- |
 | `stellar_sep43_get_address` | Return the active wallet address. | Read-only. |
 | `stellar_sep43_get_network` | Return the active network name and passphrase. | Read-only. |
-| `stellar_sep43_sign_transaction` | Sign a `TransactionEnvelope` XDR; return `signedTxXdr` and `signerAddress`. | Signs; does not submit. Decides each payment under its payment tool's rule and charges the policy windows when it signs. Requires the audit chain key (refuses `audit.chain_key_unavailable` before signing) and records an `opaque_payload_signed` audit row with the allowed payment legs. |
+| `stellar_sep43_sign_transaction` | Sign a `TransactionEnvelope` XDR; return `signedTxXdr` and `signerAddress`. | Signs; does not submit. Decides each payment under its payment tool's rule and charges the policy windows when it signs. Requires the audit chain key (refuses `audit.chain_key_unavailable` before signing) and records an `opaque_payload_signed` audit row with the allowed payment legs. An approval requirement returns `approval` first; the attested repeat with `approval_nonce` and `approval_attestation` signs and spends the approval. |
 | `stellar_sep43_sign_auth_entry` | Sign the base64 `HashIdPreimage` of a Soroban authorization entry (envelope type 9, or type 10 bound to the signing key's account); return the raw signature as `signedAuthEntry` and `signerAddress`. | Signs; does not submit. Requires the audit chain key (refuses `audit.chain_key_unavailable` before signing) and records an `opaque_payload_signed` audit row. |
 | `stellar_sep43_sign_message` | Sign an arbitrary UTF-8 message via `SHA-256("Stellar Signed Message:\n" + message)` then ed25519; return `signedMessage` (base64) and `signerAddress`. | Signs; does not submit. Refuses an overlaid or out-of-scope signer. Requires the audit chain key (refuses `audit.chain_key_unavailable` before signing) and records an `opaque_payload_signed` audit row. |
-| `stellar_sep43_sign_and_submit_transaction` | Sign a `TransactionEnvelope` XDR, submit it, and poll until confirmed; return `signedTxXdr`, `txHash`, and `status`. | Signs and submits; policy gate. Decides each payment under its payment tool's rule and charges the policy windows before it signs; the pending row carries the allowed legs. |
+| `stellar_sep43_sign_and_submit_transaction` | Sign a `TransactionEnvelope` XDR, submit it, and poll until confirmed; return `signedTxXdr`, `txHash`, and `status`. | Signs and submits; policy gate. Decides each payment under its payment tool's rule and charges the policy windows before it signs; the pending row carries the allowed legs. An approval requirement returns `approval` first; the attested repeat with `approval_nonce` and `approval_attestation` submits, and the send spends the approval. |
 
 These six tools use the standard `{ ok, data, request_id }` / `{ ok, error:
 { code, message }, request_id }` result envelope like every other tool. The
@@ -1027,9 +1031,10 @@ code derived from the SEP-43 error taxonomy (e.g.
 structural mainnet refusal shares the canonical `network.mainnet_write_forbidden`
 code used by wallet entry guards. Library signing uses
 `sep43.mainnet_signing_forbidden` or `sep43.mainnet_authorization_refused`.
-A policy `RequireApproval` verdict (which every single-shot sign tool,
-including SEP-43, refuses fail-closed) carries
-`policy.approval_required_unsupported`.
+A policy `RequireApproval` verdict that a tool cannot carry to an approval
+refuses fail-closed with `policy.approval_required_unsupported`. The SEP-43
+auth-entry and message tools always refuse it; the transaction tools refuse it
+for a transaction no approval surface shows.
 The transaction and auth-entry tools refuse XDR containing a muxed contract
 address (W) with `sep43.invalid_xdr` before key access or storing a request.
 SEP-53 and x402 use the same standard envelope for every business error.
@@ -1046,7 +1051,11 @@ effects decision, audit pre-flight, admission, signer, signature.
   `stellar_trustline_commit` or `stellar_claim_commit`). Each decision uses
   the signed asset, amount, recipient and memo, inside the own rule's policy
   state and instant. A denial returns that rule's code; an approval
-  escalation refuses with `policy.approval_required_unsupported`.
+  escalation follows the two-call flow below.
+- A wallet payment to the wallet itself is a payment. A claimable balance
+  counts only claimants other than its source and the wallet, so a balance
+  without such a claimant has no payment. Another account's payment or merge
+  into the wallet has no value effect; a wallet merge refuses.
 - An offer, a liquidity pool deposit, reserve sponsorship, a wallet clawback
   or a contract call the wallet cannot value needs `allow_opaque_signing = true`
   on the tool's own rule. A contract call that also transfers tokens needs the
@@ -1069,6 +1078,27 @@ records nothing. A signer, signing or send failure keeps the admitted usage,
 and each new sign-only call charges again, identical bytes included. The
 submitting tool's recorder charges only its own count, so value is charged
 once.
+
+An approval requirement of the tool's own rule or of a payment rule is met in
+two calls. The transaction holds exactly one operation: a payment, a path
+payment, an account creation or a trustline change. Every other shape refuses
+with `policy.approval_required_unsupported`.
+
+1. The first call stores a pending approval over the exact `transaction_xdr`
+   text and returns `{ "approval": { approval_nonce, profile, chain_id,
+   expires_at_unix_ms, reason, instructions } }`. It signs nothing, reads no
+   seed and admits no usage.
+2. The operator runs `stellar-agent approve --id <approval_nonce> --profile
+   <profile>`.
+3. The repeat call passes the same `transaction_xdr` with `approval_nonce` and
+   `approval_attestation`. It runs admission, signs, and spends the approval.
+
+The shorter lifetime of the two requirements governs the approval. A proof for
+other envelope text, or half a proof, refuses with `policy.approval_required`.
+A spent approval refuses with `policy.approval_consumed`. The submitting tool's
+send spends the approval. The sign-only tool spends it before it returns the
+signature; a failed spend returns `submission.record_unavailable` and no
+signature. Its `opaque_payload_signed` row records `require_approval`.
 
 Both `stellar_sep43_sign_message` and `stellar_sep53_sign_message` use these
 refusals before loading the signer:

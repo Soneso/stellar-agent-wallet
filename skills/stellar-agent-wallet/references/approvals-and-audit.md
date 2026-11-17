@@ -16,6 +16,10 @@ run first. The engine returns Allow, Deny, or RequireApproval.
 Two-phase MCP actions hold approval requests in a per-profile pending store.
 Single-shot signing paths refuse approval decisions; see
 [CLI signing coverage](cli-reference.md#signing-and-approval-coverage).
+The SEP-43 transaction tools store a pending approval for a single payment,
+path payment, account creation or trustline change. The attested repeat signs.
+The sign-only tool consumes the approval before it returns the signature, and
+its `opaque_payload_signed` row records `require_approval`.
 For MCP pay, create-account, trustline, and claim, simulation records pending
 approval when either tool in the pair requires it. The response returns an
 `approval_nonce`. The wallet owner runs
@@ -197,6 +201,7 @@ The commit tool's rule is binding, so the example carries the criterion on both 
 The threshold applies to its configured asset.
 A payment in another asset passes it, as it passes `per_tx_cap`.
 Single-shot tools and multicall refuse an escalation with their existing approval-required refusal.
+The SEP-43 transaction tools carry the escalation of a single payment, path payment, account creation or trustline change to a pending approval.
 A bundle is sized per inner transfer.
 
 These payment rules allow up to 500 XLM without approval, request approval

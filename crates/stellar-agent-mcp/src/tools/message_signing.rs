@@ -75,5 +75,6 @@ pub(crate) fn message_signed_row(
         RedactedStrkey::from_full(signer),
         uuid::Uuid::new_v4().to_string(),
         Vec::new(),
+        stellar_agent_core::audit_log::PolicyDecision::Allow,
     )
 }

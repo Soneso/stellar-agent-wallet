@@ -472,4 +472,13 @@ Every submitting tool reports these codes, `stellar_dex_trade`, the two vault to
 
 Both SEP-43 transaction tools decide each payment in a caller-supplied transaction under its payment tool's rule and charge the policy windows before the signer loads. The charge stands through a signer, signing or send failure, and repeated sign-only calls charge again. The pending row of the submitting tool and the `opaque_payload_signed` row of the sign-only tool carry the allowed payment legs. The SEP-43 library interface itself evaluates no policy; this decision belongs to the MCP tools.
 
+Both transaction tools accept two optional arguments for an approval requirement:
+
+| Argument | Meaning |
+| --- | --- |
+| `approval_nonce` | The `approval_nonce` of the approval response this call repeats. |
+| `approval_attestation` | The operator's attestation for that nonce, which `stellar-agent approve` records. |
+
+A transaction of one payment, path payment, account creation or trustline change that needs approval returns `{ "approval": { approval_nonce, profile, chain_id, expires_at_unix_ms, reason, instructions } }` and signs nothing. The repeat with the same `transaction_xdr` and both arguments signs and spends the approval. The sign-only tool spends it before it returns the signature. Any other shape refuses with `policy.approval_required_unsupported`.
+
 An operator policy that lists tools explicitly must include `stellar_transaction_status`, or a timed-out submission cannot be resolved through this server.
