@@ -238,6 +238,8 @@ async fn sign_and_submit_self_payment_succeeds() {
         transaction_xdr: unsigned_xdr,
         network_passphrase: None,
         address: None,
+        approval_nonce: None,
+        approval_attestation: None,
     };
 
     let result = server
@@ -329,6 +331,8 @@ async fn sign_and_submit_invalid_xdr_returns_sep43_error() {
         transaction_xdr: "not-valid-base64-xdr".to_owned(),
         network_passphrase: None,
         address: None,
+        approval_nonce: None,
+        approval_attestation: None,
     };
 
     let result = server
@@ -369,17 +373,22 @@ async fn sign_and_submit_passphrase_mismatch_returns_sep43_error() {
     let _storage_home =
         stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (g_strkey, seed) = fresh_keypair();
+    // The effects gate reads the wallet account before signing, so the
+    // source exists and the mismatch is reached at the signing step.
+    fund_via_friendbot(&g_strkey).await;
 
     let server = build_test_server(&g_strkey, &seed);
 
-    // Build a syntactically valid unsigned envelope; error fires during signing.
-    let unsigned_xdr = build_self_payment_xdr(&g_strkey, 0);
+    // Build a valid unsigned envelope; the error fires during signing.
+    let unsigned_xdr = build_self_payment_xdr(&g_strkey, fetch_sequence(&g_strkey).await);
 
     let args = Sep43SignAndSubmitTransactionArgs {
         chain_id: TESTNET_CHAIN_ID.to_owned(),
         transaction_xdr: unsigned_xdr,
         network_passphrase: Some("Public Global Stellar Network ; September 2015".to_owned()),
         address: None,
+        approval_nonce: None,
+        approval_attestation: None,
     };
 
     let result = server

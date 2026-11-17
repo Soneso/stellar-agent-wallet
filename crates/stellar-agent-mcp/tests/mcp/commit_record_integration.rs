@@ -442,6 +442,8 @@ async fn a_timed_out_sep43_submission_is_recorded_and_reconcilable() {
             transaction_xdr: envelope.envelope_xdr().to_owned(),
             network_passphrase: None,
             address: None,
+            approval_nonce: None,
+            approval_attestation: None,
         })
         .await
         .expect("the tool must not error");
@@ -526,6 +528,8 @@ async fn a_muxed_source_reaches_the_send_through_sep43() {
             transaction_xdr: envelope.envelope_xdr().to_owned(),
             network_passphrase: None,
             address: None,
+            approval_nonce: None,
+            approval_attestation: None,
         })
         .await
         .expect("the tool must not error");
@@ -575,6 +579,8 @@ async fn a_reported_sep43_success_keeps_its_pending_row_owed() {
             transaction_xdr: envelope.envelope_xdr().to_owned(),
             network_passphrase: None,
             address: None,
+            approval_nonce: None,
+            approval_attestation: None,
         })
         .await
         .expect("the tool must not error");
@@ -731,6 +737,8 @@ async fn profile_chain_sep43_accounting_persists_rate_limit() {
         transaction_xdr: envelope.envelope_xdr().into(),
         network_passphrase: None,
         address: None,
+        approval_nonce: None,
+        approval_attestation: None,
     };
     let submitted = server
         .call_stellar_sep43_sign_and_submit_transaction(args(&first))

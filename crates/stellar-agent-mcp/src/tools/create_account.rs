@@ -246,6 +246,8 @@ impl WalletServer {
     /// `~/.local/share/stellar-agent/approvals/<profile_name>.toml`, constructs
     /// an unattested entry from the create-account arguments, inserts it, and
     /// returns the entry for nonce / expiry extraction by the caller.
+    /// A SEP-43 path payment stores its payment approval here too, with its
+    /// send asset as `summary_asset`.
     ///
     /// # Errors
     ///
@@ -258,6 +260,7 @@ impl WalletServer {
         &self,
         envelope_xdr: &str,
         summary_destination: &str,
+        summary_asset: &str,
         summary_starting_stroops: i64,
         summary_simulated_total_stroops: u32,
         summary_simulated_seq_num: i64,
@@ -281,8 +284,8 @@ impl WalletServer {
             envelope_xdr.as_bytes(),
             summary_destination.to_owned(),
             summary_starting_stroops,
-            "XLM".to_owned(),
-            None, // CreateAccount has no memo
+            summary_asset.to_owned(),
+            None, // The approval surfaces read the memo from the envelope.
             summary_simulated_total_stroops,
             summary_simulated_seq_num,
             uid,
@@ -702,6 +705,7 @@ impl WalletServer {
                     self.persist_create_account_pending_approval(
                         &envelope_xdr,
                         &args.destination,
+                        "XLM",
                         starting_balance_stroops,
                         total_fee_stroops,
                         source_sequence.saturating_add(1),

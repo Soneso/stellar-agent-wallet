@@ -2784,6 +2784,8 @@ impl AuditEntry {
     /// evaluated legs in signed operation order. The row does not prove settlement.
     /// `payload_sha256_redacted` must contain only the first and last eight digest
     /// characters. The signature and payload are never recorded.
+    /// `policy_decision` is `RequireApproval` for a signature an approval
+    /// released.
     #[must_use]
     pub fn new_opaque_payload_signed(
         tool: impl Into<String>,
@@ -2792,6 +2794,7 @@ impl AuditEntry {
         signer_redacted: RedactedStrkey,
         request_id: impl Into<String>,
         legs: Vec<ValueLegRecord>,
+        policy_decision: PolicyDecision,
     ) -> Self {
         Self {
             ts: current_iso8601_utc(),
@@ -2802,7 +2805,7 @@ impl AuditEntry {
             truncated: false,
             envelope_hash: None,
             nonce_id: None,
-            policy_decision: PolicyDecision::Allow,
+            policy_decision,
             decision_reason: None,
             request_id: request_id.into(),
             event_kind: EventKind::OpaquePayloadSigned {

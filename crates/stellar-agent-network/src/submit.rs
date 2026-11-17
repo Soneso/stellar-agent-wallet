@@ -2123,7 +2123,7 @@ fn is_definitive_send_refusal(error: &stellar_rpc_client::Error) -> bool {
 /// - [`WalletError::Protocol`] wrapping [`ProtocolError::XdrCodecFailed`] for
 ///   a legacy `TxV0` envelope, which has no tagged-transaction form, or if the
 ///   payload cannot be encoded.
-pub(crate) fn compute_local_tx_hash_hex(
+pub fn compute_local_tx_hash_hex(
     envelope: &TransactionEnvelope,
     network_passphrase: &str,
 ) -> Result<String, WalletError> {

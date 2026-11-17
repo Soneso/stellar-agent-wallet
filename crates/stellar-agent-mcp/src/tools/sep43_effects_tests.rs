@@ -110,6 +110,9 @@ pub(crate) fn bump_sequence(source: [u8; 32]) -> String {
     ))
 }
 
+/// An approval proof: the nonce and the attestation.
+pub(crate) type Proof = (Option<String>, Option<String>);
+
 pub(crate) fn muxed(key: [u8; 32], id: Option<u64>) -> MuxedAccount {
     match id {
         None => MuxedAccount::Ed25519(Uint256(key)),
@@ -483,24 +486,42 @@ impl Fixture {
     }
 
     pub(crate) async fn sign(&self, transaction_xdr: String) -> CallToolResult {
+        self.sign_with(transaction_xdr, Proof::default()).await
+    }
+
+    pub(crate) async fn submit(&self, transaction_xdr: String) -> CallToolResult {
+        self.submit_with(transaction_xdr, Proof::default()).await
+    }
+
+    /// The sign-only call with an approval proof.
+    pub(crate) async fn sign_with(&self, transaction_xdr: String, proof: Proof) -> CallToolResult {
         self.server
             .call_stellar_sep43_sign_transaction(Sep43SignTransactionArgs {
                 chain_id: "stellar:testnet".into(),
                 transaction_xdr,
                 network_passphrase: None,
                 address: None,
+                approval_nonce: proof.0,
+                approval_attestation: proof.1,
             })
             .await
             .expect("a business result")
     }
 
-    pub(crate) async fn submit(&self, transaction_xdr: String) -> CallToolResult {
+    /// The submitting call with an approval proof.
+    pub(crate) async fn submit_with(
+        &self,
+        transaction_xdr: String,
+        proof: Proof,
+    ) -> CallToolResult {
         self.server
             .call_stellar_sep43_sign_and_submit_transaction(Sep43SignAndSubmitTransactionArgs {
                 chain_id: "stellar:testnet".into(),
                 transaction_xdr,
                 network_passphrase: None,
                 address: None,
+                approval_nonce: proof.0,
+                approval_attestation: proof.1,
             })
             .await
             .expect("a business result")
@@ -696,7 +717,8 @@ async fn an_unlisted_recipient_is_admitted_with_its_classification() {
     signed(&fx.sign(fx.tx(vec![payment(muxed(A, None), 6 * XLM)])).await);
 }
 
-/// An `approval_above` escalation refuses: these tools have no approval
+/// An `approval_above` escalation of a transaction no approval surface shows
+/// refuses: a payment beside a second operation has no approval
 /// continuation.
 #[tokio::test]
 #[serial_test::serial(keyring)]
@@ -711,8 +733,11 @@ async fn an_operation_that_needs_approval_refuses() {
     .await;
     assert_eq!(
         refused(
-            &fx.sign(fx.tx(vec![payment(muxed(A, None), 11 * XLM)]))
-                .await
+            &fx.sign(fx.tx(vec![
+                payment(muxed(A, None), 11 * XLM),
+                payment(muxed(B, None), XLM),
+            ]))
+            .await
         )
         .0,
         "policy.approval_required_unsupported"
@@ -1142,6 +1167,35 @@ async fn an_undecodable_envelope_refuses_between_the_tool_rule_and_the_audit_pre
     );
 }
 
+/// A refused audit pre-flight precedes admission in both tools: under
+/// chargeable payment and count rules, an allowed payment leaves durable
+/// usage unchanged and reads no seed; with the audit key restored it charges.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn a_refused_audit_preflight_admits_nothing_in_either_tool() {
+    let fx = Fixture::new(vec![
+        rule(SIGN, vec![rate(5)], false),
+        rule(SUBMIT, vec![rate(5)], false),
+        rule(PAY, vec![per_day(100 * i128::from(XLM))], false),
+    ])
+    .await;
+    let coord = fx.profile.audit_log_hash_chain_key_id.clone();
+    let entry = keyring_core::Entry::new(&coord.service, &coord.account).unwrap();
+    let key = entry.get_password().unwrap();
+    entry.delete_credential().unwrap();
+    let xdr = fx.tx(vec![payment(muxed(A, None), 10 * XLM)]);
+    for result in [fx.sign(xdr.clone()).await, fx.submit(xdr.clone()).await] {
+        assert_eq!(refused(&result).0, "audit.chain_key_unavailable");
+    }
+    assert_eq!(fx.usage("native"), (0, 0));
+    assert_eq!(fx.usage("rate_limit"), (0, 0));
+    assert_eq!(fx.seed_reads(), 0);
+    entry.set_password(&key).unwrap();
+    signed(&fx.sign(xdr).await);
+    assert_eq!(fx.usage("native"), (10 * i128::from(XLM), 1));
+}
+
 // ─── Fees ────────────────────────────────────────────────────────────────────
 
 fn bump_op(source: Option<[u8; 32]>) -> Operation {
@@ -1226,6 +1280,17 @@ fn soroban(source: [u8; 32], fee: u32, resource_fee: i64, operation: Operation) 
 
 /// A verified policy whose signed contract transfer fee cap is zero.
 fn zero_cap_policy(fx: &Fixture) -> stellar_agent_core::mainnet::verified_policy::VerifiedPolicy {
+    signed_policy(
+        fx,
+        "version = 1\nscope = \"profile:*\"\ncontract_transfer_max_fee_stroops = 0\n",
+    )
+}
+
+/// The owner-signed V1 policy `body`, loaded and verified for `fx`.
+fn signed_policy(
+    fx: &Fixture,
+    body: &str,
+) -> stellar_agent_core::mainnet::verified_policy::VerifiedPolicy {
     use stellar_agent_core::policy::v1::canonical::canonical_bytes;
     use stellar_agent_core::policy::v1::signature::{digest, sign};
     use stellar_agent_core::policy::v1::verified::{
@@ -1233,7 +1298,6 @@ fn zero_cap_policy(fx: &Fixture) -> stellar_agent_core::mainnet::verified_policy
     };
     let key = ed25519_dalek::SigningKey::from_bytes(&[31; 32]);
     let public = key.verifying_key().to_bytes();
-    let body = "version = 1\nscope = \"profile:*\"\ncontract_transfer_max_fee_stroops = 0\n";
     let path = fx.dir.path().join("policy.toml");
     std::fs::write(
         &path,
@@ -1449,6 +1513,8 @@ async fn missing_registry_and_account_facts_refuse() {
             transaction_xdr: fx.tx(vec![payment(muxed(A, None), XLM)]),
             network_passphrase: None,
             address: None,
+            approval_nonce: None,
+            approval_attestation: None,
         })
         .await
         .unwrap_err();
@@ -1752,6 +1818,8 @@ async fn sep43_admission_errors_keep_their_channel() {
             fx.server.policy_descriptor(SIGN).unwrap(),
             stellar_agent_core::policy::v1::ValueClass::ReadOnly,
         )],
+        approval_nonce: None,
+        decision: stellar_agent_core::audit_log::PolicyDecision::Allow,
     };
     let refusal = fx.server.sep43_admit(&effects).unwrap_err();
     let (code, message, _) = assert_business_envelope(&refusal);
@@ -1832,6 +1900,8 @@ async fn signer_and_signing_failures_keep_admission() {
             transaction_xdr: ten.clone(),
             network_passphrase: Some("Public Global Stellar Network ; September 2015".into()),
             address: None,
+            approval_nonce: None,
+            approval_attestation: None,
         })
         .await
         .unwrap();
@@ -1986,4 +2056,557 @@ async fn effects_clock_failure_refuses() {
     );
     assert_eq!(fx.reads(fx.key), 0);
     assert_eq!(fx.reads(A), 0);
+}
+
+// ─── Approval ────────────────────────────────────────────────────────────────
+
+use stellar_agent_core::approval::{
+    ApprovalKind, AttestationBinding, AttestedApprover, ConsumedOutcome, PendingApproval,
+    PendingApprovalStore,
+    attestation::{compute_attestation_v4, envelope_sha256},
+    process_uid_for_attestation,
+};
+use stellar_agent_core::policy::ApprovalRequest;
+
+const ATTESTATION_KEY: [u8; 32] = [0xD2; 32];
+
+/// A pay rule that escalates a native payment above 10 XLM and caps the day
+/// at 100 XLM, so an admitted spend leaves a window entry.
+fn escalating_rules() -> Vec<PolicyRule> {
+    pay_rule(vec![
+        Box::new(
+            stellar_agent_core::policy::v1::criteria::approval_above::ApprovalAboveCriterion::new(
+                "native".into(),
+                10 * i128::from(XLM),
+            ),
+        ),
+        per_day(100 * i128::from(XLM)),
+    ])
+}
+
+/// A rule for `tool` whose decision requires approval for `ttl_seconds`.
+fn approval_rule(tool: &str, ttl_seconds: u32) -> PolicyRule {
+    let mut rule = rule(tool, vec![], false);
+    rule.decision = Decision::RequireApproval(ApprovalRequest::new("rule".into(), ttl_seconds));
+    rule
+}
+
+/// A trustline on `USDC` issued by `OTHER`.
+fn usdc_trustline(limit: i64) -> OperationBody {
+    OperationBody::ChangeTrust(stellar_xdr::ChangeTrustOp {
+        line: stellar_xdr::ChangeTrustAsset::CreditAlphanum4(stellar_xdr::AlphaNum4 {
+            asset_code: stellar_xdr::AssetCode4(*b"USDC"),
+            issuer: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(OTHER))),
+        }),
+        limit,
+    })
+}
+
+impl Fixture {
+    /// A fixture whose approvals live in its own directory, whose attestation
+    /// key is enrolled, and whose verified policy binds each payment approval
+    /// for recovery as a V1 profile does.
+    async fn approving(rules: Vec<PolicyRule>) -> Self {
+        let mut fx = Self::new(rules).await;
+        fx.server.verified_policy = Some(Arc::new(signed_policy(
+            &fx,
+            "version = 1\nscope = \"profile:*\"\n",
+        )));
+        fx.server
+            .set_approval_dir_for_test(fx.dir.path().join("approvals"));
+        let key = &fx.profile.attestation_key_id;
+        keyring_core::Entry::new(&key.service, &key.account)
+            .unwrap()
+            .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(ATTESTATION_KEY))
+            .unwrap();
+        fx
+    }
+
+    fn store(&self) -> PendingApprovalStore {
+        let name = self.server.profile_name_for_approval();
+        PendingApprovalStore::open(
+            self.dir
+                .path()
+                .join("approvals")
+                .join(format!("{name}.toml")),
+        )
+        .unwrap()
+    }
+
+    fn entry(&self, nonce: &str) -> PendingApproval {
+        self.store().get(nonce).cloned().expect("a stored approval")
+    }
+
+    /// Attests the pending approval `nonce` over `envelope` as the operator
+    /// does and returns the proof the agent presents.
+    fn attest(&self, nonce: &str, envelope: &str) -> Proof {
+        let entry = self.entry(nonce);
+        let name = self.server.profile_name_for_approval();
+        let blob = compute_attestation_v4(
+            &ATTESTATION_KEY,
+            &AttestationBinding::new(&name, "stellar:testnet"),
+            nonce,
+            &envelope_sha256(envelope.as_bytes()),
+            &process_uid_for_attestation().unwrap(),
+            &entry.attested_lifetime(),
+            &AttestedApprover::Local,
+        );
+        self.store()
+            .record_attestation(nonce, blob, AttestedApprover::Local)
+            .unwrap();
+        (
+            Some(nonce.to_owned()),
+            Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob)),
+        )
+    }
+
+    fn sends(&self) -> usize {
+        self.ledger.sends.load(Ordering::SeqCst)
+    }
+}
+
+/// The `approval` block of a pending response, which holds no signature.
+fn pending(result: &CallToolResult) -> Value {
+    let text = &result.content[0].as_text().unwrap().text;
+    assert_ne!(result.is_error, Some(true), "{text}");
+    assert!(!text.contains("signedTxXdr"), "{text}");
+    let approval = serde_json::from_str::<Value>(text).unwrap()["data"]["approval"].clone();
+    assert!(approval["approval_nonce"].is_string(), "{text}");
+    approval
+}
+
+fn nonce_of(approval: &Value) -> String {
+    approval["approval_nonce"].as_str().unwrap().to_owned()
+}
+
+/// The first call of an escalated payment stores a pending approval over the
+/// caller's envelope text and returns its block; it signs nothing, reads no
+/// seed and admits no spend.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn an_escalated_payment_returns_a_pending_approval_and_signs_nothing() {
+    let fx = Fixture::approving(escalating_rules()).await;
+    let xdr = fx.tx(vec![payment(muxed(A, None), 11 * XLM)]);
+    let approval = pending(&fx.submit(xdr.clone()).await);
+    assert_eq!(approval["chain_id"], "stellar:testnet");
+    assert_eq!(approval["profile"], fx.server.profile_name_for_approval());
+    let instructions = approval["instructions"].as_str().unwrap();
+    assert!(
+        instructions.contains("approval_attestation"),
+        "{instructions}"
+    );
+    let entry = fx.entry(&nonce_of(&approval));
+    assert_eq!(approval["expires_at_unix_ms"], entry.expires_at_unix_ms);
+    let ApprovalKind::PaymentSimulated {
+        envelope_sha256_hex,
+        summary_to,
+        summary_amount_stroops,
+        ..
+    } = &entry.kind
+    else {
+        panic!("a payment approval: {:?}", entry.kind);
+    };
+    assert_eq!(
+        *envelope_sha256_hex,
+        stellar_agent_core::hex::encode(&envelope_sha256(xdr.as_bytes()))
+    );
+    assert_eq!(
+        (summary_to.as_str(), *summary_amount_stroops),
+        (g(A).as_str(), 11 * XLM)
+    );
+    assert_eq!(fx.seed_reads(), 0, "no seed read");
+    assert_eq!(fx.sends(), 0);
+    assert_eq!(fx.usage("native"), (0, 0), "no window entry");
+}
+
+/// The attested repeat submits and spends the approval; the same proof then
+/// refuses as consumed and sends nothing.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn the_attested_second_call_signs_and_spends_the_approval() {
+    let fx = Fixture::approving(escalating_rules()).await;
+    let xdr = fx.tx(vec![payment(muxed(A, None), 11 * XLM)]);
+    let nonce = nonce_of(&pending(&fx.submit(xdr.clone()).await));
+    let proof = fx.attest(&nonce, &xdr);
+    let second = fx.submit_with(xdr.clone(), proof.clone()).await;
+    let text = &second.content[0].as_text().unwrap().text;
+    assert_eq!(fx.sends(), 1, "the attested repeat sends: {text}");
+    assert_eq!(fx.usage("native"), (11 * i128::from(XLM), 1));
+    assert!(
+        matches!(fx.entry(&nonce).kind, ApprovalKind::Consumed { .. }),
+        "the send spends the approval"
+    );
+    assert_eq!(
+        refused(&fx.submit_with(xdr, proof).await).0,
+        "policy.approval_consumed"
+    );
+    assert_eq!(fx.sends(), 1);
+}
+
+/// Under a verified policy the payment approval is bound for recovery: a
+/// repeated first call returns the same nonce, and a first call after the
+/// spend refuses as consumed and sends nothing.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn a_policy_bound_first_call_returns_its_approval_until_spent() {
+    let fx = Fixture::approving(escalating_rules()).await;
+    let xdr = fx.tx(vec![payment(muxed(A, None), 11 * XLM)]);
+    let nonce = nonce_of(&pending(&fx.submit(xdr.clone()).await));
+    assert_eq!(
+        nonce_of(&pending(&fx.submit(xdr.clone()).await)),
+        nonce,
+        "a repeated first call returns the bound approval"
+    );
+    let proof = fx.attest(&nonce, &xdr);
+    let second = fx.submit_with(xdr.clone(), proof).await;
+    let text = &second.content[0].as_text().unwrap().text;
+    assert_eq!(fx.sends(), 1, "the attested repeat sends: {text}");
+    assert!(
+        matches!(fx.entry(&nonce).kind, ApprovalKind::Consumed { .. }),
+        "the send spends the approval"
+    );
+    assert_eq!(refused(&fx.submit(xdr).await).0, "policy.approval_consumed");
+    assert_eq!(fx.sends(), 1);
+}
+
+/// The sign-only tool spends the approval with an unknown outcome before it
+/// returns the signature; a repeat refuses.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn sign_only_consumes_the_approval_before_it_returns_the_signature() {
+    let fx = Fixture::approving(escalating_rules()).await;
+    let xdr = fx.tx(vec![payment(muxed(A, None), 11 * XLM)]);
+    let nonce = nonce_of(&pending(&fx.sign(xdr.clone()).await));
+    let proof = fx.attest(&nonce, &xdr);
+    signed(&fx.sign_with(xdr.clone(), proof.clone()).await);
+    let ApprovalKind::Consumed { outcome, .. } = fx.entry(&nonce).kind else {
+        panic!("the signature spends the approval");
+    };
+    assert_eq!(outcome, ConsumedOutcome::Unknown);
+    assert_eq!(
+        refused(&fx.sign_with(xdr, proof).await).0,
+        "policy.approval_consumed"
+    );
+}
+
+/// The spend refuses an approval that is no longer pending, so a second
+/// process that verified the same proof returns no signature.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn a_spent_approval_releases_no_second_signature() {
+    let fx = Fixture::approving(escalating_rules()).await;
+    let xdr = fx.tx(vec![payment(muxed(A, None), 11 * XLM)]);
+    let nonce = nonce_of(&pending(&fx.sign(xdr.clone()).await));
+    let proof = fx.attest(&nonce, &xdr);
+    signed(&fx.sign_with(xdr.clone(), proof).await);
+    let refusal = fx.server.sep43_spend_approval(&nonce, &xdr).unwrap_err();
+    assert_eq!(
+        assert_business_envelope(&refusal).0,
+        "submission.record_unavailable"
+    );
+    let missing = fx.server.sep43_spend_approval("absent", &xdr).unwrap_err();
+    assert_eq!(
+        assert_business_envelope(&missing).0,
+        "submission.record_unavailable"
+    );
+}
+
+/// A proof for one envelope does not admit another: a different amount or
+/// the same recipient spelled as an M address refuses.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn an_approval_binds_the_exact_envelope() {
+    let fx = Fixture::approving(escalating_rules()).await;
+    let xdr = fx.tx(vec![payment(muxed(A, None), 11 * XLM)]);
+    let nonce = nonce_of(&pending(&fx.submit(xdr.clone()).await));
+    let proof = fx.attest(&nonce, &xdr);
+    for other in [
+        fx.tx(vec![payment(muxed(A, None), 12 * XLM)]),
+        fx.tx(vec![payment(muxed(A, Some(0)), 11 * XLM)]),
+    ] {
+        assert_eq!(
+            refused(&fx.submit_with(other, proof.clone()).await).0,
+            "policy.approval_required"
+        );
+    }
+    assert_eq!(fx.sends(), 0);
+    assert_eq!(fx.seed_reads(), 0);
+}
+
+/// A tool rule that requires approval, under an allowing pay rule, pends
+/// on the first call and submits on the attested repeat.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn the_tool_rule_requirement_follows_the_same_flow() {
+    let fx = Fixture::approving(vec![
+        rule(SIGN, vec![], false),
+        approval_rule(SUBMIT, 600),
+        rule(PAY, vec![], false),
+    ])
+    .await;
+    let xdr = fx.tx(vec![payment(muxed(A, None), XLM)]);
+    let nonce = nonce_of(&pending(&fx.submit(xdr.clone()).await));
+    let proof = fx.attest(&nonce, &xdr);
+    let _ = fx.submit_with(xdr, proof).await;
+    assert_eq!(fx.sends(), 1);
+}
+
+/// Under a tool rule of 3600 s and an operation rule of 120 s, the pending
+/// approval lives 120 s.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn the_shorter_lifetime_governs() {
+    let fx = Fixture::approving(vec![
+        rule(SIGN, vec![], false),
+        approval_rule(SUBMIT, 3600),
+        approval_rule(PAY, 120),
+    ])
+    .await;
+    let approval = pending(&fx.submit(fx.tx(vec![payment(muxed(A, None), XLM)])).await);
+    let entry = fx.entry(&nonce_of(&approval));
+    assert_eq!(entry.expires_at_unix_ms - entry.created_at_unix_ms, 120_000);
+}
+
+/// Shapes `classic_summary` cannot show keep the unsupported refusal under
+/// an escalation: two payments, a contract transfer and a claim.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn a_shape_the_summary_cannot_show_keeps_the_refusal() {
+    let mut rules = escalating_rules();
+    rules.push(approval_rule("stellar_claim_commit", 600));
+    let fx = Fixture::approving(rules).await;
+    let claim = OperationBody::ClaimClaimableBalance(stellar_xdr::ClaimClaimableBalanceOp {
+        balance_id: stellar_xdr::ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([0xAB; 32])),
+    });
+    for xdr in [
+        fx.tx(vec![
+            payment(muxed(A, None), 11 * XLM),
+            payment(muxed(B, None), 11 * XLM),
+        ]),
+        fx.tx(vec![invoke(vec![fx.transfer(A, (11 * XLM).into())])]),
+        fx.tx(vec![claim]),
+    ] {
+        assert_eq!(
+            refused(&fx.submit(xdr).await).0,
+            "policy.approval_required_unsupported"
+        );
+    }
+    assert!(
+        !fx.dir.path().join("approvals").exists(),
+        "no pending approval"
+    );
+}
+
+/// A path payment, an account creation and a trustline change each store
+/// their own approval kind with the summary of their envelope.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn each_approvable_kind_persists_its_own_summary() {
+    use stellar_agent_core::envelope_decode::{
+        ClassicOperation, ClassicTransactionKind, classic_summary,
+    };
+    let mut rules = escalating_rules();
+    rules.push(approval_rule("stellar_create_account_commit", 600));
+    rules.push(approval_rule("stellar_trustline_commit", 600));
+    let fx = Fixture::approving(rules).await;
+    let path = OperationBody::PathPaymentStrictSend(stellar_xdr::PathPaymentStrictSendOp {
+        send_asset: Asset::Native,
+        send_amount: 11 * XLM,
+        destination: muxed(A, Some(7)),
+        dest_asset: Asset::Native,
+        dest_min: 11 * XLM,
+        path: Default::default(),
+    });
+    let create = OperationBody::CreateAccount(stellar_xdr::CreateAccountOp {
+        destination: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(B))),
+        starting_balance: 2 * XLM,
+    });
+    for body in [path, create] {
+        let xdr = fx.tx(vec![body]);
+        let entry = fx.entry(&nonce_of(&pending(&fx.submit(xdr.clone()).await)));
+        let summary = classic_summary(&xdr, ClassicTransactionKind::Payment).unwrap();
+        let (to, amount, asset) = match summary.operation {
+            ClassicOperation::PathPayment {
+                destination,
+                send_amount_stroops,
+                send_asset,
+                ..
+            } => (destination, send_amount_stroops, send_asset),
+            ClassicOperation::CreateAccount {
+                destination,
+                starting_balance_stroops,
+            } => (destination, starting_balance_stroops, "XLM".to_owned()),
+            other => panic!("{other:?}"),
+        };
+        let ApprovalKind::PaymentSimulated {
+            summary_to,
+            summary_amount_stroops,
+            summary_asset,
+            summary_simulated_fee_stroops,
+            summary_simulated_seq_num,
+            ..
+        } = entry.kind
+        else {
+            panic!("a payment approval: {:?}", entry.kind);
+        };
+        assert_eq!(
+            (summary_to, summary_amount_stroops, summary_asset),
+            (to, amount, asset)
+        );
+        assert_eq!(
+            (summary_simulated_fee_stroops, summary_simulated_seq_num),
+            (summary.fee_stroops, summary.seq_num)
+        );
+    }
+    let xdr = fx.tx(vec![usdc_trustline(100 * XLM)]);
+    let entry = fx.entry(&nonce_of(&pending(&fx.submit(xdr.clone()).await)));
+    let summary = classic_summary(&xdr, ClassicTransactionKind::Trustline).unwrap();
+    let ClassicOperation::ChangeTrust {
+        asset_code,
+        asset_issuer,
+        limit_stroops,
+    } = summary.operation
+    else {
+        panic!("a trustline summary");
+    };
+    let ApprovalKind::TrustlineSimulated {
+        summary_holder,
+        summary_asset_code,
+        summary_asset_issuer,
+        summary_limit_stroops,
+        summary_simulated_fee_stroops,
+        summary_simulated_seq_num,
+        ..
+    } = entry.kind
+    else {
+        panic!("a trustline approval: {:?}", entry.kind);
+    };
+    assert_eq!(
+        (
+            summary_holder,
+            summary_asset_code,
+            summary_asset_issuer,
+            summary_limit_stroops
+        ),
+        (summary.source, asset_code, asset_issuer, limit_stroops)
+    );
+    assert_eq!(
+        (summary_simulated_fee_stroops, summary_simulated_seq_num),
+        (summary.fee_stroops, summary.seq_num)
+    );
+}
+
+/// A nonce without an attestation, and the reverse, return the refusal of
+/// an absent proof and store nothing new.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn half_a_proof_refuses_uniformly() {
+    let fx = Fixture::approving(escalating_rules()).await;
+    let xdr = fx.tx(vec![payment(muxed(A, None), 11 * XLM)]);
+    let nonce = nonce_of(&pending(&fx.submit(xdr.clone()).await));
+    let (_, attestation) = fx.attest(&nonce, &xdr);
+    let absent = crate::tools::common::approval_required_indistinguishable(
+        &fx.server.profile_name_for_approval(),
+    );
+    let absent = assert_business_envelope(&absent);
+    for half in [(Some(nonce.clone()), None), (None, attestation)] {
+        let (code, message) = refused(&fx.submit_with(xdr.clone(), half).await);
+        assert_eq!((code, message), (absent.0.clone(), absent.1.clone()));
+    }
+    assert_eq!(fx.store().len(), 1, "no second approval");
+    assert_eq!(fx.sends(), 0);
+}
+
+/// `Debug` of both argument structs shows only whether an attestation is
+/// set.
+#[test]
+fn the_arguments_hide_the_attestation() {
+    let sign = format!(
+        "{:?}",
+        Sep43SignTransactionArgs {
+            chain_id: "stellar:testnet".into(),
+            transaction_xdr: String::new(),
+            network_passphrase: None,
+            address: None,
+            approval_nonce: Some("nonce".into()),
+            approval_attestation: Some("credential-value".into()),
+        }
+    );
+    let submit = format!(
+        "{:?}",
+        Sep43SignAndSubmitTransactionArgs {
+            chain_id: "stellar:testnet".into(),
+            transaction_xdr: String::new(),
+            network_passphrase: None,
+            address: None,
+            approval_nonce: Some("nonce".into()),
+            approval_attestation: Some("credential-value".into()),
+        }
+    );
+    for text in [sign, submit] {
+        assert!(text.contains("Some(<set>)"), "{text}");
+        assert!(!text.contains("credential-value"), "{text}");
+    }
+}
+
+/// The signature row of an approved sign-only call records
+/// `require_approval`; an allowed signature keeps `allow`.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn an_approved_signature_row_records_the_decision() {
+    let fx = Fixture::approving(escalating_rules()).await;
+    signed(&fx.sign(fx.tx(vec![payment(muxed(A, None), 5 * XLM)])).await);
+    let xdr = fx.tx(vec![payment(muxed(A, None), 11 * XLM)]);
+    let nonce = nonce_of(&pending(&fx.sign(xdr.clone()).await));
+    let proof = fx.attest(&nonce, &xdr);
+    signed(&fx.sign_with(xdr, proof).await);
+    let decisions: Vec<_> = fx
+        .rows("opaque_payload_signed")
+        .iter()
+        .map(|row| row["policy_decision"].clone())
+        .collect();
+    assert_eq!(decisions, vec![json!("allow"), json!("require_approval")]);
+}
+
+/// An approval read under a clock past its lifetime refuses; one read
+/// under a clock before its creation refuses too.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn an_approval_outside_its_interval_refuses() {
+    struct FixedClock(u64);
+    impl stellar_agent_core::timefmt::Clock for FixedClock {
+        fn now_unix_ms(&self) -> Result<u64, stellar_agent_core::WalletLifecycleError> {
+            Ok(self.0)
+        }
+    }
+    let mut fx = Fixture::approving(escalating_rules()).await;
+    let xdr = fx.tx(vec![payment(muxed(A, None), 11 * XLM)]);
+    let nonce = nonce_of(&pending(&fx.submit(xdr.clone()).await));
+    let proof = fx.attest(&nonce, &xdr);
+    let entry = fx.entry(&nonce);
+    for now in [entry.created_at_unix_ms - 1, entry.expires_at_unix_ms + 1] {
+        fx.server.set_clock_for_test(Arc::new(FixedClock(now)));
+        assert_eq!(
+            refused(&fx.submit_with(xdr.clone(), proof.clone()).await).0,
+            "policy.approval_required"
+        );
+    }
+    assert_eq!(fx.sends(), 0);
+    assert!(matches!(
+        fx.entry(&nonce).kind,
+        ApprovalKind::PaymentSimulated { .. }
+    ));
 }

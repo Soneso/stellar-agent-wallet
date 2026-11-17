@@ -343,7 +343,8 @@ How `RequireApproval` is satisfied depends on tool shape:
 - One-shot signing verbs sign in a single call. If the policy returns
   `RequireApproval` for one of these, the call is refused fail-closed with
   `policy.approval_required_unsupported`; the wallet never signs without a
-  verified approval.
+  verified approval. The SEP-43 transaction tools approve a single payment,
+  path payment, account creation or trustline change in two calls.
 
 Separately from the policy verdict, every commit/submit tool that signs or
 moves value proves the active profile's audit chain-root key is acquirable
@@ -806,10 +807,10 @@ decimal strings, not JSON numbers.
 | --- | --- | --- |
 | `stellar_sep43_get_address` | Return the active wallet address. | Read-only. |
 | `stellar_sep43_get_network` | Return the active network name and passphrase. | Read-only. |
-| `stellar_sep43_sign_transaction` | Sign a `TransactionEnvelope` XDR; return `signedTxXdr` and `signerAddress`. | Signs; no submit. Each payment decided by its payment tool's rule and charged at signing. Audit pre-flight + `opaque_payload_signed` row with the allowed legs. |
+| `stellar_sep43_sign_transaction` | Sign a `TransactionEnvelope` XDR; return `signedTxXdr` and `signerAddress`. | Signs; no submit. Each payment decided by its payment tool's rule and charged at signing. Audit pre-flight + `opaque_payload_signed` row with the allowed legs. Approval: first call returns `approval`; the attested repeat signs and spends it. |
 | `stellar_sep43_sign_auth_entry` | Sign the base64 `HashIdPreimage` of a Soroban authorization entry (envelope type 9, or type 10 bound to the signing key's account); return the raw signature as `signedAuthEntry` and `signerAddress`. | Signs; no submit. Audit pre-flight + `opaque_payload_signed` row. |
 | `stellar_sep43_sign_message` | Sign an arbitrary UTF-8 message via `SHA-256("Stellar Signed Message:\n" + message)` then ed25519; return `signedMessage` (base64) and `signerAddress`. | Signs; does not submit. Refuses an overlaid or out-of-scope signer. Requires the audit chain key (refuses `audit.chain_key_unavailable` before signing) and records an `opaque_payload_signed` audit row. |
-| `stellar_sep43_sign_and_submit_transaction` | Sign a `TransactionEnvelope` XDR, submit, poll until confirmed; return `signedTxXdr`, `txHash`, `status`. | Signs and submits; policy gate. Each payment decided by its payment tool's rule and charged before signing; the pending row carries the allowed legs. |
+| `stellar_sep43_sign_and_submit_transaction` | Sign a `TransactionEnvelope` XDR, submit, poll until confirmed; return `signedTxXdr`, `txHash`, `status`. | Signs and submits; policy gate. Each payment decided by its payment tool's rule and charged before signing; the pending row carries the allowed legs. Approval: first call returns `approval`; the attested repeat submits and spends it. |
 
 Both transaction tools decide every payment, path payment, claimant, account
 creation, trustline, claim and wallet-authorized token transfer under the rule
@@ -830,7 +831,14 @@ Arguments:
 - `stellar_sep43_sign_transaction`, `stellar_sep43_sign_and_submit_transaction`:
   required `chain_id`, required `transaction_xdr` (base64); optional
   `network_passphrase` and optional `address` (G-strkey signer; must match the
-  enrolled signer when supplied).
+  enrolled signer when supplied); optional `approval_nonce` and
+  `approval_attestation` for the repeat after an `approval` response. A
+  transaction of one payment, path payment, account creation or trustline
+  change that needs approval returns `{ "approval": { approval_nonce, profile,
+  chain_id, expires_at_unix_ms, reason, instructions } }` and signs nothing.
+  After `stellar-agent approve --id <nonce> --profile <name>`, repeat the same
+  `transaction_xdr` with both arguments. Other shapes refuse with
+  `policy.approval_required_unsupported`.
 - `stellar_sep43_sign_auth_entry`: required `chain_id`, required `auth_entry_xdr`
   (the base64 `HashIdPreimage` of the authorization entry, envelope type 9 or
   10; a type 10 preimage must be bound to the signing key's account); optional

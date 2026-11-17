@@ -1799,6 +1799,31 @@ pub(super) mod tests {
         assert_eq!(after, body, "a refused file must be left byte-identical");
     }
 
+    /// A contract transfer fee cap outside the `u32` range is a known key
+    /// with a refused value: the refusal states the value rule, never an
+    /// unknown key, and the file is left byte-identical.
+    #[tokio::test]
+    #[serial]
+    async fn an_out_of_range_fee_cap_refuses_with_its_value_rule() {
+        let body = format!(
+            "contract_transfer_max_fee_stroops = 4294967296\n{}",
+            policy_body(PROFILE_NAME)
+        );
+        let (code, envelope, after, _pk, _dir) = sign_file_holding("FEECAP", &body).await;
+        assert_eq!(code, 1, "an out-of-range cap must refuse: {envelope}");
+        let message = envelope["error"]["message"].as_str().unwrap();
+        assert!(
+            message
+                .contains("contract_transfer_max_fee_stroops must be an integer in the u32 range"),
+            "{envelope}"
+        );
+        assert!(
+            !message.contains("outside the V1 policy schema"),
+            "{envelope}"
+        );
+        assert_eq!(after, body, "a refused file must be left byte-identical");
+    }
+
     /// A body the loader refuses, but that canonicalises, is refused with
     /// `sign_policy.policy_body_invalid` carrying the loader's detail, and the
     /// file is left byte-identical: an approval `ttl_secs` out of range, and a
