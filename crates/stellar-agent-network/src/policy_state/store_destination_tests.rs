@@ -145,7 +145,7 @@ fn reservations_carry_destinations_at_the_current_version() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let _storage_home =
         stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-    assert_eq!(WIRE_VERSION_MAX, WIRE_VERSION_CANONICAL_LINEAGE);
+    assert_eq!(WIRE_VERSION_MAX, WIRE_VERSION_NATIVE_COVERAGE);
     assert_eq!(
         serde_json::from_str::<StoredDestinations>("null").unwrap(),
         StoredDestinations::Null
@@ -157,8 +157,8 @@ fn reservations_carry_destinations_at_the_current_version() {
         .record_pending(&profile, &[destination_entry(7)], &hold)
         .unwrap();
     let wire = store.read_for_inspection(&profile).unwrap().unwrap();
-    assert_eq!(wire.version, WIRE_VERSION_DESTINATION);
-    assert_eq!(WIRE_VERSION_MAX, WIRE_VERSION_CANONICAL_LINEAGE);
+    assert_eq!(wire.version, WIRE_VERSION_NATIVE_COVERAGE);
+    assert_eq!(WIRE_VERSION_MAX, WIRE_VERSION_NATIVE_COVERAGE);
     assert_eq!(
         store.pending_reservations(&profile).unwrap()[0].destinations,
         hold.destinations
@@ -247,15 +247,17 @@ fn reservations_carry_destinations_at_the_current_version() {
     let entries = serde_json::to_value(&loaded.entries).unwrap();
     store.record_and_persist(&profile, &[]).unwrap();
     let unchanged = store.read_for_inspection(&profile).unwrap().unwrap();
-    assert_eq!(unchanged.version, WIRE_VERSION_TOTAL_EPOCH);
+    assert_eq!(unchanged.version, WIRE_VERSION_NATIVE_COVERAGE);
     assert_eq!(serde_json::to_value(&unchanged.entries).unwrap(), entries);
+    let mut unmarked = unchanged.clone();
+    strip_native_coverage_for_test(&mut unmarked);
     for (committed, expected) in [
         (None, WIRE_VERSION_TOTAL_EPOCH),
         (Some(WIRE_VERSION_TOTAL_EPOCH), WIRE_VERSION_TOTAL_EPOCH),
         (Some(WIRE_VERSION_RECOVERY_RUN), WIRE_VERSION_RECOVERY_RUN),
         (Some(WIRE_VERSION_DESTINATION), WIRE_VERSION_DESTINATION),
     ] {
-        assert_eq!(select_wire_version(&unchanged, committed), expected);
+        assert_eq!(select_wire_version(&unmarked, committed), expected);
     }
     let mut successor = unchanged.clone();
     successor.accounting_expiries[0].destinations = (&hold.destinations).into();
@@ -263,7 +265,7 @@ fn reservations_carry_destinations_at_the_current_version() {
         .commit_generation(&state_key, &gen_entry, unchanged, successor)
         .unwrap();
     let upgraded = store.read_for_inspection(&profile).unwrap().unwrap();
-    assert_eq!(upgraded.version, WIRE_VERSION_DESTINATION);
+    assert_eq!(upgraded.version, WIRE_VERSION_NATIVE_COVERAGE);
     assert_eq!(serde_json::to_value(&upgraded.entries).unwrap(), entries);
 
     let capped = |wire: &WireFile| {
@@ -334,7 +336,7 @@ fn reservations_carry_destinations_at_the_current_version() {
             .unwrap()
             .unwrap()
             .version,
-        WIRE_VERSION_DESTINATION
+        WIRE_VERSION_NATIVE_COVERAGE
     );
 }
 

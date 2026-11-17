@@ -32,13 +32,16 @@ fn unread() -> WindowStoreError {
 /// Counts retained native obligations at the balance read's observation.
 /// Release evidence is applied before requiring amounts. Neither a used
 /// disposition nor a later reconciliation observation releases this balance.
+/// A file without the native coverage marker, or an observation below an
+/// admissible floor, may miss an obligation and refuses.
 pub(super) fn floor_reserved(
     wire: &super::store::WireFile,
     observation: &operations::WindowObservation,
 ) -> Result<u64, WindowStoreError> {
-    if wire
-        .admissible_floor_ledger
-        .is_some_and(|floor| observation.ledger < floor)
+    if wire.native_coverage.is_none()
+        || wire
+            .admissible_floor_ledger
+            .is_some_and(|floor| observation.ledger < floor)
         || wire
             .admissible_floor_close_time_ms
             .is_some_and(|floor| observation.close_time_floor_ms < floor)
@@ -343,10 +346,10 @@ pub(crate) fn unproved_floor_use(
 /// Refuses a permitting mainnet `decision` of `policy` whose deciding rule
 /// carries a `balance_floor`.
 ///
-/// Pruning and a window reset drop settled history that has no release
-/// bound, so no retained image shows that it counts every native obligation
-/// still in effect. A floor that passes on such an image refuses its use with
-/// `account.unread`.
+/// The native coverage marker shows at store level that a retained image
+/// counts every native obligation still in effect, but no public caller
+/// binds a passing floor into locked mint admission. A floor that passes
+/// refuses its use with `account.unread`.
 ///
 /// # Errors
 ///

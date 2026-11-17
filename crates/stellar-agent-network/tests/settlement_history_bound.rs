@@ -385,9 +385,10 @@ mod authorized {
     }
 
     /// An original sent through the authorized path, with no holds, whose
-    /// receipt is lost and whose authorization record the ledger has dropped,
-    /// sits in the oldest retained archive. Its resend under a fresh grant
-    /// is refused before any send or row.
+    /// receipt is lost, sits in the oldest retained archive past the ledger's
+    /// retention window. The ledger keeps its used authorization, which has
+    /// no release row. Its resend under a fresh grant is refused before any
+    /// send or row.
     #[tokio::test]
     #[serial]
     async fn an_authorized_original_past_ledger_retention_refuses_its_resend() {
@@ -417,8 +418,8 @@ mod authorized {
         fx.set_now(NOW + AFTER_LEDGER_RETENTION_MS);
         let (fresh, grant) = fx.grant(&envelope, &client, None, "approval-resend");
         assert!(
-            !fx.is_recorded(original),
-            "the ledger keeps no record of the original authorization"
+            fx.is_recorded(original),
+            "the ledger keeps the used original authorization without a release row"
         );
         let bytes_before = audit_bytes(fx.audit_log_path());
 

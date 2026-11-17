@@ -6692,7 +6692,10 @@ mod tests {
             assert_eq!(auth.expires_at_ms(), expected, "{ttl_ms}");
             assert_eq!(auth.entries(), holds.as_slice(), "{ttl_ms}");
             let wire = f.wire();
-            assert_eq!(wire["version"], 12);
+            assert_eq!(
+                wire["version"],
+                crate::policy_state::store::WIRE_VERSION_NATIVE_COVERAGE
+            );
             let record = wire["authorizations"]
                 .as_array()
                 .unwrap()
@@ -6996,6 +6999,15 @@ mod tests {
         }
     }
 
+    /// Commits the window's first write 5 s before the fixture's instant, so
+    /// that the native coverage marker it establishes covers the close time
+    /// of [`floor_server`], which the fixture's clock trails by 300 s.
+    fn cover(f: &ResolverFixture) {
+        f.clock.set(f.now - 5_000);
+        f.window.record_and_persist(&f.profile, &[]).unwrap();
+        f.clock.set(f.now);
+    }
+
     /// The fixture's endpoint, healthy at the ledger of its account answer
     /// and closed now. Each account read ends one second after the
     /// fixture's instant.
@@ -7044,12 +7056,13 @@ mod tests {
 
     /// A funded payment under a matched floor reads the operating account
     /// and still refuses `account.unread` under either authority, minting
-    /// nothing: retained history cannot show that it counts every native
-    /// obligation in effect, an empty history included.
+    /// nothing: no public path binds a passing floor into locked admission,
+    /// even on a covered empty history.
     #[tokio::test]
     #[serial_test::serial]
     async fn public_floor_refuses_unproved_history() {
         let f = floor_fixture(1);
+        cover(&f);
         let server = floor_server(&f).await;
         let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
         let client = context.primary_client().unwrap();
@@ -7080,6 +7093,7 @@ mod tests {
     #[serial_test::serial]
     async fn resolver_floor_counts_observed_exposure() {
         let f = floor_fixture(FIXTURE_BALANCE_STROOPS);
+        cover(&f);
         let server = floor_server(&f).await;
         let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
         let client = context.primary_client().unwrap();

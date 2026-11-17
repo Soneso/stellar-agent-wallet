@@ -4242,6 +4242,7 @@ pub(crate) mod tests {
                 )])
                 .build()
                 .await;
+            fixture.cover_native_history();
 
             let run = run(&fixture, &mainnet_args(&fixture)).await;
 

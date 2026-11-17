@@ -8812,10 +8812,10 @@ pub(crate) mod tests {
         }
 
         /// A matched balance floor reads the operating account after the
-        /// build. A balance the debit and fee take below the floor refuses
-        /// `account.floor_refused`; a funded one refuses `account.unread`,
-        /// as retained history cannot prove its native exposure complete.
-        /// Neither confirms, records, nor sends.
+        /// build over a covered window. A balance the debit and fee take
+        /// below the floor refuses `account.floor_refused`; a funded one
+        /// refuses `account.unread`, as no public path binds a passing floor
+        /// into locked admission. Neither confirms, records, nor sends.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
         async fn the_floor_reads_the_observed_account_on_mainnet() {
@@ -8833,6 +8833,7 @@ pub(crate) mod tests {
                     .rules(vec![pay_rule("allow", &balance_floor(min_stroops))])
                     .build()
                     .await;
+                fixture.cover_native_history();
 
                 let run = run(&fixture, &memo_args(&fixture)).await;
 

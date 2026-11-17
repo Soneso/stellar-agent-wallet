@@ -1,3 +1,13 @@
+/// Commits the window's first write early enough that the native coverage
+/// marker it establishes covers every observation within the 120 s age bound
+/// at `T0`, then returns the clock to `T0`.
+fn cover(fx: &Fx) {
+    fx.clock
+        .set(T0 - 125_000 - super::super::store::ESTABLISHMENT_ALLOWANCE_MS);
+    fx.store.record_and_persist(&fx.profile, &[]).unwrap();
+    fx.clock.set(T0);
+}
+
 fn observed_floor_sum(fx: &Fx) -> Result<u64, WindowStoreError> {
     OperationStatus::new(&fx.store, &fx.profile).floor_reserved_stroops(Some(WindowObservation {
         ledger: 100,
@@ -12,6 +22,7 @@ fn floor_non_native_zero_requires_bound_provenance() {
     let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
     let mut fx = Fx::new();
+    cover(&fx);
     let mut intent = x402_intent("100");
     intent.payer = stellar_strkey::ed25519::PublicKey([2; 32])
         .to_string()
@@ -69,6 +80,7 @@ fn floor_operation_commit_and_audit_matrix() {
         let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
         let mut fx = Fx::new();
+        cover(&fx);
         let open = request("floor-operation", canonical(1));
         let handle = fx.open_new(&open);
         let mut mint = fx.operation_mint_request(&handle, tx(1), fx.approval(), vec![hold(50)]);
@@ -149,6 +161,7 @@ fn floor_operation_refusal_leaves_audit_and_attempt_unchanged() {
     let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
     let mut fx = Fx::new();
+    cover(&fx);
     let handle = fx.open_new(&request("floor-refusal", canonical(1)));
     let mut mint = fx.operation_mint_request(&handle, tx(1), fx.approval(), vec![hold(50)]);
     mint.native_reservation = Some(super::super::ledger::NativeReservation {
