@@ -1355,6 +1355,8 @@ observational expiry because no durable watermark is stored.
 Unknown and collected nonces return `approval.unknown`. Every inbox opening
 failure returns `approval.store_open_failed` with a safe cause class.
 Unreadable authenticated state refuses before inbox fallback.
+The CLI refuses with `submission.record_unavailable`.
+MCP refuses with `submission.record_unavailable`, or with `policy.engine_required` when its policy engine reads the window.
 For pending consent, use `approve --id <nonce> --profile <name>`.
 Ended or invalid consent requires fresh preparation and consent.
 

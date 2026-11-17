@@ -3,6 +3,7 @@
   "data": {
     "chain_status": "NOT_FOUND",
     "ledger": null,
+    "operation": null,
     "record": {
       "envelope_hash": "77777777777777777777777777777777777777777777777777777777777777aa",
       "failure_code": "ledger.failed",

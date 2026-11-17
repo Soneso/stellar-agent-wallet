@@ -911,6 +911,51 @@ pub enum StatusFailure {
     RepairRefused(WalletError),
     /// Querying the chain fails.
     ChainQueryFailed(NetworkError),
+    /// The selectors name no retained operation or two different ones.
+    SelectorRefused(WalletError),
+}
+
+/// Resolves a status call's selectors before any reconciliation. A testnet
+/// profile keeps no operation records, so its selectors read nothing and
+/// target only the supplied hash.
+///
+/// # Errors
+///
+/// [`StatusFailure::SelectorRefused`] with `operation.unknown` or
+/// `validation.usage_error`, and [`StatusFailure::WindowUnreadable`].
+pub fn select_status(
+    profile: &Profile,
+    window: &PersistedWindowStore,
+    selectors: &crate::policy_state::StatusSelectors,
+) -> Result<crate::policy_state::StatusTarget, StatusFailure> {
+    if !profile.chain_id.is_mainnet() {
+        return Ok(crate::policy_state::StatusTarget {
+            operation_id: None,
+            tx_hash: selectors.tx_hash.clone(),
+        });
+    }
+    crate::policy_state::OperationStatus::new(window, profile)
+        .select(selectors)
+        .map_err(StatusFailure::WindowUnreadable)?
+        .map_err(StatusFailure::SelectorRefused)
+}
+
+/// Projects the targeted operation from the window as the status call left it.
+///
+/// # Errors
+///
+/// [`StatusFailure::WindowUnreadable`].
+pub fn operation_projection(
+    profile: &Profile,
+    window: &PersistedWindowStore,
+    target: &crate::policy_state::StatusTarget,
+) -> Result<Option<crate::policy_state::OperationProjection>, StatusFailure> {
+    let Some(id) = &target.operation_id else {
+        return Ok(None);
+    };
+    crate::policy_state::OperationStatus::new(window, profile)
+        .projection(id)
+        .map_err(StatusFailure::WindowUnreadable)
 }
 
 /// Logs the refusal without inferring release state from the failed call.
