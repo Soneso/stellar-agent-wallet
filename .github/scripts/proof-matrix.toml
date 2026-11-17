@@ -393,16 +393,8 @@ builds = "feature-on"
 # Delivery keys.
 
 [[delivery]]
-key = "recovery-transitions"
-change = "recovery settles sequence, outcome, hold and retry on the word of both endpoints, with an outcome audit row"
-
-[[delivery]]
 key = "accounting-counters"
 change = "accounting persists the unlisted counter, the budget epoch and the balance floor inputs"
-
-[[delivery]]
-key = "durable-approval"
-change = "a durable approval record with single use and two windows, read by every gate"
 
 [[delivery]]
 key = "intent-consent"
@@ -413,24 +405,8 @@ key = "intent-commit"
 change = "the commit rebuilds the envelope from the intent"
 
 [[delivery]]
-key = "status-views"
-change = "approval status and operation status on MCP and the CLI"
-
-[[delivery]]
 key = "operation-notification"
 change = "operation-state notifications on MCP"
-
-[[delivery]]
-key = "approval-revocation"
-change = "revocation on the CLI and in the inbox, with its audit row"
-
-[[delivery]]
-key = "remote-mainnet-consent"
-change = "mainnet consent over HTTPS at the signed origin, with enrollment"
-
-[[delivery]]
-key = "audit-outbox-ownership"
-change = "the approval audit outbox ownership and the shutdown contract"
 
 [[delivery]]
 key = "row-test"
@@ -502,7 +478,7 @@ tests = [
 [[cell]]
 claim = "approval.durable"
 rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
-pending = "durable-approval"
+pending = "row-test"
 
 [[cell]]
 claim = "approval.binds_intent"
@@ -736,7 +712,7 @@ pending = "accounting-counters"
 [[cell]]
 claim = "sizing.hold_follows_evidence"
 rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
-pending = "recovery-transitions"
+pending = "row-test"
 
 # Cells: audit.writer_before_signer.
 
@@ -753,17 +729,17 @@ claim = "audit.writer_before_signer"
 rows = ["cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
 pending = "row-test"
 
-# Cells: the audit claims a later change delivers.
+# Cells: audit.outcome_row and audit.outbox_at_shutdown.
 
 [[cell]]
 claim = "audit.outcome_row"
 rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
-pending = "recovery-transitions"
+pending = "row-test"
 
 [[cell]]
 claim = "audit.outbox_at_shutdown"
 rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
-pending = "audit-outbox-ownership"
+pending = "row-test"
 
 # Cells: halt.refuses_first.
 
@@ -891,17 +867,17 @@ claim = "status.transaction_reconciles"
 rows = ["mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "cli.claim", "cli.trustline", "cli.accounts_create"]
 pending = "row-test"
 
-# Cells: the status claims a later change delivers.
+# Cells: status.operation_view and status.approval_view.
 
 [[cell]]
 claim = "status.operation_view"
 rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
-pending = "status-views"
+pending = "row-test"
 
 [[cell]]
 claim = "status.approval_view"
 rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
-pending = "status-views"
+pending = "row-test"
 
 # Cells: status.retry_returns_stored. Each test retries every kind its
 # surface admits under a retained business id.
@@ -951,7 +927,7 @@ not_applicable = "the CLI reports state through its status verb"
 [[cell]]
 claim = "revocation.refuses_commit"
 rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
-pending = "approval-revocation"
+pending = "row-test"
 
 # Cells: remote approval. Without a signed approval origin, the listener
 # refuses mainnet before binding. Signed-origin value flows need separate proofs.
@@ -966,4 +942,4 @@ tests = [
 [[cell]]
 claim = "remote.consent_at_signed_origin"
 rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
-pending = "remote-mainnet-consent"
+pending = "row-test"
