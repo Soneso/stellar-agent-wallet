@@ -1087,9 +1087,11 @@ decides `allow`, and sets `allow_opaque_signing = false`.
   the next sequence, so each signing starts a new allocation;
   `profile reset-window-state` keeps total-budget usage.
 - `stellar_pay` and `stellar_pay_commit` add `balance_floor` at `M`. The
-  floor needs an observed account read with its reservation sum. The shipped
-  CLI and MCP payment paths do not supply one, so a matched floor refuses
-  `account.unread`.
+  floor needs an observed account read with its reservation sum. Mainnet
+  `stellar-agent pay` supplies both, so a payment that would breach the floor
+  refuses `account.floor_refused`. MCP `stellar_pay` supplies no read, and
+  every matched floor that passes still refuses `account.unread` while
+  retained history cannot prove complete native exposure.
 - Each payment rule's `counterparty_allowlist` selects `G_ACCOUNT` and
   `C_ACCOUNT` with `allowlist = []`. G, M, and C recipients share that one
   list, and no listed recipient is paid until one is added. A G address
@@ -1134,8 +1136,9 @@ budget an api preset offers. `api-day` is the default. With `--asset XLM`,
 caps derive by the same rules, rounded down to one stroop.
 
 `M` is the XLM floor: the pay tools refuse a payment that would leave less
-native balance after reservations, debit, and fee. It refuses `account.unread`
-until the caller supplies an observed account read. `R` is the recommended XLM balance of the operating account,
+native balance after reservations, debit, and fee. `account.unread` means that
+a usable observed balance or complete native-exposure facts could not be
+established, including unproved retained history. `R` is the recommended XLM balance of the operating account,
 covering the floor and the fees of `T` days. Fund the operating account with
 the operating balance of the plan in the asset, and `R` in XLM.
 

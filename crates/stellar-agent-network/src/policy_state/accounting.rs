@@ -7,12 +7,21 @@
 
 use std::borrow::Cow;
 
+use stellar_agent_core::WalletError;
+use stellar_agent_core::mainnet::decision::{MainnetDecision, MainnetRefusal};
+use stellar_agent_core::mainnet::verified_policy::VerifiedPolicy;
 use stellar_agent_core::policy::v1::asset_equivalence::total_budget_identity;
+use stellar_agent_core::policy::v1::criteria::balance_floor::BalanceFloorCriterion;
+use stellar_agent_core::policy::v1::{
+    AccountReservesView, FloorInput, ObservedAccount, PolicyEngineV1, PolicyRule,
+};
+use stellar_agent_core::policy::{DenyReason, ToolDescriptor};
+use stellar_agent_core::profile::schema::Profile;
 
 use super::WindowStoreError;
 use super::store::ChainScope;
 use super::{ledger, operations};
-use stellar_agent_core::policy::DenyReason;
+use crate::account::AccountView;
 
 fn unread() -> WindowStoreError {
     WindowStoreError::PolicyDenied {
@@ -174,8 +183,6 @@ impl CheckedFloor {
         readiness: &crate::operational::OperationalReport,
         request: &ledger::MintRequest,
     ) -> Result<Option<Self>, WindowStoreError> {
-        use stellar_agent_core::policy::v1::AccountReservesView;
-        use stellar_agent_core::policy::v1::criteria::balance_floor::BalanceFloorCriterion;
         let expected_tool = crate::mainnet::resolve::classic_consumer_tools(request.consumer)
             .map(|tools| tools.policy_tool)
             .or(match request.consumer {
@@ -205,16 +212,7 @@ impl CheckedFloor {
         {
             return Err(unread());
         }
-        let Some(minimum) = rule
-            .criteria
-            .iter()
-            .filter_map(|criterion| {
-                (criterion.as_ref() as &dyn std::any::Any)
-                    .downcast_ref::<BalanceFloorCriterion>()
-                    .map(BalanceFloorCriterion::min_stroops)
-            })
-            .max()
-        else {
+        let Some(minimum) = rule_floor(rule) else {
             return Ok(None);
         };
         let observation = observed.observation().ok_or_else(unread)?;
@@ -299,6 +297,185 @@ impl CheckedFloor {
             });
         }
         Ok(())
+    }
+}
+
+/// The strongest `balance_floor` of `rule`, in stroops.
+fn rule_floor(rule: &PolicyRule) -> Option<i128> {
+    rule.criteria
+        .iter()
+        .filter_map(|criterion| {
+            (criterion.as_ref() as &dyn std::any::Any)
+                .downcast_ref::<BalanceFloorCriterion>()
+                .map(BalanceFloorCriterion::min_stroops)
+        })
+        .max()
+}
+
+/// Whether the first effective rule matching `tool` carries a
+/// `balance_floor`, so that a strict evaluation of `tool` reads a
+/// [`FloorSource`].
+#[must_use]
+pub fn floor_rule_matches(engine: &PolicyEngineV1, tool: &ToolDescriptor) -> bool {
+    engine
+        .effective_rules()
+        .into_iter()
+        .find(|rule| rule.matches_tool(tool))
+        .and_then(rule_floor)
+        .is_some()
+}
+
+/// The refusal of a permitting strict decision whose deciding rule, at
+/// `rule_ordinal` among the effective rules, carries a `balance_floor`, as
+/// [`refuse_unproved_floor`] states.
+#[must_use]
+pub(crate) fn unproved_floor_use(
+    engine: &PolicyEngineV1,
+    rule_ordinal: usize,
+) -> Option<DenyReason> {
+    engine
+        .effective_rules()
+        .get(rule_ordinal)
+        .and_then(|rule| rule_floor(rule))
+        .map(|_| DenyReason::AccountUnread)
+}
+
+/// Refuses a permitting mainnet `decision` of `policy` whose deciding rule
+/// carries a `balance_floor`.
+///
+/// Pruning and a window reset drop settled history that has no release
+/// bound, so no retained image shows that it counts every native obligation
+/// still in effect. A floor that passes on such an image refuses its use with
+/// `account.unread`.
+///
+/// # Errors
+///
+/// [`MainnetRefusal::Denied`] with `account.unread` and the deciding rule.
+pub fn refuse_unproved_floor(
+    policy: &VerifiedPolicy,
+    decision: MainnetDecision,
+) -> Result<MainnetDecision, MainnetRefusal> {
+    let rule_index = decision.rule_index();
+    match usize::try_from(rule_index)
+        .ok()
+        .and_then(|ordinal| unproved_floor_use(&policy.engine(), ordinal))
+    {
+        Some(reason) => Err(MainnetRefusal::Denied {
+            rule_index: Some(rule_index),
+            reason,
+        }),
+        None => Ok(decision),
+    }
+}
+
+/// The observed operating account and the retained native exposure at that
+/// read: the account input of a strict evaluation under a `balance_floor`.
+#[derive(Debug)]
+pub struct FloorSource {
+    observed: ObservedAccount<AccountView>,
+    reserved_stroops: u64,
+}
+
+/// Why a [`FloorSource`] could not be read.
+#[derive(Debug)]
+pub enum FloorSourceError {
+    /// The readiness check or the account read failed.
+    Read(WalletError),
+    /// The verified window could not project its native exposure.
+    Store(WindowStoreError),
+}
+
+impl From<FloorSourceError> for WalletError {
+    fn from(error: FloorSourceError) -> Self {
+        match error {
+            FloorSourceError::Read(error) => error,
+            FloorSourceError::Store(error) => crate::operation_entry::operation_refusal(error),
+        }
+    }
+}
+
+impl FloorSource {
+    /// Checks the readiness of `client`'s endpoint, reads `account_id` after
+    /// it, and projects the verified window of `profile` at that read's
+    /// observation. Every request ends by `deadline`.
+    ///
+    /// # Errors
+    ///
+    /// [`FloorSourceError::Read`] with the readiness, deadline and account
+    /// read errors, and [`FloorSourceError::Store`] with the projection's
+    /// refusals: `account.unread` for an unquantifiable retained obligation
+    /// or deficient release coverage, the accounting refusals, and every
+    /// verified read error.
+    pub async fn read(
+        client: &crate::StellarRpcClient,
+        account_id: &str,
+        store: &super::PersistedWindowStore,
+        profile: &Profile,
+        deadline: tokio::time::Instant,
+    ) -> Result<Self, FloorSourceError> {
+        let report = crate::operational::operational_check_single(client, deadline)
+            .await
+            .map_err(FloorSourceError::Read)?;
+        let observed = crate::operational::read_within_readiness_deadline(
+            deadline,
+            crate::account::fetch_account_observed(client, account_id, &report),
+        )
+        .await
+        .map_err(FloorSourceError::Read)?;
+        let observation = observed
+            .observation()
+            .map(|seen| operations::WindowObservation {
+                ledger: seen.ledger_sequence,
+                close_time_floor_ms: seen.close_time_floor_ms,
+                observed_at_ms: seen.observed_at_ms,
+            });
+        let reserved_stroops = operations::OperationStatus::new(store, profile)
+            .floor_reserved_stroops(observation)
+            .map_err(FloorSourceError::Store)?;
+        Ok(Self {
+            observed,
+            reserved_stroops,
+        })
+    }
+
+    /// `floor` when the evaluation reads one, and `plain` otherwise.
+    #[must_use]
+    pub fn view_or<'a>(
+        floor: Option<&'a Self>,
+        plain: &'a dyn AccountReservesView,
+    ) -> &'a dyn AccountReservesView {
+        match floor {
+            Some(floor) => floor,
+            None => plain,
+        }
+    }
+
+    fn input(&self) -> FloorInput<'_, AccountView> {
+        FloorInput {
+            observed: &self.observed,
+            effective_reservations_stroops: self.reserved_stroops,
+        }
+    }
+}
+
+/// The [`FloorInput`] of the observed account and its reservations.
+impl AccountReservesView for FloorSource {
+    fn reserves_stroops(&self, base_reserve_stroops: i64) -> i64 {
+        self.input().reserves_stroops(base_reserve_stroops)
+    }
+
+    fn balance_stroops(
+        &self,
+    ) -> Result<i64, stellar_agent_core::policy::v1::AccountReserveLookupError> {
+        self.input().balance_stroops()
+    }
+
+    fn observation(&self) -> Option<stellar_agent_core::policy::v1::AccountObservation> {
+        self.input().observation()
+    }
+
+    fn effective_native_reservations_stroops(&self) -> Option<u64> {
+        self.input().effective_native_reservations_stroops()
     }
 }
 

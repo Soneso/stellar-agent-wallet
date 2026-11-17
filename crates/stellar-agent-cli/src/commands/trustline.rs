@@ -116,8 +116,8 @@ use stellar_agent_network::{ClassicFeeChoice, MainnetEndpointFlags};
 
 use crate::commands::policy_engine::{
     build_v1_policy_engine, effective_classic_fee_cap, envelope_total_fee, evaluate_mainnet_policy,
-    evaluate_value_moving_policy, load_mainnet_policy_engine, trustline_policy_args,
-    with_total_fee,
+    evaluate_value_moving_policy, load_mainnet_policy_engine, mainnet_floor_source,
+    trustline_policy_args, with_total_fee,
 };
 
 use stellar_agent_network::{
@@ -153,7 +153,7 @@ use crate::common::render::{WithPreview, with_preview_detail, write_envelope};
 use crate::common::resolve_profile_name;
 use crate::common::signer_ceremony::MainnetSignerChoice;
 use stellar_agent_network::operational::read_within_readiness_deadline;
-use stellar_agent_network::policy_state::{OperationKind, OperationTool};
+use stellar_agent_network::policy_state::{FloorSource, OperationKind, OperationTool};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Argument types
@@ -1446,6 +1446,18 @@ where
         Err(e) => return write_envelope(out, &Envelope::<()>::err(&e), 1),
     };
     let policy_args = with_total_fee(trustline_policy_args(&args.from, &args.asset), total_fee);
+    let floor = match mainnet_floor_source(
+        &context,
+        &client,
+        &policy.verified,
+        "stellar_trustline",
+        &source_account_view.account_id,
+    )
+    .await
+    {
+        Ok(floor) => floor,
+        Err(e) => return write_envelope(out, &Envelope::<()>::err(&e), 1),
+    };
     let source_adapter = AccountViewAdapter::new(&source_account_view);
     let evaluation = match evaluate_mainnet_policy(
         &policy.verified,
@@ -1454,7 +1466,7 @@ where
         stellar_agent_core::policy::ToolValueKind::MovesValue,
         context.chain().caip2_str(),
         &policy_args,
-        Some(&source_adapter),
+        Some(FloorSource::view_or(floor.as_ref(), &source_adapter)),
         None,
     ) {
         Ok(evaluation) => evaluation,
@@ -3049,7 +3061,7 @@ pub(crate) mod tests {
         };
         use crate::common::mainnet_write_fixture::{
             AGENT_SEED, CLOCK_LEAD_MS, DESTINATION, ISSUER, MainnetFixture, Spec, TRUSTLINE_ASSET,
-            minimum_reserve, refusal_warnings, trustline_rule,
+            balance_floor, minimum_reserve, refusal_warnings, trustline_rule,
         };
         use crate::common::signer_ceremony::signer_resolutions_on_this_thread;
         use crate::test_rpc::{ACCOUNT_SEQUENCE, ClassicRpc, account_key, account_xdr};
@@ -3635,6 +3647,27 @@ pub(crate) mod tests {
                 "policy.deny.minimum_reserve_breached",
             )
             .await;
+        }
+
+        /// A matched balance floor reads the operating account: the
+        /// trustline's fee takes the observed balance below a floor at that
+        /// balance.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_floor_reads_the_observed_account_on_mainnet() {
+            let fixture = Spec::new("mainnet-trustline-floor")
+                .primary(ledger(true, 0).entries_at_readiness_ledger())
+                .oracle(ledger(true, 0))
+                .rules(vec![trustline_rule(
+                    "require_approval",
+                    &balance_floor(BALANCE),
+                )])
+                .build()
+                .await;
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_refused_before_confirmation(&fixture, &run, "account.floor_refused").await;
         }
 
         /// Fee in the policy arguments, testnet.
