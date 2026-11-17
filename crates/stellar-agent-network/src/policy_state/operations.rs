@@ -3338,6 +3338,11 @@ impl Session<'_> {
             stellar_agent_core::approval::MAINNET_POLICY_AUTHORITY_TTL_SECONDS.saturating_mul(1000),
         );
         let waiting_end = self.now.saturating_add(ttl_ms);
+        if matches!(request.intent, IntentSlot::Canonical { .. })
+            && self.now.checked_add(ttl_ms).is_none()
+        {
+            return Err(invalid("the canonical waiting interval overflows"));
+        }
         let waiting_end = request
             .intent
             .envelope_end_ms()
@@ -4534,6 +4539,21 @@ impl<'a> OperationRecorder<'a> {
         }
     }
 
+    /// The authenticated full slot, including terminal records before compaction.
+    pub(crate) fn retained_intent(
+        &self,
+        id: OperationId,
+    ) -> Result<Option<IntentSlot>, WindowStoreError> {
+        Ok(OperationStatus::new(self.store, self.profile)
+            .read()?
+            .and_then(|wire| {
+                records(&wire)
+                    .iter()
+                    .find(|r| r.id == id)
+                    .map(|r| r.intent.clone())
+            }))
+    }
+
     /// Runs one locked step and commits it when it changed the window. A
     /// mint checks its retained approval and other preconditions under the
     /// lock before creating a key or reading the successor image.
@@ -5594,6 +5614,28 @@ impl<'a> OperationStatus<'a> {
         ))
     }
 
+    /// The nonce's approval and its linked operation from one authenticated image.
+    pub(crate) fn operation_for_consent(
+        &self,
+        nonce: &str,
+    ) -> Result<Option<(OperationHandle, super::approvals::WireApproval)>, WindowStoreError> {
+        let Some(wire) = self.read()? else {
+            return Ok(None);
+        };
+        let Some(approval) = wire
+            .approvals
+            .as_ref()
+            .and_then(|section| section.records.iter().find(|r| r.nonce == nonce))
+        else {
+            return Ok(None);
+        };
+        let operation = records(&wire)
+            .iter()
+            .find(|r| r.id == approval.operation_id && r.approval_record_id == Some(approval.id))
+            .ok_or_else(|| invalid("the approval and operation links disagree"))?;
+        Ok(Some((OperationHandle::of(operation), approval.clone())))
+    }
+
     /// Filters authenticated scheduling views before the driver's oldest-four limit.
     pub(super) fn runnable_snapshot(
         &self,
@@ -6333,6 +6375,7 @@ pub(crate) mod tests {
 
     pub(crate) mod progress;
     include!("operations_canonical_tests.rs");
+    mod preparation_tests;
 
     #[test]
     #[serial]

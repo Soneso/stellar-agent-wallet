@@ -225,6 +225,7 @@ impl WalletServer {
         simulated_seq_num: i64,
         profile_name: &str,
         request: &stellar_agent_core::policy::ApprovalRequest,
+        intent: Option<&stellar_agent_core::approval::ClassicIntent>,
     ) -> Result<PendingApproval, String> {
         let approvals_dir = self
             .resolve_approval_dir()
@@ -252,7 +253,13 @@ impl WalletServer {
         )
         .map_err(|e| format!("PendingApproval::new_claim_pending failed: {e}"))?;
 
-        let entry = entry.with_policy_request(request);
+        let mut entry = entry.with_policy_request(request);
+        stellar_agent_network::operation_entry::stage_pending(
+            &mut entry,
+            intent,
+            u64::from(request.ttl_seconds) * 1000,
+        )
+        .map_err(|error| error.to_string())?;
 
         let now_ms = now_unix_ms()
             .map_err(|e| format!("approval store insert: current time unavailable: {e}"))?;
@@ -645,7 +652,7 @@ impl WalletServer {
                     prepared.handle.as_ref(),
                     stellar_agent_core::approval::witness::ApprovedKind::Claim,
                     dispatch_outcome.audit_decision(),
-                    || {
+                    |intent| {
                         self.persist_claim_pending_approval(
                             &envelope_xdr,
                             &preview.balance_id_hex72,
@@ -657,6 +664,7 @@ impl WalletServer {
                             source_sequence.saturating_add(1),
                             &profile_name,
                             &approval.request,
+                            intent,
                         )
                     },
                 ) {

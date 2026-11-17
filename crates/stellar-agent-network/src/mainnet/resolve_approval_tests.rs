@@ -181,6 +181,51 @@ async fn consumed_resolver_refusals_precede_expiry_for_another_operation() {
     }
 }
 
+#[test]
+#[serial_test::serial]
+fn durable_envelope_authority_keeps_signed_expiry() {
+    let f = current_record_fixture(false);
+    let witness = f.approval(&f.envelope, f.now - 60_000, 300_000);
+    durable_record(&f, &witness, true);
+    let facts = record_facts(&f, &witness);
+    let payload = facts
+        .record()
+        .consent
+        .as_ref()
+        .unwrap()
+        .payload
+        .as_ref()
+        .unwrap();
+    let durable = stellar_agent_core::approval::witness::verify_durable_approval(
+        Some(&facts),
+        &payload.attestation,
+        &f.profile,
+        f.context.profile_name(),
+        &stellar_agent_core::approval::witness::ApprovalExpectation {
+            kind: witness.kind(),
+            subject: witness.subject(),
+        },
+        &f.policy,
+        witness.consent_at_ms(),
+    )
+    .unwrap();
+    assert!(
+        durable.execution_expires_at_ms() > durable.expires_at_ms(),
+        "fixture separates execution and signed expiry"
+    );
+    let decision = f.captured_decision();
+    let MainnetAuthority::Approval(authority) =
+        MainnetAuthority::from_decision(&decision, Some(&durable)).unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(
+        authority.expires_at_ms(),
+        durable.expires_at_ms(),
+        "EnvelopeText authority uses signed expiry"
+    );
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn resolver_state_matrix() {

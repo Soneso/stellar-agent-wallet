@@ -449,7 +449,14 @@ pub(crate) async fn confirm_mainnet_write(
     }
     let uid = process_uid_for_attestation().map_err(store_error)?;
     let ttl_ms = decision.ttl_ms();
-    let entry = summary.pending(uid, ttl_ms)?;
+    let mut entry = summary.pending(uid, ttl_ms)?;
+    let intent = operation
+        .map(|handle| {
+            stellar_agent_network::operation_entry::preparation_intent(handle, profile, policy)
+        })
+        .transpose()?
+        .flatten();
+    stellar_agent_network::operation_entry::stage_pending(&mut entry, intent.as_ref(), ttl_ms)?;
     // The key and the sink are checked before the entry is parked, so a
     // profile that cannot record consent parks nothing; both are acquired
     // again after the wait.
@@ -472,7 +479,12 @@ pub(crate) async fn confirm_mainnet_write(
                 handle,
                 summary.kind,
                 approval_subject_classic(&summary.envelope),
-                ttl_ms,
+                entry
+                    .expires_at_unix_ms
+                    .checked_sub(entry.created_at_unix_ms)
+                    .ok_or_else(|| {
+                        wrong_kind("the signed approval interval ends before it starts")
+                    })?,
             );
             let start = if integrated {
                 let (start, admitted) =
@@ -655,26 +667,17 @@ fn start_durable(
     facts: &PendingApprovalFacts,
     prepared: PolicyDecision,
 ) -> Result<DurableStart, WalletError> {
+    drop(open_store(store_path)?);
+    let _producer = stellar_agent_network::operation_entry::approval_producer_lock(
+        &store_path.with_extension("producer.lock"),
+    )?;
     let window = PersistedWindowStore::for_profile(context.profile_name());
     let status = ApprovalStatus::new(&window, context.profile());
     if let Some(view) = status
         .find_by_operation(handle.id())
         .map_err(operation_refusal)?
     {
-        let linked = open_store(store_path)?
-            .get(&view.record.nonce)
-            .cloned()
-            .ok_or_else(|| {
-                WalletError::Approval(ApprovalFailure::NotFound {
-                    detail: "the operation's approval entry is gone; prepare the operation again"
-                        .to_owned(),
-                })
-            })?;
-        return Ok(if linked.attestation_blob_b64.is_some() {
-            DurableStart::Recover(linked.approval_nonce)
-        } else {
-            DurableStart::Ceremony(Box::new(linked))
-        });
+        return linked_durable_start(store_path, &view.record.nonce);
     }
     if handle.state() != OperationState::Prepared {
         return Err(approval_requires_prepared());
@@ -697,9 +700,28 @@ fn start_durable(
         {
             discard_parked(store_path, &entry);
         }
+        if let Ok(Some(view)) = linked
+            && view.record.nonce != entry.approval_nonce
+        {
+            return linked_durable_start(store_path, &view.record.nonce);
+        }
         return Err(error);
     }
     Ok(DurableStart::Ceremony(Box::new(entry)))
+}
+
+fn linked_durable_start(store_path: &Path, nonce: &str) -> Result<DurableStart, WalletError> {
+    let linked = open_store(store_path)?.get(nonce).cloned().ok_or_else(|| {
+        WalletError::Approval(ApprovalFailure::NotFound {
+            detail: "the operation's approval entry is gone; prepare the operation again"
+                .to_owned(),
+        })
+    })?;
+    Ok(if linked.attestation_blob_b64.is_some() {
+        DurableStart::Recover(linked.approval_nonce)
+    } else {
+        DurableStart::Ceremony(Box::new(linked))
+    })
 }
 
 /// Removes the unattested live value entries of `handle`'s envelope that no
@@ -710,7 +732,7 @@ fn remove_orphans(
     status: &ApprovalStatus<'_>,
     handle: &OperationHandle,
 ) -> Result<(), WalletError> {
-    let Some(envelope) = handle.unsigned_envelope_sha256() else {
+    let Some(envelope) = handle.envelope_xdr().map(approval_subject_classic) else {
         return Ok(());
     };
     let envelope = stellar_agent_core::hex::encode(&envelope);
@@ -1279,7 +1301,9 @@ pub(crate) mod tests {
     }
 
     #[cfg(feature = "mainnet-write")]
-    fn confirmation_fixture(name: &str) -> (MainnetConsentFixture, MainnetWriteContext, String) {
+    pub(crate) fn confirmation_fixture(
+        name: &str,
+    ) -> (MainnetConsentFixture, MainnetWriteContext, String) {
         confirmation_fixture_with(name, |_| {})
     }
     /// An enabled mainnet profile whose owner-signed policy admits the
@@ -2407,6 +2431,136 @@ pub(crate) mod tests {
             .iter()
             .map(|view| store.get(&view.approval_nonce).unwrap().clone())
             .collect()
+    }
+
+    #[cfg(feature = "mainnet-write")]
+    #[test]
+    #[serial_test::serial]
+    fn canonical_prepare_removes_only_unlinked_orphans() {
+        use stellar_agent_core::approval::{IntentAsset, IntentPayload, MemoFact};
+        use stellar_agent_network::operation_entry::{
+            IntentBaseFacts, OpenedEntry, Preparation, classic_intent, stage_pending,
+        };
+        let (fixture, context, envelope) = confirmation_fixture("canonical-orphans");
+        let summary =
+            MainnetWriteSummary::from_envelope(&envelope, MainnetConsumer::CliPay, 500).unwrap();
+        let policy = fixture.current_policy();
+        let intent = classic_intent(
+            IntentBaseFacts::new(
+                context.profile(),
+                summary.args["source"].as_str().unwrap(),
+                &policy,
+                stellar_agent_network::fees::ClassicFeeChoice::Explicit(500),
+                MemoFact::None,
+            ),
+            IntentPayload::Pay {
+                destination: summary.args["destination"].as_str().unwrap().into(),
+                asset: IntentAsset::Native,
+                amount_stroops: 17,
+            },
+        )
+        .unwrap();
+        let window = PersistedWindowStore::for_profile(context.profile_name());
+        let OpenedEntry::Resume(handle) = Preparation::Canonical {
+            intent: Box::new(intent.clone()),
+            decision: PolicyDecision::RequireApproval,
+            rule_ttl_ms: Some(300_000),
+        }
+        .open(
+            &mut stellar_agent_network::policy_state::OperationRecorder::new(
+                &window,
+                context.profile(),
+                &mut NoRows,
+                "open",
+            ),
+            stellar_agent_network::policy_state::BusinessId::parse("canonical-orphans").unwrap(),
+            stellar_agent_network::policy_state::OperationTool::CliPay,
+            stellar_agent_network::policy_state::OperationKind::Pay,
+            &envelope,
+        )
+        .unwrap() else {
+            unreachable!()
+        };
+        let orphan = summary.pending("1000".into(), 300_000).unwrap();
+        let mut other = summary.pending("1000".into(), 300_000).unwrap();
+        if let ApprovalKind::PaymentSimulated {
+            envelope_sha256_hex,
+            ..
+        } = &mut other.kind
+        {
+            *envelope_sha256_hex = "ff".repeat(32);
+        }
+        let mut pending = pending_store(&fixture);
+        pending
+            .insert(orphan.clone(), orphan.created_at_unix_ms)
+            .unwrap();
+        pending
+            .insert(other.clone(), other.created_at_unix_ms)
+            .unwrap();
+        drop(pending);
+        let mut entry = summary.pending("1000".into(), 300_000).unwrap();
+        stage_pending(&mut entry, Some(&intent), 300_000).unwrap();
+        let facts = pending_approval_facts(
+            &entry,
+            &handle,
+            summary.kind,
+            approval_subject_classic(&envelope),
+            300_000,
+        );
+        assert!(matches!(
+            start_durable(
+                &context,
+                &fixture.store_path(),
+                &handle,
+                entry.clone(),
+                &facts,
+                PolicyDecision::RequireApproval
+            )
+            .unwrap(),
+            DurableStart::Ceremony(_)
+        ));
+        let pending = pending_store(&fixture);
+        assert!(
+            pending.get(&orphan.approval_nonce).is_none(),
+            "CLI removes canonical retained-envelope orphan"
+        );
+        assert!(
+            pending.get(&other.approval_nonce).is_some(),
+            "CLI keeps different operation entry"
+        );
+        assert!(
+            pending.get(&entry.approval_nonce).is_some(),
+            "CLI keeps linked entry"
+        );
+        drop(pending);
+        let DurableStart::Ceremony(repeated) = start_durable(
+            &context,
+            &fixture.store_path(),
+            &handle,
+            summary.pending("1000".into(), 300_000).unwrap(),
+            &facts,
+            PolicyDecision::RequireApproval,
+        )
+        .unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(
+            repeated.approval_nonce, entry.approval_nonce,
+            "CLI retry keeps durable winner"
+        );
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(fixture.store_path().with_extension("producer.lock"))
+            .unwrap();
+        let _held = stellar_agent_core::file_lock::HeldFileLock::try_lock(file).unwrap();
+        assert!(
+            matches!(start_durable(&context, &fixture.store_path(), &handle, entry, &facts, PolicyDecision::RequireApproval),
+            Err(error) if error.code() == "approval.writer_locked"),
+            "CLI producer lock excludes a competing preparation"
+        );
     }
 
     /// A ceremony under an operation opens one record whose facts are the
