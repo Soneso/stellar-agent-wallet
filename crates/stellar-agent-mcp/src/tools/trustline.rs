@@ -64,7 +64,7 @@ use stellar_agent_core::profile::schema::default_approval_dir;
 use stellar_agent_core::timefmt::now_unix_ms;
 use stellar_agent_network::{
     AccountView, Asset, ClassicOpBuilder, account::AccountFlagsView, fetch_account,
-    submit::SubmissionResult,
+    policy_state::FloorSource, submit::SubmissionResult,
 };
 
 use crate::policy_adapter::AccountViewAdapter;
@@ -674,13 +674,25 @@ impl WalletServer {
         let total_fee_stroops =
             total_classic_fee_stroops(fee_per_op_stroops, CLASSIC_SINGLE_OPERATION_COUNT)?;
         args_value["total_fee_stroops"] = json!(total_fee_stroops);
+        let floor = match self
+            .classic_floor_source(
+                &client,
+                &source_account_view.account_id,
+                &["stellar_trustline", "stellar_trustline_commit"],
+            )
+            .await
+        {
+            Ok(floor) => floor,
+            Err(error) => return error.into_result(),
+        };
         let source_adapter = AccountViewAdapter::new(&source_account_view);
+        let source_view = FloorSource::view_or(floor.as_ref(), &source_adapter);
         let dispatch_outcome = match self
             .dispatch_gate_with_views(
                 "stellar_trustline",
                 &args_value,
                 &args.chain_id,
-                Some(&source_adapter),
+                Some(source_view),
                 None,
             )
             .await
@@ -967,7 +979,7 @@ impl WalletServer {
                 &envelope_xdr,
                 "stellar_trustline_commit",
                 &args.chain_id,
-                Some(&source_adapter),
+                Some(source_view),
                 None,
             )
             .await
@@ -1282,13 +1294,25 @@ impl WalletServer {
         // counterparty account (the asset issuer) carries a self-asserted
         // `home_domain`, which must not feed allowlist matching; identity-class
         // criteria configured on this verb fail closed.
+        let floor = match self
+            .classic_floor_source(
+                &client,
+                &source_account_view.account_id,
+                &["stellar_trustline_commit", "stellar_trustline"],
+            )
+            .await
+        {
+            Ok(floor) => floor,
+            Err(error) => return error.into_result(),
+        };
         let source_adapter = AccountViewAdapter::new(&source_account_view);
+        let source_view = FloorSource::view_or(floor.as_ref(), &source_adapter);
         let dispatch_outcome = match self
             .dispatch_gate_with_views(
                 "stellar_trustline_commit",
                 &authoritative_args,
                 &args.chain_id,
-                Some(&source_adapter),
+                Some(source_view),
                 None,
             )
             .await
@@ -1304,7 +1328,7 @@ impl WalletServer {
                 "stellar_trustline",
                 &authoritative_args,
                 &args.chain_id,
-                Some(&source_adapter),
+                Some(source_view),
                 None,
             )
             .await
