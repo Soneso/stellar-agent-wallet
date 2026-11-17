@@ -201,7 +201,8 @@ async fn status(server: &WalletServer) -> Value {
     let result = server
         .call_stellar_transaction_status(StellarTransactionStatusArgs {
             chain_id: "stellar:testnet".to_owned(),
-            tx_hash: TX_HASH.to_owned(),
+            tx_hash: Some(TX_HASH.to_owned()),
+            business_id: None,
             retry_recovery: false,
         })
         .await
@@ -311,6 +312,10 @@ fn the_tool_descriptions_carry_the_timeout_recovery() {
         "retry_recovery (default false) starts one new bounded evidence run",
         "it never resubmits and authorizes no successor.",
         "never re-simulate or resubmit",
+        "Select by tx_hash, business_id, or both naming one operation",
+        "operation.unknown",
+        "A business_id without an exposed hash reads no network.",
+        "read_only_hint=false (the wallet's record changes)",
     ] {
         assert!(text.contains(phrase), "{phrase}: {text}");
     }
@@ -935,7 +940,8 @@ async fn a_refused_status_run_delivers_old_obligations() {
     let refused = server
         .call_stellar_transaction_status(StellarTransactionStatusArgs {
             chain_id: "stellar:testnet".to_owned(),
-            tx_hash: TX_HASH.to_owned(),
+            tx_hash: Some(TX_HASH.to_owned()),
+            business_id: None,
             retry_recovery: false,
         })
         .await
@@ -1011,7 +1017,8 @@ async fn chain_flip_refuses_status_without_rpc_or_state_changes() {
             let result = server
                 .call_stellar_transaction_status(StellarTransactionStatusArgs {
                     chain_id: "stellar:testnet".to_owned(),
-                    tx_hash: TX_HASH.to_owned(),
+                    tx_hash: Some(TX_HASH.to_owned()),
+                    business_id: None,
                     retry_recovery: false,
                 })
                 .await

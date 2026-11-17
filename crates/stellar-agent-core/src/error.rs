@@ -416,6 +416,10 @@ impl WalletError {
 #[non_exhaustive]
 pub enum ApprovalFailure {
     /// No retained approval has the requested public nonce.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.unknown"`.
     #[error("No retained approval has this approval ID.")]
     Unknown,
     /// The pending approval does not exist.
@@ -2221,6 +2225,27 @@ pub enum ValidationError {
     )]
     OperationBusinessIdMismatch,
 
+    /// A status call names neither a transaction hash nor a business id, or
+    /// names two that identify different operations.
+    ///
+    /// # Wire code
+    ///
+    /// `"validation.usage_error"`.
+    #[error("{detail}")]
+    StatusSelectors {
+        /// Which selector rule the call broke.
+        detail: &'static str,
+    },
+
+    /// A mainnet status call names a business id that no retained operation
+    /// or tombstone carries.
+    ///
+    /// # Wire code
+    ///
+    /// `"operation.unknown"`.
+    #[error("no retained operation has this business_id")]
+    OperationUnknown,
+
     /// The window-state reset refused because an operation has not reached a
     /// terminal state.
     ///
@@ -2579,6 +2604,8 @@ impl ValidationError {
             // each names the store section that refuses the caller's request.
             Self::OperationBusinessIdConflict => "operation.business_id_conflict",
             Self::OperationBusinessIdMismatch => "operation.business_id_mismatch",
+            Self::StatusSelectors { .. } => "validation.usage_error",
+            Self::OperationUnknown => "operation.unknown",
             Self::ResetOperationsOpen { .. } => "reset.operations_open",
             Self::TotalEpochUnavailable { .. } => "policy.total_epoch_unavailable",
             Self::TotalEpochStale => "policy.total_epoch_stale",
@@ -5151,6 +5178,10 @@ mod tests {
                 ValidationError::OperationBusinessIdMismatch => {
                     ValidationError::OperationBusinessIdMismatch
                 }
+                ValidationError::StatusSelectors { detail } => {
+                    ValidationError::StatusSelectors { detail }
+                }
+                ValidationError::OperationUnknown => ValidationError::OperationUnknown,
                 ValidationError::ResetOperationsOpen { open } => {
                     ValidationError::ResetOperationsOpen { open: *open }
                 }
@@ -6063,6 +6094,16 @@ mod tests {
             (
                 ValidationError::OperationBusinessIdMismatch.into(),
                 "operation.business_id_mismatch",
+                ErrorCategory::Validation,
+            ),
+            (
+                ValidationError::StatusSelectors { detail: "neither" }.into(),
+                "validation.usage_error",
+                ErrorCategory::Validation,
+            ),
+            (
+                ValidationError::OperationUnknown.into(),
+                "operation.unknown",
                 ErrorCategory::Validation,
             ),
             (

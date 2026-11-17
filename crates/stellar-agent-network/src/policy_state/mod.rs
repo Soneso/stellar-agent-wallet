@@ -243,9 +243,9 @@ pub use operations::{
     EvidenceRowInput, EvidenceSequenceClass, EvidenceVerdict, ExposureIdentity, IntentSlot,
     LookupOutcome, NotIncludedProof, ObligationKind, OpenOutcome, OpenRequest, OperationAudit,
     OperationAuthority, OperationHandle, OperationId, OperationKind, OperationLink,
-    OperationRecorder, OperationResult, OperationState, OperationStatus, OperationTool,
-    OperationView, RecoveryUpdate, ReleaseObligation, SequenceReleaseInput, SlotKind,
-    TransitionEvidence, WindowObservation, X402Intent,
+    OperationProjection, OperationRecorder, OperationResult, OperationState, OperationStatus,
+    OperationTool, OperationView, RecoveryUpdate, ReleaseObligation, SequenceReleaseInput,
+    SlotKind, StatusSelectors, StatusTarget, TransitionEvidence, WindowObservation, X402Intent,
 };
 pub use recovery::{
     AccountAnswer, CheckedRecoveryDecision, DecidedTransition, EndpointPair, LedgerAnswer,
