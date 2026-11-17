@@ -809,15 +809,40 @@ runs after the own rule allows and before the audit pre-flight:
    `evaluate_policy_in_snapshot` under the outer dispatch's frame. The
    evaluation copy carries a zero fee, and the account view subtracts the
    wallet fee and earlier classic native debits.
-8. Retain the returned effects of each Allow for admission and audit.
+8. Retain the returned effects of each Allow and each approval requirement
+   for admission and audit.
+9. Collect the approval requirements: the own rule's `RequireApproval`
+   outcome and the leg's `RequireApproval` decision. Without one, return.
+   `approvable` admits a `Tx` envelope with one operation, valued from its
+   signed arguments on the pay, create-account or trustline route, that
+   `classic_summary` shows. Any other shape refuses with
+   `policy.approval_required_unsupported`. For the own rule this refusal
+   follows step 2 and precedes step 3.
+10. The requirement with the smaller `ttl_seconds` governs; a tie takes the
+    operation's. Without a proof, persist one pending approval over the
+    envelope text, with summary values from `classic_summary`, and return the
+    approval response through the business channel. Nothing is admitted or
+    signed.
+11. With a proof, run `verify_attestation_gate` with the governing request,
+    kind `Payment` or `Trustline` and the caller's envelope text. Half a
+    proof refuses there. On success, `Sep43Effects` carries the nonce and
+    `PolicyDecision::RequireApproval`.
 
 `sep43_admit` then admits every staged item in one batch through
 `record_authorized_window_states`. A limit denial keeps its code; any other
 store failure refuses with `policy.engine_required`.
 
+An approval releases one signature. The submitting tool's recorder binds the
+nonce to the send receipt and tombstones the approval on every sent outcome.
+The sign-only tool opens the approval store after signing and, under the
+store's writer lock, checks the entry is live and consumes it with the local
+transaction hash and `ConsumedOutcome::Unknown`. A failed check or write
+returns `submission.record_unavailable` and withholds the signature. Its
+`opaque_payload_signed` row records `require_approval`.
+
 | Operation | Outcome |
 | --- | --- |
-| Payment, path payment (either kind) | `stellar_pay_commit` rule; an incoming payment from another source has no effect |
+| Payment, path payment (either kind) | `stellar_pay_commit` rule, a wallet payment to itself included; an incoming payment from another source has no effect |
 | Create claimable balance | One `stellar_pay_commit` leg per claimant other than the source and, for another source, the wallet |
 | Create account | `stellar_create_account_commit` rule |
 | Change trust (native or credit asset) | `stellar_trustline_commit` rule; a pool share line has no effect |
@@ -825,7 +850,7 @@ store failure refuses with `policy.engine_required`.
 | Source-account token `transfer`, `transfer_from`, `approve`, `burn`, `burn_from` | `stellar_pay_commit` rule with the contract address as asset; a zero approval has no effect |
 | Contract call with an unvalued node (mixed tree) | Needs the opt-in; each retained token leg still takes the pay rule |
 | Nonzero offer, liquidity pool deposit, wallet reserve sponsorship, clawback from the wallet | Needs the opt-in |
-| Account merge to another account; signer, master weight or threshold change | Refused |
+| Wallet account merge; signer, master weight or threshold change | Refused; another source's merge into the wallet has no effect |
 | Manage data, bump sequence, inflation, allow trust, trustline flags, claimable balance clawback, end sponsoring, revoke sponsorship, pool withdraw, footprint extension and restoration | No effect |
 | Fee bump | Outer fee only; inner operations carry no effect |
 

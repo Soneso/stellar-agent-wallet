@@ -1044,13 +1044,13 @@ reason = "review"
 | Policy-body element | Meaning |
 |---|---|
 | `version`, `scope`, `sequence`, `[[rules]]` | `version = 2`, profile-specific scope, a positive sequence, and explicit rules. This policy is separate from the profile document. |
+| Root `contract_transfer_max_fee_stroops` | Optional signed total transaction fee cap in policy versions 1 and 2, from 0 through 4294967295. Zero permits no positive fee. It is not required for G/M payments. |
 | Sequence allocation | Signing assigns `max(pin, body) + 1`. Signing does not advance the pin. A verified load can advance it. |
 | Pin comparison | A pin refuses v1 or a lower sequence. Equal sequence with another digest or owner is a fork. |
 | `[mainnet].profile` | Dedicated profile name. |
 | `[mainnet].endpoint_host` | Ceremony-normalized endpoint host. This policy field remains named `endpoint_host`. |
 | `[mainnet].installation_nonce_sha256` | Installation nonce digest as 64 lowercase hexadecimal characters. |
 | `[mainnet].classic_max_fee_per_op_stroops` | Required signed `u32` classic per-operation cap. |
-| Root `contract_transfer_max_fee_stroops` | Optional signed total transaction fee cap in policy versions 1 and 2, from 0 through 4294967295. Zero permits no positive fee. It is not required for G/M payments. |
 | `[mainnet].authorization_ttl_seconds` | Optional lifetime from 1 through 120 seconds, distinct from approval lifetime. |
 | `[mainnet].approval_credentials` | Required. 1 to 16 inline tables with exactly `credential_id_b64url` and `public_key_sec1_b64url`, placed in `[mainnet]` before any `[mainnet.*]` subtable. Both values are canonical unpadded base64url: an ID of 16 to 64 bytes and a 65-byte uncompressed SEC1 P-256 point. IDs are unique. The example entry is a placeholder; use the entry `approve credential enroll` prints. |
 | `[mainnet].approval_origin` | Optional canonical `https://<host>[:<port>]` origin. The RP ID is the entire host, excluding the port. |

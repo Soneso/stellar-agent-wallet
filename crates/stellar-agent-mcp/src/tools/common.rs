@@ -53,11 +53,13 @@ use crate::server::WalletServer;
 ///
 /// Commit handlers map `RequireApproval` to an attestation-verification block.
 ///
-/// Single-shot sign tools have no simulate→commit split and therefore cannot
-/// honour the two-phase approval flow. Any single-shot tool that receives
-/// `RequireApproval` MUST reject the call fail-closed via
+/// Single-shot sign tools, such as the SEP-43 auth-entry and message verbs and
+/// SEP-53 `sign_message`, have no second call. Each rejects every
+/// `RequireApproval` fail-closed via
 /// [`single_shot_require_approval_error`] rather than silently proceeding to
-/// sign.
+/// sign. The SEP-43 transaction tools take two calls: the first returns a
+/// pending approval, and the repeat with `approval_nonce` and
+/// `approval_attestation` signs.
 #[must_use]
 #[derive(Debug)]
 pub(crate) enum DispatchOutcome {
@@ -180,6 +182,13 @@ impl DispatchOutcome {
 pub(crate) struct GateSnapshot {
     policy: PolicyEvaluationSnapshot,
     cache: Option<stellar_agent_network::CounterpartyCacheSnapshot>,
+}
+
+impl GateSnapshot {
+    /// The policy instant every evaluation in this frame reads.
+    pub(crate) fn now_ms(&self) -> u64 {
+        self.policy.now_ms()
+    }
 }
 
 /// Effects and governing lifetime captured from one allowed evaluation.
@@ -1330,9 +1339,13 @@ pub(crate) fn rule_proposal_consumed_error() -> rmcp::model::CallToolResult {
 /// Returns the fail-closed wire error for a `RequireApproval` verdict on a
 /// single-shot sign tool.
 ///
-/// SEP-43 signing verbs, SEP-53 `sign_message`, and the DeFi tools refuse approval requirements.
-/// The x402 payment tools use this error for an address mismatch without proof
-/// under RequireApproval. They queue or verify approval for valid payer arguments.
+/// The SEP-43 auth-entry and message verbs, SEP-53 `sign_message`, and the DeFi tools refuse approval requirements.
+/// The SEP-43 transaction tools take two calls: the first returns a pending
+/// approval, and the repeat with `approval_nonce` and `approval_attestation`
+/// signs. They return this error
+/// for a transaction shape the approval surfaces cannot show. The x402 payment
+/// tools use this error for an address mismatch without proof under
+/// RequireApproval. They queue or verify approval for valid payer arguments.
 ///
 /// # Security
 ///

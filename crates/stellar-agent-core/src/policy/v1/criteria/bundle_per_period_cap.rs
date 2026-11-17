@@ -231,7 +231,9 @@ impl Criterion for BundlePerPeriodCapCriterion {
         // tips the sum.  Only `TokenTransfer` inners whose asset matches fire.
         // `i128` end-to-end (no clamp): `period_used_recorded` is already
         // `i128` from the state store (see `PolicyStateStore::query_window`).
-        let mut running_sum = Some(0_i128);
+        // `period_used` is the recorded usage plus every earlier matching
+        // inner; each earlier check proved it representable.
+        let mut period_used = period_used_recorded;
 
         for (idx, inner) in view.inners.iter().enumerate() {
             let InnerOpDescriptor::TokenTransfer { asset, amount, .. } = inner else {
@@ -251,28 +253,24 @@ impl Criterion for BundlePerPeriodCapCriterion {
 
             let inner_stroops = *amount;
 
-            // Check cap: period_used_recorded + running_sum + inner_stroops > max?
-            let period_used_stroops =
-                running_sum.and_then(|sum| period_used_recorded.checked_add(sum));
-            running_sum = running_sum.and_then(|sum| sum.checked_add(inner_stroops));
-            if running_sum
-                .and_then(|sum| period_used_recorded.checked_add(sum))
-                .is_none_or(|sum| sum > self.max_stroops)
+            // Check cap: period_used + inner_stroops > max, or not representable?
+            match period_used
+                .checked_add(inner_stroops)
+                .filter(|sum| *sum <= self.max_stroops)
             {
-                let deny_reason = match period_used_stroops {
-                    Some(period_used_stroops) => DenyReason::PerPeriodCapExceeded {
-                        asset: self.asset.clone(),
-                        window: self.window.label().to_owned(),
-                        max_stroops: self.max_stroops,
-                        attempted_stroops: inner_stroops,
-                        period_used_stroops,
-                    },
-                    None => self.overflow_refusal(),
-                };
-                return Ok(Some(DenyReason::BundleDenied {
-                    inner_index: u32::try_from(idx).unwrap_or(u32::MAX),
-                    deny_reason: Box::new(deny_reason),
-                }));
+                Some(sum) => period_used = sum,
+                None => {
+                    return Ok(Some(DenyReason::BundleDenied {
+                        inner_index: u32::try_from(idx).unwrap_or(u32::MAX),
+                        deny_reason: Box::new(DenyReason::PerPeriodCapExceeded {
+                            asset: self.asset.clone(),
+                            window: self.window.label().to_owned(),
+                            max_stroops: self.max_stroops,
+                            attempted_stroops: inner_stroops,
+                            period_used_stroops: period_used,
+                        }),
+                    }));
+                }
             }
         }
 

@@ -7087,6 +7087,7 @@ mod tests {
             RedactedStrkey::from_already_redacted("GBPXX...MWIVL"),
             "request",
             legs.clone(),
+            PolicyDecision::Allow,
         );
         let expected = EventKind::OpaquePayloadSigned {
             payload_sha256_redacted: "dfe78222...9d11baf1".to_owned(),
