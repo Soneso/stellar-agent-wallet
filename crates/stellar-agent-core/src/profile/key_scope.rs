@@ -4,7 +4,10 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::audit_log::tip_anchor::{AuditKeyringEntries, log_path_sha256};
+use crate::audit_log::tip_anchor::{
+    AuditKeyringEntries, CARRIER_RECORD, OUTBOX_STATE, REANCHOR_COUNTER, TIP_ANCHOR,
+    log_path_sha256,
+};
 use crate::error::ValidationError;
 use crate::observability::redact_path_in_message;
 
@@ -625,6 +628,26 @@ pub fn key_scope_findings(profile: &Profile, name: &str) -> Vec<KeyScopeFinding>
     match default_profile_dir() {
         Ok(dir) => key_scope_findings_in_dir(profile, name, &dir),
         Err(_) => vec![finding(KeyScopeKind::ProfilesDirUnreadable)],
+    }
+}
+
+impl KeyScopeFinding {
+    /// Whether this finding leaves the owner scope of the selected profile's
+    /// consent evidence unproven: a sibling names one of its four audit scope
+    /// coordinates, or a profile file or the profiles directory cannot be read.
+    /// A sibling sharing only the audit key under another log path has its own
+    /// scope and does not count.
+    #[must_use]
+    pub fn blocks_evidence_scope(&self) -> bool {
+        match &self.kind {
+            KeyScopeKind::SharedWithSibling { field, .. } => {
+                [TIP_ANCHOR, REANCHOR_COUNTER, OUTBOX_STATE, CARRIER_RECORD].contains(field)
+            }
+            KeyScopeKind::SiblingUnreadable { .. }
+            | KeyScopeKind::SelectedDocumentUnreadable
+            | KeyScopeKind::ProfilesDirUnreadable => true,
+            _ => false,
+        }
     }
 }
 

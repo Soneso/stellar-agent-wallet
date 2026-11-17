@@ -66,6 +66,12 @@
 //! completes the consent the same way before its existing answer. Other
 //! kinds and other chains never call the recording.
 //!
+//! For a kind the recording publishes, the approve reacquires the record's
+//! evidence reservation through [`ConsentRecording::precheck`] before the
+//! row, and attests through the strict attester, which stores a publication
+//! handoff. Every completion verifies that handoff under the guard and
+//! passes it to [`ConsentRecording::complete`] in [`VerifiedConsent`].
+//!
 //! # What the page showed
 //!
 //! An approve attests only the terms its page rendered. Every approval page
@@ -89,8 +95,10 @@ use stellar_agent_core::approval::witness::{
 use stellar_agent_core::approval::{
     ApprovalKind, ApproverIdentity, AttestedApprover, ConsentAudit, ConsentAuthorization,
     DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, PendingApproval, PendingApprovalStore,
-    RemoteApprovalAuthority, Surface, approval_view_digest, attest_and_persist, decode_sha256_hex,
+    RemoteApprovalAuthority, Surface, VerifiedConsentPublication, approval_view_digest,
+    attest::attest_and_persist_with_row, attest_and_persist, decode_sha256_hex,
     load_and_validate_entry, load_attestation_key, open_with_retry, process_uid_for_attestation,
+    verify_consent_publication,
 };
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::writer::AuditWriter;
@@ -285,6 +293,9 @@ pub struct VerifiedConsent {
     pub receipt: MainnetPresenceReceipt,
     /// The entry's signed process identifier.
     pub process_uid: String,
+    /// The entry's verified publication handoff. It is present exactly when
+    /// the recording publishes the entry's kind.
+    pub publication: Option<VerifiedConsentPublication>,
 }
 
 /// Durable consent of mainnet value approvals, supplied by the serving binary.
@@ -292,13 +303,34 @@ pub struct VerifiedConsent {
 /// A mainnet payment, claim, trustline or x402 approval reports its
 /// attestation only after [`Self::complete`] succeeds.
 pub trait ConsentRecording: Send + Sync {
-    /// Checks that a durable record names this value entry before presence.
-    /// The caller holds the inbox; implementations inspect state without
-    /// taking the window lock.
+    /// Checks that a durable record names this value entry before presence,
+    /// and for a published kind again before the row and before
+    /// [`Self::complete`], there through [`Self::precheck_completion`]. For a
+    /// kind the recording publishes, it also reacquires the record's consent
+    /// evidence reservation. The caller holds the inbox;
+    /// implementations inspect state without taking the window lock.
     ///
     /// # Errors
-    /// Returns `approval.not_found` without a record, or the store refusal.
+    /// Returns `approval.not_found` without a record, the store refusal, and
+    /// for a published kind the scope readiness, evidence and capacity
+    /// refusals.
     fn precheck(&self, entry: &PendingApproval) -> Result<(), WalletError>;
+
+    /// Checks a published entry before [`Self::complete`]: [`Self::precheck`]
+    /// while its durable record holds no consent, and nothing more once the
+    /// record holds it, since the commit is already durable. The default runs
+    /// [`Self::precheck`].
+    ///
+    /// # Errors
+    /// The refusals of [`Self::precheck`].
+    fn precheck_completion(&self, entry: &PendingApproval) -> Result<(), WalletError> {
+        self.precheck(entry)
+    }
+
+    /// Whether consent to `kind` is published with its verified delivery.
+    /// Such a consent uses the strict attester, and [`Self::complete`]
+    /// receives its verified publication handoff.
+    fn publishes(&self, kind: ApprovedKind) -> bool;
 
     /// Records `consent` in the durable record that names its nonce. The
     /// request holds neither the pending store nor the policy guard, so the
@@ -334,6 +366,27 @@ pub(crate) fn needs_durable_consent(ctx: &DecisionContext, kind: &ApprovalKind) 
                 | ApprovalKind::TrustlineSimulated { .. }
                 | ApprovalKind::X402Payment { .. }
         )
+}
+
+/// The durable record kind of a value approval kind.
+fn approved_kind(kind: &ApprovalKind) -> Option<ApprovedKind> {
+    match kind {
+        ApprovalKind::PaymentSimulated { .. } => Some(ApprovedKind::Payment),
+        ApprovalKind::ClaimSimulated { .. } => Some(ApprovedKind::Claim),
+        ApprovalKind::TrustlineSimulated { .. } => Some(ApprovedKind::Trustline),
+        ApprovalKind::X402Payment { .. } => Some(ApprovedKind::X402Payment),
+        _ => None,
+    }
+}
+
+/// Whether the context's recording publishes consent to `kind`.
+fn publishes_consent(ctx: &DecisionContext, kind: &ApprovalKind) -> bool {
+    needs_durable_consent(ctx, kind)
+        && ctx
+            .consent
+            .as_ref()
+            .zip(approved_kind(kind))
+            .is_some_and(|(recording, kind)| recording.publishes(kind))
 }
 
 /// Checks the inbox's durable prerequisite without taking a window lock.
@@ -378,13 +431,7 @@ pub(crate) fn verified_consent(
         .and_then(|bytes| bytes.try_into().ok())
         .ok_or_else(invalid)?;
     let receipt = entry.mainnet_presence.clone().ok_or_else(invalid)?;
-    let kind = match &entry.kind {
-        ApprovalKind::PaymentSimulated { .. } => ApprovedKind::Payment,
-        ApprovalKind::ClaimSimulated { .. } => ApprovedKind::Claim,
-        ApprovalKind::TrustlineSimulated { .. } => ApprovedKind::Trustline,
-        ApprovalKind::X402Payment { .. } => ApprovedKind::X402Payment,
-        _ => return Err(invalid()),
-    };
+    let kind = approved_kind(&entry.kind).ok_or_else(invalid)?;
     let expected = ApprovalExpectation {
         kind,
         subject: stellar_agent_core::approval::mainnet_consent_subject(entry, &context.binding())?,
@@ -422,18 +469,24 @@ pub(crate) fn verified_consent(
         attestation,
         receipt,
         process_uid: entry.process_uid.clone(),
+        publication: None,
     })
 }
 
 /// Completes the durable consent of the attested value entry `nonce` before
-/// its attestation is shown. It verifies the stored proof under `admission`,
-/// releases `store` and `admission` in that order, then calls the context's
-/// [`ConsentRecording`].
+/// its attestation is shown. It verifies the stored proof under `admission`.
+/// For a published kind it then runs [`ConsentRecording::precheck_completion`],
+/// which for a consent not yet committed proves the scope ready and
+/// reacquires the record's reservation, and verifies the entry's publication
+/// handoff. It then releases `store` and `admission` in that order and calls
+/// the context's [`ConsentRecording`].
 ///
 /// # Errors
-/// The refusals of [`verified_consent`], `approval.presence_unavailable` on a
-/// context without a [`ConsentRecording`], and the refusals of
-/// [`ConsentRecording::complete`].
+/// The refusals of [`verified_consent`], for a published kind those of
+/// [`ConsentRecording::precheck_completion`], the attestation key's refusals and
+/// `approval.attestation_invalid` for a missing, edited or foreign handoff,
+/// `approval.presence_unavailable` on a context without a
+/// [`ConsentRecording`], and the refusals of [`ConsentRecording::complete`].
 pub(crate) fn complete_consent(
     ctx: &DecisionContext,
     store: PendingApprovalStore,
@@ -457,7 +510,24 @@ pub(crate) fn complete_consent(
         nonce,
         &admission,
         intent.as_ref(),
-    );
+    )
+    .and_then(|mut consent| {
+        if let Some(entry) = store
+            .get(nonce)
+            .filter(|entry| publishes_consent(ctx, &entry.kind))
+        {
+            if let Some(recording) = &ctx.consent {
+                recording.precheck_completion(entry)?;
+            }
+            let key = load_attestation_key(&ctx.attestation_key_entry_ref, &ctx.owner)?;
+            consent.publication = Some(verify_consent_publication(
+                entry,
+                &key,
+                &ctx.context.binding(),
+            )?);
+        }
+        Ok(consent)
+    });
     drop(store);
     drop(admission);
     let recording = ctx.consent.as_ref().ok_or(WalletError::Approval(
@@ -1339,6 +1409,13 @@ fn apply_approve(
         Ok(s) => s,
         Err(outcome) => return outcome,
     };
+    // A published consent attests only while its evidence reservation still
+    // holds: the precheck reacquires it before the row.
+    let publishes = publishes_consent(ctx, &entry.kind);
+    if publishes && let Err(error) = precheck_consent(ctx, &entry) {
+        tracing::warn!(code = %error.code(), "approve: consent admission refused");
+        return entry_outcome(&error);
+    }
 
     // The consent row is written before the attestation is persisted, so a
     // writer that cannot be used refuses the decision. A poisoned mutex may
@@ -1389,7 +1466,14 @@ fn apply_approve(
         }
         _ => ConsentAuthorization::Standard(&resolved.approver),
     };
-    let result = attest_and_persist(
+    // A published consent needs the strict attester's anchored row and its
+    // publication handoff.
+    let attester = if publishes {
+        attest_strictly
+    } else {
+        attest_and_persist
+    };
+    let result = attester(
         &mut store,
         &entry,
         &key,
@@ -1397,7 +1481,7 @@ fn apply_approve(
         resolved.surface,
         ConsentAudit::Writer(&mut writer),
         authorization,
-        |req, grant_key| {
+        |req: &stellar_agent_core::approval::ToolsetGrantRequest<'_>, grant_key: &[u8; 32]| {
             stellar_agent_toolsets_runtime::record_first_invoke_grant(
                 profile_name,
                 req.toolset_name,
@@ -1492,6 +1576,29 @@ fn apply_approve(
             Outcome::Unavailable
         }
     }
+}
+
+/// [`attest_and_persist_with_row`] answering with the surfaced attestation;
+/// a direct writer returns no queued reference.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the signature of attest_and_persist, which this attester replaces"
+)]
+fn attest_strictly(
+    store: &mut PendingApprovalStore,
+    entry: &PendingApproval,
+    key: &[u8],
+    binding: &stellar_agent_core::approval::AttestationBinding<'_>,
+    surface: Surface,
+    audit: ConsentAudit<'_>,
+    auth: ConsentAuthorization<'_>,
+    grant: impl FnOnce(
+        &stellar_agent_core::approval::ToolsetGrantRequest<'_>,
+        &[u8; 32],
+    ) -> Result<(), String>,
+) -> Result<Option<String>, WalletError> {
+    attest_and_persist_with_row(store, entry, key, binding, surface, audit, auth, grant)
+        .map(|(attestation, _)| attestation)
 }
 
 /// The audit event kind a decision writes, for the `error` log of a decision
@@ -3847,13 +3954,16 @@ mod tests {
         use stellar_agent_core::approval::{
             AttestationBinding, ConsentAuthorization, mainnet_fixtures::ATTESTATION_KEY,
         };
-        for refuse in [true, false] {
+        for (refuse, publish) in [(true, false), (false, false), (true, true), (false, true)] {
             let fixture = MainnetConsentFixture::new("raced");
             let entry = fixture.payment(600_000);
             let recording = Arc::new(crate::tests::RecordingConsent::default());
             recording
                 .refuse
                 .store(refuse, std::sync::atomic::Ordering::SeqCst);
+            recording
+                .publish
+                .store(publish, std::sync::atomic::Ordering::SeqCst);
             let ctx = mainnet_context(&fixture).with_consent_recording(recording.clone());
             insert(&ctx, entry.clone());
             let policy = fixture.current_policy();
@@ -3864,22 +3974,45 @@ mod tests {
                 ctx.audit_writer.clone(),
                 entry.clone(),
             );
+            // A published competitor attests strictly and stores its handoff.
             wait_hook::install(move || {
                 let mut store = PendingApprovalStore::open(path).unwrap();
-                attest_and_persist(
-                    &mut store,
-                    &raced,
-                    &ATTESTATION_KEY,
-                    &AttestationBinding::new(&name, MAINNET_CHAIN_ID),
-                    Surface::Serve,
-                    ConsentAudit::Writer(&mut writer.lock().unwrap()),
-                    ConsentAuthorization::Mainnet {
-                        presence,
-                        policy: &policy,
-                    },
-                    |_, _| Err("no toolset grant in a mainnet consent".to_owned()),
-                )
-                .unwrap();
+                let binding = AttestationBinding::new(&name, MAINNET_CHAIN_ID);
+                let mut writer = writer.lock().unwrap();
+                let audit = ConsentAudit::Writer(&mut writer);
+                let authorization = ConsentAuthorization::Mainnet {
+                    presence,
+                    policy: &policy,
+                };
+                let grant = |_: &stellar_agent_core::approval::ToolsetGrantRequest<'_>,
+                             _: &[u8; 32]| {
+                    Err("no toolset grant in a mainnet consent".to_owned())
+                };
+                if publish {
+                    attest_and_persist_with_row(
+                        &mut store,
+                        &raced,
+                        &ATTESTATION_KEY,
+                        &binding,
+                        Surface::Serve,
+                        audit,
+                        authorization,
+                        grant,
+                    )
+                    .unwrap();
+                } else {
+                    attest_and_persist(
+                        &mut store,
+                        &raced,
+                        &ATTESTATION_KEY,
+                        &binding,
+                        Surface::Serve,
+                        audit,
+                        authorization,
+                        grant,
+                    )
+                    .unwrap();
+                }
             });
             let outcome = mainnet_approve(&ctx, &fixture, &entry);
             let stored = PendingApprovalStore::open(ctx.store_path.clone())
@@ -3904,6 +4037,11 @@ mod tests {
                 recording.calls(),
                 [(entry.approval_nonce.clone(), ConsentRowSource::Recovered)],
                 "{refuse}"
+            );
+            assert_eq!(
+                recording.published(),
+                [publish],
+                "a published race completes the winner's verified handoff"
             );
         }
     }

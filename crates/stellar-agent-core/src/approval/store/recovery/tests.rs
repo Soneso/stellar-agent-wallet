@@ -894,3 +894,57 @@ fn payment_recovery_survives_unrelated_inbox_writers() {
         );
     }
 }
+
+/// A built payment entry binds with its own nonce and signed interval, so
+/// the recovery path later reuses exactly that entry. A second entry for the
+/// same key refuses while the first binding is retained, and nothing changes.
+#[test]
+#[serial_test::serial]
+fn payment_binding_of_a_built_entry_keeps_one_entry_per_key() {
+    let fixture = MainnetConsentFixture::new("recovery");
+    let policy = fixture.current_policy();
+    let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
+    let context = PaymentRecoveryContext {
+        profile: "recovery",
+        chain: Caip2::Mainnet,
+        policy: &policy,
+        operation: Some(([7; 16], RETAIN)),
+    };
+    let built = || {
+        PendingApproval::new_payment_pending_until(
+            envelope(),
+            "1000".to_owned(),
+            START,
+            END,
+            START,
+            Some("review".to_owned()),
+        )
+        .unwrap()
+    };
+    let entry = built();
+    let elapsed = store.bind_payment(context, entry.clone(), END);
+    assert!(
+        matches!(elapsed, Err(ApprovalError::Expired)),
+        "an entry whose signed interval has ended refuses, as recovery does: {elapsed:?}"
+    );
+    assert!(store.payment_recovery.is_empty() && store.snapshot(START).is_empty());
+    let bound = store.bind_payment(context, entry.clone(), START).unwrap();
+    assert_eq!(bound.approval_nonce, entry.approval_nonce);
+    store.check_payment_recovery(&entry.approval_nonce).unwrap();
+    let reused = queue(&mut store, &policy, START).unwrap();
+    assert_eq!(
+        reused.approval_nonce, entry.approval_nonce,
+        "recovery reuses the bound entry"
+    );
+    let before = serde_json::to_value(&store.payment_recovery).unwrap();
+    let refused = store.bind_payment(context, built(), START + 1);
+    assert!(
+        matches!(refused, Err(ApprovalError::RecoveryInconsistent)),
+        "a retained binding refuses a second entry: {refused:?}"
+    );
+    assert_eq!(
+        serde_json::to_value(&store.payment_recovery).unwrap(),
+        before
+    );
+    assert_eq!(store.snapshot(START + 1).len(), 1);
+}

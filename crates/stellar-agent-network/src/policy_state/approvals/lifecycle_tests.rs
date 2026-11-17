@@ -69,7 +69,7 @@ pub(crate) fn corrupt_evidence(profile: &Profile) {
 
 /// Opens the fixture record, reserves its evidence, and publishes its
 /// consent with a Delivered queued row or strict direct provenance.
-fn publish(
+pub(super) fn publish(
     fx: &mut Fx,
     writer: &mut AuditWriter,
     outbox: &AuditOutbox,
@@ -127,7 +127,7 @@ fn refused(result: Result<impl std::fmt::Debug, WindowStoreError>) -> MainnetPre
 
 /// Mints for the fixture operation's first attempt, consuming the approval,
 /// and then commits `end` for that attempt when one is given.
-fn attempt(fx: &mut Fx, end: Option<OperationState>) {
+pub(super) fn attempt(fx: &mut Fx, end: Option<OperationState>) {
     let request = fx.mint_request();
     let operation = fx.operation;
     let mut recorder =
@@ -326,7 +326,6 @@ fn release_retries_after_terminal_commit() {
         let mut fx = Fx::new(300_000);
         let name = fx.fixture.name().to_owned();
         let _enabled = ConsentEvidenceEnforcementGuard::new(&name, ApprovedKind::Payment);
-        let _ready = ConsentEvidenceInventoryGuard::new(&name);
         let (mut writer, outbox) = keyed_evidence(fx.fixture.profile(), &name);
         publish(&mut fx, &mut writer, &outbox, queued);
         let id = fx.id();
@@ -587,6 +586,29 @@ fn mint_refreshes_floor_after_validation() {
                 ApprovalState::Pending,
                 "a refused mint consumes nothing"
             );
+            // A Policy mint keeps wall time beside the raised floor, which
+            // reaches the end of its authority.
+            let mut policy = request.clone();
+            policy.operation = None;
+            policy.binding = DomainBinding::Transaction {
+                unsigned_envelope_sha256: [5; 32],
+                tx_hash: [5; 32],
+                source: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_owned(),
+                sequence: 3,
+            };
+            policy.authority = super::super::ledger::MintAuthority::Policy(
+                super::super::ledger::PolicyAuthorityBinding {
+                    policy_digest: request.policy_digest,
+                    policy_sequence: request.policy_sequence,
+                    rule_index: 0,
+                    evaluated_at_ms: fx.witness.consent_at_ms(),
+                    governing_until_ms: end.checked_add_signed(offset).unwrap(),
+                    scope: stellar_agent_core::mainnet::decision::AuthorityScope::Classic,
+                },
+            );
+            fx.store
+                .mint_authorization(fx.fixture.profile(), &policy)
+                .expect("a Policy mint decides at wall time, not at the floor");
         }
     }
     // An unenforced kind keeps wall time and reads no evidence.
@@ -692,13 +714,59 @@ fn continuation_after_floor(offset: i64) -> Result<MintedRecord, WindowStoreErro
     minted
 }
 
+/// Each approval kind, enabled by its production capability or by a
+/// fixture, makes the profile read the evidence floor: an Approval header
+/// on a record of that kind decides at a floor above wall time, and
+/// maintenance reads the evidence. A kind the production capability
+/// enables does so for a profile without fixtures.
+#[test]
+#[serial]
+fn every_enforced_kind_reads_the_floor() {
+    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+    for kind in [
+        ApprovedKind::Payment,
+        ApprovedKind::Claim,
+        ApprovedKind::Trustline,
+        ApprovedKind::X402Payment,
+    ] {
+        let mut fx = Fx::new(300_000);
+        let name = fx.fixture.name().to_owned();
+        let _evidence = keyed_evidence(fx.fixture.profile(), &name);
+        fx.open();
+        fx.edit(|wire| wire.approvals.as_mut().unwrap().records[0].kind = kind);
+        let now = fx.witness.consent_at_ms();
+        advance_floor(fx.fixture.profile(), &name, now + 1_000);
+        let _enabled = (!consent_evidence_enforced(kind))
+            .then(|| ConsentEvidenceEnforcementGuard::new(&name, kind));
+        assert!(enforces_any_kind(&name), "{kind:?}");
+        #[cfg(feature = "mainnet-write")]
+        assert_eq!(
+            fx.store
+                .approval_decision_time(fx.fixture.profile(), &fx.facts.nonce, now)
+                .unwrap(),
+            now + 1_000,
+            "{kind:?}: the header decides at the floor"
+        );
+        corrupt_evidence(fx.fixture.profile());
+        assert!(
+            consent_evidence_maintenance(&fx.store, fx.fixture.profile()).is_err(),
+            "{kind:?}: maintenance reads the evidence"
+        );
+    }
+    for &kind in ENFORCED_KINDS {
+        assert!(consent_evidence_enforced(kind));
+        assert!(enforces_any_kind("unguarded"), "{kind:?}");
+    }
+}
+
 #[test]
 fn lifecycle_protocol_states_activation_limits() {
     let recovery = include_str!("../../../../../docs/maintainers/audit-log-recovery.md");
     for sentence in [
         "Release follows authenticated revocation or final operation termination, outside the policy-window lock.",
         "First consumption and a missing approval record do not authorize release; retryable consumed grants retain their proof.",
-        "`approve revoke --id` releases its grant at once; integrated admission, each recovery pass, and each CLI revocation release every retained ended grant, so a failed or deferred release retries.",
+        "`approve revoke --id` releases its grant at once; integrated admission, each recovery pass, and each CLI revocation of an enforced kind release every retained ended grant, so a failed or deferred release retries.",
         "Every Approval mint, claim, consumption, and signing expiry check of an enforced kind uses the greater of wall time and the evidence floor, read fresh for that decision.",
         "A floor that cannot be read refuses as a storage error, never as expiry.",
         "Unresolved pins and incomplete producer integration block activation; initialization remains explicit.",

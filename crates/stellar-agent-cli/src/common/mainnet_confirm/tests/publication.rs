@@ -2,11 +2,10 @@
 mod tests {
     use super::super::*;
     use stellar_agent_core::audit_log::{
-        BindingCheck, MAX_EVIDENCE_ENTRIES, test_helpers::seed_reserved_evidence,
-        writer::AuditWriterRegistry,
+        BindingCheck, MAX_EVIDENCE_ENTRIES, writer::AuditWriterRegistry,
     };
     use stellar_agent_network::policy_state::approvals::{
-        ConsentDeliveryV1, ConsentEvidenceEnforcementGuard, ConsentEvidenceInventoryGuard,
+        ConsentDeliveryV1, ConsentEvidenceEnforcementGuard, UnreadableSiblingProfile,
     };
     use stellar_agent_network::policy_state::store::commit_faults::{
         COMMIT_FAULT_AFTER_COUNTER, COMMIT_FAULT_AFTER_PREPARED, arm_accounting_fault,
@@ -16,26 +15,13 @@ mod tests {
     fn enabled(
         context: &MainnetWriteContext,
         kind: ApprovedKind,
-    ) -> (
-        ConsentEvidenceEnforcementGuard,
-        ConsentEvidenceInventoryGuard,
-    ) {
-        (
-            ConsentEvidenceEnforcementGuard::new(context.profile_name(), kind),
-            ConsentEvidenceInventoryGuard::new(context.profile_name()),
-        )
+    ) -> ConsentEvidenceEnforcementGuard {
+        ConsentEvidenceEnforcementGuard::new(context.profile_name(), kind)
     }
 
     fn fill_scope(context: &MainnetWriteContext) {
         let profile = context.profile();
         let name = context.profile_name();
-        let access = stellar_agent_network::keyring::keyed_audit_access(
-            profile,
-            name,
-            BindingCheck::Enforce,
-        )
-        .unwrap();
-        let (key, anchor) = access.into_parts();
         let OperatorRowSink::Writer(writer) = acquire_operator_row_sink(profile, name).unwrap()
         else {
             panic!("writer")
@@ -45,21 +31,12 @@ mod tests {
             .unwrap()
             .initialize_consent_evidence()
             .unwrap();
-        let identities: Vec<_> = (0..MAX_EVIDENCE_ENTRIES)
-            .map(|i| {
-                let mut identity = [0xee; 32];
-                identity[..8].copy_from_slice(&(i as u64).to_be_bytes());
-                identity
-            })
-            .collect();
-        seed_reserved_evidence(
-            &profile.audit_log_path,
-            anchor.as_ref(),
-            &key,
-            &identities,
-            u64::MAX,
-        )
-        .unwrap();
+        crate::common::approval_fixture::seed_foreign_evidence(
+            profile,
+            name,
+            0xee,
+            MAX_EVIDENCE_ENTRIES,
+        );
     }
 
     fn summary_for(envelope: &str, verb: usize) -> MainnetWriteSummary {
@@ -180,9 +157,10 @@ mod tests {
                 AuditWriterRegistry::remove_for_test("capacity-holder");
             }
         }
-        for missing in [false, true] {
+        for mode in ["present", "missing", "edited"] {
+            let missing = mode == "missing";
             let (fixture, context, envelope) =
-                confirmation_fixture(&format!("publication-winner-{missing}"));
+                confirmation_fixture(&format!("publication-winner-{mode}"));
             let _enabled = enabled(&context, ApprovedKind::Payment);
             let handle = prepared_operation(&context, "winner", &envelope);
             let refused_presence = driver::install(Box::new(|_| {
@@ -212,12 +190,27 @@ mod tests {
             if missing {
                 pending_store(&fixture).remove(&winner.nonce).unwrap();
             }
+            if mode == "edited" {
+                let mut store = pending_store(&fixture);
+                let mut edited = store.get(&winner.nonce).unwrap().clone();
+                edited.expires_at_unix_ms -= 1;
+                store.remove(&winner.nonce).unwrap();
+                let created = edited.created_at_unix_ms;
+                store.insert(edited, created).unwrap();
+            }
             let _presence = driver::install(driver::fixture_credential());
             let result = durable(&fixture, &context, &envelope, &handle, 900_000).await;
             if missing {
                 assert_eq!(result.unwrap_err().code(), "approval.not_found");
                 assert!(driver::ceremonies().is_empty());
                 assert!(inbox(&fixture).is_empty());
+            } else if mode == "edited" {
+                assert_eq!(
+                    result.unwrap_err().code(),
+                    "approval.attestation_invalid",
+                    "a linked entry whose signed facts changed refuses"
+                );
+                assert!(driver::ceremonies().is_empty());
             } else {
                 assert_eq!(
                     result.unwrap().nonce(),
@@ -243,6 +236,7 @@ mod tests {
             clear_shown_summaries();
             let _presence = driver::install(driver::fixture_credential());
             let handle = prepared_operation(&context, "inventory", &summary.envelope);
+            let unreadable = UnreadableSiblingProfile::plant();
             let result = confirm_mainnet_write(
                 &summary,
                 ConfirmDecision::RequireApproval { ttl_ms: 300_000 },
@@ -263,12 +257,13 @@ mod tests {
             assert!(
                 error
                     .to_string()
-                    .contains("owner-scope inventory unavailable")
+                    .contains("owner scope shared or unreadable")
             );
             assert!(inbox(&fixture).is_empty());
             assert!(shown_summaries().is_empty());
             assert!(driver::ceremonies().is_empty());
             assert_eq!(durable_record(&context, &handle), None);
+            drop(unreadable);
             drop(_enabled);
             confirm_mainnet_write(
                 &summary,
