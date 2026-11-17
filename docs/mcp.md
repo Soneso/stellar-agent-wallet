@@ -21,10 +21,11 @@ for build configuration, admitted operations, and exclusions. Per tool on
   `mainnet-write`. These builds admit the four classic commits and both x402
   payment tools after setup. With the feature off, these tools refuse mainnet
   at entry with the same code.
-- `stellar_toolset_invoke` is annotated destructive, so its own policy gate
-  refuses its other actions on mainnet: the default engine refuses a
-  destructive tool, and a mainnet policy rule cannot name it.
-  On testnet, the toolset outer gate evaluates a payment action's effects.
+- `stellar_toolset_invoke` admits only exact `stellar_pay` and
+  `stellar_pay_commit` actions on enabled mainnet profiles. Its signed outer
+  rule meets payment minimums and composes with the routed payment policy.
+  Other mainnet actions remain excluded. On testnet the outer gate evaluates
+  the payment action's effects before routing.
 
 `stellar-agent-mcp` is a [Model Context Protocol](https://modelcontextprotocol.io)
 server that exposes the Stellar Agent Wallet to an MCP client. It speaks
@@ -382,7 +383,7 @@ profile, chain, and retained operation returns the original approval nonce and
 interval. An attestation already recorded on that approval stays unchanged.
 The preparation may issue a new protocol nonce for committing that envelope.
 Direct preparation needs a signed, verified policy to queue a new payment
-approval. Without one, the forced toolset approval queues an entry with no
+approval. Without one, a policy-required toolset approval queues an entry with no
 recovery binding.
 
 Expired, rejected, consumed, or collected approvals retain their refusal while
@@ -452,9 +453,16 @@ the window lock.
 
 Classic final resolution uses the shared hold-sizing adapter with one
 evaluation. It sizes holds from that evaluation and keeps the existing lifetime
-and authority checks. The composition API can retain two rules' classified
-budgets for one payment; public toolset payment routes do not supply a second
-evaluation.
+and authority checks. The mainnet toolset payment commit supplies a toolset
+restriction to the network resolver. A restricted payment commit binds the
+checked grant, installation, and exact invocation before any endpoint request.
+It evaluates the routed rule and the `stellar_toolset_invoke` rule against one
+private window image at one instant, and both must permit under the same
+authority. Its holds keep each evaluation's repeated criteria; a shared key
+takes the larger count and the tighter cap. The authorization expires no later
+than the grant, and the grant's lease is held until submission returns.
+On mainnet, the toolset dispatcher admits only the exact `stellar_pay` and
+`stellar_pay_commit` actions.
 
 On an admitted mainnet server, an x402 payment under Allow returns the payment
 in one call. Under RequireApproval it takes two calls. [x402](#x402) describes
@@ -602,9 +610,10 @@ denial, an approval refusal, a rebuild divergence, the audit pre-flight, and a
 malformed nonce. It also precedes the chain, fee, asset, and amount checks that
 follow a read. Where such a check ends in an `invalid_params` protocol error,
 the endpoint refusal is an error result instead. Checks that need no request
-come first: argument and envelope decoding, the structural mainnet refusal,
-and the forced approval of a toolset-gated pay commit that carries no approval
-fields.
+come first: argument and envelope decoding and the structural mainnet refusal.
+Toolset payment approval follows the composed policies and precedes nonce
+consumption. On mainnet a read-only lookup of the issued nonce supplies its
+prepared operation identity before consent is queued.
 
 The two [policy engines](./concepts.md) are Noop (testnet allow-all; mainnet
 read-only allow, mainnet destructive refused) and V1 (signature-verified typed
@@ -1488,14 +1497,14 @@ configured RPC sees signed authorization during mandatory re-simulation. See
 | Tool | Purpose | Gating |
 | --- | --- | --- |
 | `stellar_toolset_list` | Enumerate installed toolsets and their invocable actions. | Read-only. No `chain_id`. |
-| `stellar_toolset_invoke` | Invoke a named action of an installed toolset, routed to a registered tool through capability enforcement. | Dispatcher. Destructive; refused on mainnet. The toolset signs nothing directly; the dispatcher's and the routed tool's policy gates apply. Optional `chain_id`, forwarded to the routed tool. |
+| `stellar_toolset_invoke` | Invoke a named action of an installed toolset, routed to a registered tool through capability enforcement. | Destructive dispatcher. Enabled mainnet setup admits exact `stellar_pay` and `stellar_pay_commit` actions. The outer and routed policies apply. Optional `chain_id`, forwarded to the routed tool. |
 
 The toolsets dispatcher enforces a toolset's declared capabilities, read from its
 install record, which is authenticated by an HMAC under an installation key in the
 platform keyring and carries the `TOOLSET.md` digest both resolvers check. Its
 ungated routes never reach a signing tool regardless of those declarations; the
 signing actions route to the commit tools only behind the first-invoke gate and
-the per-action approval described in [Toolsets](./toolsets.md). A toolset narrows
+the payment policy or rule approval described in [Toolsets](./toolsets.md). A toolset narrows
 what this dispatcher routes. It does not narrow the native tools this server
 registers, the caller chooses the `toolset` argument, and the server binds no
 session to a toolset; the operator policy and the approvals bound native and

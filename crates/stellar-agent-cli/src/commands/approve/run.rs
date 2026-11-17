@@ -1977,6 +1977,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn approve_run_recovers_an_attested_entry_without_a_ceremony() {
             for offset in [-1_i64, 5_000, 4_000_000] {

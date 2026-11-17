@@ -206,6 +206,7 @@ fn now_ms() -> u64 {
 /// nothing and is reported as rejected: the receipt stays pending, the
 /// pending audit row stays open, and the reservation stands.
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn a_bound_intent_past_send_by_keeps_its_record() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();

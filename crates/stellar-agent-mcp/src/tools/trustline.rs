@@ -1529,6 +1529,7 @@ impl WalletServer {
             &args.chain_id,
             "stellar_trustline_commit",
             now_ms,
+            None,
         )
         .await
         {
@@ -1592,6 +1593,7 @@ impl WalletServer {
             cross_check.witness(),
             Some(&floor_hook),
             operation.as_ref(),
+            None,
         )
         .await
         {

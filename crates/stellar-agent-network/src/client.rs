@@ -757,6 +757,8 @@ impl StellarRpcClient {
                 stellar_xdr::Limits::depth(SEND_XDR_DEPTH_LIMIT),
             )?,
         )?;
+        #[cfg(feature = "test-hooks")]
+        record_send_attempt_for_test();
         self.inner
             .client()
             .request("sendTransaction", params)
@@ -1186,6 +1188,7 @@ thread_local! {
     /// Calls to [`StellarRpcClient::new`] and [`StellarRpcClient::with_credential`]
     /// on this thread, failed ones included.
     static CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SEND_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static IDENTITY_DEADLINES: std::cell::RefCell<Vec<Instant>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -1212,6 +1215,41 @@ pub fn take_identity_deadlines_for_test() -> Vec<Instant> {
 #[must_use]
 pub fn constructions_on_this_thread() -> usize {
     CONSTRUCTIONS.with(std::cell::Cell::get)
+}
+
+/// Counts sendTransaction attempts on the calling test thread, including retries.
+/// Current-thread acceptance runtimes read the difference around one payment.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+#[must_use]
+pub fn send_attempts_on_this_thread() -> usize {
+    SEND_ATTEMPTS.with(std::cell::Cell::get)
+}
+
+/// An opt-in counter shared with an isolated acceptance child.
+#[cfg(feature = "test-hooks")]
+#[allow(
+    clippy::expect_used,
+    reason = "an enabled acceptance observer must record every send"
+)]
+fn record_send_attempt_for_test() {
+    SEND_ATTEMPTS.with(|count| count.set(count.get() + 1));
+    if std::env::var_os("STELLAR_AGENT_TEST_COUNT_SENDS").is_some() {
+        use std::io::Write as _;
+        let home = std::path::PathBuf::from(
+            std::env::var_os("STELLAR_AGENT_HOME").expect("isolated acceptance home"),
+        );
+        assert!(
+            home.is_absolute() && home.join(".stellar-agent-test-sandbox").is_file(),
+            "the send observer requires an isolated acceptance home"
+        );
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(home.join("payment-send-attempts"))
+            .expect("acceptance send counter");
+        writeln!(file, "send").expect("append acceptance send count");
+    }
 }
 
 /// Builds the error for a transport that refuses to construct for `endpoint`.

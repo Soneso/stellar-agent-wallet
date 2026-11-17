@@ -9,6 +9,7 @@ fn mint_refusal<T: std::fmt::Debug>(
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn mint_refusals_follow_the_record_order() {
     for case in [
@@ -89,6 +90,7 @@ fn mint_refusals_follow_the_record_order() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn consumed_mint_refusals_precede_expiry_for_another_operation() {
     for case in ["expired", "released", "early"] {
@@ -153,6 +155,7 @@ fn mint_caps_at_the_record_execution_expiry() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn envelope_mint_caps_at_the_signed_expiry() {
     for child in [false, true] {
@@ -291,6 +294,7 @@ pub(in crate::policy_state) fn begin_step_mint(
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn operation_mint_uses_admitted_identity() {
     let mut fx = Fx::new(86_400_000);
@@ -305,6 +309,7 @@ fn operation_mint_uses_admitted_identity() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn consent_keeps_waiting_until_first_mint() {
     for route in ["begin", "adopt-live", "sweep", "waiting-expiry"] {
@@ -358,6 +363,7 @@ fn consent_keeps_waiting_until_first_mint() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn remint_runs_only_through_the_operation_route() {
     let mut fx = Fx::new(86_400_000);
@@ -397,6 +403,7 @@ fn remint_runs_only_through_the_operation_route() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn approval_and_authorization_commit_together_after_restart() {
     use super::super::store::commit_faults::{
@@ -449,6 +456,7 @@ fn approval_and_authorization_commit_together_after_restart() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn malformed_approval_images_refuse_inspection_and_mint() {
     use hmac::{Hmac, KeyInit as _, Mac as _};

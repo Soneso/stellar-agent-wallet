@@ -734,12 +734,15 @@ impl Header {
 #[cfg(not(feature = "mainnet-write"))]
 enum Never {}
 
-/// A transaction signing: the header and its transaction facts.
+/// A transaction signing: the header, its transaction facts, and the toolset
+/// restriction it was resolved under. It owns the restriction until submission
+/// starts; submission retains it and its locks until it returns.
 #[cfg(feature = "mainnet-write")]
 pub(crate) struct TxSignInner {
     pub(crate) entries: Vec<stellar_agent_core::policy::v1::criteria::state_store::WindowEntry>,
     pub(crate) header: Header,
     pub(crate) binding: DomainBinding,
+    pub(crate) _restriction: Option<crate::mainnet::restriction::ToolsetRestriction>,
 }
 
 /// A Soroban intent signing: the header, its intent facts, and the entry
@@ -1616,6 +1619,7 @@ mod tests {
                             reservation: None,
                             authority: [7; 32],
                             audit: [8; 32],
+                            restriction: None,
                         },
                     ),
                 }
@@ -1631,6 +1635,7 @@ mod tests {
                         source: SOURCE.to_owned(),
                         sequence: 42,
                     },
+                    _restriction: None,
                 })
             }
 
@@ -1920,6 +1925,7 @@ mod tests {
                     source: SOURCE.to_owned(),
                     sequence: 42,
                 },
+                _restriction: None,
             });
             assert_eq!(refused(a.check_chain(Caip2::Mainnet)), P::ChainNotMainnet);
             assert_eq!(
@@ -1970,6 +1976,7 @@ mod tests {
                     reservation: None,
                     authority: [0; 32],
                     audit: [0; 32],
+                    restriction: None,
                 },
                 authorization_ttl_ms: 120_000,
                 header: f.header(AuthorizationDomain::Soroban, true),
@@ -2316,6 +2323,7 @@ mod tests {
                 reservation: None,
                 authority: approval.fact_digest(),
                 audit: audit.fact_digest(),
+                restriction: None,
             };
             let binding = match domain {
                 AuthorizationDomain::Transaction => DomainBinding::Transaction {
@@ -2413,6 +2421,7 @@ mod tests {
                     expires_at_ms: approval.expires_at_ms(),
                 },
                 chain_deadline_ms: None,
+                restriction_end_ms: None,
                 authorization_ttl_ms: 60_000,
                 bindings: facts,
                 holds: holds.clone(),
@@ -2611,6 +2620,7 @@ mod tests {
         /// the ledger untouched, so nothing reaches a signer. The same
         /// requests under the policy the consent named resolve.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn mainnet_authorization_rejects_receipt_from_another_policy() {
             use crate::mainnet::MainnetAuthorizationError;
@@ -2654,6 +2664,7 @@ mod tests {
                 audit: f.audit(),
                 store: &f.window,
                 operation: None,
+                restriction: None,
             };
             let before = f.wire();
             policy_refusal(resolve_tx_sign(request(&other)).await.unwrap_err());
@@ -2677,6 +2688,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn consume_expect_matches_the_minted_record() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -2686,6 +2698,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn real_proofs_compose_with_inner_holds() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -2695,6 +2708,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn real_proofs_compose_with_outer_holds() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -2704,6 +2718,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn real_proofs_compose_with_intent_holds() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -2713,6 +2728,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn real_proofs_compose_without_holds() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -2771,6 +2787,7 @@ mod tests {
         /// boundary row and one more row, is refused after a rotation by its
         /// segment, while the new segment's count reaches the recorded one.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn rotation_refuses_authority_recorded_at_one_or_two() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();

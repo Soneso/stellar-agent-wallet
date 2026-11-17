@@ -673,6 +673,16 @@ impl MainnetFixture {
             "native",
             toml_edit::value(NATIVE_THRESHOLD_STROOPS.to_string()),
         );
+        if spec
+            .rules
+            .iter()
+            .any(|rule| rule.contains("tool = \"stellar_pay\"") && rule.contains(TRUSTLINE_ASSET))
+        {
+            thresholds.insert(
+                TRUSTLINE_ASSET,
+                toml_edit::value(NATIVE_THRESHOLD_STROOPS.to_string()),
+            );
+        }
         doc["mainnet"]["cross_check_thresholds"] = toml_edit::Item::Table(thresholds);
         let authenticator = stellar_agent_test_support::webauthn::fixture_authenticator();
         let mut credential = toml_edit::InlineTable::new();

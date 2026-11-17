@@ -71,6 +71,7 @@ impl DestinationRecorderFixture {
 }
 
 #[test]
+#[serial_test::serial(mainnet_clock)]
 #[serial_test::serial]
 fn the_claim_records_every_destination_shape() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -129,6 +130,7 @@ fn every_rebuilt_receipt_keeps_its_destination() {
 }
 
 #[tokio::test]
+#[serial_test::serial(mainnet_clock)]
 #[serial_test::serial]
 async fn an_unusable_destination_is_recorded_as_absent() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -208,6 +210,7 @@ async fn an_unusable_destination_is_recorded_as_absent() {
 }
 
 #[tokio::test]
+#[serial_test::serial(mainnet_clock)]
 #[serial_test::serial]
 async fn a_crash_between_receipt_and_reservation_keeps_the_destination() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();

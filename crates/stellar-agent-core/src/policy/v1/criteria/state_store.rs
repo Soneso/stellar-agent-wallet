@@ -419,10 +419,14 @@ impl WindowEntry {
 /// Composes the holds of two evaluations of the same payment.
 ///
 /// `None` preserves the routed entries exactly, including repeated criteria.
-/// `Some` coalesces complete keys and epochs, retaining one debit and the
-/// tighter compatible limit. Routed keys keep their first position; new outer
-/// keys follow in outer order. Equal caps retain the first entry's labels.
-/// Each descriptor must be sized with its own evaluated recipient class.
+/// `Some` matches occurrences across the two vectors only: each outer entry
+/// pairs with the first unpaired routed entry of the same complete key and
+/// epoch, which keeps one debit and the tighter compatible limit. Each vector
+/// keeps its own multiplicity, so a key repeated in either input keeps the
+/// larger count, and the composed admission is never looser than either
+/// input's own. Routed entries keep their order; unpaired outer entries
+/// follow in outer order. Equal caps retain the routed entry's labels. Each
+/// descriptor must be sized with its own evaluated recipient class.
 ///
 /// # Errors
 /// Returns [`PolicyError::Internal`] for inconsistent amounts, timestamps,
@@ -437,18 +441,27 @@ pub fn compose_window_entries(
     let inconsistent = || PolicyError::Internal {
         detail: "inconsistent holds for one payment".to_owned(),
     };
-    let mut composed: Vec<WindowEntry> = Vec::new();
-    for entry in routed.iter().chain(outer) {
-        if matches!(entry.limit, WindowLimit::Count { .. }) && entry.amount != 1 {
-            return Err(inconsistent());
-        }
-        let Some(current) = composed
-            .iter_mut()
-            .find(|current| current.key == entry.key && current.epoch == entry.epoch)
-        else {
+    if routed
+        .iter()
+        .chain(outer)
+        .any(|entry| matches!(entry.limit, WindowLimit::Count { .. }) && entry.amount != 1)
+    {
+        return Err(inconsistent());
+    }
+    let mut composed = routed.to_vec();
+    let mut paired = vec![false; routed.len()];
+    for entry in outer {
+        let shared = (0..routed.len()).find(|&index| {
+            !paired[index]
+                && composed[index].key == entry.key
+                && composed[index].epoch == entry.epoch
+        });
+        let Some(index) = shared else {
             composed.push(entry.clone());
             continue;
         };
+        paired[index] = true;
+        let current = &mut composed[index];
         if current.amount != entry.amount || current.timestamp_ms != entry.timestamp_ms {
             return Err(inconsistent());
         }

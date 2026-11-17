@@ -60,6 +60,7 @@ fn scan_configuration_digest_vector_and_secret_free() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn scan_record_v2_validation_and_size() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -214,6 +215,7 @@ fn selected(fx: &Fx) -> RecoveryAttempt {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn run_wire_and_exposure() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -291,6 +293,7 @@ fn run_wire_and_exposure() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn run_record_validation() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -566,6 +569,7 @@ fn contextual_schedule_table() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn exhausted_reader() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -627,6 +631,7 @@ fn exhausted_reader() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn checked_schedule_arithmetic() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -681,6 +686,7 @@ fn checked_schedule_arithmetic() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn lease_and_clock_view() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -721,6 +727,7 @@ fn lease_and_clock_view() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn supported_identity_surface_and_maximum_valid_run() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -810,6 +817,7 @@ fn supported_identity_surface_and_maximum_valid_run() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn run_decisions_preserve_bytes_and_win_over_spent_runs() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -897,6 +905,7 @@ fn run_decisions_preserve_bytes_and_win_over_spent_runs() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn opaque_generation_and_stale_snapshot() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1046,6 +1055,7 @@ fn opaque_generation_and_stale_snapshot() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn run_snapshot_each_field_refuses_stale_evidence() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1125,6 +1135,7 @@ fn run_snapshot_each_field_refuses_stale_evidence() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn typed_safe_refusal() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1155,6 +1166,7 @@ fn typed_safe_refusal() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn run_context_contract() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1281,6 +1293,7 @@ fn run_context_contract() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn valid_run_generation_seams() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1350,6 +1363,7 @@ fn valid_run_generation_seams() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn isolated_run_preserves_expiry_and_clear_lifecycle() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1436,6 +1450,7 @@ fn isolated_run_preserves_expiry_and_clear_lifecycle() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn isolated_run_preserves_approval_revocation() {
     use crate::policy_state::approvals::{ApprovalState, tests::Fx as ApprovalFx};

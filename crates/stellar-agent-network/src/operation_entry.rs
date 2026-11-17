@@ -2577,6 +2577,7 @@ pub(crate) mod tests {
     /// exhausted sequence refuses before the deadline clock is read.
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn rebuild_reads_after_consent_and_rebinds_oracle() {
         use crate::cross_check::{
@@ -2923,6 +2924,7 @@ pub(crate) mod tests {
         /// edges it commits; a refused second entry commits nothing and
         /// keeps the batch's earlier edges.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn attempt_wrappers_preserve_commits_on_success_and_refusal() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();

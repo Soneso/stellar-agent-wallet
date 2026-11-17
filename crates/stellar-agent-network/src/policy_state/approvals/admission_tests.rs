@@ -498,6 +498,7 @@ fn queued_row(outbox: &AuditOutbox, reservation: &EvidenceReservation) -> Outbox
 /// authenticated fixture inventory it initializes the owner before the
 /// first reservation, and a second admission reuses both.
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn producer_admission_requires_scope_readiness() {
     let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -551,6 +552,7 @@ fn producer_admission_requires_scope_readiness() {
 /// The same facts reuse one slot; any other fact, an expired deadline and
 /// an absent record refuse. Presentation runs outside the window lock.
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn reserve_before_request_and_without_window_lock() {
     let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -671,6 +673,7 @@ fn reserve_before_request_and_without_window_lock() {
 /// open commits the winner, which admission then reserves. A refused
 /// presentation, such as lost inbox material, keeps the record and slot.
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn producer_linkage_and_retry_are_fact_bound() {
     let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -798,6 +801,7 @@ fn publish(fx: &Fx, inbox: &PendingApprovalStore) -> Result<ApprovalView, Wallet
 /// succeeds only from the authenticated reread. A released payload and a
 /// compatibility entry without a handoff refuse.
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn publication_commits_receipt_reference_and_provenance() {
     let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -873,6 +877,7 @@ fn publication_commits_receipt_reference_and_provenance() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn publication_refuses_mismatched_witness() {
     let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -904,6 +909,7 @@ fn publication_refuses_mismatched_witness() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn publication_refuses_revoked_retry() {
     let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();

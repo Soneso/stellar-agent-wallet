@@ -625,6 +625,7 @@ mod tests {
         );
     }
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn early_observation_precedes_window_gate() {
         use crate::commands::submission_record::intent_gate_fixture::{IntentGateState, home};

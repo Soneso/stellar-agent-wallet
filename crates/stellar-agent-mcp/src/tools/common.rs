@@ -2347,6 +2347,65 @@ impl WalletServer {
         )
     }
 
+    /// The outcome that governs a toolset payment commit: `routed`, the
+    /// commit's governing outcome, composed with the invocation's outer
+    /// `stellar_toolset_invoke` rule.
+    ///
+    /// Without a mainnet context the outer outcome is `carried`, the
+    /// invocation's outer gate outcome. With one, the outer rule evaluates
+    /// `authoritative_args` plus the raw `toolset` and `action`, with the
+    /// payment's value class and views, in `routed`'s frame and instant.
+    /// An approval requirement of either rule governs, the routed one on a
+    /// tie. When only the outer rule requires approval, its request and
+    /// mainnet decision govern. The routed effects stay the audit and hold
+    /// source, and the earlier absolute end of both rules bounds the result.
+    ///
+    /// # Errors
+    ///
+    /// `policy.deny.<reason>` when the outer rule denies, on every chain;
+    /// `policy.unexpected_decision` for an end that does not lie after the
+    /// routed instant; and the outer evaluation's own refusals.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the outer rule reads the raw names, the payment's arguments, and its views"
+    )]
+    pub(crate) async fn toolset_governing_outcome(
+        &self,
+        routed: DispatchOutcome,
+        carried: Option<DispatchOutcome>,
+        toolset: &str,
+        action: &str,
+        authoritative_args: &Value,
+        chain_id: &str,
+        account_view: Option<&dyn stellar_agent_core::policy::v1::AccountReservesView>,
+        identity_view: Option<&dyn stellar_agent_core::policy::v1::AccountIdentityView>,
+    ) -> Result<DispatchOutcome, ToolError> {
+        let snapshot = Arc::clone(routed.snapshot()?);
+        let now_ms = snapshot.policy.now_ms();
+        let outer = match carried {
+            Some(carried) => carried_outer_evaluation(carried, now_ms)?,
+            None => {
+                let mut outer_args = authoritative_args.clone();
+                outer_args["toolset"] = Value::String(toolset.to_owned());
+                outer_args["action"] = Value::String(action.to_owned());
+                self.evaluate_policy_in_snapshot(
+                    "stellar_toolset_invoke",
+                    &outer_args,
+                    chain_id,
+                    Some(stellar_agent_core::policy::v1::value::derive_value_class(
+                        "stellar_pay_commit",
+                        authoritative_args,
+                    )),
+                    account_view,
+                    identity_view,
+                    &snapshot,
+                )
+                .await?
+            }
+        };
+        compose_toolset_outer(routed, outer, now_ms, self.mainnet_context.is_some())
+    }
+
     /// Refreshes verified local state without reconciling through RPC and
     /// evaluates `tool` for `scope`.
     #[cfg(feature = "mainnet-write")]
@@ -2674,6 +2733,57 @@ fn stricter_outcome(
     }
 }
 
+/// The outer rule's outcome a toolset invocation carries from its outer
+/// gate, as an evaluation read at the routed instant `now_ms`: its lifetime
+/// is what remains of its absolute end.
+///
+/// # Errors
+///
+/// `policy.unexpected_decision` when that end does not lie after `now_ms`.
+fn carried_outer_evaluation(
+    carried: DispatchOutcome,
+    now_ms: u64,
+) -> Result<GateEvaluation, ToolError> {
+    let (_, end) = carried.captured_interval()?;
+    let governing_ttl_ms = end
+        .checked_sub(now_ms)
+        .filter(|ttl| *ttl > 0)
+        .ok_or_else(invalid_policy_interval)?;
+    let decision = match carried {
+        DispatchOutcome::Allow(_) => Decision::Allow,
+        DispatchOutcome::RequireApproval(approval) => Decision::RequireApproval(approval.request),
+    };
+    Ok(GateEvaluation {
+        decision,
+        value_effects: None,
+        governing_ttl_ms,
+        mainnet: None,
+    })
+}
+
+/// Composes a toolset payment's `routed` outcome with its `outer` rule's
+/// evaluation at the routed instant `now_ms`.
+///
+/// An outer denial refuses on every chain. Otherwise the stricter outcome
+/// governs with the routed side as the commit side: it wins a tie and keeps
+/// its effects, and the earlier absolute end bounds the result.
+///
+/// # Errors
+///
+/// `policy.deny.<reason>` for an outer denial and the refusals of
+/// [`stricter_outcome`].
+fn compose_toolset_outer(
+    routed: DispatchOutcome,
+    outer: GateEvaluation,
+    now_ms: u64,
+    mainnet: bool,
+) -> Result<DispatchOutcome, ToolError> {
+    if let Decision::Deny(reason) = &outer.decision {
+        return Err(ToolError::Business(policy_denial_error_result(reason)));
+    }
+    stricter_outcome(routed, outer, now_ms, mainnet, CommitSide::Outcome, true)
+}
+
 /// Names the kind of an envelope decode failure without the values its
 /// message can carry, such as an asset code.
 fn envelope_decode_error_kind(
@@ -2704,8 +2814,12 @@ fn envelope_decode_error_kind(
 /// 1. Spawn-blocking call to [`NonceMint::verify_hmac_only`] (keyring-sync I/O).
 ///    On failure: indistinguishability — `Expired`/`HmacMismatch` collapse
 ///    to a single generic message; other variants use `wire_code()` + Display.
-/// 2. Acquire `replay_window` lock briefly (no I/O inside lock); evict expired,
-///    then record the nonce. On `Replayed` → typed `nonce.replayed` error.
+/// 2. Acquire `replay_window` lock briefly (no I/O inside lock). With a
+///    `restriction`, refuse `toolset.grant_expired` when its grant has ended
+///    on a fresh mainnet clock, recording nothing. Then evict expired and
+///    record the nonce. On `Replayed` → typed `nonce.replayed` error.
+///
+/// The caller keeps ownership of the restriction for the signing that follows.
 ///
 /// # Errors
 ///
@@ -2721,6 +2835,8 @@ fn envelope_decode_error_kind(
 /// | `nonce.replayed` | replay window already contains this nonce | `"this nonce has already been used; re-simulate to obtain a fresh nonce"` |
 /// | `<other wire_code>` | any other typed `NonceError` variant | the variant's Display message WITHOUT the wire-code prefix |
 /// | `internal_error` | tokio `spawn_blocking` join failure | `"spawn_blocking join error: <e>"` |
+/// | `toolset.grant_expired` | the restricting grant ended before the window lock was held | fixed message |
+/// | `internal_error` | the mainnet clock is unavailable for a restriction | `"clock unavailable: <e>"` |
 ///
 /// # Design notes
 ///
@@ -2754,6 +2870,7 @@ pub(crate) async fn commit_envelope_and_verify_nonce(
     chain_id: &str,
     tool_name: &'static str,
     now_ms: u64,
+    restriction: Option<&stellar_agent_network::mainnet::restriction::ToolsetRestriction>,
 ) -> Result<(), ToolError> {
     // Phase 1 — HMAC + expiry + chain check inside spawn_blocking (keyring sync I/O;
     // must not block the Tokio executor).
@@ -2788,7 +2905,25 @@ pub(crate) async fn commit_envelope_and_verify_nonce(
 
     // Phase 2: replay window lock is held only for evict_expired + record_verified_nonce
     // (no I/O; sub-microsecond on non-contended path).
+    #[cfg(test)]
+    restricted_nonce_tests::replay_waiting();
     let mut replay_window_guard = replay_window.lock().await;
+    // A restricting grant must still be live after both waits above, on a
+    // clock read now, before the window records the nonce.
+    if let Some(restriction) = restriction {
+        let now = stellar_agent_network::mainnet::clock::now_ms().map_err(|e| {
+            ToolError::Protocol(ErrorData::internal_error(
+                format!("internal_error: clock unavailable: {e}"),
+                None,
+            ))
+        })?;
+        if restriction.check_unexpired(now).is_err() {
+            return Err(ToolError::Business(business_error_result(
+                "toolset.grant_expired",
+                "the verified grant has expired; the first-invoke approval is required again",
+            )));
+        }
+    }
     // Evict before record to bound HashMap memory growth.
     replay_window_guard.evict_expired(now_ms);
     if let Err(replay_err) =
@@ -2835,7 +2970,7 @@ pub(crate) fn commit_path_error_result(err: impl std::fmt::Display) -> rmcp::mod
     nonce_verification_error_result(&NonceError::Expired)
 }
 
-fn nonce_replayed_error_result() -> rmcp::model::CallToolResult {
+pub(crate) fn nonce_replayed_error_result() -> rmcp::model::CallToolResult {
     business_error_result(
         "nonce.replayed",
         "this nonce has already been used; re-simulate to obtain a fresh nonce",
@@ -3278,6 +3413,11 @@ pub(crate) async fn verify_attestation_subject_gate(
         })?;
         drop(store);
         #[cfg(all(test, feature = "mainnet-write"))]
+        if let Some((barrier, arrivals)) = &server.payment_proof_barrier {
+            arrivals.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            barrier.wait().await;
+        }
+        #[cfg(all(test, feature = "mainnet-write"))]
         tests::mainnet::delivery_fault(&profile_name);
         use stellar_agent_network::policy_state::approvals::{
             ApprovalStatus, VerifiedConsentDelivery, require_consent_evidence_time,
@@ -3705,6 +3845,124 @@ mod payment_interval_tests {
             assert_eq!(approval.request.ttl_seconds, 123);
         }
     }
+
+    /// Routed rule 0 and outer rule 1 in all four decision combinations and
+    /// both orders of end, on both chains: either approval governs, the
+    /// routed one on a tie, the routed effects stay, and the earlier
+    /// absolute end bounds the result.
+    #[test]
+    fn toolset_outer_composition_selects_and_bounds() {
+        for mainnet in [true, false] {
+            for (routed, outer) in [(false, false), (true, false), (false, true), (true, true)] {
+                for (routed_ttl, outer_ttl) in [(1_000, 800), (800, 1_000)] {
+                    let case = format!("{mainnet} {routed} {outer} {routed_ttl} {outer_ttl}");
+                    let composed = compose_toolset_outer(
+                        outcome(routed, 1_000, routed_ttl),
+                        evaluation(outer, 1_000, outer_ttl, 1),
+                        1_000,
+                        mainnet,
+                    )
+                    .unwrap();
+                    let selected = u32::from(outer && !routed);
+                    assert_eq!(
+                        composed.captured_interval().unwrap(),
+                        (1_000, 1_800),
+                        "{case}"
+                    );
+                    let decision = composed.mainnet_decision().unwrap();
+                    assert_eq!(
+                        (
+                            decision.rule_index(),
+                            decision.policy_digest(),
+                            decision.policy_sequence()
+                        ),
+                        (selected, [selected as u8; 32], i64::from(selected) + 9),
+                        "{case}"
+                    );
+                    let effects = match &composed {
+                        DispatchOutcome::Allow(allowed) => {
+                            assert!(!routed && !outer, "{case}");
+                            &allowed.value_effects
+                        }
+                        DispatchOutcome::RequireApproval(approval) => {
+                            assert_eq!(
+                                approval.request.reason,
+                                Some(format!("rule {selected}")),
+                                "{case}"
+                            );
+                            &approval.value_effects
+                        }
+                    };
+                    assert_eq!(
+                        effects.as_ref().unwrap().legs()[0].amount,
+                        Some(7),
+                        "{case}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// An outer denial refuses with its own code on both chains, also under
+    /// a routed approval; an end past `u64::MAX` refuses typed.
+    #[test]
+    fn toolset_outer_denial_and_overflow_refuse() {
+        for mainnet in [true, false] {
+            for routed in [false, true] {
+                let Err(ToolError::Business(result)) = compose_toolset_outer(
+                    outcome(routed, 1_000, 1_000),
+                    GateEvaluation::denied(DenyReason::ExplicitRuleDeny),
+                    1_000,
+                    mainnet,
+                ) else {
+                    panic!("an outer denial refuses: {mainnet} {routed}")
+                };
+                assert_eq!(
+                    assert_business_envelope(&result).0,
+                    "policy.deny.explicit_rule_deny"
+                );
+            }
+            let Err(ToolError::Business(result)) = compose_toolset_outer(
+                outcome(false, 1_000, 1_000),
+                evaluation(true, 1_000, u64::MAX, 1),
+                1_000,
+                mainnet,
+            ) else {
+                panic!("an overflowing end refuses")
+            };
+            assert_eq!(
+                assert_business_envelope(&result).0,
+                "policy.unexpected_decision"
+            );
+        }
+    }
+
+    /// A carried outer outcome keeps its request and absolute end at a later
+    /// routed instant, and refuses typed once that end is reached.
+    #[test]
+    fn carried_outer_outcome_keeps_its_absolute_end() {
+        for required in [false, true] {
+            let carried = carried_outer_evaluation(outcome(required, 1_000, 500), 1_400).unwrap();
+            assert_eq!(carried.governing_ttl_ms, 100);
+            assert_eq!(
+                matches!(carried.decision, Decision::RequireApproval(ref request)
+                    if request.reason.as_deref() == Some("rule 0")),
+                required
+            );
+            assert!(carried.mainnet.is_none() && carried.value_effects.is_none());
+            for now in [1_500, 1_501] {
+                let Err(ToolError::Business(result)) =
+                    carried_outer_evaluation(outcome(required, 1_000, 500), now)
+                else {
+                    panic!("an elapsed outer end refuses at {now}")
+                };
+                assert_eq!(
+                    assert_business_envelope(&result).0,
+                    "policy.unexpected_decision"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3793,7 +4051,7 @@ mod signed_intent_observation_tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial(keyring)]
+    #[serial_test::serial(keyring, mainnet_clock)]
     #[serial_test::serial]
     async fn dispatch_observation_is_optional_but_verification_is_required() {
         use stellar_agent_core::policy::v1::criteria::{
@@ -4146,7 +4404,7 @@ pub(crate) mod tests {
     /// classic `Tx` one although its time bounds are valid, refuse naming the
     /// envelope's shape, before the clock is read.
     #[test]
-    #[serial_test::serial(keyring)]
+    #[serial_test::serial(keyring, mainnet_clock)]
     fn a_presented_envelope_of_the_wrong_shape_names_the_shape() {
         use stellar_xdr::{
             Limits, Memo, SequenceNumber, TimeBounds, TimePoint, TransactionEnvelope,
@@ -4182,7 +4440,7 @@ pub(crate) mod tests {
     /// none or a minimum time, an elapsed one, one beyond the ceiling. A
     /// valid one returns its `max_time`.
     #[test]
-    #[serial_test::serial(keyring)]
+    #[serial_test::serial(keyring, mainnet_clock)]
     fn a_presented_deadline_refuses_with_its_label() {
         let now = stellar_agent_core::timefmt::now_unix_ms().unwrap() + CLOCK_LEAD_MS;
         let _clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(now);
@@ -4214,7 +4472,7 @@ pub(crate) mod tests {
     /// A deadline the send margin reaches refuses naming
     /// `deadline_within_margin`; one just outside the margin passes.
     #[test]
-    #[serial_test::serial(keyring)]
+    #[serial_test::serial(keyring, mainnet_clock)]
     fn a_presented_deadline_refuses_inside_the_margin() {
         use stellar_agent_network::mainnet::resolve::MAINNET_SEND_MARGIN_SECONDS;
         let now = stellar_agent_core::timefmt::now_unix_ms().unwrap() + CLOCK_LEAD_MS;
@@ -4240,7 +4498,7 @@ pub(crate) mod tests {
     /// A mainnet clock that cannot be read refuses with the wallet's clock
     /// error, not a deadline label.
     #[test]
-    #[serial_test::serial(keyring)]
+    #[serial_test::serial(keyring, mainnet_clock)]
     fn a_presented_deadline_keeps_the_clock_error() {
         let now_s = stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1000;
         let _failing = stellar_agent_network::mainnet::clock::set_clock_error_for_test();
@@ -4415,7 +4673,7 @@ pub(crate) mod tests {
     struct StubCounterpartyResolver;
 
     #[cfg(feature = "mainnet-write")]
-    struct ChangingCounterpartyResolver(std::sync::atomic::AtomicUsize);
+    pub(crate) struct ChangingCounterpartyResolver(pub std::sync::atomic::AtomicUsize);
 
     #[cfg(feature = "mainnet-write")]
     #[async_trait::async_trait]
@@ -7032,9 +7290,9 @@ pub(crate) mod tests {
         pub(crate) struct Fixture {
             pub server: WalletServer,
             pub raw: String,
-            key_changes: Option<stellar_agent_test_support::keyring_mock::MutationLog>,
+            pub(crate) key_changes: Option<stellar_agent_test_support::keyring_mock::MutationLog>,
             pub seed_reads: Arc<AtomicU32>,
-            nonce_reads: Arc<AtomicU32>,
+            pub nonce_reads: Arc<AtomicU32>,
             clock_after_seed: Arc<std::sync::atomic::AtomicU64>,
             _clock: Arc<
                 std::sync::Mutex<Option<stellar_agent_network::mainnet::clock::TestClockGuard>>,
@@ -7048,7 +7306,7 @@ pub(crate) mod tests {
             pub on_window_key_read: Observer,
             pub envelope: SignedTestEnvelope,
             _home: StellarAgentHomeGuard,
-            _dir: stellar_agent_test_support::sandbox::StateSandbox,
+            pub(crate) _dir: stellar_agent_test_support::sandbox::StateSandbox,
         }
 
         pub(crate) fn put(entry: &KeyringEntryRef, value: &str) {
@@ -7072,7 +7330,7 @@ pub(crate) mod tests {
                 Self::build(edit, profile_edit, false)
             }
 
-            fn build(
+            pub(crate) fn build(
                 edit: impl FnOnce(String) -> String,
                 profile_edit: impl FnOnce(&mut Profile),
                 record_keys: bool,
@@ -7332,7 +7590,7 @@ pub(crate) mod tests {
                 Self::attest_with(&self.server, entry, "operator", "stellar:mainnet", false)
             }
 
-            fn attest_server(
+            pub(crate) fn attest_server(
                 server: &WalletServer,
                 entry: &stellar_agent_core::approval::PendingApproval,
                 profile_name: &str,
@@ -8048,6 +8306,129 @@ pub(crate) mod tests {
             let decision = paired.mainnet_decision().expect("the decision is carried");
             assert_eq!(decision.decision(), &Decision::Allow);
             assert_eq!(decision.governing_ttl_ms(), 600_000);
+        }
+
+        /// On mainnet a toolset payment's outer rule evaluates the
+        /// authoritative payment in the routed pair's frame and instant: an
+        /// outer cap below the amount denies, an outer approval alone
+        /// governs with its own rule and the routed effects, and an outer
+        /// `Allow` keeps the routed decision. Mainnet loading refuses a
+        /// toolset rule, so the rules are substituted below the validator.
+        #[tokio::test]
+        #[serial_test::serial(keyring, mainnet_clock)]
+        #[serial_test::serial]
+        async fn toolset_outer_rule_evaluates_in_the_routed_frame() {
+            use ed25519_dalek::Signer as _;
+            use stellar_agent_core::policy::v1::{PolicyEngineV1, loader::load_signed_policy_text};
+            let mut f = Fixture::new(|raw| raw);
+            let verified = f.server.verified_policy.clone().unwrap();
+            let substitute = |outer: &str| {
+                let body = format!(
+                    "version = 2\nscope = \"profile:operator\"\nsequence = 7\n\
+                     [[rules]]\nmatch = {{ tool = \"stellar_pay\", chain = \"stellar:mainnet\" }}\ncriteria = []\ndecision = \"allow\"\n\
+                     [[rules]]\nmatch = {{ tool = \"stellar_pay_commit\", chain = \"stellar:mainnet\" }}\ncriteria = [{{ kind = \"per_tx_cap\", asset = \"native\", max_stroops = \"100\" }}]\ndecision = \"allow\"\n\
+                     [[rules]]\nmatch = {{ tool = \"stellar_toolset_invoke\", chain = \"stellar:mainnet\" }}\n{outer}\n"
+                );
+                let owner = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
+                let signature = owner.sign(&digest(&canonical_bytes(&body).unwrap()));
+                let signed = format!(
+                    "{body}\n[signature]\nowner_id = \"{}\"\nsig = \"{}\"\n",
+                    stellar_strkey::ed25519::PublicKey(owner.verifying_key().to_bytes()),
+                    stellar_agent_core::hex::encode(&signature.to_bytes())
+                );
+                let document = load_signed_policy_text(
+                    &signed,
+                    "operator",
+                    &owner.verifying_key().to_bytes(),
+                    stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE,
+                )
+                .unwrap();
+                Arc::new(
+                    verified.with_engine_for_test(Arc::new(
+                        PolicyEngineV1::new(document, "operator".to_owned())
+                            .with_policy_digest_for_test(verified.digest()),
+                    )),
+                )
+            };
+            let mut args = stellar_agent_core::envelope_decode::decode_authoritative_args(
+                f.envelope.envelope_xdr(),
+                "stellar_pay_commit",
+            )
+            .unwrap();
+            args["chain_id"] = Value::String("stellar:mainnet".to_owned());
+            for (outer, expected) in [
+                (
+                    "criteria = [{ kind = \"per_tx_cap\", asset = \"native\", max_stroops = \"9\" }]\ndecision = \"allow\"",
+                    Err("policy.deny.per_tx_cap_exceeded"),
+                ),
+                (
+                    "criteria = [{ kind = \"per_tx_cap\", asset = \"native\", max_stroops = \"10\" }]\ndecision = \"allow\"",
+                    Ok((None, 1, 600_000)),
+                ),
+                (
+                    "criteria = []\ndecision = \"require_approval\"\nttl_secs = 450\nreason = \"outer review\"",
+                    Ok((Some("outer review"), 2, 450_000)),
+                ),
+            ] {
+                f.server.verified_policy = Some(substitute(outer));
+                let routed = f
+                    .server
+                    .dispatch_gate("stellar_pay_commit", &args, "stellar:mainnet")
+                    .await
+                    .unwrap();
+                let routed = f
+                    .server
+                    .commit_governing_outcome(
+                        routed,
+                        "stellar_pay",
+                        &args,
+                        "stellar:mainnet",
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let frame = Arc::clone(routed.snapshot().unwrap());
+                let now = frame.policy.now_ms();
+                let composed = f
+                    .server
+                    .toolset_governing_outcome(
+                        routed,
+                        None,
+                        "pay-toolset",
+                        "stellar_pay_commit",
+                        &args,
+                        "stellar:mainnet",
+                        None,
+                        None,
+                    )
+                    .await;
+                match (composed, expected) {
+                    (Err(ToolError::Business(result)), Err(code)) => {
+                        assert_eq!(assert_business_envelope(&result).0, code);
+                    }
+                    (Ok(composed), Ok((reason, rule, ttl))) => {
+                        assert!(Arc::ptr_eq(composed.snapshot().unwrap(), &frame));
+                        assert_eq!(composed.captured_interval().unwrap(), (now, now + ttl));
+                        let decision = composed.mainnet_decision().unwrap();
+                        assert_eq!(
+                            (decision.rule_index(), decision.evaluated_at_ms()),
+                            (rule, now)
+                        );
+                        let (request, effects) = match &composed {
+                            DispatchOutcome::Allow(allowed) => (None, &allowed.value_effects),
+                            DispatchOutcome::RequireApproval(approval) => {
+                                (approval.request.reason.as_deref(), &approval.value_effects)
+                            }
+                        };
+                        assert_eq!(request, reason);
+                        assert_eq!(effects.as_ref().unwrap().legs()[0].amount, Some(10));
+                    }
+                    (composed, expected) => {
+                        panic!("{outer}: expected {expected:?}, got {composed:?}")
+                    }
+                }
+            }
         }
 
         /// Every public classic pair acquires its frame once.
@@ -8842,7 +9223,7 @@ pub(crate) mod tests {
             )
         }
 
-        fn route_fixture(
+        pub(crate) fn route_fixture(
             mut f: Fixture,
             primary: &wiremock::MockServer,
             oracle: &wiremock::MockServer,
@@ -10694,7 +11075,7 @@ pub(crate) mod tests {
         }
 
         #[tokio::test]
-        #[serial_test::serial(keyring)]
+        #[serial_test::serial(keyring, mainnet_clock)]
         #[serial_test::serial]
         async fn mainnet_previews_carry_the_deadline() {
             let now = stellar_agent_core::timefmt::now_unix_ms().unwrap() + CLOCK_LEAD_MS;
@@ -10709,7 +11090,7 @@ pub(crate) mod tests {
         }
 
         #[tokio::test]
-        #[serial_test::serial(keyring)]
+        #[serial_test::serial(keyring, mainnet_clock)]
         #[serial_test::serial]
         async fn mainnet_time_bounds_prepare_and_commit_preserve_the_deadline() {
             let now = stellar_agent_core::timefmt::now_unix_ms().unwrap() + CLOCK_LEAD_MS;
@@ -10740,7 +11121,7 @@ pub(crate) mod tests {
         /// any authorization is minted: no seed read, so nothing is signed,
         /// and nothing is sent.
         #[tokio::test]
-        #[serial_test::serial(keyring)]
+        #[serial_test::serial(keyring, mainnet_clock)]
         #[serial_test::serial]
         async fn mainnet_time_bounds_commit_after_the_deadline_signs_nothing() {
             use stellar_agent_network::mainnet::resolve::MAINNET_CLASSIC_DEADLINE_SECONDS;
@@ -10770,7 +11151,7 @@ pub(crate) mod tests {
         }
 
         #[tokio::test]
-        #[serial_test::serial(keyring)]
+        #[serial_test::serial(keyring, mainnet_clock)]
         #[serial_test::serial]
         async fn commit_refuses_an_untimed_envelope() {
             let now = stellar_agent_core::timefmt::now_unix_ms().unwrap() + CLOCK_LEAD_MS;
@@ -10797,7 +11178,7 @@ pub(crate) mod tests {
         }
 
         #[tokio::test]
-        #[serial_test::serial(keyring)]
+        #[serial_test::serial(keyring, mainnet_clock)]
         #[serial_test::serial]
         async fn payment_process_recovery_and_replay() {
             use stellar_agent_core::approval::fixtures::{
@@ -10805,6 +11186,58 @@ pub(crate) mod tests {
             };
             const DESTINATION: &str =
                 "MBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMX77777777777752TU";
+            const TOOLSET: &str = "payment-recovery";
+            fn bind_toolset(server: &mut WalletServer, root: &std::path::Path) {
+                server.set_toolsets_root_for_test(root.join("toolsets"));
+                server.set_grant_store_path_for_test(root.join("grants.toml"));
+                server.set_toolset_pin_key_for_test(
+                    stellar_agent_toolsets_runtime::PinKey::from_bytes(zeroize::Zeroizing::new(
+                        [0x63; 32],
+                    )),
+                );
+            }
+            async fn prepare_route(
+                server: &WalletServer,
+                args: &serde_json::Value,
+                toolset: bool,
+            ) -> serde_json::Value {
+                if toolset {
+                    wire(
+                        &server
+                            .call_stellar_toolset_invoke(crate::server::StellarToolsetInvokeArgs {
+                                toolset: TOOLSET.into(),
+                                action: "stellar_pay".into(),
+                                chain_id: Some("stellar:mainnet".into()),
+                                args: args.clone(),
+                            })
+                            .await
+                            .unwrap(),
+                    )
+                } else {
+                    wire(&Tool::Pay.prepare(server, args).await)
+                }
+            }
+            async fn commit_route(
+                server: &WalletServer,
+                args: serde_json::Value,
+                toolset: bool,
+            ) -> serde_json::Value {
+                if toolset {
+                    wire(
+                        &server
+                            .call_stellar_toolset_invoke(crate::server::StellarToolsetInvokeArgs {
+                                toolset: TOOLSET.into(),
+                                action: "stellar_pay_commit".into(),
+                                chain_id: Some("stellar:mainnet".into()),
+                                args,
+                            })
+                            .await
+                            .unwrap(),
+                    )
+                } else {
+                    wire(&Tool::Pay.commit(server, args).await.unwrap())
+                }
+            }
             if let Ok(root) = std::env::var("MAINNET_PAYMENT_PROCESS_ROOT") {
                 let root = std::path::PathBuf::from(root);
                 let _home = StellarAgentHomeGuard::new(&root);
@@ -10814,7 +11247,7 @@ pub(crate) mod tests {
                         .unwrap();
                 let primary = url::Url::parse(&profile.rpc_url).unwrap();
                 let oracle = profile.oracle_provider_url.as_ref().unwrap();
-                let server = WalletServer::new_with_selection_and_routes_for_test(
+                let mut server = WalletServer::new_with_selection_and_routes_for_test(
                     profile.clone(),
                     ProfileNameSource::Flag,
                     &default_profile_dir().unwrap(),
@@ -10830,6 +11263,7 @@ pub(crate) mod tests {
                     ],
                 )
                 .unwrap();
+                bind_toolset(&mut server, &root);
                 let now: u64 = std::env::var("MAINNET_PAYMENT_TIME")
                     .unwrap()
                     .parse()
@@ -10839,13 +11273,41 @@ pub(crate) mod tests {
                     serde_json::from_slice(&std::fs::read(root.join("request.json")).unwrap())
                         .unwrap();
                 let mode = std::env::var("MAINNET_PAYMENT_MODE").unwrap();
-                let result = if mode.starts_with("prepare") {
-                    let result = wire(&Tool::Pay.prepare(&server, &args).await);
+                let toolset = (std::env::var("MAINNET_PAYMENT_FIRST_TOOLSET").unwrap() == "true")
+                    != mode.ends_with("retry");
+                let result = if mode == "settle" {
+                    let id = stellar_agent_network::policy_state::BusinessId::parse(
+                        args["business_id"].as_str().unwrap(),
+                    )
+                    .unwrap();
+                    let operation = stellar_agent_network::policy_state::OperationStatus::new(
+                        &server.window_store,
+                        server.security_profile(),
+                    )
+                    .view(&id)
+                    .unwrap()
+                    .unwrap();
+                    let hash = operation.result.unwrap().tx_hash.unwrap();
+                    wire(
+                        &server
+                            .call_stellar_transaction_status(
+                                crate::server::StellarTransactionStatusArgs {
+                                    chain_id: "stellar:mainnet".into(),
+                                    tx_hash: Some(stellar_agent_core::hex::encode(&hash)),
+                                    business_id: None,
+                                    retry_recovery: true,
+                                },
+                            )
+                            .await
+                            .unwrap(),
+                    )
+                } else if mode.starts_with("prepare") {
+                    let result = prepare_route(&server, &args, toolset).await;
                     assert_eq!(result["ok"], true, "{result}");
                     result
                 } else {
                     let prepared: serde_json::Value = if mode == "commit-lost" {
-                        let prepared = wire(&Tool::Pay.prepare(&server, &args).await);
+                        let prepared = prepare_route(&server, &args, toolset).await;
                         assert_eq!(prepared["ok"], true, "{prepared}");
                         prepared
                     } else {
@@ -10873,12 +11335,20 @@ pub(crate) mod tests {
                             Fixture::attest_server(&server, &entry, "operator", "stellar:mainnet")
                                 .into();
                     }
-                    wire(&Tool::Pay.commit(&server, args).await.unwrap())
+                    commit_route(&server, args, toolset).await
                 };
                 save_process_keyring(&root.join("keys.json"), &changes);
                 if mode.ends_with("lost") {
                     if mode == "commit-lost" {
-                        assert_eq!(result["error"]["code"], "submission.tx_timeout", "{result}");
+                        if std::env::var("MAINNET_PAYMENT_UNKNOWN").unwrap() == "true" {
+                            assert_eq!(
+                                result["error"]["code"], "submission.tx_timeout",
+                                "{result}"
+                            );
+                        } else {
+                            assert_eq!(result["ok"], true, "{result}");
+                            assert_eq!(result["data"]["ledger"], 101, "{result}");
+                        }
                     }
                     std::process::exit(81);
                 }
@@ -10889,149 +11359,295 @@ pub(crate) mod tests {
                 .unwrap();
                 return;
             }
-            let primary = wiremock::MockServer::start().await;
-            let oracle = wiremock::MockServer::start().await;
-            let f = route_fixture(
-                Fixture::build(
-                    |raw| require_approval_rules(&raw, &["stellar_pay", "stellar_pay_commit"], 600),
-                    |profile| profile.submit_timeout_seconds = Some(1),
-                    true,
-                ),
-                &primary,
-                &oracle,
-            );
-            let control = mount_rpc(&f, &primary).await;
-            let _oracle_control = mount_rpc(&f, &oracle).await;
-            control.transaction_unknown.store(true, Ordering::SeqCst);
-            let root = f._dir.path().to_owned();
-            let profile = f.server.security_profile().clone();
-            let state_path = f.server.window_store.path().to_owned();
-            let approval_path = f
-                .server
-                .resolve_approval_dir()
-                .unwrap()
-                .join("operator.toml");
-            let mut args = Tool::Pay.prepare_args(&f);
-            args["destination"] = DESTINATION.into();
-            let business_id = stellar_agent_network::policy_state::BusinessId::parse(
-                args["business_id"].as_str().unwrap(),
-            )
-            .unwrap();
-            std::fs::write(
-                root.join("request.json"),
-                serde_json::to_vec(&args).unwrap(),
-            )
-            .unwrap();
-            save_process_keyring(&root.join("keys.json"), f.key_changes.as_ref().unwrap());
-            drop(f.server);
-            stellar_agent_core::audit_log::AuditWriterRegistry::remove_for_test("operator");
-            let now = stellar_agent_core::timefmt::now_unix_ms().unwrap() + CLOCK_LEAD_MS;
-            let run_child = |mode: &str| {
-                let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
-                cmd.arg("--exact")
-                    .arg("tools::common::tests::mainnet::payment_process_recovery_and_replay")
-                    .env("MAINNET_PAYMENT_PROCESS_ROOT", &root)
-                    .env("MAINNET_PAYMENT_PRIMARY", primary.uri())
-                    .env("MAINNET_PAYMENT_ORACLE", oracle.uri())
-                    .env("MAINNET_PAYMENT_TIME", now.to_string())
-                    .env("MAINNET_PAYMENT_MODE", mode);
-                tokio::task::spawn_blocking(move || cmd.output().unwrap())
-            };
-            let lost = run_child("prepare-lost").await.unwrap();
-            assert_eq!(
-                lost.status.code(),
-                Some(81),
-                "preparation response lost: {} {}",
-                String::from_utf8_lossy(&lost.stdout),
-                String::from_utf8_lossy(&lost.stderr)
-            );
-            let original = std::fs::read(&approval_path).unwrap();
-            let retried = run_child("prepare-retry").await.unwrap();
-            assert!(
-                retried.status.success(),
-                "{} {}",
-                String::from_utf8_lossy(&retried.stdout),
-                String::from_utf8_lossy(&retried.stderr)
-            );
-            assert_eq!(
-                std::fs::read(&approval_path).unwrap(),
-                original,
-                "mainnet recovery keeps nonce and times byte for byte"
-            );
-            let store =
-                stellar_agent_core::approval::PendingApprovalStore::open(approval_path.clone())
+            for (first_toolset, unknown) in
+                [(false, true), (true, true), (false, false), (true, false)]
+            {
+                let primary = wiremock::MockServer::start().await;
+                let oracle = wiremock::MockServer::start().await;
+                let f = route_fixture(
+                    Fixture::build(
+                        |raw| {
+                            let raw = require_approval_rules(
+                                &raw,
+                                &["stellar_pay", "stellar_pay_commit"],
+                                600,
+                            );
+                            let mut doc = raw.parse::<toml_edit::DocumentMut>().unwrap();
+                            let rules = doc["rules"].as_array_of_tables_mut().unwrap();
+                            let mut outer = rules.get(0).unwrap().clone();
+                            outer["match"]["tool"] = toml_edit::value("stellar_toolset_invoke");
+                            outer["decision"] = toml_edit::value("allow");
+                            outer.remove("reason");
+                            outer.remove("ttl_secs");
+                            rules.push(outer);
+                            doc.to_string()
+                                + "\n[[rules]]\nmatch = { tool = \"stellar_transaction_status\", chain = \"stellar:mainnet\" }\ncriteria = []\ndecision = \"allow\"\n"
+                        },
+                        |profile| profile.submit_timeout_seconds = Some(1),
+                        true,
+                    ),
+                    &primary,
+                    &oracle,
+                );
+                let control = mount_rpc(&f, &primary).await;
+                let _oracle_control = mount_rpc(&f, &oracle).await;
+                control.transaction_unknown.store(unknown, Ordering::SeqCst);
+                let root = f._dir.path().to_owned();
+                stellar_agent_toolsets_install::write_toolset_for_test(
+                    &root.join("toolsets"),
+                    TOOLSET,
+                    &["propose-transaction", "sign-payment"],
+                    &[],
+                    "2020-01-01T00:00:00Z",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    &stellar_agent_toolsets_runtime::PinKey::from_bytes(zeroize::Zeroizing::new(
+                        [0x63; 32],
+                    )),
+                )
+                .unwrap();
+                stellar_agent_toolsets_runtime::record_first_invoke_grant(
+                    "operator",
+                    TOOLSET,
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "1.0.0",
+                    &"0".repeat(64),
+                    "sign-payment",
+                    DESTINATION,
+                    "XLM",
+                    1,
+                    i64::MAX,
+                    &stellar_agent_core::approval::process_uid_for_attestation().unwrap(),
+                    stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+                    &load_attestation_key(f.server.security_profile()).unwrap(),
+                    &stellar_agent_core::approval::AttestationBinding::new(
+                        "operator",
+                        "stellar:mainnet",
+                    ),
+                    Some(root.join("grants.toml")),
+                )
+                .unwrap();
+                let profile = f.server.security_profile().clone();
+                let state_path = f.server.window_store.path().to_owned();
+                let approval_path = f
+                    .server
+                    .resolve_approval_dir()
+                    .unwrap()
+                    .join("operator.toml");
+                let mut args = Tool::Pay.prepare_args(&f);
+                args["destination"] = DESTINATION.into();
+                let business_id = stellar_agent_network::policy_state::BusinessId::parse(
+                    args["business_id"].as_str().unwrap(),
+                )
+                .unwrap();
+                std::fs::write(
+                    root.join("request.json"),
+                    serde_json::to_vec(&args).unwrap(),
+                )
+                .unwrap();
+                save_process_keyring(&root.join("keys.json"), f.key_changes.as_ref().unwrap());
+                drop(f.server);
+                stellar_agent_core::audit_log::AuditWriterRegistry::remove_for_test("operator");
+                let now = stellar_agent_core::timefmt::now_unix_ms().unwrap() + CLOCK_LEAD_MS;
+                let run_child = |mode: &str| {
+                    let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+                    cmd.arg("--exact")
+                        .arg("tools::common::tests::mainnet::payment_process_recovery_and_replay")
+                        .env("MAINNET_PAYMENT_PROCESS_ROOT", &root)
+                        .env("MAINNET_PAYMENT_PRIMARY", primary.uri())
+                        .env("MAINNET_PAYMENT_ORACLE", oracle.uri())
+                        .env(
+                            "MAINNET_PAYMENT_TIME",
+                            (if mode == "settle" { now + 180_000 } else { now }).to_string(),
+                        )
+                        .env("MAINNET_PAYMENT_FIRST_TOOLSET", first_toolset.to_string())
+                        .env("MAINNET_PAYMENT_UNKNOWN", unknown.to_string())
+                        .env("MAINNET_PAYMENT_MODE", mode);
+                    tokio::task::spawn_blocking(move || cmd.output().unwrap())
+                };
+                let lost = run_child("prepare-lost").await.unwrap();
+                assert_eq!(
+                    lost.status.code(),
+                    Some(81),
+                    "preparation response lost: {} {}",
+                    String::from_utf8_lossy(&lost.stdout),
+                    String::from_utf8_lossy(&lost.stderr)
+                );
+                let original = std::fs::read(&approval_path).unwrap();
+                let retried = run_child("prepare-retry").await.unwrap();
+                assert!(
+                    retried.status.success(),
+                    "{} {}",
+                    String::from_utf8_lossy(&retried.stdout),
+                    String::from_utf8_lossy(&retried.stderr)
+                );
+                assert_eq!(
+                    std::fs::read(&approval_path).unwrap(),
+                    original,
+                    "mainnet recovery keeps nonce and times byte for byte"
+                );
+                let store =
+                    stellar_agent_core::approval::PendingApprovalStore::open(approval_path.clone())
+                        .unwrap();
+                assert_eq!(store.len(), 1);
+                drop(store);
+                assert_eq!(control.count("sendTransaction"), 0);
+                let lost = run_child("commit-lost").await.unwrap();
+                assert_eq!(
+                    lost.status.code(),
+                    Some(81),
+                    "payment response lost: {} {}",
+                    String::from_utf8_lossy(&lost.stdout),
+                    String::from_utf8_lossy(&lost.stderr)
+                );
+                restore_process_keyring(&root.join("keys.json"));
+                let window = stellar_agent_network::policy_state::PersistedWindowStore::for_profile(
+                    "operator",
+                );
+                let mut stored =
+                    stellar_agent_network::policy_state::OperationStatus::new(&window, &profile)
+                        .view(&business_id)
+                        .unwrap()
+                        .unwrap();
+                if !unknown {
+                    use stellar_xdr::WriteXdr as _;
+                    let result_xdr = stellar_xdr::TransactionResult {
+                        fee_charged: 100,
+                        result: stellar_xdr::TransactionResultResult::TxSuccess(
+                            stellar_xdr::VecM::default(),
+                        ),
+                        ext: stellar_xdr::TransactionResultExt::V0,
+                    }
+                    .to_xdr_base64(stellar_xdr::Limits::none())
                     .unwrap();
-            assert_eq!(store.len(), 1);
-            drop(store);
-            assert_eq!(control.count("sendTransaction"), 0);
-            let lost = run_child("commit-lost").await.unwrap();
-            assert_eq!(
-                lost.status.code(),
-                Some(81),
-                "payment response lost: {} {}",
-                String::from_utf8_lossy(&lost.stdout),
-                String::from_utf8_lossy(&lost.stderr)
-            );
-            restore_process_keyring(&root.join("keys.json"));
-            let window =
-                stellar_agent_network::policy_state::PersistedWindowStore::for_profile("operator");
-            let stored =
-                stellar_agent_network::policy_state::OperationStatus::new(&window, &profile)
+                    let hash = stellar_agent_core::hex::encode(
+                        &stored.result.as_ref().unwrap().tx_hash.unwrap(),
+                    );
+                    let included = serde_json::json!({
+                        "status":"SUCCESS", "ledger":101, "createdAt":now/1000,
+                        "txHash":hash, "envelopeXdr":control.sent()[0],
+                        "resultXdr":result_xdr, "latestLedger":102, "oldestLedger":1
+                    });
+                    let health = serde_json::json!({
+                        "status":"healthy", "latestLedger":102, "oldestLedger":1,
+                        "ledgerRetentionWindow":102, "oldestLedgerCloseTime":1,
+                        "latestLedgerCloseTime":now/1000 + 180
+                    });
+                    for endpoint in [&primary, &oracle] {
+                        for (method, answer) in [
+                            ("getTransaction", included.clone()),
+                            ("getHealth", health.clone()),
+                        ] {
+                            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                                .and(wiremock::matchers::body_partial_json(
+                                    serde_json::json!({"method":method}),
+                                ))
+                                .respond_with(move |request: &wiremock::Request| {
+                                    let body: serde_json::Value =
+                                        serde_json::from_slice(&request.body).unwrap();
+                                    wiremock::ResponseTemplate::new(200).set_body_json(
+                                        serde_json::json!({"jsonrpc":"2.0", "id":body["id"], "result":answer}),
+                                    )
+                                })
+                                .with_priority(1)
+                                .mount(endpoint)
+                                .await;
+                        }
+                    }
+                    let settled = run_child("settle").await.unwrap();
+                    assert!(
+                        settled.status.success(),
+                        "{} {}",
+                        String::from_utf8_lossy(&settled.stdout),
+                        String::from_utf8_lossy(&settled.stderr)
+                    );
+                    let answer: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(root.join("settle.json")).unwrap())
+                            .unwrap();
+                    assert_eq!(answer["ok"], true, "{answer}");
+                    assert_eq!(answer["data"]["chain_status"], "SUCCESS", "{answer}");
+                    restore_process_keyring(&root.join("keys.json"));
+                    stored = stellar_agent_network::policy_state::OperationStatus::new(
+                        &window, &profile,
+                    )
                     .view(&business_id)
                     .unwrap()
                     .unwrap();
-            assert_eq!(stored.state.wire_name(), "sent_outcome_unknown");
-            let mut inbox =
-                stellar_agent_core::approval::PendingApprovalStore::open(approval_path.clone())
-                    .unwrap();
-            assert_eq!(inbox.gc_expired_and_consumed(now).unwrap(), 1);
-            assert!(
-                inbox.is_empty(),
-                "inbox payload is collected before retained replay"
-            );
-            drop(inbox);
-            let state = std::fs::read(&state_path).unwrap();
-            let approvals = std::fs::read(&approval_path).unwrap();
-            let receipts_before = serde_json::to_value(receipts()).unwrap();
-            let audit = std::fs::read(&profile.audit_log_path).unwrap();
-            let retried = run_child("commit-retry").await.unwrap();
-            assert!(
-                retried.status.success(),
-                "{} {}",
-                String::from_utf8_lossy(&retried.stdout),
-                String::from_utf8_lossy(&retried.stderr)
-            );
-            let answer: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(root.join("commit-retry.json")).unwrap())
-                    .unwrap();
-            assert_eq!(answer["ok"], true, "{answer}");
-            assert_eq!(answer["data"]["status"], "replayed");
-            assert_eq!(answer["data"]["next"], "wait");
-            assert_eq!(
-                answer["data"]["operation"]["id"],
-                stored.operation_id.to_hex()
-            );
-            assert_eq!(
-                answer["data"]["operation"]["tx_hash"],
-                stellar_agent_core::hex::encode(&stored.result.unwrap().tx_hash.unwrap())
-            );
-            assert_eq!(control.count("sendTransaction"), 1);
-            assert_eq!(
-                std::fs::read(state_path).unwrap(),
-                state,
-                "one claim and accounting debit"
-            );
-            assert_eq!(std::fs::read(approval_path).unwrap(), approvals);
-            assert_eq!(serde_json::to_value(receipts()).unwrap(), receipts_before);
-            assert_eq!(std::fs::read(profile.audit_log_path).unwrap(), audit);
-            assert_eq!(
-                answer["data"]["destination"], DESTINATION,
-                "retained replay carries the literal stored destination"
-            );
+                }
+                assert_eq!(
+                    stored.state.wire_name(),
+                    if unknown {
+                        "sent_outcome_unknown"
+                    } else {
+                        "succeeded"
+                    }
+                );
+                let mut inbox =
+                    stellar_agent_core::approval::PendingApprovalStore::open(approval_path.clone())
+                        .unwrap();
+                assert_eq!(inbox.gc_expired_and_consumed(now).unwrap(), 1);
+                assert!(
+                    inbox.is_empty(),
+                    "inbox payload is collected before retained replay"
+                );
+                drop(inbox);
+                let state = std::fs::read(&state_path).unwrap();
+                let approvals = std::fs::read(&approval_path).unwrap();
+                let receipts_before = serde_json::to_value(receipts()).unwrap();
+                let audit = std::fs::read(&profile.audit_log_path).unwrap();
+                let retried = run_child("commit-retry").await.unwrap();
+                assert!(
+                    retried.status.success(),
+                    "{} {}",
+                    String::from_utf8_lossy(&retried.stdout),
+                    String::from_utf8_lossy(&retried.stderr)
+                );
+                let answer: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(root.join("commit-retry.json")).unwrap())
+                        .unwrap();
+                assert_eq!(answer["ok"], true, "{answer}");
+                assert_eq!(answer["data"]["status"], "replayed");
+                assert_eq!(
+                    answer["data"]["next"],
+                    if unknown { "wait" } else { "none" },
+                    "a completed payment never requests another attempt"
+                );
+                assert_eq!(
+                    answer["data"]["operation"]["state"],
+                    if unknown {
+                        "sent_outcome_unknown"
+                    } else {
+                        "succeeded"
+                    }
+                );
+                if !unknown {
+                    assert_eq!(answer["data"]["operation"]["ledger"], 101);
+                }
+                assert_eq!(
+                    answer["data"]["operation"]["id"],
+                    stored.operation_id.to_hex()
+                );
+                assert_eq!(
+                    answer["data"]["operation"]["tx_hash"],
+                    stellar_agent_core::hex::encode(&stored.result.unwrap().tx_hash.unwrap())
+                );
+                assert_eq!(control.count("sendTransaction"), 1);
+                assert_eq!(
+                    std::fs::read(state_path).unwrap(),
+                    state,
+                    "one claim and accounting debit"
+                );
+                assert_eq!(std::fs::read(approval_path).unwrap(), approvals);
+                assert_eq!(serde_json::to_value(receipts()).unwrap(), receipts_before);
+                assert_eq!(std::fs::read(profile.audit_log_path).unwrap(), audit);
+                assert_eq!(
+                    answer["data"]["destination"], DESTINATION,
+                    "retained replay carries the literal stored destination"
+                );
+            }
         }
 
         #[tokio::test]
-        #[serial_test::serial(keyring)]
+        #[serial_test::serial(keyring, mainnet_clock)]
         #[serial_test::serial]
         async fn preparation_refusal_preserves_prior_settlement() {
             use stellar_agent_network::policy_state::{
@@ -12426,7 +13042,7 @@ pub(crate) mod tests {
         /// at signing; its claimed holds become confirmed spend dated at the
         /// claim.
         #[tokio::test]
-        #[serial_test::serial(keyring)]
+        #[serial_test::serial(keyring, mainnet_clock)]
         #[serial_test::serial]
         async fn mainnet_submit_expiry_refuses_before_pre_send() {
             for tool in Tool::ALL {
@@ -14737,7 +15353,10 @@ pub(crate) mod tests {
             assert!(matches!(outcome, DispatchOutcome::Allow(_)));
 
             // A second durable reset falls between the commit gate and final
-            // resolution. The captured decision remains usable after it.
+            // resolution. The commit below needs only the gate's refresh of
+            // the shared image above, not a later reload; final resolution
+            // still evaluates the shared engine, so this is no fresh-frame
+            // proof.
             writer.record_and_persist(profile, &[entry]).unwrap();
             reset("after-commit-gate");
             let durable = stellar_agent_core::policy::v1::PolicyStateStore::new();
@@ -14773,6 +15392,7 @@ pub(crate) mod tests {
                 audit,
                 store: &server.window_store,
                 operation: None,
+                restriction: None,
             })
             .await;
             assert!(
@@ -14860,6 +15480,7 @@ pub(crate) mod tests {
                 audit,
                 store: &store,
                 operation: None,
+                restriction: None,
             })
             .await
             .unwrap_err();
@@ -15364,5 +15985,295 @@ pub(crate) mod tests {
             assert_eq!(code, "policy.approval_required");
             assert!(message.contains("--profile 'treasury ops'"));
         }
+    }
+}
+
+#[cfg(test)]
+mod restricted_nonce_tests {
+    #![allow(clippy::unwrap_used, clippy::panic, reason = "test fixtures")]
+
+    use super::*;
+    use stellar_agent_network::mainnet::restriction::ToolsetRestriction;
+
+    thread_local! {
+        static REPLAY_WAIT: std::cell::RefCell<Option<Arc<tokio::sync::Notify>>> = const { std::cell::RefCell::new(None) };
+    }
+    pub(super) fn replay_waiting() {
+        REPLAY_WAIT.with_borrow(|slot| {
+            if let Some(waiting) = slot {
+                waiting.notify_one();
+            }
+        });
+    }
+
+    fn lease(root: &std::path::Path) -> (ToolsetRestriction, std::path::PathBuf, u64) {
+        use stellar_agent_core::approval::{AttestationBinding, process_uid_for_attestation};
+        use stellar_agent_toolsets_runtime::{
+            GatedInvokeParams, GatedResolveOutcome, GrantRecheckParams, PinKey,
+            acquire_toolset_grant_lease, record_first_invoke_grant,
+            resolve_toolset_sign_payment_gated,
+        };
+        let pin = PinKey::from_bytes(zeroize::Zeroizing::new([0xab; 32]));
+        stellar_agent_toolsets_install::write_toolset_for_test(
+            root,
+            "pay-toolset",
+            &["sign-payment"],
+            &[],
+            "2020-01-01T00:00:00Z",
+            &"a".repeat(32),
+            &pin,
+        )
+        .unwrap();
+        let grants = root.join("grants.toml");
+        let destination = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
+        let binding = AttestationBinding::new("restricted", "stellar:testnet");
+        let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+        let grant = record_first_invoke_grant(
+            "restricted",
+            "pay-toolset",
+            &"a".repeat(32),
+            "1.0.0",
+            &"0".repeat(64),
+            "sign-payment",
+            destination,
+            "XLM",
+            1,
+            1,
+            &process_uid_for_attestation().unwrap(),
+            now,
+            &[0xdd; 32],
+            &binding,
+            Some(grants.clone()),
+        )
+        .unwrap();
+        let GatedResolveOutcome::Resolved { grant: checked, .. } =
+            resolve_toolset_sign_payment_gated(&GatedInvokeParams {
+                toolset_name: "pay-toolset",
+                action: "stellar_pay_commit",
+                toolsets_root: root,
+                profile_name: "restricted",
+                attestation_key: &[0xdd; 32],
+                attestation_binding: &binding,
+                authoritative_destination: destination,
+                authoritative_asset: "XLM",
+                authoritative_amount_stroops: 1,
+                now_unix_ms: now,
+                process_uid: &process_uid_for_attestation().unwrap(),
+                pin_key: Some(&pin),
+                approval_dir_override: Some(root.join("approvals")),
+                grant_store_path_override: Some(grants.clone()),
+            })
+            .unwrap()
+        else {
+            panic!("the real grant must resolve")
+        };
+        let lease = acquire_toolset_grant_lease(
+            &checked,
+            &GrantRecheckParams {
+                toolset_name: "pay-toolset",
+                action: "stellar_pay_commit",
+                toolsets_root: root,
+                profile_name: "restricted",
+                attestation_key: &[0xdd; 32],
+                attestation_binding: &binding,
+                authoritative_destination: destination,
+                authoritative_asset: "XLM",
+                authoritative_amount_stroops: 1,
+                pin_key: Some(&pin),
+                grant_store_path_override: Some(grants.clone()),
+            },
+        )
+        .unwrap();
+        let restriction = ToolsetRestriction::new(Box::new(lease));
+        assert_eq!(restriction.facts().grant_id, grant.grant_id);
+        (restriction, grants, grant.expires_at_unix_ms)
+    }
+
+    struct Catalogue;
+
+    impl stellar_agent_nonce::ToolCatalogue for Catalogue {
+        fn is_registered(&self, tool_name: &str) -> bool {
+            tool_name == "stellar_pay_commit"
+        }
+    }
+
+    fn mint(
+        now: u64,
+        expiry: u64,
+        hmac_read: impl Fn() + Send + Sync + 'static,
+    ) -> (Arc<NonceMint>, Nonce) {
+        use base64::Engine as _;
+        stellar_agent_test_support::keyring_mock::install_with_read_hooks(vec![
+            stellar_agent_test_support::keyring_mock::ReadHook::new(
+                "stellar-agent-nonce-restricted",
+                "restricted",
+                Arc::new(hmac_read),
+            ),
+        ])
+        .unwrap();
+        let profile = stellar_agent_core::profile::schema::Profile::builder_testnet(
+            "stellar-agent-signer",
+            "restricted",
+            "stellar-agent-nonce-restricted",
+            "restricted",
+        )
+        .build();
+        keyring_core::Entry::new(
+            &profile.mcp_nonce_key_alias.service,
+            &profile.mcp_nonce_key_alias.account,
+        )
+        .unwrap()
+        .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xdd; 32]))
+        .unwrap();
+        let mint = NonceMint::from_profile(&profile, "restricted").unwrap();
+        let nonce = mint
+            .mint(
+                &Catalogue,
+                b"envelope",
+                now,
+                expiry,
+                "stellar_pay_commit",
+                "stellar:testnet",
+            )
+            .unwrap();
+        (Arc::new(mint), nonce)
+    }
+
+    async fn verify(
+        mint: &Arc<NonceMint>,
+        window: &TokioMutex<ReplayWindow>,
+        nonce: &Nonce,
+        restriction: Option<&ToolsetRestriction>,
+        now: u64,
+    ) -> Result<(), String> {
+        commit_envelope_and_verify_nonce(
+            mint,
+            window,
+            nonce,
+            "envelope",
+            now + 300_000,
+            "stellar:testnet",
+            "stellar_pay_commit",
+            now,
+            restriction,
+        )
+        .await
+        .map_err(|error| match error {
+            ToolError::Business(result) => assert_business_envelope(&result).0,
+            ToolError::Protocol(error) => panic!("unexpected protocol error: {error:?}"),
+        })
+    }
+
+    /// The grant ends after the verification instant passed in and at the
+    /// fresh clock: the refusal records nothing and repeats, and a live grant
+    /// records the nonce once.
+    #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
+    #[serial_test::serial]
+    async fn restricted_nonce_expiry_does_not_consume_replay_state() {
+        nonce_wait_case(false).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
+    #[serial_test::serial]
+    async fn restricted_nonce_expiry_during_hmac_does_not_consume_replay_state() {
+        nonce_wait_case(true).await;
+    }
+
+    async fn nonce_wait_case(during_hmac: bool) {
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+        let armed = Arc::new(AtomicBool::new(false));
+        let hmac_waiting = Arc::new(tokio::sync::Notify::new());
+        let hmac_release = Arc::new(std::sync::Barrier::new(2));
+        let (arm, waiting, release) = (
+            Arc::clone(&armed),
+            Arc::clone(&hmac_waiting),
+            Arc::clone(&hmac_release),
+        );
+        let (mint, nonce) = mint(now, now + 300_000, move || {
+            if arm.swap(false, Ordering::SeqCst) {
+                waiting.notify_one();
+                release.wait();
+            }
+        });
+        let (live, grants, end) = lease(&sandbox.path().join("toolsets"));
+        let window = TokioMutex::new(ReplayWindow::new());
+        let clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(now);
+        if during_hmac {
+            armed.store(true, Ordering::SeqCst);
+            let (result, ()) =
+                tokio::join!(verify(&mint, &window, &nonce, Some(&live), now), async {
+                    hmac_waiting.notified().await;
+                    assert!(
+                        matches!(
+                            stellar_agent_core::approval::ToolsetGrantStore::open(
+                                grants.clone(),
+                                now
+                            ),
+                            Err(stellar_agent_core::approval::ApprovalError::WriterLocked)
+                        ),
+                        "revocation is blocked during HMAC key access"
+                    );
+                    clock.set(end);
+                    hmac_release.wait();
+                });
+            assert_eq!(result, Err("toolset.grant_expired".to_owned()));
+            assert!(
+                window.lock().await.is_empty(),
+                "expiry during HMAC consumes no nonce"
+            );
+        } else {
+            // The grant ends while the call waits for the replay window.
+            clock.set(now);
+            let held = window.lock().await;
+            let replay_waiting = Arc::new(tokio::sync::Notify::new());
+            REPLAY_WAIT.with_borrow_mut(|slot| *slot = Some(Arc::clone(&replay_waiting)));
+            let (result, ()) =
+                tokio::join!(verify(&mint, &window, &nonce, Some(&live), now), async {
+                    replay_waiting.notified().await;
+                    clock.set(end);
+                    drop(held);
+                });
+            REPLAY_WAIT.with_borrow_mut(|slot| *slot = None);
+            assert_eq!(result, Err("toolset.grant_expired".to_owned()));
+            assert!(window.lock().await.is_empty());
+        }
+        for _ in 0..2 {
+            assert_eq!(
+                verify(&mint, &window, &nonce, Some(&live), now).await,
+                Err("toolset.grant_expired".to_owned())
+            );
+            assert!(
+                window.lock().await.is_empty(),
+                "a repeated expiry records nothing"
+            );
+        }
+        clock.set(now);
+        verify(&mint, &window, &nonce, Some(&live), now)
+            .await
+            .unwrap();
+        assert_eq!(window.lock().await.len(), 1, "a live grant records once");
+        assert_eq!(
+            verify(&mint, &window, &nonce, Some(&live), now).await,
+            Err("nonce.replayed".to_owned())
+        );
+        clock.set(u64::MAX);
+        assert_eq!(
+            verify(&mint, &window, &nonce, None, now).await,
+            Err("nonce.replayed".to_owned()),
+            "without a restriction the clock is not read"
+        );
+        drop(live);
+        assert_eq!(
+            stellar_agent_core::approval::ToolsetGrantStore::open(grants, now)
+                .unwrap()
+                .revoke_toolset("pay-toolset")
+                .unwrap(),
+            1
+        );
     }
 }

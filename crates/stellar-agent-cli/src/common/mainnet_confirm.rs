@@ -2023,6 +2023,7 @@ pub(crate) mod tests {
             operation: Some(stellar_agent_network::operation_entry::next_attempt_link(
                 &operation,
             )),
+            restriction: None,
         };
         assert_eq!(
             resolve_tx_sign(request(None))

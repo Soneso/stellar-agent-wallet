@@ -2136,6 +2136,7 @@ pub(in crate::policy_state) mod tests {
                     expires_at_ms: u64::MAX,
                 },
                 chain_deadline_ms: None,
+                restriction_end_ms: None,
                 authorization_ttl_ms: 120_000,
                 bindings: BindingFacts {
                     endpoint: None,
@@ -2146,6 +2147,7 @@ pub(in crate::policy_state) mod tests {
                     reservation: None,
                     authority: [7; 32],
                     audit: [8; 32],
+                    restriction: None,
                 },
                 holds: vec![],
                 parent: None,
@@ -2272,6 +2274,7 @@ pub(in crate::policy_state) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn delivery_classifier_binds_witness() {
         let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -2387,6 +2390,7 @@ pub(in crate::policy_state) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn enforcement_activation_requires_complete_producers() {
         let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -2434,6 +2438,7 @@ pub(in crate::policy_state) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn effective_floor_prevents_expired_use() {
         let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -2472,6 +2477,7 @@ pub(in crate::policy_state) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn same_receipt_cannot_replace_delivery() {
         let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -2556,6 +2562,7 @@ pub(in crate::policy_state) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn open_pending_links_and_awaits_in_one_commit() {
         let mut fx = Fx::new(300_000);
@@ -2587,6 +2594,7 @@ pub(in crate::policy_state) mod tests {
     /// the operation's identity, business id, history time and the durable
     /// record id `find_by_nonce` reports.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn recorder_drains_once_including_approval() {
         let mut fx = Fx::new(300_000);
@@ -2632,6 +2640,7 @@ pub(in crate::policy_state) mod tests {
     /// Over the consent commit's sink, consent commits without an audit
     /// writer, and a step that appends a row fails as `audit.append_failed`.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn consent_commit_needs_no_audit_writer() {
         use crate::operation_entry::ConsentOnlyAudit;
@@ -2657,6 +2666,7 @@ pub(in crate::policy_state) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn find_by_operation_reads_without_writing() {
         let mut fx = Fx::new(300_000);
@@ -2678,6 +2688,7 @@ pub(in crate::policy_state) mod tests {
     /// expiry from the open's 600-second default to the signed waiting
     /// expiry, capped at the envelope's end.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn open_stores_the_prepare_decision_and_the_earlier_waiting_end() {
         for ttl in [300_000, 3_600_000] {
@@ -2722,6 +2733,7 @@ pub(in crate::policy_state) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn open_pending_refuses_a_non_prepared_or_linked_operation() {
         for linked in [false, true] {
@@ -2753,6 +2765,7 @@ pub(in crate::policy_state) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn open_pending_with_the_same_facts_returns_the_record() {
         let mut fx = Fx::new(300_000);
@@ -2782,6 +2795,7 @@ pub(in crate::policy_state) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn open_pending_refuses_a_waiting_expiry_other_than_created_plus_ttl() {
         let mut fx = Fx::new(300_000);
@@ -2813,6 +2827,7 @@ pub(in crate::policy_state) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn consent_sets_both_clocks_once() {
         for (ttl, execution) in [(86_400_000, 900_000), (300_000, 300_000)] {
@@ -2853,6 +2868,7 @@ pub(in crate::policy_state) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn consent_requires_the_matching_witness() {
         for field in 0..6 {
@@ -2918,6 +2934,7 @@ pub(in crate::policy_state) mod tests {
     /// version 6: the intent witness's genuine consent verifies and stores,
     /// and a version 5 blob over the same facts refuses.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn durable_consent_selects_the_layout_by_subject_kind() {
         let ttl = 300_000;
@@ -3050,6 +3067,7 @@ pub(in crate::policy_state) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn consent_at_or_after_the_waiting_expiry_refuses() {
         let mut fx = Fx::new(300_000);
@@ -3066,6 +3084,7 @@ pub(in crate::policy_state) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn record_consent_refuses_revocation_and_waiting_expiry() {
         for revoked in [true, false] {
@@ -3100,6 +3119,7 @@ pub(in crate::policy_state) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn restart_keeps_state_and_both_windows() {
         let mut fx = Fx::new(300_000);
@@ -3127,6 +3147,7 @@ pub(in crate::policy_state) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn payload_drops_when_the_operation_ends_or_the_window_closes() {
         let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -3189,6 +3210,7 @@ pub(in crate::policy_state) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn consumed_evidence_survives_same_operation_retry() {
         let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -3302,6 +3324,7 @@ pub(in crate::policy_state) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn status_reads_write_nothing() {
         let mut fx = Fx::new(300_000);
@@ -3318,6 +3341,7 @@ pub(in crate::policy_state) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn revoke_is_idempotent_and_writes_nothing_after_the_window() {
         for expired in [false, true] {
@@ -3361,6 +3385,7 @@ pub(in crate::policy_state) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn validate_refuses_every_inconsistent_record() {
         let mut fx = Fx::new(300_000);
@@ -3393,6 +3418,7 @@ pub(in crate::policy_state) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn retention_keeps_live_records_and_evicts_the_oldest_closed() {
         let mut fx = Fx::new(300_000);
@@ -3422,6 +3448,7 @@ pub(in crate::policy_state) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn largest_approval_record_fits_its_bound() {
         let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -3522,6 +3549,7 @@ pub(in crate::policy_state) mod tests {
     /// write refuses a payload that states both or neither, and the
     /// validation refuses one that states both.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn missing_reference_states_its_provenance() {
         let mut fx = Fx::new(300_000);
@@ -3582,6 +3610,7 @@ pub(in crate::policy_state) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn consent_delivery_codec_and_legacy_bytes() {
         let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -3645,6 +3674,7 @@ pub(in crate::policy_state) mod tests {
     /// nor a provenance reads with that payload as stored, writes nothing on
     /// the read, and its record still mints.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_stored_payload_without_reference_or_provenance_reads_unchanged() {
         let mut fx = Fx::new(300_000);
@@ -3690,6 +3720,7 @@ pub(in crate::policy_state) mod tests {
     /// A new consent without a reference or a provenance refuses and writes
     /// nothing.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_new_consent_without_reference_or_provenance_refuses() {
         let mut fx = Fx::new(300_000);
@@ -3711,6 +3742,7 @@ pub(in crate::policy_state) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn queued_consent_stores_its_reference() {
         let mut fx = Fx::new(300_000);
@@ -3777,6 +3809,7 @@ pub(in crate::policy_state) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_second_consent_keeps_its_receipt_rule() {
         let mut fx = Fx::new(300_000);

@@ -1,4 +1,6 @@
 pub mod child_process;
+#[cfg(feature = "testnet-acceptance")]
+pub mod payment_matrix;
 pub mod policy_mock;
 pub mod server_binary;
 pub mod source_contracts;

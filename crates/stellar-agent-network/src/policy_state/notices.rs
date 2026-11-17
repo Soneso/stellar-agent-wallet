@@ -287,6 +287,7 @@ mod tests {
     /// disagreements, success first; records and tombstones read through
     /// one verified read that leaves the authenticated bytes as they are.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn watch_classes_follow_state_and_disagreements() {
         use OperationState as S;
@@ -364,6 +365,7 @@ mod tests {
     /// Open records always count; a record or tombstone counts when it
     /// closed at or after the boundary.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn watch_classes_keep_the_since_boundary() {
         use OperationState as S;

@@ -270,7 +270,7 @@ test-helpers = ["stellar-agent-network/test-hooks",
 #     --test sep43_sign_and_submit_transaction_testnet_acceptance
 # This feature is CI/dev-only and MUST NOT be enabled in any release-artefact
 # feature set.
-testnet-acceptance = ["stellar-agent-test-support/testnet-helpers"]
+testnet-acceptance = ["stellar-agent-test-support/testnet-helpers", "stellar-agent-network/test-hooks"]
 
 # The live testnet suites build only with `testnet-acceptance`, so an offline
 # test run never links them.

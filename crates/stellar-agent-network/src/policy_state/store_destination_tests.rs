@@ -3,6 +3,7 @@ const DESTINATION_LEGACY_DIGEST: &str =
     "4bbe1cd433fa3bdde43ccc7f9a5281155f89d81ee40e0def2a28808bcf2a129f";
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn a_stale_second_process_keeps_the_destination() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -140,6 +141,7 @@ fn destination_entry(amount: i128) -> WindowEntry {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn reservations_carry_destinations_at_the_current_version() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -341,6 +343,7 @@ fn reservations_carry_destinations_at_the_current_version() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn an_unusable_destination_is_recorded_as_absent() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -372,6 +375,7 @@ fn an_unusable_destination_is_recorded_as_absent() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn unusable_provenance_projects_none() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -437,6 +441,7 @@ fn unusable_provenance_projects_none() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn every_rebuilt_receipt_keeps_its_destination() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -460,6 +465,7 @@ fn every_rebuilt_receipt_keeps_its_destination() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn a_destination_commit_survives_every_cut() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -469,6 +475,7 @@ fn a_destination_commit_survives_every_cut() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn a_destination_commit_survives_every_cut_after_counter() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -520,6 +527,7 @@ fn destination_commit_survives_cut(fault: u8) {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn an_expiry_keeps_its_destination_across_clock_moves() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();

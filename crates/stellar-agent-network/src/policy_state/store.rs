@@ -8033,6 +8033,7 @@ mod tests {
     )]
 
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn recovery_run_versions_and_safe_refusals() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -8213,6 +8214,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn an_unbounded_source_subject_never_closes() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -8245,6 +8247,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn closure_survives_each_commit_seam() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -8386,6 +8389,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn freshness_is_rechecked_at_the_protected_commit() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -8443,6 +8447,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn older_readers_refuse_final_intent_snapshots() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -8512,6 +8517,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn final_intent_snapshot_predicates_are_distinct() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -8852,6 +8858,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn reset_obeys_intent_retention_and_refusal_order() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -9084,6 +9091,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn intent_views_report_horizons_without_mutation() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -9155,6 +9163,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(mainnet_clock)]
     #[serial]
     async fn schedule_closure_requires_two_terminal_reads() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -9290,6 +9299,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn schedule_evidence_matches_guarded_record() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -9492,6 +9502,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn insufficient_evidence_keeps_intents_open() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -9641,6 +9652,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn readmission_cannot_reclassify_an_intent() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -9695,6 +9707,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn stored_testnet_default_primary_authorizes_capability() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -9735,6 +9748,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn overflowing_fallback_history_refuses_a_zero_authorization() {
         let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -9914,6 +9928,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial]
     fn intent_reset_explanations_follow_open_records_and_stored_endpoints() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -9965,6 +9980,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn reset_retains_closed_intents_on_store_clock() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -10016,6 +10032,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn stale_observation_commits_pruning_once() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -10082,6 +10099,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn witnessed_closure_requires_stored_pair() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -10259,6 +10277,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn intent_horizons_survive_window_lengthening() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -10298,6 +10317,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn refused_admission_commits_only_progress() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -10361,6 +10381,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn intent_horizon_overflow_changes_nothing() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -10456,6 +10477,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn final_submission_links_and_charges_once() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -10749,6 +10771,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn same_authority_with_changed_legs_refuses() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -10953,6 +10976,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn restart_preserves_exposed_intent_without_envelope() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -11016,6 +11040,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn malformed_intent_snapshots_refuse() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -13778,6 +13803,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn reset_consent_replaces_latest_record_and_survives_pruning() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -13962,6 +13988,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn owner_reset_preserves_all_reset_barriers() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -14105,6 +14132,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn owner_reset_preserves_terminal_history_and_unreleased_reservations() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -15636,6 +15664,7 @@ mod tests {
     /// obligation and the outcome marker stay owed. A different attempt at
     /// the same source and sequence suppresses nothing.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn recovery_expiry_suppression_completes_receipt_flag() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -15713,6 +15742,7 @@ mod tests {
     /// completes the flag with no second expiry projection call, and outcome
     /// repair then completes on its own.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn recovery_expiry_receipt_flag_replays_after_crash() {
         let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -15809,6 +15839,7 @@ mod tests {
     /// keeps it unset. Both keep the exact receipt and replay to completion
     /// without a second release or audit row.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn recovery_projection_acknowledgement_survives_commit_point() {
         let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -15880,6 +15911,7 @@ mod tests {
     /// evidence, keeping an operator clear; accounting and the outcome
     /// marker stay as they are.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn recovery_projection_heals_late_expiry_write() {
         let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -16179,6 +16211,7 @@ mod tests {
     /// acknowledgement persists. A stop before the generation commit leaves
     /// the prior authenticated state and owes nothing.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn restart_replays_exact_owed_decision() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -17258,6 +17291,7 @@ mod tests {
     /// straddling the caller's time, the one whose horizon it passed expires
     /// and the one whose horizon it has not reached is retained.
     #[tokio::test]
+    #[serial(mainnet_clock)]
     #[serial]
     async fn reconciliation_expires_accounting_at_the_callers_horizon() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -17670,6 +17704,7 @@ mod tests {
     /// longer duration at query time. Each record still expires on the duration
     /// it was admitted under.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn policy_duration_edits_apply_the_longer_window_at_query_time() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -18168,6 +18203,7 @@ mod tests {
     /// when its compaction never happened. A commitment naming another body
     /// refuses, and the next write uses the current write version.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn every_prepared_version_pair_survives_both_sides_of_the_commit_point() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -18507,6 +18543,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn an_operation_file_reserializes_byte_identically() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -18547,6 +18584,7 @@ mod tests {
     /// commits and the HMAC tag stay identical on both sides of the prepared
     /// commit.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn version_ten_file_reserializes_byte_identically() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -18597,6 +18635,7 @@ mod tests {
     /// successor, and a failed compaction leaves the successor readable
     /// beside its parent. The window totals follow the selected side.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn version_ten_prepared_pairs_survive_both_sides_of_the_commit_point() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -18703,6 +18742,7 @@ mod tests {
     /// An unrelated settled write to a version 10 file keeps its signed
     /// intent, its owed accounting expiry and its pending hold byte for byte.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn unrelated_write_preserves_intents_obligations_and_pending_holds() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -18886,6 +18926,7 @@ mod tests {
                 scope: stellar_agent_core::mainnet::decision::AuthorityScope::Classic,
             }),
             chain_deadline_ms: None,
+            restriction_end_ms: None,
             authorization_ttl_ms: 120_000,
             bindings: crate::mainnet::digest::BindingFacts {
                 endpoint: None,
@@ -18896,6 +18937,7 @@ mod tests {
                 reservation: None,
                 authority: [7; 32],
                 audit: [8; 32],
+                restriction: None,
             },
             holds: vec![],
             parent: None,
@@ -18911,6 +18953,7 @@ mod tests {
     /// is live, with the release row the operator clear wrote, and clears
     /// the floors.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn reset_refuses_open_operations_and_keeps_terminal_records() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -19174,6 +19217,7 @@ mod tests {
     /// commit moves it to the current write version. Every earlier section keeps its bytes,
     /// and the new file reserializes to itself.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_version_ten_file_migrates_to_twelve_preserving_every_section() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -19255,6 +19299,7 @@ mod tests {
     /// the current write version with its next commit, keeping every earlier section byte
     /// for byte.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_version_ten_golden_body_migrates_to_eleven() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -19333,6 +19378,7 @@ mod tests {
     /// policy authority, or operation content. Native amounts below version
     /// 10 refuse, and the amounts survive an operation write.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn native_amounts_need_version_ten_and_writers_select_twelve() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -19393,6 +19439,7 @@ mod tests {
     /// without authenticated scope refuses the operation write and stays
     /// unchanged.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn an_operation_write_preserves_authenticated_history() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -19468,6 +19515,7 @@ mod tests {
     /// The version pairs (10, 11) and (11, 11) are read on both sides of the
     /// commit point at every commit seam, as the version 10 pairs are.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn version_eleven_prepared_pairs_survive_both_sides_of_the_commit_point() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -19583,6 +19631,7 @@ mod tests {
     /// A commit with or without version-11 content selects the current write version on
     /// both version selections.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn version_eleven_file_never_selects_ten() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -19627,6 +19676,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_mint_that_fails_to_commit_leaves_the_record_pending() {
         use super::super::approvals::{ApprovalState, tests::Fx};
@@ -19666,6 +19716,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_rolled_back_file_cannot_restore_a_pending_record() {
         use super::super::approvals::{ApprovalState, tests::Fx};
@@ -19701,6 +19752,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn reset_refuses_pending_approvals_and_keeps_terminal_history() {
         use super::super::approvals::{ApprovalState, tests::Fx};
@@ -19806,6 +19858,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn approvals_select_wire_version_eleven() {
         use super::super::approvals::tests::Fx;
@@ -19839,6 +19892,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn approvals_section_survives_both_sides_of_the_commit_point() {
         use super::super::approvals::{ApprovalsSection, tests::Fx};
@@ -20192,6 +20246,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     #[cfg(feature = "mainnet-write")]
     fn a_claimed_record_blocks_the_mainnet_reset() {
@@ -20231,6 +20286,7 @@ mod tests {
     /// refuses the reset with nothing changed; once it expires, the reset
     /// proceeds. Without the mainnet rules the open record does not block.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_reset_refuses_while_a_mainnet_authorization_is_open() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -21008,6 +21064,7 @@ mod tests {
         // ── operator clears and cancellations ────────────────────────────
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn an_operator_clear_keeps_the_total_debit() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -21051,6 +21108,7 @@ mod tests {
         /// reservation's total once; a reservation it does not name, or one
         /// with an observed success, keeps its total.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn an_unsent_reservation_releases_only_its_own_total() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -21189,6 +21247,7 @@ mod tests {
         /// of 10, and the stale process's admission of 6 refuses because the
         /// writer rereads the file under the lock. Its 4 then admits.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_stale_second_process_cannot_overshoot() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -21255,6 +21314,7 @@ mod tests {
         /// One batch that spells one asset two ways fills one allocation: 6
         /// under `native` and 6 under its asset contract refuse against 10.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn two_spellings_in_one_batch_share_one_allocation() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -21294,6 +21354,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn pre_exposure_cancellation_keeps_the_total() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -21317,6 +21378,7 @@ mod tests {
         // ── the projection ───────────────────────────────────────────────
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn snapshot_hydration_uses_capture_time_and_keeps_its_image() {
             let guard_home = tempfile::tempdir().unwrap();
@@ -21405,6 +21467,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_row_sum_overflow_refuses() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -21421,13 +21484,15 @@ mod tests {
             let mut wire = version_twelve();
             f.push_row(&mut wire, i128::MAX, Some(D1));
             f.push_row(&mut wire, 1, Some(D1));
-            assert_eq!(
-                detail(total_in_file(&wire, &f.total_key(), D1).map(drop)),
-                "a total-budget sum overflows"
+            let result = total_in_file(&wire, &f.total_key(), D1);
+            assert!(
+                matches!(&result, Err(WindowStoreError::Invalid { detail }) if detail == "a total-budget sum overflows"),
+                "row amounts refuse overflow with the typed sum error: {result:?}"
             );
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_hold_sum_overflow_refuses() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -21444,15 +21509,17 @@ mod tests {
             let mut wire = version_twelve();
             f.push_row(&mut wire, i128::MAX, Some(D1));
             wire.holds.push(total_hold(1, 1, Some(D1)));
-            assert_eq!(
-                detail(total_in_file(&wire, &f.total_key(), D1).map(drop)),
-                "a total-budget sum overflows"
+            let result = total_in_file(&wire, &f.total_key(), D1);
+            assert!(
+                matches!(&result, Err(WindowStoreError::Invalid { detail }) if detail == "a total-budget sum overflows"),
+                "row and hold amounts refuse overflow with the typed sum error: {result:?}"
             );
         }
 
         // ── admission ────────────────────────────────────────────────────
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn record_and_persist_refuses_a_total_entry() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -21483,6 +21550,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn record_authorized_admits_a_total_once() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -21505,6 +21573,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_total_admission_binds_the_pin() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -21546,6 +21615,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn negative_incoming_totals_refuse() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -21583,6 +21653,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn the_successor_is_validated_before_commit() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -21619,6 +21690,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn an_admission_overflow_refuses() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -21675,6 +21747,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_mixed_digest_batch_accumulates_per_digest() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -21692,6 +21765,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn same_digest_batch_cannot_overshoot() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -21750,6 +21824,7 @@ mod tests {
         /// directory before it starts, so the facade's conventional store
         /// path lies under that directory.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn post_confirm_recording_skips_total_entries() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -21840,6 +21915,7 @@ mod tests {
         /// hydrated gate reports, and durable admission in that bucket still
         /// refuses as an invalid record.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_negative_stored_total_never_lowers_the_reported_use() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -21874,6 +21950,7 @@ mod tests {
         /// total admission in that bucket refuses, as an invalid record; a
         /// total admission in another bucket of the same file succeeds.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_negative_stored_total_refuses_only_its_bucket() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -21946,6 +22023,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn new_fields_need_version_twelve() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -22021,6 +22099,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn prepared_successors_validate_before_writing() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -22102,6 +22181,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn owner_reset_preserves_total_history() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -22163,6 +22243,7 @@ mod tests {
         /// A reset keeps D1's settled 6. Under a new pin D2 charges 4 from
         /// zero; back on D1 the 6 still counts, and 5 refuses against 10.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_reset_and_a_repin_keep_each_digest() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -22195,6 +22276,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn reset_survives_every_commit_fault() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -22262,6 +22344,7 @@ mod tests {
         // ── earlier builds ───────────────────────────────────────────────
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_pin_advanced_before_upgrade_moves_nothing() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -22288,6 +22371,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn pruned_earlier_history_retires_the_digest() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -22314,6 +22398,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_new_digest_admits_after_retirement() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -22335,6 +22420,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn retirement_is_written_once() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -22365,6 +22451,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn retirement_survives_a_commit_fault() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -22415,6 +22502,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn earlier_history_without_a_pin_refuses() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -22453,6 +22541,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn retirement_leaves_the_original_untouched() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -22498,6 +22587,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn retirement_rereads_under_the_lock() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -22556,6 +22646,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn unmarked_content_selects_twelve_and_writes_carry_the_marker() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -22600,6 +22691,7 @@ mod tests {
         /// floor also stays. The retirement threshold stays at the epoch
         /// version.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn final_charges_and_sums_select_the_sums_version() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -22647,6 +22739,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn an_older_reader_refuses_version_twelve() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -22681,6 +22774,7 @@ mod tests {
 
         /// Admitted authorized spend of 2 is a final charge.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn authorized_spend_is_a_final_charge() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -22697,6 +22791,7 @@ mod tests {
         /// folds into a sum of 6. Restarts with a clock before the row and
         /// far past it read 6 and refuse 5 against 10.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_final_charge_folds_strictly_after_retention() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -22730,6 +22825,7 @@ mod tests {
 
         /// Repeated writes after a fold keep one sum of 6 and no source row.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_repeated_fold_adds_once() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -22757,6 +22853,7 @@ mod tests {
         /// final 6 fold into exactly 10, which admits 0 and refuses 1. A
         /// final 0 folds into a sum of 0.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn sum_arithmetic_is_checked_at_the_limits() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -22798,6 +22895,7 @@ mod tests {
         /// D2's 2 and scope 2's 1 keep their own sums, in the file and in
         /// hydration.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn aliases_fold_into_one_sum_per_scope_and_digest() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -22842,6 +22940,7 @@ mod tests {
         /// of 2. Past retention only the proven 2 folds; the claim stays an
         /// individual counted row.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn only_a_proven_origin_upgrades_to_a_final_charge() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -22883,6 +22982,7 @@ mod tests {
         /// representation of 6: the row before the counter commits, the sum
         /// after it. A repeated write keeps 6.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_fold_follows_the_commit_counter() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -22919,6 +23019,7 @@ mod tests {
         /// A first final charge whose file write fails after its counter
         /// commits leaves a typed refusal, not an empty allocation.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn an_interrupted_first_charge_refuses_typed() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -22942,6 +23043,7 @@ mod tests {
         /// Each malformed sum or marker refuses the current and the prepared
         /// image with its typed detail.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn malformed_sums_and_markers_refuse_in_both_images() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -23056,6 +23158,7 @@ mod tests {
         /// Two OS processes on one store: the first commits 6 and folds it
         /// into a sum; the second, hydrated before, refuses 6 and admits 4.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_stale_process_counts_a_folded_sum() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -23113,6 +23216,7 @@ mod tests {
         /// without a new retirement or signature. It moves to the sums
         /// version and keeps 6.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_version_twelve_file_upgrades_without_retirement() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -23139,6 +23243,7 @@ mod tests {
         /// expiry, which writes no pruning step. The successor still marks
         /// the 2 final, and the 2 folds once it is older than retention.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_first_unpruned_commit_promotes_legacy_rows() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -23183,6 +23288,7 @@ mod tests {
         /// snapshot holding a final charge and a prepared image that marks
         /// one beside a version 12 parent.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_version_fourteen_reader_refuses_both_images() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -23227,6 +23333,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn retirement_refuses_every_total_admission() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -23265,6 +23372,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn retirement_survives_pruning() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -23305,6 +23413,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_signed_intent_admits_and_exhausts_a_total_leg() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -23393,6 +23502,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn record_and_persist_refuses_a_total_limit_on_a_windowed_key() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -23415,6 +23525,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn record_and_persist_refuses_an_amount_limit_on_a_total_key() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -23437,6 +23548,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn record_authorized_refuses_a_total_limit_on_a_windowed_key() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -23455,6 +23567,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn record_authorized_refuses_an_amount_limit_on_a_total_key() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -23473,6 +23586,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn record_pending_refuses_a_total_limit_on_a_windowed_key() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -23491,6 +23605,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn record_pending_refuses_an_amount_limit_on_a_total_key() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -23509,6 +23624,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn record_pending_linked_refuses_a_total_limit_on_a_windowed_key() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -23536,6 +23652,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn record_pending_linked_refuses_an_amount_limit_on_a_total_key() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -23563,6 +23680,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_signed_intent_refuses_a_total_limit_on_a_windowed_key() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -23585,6 +23703,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_signed_intent_refuses_an_amount_limit_on_a_total_key() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -23607,6 +23726,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_total_entry_needs_its_epoch() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();

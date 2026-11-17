@@ -3582,6 +3582,7 @@ mod tests {
     ///    (the external-contract shape, e.g. `SAC.transfer` invoked as a
     ///    sub-invocation of an external router).
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn ed25519_rule_signer_arm_patches_credential_and_omits_g_key() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4829,6 +4830,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial_test::serial(mainnet_clock)]
         #[serial_test::serial]
         async fn a_refusal_before_the_first_signature_cancels_the_admission() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();

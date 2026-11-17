@@ -25,7 +25,8 @@
 //!   The toolset gate is ADDITIVE, never substitutive.
 //! - No signing/key/policy tool is reachable via an ungated capability grant;
 //!   the signing actions (sign-payment, sign-rule-create) route to the signing
-//!   commit tools only behind a first-invoke grant and a per-action approval.
+//!   commit tools only behind a first-invoke grant. Payment consent follows
+//!   the composed policies; rule creation requires per-action approval.
 //! - `stellar_toolset_invoke` is annotated destructive, so on mainnet the
 //!   default policy engine refuses it.
 //! - A toolset narrows what this dispatcher routes. It does not restrict the
@@ -309,8 +310,8 @@ impl WalletServer {
     /// the ungated matrix contains no such tool regardless of declared
     /// capabilities.  The signing actions (sign-payment, sign-rule-create)
     /// route to `stellar_pay_commit` and `stellar_rule_create_commit` only
-    /// through the gated resolver, behind a first-invoke grant and a
-    /// per-action approval.
+    /// through the gated resolver and a first-invoke grant. Payment approval
+    /// follows the composed policies; rule creation requires per-action approval.
     ///
     /// # Tool annotations
     ///
@@ -325,9 +326,8 @@ impl WalletServer {
     /// - `profile.halted` or `profile.halt_unreadable`: the action names a tool
     ///   that is not read-only and the profile is halted, answered before any
     ///   other step.
-    /// - `network.mainnet_write_forbidden`: a signing action (sign-payment or
-    ///   rule-create) on a mainnet profile, answered as a business envelope
-    ///   before any gate, approval, key access, or RPC request.
+    /// - `network.mainnet_write_forbidden`: mainnet payment setup is incomplete,
+    ///   or a mainnet action has no admitted route. Rule creation stays excluded.
     /// - `policy.engine_required` and the other dispatch-gate refusals: a non-signing
     ///   action on a mainnet profile, refused by the dispatcher's policy gate.
     /// - `toolset.pin_unverifiable`: the install record does not verify under
@@ -349,7 +349,8 @@ impl WalletServer {
                        package; `action` must be granted by the toolset's declared \
                        capabilities, read from its authenticated install record. Signing \
                        actions (sign-payment, sign-rule-create) route to the signing commit \
-                       tools behind a first-invoke grant and a per-action approval. A toolset \
+                       tools behind a first-invoke grant. Payment consent follows the \
+                       composed policies; rule creation requires per-action approval. A toolset \
                        adds these gates; it does not restrict the native tools this server \
                        also exposes.",
         annotations(read_only_hint = false, destructive_hint = true)
@@ -374,66 +375,59 @@ impl WalletServer {
             return Ok(refusal);
         }
 
-        // Signing actions refuse here; other actions reach the dispatcher's
-        // policy gate, which refuses them on mainnet.
+        let is_payment = matches!(action.as_str(), "stellar_pay" | "stellar_pay_commit");
         let is_signing_action = matrix::GATED_MATRIX_ENTRIES
             .iter()
             .any(|(_, tools)| tools.contains(&action.as_str()));
-        if is_signing_action && self.context.chain_id.is_mainnet() {
+        let mainnet_payment = self.context.chain_id.is_mainnet() && is_payment;
+        if self.context.chain_id.is_mainnet() && is_signing_action && !is_payment {
+            return Ok(crate::tools::common::mainnet_write_forbidden_result());
+        }
+        if mainnet_payment {
+            let guard = match self
+                .mainnet_write_admission(stellar_agent_network::mainnet::MainnetConsumer::McpPay)
+            {
+                Ok(guard) => guard,
+                Err(result) => return Ok(result),
+            };
+            if let Err(result) = self.verify_mainnet_freshness(&guard) {
+                return Ok(result);
+            }
+            let chain = args
+                .chain_id
+                .as_deref()
+                .filter(|chain| !chain.is_empty())
+                .or_else(|| {
+                    args.args
+                        .get("chain_id")
+                        .and_then(serde_json::Value::as_str)
+                })
+                .unwrap_or("");
+            stellar_agent_core::profile::caip2::validate_chain_id_matches_profile(
+                chain,
+                self.security_profile(),
+            )
+            .map_err(|error| {
+                rmcp::ErrorData::invalid_params(format!("chain_id mismatch: {error}"), None)
+            })?;
+        }
+        let outer = if mainnet_payment {
+            None
+        } else {
+            match self
+                .toolset_outer_gate(&toolset_name, &action, &args.args, args.chain_id.as_deref())
+                .await
+            {
+                Ok(outcome) => Some(outcome),
+                Err(error) => return error.into_result(),
+            }
+        };
+        // A signed outer payment rule grants no route to another mainnet action.
+        if self.context.chain_id.is_mainnet() && !is_payment {
             return Ok(crate::tools::common::mainnet_write_forbidden_result());
         }
 
-        let args_value = json!({
-            "toolset": &toolset_name,
-            "action": &action,
-        });
-        // Payment effects come from the envelope or the routed arguments.
-        // The routed gate enforces approval and reads live account state.
-        let payment_value = toolset_payment_value(
-            &action,
-            &args.args,
-            args.chain_id.as_deref(),
-            self.mainnet_context.is_some(),
-        );
-        let outer = match payment_value {
-            Some(Ok(value)) => {
-                self.dispatch_gate_provisional("stellar_toolset_invoke", &args_value, "", value)
-                    .await
-            }
-            Some(Err(err)) => return err.into_result(),
-            None => {
-                self.dispatch_gate("stellar_toolset_invoke", &args_value, "")
-                    .await
-            }
-        };
-        if let Err(e) = outer {
-            return e.into_result();
-        }
-
-        let toolsets_root = {
-            #[cfg(any(test, feature = "test-helpers"))]
-            {
-                if let Some(ref override_root) = self.toolsets_root_override {
-                    override_root.clone()
-                } else {
-                    stellar_agent_core::profile::schema::default_toolsets_dir().map_err(|e| {
-                        rmcp::ErrorData::internal_error(
-                            format!("toolset.toolsets_dir_error: {e}"),
-                            None,
-                        )
-                    })?
-                }
-            }
-            #[cfg(not(any(test, feature = "test-helpers")))]
-            {
-                stellar_agent_core::profile::schema::default_toolsets_dir().map_err(|e| {
-                    rmcp::ErrorData::internal_error(
-                        format!("toolset.toolsets_dir_error: {e}"),
-                        None,
-                    )
-                })?
-            }
-        };
+        let toolsets_root = self.toolsets_root()?;
 
         // ── Check if this is a gated action ───────────────────────────────────
         //
@@ -456,7 +450,7 @@ impl WalletServer {
         }
         if is_signing_action {
             return self
-                .route_to_gated_resolver(&toolset_name, &action, &args, &toolsets_root)
+                .route_to_gated_resolver(&toolset_name, &action, &args, &toolsets_root, outer)
                 .await;
         }
 
@@ -529,13 +523,40 @@ impl WalletServer {
         //
         // The routed handler evaluates its tool-specific arguments and live
         // account views. Its strict decision and approval govern submission.
-        self.route_to_matrix_tool(tool_name, tool_args_value).await
+        let preparation =
+            (tool_name == "stellar_pay").then_some(super::pay::ToolsetPreparationContext {
+                toolset: toolset_name,
+                action,
+                outer,
+            });
+        self.route_to_matrix_tool(tool_name, tool_args_value, preparation)
+            .await
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Gated resolver routing
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// The destination, asset, and amount in stroops a grant is checked for,
+/// from a payment's decoded authoritative arguments.
+fn grant_invocation_facts(authoritative: &serde_json::Value) -> (String, String, i64) {
+    let destination = authoritative
+        .get("destination")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+    let asset = authoritative
+        .get("asset")
+        .and_then(|v| v.as_str())
+        .unwrap_or("XLM")
+        .to_owned();
+    let amount_stroops = authoritative
+        .get("amount_stroops")
+        .and_then(crate::tools::amount_wire::value_as_stroops_i64)
+        .unwrap_or(0_i64);
+    (destination, asset, amount_stroops)
+}
 
 /// Payment fields shared by preparation and sign-payment routes.
 /// Both routes use the payment parser before deriving or signing an amount.
@@ -550,6 +571,111 @@ struct GatedPaymentFields {
 }
 
 impl WalletServer {
+    /// Evaluates the outer `stellar_toolset_invoke` rule of one invocation
+    /// over its raw toolset and action names.
+    ///
+    /// Payment effects come from the envelope or the routed arguments, and
+    /// only without a mainnet context. The routed gate enforces approval and
+    /// reads live account state.
+    pub(crate) async fn toolset_outer_gate(
+        &self,
+        toolset: &str,
+        action: &str,
+        args: &serde_json::Value,
+        chain_id: Option<&str>,
+    ) -> Result<super::common::DispatchOutcome, super::common::ToolError> {
+        let args_value = json!({
+            "toolset": toolset,
+            "action": action,
+        });
+        match toolset_payment_value(action, args, chain_id, self.mainnet_context.is_some()) {
+            Some(Ok(value)) => {
+                self.dispatch_gate_provisional("stellar_toolset_invoke", &args_value, "", value)
+                    .await
+            }
+            Some(Err(err)) => Err(err),
+            None => {
+                self.dispatch_gate("stellar_toolset_invoke", &args_value, "")
+                    .await
+            }
+        }
+    }
+
+    /// The root directory of installed toolsets.
+    fn toolsets_root(&self) -> Result<std::path::PathBuf, rmcp::ErrorData> {
+        #[cfg(any(test, feature = "test-helpers"))]
+        if let Some(ref override_root) = self.toolsets_root_override {
+            return Ok(override_root.clone());
+        }
+        stellar_agent_core::profile::schema::default_toolsets_dir().map_err(|e| {
+            rmcp::ErrorData::internal_error(format!("toolset.toolsets_dir_error: {e}"), None)
+        })
+    }
+
+    /// Acquires the lease on the grant `context` holds for the payment that
+    /// `authoritative` describes, the decoded envelope of the commit.
+    ///
+    /// # Errors
+    ///
+    /// The runtime's refusal under its own wire code, such as
+    /// `toolset.grant_changed`, `toolset.grant_expired`,
+    /// `toolset.grant_invocation_mismatch`, or `toolset.coordination_busy`;
+    /// `policy.approval_required` without the attestation key.
+    pub(crate) fn lease_toolset_grant(
+        &self,
+        context: &super::pay::ToolsetPaymentContext,
+        authoritative: &serde_json::Value,
+    ) -> Result<stellar_agent_toolsets_runtime::ToolsetGrantLease, CallToolResult> {
+        let internal = |error: rmcp::ErrorData| {
+            crate::tools::common::business_error_result("toolset.enforcement_error", error.message)
+        };
+        let profile_name = self.profile_name_for_approval();
+        let (attestation_key, attestation_binding) =
+            self.load_gated_attestation_key(&profile_name)?;
+        let toolsets_root = self.toolsets_root().map_err(internal)?;
+        let pin_key = self.toolset_pin_key().map_err(internal)?;
+        let (destination, asset, amount_stroops) = grant_invocation_facts(authoritative);
+        let params = stellar_agent_toolsets_runtime::GrantRecheckParams {
+            toolset_name: &context.toolset,
+            action: &context.action,
+            toolsets_root: &toolsets_root,
+            profile_name: &profile_name,
+            attestation_key: &attestation_key,
+            attestation_binding: &attestation_binding,
+            authoritative_destination: &destination,
+            authoritative_asset: &asset,
+            authoritative_amount_stroops: amount_stroops,
+            pin_key: pin_key.as_ref(),
+            #[cfg(feature = "test-helpers")]
+            grant_store_path_override: self.grant_store_path_override.clone(),
+        };
+        stellar_agent_toolsets_runtime::acquire_toolset_grant_lease(&context.grant, &params)
+            .map_err(|error| {
+                let text = error.to_string();
+                let (code, message) = text
+                    .split_once(": ")
+                    .unwrap_or(("toolset.enforcement_error", text.as_str()));
+                crate::tools::common::business_error_result(code, message)
+            })
+    }
+
+    /// The restriction that owns `lease` for one payment commit.
+    pub(crate) fn toolset_restriction(
+        &self,
+        lease: stellar_agent_toolsets_runtime::ToolsetGrantLease,
+    ) -> stellar_agent_network::mainnet::restriction::ToolsetRestriction {
+        #[cfg(any(test, feature = "test-helpers"))]
+        if let Some(probe) = &self.toolset_lease_release_probe {
+            return stellar_agent_network::mainnet::restriction::ToolsetRestriction::new(Box::new(
+                ProbedLease {
+                    lease,
+                    probe: std::sync::Arc::clone(probe),
+                },
+            ));
+        }
+        stellar_agent_network::mainnet::restriction::ToolsetRestriction::new(Box::new(lease))
+    }
+
     /// Reads the installation's toolset pin key for one toolset call.
     ///
     /// Read per call, so a key minted by an install after this server started
@@ -617,9 +743,8 @@ impl WalletServer {
     ///    approval.
     /// 3. Four-part check via the gated matrix.
     /// 4. First-invoke gate check (via `resolve_toolset_sign_payment_gated`).
-    /// 5. On `GatedResolveOutcome::Resolved` → route to `stellar_pay_commit`
-    ///    with per-action `PaymentSimulated` approval FORCED ON (Override
-    ///    `Allow → RequireApproval`).
+    /// 5. On `GatedResolveOutcome::Resolved`, move the verified grant and outer
+    ///    outcome to the shared payment handler for policy composition.
     /// 6. On `GatedResolveOutcome::FirstInvokeApprovalRequired` → return
     ///    `FirstInvokeApprovalRequired` typed error with `approval_nonce`.
     ///
@@ -654,6 +779,7 @@ impl WalletServer {
         action: &str,
         toolset_args: &StellarToolsetInvokeArgs,
         toolsets_root: &std::path::Path,
+        outer: Option<super::common::DispatchOutcome>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         use stellar_agent_core::approval::process_uid_for_attestation;
         use stellar_agent_core::envelope_decode::decode_authoritative_args;
@@ -737,20 +863,20 @@ impl WalletServer {
                 )
             })?;
 
-        let destination = authoritative_args
-            .get("destination")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_owned();
-        let asset = authoritative_args
-            .get("asset")
-            .and_then(|v| v.as_str())
-            .unwrap_or("XLM")
-            .to_owned();
-        let amount_stroops = authoritative_args
-            .get("amount_stroops")
-            .and_then(crate::tools::amount_wire::value_as_stroops_i64)
-            .unwrap_or(0_i64);
+        use stellar_agent_core::envelope_decode::{
+            ClassicOperation, ClassicTransactionKind, classic_summary,
+        };
+        if !matches!(
+            classic_summary(&envelope_xdr, ClassicTransactionKind::Payment)
+                .map(|summary| summary.operation),
+            Ok(ClassicOperation::Payment { .. })
+        ) {
+            return Ok(super::common::business_error_result(
+                "simulation.divergence",
+                "toolset_gated envelope_xdr decode: sign-payment needs one payment operation",
+            ));
+        }
+        let (destination, asset, amount_stroops) = grant_invocation_facts(&authoritative_args);
 
         // Validate: the destination is a G or M classic account. The parser
         // checks the base32 checksum and version byte. An M destination keeps
@@ -813,6 +939,10 @@ impl WalletServer {
         };
 
         match resolve_toolset_sign_payment_gated(&gated_params) {
+            Err(ToolsetRuntimeError::CoordinationBusy) => Ok(super::common::business_error_result(
+                "toolset.coordination_busy",
+                "a toolset writer is active; retry this invocation",
+            )),
             Err(e) => {
                 // Hard errors (toolset not installed, capability not declared, etc.)
                 let err = match e {
@@ -872,31 +1002,27 @@ impl WalletServer {
                 ))
             }
 
-            Ok(GatedResolveOutcome::Resolved { tool_name, .. }) => {
-                // Gate passed (current grant found).
-                // Force per-action PaymentSimulated approval UNCONDITIONALLY,
-                // overriding DispatchOutcome::Allow.
-                // Route to stellar_pay_commit via the gated commit path.
-                self.route_to_gated_commit(tool_name, toolset_args, envelope_xdr)
+            Ok(GatedResolveOutcome::Resolved { tool_name, grant }) => {
+                let context = super::pay::ToolsetPaymentContext {
+                    toolset: toolset_name.to_owned(),
+                    action: action.to_owned(),
+                    grant,
+                    outer,
+                };
+                self.route_to_gated_commit(tool_name, toolset_args, envelope_xdr, context)
                     .await
             }
         }
     }
 
-    /// Routes to `stellar_pay_commit` with the per-action `PaymentSimulated`
-    /// approval FORCED ON UNCONDITIONALLY.
-    ///
-    /// This method synthesises a `RequireApproval` dispatch outcome if the
-    /// policy engine returned `Allow`, ensuring the per-action human
-    /// envelope-review approval fires for every toolset-routed payment.
-    ///
-    /// The `approval_nonce` and `approval_attestation` must be present in
-    /// `toolset_args.args` for the forced-approval path.
+    /// Routes a verified invocation to the shared payment commit handler.
+    /// Argument injection finishes before the dangerous-key check.
     async fn route_to_gated_commit(
         &self,
         tool_name: &'static str,
         toolset_args: &StellarToolsetInvokeArgs,
         envelope_xdr: String,
+        context: super::pay::ToolsetPaymentContext,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         // Build the full tool args, injecting chain_id and envelope_xdr.
         let chain_id = toolset_args.chain_id.as_deref().unwrap_or("");
@@ -942,7 +1068,8 @@ impl WalletServer {
 
         // Route to stellar_pay_commit via the gated routing arm.
         // The tool_name here is "stellar_pay_commit" (a &'static str constant).
-        self.route_to_gated_tool(tool_name, tool_args_value).await
+        self.route_to_gated_tool(tool_name, tool_args_value, Some(context))
+            .await
     }
 
     /// Route a toolset-routed `sign-rule-create` action through the GATED
@@ -1186,7 +1313,8 @@ impl WalletServer {
             rmcp::ErrorData::invalid_params(format!("toolset.args_validation: {e}"), None)
         })?;
 
-        self.route_to_gated_tool(tool_name, tool_args_value).await
+        self.route_to_gated_tool(tool_name, tool_args_value, None)
+            .await
     }
 }
 
@@ -1195,27 +1323,16 @@ impl WalletServer {
 // ─────────────────────────────────────────────────────────────────────────────
 
 impl WalletServer {
-    /// Route to a GATED tool by its `&'static str` name constant.
-    ///
-    /// Unlike `route_to_matrix_tool`, this entry point routes to signing-adjacent
-    /// tools (`stellar_pay_commit`) with the per-action `PaymentSimulated` approval
-    /// FORCED ON UNCONDITIONALLY.
-    ///
-    /// The `args` object MUST contain `approval_nonce` and `approval_attestation`
-    /// (pre-approved per-action `PaymentSimulated` approval) for the commit to
-    /// succeed.  If the caller provides these (from a previously-approved
-    /// `PaymentSimulated` pending approval), the commit proceeds.  If absent,
-    /// `stellar_pay_commit` returns `policy.approval_required` as usual —
-    /// this is the correct behaviour (the forced gate fired; the operator must
-    /// approve via `stellar-agent approve --id <nonce> --profile <name>`).
+    /// Routes gated signing actions. Payments carry a verified invocation;
+    /// rule creation retains its per-proposal approval requirement.
     ///
     /// # Errors
-    ///
-    /// Returns an MCP error from `stellar_pay_commit` on any failure.
+    /// Returns the routed handler's refusal or an invalid argument error.
     pub(crate) async fn route_to_gated_tool(
         &self,
         tool_name: &'static str,
         args: serde_json::Value,
+        context: Option<super::pay::ToolsetPaymentContext>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         match tool_name {
             "stellar_pay_commit" => {
@@ -1229,9 +1346,7 @@ impl WalletServer {
                             None,
                         )
                     })?;
-                // Route via invoke_stellar_pay_commit_toolset_gated which forces
-                // RequireApproval unconditionally.
-                self.invoke_stellar_pay_commit_toolset_gated(typed).await
+                self.stellar_pay_commit_impl(typed, context).await
             }
             "stellar_rule_create_commit" => {
                 let typed: super::rule_create::StellarRuleCreateCommitArgs =
@@ -1297,6 +1412,7 @@ impl WalletServer {
         &self,
         tool_name: &'static str,
         args: serde_json::Value,
+        preparation: Option<super::pay::ToolsetPreparationContext>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         match tool_name {
             "stellar_balances" => {
@@ -1323,7 +1439,7 @@ impl WalletServer {
                             None,
                         )
                     })?;
-                self.invoke_stellar_pay(typed).await
+                self.invoke_stellar_pay(typed, preparation).await
             }
             "stellar_claim" => {
                 let typed: super::claim::StellarClaimArgs =
@@ -1452,6 +1568,27 @@ impl TypeStrName for serde_json::Value {
     }
 }
 
+/// A grant lease that runs a test probe as it drops, before its locks do.
+#[cfg(any(test, feature = "test-helpers"))]
+struct ProbedLease {
+    lease: stellar_agent_toolsets_runtime::ToolsetGrantLease,
+    probe: std::sync::Arc<dyn Fn() + Send + Sync>,
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl stellar_agent_core::mainnet::toolset_grant::ToolsetGrantEvidence for ProbedLease {
+    fn facts(&self) -> stellar_agent_core::mainnet::toolset_grant::ToolsetGrantFacts<'_> {
+        stellar_agent_core::mainnet::toolset_grant::ToolsetGrantEvidence::facts(&self.lease)
+    }
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl Drop for ProbedLease {
+    fn drop(&mut self) {
+        (self.probe)();
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Unit tests for route_to_matrix_tool fail-closed `other =>` arm
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1472,7 +1609,7 @@ mod tests {
     use crate::server::WalletServer;
 
     #[test]
-    fn mainnet_context_keeps_raw_outer_gate() {
+    fn raw_payment_facts_are_provisional_only_off_mainnet() {
         let args = serde_json::json!({
             "source": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
             "destination": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
@@ -2042,6 +2179,71 @@ impl WalletServer {
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         self.stellar_toolset_invoke(rmcp::handler::server::wrapper::Parameters(args))
             .await
+    }
+
+    /// Builds the toolset context of a payment commit for `invoke` from the
+    /// gated resolver's `resolved` outcome. Without a mainnet context it runs
+    /// the invocation's outer gate and carries its outcome.
+    ///
+    /// # Errors
+    ///
+    /// A `FirstInvokeApprovalRequired` outcome refuses with
+    /// `toolset.first_invoke_approval_required`; an outer gate refusal
+    /// answers with its own error.
+    pub(crate) async fn toolset_payment_context(
+        &self,
+        invoke: &StellarToolsetInvokeArgs,
+        resolved: GatedResolveOutcome,
+    ) -> Result<super::pay::ToolsetPaymentContext, super::common::ToolError> {
+        let GatedResolveOutcome::Resolved { grant, .. } = resolved else {
+            return Err(super::common::ToolError::Business(
+                crate::tools::common::business_error_result(
+                    "toolset.first_invoke_approval_required",
+                    "the invocation has no verified grant",
+                ),
+            ));
+        };
+        let outer = if self.mainnet_context.is_some() {
+            None
+        } else {
+            Some(
+                self.toolset_outer_gate(
+                    &invoke.toolset,
+                    &invoke.action,
+                    &invoke.args,
+                    invoke.chain_id.as_deref(),
+                )
+                .await?,
+            )
+        };
+        Ok(super::pay::ToolsetPaymentContext {
+            toolset: invoke.toolset.clone(),
+            action: invoke.action.clone(),
+            grant,
+            outer,
+        })
+    }
+
+    /// Commits a payment through the shared handler with the toolset context
+    /// [`Self::toolset_payment_context`] builds for `invoke` and `resolved`.
+    ///
+    /// Integration-test entry point for independently checked grant snapshots.
+    ///
+    /// # Errors
+    ///
+    /// As `stellar_pay_commit`.
+    #[doc(hidden)]
+    pub async fn call_stellar_pay_commit_in_toolset(
+        &self,
+        invoke: &StellarToolsetInvokeArgs,
+        resolved: GatedResolveOutcome,
+        args: super::pay::StellarPayCommitArgs,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let context = match self.toolset_payment_context(invoke, resolved).await {
+            Ok(context) => context,
+            Err(error) => return error.into_result(),
+        };
+        self.stellar_pay_commit_impl(args, Some(context)).await
     }
 }
 

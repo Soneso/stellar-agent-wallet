@@ -355,6 +355,23 @@ mod tests {
     #[test]
     fn render_json_to_escapes_format_characters_and_keeps_the_value() {
         let name = "caf\u{e9}\u{202e}\u{200d}\u{85}\u{7f}\u{e0041}rule";
+        let refusal = Envelope::<()>::err_raw(
+            "toolset.grant_changed",
+            format!("toolset \"{name}\": resolve the invocation again\n"),
+        );
+        let mut error_out = Vec::new();
+        assert!(render_json_to(&mut error_out, &refusal).is_ok());
+        let error_text = String::from_utf8(error_out.clone()).unwrap_or_default();
+        assert!(
+            error_text.contains(r#""message":"toolset \"café\u202e\u200d\u0085\u007f\udb40\udc41rule\": resolve the invocation again\n""#),
+            "the CLI refusal escapes the complete identifier: {error_text}"
+        );
+        let error = single_json_document(&error_out);
+        assert_eq!(error["error"]["code"], "toolset.grant_changed");
+        assert_eq!(
+            error["error"]["message"],
+            format!("toolset \"{name}\": resolve the invocation again\n")
+        );
         let mut out = Vec::new();
         let written = render_json_to(&mut out, &Envelope::ok(serde_json::json!({ "name": name })));
         assert!(written.is_ok(), "{written:?}");

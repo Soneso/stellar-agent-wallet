@@ -768,7 +768,7 @@ impl WalletServer {
                     expires_at_ms,
                     &profile_name,
                     request,
-                    crate::tools::pay::PaymentQueue::Forced,
+                    crate::tools::pay::PaymentQueue::Toolset(None),
                 )
                 .map_err(|error| {
                     match crate::tools::common::payment_recovery_wire_error(&error, &profile_name) {

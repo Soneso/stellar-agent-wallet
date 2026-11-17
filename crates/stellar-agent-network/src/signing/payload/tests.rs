@@ -396,6 +396,7 @@ mod authorized {
     /// The mainnet transaction payload is the transaction hash the
     /// authorization binds.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn the_mainnet_transaction_payload_is_the_bound_hash() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -416,6 +417,7 @@ mod authorized {
 
     /// An authorization for another transaction hash builds no payload.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn another_transaction_hash_is_refused() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -437,6 +439,7 @@ mod authorized {
     /// An authorization bound to a chain other than mainnet builds no
     /// payload.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_non_mainnet_authorization_is_refused() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -454,6 +457,7 @@ mod authorized {
     /// A fee bump is a domain of its own and builds no transaction
     /// payload under a transaction authorization.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_fee_bump_is_refused_under_a_transaction_authorization() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -472,6 +476,7 @@ mod authorized {
     /// signature over `SHA-256` of the preimage's XDR, and hands back the
     /// signed intent of the same authorization.
     #[tokio::test]
+    #[serial(mainnet_clock)]
     #[serial]
     async fn the_approved_preimage_signs_once_and_yields_the_signed_intent() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -508,6 +513,7 @@ mod authorized {
     /// another invocation, nonce, expiration ledger, network, consumer, or
     /// preimage type.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_preimage_the_authorization_does_not_name_is_refused() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -589,6 +595,7 @@ mod authorized {
     /// authorization's signer is refused before the expected signer is
     /// compared, so a mismatch of both reports the address.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_preimage_bound_to_another_address_is_refused_first() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -619,6 +626,7 @@ mod authorized {
     /// An expected signer other than the authorization's builds no
     /// payload.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn another_expected_signer_is_refused() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -644,6 +652,7 @@ mod authorized {
     /// call is accepted at the issue time, refused before it and at the
     /// expiry, and fails when the clock cannot be read.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn the_constructor_reads_the_mainnet_clock() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -679,6 +688,7 @@ mod authorized {
     /// authorization's after one public-key call and before any
     /// signature.
     #[tokio::test]
+    #[serial(mainnet_clock)]
     #[serial]
     async fn the_signing_call_refuses_another_signer_key() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -758,6 +768,7 @@ mod authorized {
 
     /// A transaction callback forwards only to the authorization's signer key.
     #[tokio::test]
+    #[serial(mainnet_clock)]
     #[serial]
     async fn forwarding_a_mainnet_transaction_checks_the_software_key() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -802,6 +813,7 @@ mod authorized {
     /// The trusted target checks the authorization's signer binding even
     /// when the callback reports the authorized key itself.
     #[tokio::test]
+    #[serial(mainnet_clock)]
     #[serial]
     async fn forwarding_a_mainnet_payload_to_another_software_key_is_refused() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -834,6 +846,7 @@ mod authorized {
     /// Forwarding within the callback to the authorized key returns the
     /// same signature as the consuming wrapper.
     #[tokio::test]
+    #[serial(mainnet_clock)]
     #[serial]
     async fn forwarding_a_mainnet_payload_to_the_same_software_key_matches() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -868,6 +881,7 @@ mod authorized {
 
     /// A payload held until expiry refuses before the signing callback.
     #[tokio::test]
+    #[serial(mainnet_clock)]
     #[serial]
     async fn the_signing_call_rechecks_freshness_on_the_mainnet_clock() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -895,6 +909,7 @@ mod authorized {
     }
 
     #[tokio::test]
+    #[serial(mainnet_clock)]
     #[serial]
     async fn an_invalidated_soroban_payload_never_reaches_the_signer() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -928,6 +943,7 @@ mod authorized {
     }
 
     #[tokio::test]
+    #[serial(mainnet_clock)]
     #[serial]
     async fn a_soroban_claim_that_fails_to_persist_never_reaches_the_signer() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -957,6 +973,7 @@ mod authorized {
     }
 
     #[tokio::test]
+    #[serial(mainnet_clock)]
     #[serial]
     async fn a_late_soroban_signature_is_discarded() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -986,6 +1003,7 @@ mod authorized {
     /// A signature that does not verify under the authorization's signer
     /// is refused after the one signing call.
     #[tokio::test]
+    #[serial(mainnet_clock)]
     #[serial]
     async fn a_signature_that_does_not_verify_is_refused() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();

@@ -112,6 +112,7 @@ pub(crate) fn revoke_in_other_process(
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn canonical_mint_binds_the_previous_attempt() {
     let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();

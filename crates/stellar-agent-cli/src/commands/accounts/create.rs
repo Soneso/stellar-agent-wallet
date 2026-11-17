@@ -3963,6 +3963,7 @@ pub(crate) mod tests {
         /// is sent once with the enrolled key's signature, and settles its
         /// authorization and its confirmation entry.
         #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial(mainnet_clock)]
         #[serial_test::serial]
         async fn mainnet_time_bounds_sponsored_accounts_create() {
             let fixture = Spec::new("mainnet-create-accept").build().await;
@@ -3999,6 +4000,7 @@ pub(crate) mod tests {
         /// before any signer is resolved: the Ledger never signs and nothing
         /// is sent.
         #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial(mainnet_clock)]
         #[serial_test::serial]
         async fn mainnet_time_bounds_sponsored_accounts_create_elapsed_refuses_before_signing() {
             let mut fixture = Spec::new("mainnet-create-elapsed").build().await;
@@ -4323,6 +4325,7 @@ pub(crate) mod tests {
         );
     }
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn early_observation_precedes_window_gate() {
         use crate::commands::submission_record::intent_gate_fixture::{IntentGateState, home};
