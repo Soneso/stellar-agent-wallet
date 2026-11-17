@@ -584,7 +584,7 @@ fn floor_malformed_native_shape_refuses_every_read_and_mint() {
                 value["authorizations"][0]["native_reservation"]["extra"] = serde_json::json!(0);
             }
             "version" => {
-                value["version"] = serde_json::json!(17);
+                value["version"] = serde_json::json!(super::super::store::WIRE_VERSION_MAX + 1);
             }
             _ => unreachable!(),
         }

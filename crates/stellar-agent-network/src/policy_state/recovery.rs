@@ -2920,6 +2920,9 @@ pub fn claim_fixture_authorization(
             profile,
             minted.id,
             &super::ClaimExpect {
+                operation: request.operation,
+                intent_digest: request.intent_digest,
+                predecessor: request.predecessor,
                 domain: request.binding.domain(),
                 consumer: request.consumer,
                 bindings_digest: minted.bindings_digest,

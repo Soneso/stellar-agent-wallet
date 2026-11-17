@@ -135,6 +135,8 @@ impl Fixture {
                 panic!("new operation required")
             };
             let mint = MintRequest {
+                intent_digest: Some(handle.intent().intent_digest()),
+                predecessor: None,
                 chain: Caip2::Mainnet,
                 consumer: MainnetConsumer::CliPay,
                 binding: DomainBinding::Transaction {
@@ -176,7 +178,10 @@ impl Fixture {
                     },
                 )],
                 parent: None,
-                operation: None,
+                operation: Some(stellar_agent_network::policy_state::OperationLink {
+                    operation_id: handle.id(),
+                    attempt_index: 1,
+                }),
                 floor: None,
                 native_reservation: Some(NativeReservation {
                     debit_stroops: 100,

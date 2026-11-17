@@ -531,6 +531,9 @@ pub(crate) struct Header {
     pub(crate) issued_at_ms: u64,
     pub(crate) expires_at_ms: u64,
     pub(crate) bindings_digest: [u8; 32],
+    pub(crate) operation: Option<crate::policy_state::OperationLink>,
+    pub(crate) intent_digest: Option<[u8; 32]>,
+    pub(crate) predecessor: Option<AuthorizationId>,
 }
 
 #[cfg(feature = "mainnet-write")]
@@ -548,6 +551,9 @@ impl Header {
                     policy_sequence: self.policy.sequence,
                     policy_digest: self.policy.digest,
                     authority: self.authority.mint_authority(),
+                    operation: self.operation,
+                    intent_digest: self.intent_digest,
+                    predecessor: self.predecessor,
                 },
             )
             .map(|_| ())
@@ -1530,6 +1536,9 @@ mod tests {
             fn header(&self, domain: AuthorizationDomain, endpoint: bool) -> Header {
                 let id = AuthorizationId::from_bytes(ID);
                 Header {
+                    operation: None,
+                    intent_digest: None,
+                    predecessor: None,
                     claim: ClaimTarget {
                         store: crate::policy_state::PersistedWindowStore::at_path(
                             self._dir.path().join("state.window"),
@@ -2254,6 +2263,8 @@ mod tests {
                 .unwrap();
             }
             let request = MintRequest {
+                intent_digest: None,
+                predecessor: None,
                 chain: Caip2::Mainnet,
                 binding: binding.clone(),
                 // A Message record is minted only for the authenticated x402
@@ -2285,6 +2296,9 @@ mod tests {
                 .map(WindowReservation::fact_digest);
             assert_eq!(minted.bindings_digest, bindings_digest(&facts));
             let header = Header {
+                operation: None,
+                intent_digest: None,
+                predecessor: None,
                 claim: ClaimTarget {
                     store: store.clone(),
                     profile: profile.clone(),

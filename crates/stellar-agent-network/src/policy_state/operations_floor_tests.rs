@@ -71,7 +71,7 @@ fn floor_operation_commit_and_audit_matrix() {
         let mut fx = Fx::new();
         let open = request("floor-operation", canonical(1));
         let handle = fx.open_new(&open);
-        let mut mint = fx.mint_request(tx(1), fx.approval(), vec![hold(50)]);
+        let mut mint = fx.operation_mint_request(&handle, tx(1), fx.approval(), vec![hold(50)]);
         mint.native_reservation = Some(super::super::ledger::NativeReservation {
             debit_stroops: 50,
             fee_stroops: 0,
@@ -150,7 +150,7 @@ fn floor_operation_refusal_leaves_audit_and_attempt_unchanged() {
     let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
     let mut fx = Fx::new();
     let handle = fx.open_new(&request("floor-refusal", canonical(1)));
-    let mut mint = fx.mint_request(tx(1), fx.approval(), vec![hold(50)]);
+    let mut mint = fx.operation_mint_request(&handle, tx(1), fx.approval(), vec![hold(50)]);
     mint.native_reservation = Some(super::super::ledger::NativeReservation {
         debit_stroops: 50,
         fee_stroops: 0,

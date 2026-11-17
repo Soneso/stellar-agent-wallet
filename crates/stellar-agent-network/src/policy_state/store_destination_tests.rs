@@ -145,7 +145,7 @@ fn reservations_carry_destinations_at_the_current_version() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let _storage_home =
         stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-    assert_eq!(WIRE_VERSION_MAX, WIRE_VERSION_TOTAL_INTENTS);
+    assert_eq!(WIRE_VERSION_MAX, WIRE_VERSION_CANONICAL_LINEAGE);
     assert_eq!(
         serde_json::from_str::<StoredDestinations>("null").unwrap(),
         StoredDestinations::Null
@@ -158,7 +158,7 @@ fn reservations_carry_destinations_at_the_current_version() {
         .unwrap();
     let wire = store.read_for_inspection(&profile).unwrap().unwrap();
     assert_eq!(wire.version, WIRE_VERSION_DESTINATION);
-    assert_eq!(WIRE_VERSION_MAX, WIRE_VERSION_TOTAL_INTENTS);
+    assert_eq!(WIRE_VERSION_MAX, WIRE_VERSION_CANONICAL_LINEAGE);
     assert_eq!(
         store.pending_reservations(&profile).unwrap()[0].destinations,
         hold.destinations
@@ -217,8 +217,8 @@ fn reservations_carry_destinations_at_the_current_version() {
                 0 => candidate.entries[0].records[0].destinations = destinations.clone(),
                 1 => candidate.accounting_expiries[0].destinations = destinations.clone(),
                 _ => {
-                    candidate.authorizations[0].consumption =
-                        Some(ledger::ConsumptionBinding::Transaction(ledger::SubmissionBinding {
+                    candidate.authorizations[0].consumption = Some(
+                        ledger::ConsumptionBinding::Transaction(ledger::SubmissionBinding {
                             destinations: destinations.clone(),
                             chain_scope: Some(hold.chain_scope),
                             fee_bump: None,
@@ -230,10 +230,14 @@ fn reservations_carry_destinations_at_the_current_version() {
                             pending_since_ms: hold.pending_since_ms,
                             submission_ledger: hold.submission_ledger,
                             submission_anchor: None,
-                        }));
+                        }),
+                    );
                 }
             }
-            assert_eq!(select_wire_version(&candidate, None), WIRE_VERSION_DESTINATION);
+            assert_eq!(
+                select_wire_version(&candidate, None),
+                WIRE_VERSION_DESTINATION
+            );
             assert_eq!(
                 select_wire_version(&candidate, Some(WIRE_VERSION_RECOVERY_RUN)),
                 WIRE_VERSION_DESTINATION
@@ -325,7 +329,11 @@ fn reservations_carry_destinations_at_the_current_version() {
         .commit_generation(&state_key, &gen_entry, rewritten, pruned)
         .unwrap();
     assert_eq!(
-        store.read_for_inspection(&profile).unwrap().unwrap().version,
+        store
+            .read_for_inspection(&profile)
+            .unwrap()
+            .unwrap()
+            .version,
         WIRE_VERSION_DESTINATION
     );
 }

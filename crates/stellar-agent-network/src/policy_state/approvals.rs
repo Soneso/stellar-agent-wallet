@@ -1487,6 +1487,26 @@ mod delivery_test_override {
 #[cfg(any(test, feature = "test-helpers"))]
 pub use delivery_test_override::ConsentEvidenceEnforcementGuard;
 
+/// Whether retained intent consent keeps a linked operation waiting.
+pub(super) fn keeps_waiting(
+    wire: &WireFile,
+    operation: OperationId,
+    approval: Option<[u8; 32]>,
+    now: u64,
+) -> bool {
+    records(wire).iter().any(|record| {
+        Some(record.id) == approval
+            && record.operation_id == operation
+            && record.subject_kind == SubjectKind::IntentDigest
+            && record.state != ApprovalState::Revoked
+            && record.consent.as_ref().is_some_and(|consent| {
+                consent.payload.is_some()
+                    && consent.consent_at_ms <= now
+                    && now < consent.execution_expires_at_ms
+            })
+    })
+}
+
 /// The consent bound, including the signed expiry for an envelope approval.
 pub(super) fn record_cap(section: &Option<ApprovalsSection>, nonce: &str) -> Option<u64> {
     let record = section
@@ -1700,9 +1720,10 @@ pub(in crate::policy_state) mod tests {
         pub(in crate::policy_state) fn new(ttl: u64) -> Self {
             Self::with_intent(
                 ttl,
-                IntentSlot::Canonical {
+                IntentSlot::Envelope {
                     intent_digest: [1; 32],
-                    intent: serde_json::json!({"op":"pay"}),
+                    unsigned_envelope_sha256: [1; 32],
+                    max_time: 0,
                 },
                 Some(ttl),
             )
@@ -1888,6 +1909,8 @@ pub(in crate::policy_state) mod tests {
         pub(in crate::policy_state) fn mint_request(&self) -> MintRequest {
             let policy = self.fixture.current_policy();
             MintRequest {
+                intent_digest: None,
+                predecessor: None,
                 chain: self.fixture.profile().chain_id,
                 consumer: MainnetConsumer::CliPay,
                 binding: DomainBinding::Transaction {

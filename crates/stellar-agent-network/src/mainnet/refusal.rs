@@ -180,6 +180,10 @@ pub enum MainnetPrecondition {
     PreimageAddress,
     /// The parent intent record differs or does not qualify.
     IntentRecordMismatch,
+    /// The canonical slot or the candidate envelope differs from the intent.
+    IntentMismatch,
+    /// The predecessor differs from the operation's latest attempt.
+    PredecessorMismatch,
     /// The final envelope digest differs.
     FinalEnvelope,
     /// The root invocation digest differs.
@@ -338,6 +342,8 @@ impl MainnetPrecondition {
             Self::EntryExpiration => "entry_expiration",
             Self::PreimageAddress => "preimage_address",
             Self::IntentRecordMismatch => "intent_record_mismatch",
+            Self::IntentMismatch => "intent_mismatch",
+            Self::PredecessorMismatch => "predecessor_mismatch",
             Self::FinalEnvelope => "final_envelope",
             Self::RootInvocation => "root_invocation",
             Self::InnerTxHash => "inner_tx_hash",
@@ -756,6 +762,8 @@ mod tests {
             P::EntryExpiration,
             P::PreimageAddress,
             P::IntentRecordMismatch,
+            P::IntentMismatch,
+            P::PredecessorMismatch,
             P::FinalEnvelope,
             P::RootInvocation,
             P::InnerTxHash,
@@ -870,6 +878,8 @@ mod tests {
                 | P::EntryExpiration
                 | P::PreimageAddress
                 | P::IntentRecordMismatch
+                | P::IntentMismatch
+                | P::PredecessorMismatch
                 | P::FinalEnvelope
                 | P::RootInvocation
                 | P::InnerTxHash
@@ -993,6 +1003,8 @@ mod tests {
             "entry_expiration",
             "preimage_address",
             "intent_record_mismatch",
+            "intent_mismatch",
+            "predecessor_mismatch",
             "final_envelope",
             "root_invocation",
             "inner_tx_hash",

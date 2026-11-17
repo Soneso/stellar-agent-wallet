@@ -417,9 +417,10 @@ pub(super) mod tests {
                 business_id: BusinessId::parse(business).unwrap(),
                 tool: OperationTool::CliPay,
                 kind: OperationKind::Pay,
-                intent: IntentSlot::Canonical {
+                intent: IntentSlot::Envelope {
                     intent_digest: [1; 32],
-                    intent: json!({"op":"pay"}),
+                    unsigned_envelope_sha256: [1; 32],
+                    max_time: 0,
                 },
                 envelope_xdr: Some("AAAA".to_owned()),
                 prepared_decision: None,
@@ -606,6 +607,8 @@ pub(super) mod tests {
         pub(in crate::commands::approve) fn mint(&self) -> MintRequest {
             let policy = self.core.current_policy();
             MintRequest {
+                intent_digest: None,
+                predecessor: None,
                 chain: self.core.profile().chain_id,
                 consumer: MainnetConsumer::CliPay,
                 binding: DomainBinding::Transaction {

@@ -268,7 +268,7 @@ pub(super) const WIRE_VERSION_LEDGER: u32 = 4;
 /// A file written by a newer build carries records this one cannot account
 /// for, so it is refused rather than read with the fields it happens to
 /// recognise.
-pub(super) const WIRE_VERSION_MAX: u32 = WIRE_VERSION_TOTAL_INTENTS;
+pub(super) const WIRE_VERSION_MAX: u32 = WIRE_VERSION_CANONICAL_LINEAGE;
 
 /// Wire version binding the accounting network on every snapshot.
 #[cfg_attr(
@@ -322,9 +322,19 @@ pub(crate) const WIRE_VERSION_TOTAL_SUMS: u32 = WIRE_VERSION_DESTINATION + 1;
 /// Wire version carrying epoch-bearing total-budget intent legs.
 pub(crate) const WIRE_VERSION_TOTAL_INTENTS: u32 = 16;
 
+/// Wire version carrying canonical intent digests and attempt predecessors.
+pub(crate) const WIRE_VERSION_CANONICAL_LINEAGE: u32 = 17;
+
 /// Selects the format required by stored fields and retains each committed floor.
 fn select_wire_version(wire: &WireFile, committed: Option<u32>) -> u32 {
-    if committed.is_some_and(|version| version >= WIRE_VERSION_TOTAL_INTENTS)
+    if committed.is_some_and(|version| version >= WIRE_VERSION_CANONICAL_LINEAGE)
+        || wire
+            .authorizations
+            .iter()
+            .any(|auth| auth.intent_digest.is_some() || auth.predecessor.is_some())
+    {
+        WIRE_VERSION_CANONICAL_LINEAGE
+    } else if committed.is_some_and(|version| version >= WIRE_VERSION_TOTAL_INTENTS)
         || wire
             .signed_intents
             .iter()
@@ -5207,6 +5217,18 @@ fn check_snapshot(wire: &WireFile) -> Result<(), WindowStoreError> {
             detail: format!("native amounts require wire version {WIRE_VERSION_POLICY_AUTHORITY}"),
         });
     }
+    if wire.version < WIRE_VERSION_CANONICAL_LINEAGE
+        && wire
+            .authorizations
+            .iter()
+            .any(|auth| auth.intent_digest.is_some() || auth.predecessor.is_some())
+    {
+        return Err(WindowStoreError::Invalid {
+            detail: format!(
+                "canonical lineage requires wire version {WIRE_VERSION_CANONICAL_LINEAGE}"
+            ),
+        });
+    }
     check_total_fields(wire)?;
     validate_signed_intents(wire)?;
     operations::Operations::validate(wire)?;
@@ -7898,9 +7920,19 @@ mod tests {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        use super::super::operations::tests::{Fx, unknown_with};
+        use super::super::operations::tests::{Fx, unknown_with_slot};
         let mut fx = Fx::new();
-        unknown_with(&mut fx, 1, 10, vec![]);
+        unknown_with_slot(
+            &mut fx,
+            1,
+            10,
+            vec![],
+            super::super::operations::IntentSlot::Envelope {
+                intent_digest: [1; 32],
+                unsigned_envelope_sha256: [1; 32],
+                max_time: 0,
+            },
+        );
         let current = fx.wire();
         let (key, _) = fx.store.load_or_mint_key(&fx.profile).unwrap();
         let verify = |body: &[u8]| {
@@ -9502,6 +9534,7 @@ mod tests {
     }
 
     include!("store_destination_tests.rs");
+    include!("store_canonical_tests.rs");
 
     fn progress_fixture() -> (
         TempDir,
@@ -9635,7 +9668,7 @@ mod tests {
                     .unwrap()
                     .unwrap()
                     .version,
-                16
+                WIRE_VERSION_MAX
             );
         }
     }
@@ -13948,7 +13981,7 @@ mod tests {
             let ended = open_operation(&store, &profile, &mut audit, "order-2", 2);
             step_operation(&store, &profile, &mut audit, ended.id(), None, S::Expired);
 
-            let cancelled = open_operation(&store, &profile, &mut audit, "order-4", 4);
+            let cancelled = open_envelope_operation(&store, &profile, &mut audit, "order-4", 4);
             let mint = policy_mint(4);
             let started =
                 operations::OperationRecorder::new(&store, &profile, &mut audit, "ops-request")
@@ -13972,6 +14005,9 @@ mod tests {
                     &profile,
                     minted.id,
                     &ledger::ClaimExpect {
+                        operation: mint.operation,
+                        intent_digest: mint.intent_digest,
+                        predecessor: mint.predecessor,
                         domain: mint.binding.domain(),
                         consumer: mint.consumer,
                         bindings_digest: minted.bindings_digest,
@@ -17760,6 +17796,8 @@ mod tests {
             intent_digest: [n; 32],
         };
         ledger::WireAuthorization {
+            intent_digest: None,
+            predecessor: None,
             id: crate::mainnet::AuthorizationId::from_bytes([n; 32]),
             profile: "versions".to_owned(),
             chain: stellar_agent_core::profile::caip2::Caip2::Mainnet,
@@ -18166,6 +18204,8 @@ mod tests {
         };
         let open_id = crate::mainnet::AuthorizationId::from_bytes([0x33; 32]);
         wire.authorizations.push(ledger::WireAuthorization {
+            intent_digest: None,
+            predecessor: None,
             id: open_id,
             profile: "intent".to_owned(),
             chain: Caip2::Testnet,
@@ -18589,6 +18629,29 @@ mod tests {
         }
     }
 
+    /// Opens an envelope operation for legacy wire-format fixtures.
+    fn open_envelope_operation(
+        store: &PersistedWindowStore,
+        profile: &Profile,
+        audit: &mut OperationRows,
+        business_id: &str,
+        n: u8,
+    ) -> operations::OperationHandle {
+        let mut request = operation_request(business_id, n);
+        request.intent = operations::IntentSlot::Envelope {
+            intent_digest: [n; 32],
+            unsigned_envelope_sha256: [n; 32],
+            max_time: 0,
+        };
+        match operations::OperationRecorder::new(store, profile, audit, "ops-request")
+            .open(&request)
+            .unwrap()
+        {
+            operations::OpenOutcome::New(handle) => handle,
+            other => panic!("expected a new record, got {other:?}"),
+        }
+    }
+
     /// Moves `id` along the edge to `to` without evidence.
     fn step_operation(
         store: &PersistedWindowStore,
@@ -18612,6 +18675,8 @@ mod tests {
     fn policy_mint(n: u8) -> ledger::MintRequest {
         let now = now_ms().unwrap();
         ledger::MintRequest {
+            intent_digest: None,
+            predecessor: None,
             chain: Caip2::Mainnet,
             consumer: crate::mainnet::MainnetConsumer::CliPay,
             binding: ledger::DomainBinding::Transaction {
@@ -18677,7 +18742,7 @@ mod tests {
         let ended = open_operation(&store, &profile, &mut audit, "order-2", 2);
         step_operation(&store, &profile, &mut audit, ended.id(), None, S::Expired);
 
-        let cancelled = open_operation(&store, &profile, &mut audit, "order-4", 4);
+        let cancelled = open_envelope_operation(&store, &profile, &mut audit, "order-4", 4);
         let mint = policy_mint(4);
         let started =
             operations::OperationRecorder::new(&store, &profile, &mut audit, "ops-request")
@@ -18701,6 +18766,9 @@ mod tests {
                 &profile,
                 minted.id,
                 &ledger::ClaimExpect {
+                    operation: mint.operation,
+                    intent_digest: mint.intent_digest,
+                    predecessor: mint.predecessor,
                     domain: mint.binding.domain(),
                     consumer: mint.consumer,
                     bindings_digest: minted.bindings_digest,
@@ -22327,7 +22395,7 @@ mod tests {
                 stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             assert_eq!(WIRE_VERSION_TOTAL_EPOCH, 12);
             assert_eq!(WIRE_VERSION_TOTAL_SUMS, WIRE_VERSION_DESTINATION + 1);
-            assert_eq!(WIRE_VERSION_MAX, WIRE_VERSION_TOTAL_INTENTS);
+            assert_eq!(WIRE_VERSION_MAX, WIRE_VERSION_CANONICAL_LINEAGE);
             let f = fx("total-sums-version");
             let mut marked = version_twelve();
             f.push_final(&mut marked, 1, "total:native", 1, D1);
