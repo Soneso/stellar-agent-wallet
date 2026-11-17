@@ -1628,7 +1628,7 @@ impl AuditOutbox {
     }
 
     /// Advances the persistent floor and removes expired records, retaining migration pins.
-    /// Authorization uses and mints refresh `max(wall_clock, evidence_floor)`.
+    /// Approval mints and uses of an enforced kind decide at `max(wall_clock, evidence_floor)`.
     ///
     /// # Errors
     /// Returns carrier, evidence, key, and storage refusals.

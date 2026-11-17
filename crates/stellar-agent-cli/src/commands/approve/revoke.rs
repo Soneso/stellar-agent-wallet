@@ -4,13 +4,16 @@ use std::sync::{Arc, Mutex};
 
 use clap::Args;
 use stellar_agent_approval_ui::decision::{RevocationAccess, RevocationFailure, RevocationView};
+use stellar_agent_core::WalletError;
 use stellar_agent_core::approval::Surface;
-use stellar_agent_core::audit_log::{AuditEntry, AuditWriter};
+use stellar_agent_core::audit_log::{AuditEntry, AuditWriter, BindingCheck};
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::policy::state_lock::WindowStoreLock;
-use stellar_agent_core::profile::Profile;
+use stellar_agent_core::profile::{Profile, name::profile_name_for_approval};
 use stellar_agent_network::policy_state::approvals::{
-    ApprovalRecorder, ApprovalState, ApprovalStatus, ApprovalView,
+    ApprovalRecorder, ApprovalState, ApprovalStatus, ApprovalView, WireApproval,
+    consent_evidence_outbox, delivery_enforced, release_ended_consent_evidence,
+    sweep_ended_consent_evidence,
 };
 use stellar_agent_network::policy_state::operations::OperationAudit;
 use stellar_agent_network::policy_state::{PersistedWindowStore, WindowStoreError};
@@ -73,6 +76,8 @@ trait RevocationCalls {
     fn lookup(&mut self, nonce: &str) -> Result<ApprovalView, RevocationFailure>;
     fn revoke(&mut self, id: [u8; 32]) -> Result<ApprovalView, RevocationFailure>;
     fn append(&mut self, entry: AuditEntry) -> Result<(), RevocationFailure>;
+    /// Releases the consent evidence of the committed revoked `record`.
+    fn release(&mut self, record: &WireApproval) -> Result<(), WalletError>;
 }
 
 fn revoke_with(
@@ -106,6 +111,13 @@ fn revoke_with(
             "audit.append_failed",
             "The approval record is revoked, but its audit row cannot be appended. Retrying does not repair the audit row.",
         ))?;
+        // The committed revocation stands whether or not its evidence leaves.
+        if let Err(error) = calls.release(&after.record) {
+            tracing::warn!(
+                code = error.code(),
+                "approval revocation: evidence release failed; a later sweep retries it"
+            );
+        }
     }
     Ok(project(&after))
 }
@@ -172,6 +184,18 @@ impl RevocationCalls for &DurableRevocations {
             .append(entry)
             .map_err(|_| failure("audit.append_failed", "The audit row cannot be appended."))
     }
+
+    /// Releases `record`'s evidence, then sweeps every other retained ended
+    /// record the same outbox still holds.
+    fn release(&mut self, record: &WireApproval) -> Result<(), WalletError> {
+        let name = profile_name_for_approval(&self.profile);
+        if !delivery_enforced(&name, record.kind) {
+            return Ok(());
+        }
+        let outbox = consent_evidence_outbox(&self.profile, &name, BindingCheck::Enforce)?;
+        release_ended_consent_evidence(&self.store, &self.profile, &outbox, record.id)?;
+        sweep_ended_consent_evidence(&self.store, &self.profile, &outbox).map(|_| ())
+    }
 }
 
 impl RevocationAccess for DurableRevocations {
@@ -229,6 +253,12 @@ impl RevocationCalls for HeldRevocations<'_> {
 
     fn append(&mut self, entry: AuditEntry) -> Result<(), RevocationFailure> {
         RevocationCalls::append(&mut self.inner, entry)
+    }
+
+    /// The caller still holds the window guard, so release waits for the
+    /// next admission, recovery or revocation sweep.
+    fn release(&mut self, _: &WireApproval) -> Result<(), WalletError> {
+        Ok(())
     }
 }
 
@@ -819,6 +849,97 @@ pub(super) mod tests {
         assert_eq!(f.bytes(), before);
     }
 
+    /// `approve revoke --id` releases an enforced grant's evidence after its
+    /// commit; a revocation under a caller-held guard leaves it for the next
+    /// sweep, which the next admission, recovery pass or CLI revocation runs.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cli_revocation_releases_enforced_evidence() {
+        use stellar_agent_network::policy_state::approvals::{
+            ConsentEvidenceEnforcementGuard, consent_evidence_maintenance,
+        };
+        for (held, next_cli) in [(false, false), (true, false), (true, true)] {
+            // A profile name of its own keeps the keyed audit binding and
+            // key out of the other revocation fixtures' keyring entries. Each
+            // case that dispatches the CLI has its own name, because the
+            // process keeps one keyed audit writer per profile name.
+            let f = Fixture::from_core(MainnetConsentFixture::new(if next_cli {
+                "revocation-sweep"
+            } else {
+                "revocation-release"
+            }));
+            mint_audit_key(f.core.name()).await;
+            let name = f.core.name().to_owned();
+            let profile = f.core.profile().clone();
+            let _enabled = ConsentEvidenceEnforcementGuard::new(&name, ApprovedKind::Payment);
+            let access = stellar_agent_network::keyring::keyed_audit_access(
+                &profile,
+                &name,
+                BindingCheck::Enforce,
+            )
+            .unwrap();
+            let mut writer =
+                AuditWriter::open(profile.audit_log_path.clone(), Some(access)).unwrap();
+            writer.initialize_consent_evidence().unwrap();
+            let outbox = consent_evidence_outbox(&profile, &name, BindingCheck::Enforce).unwrap();
+            let record = f.view().record;
+            ApprovalRecorder::new(&f.store, &profile, &mut Rows::default(), "reserve")
+                .reserve_consent_evidence(record.operation_id, &record.facts(), &outbox)
+                .unwrap();
+            let holds = || outbox.evidence().unwrap().unwrap().holds_record(&record.id);
+            assert!(holds());
+            if held {
+                let lock = WindowStoreLock::acquire_for(
+                    f.store.path(),
+                    &profile.policy_window_state_key_id,
+                )
+                .unwrap();
+                let revocations =
+                    DurableRevocations::new(&name, &profile, Arc::new(Mutex::new(writer)));
+                let view = revocations
+                    .revoke_held(&f.entry.approval_nonce, Surface::Cli, None, &lock)
+                    .unwrap();
+                assert_eq!(view.state, "revoked");
+                drop(lock);
+                assert!(
+                    holds(),
+                    "a held revocation leaves release to the next sweep"
+                );
+                if next_cli {
+                    drop(revocations);
+                    let second = f.core.payment(300_000);
+                    PendingApprovalStore::open(f.core.store_path())
+                        .unwrap()
+                        .insert(second.clone(), second.created_at_unix_ms)
+                        .unwrap();
+                    open_record(&f.store, &profile, &second, "revocation-second");
+                    let other = ApprovalStatus::new(&f.store, &profile)
+                        .find_by_nonce(&second.approval_nonce)
+                        .unwrap()
+                        .unwrap()
+                        .record;
+                    ApprovalRecorder::new(&f.store, &profile, &mut Rows::default(), "reserve")
+                        .reserve_consent_evidence(other.operation_id, &other.facts(), &outbox)
+                        .unwrap();
+                    f.clock.set(second.created_at_unix_ms);
+                    assert_eq!(dispatch(&f, &second.approval_nonce).await, 0);
+                    assert!(
+                        !holds(),
+                        "an earlier held revocation's evidence leaves at the next CLI revocation"
+                    );
+                    assert!(!outbox.evidence().unwrap().unwrap().holds_record(&other.id));
+                } else {
+                    assert_eq!(consent_evidence_maintenance(&f.store, &profile).unwrap(), 1);
+                }
+            } else {
+                drop(writer);
+                assert_eq!(dispatch(&f, &f.entry.approval_nonce).await, 0);
+            }
+            assert_eq!(f.view().record.state, ApprovalState::Revoked);
+            assert!(!holds(), "the committed revocation releases its evidence");
+        }
+    }
+
     struct ScriptedClockAndCalls<'a> {
         real: &'a DurableRevocations,
         clock: &'a TestClockGuard,
@@ -851,6 +972,19 @@ pub(super) mod tests {
                 return Err(failure("audit.append_failed", "test append refusal"));
             }
             RevocationCalls::append(&mut self.real, entry)
+        }
+        fn release(&mut self, record: &WireApproval) -> Result<(), WalletError> {
+            self.calls.push("release");
+            let nonce = self.real_nonce();
+            assert_eq!(
+                RevocationCalls::lookup(&mut self.real, &nonce)
+                    .unwrap()
+                    .record
+                    .state,
+                ApprovalState::Revoked,
+                "release follows the committed revocation"
+            );
+            RevocationCalls::release(&mut self.real, record)
         }
     }
     impl ScriptedClockAndCalls<'_> {
@@ -910,10 +1044,13 @@ pub(super) mod tests {
                 fail_append: scenario == "append-error",
             };
             let result = revoke_with(&mut calls, &f.entry.approval_nonce, Surface::Cli, None);
+            // Evidence release follows the committed revocation and its row;
+            // a failed revocation or audit append releases nothing.
             let expected: &[&str] = match scenario {
                 "expired" => &["lookup"],
                 "during-expiry" | "facade-error" => &["lookup", "revoke"],
-                _ => &["lookup", "revoke", "append"],
+                "append-error" => &["lookup", "revoke", "append"],
+                _ => &["lookup", "revoke", "append", "release"],
             };
             assert_eq!(calls.calls, expected, "{scenario}");
             assert_eq!(f.unchanged_sections(), unchanged);

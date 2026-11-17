@@ -2089,6 +2089,21 @@ pub(super) fn mint_into(
     })
 }
 
+/// The time the lifetime of `auth` is checked at on the authenticated
+/// `wire`: [`super::approvals::decision_time`] under an approval authority,
+/// and `now` under a policy authority.
+fn expiry_time(
+    wire: &WireFile,
+    profile: &Profile,
+    auth: &WireAuthorization,
+    now: u64,
+) -> Result<u64, WindowStoreError> {
+    match &auth.approval_nonce {
+        Some(nonce) => super::approvals::decision_time(wire, profile, nonce, now),
+        None => Ok(now),
+    }
+}
+
 /// Whether `auth` is an earlier authorization of `lineage`'s operation that
 /// ended unused: never claimed, with disposition `unused`, and named by no
 /// committed exposure, so no transaction was signed under it and its
@@ -2207,6 +2222,10 @@ impl PersistedWindowStore {
 
     /// Checks the chain and retained approval under the caller's window lock.
     /// Inspection authenticates existing state without creating a window key.
+    /// The approval check refreshes its time under that lock, as
+    /// [`super::approvals::decision_time`] states, so both mint entries
+    /// decide on a floor read after any earlier validation. A continuation
+    /// mint under a parent refuses when the record cap is at or below it.
     pub(super) fn mint_record_checks(
         &self,
         profile: &Profile,
@@ -2229,9 +2248,16 @@ impl PersistedWindowStore {
             return Ok(None);
         };
         if request.parent.is_some() {
-            Ok(super::approvals::record_cap(&wire.approvals, nonce))
+            let cap = super::approvals::record_cap(&wire.approvals, nonce);
+            let at = super::approvals::decision_time(&wire, profile, nonce, now)?;
+            check(
+                cap.is_none_or(|end| at < end),
+                MainnetPrecondition::ApprovalExpired,
+            )?;
+            Ok(cap)
         } else {
-            super::approvals::check_record(&wire, nonce, operation, now)
+            let at = super::approvals::decision_time(&wire, profile, nonce, now)?;
+            super::approvals::check_record(&wire, nonce, operation, at)
         }
     }
 
@@ -2355,7 +2381,10 @@ impl PersistedWindowStore {
             .ok_or_else(|| refused(P::UnknownAuthorization))?;
         check(as_read.state == AuthorizationState::Open, P::NotOpen)?;
         check(as_read.minted_ms <= now, P::NotYetValid)?;
-        check(now < as_read.expires_ms, P::Expired)?;
+        check(
+            expiry_time(&original, profile, as_read, now)? < as_read.expires_ms,
+            P::Expired,
+        )?;
         let mut wire = self.retired_successor(&lock, profile, &original)?;
         sweep_expired(&mut wire, now);
         let auth = wire
@@ -2572,7 +2601,10 @@ impl PersistedWindowStore {
             // The sweep above leaves an authorization that links a live
             // operation to that operation's own step. Its lifetime is
             // checked here: an authorization past its expiry is not open.
-            check(now < auth.expires_ms, P::NotOpen)?;
+            check(
+                expiry_time(&wire, profile, auth, now)? < auth.expires_ms,
+                P::NotOpen,
+            )?;
             check(auth.minted_ms <= now, P::NotYetValid)?;
             check_profile_handle(auth, profile)?;
             compare_expectation(auth, expect)?;

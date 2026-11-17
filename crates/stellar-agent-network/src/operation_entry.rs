@@ -35,7 +35,9 @@ use stellar_xdr::{Limits, Memo, ReadXdr as _, TransactionEnvelope};
 use crate::fees::ClassicFeeChoice;
 use crate::mainnet::MainnetAuthorizationError;
 use crate::mainnet::canonical::{CanonicalPart, CanonicalRefusal};
-use crate::policy_state::approvals::{ConsentDeliveryV1, require_consent_evidence_inventory};
+use crate::policy_state::approvals::{
+    ConsentDeliveryV1, require_consent_evidence_inventory, sweep_ended_consent_evidence,
+};
 use crate::policy_state::{
     ApprovalRecorder, ApprovalStatus, ApprovalView, AttemptAuthorization, AttemptEnvelope,
     AttemptRequest, BusinessId, CommitBinding, CommitTarget, CommittedBatch, ConsentPayload,
@@ -1599,7 +1601,8 @@ impl ConsentAdmission<'_> {
     /// `present` with the committed record and its reservation.
     ///
     /// In order: the owner-scope inventory, the pending record, the owner's
-    /// evidence initialization, and the reservation. The record is the one
+    /// evidence initialization, the release of evidence whose records ended,
+    /// and the reservation. The record is the one
     /// already committed for the operation, else the one `open` commits from
     /// `facts`, else the committed winner of a conflicting open. Its stored
     /// nonce, clocks and facts govern a retry, never the retry's own facts.
@@ -1609,7 +1612,8 @@ impl ConsentAdmission<'_> {
     /// # Errors
     ///
     /// The refusals of [`require_consent_evidence_inventory`], of `open`
-    /// when no record names the operation, of evidence initialization,
+    /// when no record names the operation, of evidence initialization, of
+    /// [`sweep_ended_consent_evidence`],
     /// `audit.outbox_evidence_unusable` while a migration pin remains, the
     /// refusals of [`ApprovalRecorder::reserve_consent_evidence`], and those
     /// of `present`.
@@ -1639,6 +1643,7 @@ impl ConsentAdmission<'_> {
         self.writer
             .initialize_consent_evidence()
             .map_err(evidence_refusal)?;
+        sweep_ended_consent_evidence(self.store, self.profile, self.outbox)?;
         let reservation = Self::reacquire(
             self.store,
             self.profile,
