@@ -310,7 +310,7 @@ impl WireApproval {
         now >= self.waiting_expires_at_ms && now >= self.expiry()
     }
 
-    fn view(&self, now: u64) -> ApprovalView {
+    pub(super) fn view(&self, now: u64) -> ApprovalView {
         ApprovalView {
             record: self.clone(),
             expired: now >= self.expiry(),

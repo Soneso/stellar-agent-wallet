@@ -68,7 +68,8 @@ async fn run_reads(server: &WalletServer) -> Vec<(&'static str, rmcp::model::Cal
             server
                 .call_stellar_transaction_status(StellarTransactionStatusArgs {
                     chain_id: "stellar:testnet".to_owned(),
-                    tx_hash: "cd".repeat(32),
+                    tx_hash: Some("cd".repeat(32)),
+                    business_id: None,
                     retry_recovery: false,
                 })
                 .await

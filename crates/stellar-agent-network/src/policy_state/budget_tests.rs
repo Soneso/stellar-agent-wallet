@@ -1,5 +1,5 @@
 /// The budget projection over windows its writers and sealed fixtures hold.
-mod budget {
+pub(crate) mod budget {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -32,7 +32,7 @@ mod budget {
 
     /// A fixture policy under the pinned digest whose one rule carries
     /// `criteria`.
-    fn policy(criteria: Vec<Box<dyn Criterion>>) -> VerifiedPolicy {
+    pub(crate) fn policy(criteria: Vec<Box<dyn Criterion>>) -> VerifiedPolicy {
         policy_as([7; 32], criteria)
     }
 
@@ -104,7 +104,7 @@ mod budget {
         }
     }
 
-    fn period(asset: &str, window: &str, cap: i128) -> Box<dyn Criterion> {
+    pub(crate) fn period(asset: &str, window: &str, cap: i128) -> Box<dyn Criterion> {
         Box::new(PerPeriodCapCriterion::new(
             asset.to_owned(),
             Window::parse(window).unwrap(),
@@ -140,14 +140,16 @@ mod budget {
         })
     }
 
-    /// A settled row of 30, two holds of one authorization at ordinals 0 and
-    /// 1 (10 and 15), and a pending debit of 20 give used 30, reserved 45 and
-    /// remaining 25 under a daily cap of 100. A row linked to a signed intent
-    /// adds nothing, an aged row is out of the window, and another asset
-    /// stays apart. The weekly bucket counts the pending debit charged under
-    /// the daily window and floors its remaining at zero. The total counts
-    /// its own epoch only. The unlisted bucket and a retired epoch report
-    /// why they have no figures, and an overflowing sum refuses typed.
+    /// Under a daily cap of 200, a settled row of 30, two holds of one
+    /// authorization at ordinals 0 and 1 (10 and 15), a pending debit of 20
+    /// and a signed-intent leg of 40 give used 30, reserved 85 and remaining
+    /// 85. An aged row is out of the window, and another asset stays apart
+    /// with used 9 and remaining 41 under 50. The weekly bucket has used 7
+    /// and reserved 60 and floors its remaining at zero under 10. The total
+    /// counts its own epoch only: used 9 (a row of 5 and a settled sum of 4),
+    /// reserved 3 and remaining 188. A native reservation without bucket
+    /// holds adds to no bucket. The unlisted bucket and a retired epoch
+    /// report why they have no figures, and an overflowing sum refuses typed.
     #[test]
     #[serial]
     fn budget_bucket_breakdown_and_dedup() {
@@ -175,6 +177,14 @@ mod budget {
             let request = fx.mint_request(tx(holds.len() as u8), fx.approval(), holds);
             fx.store.mint_authorization(&fx.profile, &request).unwrap();
         }
+        let mut native_only = fx.mint_request(tx(9), fx.approval(), Vec::new());
+        native_only.native_reservation = Some(NativeReservation {
+            debit_stroops: 70,
+            fee_stroops: 1,
+        });
+        fx.store
+            .mint_authorization(&fx.profile, &native_only)
+            .unwrap();
         let now = fx.now();
         let mut wire = fx.wire();
         wire.version = WIRE_VERSION_TOTAL_INTENTS;
@@ -548,6 +558,7 @@ mod budget {
                     ..row("reserved-one", 1, RecordStatus::Pending, T0)
                 },
             ]);
+        let mut period_wire = wire.clone();
         seal(&fx, wire);
         let admission = fx.store.total_usage(&fx.profile, [7; 32]).unwrap_err();
         let result = project(
@@ -568,6 +579,29 @@ mod budget {
         let error = result.unwrap_err();
         assert_eq!(error.to_string(), admission.to_string());
         assert_eq!(error.code(), admission.code());
+
+        period_wire
+            .entries
+            .retain(|bucket| bucket.bucket != total.bucket());
+        find_or_insert_bucket(
+            &mut period_wire.entries,
+            &StateKey::new("ops", 1, "native", 86_400),
+        )
+        .records = vec![
+            row("used-max", i128::MAX, RecordStatus::Confirmed, fx.now()),
+            row("reserved-one", 1, RecordStatus::Pending, fx.now()),
+        ];
+        seal(&fx, period_wire);
+        let period = project(&fx, &policy(vec![period("native", "1d", 100)])).unwrap_err();
+        assert!(
+            matches!(
+                &period,
+                BudgetError::State(WindowStoreError::Invalid { detail })
+                    if detail == "a period bucket's used and reserved sum overflows"
+            ),
+            "a period bucket names its own sum: {period:?}"
+        );
+        assert_eq!(period.code(), "policy.window_state_unverifiable");
     }
 
     /// Exposure of one authorization in another window falls back to its
@@ -667,6 +701,170 @@ mod budget {
             };
             assert_eq!(disclosed, expected, "legacy release evidence: {bound:?}");
         }
+    }
+
+    fn secret(entry: &stellar_agent_core::profile::schema::KeyringEntryRef) -> Option<Vec<u8>> {
+        keyring_core::Entry::new(&entry.service, &entry.account)
+            .unwrap()
+            .get_secret()
+            .ok()
+    }
+
+    /// The window bytes, generation counter, window key and pin secrets.
+    fn durable_state(fx: &Fx) -> [Option<Vec<u8>>; 4] {
+        [
+            fs::read(fx.store.path()).ok(),
+            secret(&generation_entry_ref(&fx.profile)),
+            secret(&fx.profile.policy_window_state_key_id),
+            secret(&PinScope::for_profile(fx.store.path(), &fx.profile).pin_entry_ref()),
+        ]
+    }
+
+    /// Each refusal for state the store refuses keeps the store's own
+    /// inspection code, repeats through a reopened store, and leaves the
+    /// window bytes, generation counter, window key and pin unchanged: a
+    /// duplicated operation record, an unknown and a missing field in an
+    /// authentic body, an altered tag and another chain. An unusable pin and
+    /// a held writer lock refuse with their policy codes.
+    #[test]
+    #[serial]
+    fn budget_facade_refusal_matrix() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let mut fx = Fx::new();
+        fx.open_new(&request("budget-duplicate", canonical(1)));
+        let minted = fx.mint_request(tx(1), fx.approval(), vec![hold(10)]);
+        fx.store.mint_authorization(&fx.profile, &minted).unwrap();
+        let policy = policy(vec![period("native", "1d", 100)]);
+        let mut good = fx.wire();
+        good.generation += 1;
+        let body = |change: &dyn Fn(&mut serde_json::Value)| {
+            let mut value = serde_json::to_value(&good).unwrap();
+            change(&mut value);
+            serde_json::to_vec(&value).unwrap()
+        };
+        type Case<'a> = (&'a str, Box<dyn Fn(&Fx) + 'a>);
+        let cases: Vec<Case> = vec![
+            (
+                "duplicate operation",
+                Box::new(|fx: &Fx| {
+                    let mut wire = good.clone();
+                    let section = section_mut(&mut wire);
+                    section.records.push(section.records[0].clone());
+                    fx.store.seal_unchecked_for_test(&fx.profile, &wire);
+                }),
+            ),
+            (
+                "unknown field",
+                Box::new(|fx: &Fx| {
+                    let bytes = body(&|value| {
+                        value["authorizations"][0]["unexpected"] = serde_json::json!(true);
+                    });
+                    fx.store
+                        .seal_body_unchecked_for_test(&fx.profile, &bytes, &good);
+                }),
+            ),
+            (
+                "missing field",
+                Box::new(|fx: &Fx| {
+                    let bytes = body(&|value| {
+                        value["authorizations"][0]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("state");
+                    });
+                    fx.store
+                        .seal_body_unchecked_for_test(&fx.profile, &bytes, &good);
+                }),
+            ),
+            (
+                "altered tag",
+                Box::new(|fx: &Fx| {
+                    fx.store.seal_unchecked_for_test(&fx.profile, &good);
+                    let mut bytes = fs::read(fx.store.path()).unwrap();
+                    bytes[0] ^= 1;
+                    fs::write(fx.store.path(), bytes).unwrap();
+                }),
+            ),
+            (
+                "another chain",
+                Box::new(|fx: &Fx| {
+                    let mut wire = good.clone();
+                    wire.chain_scope = Some(ChainScope::for_chain(Caip2::Testnet));
+                    fx.store.seal_unchecked_for_test(&fx.profile, &wire);
+                }),
+            ),
+        ];
+        for (label, apply) in &cases {
+            apply(&fx);
+            let store_code = match fx.store.read_for_inspection(&fx.profile) {
+                Err(error) => crate::policy_state::store::inspection_code(&error),
+                Ok(_) => panic!("{label}: the store reader refuses this state"),
+            };
+            let before = durable_state(&fx);
+            for _ in 0..2 {
+                let reopened = PersistedWindowStore::at_path(fx.store.path().to_owned());
+                let refused =
+                    BudgetProjection::for_profile("ops", &fx.profile, &reopened, &policy, fx.now())
+                        .unwrap_err();
+                assert!(
+                    matches!(refused, BudgetError::State(_)),
+                    "{label}: {refused:?}"
+                );
+                assert_eq!(refused.code(), store_code, "{label}: the store's own code");
+                assert_eq!(
+                    durable_state(&fx),
+                    before,
+                    "{label}: a refusal changes nothing"
+                );
+            }
+        }
+        fx.store.seal_unchecked_for_test(&fx.profile, &good);
+        assert_eq!(project(&fx, &policy).unwrap().generation, good.generation);
+
+        let pin = PinScope::for_profile(fx.store.path(), &fx.profile).pin_entry_ref();
+        let stored_pin = secret(&pin).unwrap();
+        let pin_entry = keyring_core::Entry::new(&pin.service, &pin.account).unwrap();
+        pin_entry.set_secret(b"not a pin").unwrap();
+        let unusable = project(&fx, &policy).unwrap_err();
+        assert_eq!(unusable.code(), "policy.pin_unusable", "{unusable:?}");
+        pin_entry.set_secret(&stored_pin).unwrap();
+        let held =
+            WindowStoreLock::acquire_for(fx.store.path(), &fx.profile.policy_window_state_key_id)
+                .unwrap();
+        let before = durable_state(&fx);
+        let busy = project(&fx, &policy).unwrap_err();
+        assert_eq!(busy.code(), "policy.state_lock_busy", "{busy:?}");
+        assert_eq!(durable_state(&fx), before);
+        drop(held);
+        assert_eq!(project(&fx, &policy).unwrap().generation, good.generation);
+    }
+
+    /// At the open-authorization cap with every authorization expired, the
+    /// projection lists each of them and writes nothing; admission's own
+    /// sweep then accepts a valid new authorization.
+    #[test]
+    #[serial(mainnet_clock)]
+    #[serial]
+    fn budget_projection_at_capacity_prunes_and_reserves_nothing() {
+        use crate::policy_state::ledger::MAX_OPEN_AUTHORIZATIONS;
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let mut fx = Fx::new();
+        super::progress::fill_native_capacity(&mut fx);
+        fx.clock.set(T0 + TTL_MS + 1);
+        let before = durable_state(&fx);
+        let projection = project(&fx, &policy(Vec::new())).unwrap();
+        assert_eq!(
+            projection.authorizations.len(),
+            MAX_OPEN_AUTHORIZATIONS,
+            "expired authorizations stay listed"
+        );
+        assert_eq!(durable_state(&fx), before, "the projection frees nothing");
+        let fresh = fx.mint_request(tx(91), fx.policy(), vec![]);
+        fx.store.mint_authorization(&fx.profile, &fresh).unwrap();
     }
 
     fn get_counter(entry: &stellar_agent_core::profile::schema::KeyringEntryRef) -> Option<String> {
@@ -848,6 +1046,31 @@ mod budget {
         assert_eq!(equal.native.counted, Ok(101 + 606));
         assert_eq!(equal.native.observation_age_ms, Some(250));
 
+        let mut epoch = wire.clone();
+        let live = epoch
+            .authorizations
+            .iter_mut()
+            .find(|auth| auth.id == ids[0])
+            .unwrap();
+        (live.policy_digest, live.policy_sequence) = ([9; 32], 6);
+        epoch.last_observation = equal.native.observation;
+        (
+            epoch.admissible_floor_ledger,
+            epoch.admissible_floor_close_time_ms,
+        ) = (Some(500), Some(9_000));
+        seal(&fx, epoch);
+        let earlier_epoch = project(&fx, &policy).unwrap();
+        assert_eq!(
+            counted(&earlier_epoch, tracked),
+            counted(&equal, tracked),
+            "an earlier epoch's reservation keeps its obligation"
+        );
+        assert_eq!(
+            earlier_epoch.native.counted,
+            Ok(101 + 606),
+            "counted once across epochs"
+        );
+
         let earlier = at(499, 8_999, (None, None));
         assert_eq!(
             counted(&earlier, tracked),
@@ -969,5 +1192,20 @@ mod budget {
             );
             assert_eq!(projection.native.counted, Ok(42));
         }
+
+        let mut past = wire;
+        past.last_observation = Some(WindowObservation {
+            ledger: 20,
+            close_time_floor_ms: (T0 / 1_000 + 60) * 1_000 + 1,
+            observed_at_ms: T0,
+        });
+        seal(&fx, past);
+        let projection = project(&fx, &policy).unwrap();
+        assert_eq!(
+            obligation(&projection, auth_id).unwrap().counted,
+            Ok(true),
+            "an informational bound releases nothing without a row"
+        );
+        assert_eq!(projection.native.counted, Ok(42));
     }
 }

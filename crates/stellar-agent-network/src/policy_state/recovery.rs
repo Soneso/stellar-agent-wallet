@@ -3213,6 +3213,38 @@ mod tests {
             );
             assert_eq!(row.observed_ledger, Some(131));
         }
+
+        use super::super::budget::{BudgetProjection, InformationalBound, NativeClass};
+        use super::super::operations::tests::budget::{period, policy};
+        let projection = BudgetProjection::for_profile(
+            "ops",
+            &fx.profile,
+            &fx.store,
+            &policy(vec![period("native", "1d", 1_000)]),
+            NOW,
+        )
+        .unwrap();
+        let native = projection.rules[0].buckets[0].usage.unwrap();
+        assert_eq!(
+            native.used,
+            25 + 100,
+            "the success debit and the failure fee are used"
+        );
+        for handle in [&success, &failure] {
+            let auth = fx.record(handle.id()).attempts[0].authorization_id;
+            let obligation = projection
+                .authorizations
+                .iter()
+                .find(|view| view.id == auth)
+                .unwrap()
+                .native_obligation
+                .unwrap();
+            assert_eq!(
+                (obligation.class, obligation.release_bound),
+                (NativeClass::Settled, Some(InformationalBound::Ledger(120))),
+                "both decisions settle their native obligation"
+            );
+        }
     }
 
     /// Both non-inclusion proofs release every record of the reservation

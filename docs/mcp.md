@@ -852,6 +852,12 @@ time or the typed reason that the time is unavailable.
 
 `stellar_transaction_status` refuses with `submission.record_unavailable` when the spending-window file cannot be read.
 
+`stellar_transaction_status` takes `tx_hash`, `business_id`, or both, beside the required `chain_id`.
+The selectors follow `stellar-agent tx status --business-id`: neither refuses with `validation.usage_error`, an unknown mainnet business id with `operation.unknown`, and two selectors naming different operations with `validation.usage_error`.
+A mainnet business id alone targets the latest exposed classic hash; without one it reads no network and reports null hash keys.
+Every success payload adds `operation`, the stored projection described for [`tx status`](cli-reference/stellar-ops.md), or `null` for an unrecorded hash and on testnet.
+A testnet business id alone returns `business_id`, `operation`, `chain`, `receipt` and `reservation`, the last four null.
+
 A v1 rule set that names tools explicitly must include `stellar_transaction_status` to reconcile timed-out submissions through that server; the server logs `policy.transaction_status_unmatched` at startup when neither that tool nor `*` appears.
 
 #### Business ids

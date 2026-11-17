@@ -1,16 +1,19 @@
 //! A read-only budget projection of one verified window snapshot.
 //!
-//! [`BudgetProjection::for_profile`] reads the profile's window snapshot once,
-//! under the shared window-state lock that also guards the policy pin, and
-//! computes every figure from that one generation. It reads no network,
-//! sweeps nothing, and writes no policy, budget, approval or audit state.
+//! [`BudgetProjection::for_profile`] reads the profile's window snapshot once
+//! and computes every figure from that one generation. When the lock file
+//! exists, the read holds the shared window-state lock that also guards the
+//! policy pin. With no lock file the read takes no lock and accepts only a
+//! verified fresh absence. It
+//! reads no network, sweeps nothing, and writes no policy, budget, approval
+//! or audit state.
 //!
 //! The figures are recorded amounts. An authorization minted without native
 //! amounts counts zero and is listed as an unreserved legacy obligation, and
-//! an x402 authorization records a zero native debit. The projection carries
-//! no live account balance, floor headroom, earlier-epoch total obligation,
-//! unlisted allowance, or counter reconciliation time, because no stored fact
-//! supplies them.
+//! an x402 authorization records a zero native debit. Earlier-epoch total
+//! figures and the unlisted allowance are deferred pending the accounting
+//! integration; live account figures and a reconciliation timestamp are not
+//! supplied by this snapshot.
 
 use stellar_agent_core::mainnet::verified_policy::VerifiedPolicy;
 use stellar_agent_core::policy::pin::PinState;
@@ -320,13 +323,15 @@ impl Tally {
         *sum = sum.and_then(|sum| sum.checked_add(amount));
     }
 
-    fn usage(self, cap: i128) -> Result<BucketUsage, BudgetError> {
+    /// The figures under `cap`; `combined` names the sum of used and reserved
+    /// when that sum overflows.
+    fn usage(self, cap: i128, combined: &str) -> Result<BucketUsage, BudgetError> {
         let (Some(used), Some(reserved)) = (self.used, self.reserved) else {
             return Err(overflow());
         };
         used.checked_add(reserved).ok_or_else(|| {
             BudgetError::State(WindowStoreError::Invalid {
-                detail: "a total-budget sum overflows".to_owned(),
+                detail: format!("{combined} overflows"),
             })
         })?;
         let left = cap
@@ -373,7 +378,7 @@ fn rule_budget(
                     Ok(())
                 })
                 .map_err(BudgetError::State)?;
-                Ok(tally.usage(descriptor.cap_stroops)?)
+                Ok(tally.usage(descriptor.cap_stroops, "a total-budget sum")?)
             }
             _ => {
                 store::window_shares(wire, &key, now_ms, |share, amount, _| {
@@ -395,7 +400,10 @@ fn rule_budget(
                     },
                     other => BudgetError::State(other),
                 })?;
-                Ok(tally.usage(descriptor.cap_stroops)?)
+                Ok(tally.usage(
+                    descriptor.cap_stroops,
+                    "a period bucket's used and reserved sum",
+                )?)
             }
         };
         buckets.push(BucketProjection { descriptor, usage });

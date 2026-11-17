@@ -387,7 +387,8 @@ async fn a_timed_out_create_account_records_the_submission_and_reports_the_hash(
     let status = server
         .call_stellar_transaction_status(StellarTransactionStatusArgs {
             chain_id: "stellar:testnet".to_owned(),
-            tx_hash,
+            tx_hash: Some(tx_hash),
+            business_id: None,
             retry_recovery: false,
         })
         .await
@@ -481,7 +482,8 @@ async fn a_timed_out_sep43_submission_is_recorded_and_reconcilable() {
     let status = server
         .call_stellar_transaction_status(StellarTransactionStatusArgs {
             chain_id: "stellar:testnet".to_owned(),
-            tx_hash,
+            tx_hash: Some(tx_hash),
+            business_id: None,
             retry_recovery: false,
         })
         .await
@@ -636,7 +638,8 @@ async fn a_reported_sep43_success_keeps_its_pending_row_owed() {
     let status = server
         .call_stellar_transaction_status(StellarTransactionStatusArgs {
             chain_id: "stellar:testnet".to_owned(),
-            tx_hash,
+            tx_hash: Some(tx_hash),
+            business_id: None,
             retry_recovery: false,
         })
         .await

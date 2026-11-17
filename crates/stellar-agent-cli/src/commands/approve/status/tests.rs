@@ -385,6 +385,95 @@ async fn approval_status_errors_end_to_end() {
     );
 }
 
+/// Under one fixed clock on both surfaces, an attested entry whose
+/// `expires_at_unix_ms` equals the clock is expired, and one a millisecond
+/// later is attested and valid.
+#[tokio::test(flavor = "current_thread")]
+#[serial(keyring)]
+#[serial]
+async fn approval_status_expiry_boundary_cli_mcp() {
+    use stellar_agent_core::timefmt::{MockClock, test_clock};
+    stellar_agent_test_support::keyring_mock::install().unwrap();
+    let root = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(root.path());
+    let profile = testnet_profile();
+    const NOW: u64 = 1_900_000_000_000;
+    let fixed: Arc<MockClock> = Arc::new(MockClock::new(|| Ok(NOW)));
+    let _clock = test_clock::install(fixed.clone());
+    let mut server = WalletServer::new(profile.clone()).unwrap();
+    server.set_clock_for_test(fixed);
+    let path = super::super::approval_store_dir()
+        .unwrap()
+        .join(format!("{NAME}.toml"));
+    drop(PendingApprovalStore::open(path.clone()).unwrap());
+    for (expires, state, reason) in [(NOW, "expired", "expired"), (NOW + 1, "attested", "ok")] {
+        let mut entry = payment();
+        entry.created_at_unix_ms = NOW - 60_000;
+        entry.expires_at_unix_ms = expires;
+        attest(&mut entry, &profile);
+        write_entries(&path, std::slice::from_ref(&entry));
+        let (rc, result) = surfaces(NAME, &server, &entry.approval_nonce).await;
+        assert_eq!(rc, 0, "{result}");
+        assert_eq!(
+            (
+                &result["data"]["state"],
+                &result["data"]["verification"]["reason"]
+            ),
+            (&json!(state), &json!(reason)),
+            "the expiry boundary is exclusive: expires_at {expires}, now {NOW}"
+        );
+    }
+}
+
+/// An unreadable clock refuses `approve status` with `wallet.clock_error`
+/// before any store is read.
+#[tokio::test(flavor = "current_thread")]
+#[serial(keyring)]
+#[serial]
+async fn approval_status_cli_clock_failure() {
+    use stellar_agent_core::timefmt::{MockClock, test_clock};
+    use stellar_agent_core::wallet::WalletLifecycleError;
+    stellar_agent_test_support::keyring_mock::install().unwrap();
+    let root = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(root.path());
+    testnet_profile();
+    let nonce = payment().approval_nonce;
+    let _clock = test_clock::install(Arc::new(MockClock::new(|| {
+        Err(WalletLifecycleError::ClockError {
+            detail: "system clock is before UNIX_EPOCH".to_owned(),
+            source: None,
+        })
+    })));
+    let before = crate::common::test_support::tree(root.path());
+    let parsed = crate::Cli::try_parse_from([
+        "stellar-agent",
+        "approve",
+        "status",
+        &nonce,
+        "--profile",
+        NAME,
+    ])
+    .unwrap();
+    let crate::Commands::Approve(args) = parsed.command else {
+        panic!("approve command")
+    };
+    crate::common::render::take_rendered_for_test();
+    let rc = super::super::dispatch(args).await;
+    let cli = crate::common::render::take_rendered_for_test()
+        .pop()
+        .unwrap();
+    assert_eq!(
+        (rc, &cli["error"]["code"]),
+        (1, &json!("wallet.clock_error")),
+        "{cli}"
+    );
+    assert_eq!(
+        crate::common::test_support::tree(root.path()),
+        before,
+        "a clock refusal reads and writes no store"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 #[serial(keyring)]
 #[serial]
