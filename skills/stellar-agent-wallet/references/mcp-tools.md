@@ -359,7 +359,8 @@ loads. The SEP-43 sign-only pair
 same pre-flight and, once the signature is produced, records an
 `opaque_payload_signed` audit row (redacted payload digest and redacted
 signer; the caller broadcasts externally, so the row records signature
-production, not confirmation).
+production, not confirmation). A transaction row also carries the allowed
+payment legs with amount, asset and redacted destination.
 
 ## chain_id requirement
 
@@ -805,10 +806,22 @@ decimal strings, not JSON numbers.
 | --- | --- | --- |
 | `stellar_sep43_get_address` | Return the active wallet address. | Read-only. |
 | `stellar_sep43_get_network` | Return the active network name and passphrase. | Read-only. |
-| `stellar_sep43_sign_transaction` | Sign a `TransactionEnvelope` XDR; return `signedTxXdr` and `signerAddress`. | Signs; no submit. Audit pre-flight + `opaque_payload_signed` row. |
+| `stellar_sep43_sign_transaction` | Sign a `TransactionEnvelope` XDR; return `signedTxXdr` and `signerAddress`. | Signs; no submit. Each payment decided by its payment tool's rule and charged at signing. Audit pre-flight + `opaque_payload_signed` row with the allowed legs. |
 | `stellar_sep43_sign_auth_entry` | Sign the base64 `HashIdPreimage` of a Soroban authorization entry (envelope type 9, or type 10 bound to the signing key's account); return the raw signature as `signedAuthEntry` and `signerAddress`. | Signs; no submit. Audit pre-flight + `opaque_payload_signed` row. |
 | `stellar_sep43_sign_message` | Sign an arbitrary UTF-8 message via `SHA-256("Stellar Signed Message:\n" + message)` then ed25519; return `signedMessage` (base64) and `signerAddress`. | Signs; does not submit. Refuses an overlaid or out-of-scope signer. Requires the audit chain key (refuses `audit.chain_key_unavailable` before signing) and records an `opaque_payload_signed` audit row. |
-| `stellar_sep43_sign_and_submit_transaction` | Sign a `TransactionEnvelope` XDR, submit, poll until confirmed; return `signedTxXdr`, `txHash`, `status`. | Signs and submits; policy gate. |
+| `stellar_sep43_sign_and_submit_transaction` | Sign a `TransactionEnvelope` XDR, submit, poll until confirmed; return `signedTxXdr`, `txHash`, `status`. | Signs and submits; policy gate. Each payment decided by its payment tool's rule and charged before signing; the pending row carries the allowed legs. |
+
+Both transaction tools decide every payment, path payment, claimant, account
+creation, trustline, claim and wallet-authorized token transfer under the rule
+of its payment tool, with the signed asset, amount, recipient and memo. Offers,
+pool deposits, sponsorship, wallet clawbacks and contract calls the wallet
+cannot value need `allow_opaque_signing = true` on the tool's own rule. Account
+merges and signer or threshold changes always refuse with
+`policy.deny.unsizable_value_effect`. A wallet-paid fee passes the classic
+per-operation cap, and a resource transaction's full fee passes the contract
+transfer fee cap. The usage is charged before the signer loads and stays
+charged through a signer, signing or send failure; each sign-only call charges
+again.
 
 Arguments:
 

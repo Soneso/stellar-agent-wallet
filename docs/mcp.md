@@ -966,10 +966,14 @@ agent's External-Ed25519 rule key. There is deliberately no MCP equivalent.
 Every value-moving MCP tool in this catalog is a TYPED verb whose rendered
 preview is what the operator consents to. The three SEP-43 transaction and
 auth-entry signing tools are the exception: they sign caller-supplied material
-as `opaque_sign`. A value criterion, such as a per-transaction or per-period
-cap, refuses them with `policy.deny.unsizable_value_effect`. A matching rule
-that sets `allow_opaque_signing = true` exempts them from that refusal. A
-matching rule without criteria returns its own decision. `stellar_pay_commit` renders a
+as `opaque_sign`. A value criterion of the tool's own rule, such as a
+per-transaction or per-period cap, refuses them with
+`policy.deny.unsizable_value_effect`. A matching rule that sets
+`allow_opaque_signing = true` exempts them from that refusal. A matching rule
+without criteria returns its own decision. The two transaction tools then
+decide each payment in the transaction under its payment tool's rule; see
+[SEP-43 transaction effects](#sep-43-transaction-effects). The auth-entry tool
+has no such decision. `stellar_pay_commit` renders a
 payment, `stellar_rule_create_commit` renders a full rule definition, and so
 on. An arbitrary-invocation `execute` tool on the agent surface would have no
 such preview: it would sign whatever contract, function, and `ScVal` arguments
@@ -1003,10 +1007,10 @@ Credentialed input URLs are refused. On a mainnet profile the three tools refuse
 | --- | --- | --- |
 | `stellar_sep43_get_address` | Return the active wallet address. | Read-only. |
 | `stellar_sep43_get_network` | Return the active network name and passphrase. | Read-only. |
-| `stellar_sep43_sign_transaction` | Sign a `TransactionEnvelope` XDR; return `signedTxXdr` and `signerAddress`. | Signs; does not submit. Requires the audit chain key (refuses `audit.chain_key_unavailable` before signing) and records an `opaque_payload_signed` audit row. |
+| `stellar_sep43_sign_transaction` | Sign a `TransactionEnvelope` XDR; return `signedTxXdr` and `signerAddress`. | Signs; does not submit. Decides each payment under its payment tool's rule and charges the policy windows when it signs. Requires the audit chain key (refuses `audit.chain_key_unavailable` before signing) and records an `opaque_payload_signed` audit row with the allowed payment legs. |
 | `stellar_sep43_sign_auth_entry` | Sign the base64 `HashIdPreimage` of a Soroban authorization entry (envelope type 9, or type 10 bound to the signing key's account); return the raw signature as `signedAuthEntry` and `signerAddress`. | Signs; does not submit. Requires the audit chain key (refuses `audit.chain_key_unavailable` before signing) and records an `opaque_payload_signed` audit row. |
 | `stellar_sep43_sign_message` | Sign an arbitrary UTF-8 message via `SHA-256("Stellar Signed Message:\n" + message)` then ed25519; return `signedMessage` (base64) and `signerAddress`. | Signs; does not submit. Refuses an overlaid or out-of-scope signer. Requires the audit chain key (refuses `audit.chain_key_unavailable` before signing) and records an `opaque_payload_signed` audit row. |
-| `stellar_sep43_sign_and_submit_transaction` | Sign a `TransactionEnvelope` XDR, submit it, and poll until confirmed; return `signedTxXdr`, `txHash`, and `status`. | Signs and submits; policy gate. |
+| `stellar_sep43_sign_and_submit_transaction` | Sign a `TransactionEnvelope` XDR, submit it, and poll until confirmed; return `signedTxXdr`, `txHash`, and `status`. | Signs and submits; policy gate. Decides each payment under its payment tool's rule and charges the policy windows before it signs; the pending row carries the allowed legs. |
 
 These six tools use the standard `{ ok, data, request_id }` / `{ ok, error:
 { code, message }, request_id }` result envelope like every other tool. The
@@ -1023,6 +1027,42 @@ including SEP-43, refuses fail-closed) carries
 The transaction and auth-entry tools refuse XDR containing a muxed contract
 address (W) with `sep43.invalid_xdr` before key access or storing a request.
 SEP-53 and x402 use the same standard envelope for every business error.
+
+#### SEP-43 transaction effects
+
+After the tool's own rule allows, both transaction tools decode what the
+signature authorizes. The order is: mainnet refusal, address forms, own rule,
+effects decision, audit pre-flight, admission, signer, signature.
+
+- Each payment, path payment, claimable-balance claimant, account creation,
+  trustline, claim and wallet-authorized token transfer is decided by the rule
+  of its payment tool (`stellar_pay_commit`, `stellar_create_account_commit`,
+  `stellar_trustline_commit` or `stellar_claim_commit`). Each decision uses
+  the signed asset, amount, recipient and memo, inside the own rule's policy
+  state and instant. A denial returns that rule's code; an approval
+  escalation refuses with `policy.approval_required_unsupported`.
+- An offer, a liquidity pool deposit, reserve sponsorship, a wallet clawback
+  or a contract call the wallet cannot value needs `allow_opaque_signing = true`
+  on the tool's own rule. A contract call that also transfers tokens needs the
+  flag, and each of its transfers is still decided as a payment.
+- An account merge and a signer, master weight or threshold change refuse with
+  `policy.deny.unsizable_value_effect` under every rule.
+- A malformed or legacy envelope, a negative operation amount, a resource fee
+  above the total fee, and a text memo that is not UTF-8 on a valued
+  transaction refuse with `sep43.invalid_xdr`.
+- A fee the wallet account pays passes the classic per-operation cap, rounded
+  up. A transaction with a resource fee also passes its full total through the
+  contract transfer fee cap.
+- A transaction with a payment reads the wallet account and each recipient
+  account over RPC. Each muxed recipient is read once per call at its base
+  account.
+
+Admission records every allowed payment, and for the sign-only tool its own
+rule's count, in one durable batch before the signer loads. A refused batch
+records nothing. A signer, signing or send failure keeps the admitted usage,
+and each new sign-only call charges again, identical bytes included. The
+submitting tool's recorder charges only its own count, so value is charged
+once.
 
 Both `stellar_sep43_sign_message` and `stellar_sep53_sign_message` use these
 refusals before loading the signer:

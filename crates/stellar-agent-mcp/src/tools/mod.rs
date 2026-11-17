@@ -47,6 +47,7 @@ pub(crate) mod friendbot;
 pub(crate) mod message_signing;
 pub(crate) mod mpp;
 pub(crate) mod pay;
+pub(crate) mod sep43_effects;
 pub(crate) mod sep43_get_address;
 pub(crate) mod sep43_get_network;
 pub(crate) mod sep43_sign_and_submit_transaction;

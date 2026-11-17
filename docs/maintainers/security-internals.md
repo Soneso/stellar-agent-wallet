@@ -739,7 +739,8 @@ On mainnet, after release authorization is consumed, the tool consumes the pendi
 | MCP | `stellar_pay_commit`, `stellar_create_account_commit`, `stellar_claim_commit`, `stellar_trustline_commit` | `value_action_pending` (sized legs) |
 | MCP | `stellar_dex_trade`, `stellar_defindex_vault_deposit`, `stellar_defindex_vault_withdraw` | `value_action_pending` (sized legs) before the send; `sa_raw_invocation` on submit failure |
 | MCP | `stellar_x402_create_payment`, `stellar_x402_authenticated_payment` | `x402_payment_authorized` (its own `EventKind` carrying legs, network, and scheme, plus a passed witness when the payment required one), fatal, before the signed re-simulation. `x402_authorization_withheld` follows a later failure, at a stage the paragraphs above list. Mainnet `x402_payment_authorized` rows record the governing Allow or RequireApproval decision before signed re-simulation. Later withholding rows identify the failed stage with the same request identifier. |
-| MCP | `stellar_sep43_sign_and_submit_transaction` | `value_action_pending` (empty legs for an envelope the policy could not size) |
+| MCP | `stellar_sep43_sign_and_submit_transaction` | `value_action_pending` (the allowed payment legs; empty for a transaction without one) |
+| MCP | `stellar_sep43_sign_transaction` | `opaque_payload_signed` (the allowed payment legs; omitted when empty) |
 | CLI | `pay`, `claim`, `accounts create` (sponsored mode only), `trustline` | `value_action_pending` (sized legs) |
 | CLI | `trade`, `vault deposit`, `vault withdraw` | `value_action_pending` (sized legs) before the send; `sa_raw_invocation` on submit failure |
 | CLI | `pool init` | `value_action_pending` (empty legs) |
@@ -779,7 +780,59 @@ It defaults to false and returns true for the Noop engine.
 The query supplies consent information; the rule's decision still governs the call.
 The signing audit constructor accepts ordered evaluated legs.
 An empty vector is omitted and historical rows deserialize with empty legs.
-Current transaction, auth-entry, and message-signing callers pass empty vectors.
+Transaction signing passes its allowed payment legs; auth-entry and message-signing callers pass empty vectors.
+
+### SEP-43 transaction effects
+
+Invariant: a wallet signature on a caller-supplied transaction authorizes no
+valued debit that its payment-route rule refuses or escalates for the same
+signed asset, amount, recipient and memo. The tool's own rule must also allow.
+Admitted usage is durable before the signer loads and is never refunded.
+
+`sep43_effects_gate` in `crates/stellar-agent-mcp/src/tools/sep43_effects.rs`
+runs after the own rule allows and before the audit pre-flight:
+
+1. Decode with `transaction_effects` under the profile's wallet key. A key
+   that does not parse counts every source and fee payer as the wallet.
+2. Refuse decoder errors: malformed, legacy, negative-field and unreadable
+   memo errors with `sep43.invalid_xdr`; merges and authority changes with
+   `policy.deny.unsizable_value_effect`.
+3. Refuse any unvalued effect unless `opaque_signing_opted_in` holds for the
+   tool's own descriptor.
+4. Check a wallet-paid fee: the inclusion fee, rounded up per operation, under
+   the classic cap at full width; and for a resource transaction, the full
+   total under `check_contract_transfer_fee_cap`.
+5. Stage the own rule's count for the sign-only tool. Return here when no
+   payment leg exists, before any account read.
+6. Read the wallet account once and each recipient base account once.
+7. Evaluate each payment leg in operation order with
+   `evaluate_policy_in_snapshot` under the outer dispatch's frame. The
+   evaluation copy carries a zero fee, and the account view subtracts the
+   wallet fee and earlier classic native debits.
+8. Retain the returned effects of each Allow for admission and audit.
+
+`sep43_admit` then admits every staged item in one batch through
+`record_authorized_window_states`. A limit denial keeps its code; any other
+store failure refuses with `policy.engine_required`.
+
+| Operation | Outcome |
+| --- | --- |
+| Payment, path payment (either kind) | `stellar_pay_commit` rule; an incoming payment from another source has no effect |
+| Create claimable balance | One `stellar_pay_commit` leg per claimant other than the source and, for another source, the wallet |
+| Create account | `stellar_create_account_commit` rule |
+| Change trust (native or credit asset) | `stellar_trustline_commit` rule; a pool share line has no effect |
+| Claim claimable balance | `stellar_claim_commit` rule |
+| Source-account token `transfer`, `transfer_from`, `approve`, `burn`, `burn_from` | `stellar_pay_commit` rule with the contract address as asset; a zero approval has no effect |
+| Contract call with an unvalued node (mixed tree) | Needs the opt-in; each retained token leg still takes the pay rule |
+| Nonzero offer, liquidity pool deposit, wallet reserve sponsorship, clawback from the wallet | Needs the opt-in |
+| Account merge to another account; signer, master weight or threshold change | Refused |
+| Manage data, bump sequence, inflation, allow trust, trustline flags, claimable balance clawback, end sponsoring, revoke sponsorship, pool withdraw, footprint extension and restoration | No effect |
+| Fee bump | Outer fee only; inner operations carry no effect |
+
+A native asset contract transfer keeps its contract address, so reserve
+criteria count no debit for it and known-issuer checks fail closed. A fee paid
+by another account has no cap and no reserve debit in this gate. Address
+credentials carry their own signatures and add no effect.
 
 ### Key-write emission sites
 
@@ -1395,8 +1448,9 @@ CLI `pay` and `claim` check the cap in the full pipeline, `--build-only`,
 `--sign-only`, and `--submit-only`. MCP pay, create-account, trustline, and
 claim check it in both prepare and commit. CLI sponsored `accounts create`,
 `trustline`, and every sending `pool init` path also check the cap.
-Opaque, fee-bump, and multi-operation staged envelopes and the SEP-43 signing
-tools remain outside this coverage.
+Opaque, fee-bump, and multi-operation staged envelopes remain outside this
+coverage. The SEP-43 transaction tools check a wallet-paid fee in their
+effects gate.
 
 The checked fee is the resolved auto-selected, explicit, profile, or command
 fee, or the fee decoded from a presented or staged envelope. A fee equal to the cap
