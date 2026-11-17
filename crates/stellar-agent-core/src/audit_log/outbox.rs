@@ -5036,8 +5036,17 @@ mod tests {
             )
             .unwrap();
             let (waiting, ready) = std::sync::mpsc::channel();
-            test_seam::on_contended(&outbox_lock_path(&path), move || waiting.send(()).unwrap());
+            let (released, release) = std::sync::mpsc::channel::<()>();
+            // The append waits in the hook until the rotation writer is
+            // dropped, and the wait refuses only after a held acquisition, so
+            // its next acquisition finds the lock free at any elapsed time.
+            test_seam::on_contended(&outbox_lock_path(&path), move || {
+                waiting.send(()).unwrap();
+                release.recv().unwrap();
+            });
             let reference = std::thread::scope(|scope| {
+                // Owned here, so a failing step drops it and frees the hook.
+                let released = released;
                 let append = scope.spawn(|| outbox.append_queued(&row("rotated")));
                 ready.recv().unwrap();
                 store.set_reload(Ok(Some(ROW_KEY)));
@@ -5048,6 +5057,7 @@ mod tests {
                     .unwrap();
                 crate::audit_log::resign_chain_root_sidecars(&path, &NEXT_KEY).unwrap();
                 drop(rotation);
+                released.send(()).unwrap();
                 append.join().unwrap().unwrap()
             });
             let bytes = outbox_bytes(&path);
@@ -13395,6 +13405,10 @@ mod tests {
                     .args(["--exact", "audit_log::outbox::tests::routed_admissions_are_serializable_across_processes", "--nocapture"])
                     .env("ADMISSION_RACE_ROOT", root).env("ADMISSION_RACE_ID", id.to_string())
                     .env("STELLAR_AGENT_HOME", &child_home)
+                    // The loser waits for the winner's whole admission, so a
+                    // 60 s outbox wait keeps a starved winner from turning the
+                    // loser into `OutboxBusy`.
+                    .env(OUTBOX_LOCK_WAIT_ENV, "60000")
                     .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
                 let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
                 loop {

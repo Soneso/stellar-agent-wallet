@@ -3764,13 +3764,17 @@ mod tests {
             }
         }
         let _home = StellarAgentHomeGuard::new(temporary.path());
+        // The guard and the helpers resolve the canonical home, and a
+        // verbatim path takes only separate components, so the expected
+        // paths join each component onto the canonical temporary path.
+        let home = temporary.path().canonicalize().unwrap();
         assert_eq!(
             default_audit_log_path_for("isolated"),
-            temporary.path().join("audit/isolated.jsonl")
+            home.join("audit").join("isolated.jsonl")
         );
         assert_eq!(
             default_policy_window_state_path_for("isolated"),
-            temporary.path().join("policy/isolated.window")
+            home.join("policy").join("isolated.window")
         );
     }
 
