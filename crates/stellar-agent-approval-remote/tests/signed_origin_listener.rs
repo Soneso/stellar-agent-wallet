@@ -123,6 +123,7 @@ impl Fixture {
         .await?;
         Ok(if one_shot {
             config.with_one_shot(MainnetPresenceConfig {
+                intent: None,
                 entry: self.entry.clone(),
                 context,
                 authority: self.fixture.authority(),

@@ -15,6 +15,10 @@ use stellar_agent_core::approval::mainnet_fixtures::MainnetConsentFixture;
 use stellar_agent_test_support::webauthn::fixture_authenticator;
 use tower::ServiceExt as _;
 
+mod canonical_tests {
+    include!("canonical_tests.rs");
+}
+
 struct Harness {
     fixture: MainnetConsentFixture,
     entry: PendingApproval,
@@ -136,6 +140,7 @@ impl Harness {
     ) -> oneshot::Receiver<Result<VerifiedMainnetPresence, WalletError>> {
         let (sender, receiver) = oneshot::channel();
         Arc::get_mut(&mut self.state).unwrap().mode = Mode::OneShot {
+            intent: None,
             nonce: self.entry.approval_nonce.clone(),
             expires_at,
             completion: Mutex::new(Some(sender)),
@@ -594,6 +599,7 @@ async fn mainnet_wait_releases_pending_lock() {
     store.insert(entry.clone(), now_ms().unwrap()).unwrap();
     drop(store);
     let mut handle = start_mainnet_presence(MainnetPresenceConfig {
+        intent: None,
         entry: entry.clone(),
         context: ApprovalContext::from_profile(fixture.name(), fixture.profile()),
         authority: fixture.authority(),
@@ -662,6 +668,7 @@ async fn mainnet_policy_revocation_during_ceremony_refuses() {
     store.insert(entry.clone(), now_ms().unwrap()).unwrap();
     drop(store);
     let mut handle = start_mainnet_presence(MainnetPresenceConfig {
+        intent: None,
         entry: entry.clone(),
         context: ApprovalContext::from_profile(fixture.name(), fixture.profile()),
         authority: fixture.authority(),
@@ -822,6 +829,7 @@ async fn mainnet_x402_presence_binds_the_authoritative_intent() {
         store.insert(entry.clone(), now_ms().unwrap()).unwrap();
         drop(store);
         let mut handle = start_mainnet_presence(MainnetPresenceConfig {
+            intent: None,
             entry: entry.clone(),
             context: ApprovalContext::from_profile(fixture.name(), fixture.profile()),
             authority: fixture.authority(),
@@ -958,6 +966,7 @@ async fn start_refusals_keep_their_codes() {
     store.insert(entry.clone(), now_ms().unwrap()).unwrap();
     drop(store);
     let config = |entry: &PendingApproval, store_path: PathBuf| MainnetPresenceConfig {
+        intent: None,
         entry: entry.clone(),
         context: ApprovalContext::from_profile(fixture.name(), fixture.profile()),
         authority: fixture.authority(),
@@ -1036,6 +1045,7 @@ async fn presence_refuses_when_ipv6_is_held_and_mints_no_token() {
     let record = Arc::clone(&at_bind);
     let result = start_mainnet_presence_with(
         MainnetPresenceConfig {
+            intent: None,
             entry: entry.clone(),
             context: ApprovalContext::from_profile(fixture.name(), fixture.profile()),
             authority: fixture.authority(),
@@ -1089,6 +1099,7 @@ async fn presence_serves_one_session_on_both_families() {
     store.insert(entry.clone(), now_ms().unwrap()).unwrap();
     drop(store);
     let mut handle = start_mainnet_presence(MainnetPresenceConfig {
+        intent: None,
         entry: entry.clone(),
         context: ApprovalContext::from_profile(fixture.name(), fixture.profile()),
         authority: fixture.authority(),
@@ -1918,6 +1929,7 @@ async fn signed_origin_one_shot_completes_without_persisting_consent() {
     let (gate, session) = HttpsSessionGate::open();
     let (router, completion) = signed_origin_consent(
         SignedOriginMode::OneShot(Box::new(MainnetPresenceConfig {
+            intent: None,
             entry: so.entry.clone(),
             context: ApprovalContext::from_profile(so.fixture.name(), so.fixture.profile()),
             authority: so.fixture.authority(),
@@ -2031,6 +2043,7 @@ async fn local_inbox_refuses_consent_under_signed_origin() {
         assert_eq!(error.to_string(), MESSAGE);
 
         let start = start_mainnet_presence(MainnetPresenceConfig {
+            intent: None,
             entry: entry.clone(),
             context: ApprovalContext::from_profile(fixture.name(), fixture.profile()),
             authority: fixture.authority(),

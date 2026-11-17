@@ -325,7 +325,9 @@ pub(super) fn install_durable_access(
 ) -> DecisionContext {
     let access =
         super::revoke::DurableRevocations::new(name, profile, context.audit_writer.clone());
+    let intents = crate::common::mainnet_presence::StoredIntents::new(&context.store_path, name);
     context
+        .with_intent_lookup(std::sync::Arc::new(intents))
         .with_revocation_access(std::sync::Arc::new(access))
         .with_consent_recording(std::sync::Arc::new(
             super::consent_record::DurableConsents::new(name, profile),
@@ -651,6 +653,11 @@ mod tests {
 
     use super::*;
     use clap::Parser;
+
+    #[cfg(feature = "mainnet-write")]
+    mod canonical_tests {
+        include!("canonical_serve_tests.rs");
+    }
 
     /// Each presence start refusal surfaces with its approval code and the
     /// fixed message of that code, never as a generic serve-start error.
