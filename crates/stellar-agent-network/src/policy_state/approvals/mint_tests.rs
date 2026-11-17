@@ -230,10 +230,20 @@ fn envelope_mint_caps_at_the_signed_expiry() {
                 final_envelope_sha256: [10; 32],
                 root_invocation_digest: [9; 32],
             };
+            // Before the record cap, a lifetime that ends at the decision
+            // time is invalid.
+            let mut short = next.clone();
+            short.chain_deadline_ms = Some(end - 1);
+            fx.clock.set(end - 1);
+            mint_refusal(
+                &fx.store.mint_authorization(fx.fixture.profile(), &short),
+                MainnetPrecondition::LifetimeInvalid,
+            );
+            // At the record cap, the record refuses first.
             fx.clock.set(end);
             mint_refusal(
                 &fx.store.mint_authorization(fx.fixture.profile(), &next),
-                MainnetPrecondition::LifetimeInvalid,
+                MainnetPrecondition::ApprovalExpired,
             );
         }
     }

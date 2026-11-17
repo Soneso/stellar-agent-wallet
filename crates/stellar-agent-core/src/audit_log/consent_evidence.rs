@@ -485,6 +485,14 @@ impl OutboxEvidence {
         self.floor_ms
     }
 
+    /// Whether a record of `identity` exists, in any state.
+    #[must_use]
+    pub fn holds_record(&self, identity: &[u8; 32]) -> bool {
+        self.records
+            .binary_search_by(|record| record.identity.cmp(identity))
+            .is_ok()
+    }
+
     /// Whether a migration pin no authenticated grant adopted remains.
     #[must_use]
     pub fn holds_migration_pins(&self) -> bool {

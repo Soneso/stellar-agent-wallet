@@ -606,9 +606,11 @@ Use `audit verify` to inspect evidence failures; never erase evidence to make a 
 
 **Lifecycle and clocks.** Release follows authenticated revocation or final operation termination, outside the policy-window lock.
 First consumption and a missing approval record do not authorize release; retryable consumed grants retain their proof.
+`approve revoke --id` releases its grant at once; integrated admission, each recovery pass, and each CLI revocation release every retained ended grant, so a failed or deferred release retries.
 Explicit floor advancement removes records expiring at or below the persistent maximum clock, and migration pins never expire through clock collection.
 Admission can reclaim expired slots before refusing capacity.
-Every authorization use and mint uses the greater of wall time and the evidence floor, refreshed before a mint after collection.
+Every Approval mint, claim, consumption, and signing expiry check of an enforced kind uses the greater of wall time and the evidence floor, read fresh for that decision.
+A floor that cannot be read refuses as a storage error, never as expiry.
 Recoverable storage and publication errors retry the existing grant without another ceremony.
 Production activation requires authenticated sink provenance, retained references, publication and lifecycle adapters, and a complete live-grant inventory.
 Unresolved pins and incomplete producer integration block activation; initialization remains explicit.

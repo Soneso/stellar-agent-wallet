@@ -668,12 +668,24 @@ impl Header {
         require(anchored_count >= self.audit.anchored_count(), P::AuditCount)
     }
 
+    /// Checks the lifetime at `now_ms`. An approval authority checks its
+    /// expiry at the time its retained store and profile decide with, so a
+    /// fresh evidence floor bounds it whatever time the caller sampled.
     pub(crate) fn check_not_expired(&self, now_ms: u64) -> Result<(), MainnetAuthorizationError> {
         require(
             self.expires_at_ms <= self.authority.expires_at_ms(),
             P::LifetimeInvalid,
         )?;
-        check_validity(self.issued_at_ms, self.expires_at_ms, now_ms)
+        check_validity(self.issued_at_ms, self.expires_at_ms, now_ms)?;
+        if let AuthorityBinding::Approval(approval) = &self.authority {
+            let at = self
+                .claim
+                .store
+                .approval_decision_time(&self.claim.profile, &approval.nonce, now_ms)
+                .map_err(super::mint::store_error)?;
+            require(at < self.expires_at_ms, P::Expired)?;
+        }
+        Ok(())
     }
 
     fn endpoint(&self) -> Option<(&str, u64)> {
@@ -1741,6 +1753,125 @@ mod tests {
             assert_eq!(a.signer_public_key(), [1; 32]);
             assert_eq!(a.signer_role(), SignerRole::AgentSigner);
             assert_eq!(a.endpoint(), Some(("rpc.example:443", 3)));
+        }
+
+        /// An approval authorization whose record of an enforced kind lives in
+        /// a real window store checks its expiry at the fresh evidence floor.
+        #[test]
+        #[serial_test::serial]
+        fn approval_expiry_uses_the_fresh_floor() {
+            use crate::policy_state::approvals::lifecycle_tests::{
+                advance_floor, corrupt_evidence, keyed_evidence,
+            };
+            use crate::policy_state::approvals::{
+                ApprovalRecorder, ConsentEvidenceEnforcementGuard, PendingApprovalFacts,
+            };
+            use crate::policy_state::operations::{
+                BusinessId, IntentSlot, OpenOutcome, OpenRequest, OperationAudit, OperationKind,
+                OperationRecorder, OperationTool,
+            };
+            use stellar_agent_core::approval::{
+                ApprovalKind,
+                mainnet_fixtures::MainnetConsentFixture,
+                subject::{SubjectKind, approval_subject_classic},
+                witness::ApprovedKind,
+            };
+            struct Rows;
+            impl OperationAudit for Rows {
+                fn append(
+                    &mut self,
+                    _: stellar_agent_core::audit_log::AuditEntry,
+                ) -> Result<(), String> {
+                    Ok(())
+                }
+            }
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let core = MainnetConsentFixture::new("floor-header");
+            let entry = core.payment(300_000);
+            let _clock = set_now_ms_for_test(entry.created_at_unix_ms);
+            let store = PersistedWindowStore::for_profile(core.name());
+            let opened = OperationRecorder::new(&store, core.profile(), &mut Rows, "open")
+                .open(&OpenRequest {
+                    business_id: BusinessId::parse("floor-header").unwrap(),
+                    tool: OperationTool::CliPay,
+                    kind: OperationKind::Pay,
+                    intent: IntentSlot::Canonical {
+                        intent_digest: [1; 32],
+                        intent: serde_json::json!({"op":"pay"}),
+                    },
+                    envelope_xdr: Some("AAAA".to_owned()),
+                    prepared_decision: None,
+                    rule_ttl_ms: Some(300_000),
+                })
+                .unwrap();
+            let OpenOutcome::New(handle) = opened else {
+                panic!("new operation")
+            };
+            let ApprovalKind::PaymentSimulated {
+                envelope_xdr_b64, ..
+            } = &entry.kind
+            else {
+                panic!("payment")
+            };
+            ApprovalRecorder::new(&store, core.profile(), &mut Rows, "pending")
+                .open_pending(
+                    handle.id(),
+                    &PendingApprovalFacts {
+                        nonce: entry.approval_nonce.clone(),
+                        kind: ApprovedKind::Payment,
+                        subject_kind: SubjectKind::EnvelopeText,
+                        subject: approval_subject_classic(envelope_xdr_b64),
+                        intent_digest: [1; 32],
+                        created_at_ms: entry.created_at_unix_ms,
+                        waiting_expires_at_ms: entry.expires_at_unix_ms,
+                        rule_ttl_ms: 300_000,
+                    },
+                    stellar_agent_core::audit_log::PolicyDecision::RequireApproval,
+                )
+                .unwrap();
+            let _evidence = keyed_evidence(core.profile(), core.name());
+            let f = Fixture::new();
+            let mut a = f.tx();
+            a.0.header.claim = ClaimTarget {
+                store: PersistedWindowStore::for_profile(core.name()),
+                profile: core.profile().clone(),
+            };
+            a.0.header.authority = AuthorityBinding::Approval(ApprovalBinding {
+                nonce: entry.approval_nonce.clone(),
+                expires_at_ms: 2_000,
+            });
+            let enabled = ConsentEvidenceEnforcementGuard::new(core.name(), ApprovedKind::Payment);
+            a.check_not_expired(1_000).unwrap();
+            advance_floor(core.profile(), core.name(), 1_499);
+            a.check_not_expired(1_000).unwrap();
+            for floor in [1_500, 1_501] {
+                advance_floor(core.profile(), core.name(), floor);
+                assert_eq!(
+                    refused(a.check_not_expired(1_000)),
+                    P::Expired,
+                    "a caller time before the floor {floor} cannot revive expiry"
+                );
+            }
+            drop(enabled);
+            a.check_not_expired(1_000).unwrap();
+            let enabled = ConsentEvidenceEnforcementGuard::new(core.name(), ApprovedKind::Payment);
+            // A nonce without a retained record names no kind, so its check
+            // reads no floor.
+            let mut other = f.tx();
+            other.0.header.claim = ClaimTarget {
+                store: PersistedWindowStore::for_profile(core.name()),
+                profile: core.profile().clone(),
+            };
+            other.check_not_expired(1_000).unwrap();
+            corrupt_evidence(core.profile());
+            assert_eq!(
+                refused(a.check_not_expired(1_000)),
+                P::StoreUnavailable,
+                "an unreadable floor is a storage refusal"
+            );
+            drop(enabled);
         }
 
         #[test]

@@ -13,14 +13,11 @@ use stellar_agent_core::{error::WalletError, profile::schema::Profile};
 
 /// The keyed outbox for reservation and publication under this profile.
 pub(crate) fn consent_outbox(profile: &Profile, name: &str) -> Result<AuditOutbox, WalletError> {
-    let access =
-        stellar_agent_network::keyring::keyed_audit_access(profile, name, BindingCheck::Enforce)?;
-    let (key, anchor) = access.into_parts();
-    Ok(AuditOutbox::for_log_keyed(
-        &profile.audit_log_path,
-        anchor,
-        key,
-    ))
+    stellar_agent_network::policy_state::approvals::consent_evidence_outbox(
+        profile,
+        name,
+        BindingCheck::Enforce,
+    )
 }
 
 /// Verifies the original receipt and handoff while admitted, then releases
