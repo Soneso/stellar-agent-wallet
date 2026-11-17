@@ -873,6 +873,8 @@ pub struct StatusRequest<'a> {
 pub struct StatusOutcome {
     /// Recovery results for authenticated mainnet classic attempts.
     pub recovery: crate::policy_state::RecoveryReport,
+    /// Authenticated progress after repair, with any current repair failure marked pending.
+    pub progress: Option<crate::policy_state::operations::SubmissionProgress>,
     /// Managed cached status or UNKNOWN; otherwise the endpoint's status.
     pub chain_status: String,
     /// The including ledger, when known.
@@ -1133,12 +1135,16 @@ pub async fn transaction_status_committed(
     let _ = drain_accounting_obligations(window, profile, profile_name, Some(&receipts), || {
         writer.for_drain()
     });
-    if profile.chain_id.is_mainnet()
+    let repair = if profile.chain_id.is_mainnet()
         && let Ok(hash) = stellar_agent_core::hex::decode_hex32(tx_hash)
-        && let Some(writer) = writer.handle()
-        && let Err(refused) =
-            recovery::repair_committed_receipts(window, profile, &receipts, &writer, Some(&hash))
     {
+        writer.handle().map(|writer| {
+            recovery::repair_committed_receipts(window, profile, &receipts, &writer, Some(&hash))
+        })
+    } else {
+        Some(Ok(()))
+    };
+    if let Some(Err(refused)) = &repair {
         recovery_report
             .refusal
             .get_or_insert(crate::policy_state::RecoveryRefusal {
@@ -1179,6 +1185,26 @@ pub async fn transaction_status_committed(
             Some(&hash),
         );
     }
+    let mut progress = if profile.chain_id.is_mainnet()
+        && let Ok(hash) = stellar_agent_core::hex::decode_hex32(tx_hash)
+    {
+        crate::policy_state::OperationStatus::new(window, profile)
+            .submission_progress(&hash)
+            .map_err(StatusFailure::WindowUnreadable)?
+    } else {
+        None
+    };
+    if let Some(progress) = &mut progress
+        && progress.decision.is_some_and(|decision| {
+            repair.as_ref().is_none_or(|result| {
+                result
+                    .as_ref()
+                    .is_err_and(|refused| refused.includes(decision))
+            })
+        })
+    {
+        progress.projection_pending = true;
+    }
     let (chain_status, ledger) = if let Some(attempt) = recovery_report
         .attempts
         .iter()
@@ -1215,6 +1241,7 @@ pub async fn transaction_status_committed(
     });
     Ok(StatusOutcome {
         recovery: recovery_report,
+        progress,
         chain_status,
         ledger,
         record,
