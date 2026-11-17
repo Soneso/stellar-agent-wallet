@@ -124,7 +124,7 @@ The scope table defines mainnet admission for each build configuration. Public S
     Before dispatch, a complete testnet approval pair maps this refusal to `policy.approval_required`.
     A later protocol refusal keeps `x402.muxed_contract_protocol_unsupported`.
   - Simulation decides whether the C asset accepts W. A transfer error identifies the W payee form and simulation phase under `x402.rpc_simulate_failed`.
-  - Mainnet M and eligible W follow the rule's Allow or two-call RequireApproval flow. Testnet RequireApproval queues an intent for owner approval. An unlisted `budget` can admit payments within its shared cap.
+  - Mainnet M and eligible W follow the rule's Allow or two-call RequireApproval flow. Testnet RequireApproval queues an intent for owner approval. An unlisted `budget` admits unattended payments within both shared allowance bounds. Mainnet excess requests per-payment approval and counts in full when approved; testnet excess denies. Hard caps, rate limits, and total allocations still apply.
   - Authenticated anchoring compares M by its base G. A matching account is `anchored`, an absent account in a non-empty list is `not_anchored`, and an empty list is `unknown`. C and W remain `unknown`.
   - Before signing, the first simulation must return exactly one authorization entry. It carries legacy `Address` credentials for the payer, a zero expiration ledger, and no signature.
   - That entry's root invocation must equal the SAC `transfer` the wallet built, contract and every argument included, with no nested calls. Any other answer refuses before signing.

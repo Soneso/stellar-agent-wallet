@@ -31,9 +31,10 @@
 //! `extended_grammar/` holds the version 2 additions: unlisted recipient
 //! modes, total budgets, the balance floor, and memo bindings. Its cases run
 //! in the named `extended_corpus_*` tests. A `sequence` case evaluates its
-//! steps against one usage history. Each step loads its policy through the
-//! verified loader, so `total_budget` counts against the signed digest. The
-//! history is replayed into each step's in-memory store; it is not a durable
+//! steps against one usage history. Except for the deliberate zero-digest
+//! refusal case, each step loads its policy through the verified loader, so
+//! `total_budget` counts against the signed digest. The history is replayed
+//! into each step's in-memory store; it is not a durable
 //! restart. Account views in these cases are core test inputs, not evidence
 //! that a caller supplies them.
 //!
@@ -1597,6 +1598,16 @@ const TESTNET_BUDGET_BOUNDARIES: &[&str] = &[
     "listed_not_charged",
 ];
 
+/// Mainnet requests approval beyond either allowance bound; hard caps and
+/// the testnet refusals still apply.
+const BUDGET_NETWORK_MATRIX: &[&str] = &[
+    "mainnet_unlisted_per_tx_approval",
+    "mainnet_unlisted_period_approval",
+    "mainnet_approved_hard_cap_refused",
+    "testnet_unlisted_per_tx_boundary",
+    "testnet_unlisted_period_boundary",
+];
+
 /// A total allocation never renews with time and is bound to the signed
 /// digest.
 const TOTAL_EPOCH: &[&str] = &[
@@ -1623,7 +1634,7 @@ const MEMO_BINDINGS: &[&str] = &[
     "memo_malformed_fact_refused",
 ];
 
-/// Refusals carry the production wire code and redacted structured fields.
+/// Refusals carry the production wire code and structured fields.
 /// `account_wire_code_only` sets only `wire_code`, so that expectation is
 /// compared on its own.
 const REFUSAL_CODES: &[&str] = &[
@@ -1633,10 +1644,11 @@ const REFUSAL_CODES: &[&str] = &[
     "testnet_unlisted_per_tx_boundary",
 ];
 
-const EXTENDED_GROUPS: [&[&str]; 7] = [
+const EXTENDED_GROUPS: [&[&str]; 8] = [
     CLOSED_GRAMMAR,
     RECIPIENT_MODES,
     TESTNET_BUDGET_BOUNDARIES,
+    BUDGET_NETWORK_MATRIX,
     TOTAL_EPOCH,
     FLOOR_FACTS,
     MEMO_BINDINGS,
@@ -1678,6 +1690,35 @@ fn extended_corpus_recipient_modes() {
 #[serial_test::serial]
 fn extended_corpus_testnet_budget_boundaries() {
     run_extended(TESTNET_BUDGET_BOUNDARIES);
+}
+
+#[test]
+#[serial_test::serial]
+fn extended_corpus_budget_network_matrix() {
+    use stellar_agent_core::policy::v1::presets::{AuthorityStatus, summarize};
+    use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
+
+    run_extended(BUDGET_NETWORK_MATRIX);
+    let body = load_policy_body(
+        &adversarial_root()
+            .join(EXTENDED_DIR)
+            .join("mainnet_unlisted_per_tx_approval.case.json"),
+    );
+    let body = body.parse().unwrap();
+    for (passphrase, exhaustion, largest) in [
+        (MAINNET_PASSPHRASE, "approval", "0.0001"),
+        (TESTNET_PASSPHRASE, "deny", "0.00001"),
+    ] {
+        let summary = summarize(&body, passphrase, AuthorityStatus::Draft);
+        let pay = summary
+            .limits
+            .iter()
+            .flat_map(|limit| &limit.tools)
+            .find(|tool| tool.tool == "stellar_pay")
+            .unwrap();
+        assert_eq!(pay.unlisted_exhaustion, exhaustion);
+        assert_eq!(pay.unlisted_largest_payment.as_deref(), Some(largest));
+    }
 }
 
 #[test]

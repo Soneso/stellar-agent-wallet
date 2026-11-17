@@ -1615,6 +1615,8 @@ same counter and keep their stored bytes. Unlisted sums there are checked: an
 overflow refuses with `policy.accounting_overflow` and a negative stored amount
 with `policy.accounting_invalid`, before any write. Hydration keeps a negative
 row as stored, and evaluation refuses its bucket with the same code.
+The unlisted key contains no policy digest. Re-signing preserves its rolling
+usage, and reopening the store hydrates the same counter.
 `mint_into` derives the admission mode from the mint's own verified authority,
 after the nonce check and consumption or the parent check. Under an approval
 authority an unlisted hold passes the spent allowance and still counts in

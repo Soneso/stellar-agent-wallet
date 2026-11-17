@@ -1,0 +1,7 @@
+{
+  "classic_asset": "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+  "history_stroops": [100, 100],
+  "expected_usage": [200, 2],
+  "allowed_stroops": 50,
+  "refused_stroops": 51
+}

@@ -742,7 +742,9 @@ On `--network mainnet --engine v1`, `init` also writes the unsigned
 - `--asset <USDC|XLM>` defaults to `USDC`. XLM takes `--tolerated-loss` and
   `--typical-payment`.
 - `--unlisted-budget <yes|no>` lets an api preset pay unlisted recipients from
-  one budget shared by all payment tools.
+  one unattended budget shared by all payment tools. Mainnet requests
+  per-payment approval beyond either bound. Approved payments count in full;
+  hard caps, rate limits, and total allocations still apply.
 - `--total-budget <yes|no>` defaults to `yes`.
 - `--output <FORMAT>` sets the stderr preview to `json` (default) or `table`.
 
@@ -1093,7 +1095,7 @@ The policy-file owner key is NOT rotated here — it is an ed25519 key enrolled 
 | `rotate-audit-key` | audit-log chain-root HMAC (`audit_log_hash_chain_key_id`) | Before any key write, checks the log's entry tags under the old key and refuses with that check's code (`audit.entry_tag_invalid` among them). Once entry tags are in force it appends `audit_entry_tags_rekeyed` (cause `rotation`) under the new key before its `keyring_key_written` row; an interrupted rotation is repaired at the next keyed open. Re-signs every existing per-file chain-root sidecar with the new key, so `audit verify <LOG_PATH> --profile <NAME>` stays green and the old key stops verifying. Adds `key_kind:"hmac_32_bytes"` and `sidecars_resigned`. Takes the audit writer's exclusive lock, so it refuses while an MCP server holds the writer. A changed audit binding refuses with `audit.log_binding_changed` before the writer opens. |
 | `rotate-nonce-key` | HMAC nonce key (`mcp_nonce_key_alias`) | Invalidates outstanding nonces. Returns only `profile` + `rotated`. |
 | `rotate-counterparty-key` | `stellar.toml` cache-integrity HMAC (`counterparty_cache_key_id`) | Invalidates cached bindings. `counterparty refresh <domain>` rewrites one binding, and `counterparty warm-up` refreshes only the `HOME_DOMAIN` entries of the policy allowlist. Adds `key_kind:"hmac_32_bytes"` and `cache_invalidated:true`. |
-| `rotate-policy-state-key` | policy-window-state HMAC (`policy_window_state_key_id`) | Re-signs the persisted window-state store under the new key, so accumulated `per_period_cap` / `rate_limit` history is preserved, not invalidated. Rotation refuses if the store does not verify under the current key. Integrity failures and missing authenticated network provenance have no recovery verb in this release; create a profile under a new name. Before rotation, file I/O failures refuse without changing state; retry after access is restored. Adds `key_kind:"hmac_32_bytes"`. |
+| `rotate-policy-state-key` | policy-window-state HMAC (`policy_window_state_key_id`) | Re-signs the persisted window-state store under the new key, so accumulated `per_period_cap` / `rate_limit` history and unlisted and total-budget usage are preserved. Rotation refuses if the store does not verify under the current key. Integrity failures and missing authenticated network provenance have no recovery verb in this release; create a profile under a new name. Before rotation, file I/O failures refuse without changing state; retry after access is restored. Adds `key_kind:"hmac_32_bytes"`. |
 
 ```bash
 stellar-agent profile rotate-attestation-key default
