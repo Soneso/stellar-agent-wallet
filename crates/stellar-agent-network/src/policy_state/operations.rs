@@ -2999,6 +2999,37 @@ pub struct OperationView {
     pub destinations: PaymentDestinations,
 }
 
+/// Authenticated progress of one retained classic exposure, from one window image.
+/// Receipt contents and current display repair do not grant successor authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmissionProgress {
+    /// The owning operation, whose current attempt may be later than `attempt`.
+    pub operation: OperationView,
+    /// The exposed attempt selected by the hash.
+    pub attempt: u32,
+    /// The authenticated transaction hash.
+    pub tx_hash: [u8; 32],
+    /// Whether the selected attempt retains its exposure.
+    pub exposure_present: bool,
+    /// Whether ordinary evidence recovery is runnable at this read's time and configuration.
+    pub outcome_recoverable: bool,
+    /// Whether the checked decision needs projection, including a current status repair refusal.
+    pub projection_pending: bool,
+    /// The first missing authenticated receipt fact, when projection cannot be reconstructed.
+    pub projection_missing_fact: Option<String>,
+    /// Whether stored predecessor constraints permit trying a properly authorized successor.
+    /// A suitable prospective authorization, current policy and envelope are still required;
+    /// admission revalidates them and the predecessor under its mutation lock.
+    /// A fresh Approval successor remains possible after a spent predecessor approval.
+    pub retry_eligible: bool,
+    /// The applicable existing refusal code when the predecessor does not permit a successor.
+    pub retry_refusal: Option<String>,
+    /// The selected attempt's retained endpoint disagreement count.
+    pub disagreements: u8,
+    /// The exact decision a current repair result can overlay.
+    pub(crate) decision: Option<CommitId>,
+}
+
 /// The destinations of a pay record, from its validated canonical intent or
 /// its stored envelope; `None` when neither holds payment terms.
 fn record_destinations(record: &WireOperation) -> PaymentDestinations {
@@ -3393,24 +3424,8 @@ impl Session<'_> {
         {
             return Err(WindowStoreError::BusinessIdConflict);
         }
-        if matches!(record.state, S::Sending | S::SentOutcomeUnknown) {
-            return Err(WindowStoreError::AttemptOpen);
-        }
-        if record.attempts.len() >= MAX_ATTEMPTS {
-            return Err(WindowStoreError::AttemptLimit);
-        }
+        check_attempt_state(record, self.now)?;
         let from = record.state;
-        if !from.is_waiting() {
-            check_edge(Some(from), S::Sending)?;
-        }
-        if record
-            .execution_expires_at_ms
-            .is_some_and(|end| end <= self.now)
-        {
-            return Err(WindowStoreError::AuthorizationRefused {
-                precondition: MainnetPrecondition::Expired,
-            });
-        }
         if request_id.is_empty() || request_id.len() > REQUEST_ID_MAX {
             return Err(invalid("a request identifier exceeds its allowance"));
         }
@@ -3418,26 +3433,7 @@ impl Session<'_> {
         let previous_auth = record
             .current_attempt()
             .map(|attempt| attempt.authorization_id);
-        if successor {
-            if record.kind.is_x402() {
-                return Err(unexpected("an x402 operation makes one attempt"));
-            }
-            if record
-                .current_attempt()
-                .is_none_or(|attempt| attempt.not_included.is_none())
-            {
-                return Err(WindowStoreError::RetryRefused);
-            }
-            // Only a checked non-inclusion permits a successor, and only
-            // after the caller projected its decision onto the receipt.
-            if record
-                .current_attempt()
-                .and_then(|attempt| attempt.decision.as_ref())
-                .is_none_or(|decision| !decision.projected)
-            {
-                return Err(WindowStoreError::RetryRefused);
-            }
-        }
+        check_successor_proof(record)?;
         let permission = successor
             .then(|| {
                 record
@@ -4248,6 +4244,49 @@ impl Session<'_> {
     }
 }
 
+/// Admission's ordered state guards, independent of the prospective authorization.
+fn check_attempt_state(record: &WireOperation, now: u64) -> Result<(), WindowStoreError> {
+    use OperationState as S;
+    if matches!(record.state, S::Sending | S::SentOutcomeUnknown) {
+        return Err(WindowStoreError::AttemptOpen);
+    }
+    if record.attempts.len() >= MAX_ATTEMPTS {
+        return Err(WindowStoreError::AttemptLimit);
+    }
+    if !record.state.is_waiting() {
+        check_edge(Some(record.state), S::Sending)?;
+    }
+    if record.execution_expires_at_ms.is_some_and(|end| end <= now) {
+        return Err(WindowStoreError::AuthorizationRefused {
+            precondition: MainnetPrecondition::Expired,
+        });
+    }
+    Ok(())
+}
+
+/// A successor uses its current predecessor's checked, acknowledged non-inclusion.
+fn check_successor_proof(record: &WireOperation) -> Result<(), WindowStoreError> {
+    if record.state == OperationState::NotIncluded {
+        if record.kind.is_x402() {
+            return Err(unexpected("an x402 operation makes one attempt"));
+        }
+        if record
+            .current_attempt()
+            .is_none_or(|attempt| attempt.not_included.is_none())
+        {
+            return Err(WindowStoreError::RetryRefused);
+        }
+        if record
+            .current_attempt()
+            .and_then(|attempt| attempt.decision.as_ref())
+            .is_none_or(|decision| !decision.projected)
+        {
+            return Err(WindowStoreError::RetryRefused);
+        }
+    }
+    Ok(())
+}
+
 /// Refuses a successor attempt whose authorization names another policy
 /// digest or sequence than the predecessor attempt's authorization.
 fn same_policy_as_predecessor(
@@ -4256,15 +4295,22 @@ fn same_policy_as_predecessor(
     policy_digest: [u8; 32],
     policy_sequence: i64,
 ) -> Result<(), WindowStoreError> {
-    let previous = previous_auth
-        .and_then(|previous| wire.authorizations.iter().find(|auth| auth.id == previous))
-        .ok_or_else(|| unexpected("a successor attempt's predecessor authorization is gone"))?;
+    let previous = predecessor_authorization(wire, previous_auth)?;
     if previous.policy_digest != policy_digest || previous.policy_sequence != policy_sequence {
         return Err(unexpected(
             "a successor attempt names another policy than its predecessor",
         ));
     }
     Ok(())
+}
+
+fn predecessor_authorization(
+    wire: &WireFile,
+    previous_auth: Option<AuthorizationId>,
+) -> Result<&WireAuthorization, WindowStoreError> {
+    previous_auth
+        .and_then(|previous| wire.authorizations.iter().find(|auth| auth.id == previous))
+        .ok_or_else(|| unexpected("a successor attempt's predecessor authorization is gone"))
 }
 
 /// What one exposed authorization still owes its native release row.
@@ -5255,6 +5301,91 @@ fn committed_failure_code(attempt: &WireAttempt, decision: &WireDecision) -> Opt
     })
 }
 
+/// Projects a checked decision using only the selected attempt's authenticated provenance.
+fn committed_decision(
+    wire: &WireFile,
+    record: &WireOperation,
+    attempt: &WireAttempt,
+) -> Option<CommittedDecision> {
+    let decision = attempt.decision.as_ref()?;
+    let state = attempt.outcome?;
+    let ExposureIdentity::Classic {
+        envelope_sha256,
+        tx_hash,
+        ..
+    } = &attempt.exposure.as_ref()?.identity
+    else {
+        return None;
+    };
+    let identity = projection_identity(wire, attempt);
+    let failure_code = committed_failure_code(attempt, decision);
+    let missing = match &identity {
+        Err(field) => Some((*field).to_owned()),
+        Ok(_) if state == OperationState::Failed && failure_code.is_none() => {
+            Some("failure_code".to_owned())
+        }
+        Ok(_) => None,
+    };
+    Some(CommittedDecision {
+        operation_id: record.id,
+        attempt_index: attempt.index,
+        state,
+        commit_id: decision.commit_id,
+        evidence_digest: decision.evidence_digest,
+        ledgers: (decision.primary_ledger, decision.witness_ledger),
+        envelope_sha256: *envelope_sha256,
+        tx_hash: *tx_hash,
+        ledger: attempt
+            .agreed_outcome
+            .as_ref()
+            .map(|outcome| outcome.ledger),
+        fee_charged: decision.fee_charged,
+        not_included: attempt.not_included,
+        projected: decision.projected,
+        projection_identity: identity.ok(),
+        missing_projection_fact: missing,
+        failure_code,
+    })
+}
+
+fn classic_selectable(record: &WireOperation, attempt: &WireAttempt) -> bool {
+    !record.kind.is_x402()
+        && record.state == OperationState::SentOutcomeUnknown
+        && attempt.outcome == Some(OperationState::SentOutcomeUnknown)
+}
+
+fn attempt_runnable(
+    wire: &WireFile,
+    record: &WireOperation,
+    attempt: &WireAttempt,
+    now: u64,
+    configuration: &str,
+) -> bool {
+    if !classic_selectable(record, attempt) {
+        return false;
+    }
+    let Some(WireExposure {
+        identity: ExposureIdentity::Classic { max_time, .. },
+        ..
+    }) = &attempt.exposure
+    else {
+        return false;
+    };
+    let run = RecoveryRunSnapshot::of(
+        record.id,
+        attempt,
+        attempt_account(wire, attempt).as_deref(),
+    );
+    let view = super::normalize_recovery_run(
+        run.as_ref(),
+        *max_time,
+        attempt.send_by_ms,
+        attempt.decision.is_some(),
+        now,
+    );
+    super::recovery_run::recovery_runnable(&view, run.as_ref(), now, configuration)
+}
+
 /// Whether `wire` holds a committed decision of the classic attempt whose
 /// exposure names receipt `reservation_id` and transaction `tx_hash`.
 pub(super) fn committed_exposure_matches(
@@ -5366,8 +5497,80 @@ impl<'a> OperationStatus<'a> {
         let Some(mut wire) = self.store.read_for_inspection(self.profile)? else {
             return Ok(None);
         };
+        #[cfg(test)]
+        tests::progress::after_read();
         super::store::prune_lifecycle(&mut wire, now_ms()?);
         Ok(Some(wire))
+    }
+
+    /// Reads progress for the exact retained classic exposure, including historical attempts.
+    /// All facts use one authenticated image and the captured store time and configuration.
+    /// This query performs no RPC, receipt access, adoption or durable write.
+    ///
+    /// # Errors
+    /// Returns the verified window's integrity, keyring, clock and I/O errors.
+    pub fn submission_progress(
+        &self,
+        tx_hash: &[u8; 32],
+    ) -> Result<Option<SubmissionProgress>, WindowStoreError> {
+        let Some(wire) = self.read()? else {
+            return Ok(None);
+        };
+        let now = now_ms()?;
+        let configuration = super::recovery_run::recovery_configuration_digest(self.profile);
+        for record in records(&wire) {
+            for attempt in &record.attempts {
+                if !matches!(
+                    attempt.exposure.as_ref().map(|exposure| &exposure.identity),
+                    Some(ExposureIdentity::Classic { tx_hash: stored, .. }) if stored == tx_hash
+                ) {
+                    continue;
+                }
+                let decision = committed_decision(&wire, record, attempt);
+                let permission = check_attempt_state(record, now)
+                    .and_then(|()| check_successor_proof(record))
+                    .and_then(|()| {
+                        if record.state != OperationState::NotIncluded
+                            || record.current_attempt().map(|current| current.index)
+                                != Some(attempt.index)
+                        {
+                            return Err(WindowStoreError::RetryRefused);
+                        }
+                        predecessor_authorization(&wire, Some(attempt.authorization_id)).map(|_| ())
+                    });
+                return Ok(Some(SubmissionProgress {
+                    operation: OperationView::of_record(record),
+                    attempt: attempt.index,
+                    tx_hash: *tx_hash,
+                    exposure_present: true,
+                    outcome_recoverable: attempt_runnable(
+                        &wire,
+                        record,
+                        attempt,
+                        now,
+                        &configuration,
+                    ),
+                    projection_pending: decision
+                        .as_ref()
+                        .is_some_and(|decision| !decision.projected),
+                    projection_missing_fact: decision
+                        .as_ref()
+                        .and_then(|decision| decision.missing_projection_fact.clone()),
+                    retry_eligible: permission.is_ok(),
+                    retry_refusal: permission.err().map(|error| {
+                        crate::operation_entry::operation_refusal(error)
+                            .code()
+                            .to_owned()
+                    }),
+                    disagreements: attempt
+                        .recovery
+                        .as_ref()
+                        .map_or(0, |recovery| recovery.disagreements),
+                    decision: decision.map(|decision| decision.commit_id),
+                }));
+            }
+        }
+        Ok(None)
     }
 
     /// The retained slot and latest attempt, for resolver inspection.
@@ -5414,29 +5617,13 @@ impl<'a> OperationStatus<'a> {
                     continue;
                 }
                 let Some(WireExposure {
-                    identity:
-                        ExposureIdentity::Classic {
-                            tx_hash, max_time, ..
-                        },
+                    identity: ExposureIdentity::Classic { tx_hash, .. },
                     ..
                 }) = &attempt.exposure
                 else {
                     continue;
                 };
-                let run = RecoveryRunSnapshot::of(
-                    record.id,
-                    attempt,
-                    attempt_account(&wire, attempt).as_deref(),
-                );
-                let view = super::normalize_recovery_run(
-                    run.as_ref(),
-                    *max_time,
-                    attempt.send_by_ms,
-                    attempt.decision.is_some(),
-                    now,
-                );
-                if super::recovery_run::recovery_runnable(&view, run.as_ref(), now, &configuration)
-                {
+                if attempt_runnable(&wire, record, attempt, now, &configuration) {
                     candidates.push((
                         attempt.started_at_ms,
                         record.id.to_hex(),
@@ -5535,8 +5722,7 @@ impl<'a> OperationStatus<'a> {
                 else {
                     continue;
                 };
-                let selectable = record.state == OperationState::SentOutcomeUnknown
-                    && attempt.outcome == Some(OperationState::SentOutcomeUnknown);
+                let selectable = classic_selectable(record, attempt);
                 // A matched release stays selected until a decision resolves it.
                 if (!reporting && !selectable) || tx_hash.is_some_and(|hash| hash != stored_hash) {
                     continue;
@@ -5606,49 +5792,13 @@ impl<'a> OperationStatus<'a> {
         let mut decisions = Vec::new();
         for record in records(&wire) {
             for attempt in &record.attempts {
-                let (Some(decision), Some(state)) = (&attempt.decision, attempt.outcome) else {
+                let Some(decision) = committed_decision(&wire, record, attempt) else {
                     continue;
                 };
-                let Some(ExposureIdentity::Classic {
-                    envelope_sha256,
-                    tx_hash: stored_hash,
-                    ..
-                }) = attempt.exposure.as_ref().map(|exposure| &exposure.identity)
-                else {
-                    continue;
-                };
-                if tx_hash.is_some_and(|hash| hash != stored_hash) {
+                if tx_hash.is_some_and(|hash| hash != &decision.tx_hash) {
                     continue;
                 }
-                let identity = projection_identity(&wire, attempt);
-                let failure_code = committed_failure_code(attempt, decision);
-                let missing = match &identity {
-                    Err(field) => Some((*field).to_owned()),
-                    Ok(_) if state == OperationState::Failed && failure_code.is_none() => {
-                        Some("failure_code".to_owned())
-                    }
-                    Ok(_) => None,
-                };
-                decisions.push(CommittedDecision {
-                    operation_id: record.id,
-                    attempt_index: attempt.index,
-                    state,
-                    commit_id: decision.commit_id,
-                    evidence_digest: decision.evidence_digest,
-                    ledgers: (decision.primary_ledger, decision.witness_ledger),
-                    envelope_sha256: *envelope_sha256,
-                    tx_hash: *stored_hash,
-                    ledger: attempt
-                        .agreed_outcome
-                        .as_ref()
-                        .map(|outcome| outcome.ledger),
-                    fee_charged: decision.fee_charged,
-                    not_included: attempt.not_included,
-                    projected: decision.projected,
-                    projection_identity: identity.ok(),
-                    missing_projection_fact: missing,
-                    failure_code,
-                });
+                decisions.push(decision);
             }
         }
         Ok(decisions)
@@ -6180,6 +6330,7 @@ pub(crate) mod tests {
     use crate::policy_state::store::{RETENTION_MS, ResetConsent, ResetError};
     use crate::policy_state::{ChainScope, WatchClass, WatchedOperation};
 
+    pub(crate) mod progress;
     include!("operations_canonical_tests.rs");
 
     #[test]
@@ -12831,6 +12982,10 @@ pub(crate) mod tests {
 
         let (handle, commit) = checked_not_included(&mut fx, 3);
         let before = fs::read(fx.store.path()).unwrap();
+        assert_eq!(
+            progress::progress(&fx, 3).retry_refusal.as_deref(),
+            Some("recovery.retry_refused")
+        );
         let mint = fx.operation_mint_request(&handle, tx(13), fx.policy(), vec![]);
         let refused = fx.begin_mint(&handle, &mint).unwrap_err();
         assert_eq!(code(&refused), "recovery.retry_refused");
@@ -12870,6 +13025,7 @@ pub(crate) mod tests {
             );
         }
         repin(&fx, 7, [7; 32]);
+        assert!(progress::progress(&fx, 3).retry_eligible);
         let started = fx.begin_mint(&handle, &mint).unwrap();
         assert_eq!(started.attempt_index, 2);
         assert_eq!(fx.record(handle.id()).state, OperationState::Sending);
@@ -13155,6 +13311,10 @@ pub(crate) mod tests {
         let handle = projected_not_included(&mut fx, 1);
         let minted = link_next(&fx, &handle, 21, fx.policy());
         repin_policy(&fx, 8, [8; 32]);
+        assert!(
+            progress::progress(&fx, 1).retry_eligible,
+            "the prospective pin remains an admission check"
+        );
         let before = fs::read(fx.store.path()).unwrap();
         let generation = fx.generation();
         let attempts = serde_json::to_vec(&fx.record(handle.id()).attempts).unwrap();

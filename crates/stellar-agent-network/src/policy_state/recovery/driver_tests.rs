@@ -1274,6 +1274,9 @@ async fn driver_resolved_requires_exact_projection_before_successor() {
         super::super::operations::tests::successor_refusal(&mut fx.fx, &fx.handles[0]),
         "recovery.retry_refused"
     );
+    let progress = crate::policy_state::operations::tests::progress::progress(&fx.fx, 1);
+    assert!(progress.projection_pending && !progress.retry_eligible);
+    assert!(!progress.outcome_recoverable);
     let decision = OperationStatus::new(&fx.fx.store, &fx.fx.profile)
         .committed_decisions(None)
         .unwrap()
@@ -1286,6 +1289,8 @@ async fn driver_resolved_requires_exact_projection_before_successor() {
             decision.commit_id,
         )
         .unwrap();
+    let progress = crate::policy_state::operations::tests::progress::progress(&fx.fx, 1);
+    assert!(progress.retry_eligible && !progress.projection_pending);
     assert_eq!(
         super::super::operations::tests::successor_refusal(&mut fx.fx, &fx.handles[0]),
         "none"

@@ -2143,6 +2143,25 @@ attempt's authorization must carry the predecessor's policy digest and
 sequence, whether it is minted with the attempt or linked earlier. Another
 policy refuses with `internal.unexpected_state`.
 
+`OperationStatus::submission_progress` reads one authenticated image for an
+exact classic exposure hash, including historical and terminal attempts.
+It reports ordinary recovery runnability, projection provenance and persisted
+predecessor eligibility separately. Eligibility means the predecessor permits
+trying a suitable successor. Admission still checks the prospective envelope,
+fresh authorization, approval nonce and current policy pin under its lock.
+A fresh owner approval can authorize that successor. An absent historical
+execution end is supplied by the new authority; a recorded end stays fixed.
+
+Library transaction status returns this progress after recovery and receipt
+repair. A refused current repair marks display pending even if the decision's
+authenticated acknowledgement is already true. That display flag changes no
+successor permission, receipt claim or stored schema. A later successful
+`tx status` repair clears the display flag. Missing provenance stays named;
+unreadable authenticated state returns the existing typed status error.
+Missing history, expired authority and the eight-attempt limit cannot be
+repaired by editing receipts. The CLI and MCP payloads retain their existing
+fields; progress is a library handoff.
+
 A new record refuses with `operation.capacity` when its envelope, intent slot
 or record exceeds its bound, when 16 records wait, or when the committed file
 reached 1,179,648 bytes. One record stays within 184,365 bytes. Free text is

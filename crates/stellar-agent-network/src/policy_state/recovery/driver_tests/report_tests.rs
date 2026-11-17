@@ -294,6 +294,13 @@ async fn recovery_result_contract() {
                 .unwrap();
             let decision = entry.settlement.as_ref().unwrap();
             assert_eq!(decision.commit_id, *commit);
+            let progress = OperationStatus::new(&fx.store, &fx.profile)
+                .submission_progress(&entry.tx_hash)
+                .unwrap()
+                .unwrap();
+            assert_eq!(progress.operation.operation_id, *id);
+            assert!(progress.exposure_present && progress.projection_pending);
+            assert!(!progress.outcome_recoverable && !progress.retry_eligible);
             assert_eq!(decision.tx_hash, entry.tx_hash);
             match kind {
                 Checked::Succeeded => assert_eq!(
@@ -338,6 +345,14 @@ async fn recovery_reporting_legacy_compatibility() {
     let report = fx.run(&pair).await.unwrap();
     assert_eq!(report.evaluated, 0);
     assert_eq!(report.attempts.len(), 2);
+    for entry in &report.attempts {
+        let progress = OperationStatus::new(&fx.fx.store, &fx.fx.profile)
+            .submission_progress(&entry.tx_hash)
+            .unwrap()
+            .unwrap();
+        assert!(progress.exposure_present);
+        assert!(!progress.outcome_recoverable && !progress.projection_pending);
+    }
     assert!(matches!(
         report.attempts[0].result,
         RecoveryResult::NeedsEvidence {
