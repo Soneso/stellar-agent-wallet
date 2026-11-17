@@ -150,20 +150,17 @@ fn linked_entry_in(
     })
 }
 
-/// Removes live unattested entries of this envelope only when authenticated
+/// Removes live unattested entries of this intent only when authenticated
 /// status proves that no durable record names their nonce.
 fn remove_orphans(
     store: &mut PendingApprovalStore,
     status: &ApprovalStatus<'_>,
     handle: &OperationHandle,
 ) -> Result<(), WalletError> {
-    let Some(envelope) = handle
+    let envelope = handle
         .envelope_xdr()
         .map(operation_entry::unsigned_envelope_sha256)
-    else {
-        return Ok(());
-    };
-    let envelope = stellar_agent_core::hex::encode(&envelope);
+        .map(|digest| stellar_agent_core::hex::encode(&digest));
     let now = stellar_agent_core::timefmt::now_unix_ms().map_err(|error| {
         WalletError::Approval(ApprovalFailure::ClockError {
             detail: error.to_string(),
@@ -173,24 +170,27 @@ fn remove_orphans(
         let Some(stored) = store.get(&view.approval_nonce) else {
             continue;
         };
-        let (ApprovalKind::PaymentSimulated {
-            envelope_sha256_hex,
-            ..
-        }
-        | ApprovalKind::ClaimSimulated {
-            envelope_sha256_hex,
-            ..
-        }
-        | ApprovalKind::TrustlineSimulated {
-            envelope_sha256_hex,
-            ..
-        }) = &stored.kind
-        else {
-            continue;
+        let matches = match &stored.kind {
+            ApprovalKind::PaymentSimulated {
+                envelope_sha256_hex,
+                ..
+            }
+            | ApprovalKind::ClaimSimulated {
+                envelope_sha256_hex,
+                ..
+            }
+            | ApprovalKind::TrustlineSimulated {
+                envelope_sha256_hex,
+                ..
+            } => envelope.as_ref() == Some(envelope_sha256_hex),
+            ApprovalKind::X402Payment { intent_digest, .. } => {
+                *intent_digest == handle.intent().intent_digest()
+            }
+            _ => false,
         };
         if view.expired
             || stored.attestation_blob_b64.is_some()
-            || *envelope_sha256_hex != envelope
+            || !matches
             || status
                 .find_by_nonce(&view.approval_nonce)
                 .map_err(operation_entry::operation_refusal)?
@@ -208,7 +208,7 @@ fn remove_orphans(
 /// How a durable producer treats an inbox entry that no durable record names.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Unlinked {
-    /// The entry is an orphan: live unattested entries of the envelope are
+    /// The entry is an orphan: live unattested entries of the operation are
     /// removed before insertion, and after a refused open without a record.
     Replace,
     /// The entry is recoverable work under its recovery binding. It stays
@@ -217,7 +217,41 @@ enum Unlinked {
     Recover,
 }
 
+/// Pre-insert inbox failures keep the insertion protocol's error channel.
+enum ProducerError {
+    Inbox(ApprovalError),
+    Durable(WalletError),
+}
+
+impl From<WalletError> for ProducerError {
+    fn from(error: WalletError) -> Self {
+        Self::Durable(error)
+    }
+}
+
 impl WalletServer {
+    /// Reuses or opens the durable approval for an x402 operation.
+    #[cfg(feature = "mainnet-write")]
+    pub(crate) fn x402_pending_approval(
+        &self,
+        handle: Option<&OperationHandle>,
+        decision: PolicyDecision,
+        persist: impl FnOnce() -> Result<PendingApproval, WalletError>,
+    ) -> Result<PendingApproval, WalletError> {
+        self.start_approval(
+            handle,
+            ApprovedKind::X402Payment,
+            decision,
+            Unlinked::Replace,
+            |path, view, _| linked_entry(path, &view.record.nonce).map(Ok),
+            |_| persist(),
+        )
+        .map_err(|error| match error {
+            ProducerError::Inbox(error) => record_error(&error),
+            ProducerError::Durable(error) => error,
+        })?
+    }
+
     /// Reuses the linked approval or persists and opens it for `handle`.
     /// Inbox insertion retains the tool's protocol-error format. Durable
     /// recorder refusals use the wallet error envelope.
@@ -239,7 +273,13 @@ impl WalletServer {
             |path, view, _| linked_entry(path, &view.record.nonce).map(Ok),
             persist,
         )
-        .map_err(|error| ToolError::Business(refusal(&error)))?
+        .map_err(|error| match error {
+            ProducerError::Inbox(error) => ToolError::Protocol(rmcp::ErrorData::internal_error(
+                format!("approval.store_error: {error}"),
+                None,
+            )),
+            ProducerError::Durable(error) => ToolError::Business(refusal(&error)),
+        })?
         .map_err(|error| {
             ToolError::Protocol(rmcp::ErrorData::internal_error(
                 format!("approval.store_error: {error}"),
@@ -266,14 +306,21 @@ impl WalletServer {
         interval: (u64, u64),
         persist: impl FnOnce() -> Result<PendingApproval, ApprovalError>,
     ) -> Result<Result<PendingApproval, ApprovalError>, WalletError> {
-        self.start_approval(
+        match self.start_approval(
             handle,
             ApprovedKind::Payment,
             decision,
             Unlinked::Recover,
             |path, view, handle| self.linked_payment(path, view, handle, interval),
             |_| persist(),
-        )
+        ) {
+            Ok(result) => Ok(result),
+            Err(ProducerError::Inbox(error)) => Ok(Err(ApprovalError::Io {
+                kind: std::io::ErrorKind::Other,
+                source: std::io::Error::other(error),
+            })),
+            Err(ProducerError::Durable(error)) => Err(error),
+        }
     }
 
     /// The linked payment entry of `view`, read and checked under one inbox
@@ -391,7 +438,7 @@ impl WalletServer {
         persist: impl FnOnce(
             Option<&stellar_agent_core::approval::ClassicIntent>,
         ) -> Result<PendingApproval, E>,
-    ) -> Result<Result<PendingApproval, E>, WalletError> {
+    ) -> Result<Result<PendingApproval, E>, ProducerError> {
         if !self.context.chain_id.is_mainnet() {
             return Ok(persist(None));
         }
@@ -402,24 +449,28 @@ impl WalletServer {
         })?;
         let name = self.profile_name_for_approval();
         let directory = self.resolve_approval_dir().map_err(|error| {
-            WalletError::Approval(ApprovalFailure::StoreOpenFailed {
-                detail: error.to_string(),
+            ProducerError::Inbox(ApprovalError::Io {
+                kind: std::io::ErrorKind::Other,
+                source: std::io::Error::other(error),
             })
         })?;
         let path = directory.join(format!("{name}.toml"));
         // Opening the inbox establishes its private directory before the
         // producer lock is created; this initial guard writes no entry.
-        drop(open_inbox(&path)?);
+        drop(
+            open_with_retry(&path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF)
+                .map_err(ProducerError::Inbox)?,
+        );
         let _producer = producer_lock(&directory.join(format!("{name}.producer.lock")))?;
         let status = ApprovalStatus::new(&self.window_store, self.security_profile());
         if let Some(view) = status
             .find_by_operation(handle.id())
             .map_err(operation_entry::operation_refusal)?
         {
-            return linked(&path, &view, handle);
+            return linked(&path, &view, handle).map_err(Into::into);
         }
         if handle.state() != OperationState::Prepared {
-            return Err(operation_entry::approval_requires_prepared());
+            return Err(operation_entry::approval_requires_prepared().into());
         }
         if unlinked == Unlinked::Replace {
             let mut pending = open_inbox(&path)?;
@@ -462,7 +513,9 @@ impl WalletServer {
             })
         })();
         let error = match opened {
-            Ok(view) if unlinked == Unlinked::Recover => return linked(&path, &view, handle),
+            Ok(view) if unlinked == Unlinked::Recover => {
+                return linked(&path, &view, handle).map_err(Into::into);
+            }
             Ok(_) => return Ok(Ok(entry)),
             Err(error) => error,
         };
@@ -471,7 +524,7 @@ impl WalletServer {
                 open_inbox(&path)?
                     .remove(&entry.approval_nonce)
                     .map_err(|error| record_error(&error))?;
-                return linked(&path, &view, handle);
+                return linked(&path, &view, handle).map_err(Into::into);
             }
             Ok(None) if unlinked == Unlinked::Replace => {
                 // A failed cleanup leaves an orphan for the next retry.
@@ -482,7 +535,7 @@ impl WalletServer {
             // A matching or unreadable outcome keeps the entry for retry.
             _ => {}
         }
-        Err(error)
+        Err(error.into())
     }
 
     /// The business id a value tool enters with.
@@ -1442,6 +1495,23 @@ mod tests {
         assert_eq!(
             repeated.approval_nonce, result.approval_nonce,
             "restart adopts durable winner"
+        );
+    }
+
+    #[test]
+    fn producer_lock_acquires_when_the_holder_releases_between_attempts() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("producer.lock");
+        let held = producer_lock(&path).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(DEFAULT_RETRY_BACKOFF + DEFAULT_RETRY_BACKOFF / 2);
+            drop(held);
+        });
+        let result = producer_lock(&path);
+        release.join().unwrap();
+        assert!(
+            result.is_ok(),
+            "a retry acquires the lock released during the retry window"
         );
     }
 

@@ -1201,6 +1201,9 @@ pub struct MintRequest {
     pub intent_digest: Option<[u8; 32]>,
     /// The authorization of that operation's latest attempt, if any.
     pub predecessor: Option<AuthorizationId>,
+    /// The operation whose approval a mint without an operation link consumes.
+    /// This identity is not stored as the authorization's operation link.
+    pub approval_operation: Option<OperationId>,
     /// The native amounts the authorization reserves, stored with the
     /// record whether or not it holds window entries.
     pub native_reservation: Option<NativeReservation>,
@@ -1208,6 +1211,21 @@ pub struct MintRequest {
     /// refuse a passing floor during evaluation, as
     /// [`super::refuse_unproved_floor`] states, and pass `None`.
     pub floor: Option<super::accounting::CheckedFloor>,
+}
+
+impl MintRequest {
+    /// Resolves the approval identity before any mint reads retained state.
+    pub(super) fn approval_identity(&self) -> Result<Option<OperationId>, WindowStoreError> {
+        if self.operation.is_some() && self.approval_operation.is_some() {
+            return Err(WindowStoreError::UnexpectedState {
+                detail: "a mint cannot carry two operation identities".to_owned(),
+            });
+        }
+        Ok(self
+            .operation
+            .map(|link| link.operation_id)
+            .or(self.approval_operation))
+    }
 }
 
 /// How a mint inside an operation step relaxes the stand-alone rules.
@@ -1914,6 +1932,7 @@ pub(super) fn mint_into(
     expires: u64,
     options: MintOptions,
 ) -> Result<MintedRecord, WindowStoreError> {
+    let approval_identity = request.approval_identity()?;
     use MainnetPrecondition as P;
     // Both public mint entries ran `check_total_shape` before their lock.
     // The mint's prechecks compared `policy_digest` with the pin under the
@@ -1970,7 +1989,7 @@ pub(super) fn mint_into(
                     }),
                     P::ApprovalNonceReused,
                 )?;
-                super::approvals::consume(wire, nonce, request.operation, now)?;
+                super::approvals::consume(wire, nonce, approval_identity, now)?;
             }
         }
     }
@@ -2148,6 +2167,7 @@ impl PersistedWindowStore {
     /// admitted against the window's spend, its pending records, and every
     /// other hold.
     ///
+    /// Conflicting operation identities refuse before every store read.
     /// Retained approvals are checked after the chain and before the other
     /// prechecks, using a non-minting read under the lock. Their consent bound
     /// also caps the authorization, including a continuation under a used parent.
@@ -2170,16 +2190,12 @@ impl PersistedWindowStore {
         profile: &Profile,
         request: &MintRequest,
     ) -> Result<MintedRecord, WindowStoreError> {
+        let approval_identity = request.approval_identity()?;
         // A malformed entry refuses before the lock, the key, and any read.
         check_total_shape(&request.holds)?;
         let lock = self.ledger_lock(profile)?;
         let now = now_ms()?;
-        let cap = self.mint_record_checks(
-            profile,
-            request,
-            request.operation.map(|link| link.operation_id),
-            now,
-        )?;
+        let cap = self.mint_record_checks(profile, request, approval_identity, now)?;
         let expires = self.mint_prechecks(&lock, profile, request, now, cap)?;
 
         let (key, _mint) = self.load_or_mint_key(profile)?;
@@ -2890,6 +2906,7 @@ mod tests {
             MintRequest {
                 intent_digest: None,
                 predecessor: None,
+                approval_operation: None,
                 chain: Caip2::Mainnet,
                 consumer: match binding.domain() {
                     AuthorizationDomain::Soroban | AuthorizationDomain::X402Submit => {
@@ -7865,6 +7882,66 @@ mod tests {
             MainnetPrecondition::ApprovalNonceReused
         );
         assert_eq!(fx.bytes(), before);
+    }
+
+    #[test]
+    #[serial]
+    #[serial(mainnet_clock)]
+    fn consume_key_refuses_conflicting_identities_before_a_record_read() {
+        use super::super::approvals::tests::Fx;
+        let mut fx = Fx::new(300_000);
+        fx.open();
+        fx.consent();
+        let mut request = fx.mint_request();
+        request.approval_operation = Some(fx.operation);
+        std::fs::write(fx.store.path(), b"unreadable authenticated state").unwrap();
+        let before = fx.bytes();
+        let error = fx
+            .store
+            .mint_authorization(fx.fixture.profile(), &request)
+            .unwrap_err();
+        assert_eq!(
+            crate::operation_entry::operation_refusal(error).code(),
+            "internal.unexpected_state",
+            "conflicting identities refuse before an unreadable record is read"
+        );
+        assert_eq!(fx.bytes(), before);
+        request.approval_operation = None;
+        let error = fx
+            .store
+            .mint_authorization(fx.fixture.profile(), &request)
+            .unwrap_err();
+        assert_ne!(
+            crate::operation_entry::operation_refusal(error).code(),
+            "internal.unexpected_state"
+        );
+        drop(fx);
+
+        // The operation step supplies the link itself, so a step mint that
+        // also carries a separate approval identity refuses before any read.
+        use super::super::approvals::tests::{approval_handle, begin_step_mint};
+        let mut fx = Fx::new(300_000);
+        fx.open();
+        fx.consent();
+        let handle = approval_handle(&mut fx);
+        let mut request = fx.mint_request();
+        request.operation = None;
+        request.approval_operation = Some(fx.operation);
+        std::fs::write(fx.store.path(), b"unreadable authenticated state").unwrap();
+        let before = fx.bytes();
+        let error = begin_step_mint(&mut fx, &handle, request.clone()).unwrap_err();
+        assert_eq!(
+            crate::operation_entry::operation_refusal(error).code(),
+            "internal.unexpected_state",
+            "a step mint with a separate approval identity refuses before an unreadable record is read"
+        );
+        assert_eq!(fx.bytes(), before);
+        request.approval_operation = None;
+        let error = begin_step_mint(&mut fx, &handle, request).unwrap_err();
+        assert_ne!(
+            crate::operation_entry::operation_refusal(error).code(),
+            "internal.unexpected_state"
+        );
     }
 
     #[test]

@@ -237,6 +237,7 @@ pub(crate) type CompletionCall = (String, crate::decision::ConsentRowSource);
 pub(crate) struct RecordingConsent {
     pub(crate) calls: StdMutex<Vec<CompletionCall>>,
     pub(crate) refuse: std::sync::atomic::AtomicBool,
+    pub(crate) missing_record: std::sync::atomic::AtomicBool,
 }
 impl RecordingConsent {
     pub(crate) fn calls(&self) -> Vec<CompletionCall> {
@@ -244,6 +245,20 @@ impl RecordingConsent {
     }
 }
 impl crate::decision::ConsentRecording for RecordingConsent {
+    fn precheck(&self, _: &PendingApproval) -> Result<(), stellar_agent_core::error::WalletError> {
+        if self
+            .missing_record
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(stellar_agent_core::error::WalletError::Approval(
+                stellar_agent_core::ApprovalFailure::NotFound {
+                    detail: "no durable approval record for that nonce".to_owned(),
+                },
+            ));
+        }
+        Ok(())
+    }
+
     fn complete(
         &self,
         consent: crate::decision::VerifiedConsent,

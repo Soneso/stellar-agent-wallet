@@ -1387,6 +1387,9 @@ async fn challenge<G: ConsentSessionGate>(
             serde_json::from_slice(&body).map_err(|_| failure(Failure::PresenceChanged))?;
         let (store, current, intent) = state.snapshot(&nonce, true, None)?;
         let entry = state.live_entry(&store, &nonce)?;
+        if let Mode::Inbox(context) = &state.mode {
+            crate::decision::precheck_consent(context, &entry)?;
+        }
         let view_digest = hex::encode(mainnet_intent_consent_view_digest(
             &entry,
             &state.context.binding(),

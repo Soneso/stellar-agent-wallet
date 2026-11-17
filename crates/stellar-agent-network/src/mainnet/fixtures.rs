@@ -152,6 +152,7 @@ pub(crate) fn mint_header(header: &mut Header, binding: &DomainBinding, holds: &
             &MintRequest {
                 intent_digest: None,
                 predecessor: None,
+                approval_operation: None,
                 chain: header.chain,
                 binding: binding.clone(),
                 consumer: header.consumer,
@@ -638,6 +639,7 @@ impl LedgerFixture {
                 &MintRequest {
                     intent_digest: None,
                     predecessor: None,
+                    approval_operation: None,
                     chain: Caip2::Mainnet,
                     binding: binding.clone(),
                     consumer: header.consumer,
@@ -1647,6 +1649,7 @@ impl ResolverFixture {
         authority: &'a super::authority::MainnetAuthority<'a>,
     ) -> super::resolve::MessageSignRequest<'a> {
         super::resolve::MessageSignRequest {
+            approval_operation: None,
             context: &self.context,
             consumer: MainnetConsumer::X402Authenticated,
             intent,

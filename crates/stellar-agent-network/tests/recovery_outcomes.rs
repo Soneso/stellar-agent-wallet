@@ -137,6 +137,7 @@ impl Fixture {
             let mint = MintRequest {
                 intent_digest: Some(handle.intent().intent_digest()),
                 predecessor: None,
+                approval_operation: None,
                 chain: Caip2::Mainnet,
                 consumer: MainnetConsumer::CliPay,
                 binding: DomainBinding::Transaction {

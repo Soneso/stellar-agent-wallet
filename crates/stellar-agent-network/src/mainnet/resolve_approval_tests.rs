@@ -177,7 +177,12 @@ async fn consumed_resolver_refusals_precede_expiry_for_another_operation() {
         req.operation = None;
         req.unsigned_envelope_xdr = &envelope;
         let before = f.wire();
-        assert_refused(resolve_tx_sign(req).await, P::ApprovalNonceReused, &f, &before);
+        assert_refused(
+            resolve_tx_sign(req).await,
+            P::ApprovalNonceReused,
+            &f,
+            &before,
+        );
     }
 }
 
@@ -611,6 +616,7 @@ fn header_preserves_bindings_and_bounds() {
     let request = MintRequest {
         intent_digest: None,
         predecessor: None,
+        approval_operation: None,
         chain: f.profile.chain_id,
         binding: DomainBinding::Transaction {
             unsigned_envelope_sha256: witness.subject(),
@@ -759,6 +765,7 @@ fn intent_restart_seam() {
     let mint = MintRequest {
         intent_digest: Some(facts.record().intent_digest),
         predecessor: None,
+        approval_operation: None,
         chain: fx.fixture.profile().chain_id,
         binding: DomainBinding::Transaction {
             unsigned_envelope_sha256: [1; 32],

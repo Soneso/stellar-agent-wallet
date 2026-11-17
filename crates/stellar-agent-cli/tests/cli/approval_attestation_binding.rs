@@ -182,6 +182,10 @@ fn approve_binary_case(mainnet: bool, case: ApprovalCase) {
         .unwrap();
     }
     entry.approval_nonce = format!("-{}", &entry.approval_nonce[1..]);
+    if mainnet {
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home);
+        crate::approval_fixture::open_record(name, &profile, &entry);
+    }
     let nonce = entry.approval_nonce.clone();
     let mut approvals =
         PendingApprovalStore::open(home.join("approvals").join(format!("{name}.toml"))).unwrap();
