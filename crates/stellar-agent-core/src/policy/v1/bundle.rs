@@ -8,7 +8,7 @@
 //! addresses needs their authorization and contributes no sized wallet outflow.
 
 use crate::sc_address::scaddress_to_strkey;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use stellar_xdr::{InvokeContractArgs, ScAddress, ScVal};
 
 use crate::policy::v1::criteria::state_store::StateKey;
@@ -82,9 +82,8 @@ pub enum InnerOpDescriptor {
 ///
 /// Accumulation uses `i128` end-to-end (no clamp): each `TokenTransfer`
 /// inner's amount is already `i128` at the descriptor layer, so it is
-/// accumulated directly.  [`i128::saturating_add`] guards only against the
-/// running total itself overflowing `i128::MAX`, not against narrowing to a
-/// smaller integer type.
+/// accumulated directly. Amount criteria read a checked total. Count readers
+/// retain the saturated projection when an amount exceeds its representation.
 ///
 /// # Single-tx path
 ///
@@ -105,6 +104,7 @@ pub enum InnerOpDescriptor {
 #[derive(Debug, Default)]
 pub struct BundleStateOverlay {
     per_key_accumulated_stroops: HashMap<StateKey, i128>,
+    overflowed: HashSet<StateKey>,
 }
 
 impl BundleStateOverlay {
@@ -123,20 +123,25 @@ impl BundleStateOverlay {
             .unwrap_or(0)
     }
 
+    /// Returns the exact amount, refusing a previously overflowing accumulation.
+    pub(crate) fn checked_get(&self, state_key: &StateKey) -> Option<i128> {
+        (!self.overflowed.contains(state_key)).then(|| self.get(state_key))
+    }
+
     /// Adds `attempted_stroops` to the running total for `state_key`.
     ///
-    /// Uses [`i128::saturating_add`] to prevent overflow.  When the accumulated
-    /// total saturates at `i128::MAX`, subsequent `get` calls return `i128::MAX`,
-    /// which will cause the per-period cap to deny (over-deny rather than
-    /// under-deny — a safe-fail posture).
+    /// Remembers overflow for amount admission even if later additions would
+    /// make the saturated projection representable again.
     ///
-    /// This is a `pub(crate)` method; only [`crate::policy::v1::PolicyEngineV1::evaluate_bundle`]
-    /// calls it.
+    /// Criteria populate this overlay during bundle evaluation.
     pub(crate) fn accumulate(&mut self, state_key: StateKey, attempted_stroops: i128) {
         let entry = self
             .per_key_accumulated_stroops
-            .entry(state_key)
+            .entry(state_key.clone())
             .or_insert(0);
+        if entry.checked_add(attempted_stroops).is_none() {
+            self.overflowed.insert(state_key);
+        }
         *entry = entry.saturating_add(attempted_stroops);
     }
 }

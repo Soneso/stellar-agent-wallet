@@ -2475,9 +2475,13 @@ fn total_budget_attempt_overflow_denies() {
         .append_epoch(&total_key(), NOW_MS, i128::MAX, [5; 32])
         .unwrap();
     let result = total_evaluation(i128::MAX, &store, 1, None);
-    assert!(
-        !matches!(result, Ok(None)),
-        "an overflowing attempt is allowed: {result:?}"
+    assert_eq!(
+        result.unwrap(),
+        Some(DenyReason::TotalBudgetExhausted {
+            asset: "native".into(),
+            max_stroops: i128::MAX,
+            remaining_stroops: 0,
+        })
     );
 }
 
@@ -2558,15 +2562,22 @@ fn total_budget_multileg_overflow_denies() {
     let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
     use stellar_agent_core::policy::v1::criteria::total_budget::TotalBudgetCriterion;
     let store = PolicyStateStore::new();
+    store
+        .append_epoch(&total_key(), NOW_MS, 7, [5; 32])
+        .unwrap();
     let tool = pay();
     let profile = profile();
     let ctx = EvalContext::new(&tool, &Value::Null, "operator", &profile, &store, NOW_MS)
         .with_policy_digest([5; 32])
         .with_value(overflowing_legs());
     let result = TotalBudgetCriterion::new("native".to_owned(), i128::MAX).evaluate(&ctx);
-    assert!(
-        matches!(&result, Err(PolicyError::CriterionEvaluationFailed { detail }) if detail == "total_budget: sum overflows"),
-        "an overflowing multileg debit is allowed: {result:?}"
+    assert_eq!(
+        result.unwrap(),
+        Some(DenyReason::TotalBudgetExhausted {
+            asset: "native".into(),
+            max_stroops: i128::MAX,
+            remaining_stroops: i128::MAX - 7,
+        })
     );
 }
 
@@ -2639,10 +2650,198 @@ fn total_budget_overlay_overflow_denies() {
         &mut overlay,
     );
     let result = total_evaluation(i128::MAX, &store, 0, Some(&overlay));
-    assert!(
-        matches!(&result, Err(PolicyError::CriterionEvaluationFailed { detail }) if detail == "total_budget: sum overflows"),
-        "{result:?}"
+    assert_eq!(
+        result.unwrap(),
+        Some(DenyReason::TotalBudgetExhausted {
+            asset: "native".into(),
+            max_stroops: i128::MAX,
+            remaining_stroops: 0,
+        })
     );
+}
+
+fn amount_caps() -> Vec<(String, StateKey, &'static str)> {
+    let max = format!("\"{}\"", i128::MAX);
+    vec![
+        (
+            format!(
+                "{{ kind = \"per_period_cap\", asset = \"native\", window = \"1d\", max_stroops = {max} }}"
+            ),
+            StateKey::new("operator", 1, "native", 86_400),
+            "policy.deny.per_period_cap_exceeded",
+        ),
+        (
+            format!("{{ kind = \"total_budget\", asset = \"native\", max_stroops = {max} }}"),
+            total_key(),
+            "policy.deny.total_budget_exhausted",
+        ),
+        (
+            budget_table(", asset = \"native\"", &max, &max, "1d"),
+            unlisted_key(),
+            "policy.accounting_overflow",
+        ),
+    ]
+}
+
+#[test]
+#[serial_test::serial]
+fn caps_refuse_an_overflowing_sum() {
+    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+    let tool = pay();
+    let profile = profile();
+    for (text, key, code) in amount_caps() {
+        let document = load(&v2(&rule(&text, "allow")));
+        let criterion = document.rules[0].criteria[0].as_ref();
+        for (recorded, overlays, attempt, denied) in [
+            (vec![i128::MAX], vec![], 1, true),
+            (vec![i128::MAX], vec![1], 0, true),
+            (vec![], vec![i128::MAX], 1, true),
+            (vec![], vec![i128::MAX, 1], 0, true),
+            (vec![i128::MAX, 1], vec![], 0, true),
+            (vec![i128::MAX - 2], vec![1], 1, false),
+            (vec![], vec![], i128::MAX, false),
+            (vec![i128::MAX], vec![], 0, false),
+        ] {
+            let store = PolicyStateStore::new();
+            for amount in recorded {
+                if key.window_secs() == 0 {
+                    store.append_epoch(&key, NOW_MS, amount, [5; 32]).unwrap();
+                } else {
+                    store.append(&key, NOW_MS, amount).unwrap();
+                }
+            }
+            let mut overlay = BundleStateOverlay::default();
+            let ctx = EvalContext::new(&tool, &Value::Null, "operator", &profile, &store, NOW_MS)
+                .with_policy_digest([5; 32])
+                .with_value(payment(attempt, UNLISTED));
+            for amount in overlays {
+                criterion.accumulate_overlay(&ctx, &transfer(UNLISTED, amount), &mut overlay);
+            }
+            let bundle = BundleView {
+                inners: &[],
+                overlay: &overlay,
+            };
+            let evaluated = criterion.evaluate(&ctx.with_bundle(&bundle));
+            if denied && code == "policy.accounting_overflow" {
+                let error = evaluated.unwrap_err();
+                assert!(matches!(error, PolicyError::AccountingOverflow));
+                assert_eq!(error.wire_code(), code, "{text}");
+                continue;
+            }
+            let result = evaluated.unwrap();
+            assert_eq!(
+                result.as_ref().map(DenyReason::wire_code),
+                denied.then_some(code),
+                "{text}"
+            );
+            if let Some(reason) = result {
+                assert_eq!(format!("policy.deny.{}", reason.code()), code);
+            }
+        }
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn leg_sums_refuse_overflow_without_losing_asset_equivalence() {
+    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+    let tool = pay();
+    let profile = profile();
+    let store = PolicyStateStore::new();
+    let native_contract = CanonicalAsset::Native
+        .sac_contract_id(TESTNET_PASSPHRASE)
+        .unwrap();
+    for (text, key, code) in amount_caps() {
+        let document = load(&v2(&rule(&text, "allow")));
+        let criterion = document.rules[0].criteria[0].as_ref();
+        for (first, denied) in [(i128::MAX, true), (i128::MAX - 1, false)] {
+            let value = ValueClass::Value(
+                ValueEffects::new(vec![
+                    leg(ActionKind::Payment, first, "native", Some(UNLISTED)),
+                    leg(ActionKind::Payment, 1, &native_contract, Some(UNLISTED)),
+                ])
+                .with_recipient_class(Some(RecipientClass::Unlisted)),
+            );
+            let ctx = EvalContext::new(&tool, &Value::Null, "operator", &profile, &store, NOW_MS)
+                .with_policy_digest([5; 32])
+                .with_value(value);
+            let evaluated = criterion.evaluate(&ctx);
+            if denied && code == "policy.accounting_overflow" {
+                let error = evaluated.unwrap_err();
+                assert!(matches!(error, PolicyError::AccountingOverflow));
+                assert_eq!(error.wire_code(), code);
+            } else {
+                assert_eq!(
+                    evaluated.unwrap().as_ref().map(DenyReason::wire_code),
+                    denied.then_some(code)
+                );
+            }
+            let sized = criterion.size(&ctx, NOW_MS);
+            if denied && code == "policy.accounting_overflow" {
+                let error = sized.unwrap_err();
+                assert!(matches!(error, PolicyError::AccountingOverflow));
+                assert_eq!(error.wire_code(), code);
+            } else if denied {
+                assert!(
+                    matches!(sized, Err(PolicyError::CriterionEvaluationFailed { detail }) if detail.ends_with("sum overflows"))
+                );
+            } else {
+                let sized = sized.unwrap().unwrap();
+                assert_eq!(sized.amount(), i128::MAX);
+                assert_eq!(sized.key(), &key);
+            }
+        }
+    }
+}
+
+#[test]
+fn window_and_fallback_queries_refuse_overflow() {
+    use stellar_agent_core::policy::v1::criteria::state_store::StateStoreError;
+    let key = StateKey::new("operator", 1, "native", 3600);
+    let other_window = StateKey::new("operator", 1, "native", 60);
+    for mode in 0..3 {
+        let store = PolicyStateStore::new();
+        for (index, amount) in [i128::MAX, 1].into_iter().enumerate() {
+            if mode == 0 {
+                store.append(&key, NOW_MS, amount).unwrap();
+            } else {
+                let id = if mode == 1 || index == 0 {
+                    "first"
+                } else {
+                    "second"
+                };
+                store
+                    .append_exposure(&other_window, NOW_MS, amount, id, None, None)
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            store.query_window(&key, NOW_MS),
+            Err(StateStoreError::SumOverflow),
+            "mode {mode}"
+        );
+        assert_eq!(
+            store.query_window(&key, NOW_MS),
+            Err(StateStoreError::SumOverflow),
+            "overflow keeps history"
+        );
+        let unrelated = StateKey::new("operator", 1, "unlisted:native", 3600);
+        store.append(&unrelated, NOW_MS, 7).unwrap();
+        assert_eq!(store.query_window(&unrelated, NOW_MS).unwrap(), (7, 1));
+        if mode == 0 {
+            assert_eq!(
+                store.query_window(&key, NOW_MS + 3_600_001).unwrap(),
+                (0, 0)
+            );
+            assert_eq!(
+                store.query_window(&key, NOW_MS).unwrap(),
+                (0, 0),
+                "pruned history stays expired"
+            );
+        }
+    }
 }
 
 #[test]
@@ -3191,6 +3390,32 @@ fn final_evaluation_runs_deferred_checks() {
 
 /// An engine that implements only the strict methods.
 struct StrictOnly(PolicyEngineV1);
+
+#[test]
+fn the_opt_in_reads_the_first_matching_rule() {
+    let descriptor = tool("stellar_sep43_sign_transaction");
+    for (first, second) in [(false, true), (true, false)] {
+        let raw = v2(&format!(
+            "{}allow_opaque_signing = {first}\n{}allow_opaque_signing = {second}\n",
+            rule_for("*", "", "deny"),
+            rule_for("stellar_sep43_sign_transaction", "", "allow"),
+        ));
+        assert_eq!(engine(&raw).opaque_signing_opted_in(&descriptor), first);
+    }
+    let unmatched = engine(&v2(&format!(
+        "{}allow_opaque_signing = true\n",
+        rule_for("stellar_pay_commit", "", "allow"),
+    )));
+    assert!(!unmatched.opaque_signing_opted_in(&descriptor));
+}
+
+#[test]
+fn the_default_opt_in_query_is_closed_and_noop_is_open() {
+    let descriptor = tool("stellar_sep43_sign_transaction");
+    let default_engine = StrictOnly(engine_from_criteria(""));
+    assert!(!default_engine.opaque_signing_opted_in(&descriptor));
+    assert!(stellar_agent_core::policy::NoopPolicyEngine.opaque_signing_opted_in(&descriptor));
+}
 
 impl PolicyEngine for StrictOnly {
     fn evaluate(

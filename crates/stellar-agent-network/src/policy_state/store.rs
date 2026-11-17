@@ -7717,6 +7717,17 @@ pub(super) fn admit_as(
     for entry in entries {
         let total = is_total_entry(entry);
         let slot = slot_of(entry);
+        let overflow = || WindowStoreError::PolicyDenied {
+            reason: Box::new(entry.overflow_refusal()),
+        };
+        let sum_error = |error| match error {
+            WindowStoreError::AccountingOverflow
+                if !entry.key().bucket().starts_with("unlisted:") =>
+            {
+                overflow()
+            }
+            other => other,
+        };
         let accrued = batch
             .get(&slot)
             .copied()
@@ -7730,25 +7741,19 @@ pub(super) fn admit_as(
                 return Err(WindowStoreError::TotalEpochRetired);
             }
             let (file_sum, file_count) = total_in_file(wire, entry.key(), epoch)?;
-            let used =
-                file_sum
-                    .checked_add(batch_sum)
-                    .ok_or_else(|| WindowStoreError::Invalid {
-                        detail: "a total-budget sum overflows".to_owned(),
-                    })?;
-            used.checked_add(entry.amount())
-                .ok_or_else(|| WindowStoreError::Invalid {
-                    detail: "a total-budget sum overflows".to_owned(),
-                })?;
+            let used = file_sum.checked_add(batch_sum).ok_or_else(overflow)?;
             (used, file_count.saturating_add(batch_count))
         } else {
-            let (file_sum, file_count) = window_in_file(wire, entry.key(), entry.timestamp_ms())?;
+            let (file_sum, file_count) =
+                window_in_file(wire, entry.key(), entry.timestamp_ms()).map_err(sum_error)?;
             let mut used = accrued;
-            used.add_all(file_sum, file_count)?;
+            used.add_all(file_sum, file_count).map_err(sum_error)?;
             // The entry's own debit must be representable before any limit
             // compares it.
-            let mut after = used;
-            after.add(entry.amount())?;
+            if entry.key().bucket().starts_with("unlisted:") {
+                let mut after = used;
+                after.add(entry.amount())?;
+            }
             (used.sum, used.count)
         };
         if let Some(reason) = entry.refusal(used, calls) {
@@ -7766,7 +7771,7 @@ pub(super) fn admit_as(
             }
         }
         let mut accrued = accrued;
-        accrued.add(entry.amount())?;
+        accrued.add(entry.amount()).map_err(sum_error)?;
         batch.insert(slot, accrued);
     }
     Ok(())
@@ -9555,6 +9560,185 @@ mod tests {
         assert_eq!(
             store.signed_intents("intent", &profile).unwrap()[0].expiry_observed_at_ms,
             Some(2000)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn overflowing_fallback_history_refuses_a_zero_authorization() {
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        for intent in [false, true] {
+            let (_dir, profile, store, plan) = progress_fixture();
+            let _clock = crate::mainnet::clock::set_now_ms_for_test(1000);
+            if intent {
+                let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
+            } else {
+                store
+                    .record_pending(
+                        &profile,
+                        &[entry(key("intent", "native", 60), 1000, 1)],
+                        &reservation(&"af".repeat(32), "GSOURCE", 1, 1000),
+                    )
+                    .unwrap();
+            }
+            let mut wire = store.read_for_inspection(&profile).unwrap().unwrap();
+            if intent {
+                let legs = &mut wire.signed_intents[0].legs;
+                let index = legs.iter().position(|leg| leg.bucket == "native").unwrap();
+                legs[index].amount = i128::MAX;
+                let mut extra = legs[index].clone();
+                extra.amount = 1;
+                legs.push(extra);
+            } else {
+                let records = &mut wire.entries[0].records;
+                records[0].amount = i128::MAX;
+                let mut extra = records[0].clone();
+                extra.amount = 1;
+                records.push(extra);
+            }
+            // Authenticate the individually valid rows an older writer could retain.
+            wire.version = WIRE_VERSION_MAX;
+            check_snapshot(&wire).unwrap();
+            wire.generation += 1;
+            let (secret, _) = store.load_or_mint_key(&profile).unwrap();
+            write_generation(&generation_entry_ref(&profile), &wire).unwrap();
+            store.write_atomic(&secret, &wire).unwrap();
+            let before = fs::read(store.path()).unwrap();
+            let queried = key("intent", "native", 3600);
+            let memory = PolicyStateStore::new();
+            store.load_into("intent", &profile, &memory).unwrap();
+            assert_eq!(
+                memory.query_window(&queried, 1000),
+                Err(StateStoreError::SumOverflow)
+            );
+            let zero = WindowEntry::new(
+                queried,
+                1000,
+                0,
+                WindowLimit::Amount {
+                    asset: "native".into(),
+                    window: "1h".into(),
+                    max_stroops: i128::MAX,
+                },
+            );
+            assert!(
+                matches!(store.record_authorized(&profile, &[zero]),
+                Err(WindowStoreError::PolicyDenied { reason })
+                    if reason.wire_code() == "policy.deny.per_period_cap_exceeded"),
+                "intent={intent}"
+            );
+            assert_eq!(fs::read(store.path()).unwrap(), before);
+            assert_eq!(
+                store
+                    .read_for_inspection(&profile)
+                    .unwrap()
+                    .unwrap()
+                    .version,
+                16
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn authorized_batches_keep_the_generation_safety_stop() {
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = test_profile(dir.path(), "batch-crash");
+        let store = PersistedWindowStore::at_path(dir.path().join("batch.window"));
+        let key = key("batch-crash", "native", 3600);
+        let now = now_ms().unwrap();
+        store
+            .record_authorized(&profile, &[entry(key.clone(), now, 0)])
+            .unwrap();
+        let before = fs::read(store.path()).unwrap();
+        let failure = fail_store_writes();
+        assert!(matches!(
+            store.record_authorized(&profile, &[entry(key.clone(), now, 4), entry(key, now, 6),]),
+            Err(WindowStoreError::Io { .. })
+        ));
+        drop(failure);
+        assert_eq!(fs::read(store.path()).unwrap(), before);
+        let reopened = PersistedWindowStore::at_path(store.path().to_owned());
+        assert!(matches!(
+            reopened.load_into("batch-crash", &profile, &PolicyStateStore::new()),
+            Err(WindowStoreError::GenerationMismatch)
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn authorized_batches_survive_restart_and_expiry() {
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = test_profile(dir.path(), "batch-lifetime");
+        let store = PersistedWindowStore::at_path(dir.path().join("batch.window"));
+        let clock = crate::mainnet::clock::set_now_ms_for_test(5000);
+        let key = key("batch-lifetime", "native", 60);
+        let batch = |time| {
+            [4, 6].map(|amount| {
+                WindowEntry::new(
+                    key.clone(),
+                    time,
+                    amount,
+                    WindowLimit::Amount {
+                        asset: "native".into(),
+                        window: "1m".into(),
+                        max_stroops: 15,
+                    },
+                )
+            })
+        };
+        store.record_authorized(&profile, &batch(5000)).unwrap();
+        let reopened = PersistedWindowStore::at_path(store.path().to_owned());
+        clock.set(4000);
+        let memory = PolicyStateStore::new();
+        reopened
+            .load_into("batch-lifetime", &profile, &memory)
+            .unwrap();
+        assert_eq!(
+            memory.query_window(&key, 4000).unwrap(),
+            (10, 2),
+            "an earlier clock keeps authorized spend"
+        );
+        let before = fs::read(store.path()).unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                reopened.record_authorized(&profile, &batch(4000)),
+                Err(WindowStoreError::PolicyDenied { .. })
+            ));
+            assert_eq!(fs::read(store.path()).unwrap(), before);
+        }
+        let later = 5001 + RETENTION_MS;
+        clock.set(later);
+        reopened.record_authorized(&profile, &batch(later)).unwrap();
+        clock.set(4000);
+        memory.clear().unwrap();
+        reopened
+            .load_into("batch-lifetime", &profile, &memory)
+            .unwrap();
+        assert_eq!(
+            memory.query_window(&key, 4000).unwrap(),
+            (10, 2),
+            "expired records do not resurrect"
+        );
+        let mut corrupt = fs::read(store.path()).unwrap();
+        corrupt.push(b' ');
+        fs::write(store.path(), &corrupt).unwrap();
+        let refused = reopened.record_authorized(&profile, &batch(4000));
+        assert!(
+            matches!(refused, Err(WindowStoreError::HmacMismatch)),
+            "{refused:?}"
+        );
+        assert_eq!(
+            fs::read(store.path()).unwrap(),
+            corrupt,
+            "malformed state is not rewritten"
         );
     }
 
@@ -21167,12 +21351,46 @@ mod tests {
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let f = fx("total-admit-overflow");
-            let mut wire = version_twelve();
-            f.push_row(&mut wire, i128::MAX, Some(D1));
-            assert_eq!(
-                detail(admit(&wire, &[f.total_of(1, i128::MAX, Some(D1))])),
-                "a total-budget sum overflows"
+            f.pin(D1);
+            f.authorized(&[f.total_of(i128::MAX, i128::MAX, Some(D1))])
+                .unwrap();
+            let before = f.state();
+            assert!(
+                matches!(f.authorized(&[f.total_of(1, i128::MAX, Some(D1))]),
+                Err(WindowStoreError::PolicyDenied { reason })
+                    if *reason == DenyReason::TotalBudgetExhausted {
+                        asset: "native".into(), max_stroops: i128::MAX, remaining_stroops: 0,
+                    })
             );
+            assert_eq!(f.state(), before);
+            let batch = fx("total-batch-overflow");
+            batch.pin(D1);
+            batch
+                .authorized(&[batch.total_of(0, i128::MAX, Some(D1))])
+                .unwrap();
+            let before = batch.state();
+            assert!(matches!(batch.authorized(&[
+                batch.total_of(i128::MAX, i128::MAX, Some(D1)),
+                batch.total_of(1, i128::MAX, Some(D1)),
+            ]), Err(WindowStoreError::PolicyDenied { reason })
+                if reason.wire_code() == "policy.deny.total_budget_exhausted"));
+            assert_eq!(batch.state(), before);
+
+            let partial = fx("total-partial-overflow");
+            partial.pin(D1);
+            partial
+                .authorized(&[partial.total_of(7, i128::MAX, Some(D1))])
+                .unwrap();
+            let before = partial.state();
+            assert!(
+                matches!(partial.authorized(&[partial.total_of(i128::MAX, i128::MAX, Some(D1))]),
+                Err(WindowStoreError::PolicyDenied { reason })
+                if *reason == DenyReason::TotalBudgetExhausted {
+                    asset: "native".into(), max_stroops: i128::MAX, remaining_stroops: i128::MAX - 7,
+                }),
+                "an overflowing attempt preserves the unused allocation"
+            );
+            assert_eq!(partial.state(), before);
         }
 
         #[test]

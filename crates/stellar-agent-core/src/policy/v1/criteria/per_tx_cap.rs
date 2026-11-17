@@ -161,7 +161,7 @@ pub(super) fn asset_debit_sum(
     criterion: &str,
 ) -> Result<AssetDebitSum, PolicyError> {
     debit_sum(ctx, asset, criterion, |sum, amount| {
-        Some(sum.saturating_add(amount))
+        Ok(sum.saturating_add(amount))
     })
 }
 
@@ -170,21 +170,24 @@ pub(super) fn asset_debit_sum(
 ///
 /// # Errors
 ///
-/// [`PolicyError::CriterionEvaluationFailed`] with `"{criterion}: sum
-/// overflows"` when the matching legs overflow their sum.
+/// Returns sizing errors for missing assets or amounts. Overflow returns
+/// the caller's governing-limit denial without inventing a debit total.
 pub(super) fn checked_asset_debit_sum(
     ctx: &EvalContext<'_>,
     asset: &str,
     criterion: &str,
+    overflow: &DenyReason,
 ) -> Result<AssetDebitSum, PolicyError> {
-    debit_sum(ctx, asset, criterion, i128::checked_add)
+    debit_sum(ctx, asset, criterion, |sum, amount| {
+        sum.checked_add(amount).ok_or_else(|| overflow.clone())
+    })
 }
 
 fn debit_sum(
     ctx: &EvalContext<'_>,
     asset: &str,
     criterion: &str,
-    add: fn(i128, i128) -> Option<i128>,
+    add: impl Fn(i128, i128) -> Result<i128, DenyReason>,
 ) -> Result<AssetDebitSum, PolicyError> {
     let tool_name = ctx.tool.name.as_str();
 
@@ -224,9 +227,10 @@ fn debit_sum(
                 ),
             })?;
         matched = true;
-        sum = add(sum, amount).ok_or_else(|| PolicyError::CriterionEvaluationFailed {
-            detail: format!("{criterion}: sum overflows"),
-        })?;
+        sum = match add(sum, amount) {
+            Ok(sum) => sum,
+            Err(reason) => return Ok(AssetDebitSum::Deny(reason)),
+        };
     }
 
     // A call with no matching debit leaves this asset unconstrained.

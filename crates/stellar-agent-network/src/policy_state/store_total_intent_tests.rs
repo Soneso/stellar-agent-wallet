@@ -425,16 +425,16 @@ fn intent_total_negative_and_overflow() {
         )
         .unwrap();
     let before = f.state();
-    assert_eq!(
-        detail(
-            f.store
-                .admit_signed_intent(
-                    &f.profile,
-                    &total_plan(2, &[f.total_of(1, i128::MAX, Some(D1))])
-                )
-                .map(drop)
-        ),
-        "a total-budget sum overflows"
+    let refused = f.store.admit_signed_intent(
+        &f.profile,
+        &total_plan(2, &[f.total_of(1, i128::MAX, Some(D1))]),
+    );
+    assert!(
+        matches!(refused, Err(WindowStoreError::PolicyDenied { reason })
+        if *reason == stellar_agent_core::policy::DenyReason::TotalBudgetExhausted {
+            asset: "native".into(), max_stroops: i128::MAX, remaining_stroops: 0,
+        }),
+        "an intent overflow is the governing total-budget denial"
     );
     assert_eq!(f.state(), before);
     assert_eq!(f.sum(D1), i128::MAX);

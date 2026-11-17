@@ -5282,12 +5282,12 @@ mod tests {
         }
 
         /// A charge of `i128::MAX` under a limit of `i128::MAX` leaves no
-        /// room: a reservation of 1 overflows the total. The send refuses as
-        /// `submission.record_unavailable` with the typed detail, reserves
-        /// nothing, and the rendered envelope keeps the code.
+        /// room: a reservation of 1 overflows the total. The send returns the
+        /// total-budget denial, reserves nothing, and the rendered envelope
+        /// keeps that code.
         #[tokio::test]
         #[serial]
-        async fn a_total_overflow_refuses_as_record_unavailable() {
+        async fn a_total_overflow_refuses_as_budget_exhausted() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
             let _storage_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
@@ -5316,9 +5316,12 @@ mod tests {
                 .pre_send(&sub.intent)
                 .await
                 .unwrap_err();
-            assert_eq!(error.code(), "submission.record_unavailable");
+            assert_eq!(error.code(), "policy.deny.total_budget_exhausted");
             assert!(
-                error.message().contains("a total-budget sum overflows"),
+                matches!(&error, WalletError::PolicyDenied { reason }
+                if **reason == stellar_agent_core::policy::DenyReason::TotalBudgetExhausted {
+                    asset: "native".into(), max_stroops: i128::MAX, remaining_stroops: 0,
+                }),
                 "{error:?}"
             );
             assert_eq!(reservations(&fx), 0);
@@ -5326,7 +5329,7 @@ mod tests {
                 crate::submission_flow::submission_error_envelope(&error, "AAAA", "tx status");
             assert_eq!(
                 envelope.error.as_ref().unwrap().code,
-                "submission.record_unavailable"
+                "policy.deny.total_budget_exhausted"
             );
         }
 

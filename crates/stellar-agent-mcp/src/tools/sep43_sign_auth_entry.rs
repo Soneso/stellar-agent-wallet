@@ -258,6 +258,7 @@ impl WalletServer {
                         stellar_agent_network::submit::redact_tx_hash(&payload_digest),
                         stellar_agent_core::observability::RedactedStrkey::from_full(&signer_g),
                         uuid::Uuid::new_v4().to_string(),
+                        Vec::new(),
                     );
                 crate::tools::value_audit::emit_value_audit_row_with_writer(
                     &audit_writer,

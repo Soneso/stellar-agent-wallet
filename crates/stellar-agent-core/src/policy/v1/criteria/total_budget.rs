@@ -139,32 +139,44 @@ impl Criterion for TotalBudgetCriterion {
     ///
     /// Returns [`PolicyError::CriterionEvaluationFailed`] for an all-zero
     /// policy digest, whatever the call, an unresolvable debit, a
-    /// state-store failure, or a sum that overflows.
+    /// state-store failure other than an overflowing amount sum.
     fn evaluate(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
         let epoch = epoch(ctx)?;
-        let attempted = match checked_asset_debit_sum(ctx, &self.asset, self.kind())? {
+        let exhausted = || DenyReason::TotalBudgetExhausted {
+            asset: self.asset.clone(),
+            max_stroops: self.max_stroops,
+            remaining_stroops: 0,
+        };
+        let attempted = match checked_asset_debit_sum(ctx, &self.asset, self.kind(), &exhausted())?
+        {
             AssetDebitSum::NotApplicable => return Ok(None),
+            // An overflowing attempt still reports the allocation left by existing use.
+            AssetDebitSum::Deny(DenyReason::TotalBudgetExhausted { .. }) => None,
             AssetDebitSum::Deny(reason) => return Ok(Some(reason)),
-            AssetDebitSum::Amount(sum) => sum,
+            AssetDebitSum::Amount(sum) => Some(sum),
         };
         let state_key = self.state_key(ctx);
-        let (recorded, _) = ctx
-            .state_store
-            .query_epoch(&state_key, epoch)
-            .map_err(|e| PolicyError::CriterionEvaluationFailed {
-                detail: format!("total_budget: state store error: {e}"),
-            })?;
-        let overflow = || PolicyError::CriterionEvaluationFailed {
-            detail: "total_budget: sum overflows".to_owned(),
+        let recorded = match ctx.state_store.query_epoch(&state_key, epoch) {
+            Ok((amount, _)) => amount,
+            Err(super::state_store::StateStoreError::SumOverflow) => return Ok(Some(exhausted())),
+            Err(e) => {
+                return Err(PolicyError::CriterionEvaluationFailed {
+                    detail: format!("total_budget: state store error: {e}"),
+                });
+            }
         };
-        let used = recorded
-            .checked_add(
-                ctx.bundle
-                    .map(|view| view.overlay.get(&state_key))
-                    .unwrap_or(0),
-            )
-            .ok_or_else(overflow)?;
-        if used.checked_add(attempted).ok_or_else(overflow)? > self.max_stroops {
+        let Some(used) = ctx
+            .bundle
+            .map(|view| view.overlay.checked_get(&state_key))
+            .unwrap_or(Some(0))
+            .and_then(|overlay| recorded.checked_add(overlay))
+        else {
+            return Ok(Some(exhausted()));
+        };
+        if attempted
+            .and_then(|amount| used.checked_add(amount))
+            .is_none_or(|sum| sum > self.max_stroops)
+        {
             return Ok(Some(DenyReason::TotalBudgetExhausted {
                 asset: self.asset.clone(),
                 max_stroops: self.max_stroops,
