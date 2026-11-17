@@ -71,6 +71,7 @@ use stellar_agent_network::MainnetWriteContext;
 use stellar_agent_network::policy_engine::{
     BuiltPolicyEngine, PolicyEngineBuildError, ProfileSelection, build_policy_engine,
 };
+use stellar_agent_network::policy_state::{FloorSource, floor_rule_matches, refuse_unproved_floor};
 
 /// A policy build refusal with its stable business code.
 #[derive(Debug)]
@@ -652,6 +653,7 @@ pub(crate) fn evaluate_mainnet_policy(
                 },
             )
         })
+        .and_then(|decision| refuse_unproved_floor(policy, decision))
         .map_err(AuthorityRefusal::Refusal)?;
     let verdict = match decision.decision() {
         Decision::Allow => MainnetVerdict::Allow,
@@ -668,6 +670,44 @@ pub(crate) fn evaluate_mainnet_policy(
         }
     };
     Ok(MainnetEvaluation { verdict, decision })
+}
+
+/// The observed source facts of a classic mainnet `tool_name` evaluation:
+/// `Some` when the first rule matching the tool carries a balance floor.
+/// The read runs before [`evaluate_mainnet_policy`] samples its instant.
+///
+/// # Errors
+///
+/// The readiness, account read, and native exposure refusals of
+/// [`FloorSource::read`].
+pub(crate) async fn mainnet_floor_source(
+    context: &MainnetWriteContext,
+    client: &stellar_agent_network::StellarRpcClient,
+    policy: &VerifiedPolicy,
+    tool_name: &'static str,
+    source: &str,
+) -> Result<Option<FloorSource>, WalletError> {
+    let tool = value_descriptor(
+        tool_name,
+        ToolValueKind::MovesValue,
+        context.chain().caip2_str(),
+    );
+    if !floor_rule_matches(&policy.engine(), &tool) {
+        return Ok(None);
+    }
+    let store = stellar_agent_network::policy_state::PersistedWindowStore::for_profile(
+        context.profile_name(),
+    );
+    FloorSource::read(
+        client,
+        source,
+        &store,
+        context.profile(),
+        stellar_agent_network::operational::readiness_deadline(),
+    )
+    .await
+    .map(Some)
+    .map_err(WalletError::from)
 }
 
 /// The refusal of a policy evaluation whose instant cannot be read.

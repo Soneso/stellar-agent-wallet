@@ -211,6 +211,11 @@ pub(crate) fn minimum_reserve(margin_stroops: i64) -> String {
     format!("{{ kind = \"minimum_reserve\", margin_stroops = {margin_stroops} }},\n")
 }
 
+/// A `balance_floor` criterion of `min_stroops`.
+pub(crate) fn balance_floor(min_stroops: i64) -> String {
+    format!("{{ kind = \"balance_floor\", min_stroops = \"{min_stroops}\" }},\n")
+}
+
 /// How the fixture's profile and policy are set up.
 pub(crate) struct Spec {
     name: &'static str,

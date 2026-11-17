@@ -39,7 +39,7 @@ use stellar_agent_core::{
         verified_policy::VerifiedPolicy,
     },
     policy::{
-        Decision,
+        Decision, PolicyError,
         v1::value::{ValueClass, derive_value_class},
     },
     profile::owner_key::OwnerKeyContext,
@@ -366,6 +366,9 @@ pub(crate) fn render_authority_refusal(
                 format!("{verb} operation denied by operator policy"),
             )
         }
+        AuthorityRefusal::Refusal(MainnetRefusal::Engine(
+            e @ (PolicyError::AccountingOverflow | PolicyError::AccountingInvalid),
+        )) => Envelope::<()>::err_raw(e.wire_code(), format!("{e}")),
         AuthorityRefusal::Refusal(MainnetRefusal::Engine(e)) => {
             Envelope::<()>::err_raw("policy.engine_required", format!("{e}"))
         }
@@ -1561,6 +1564,16 @@ pub(crate) mod tests {
                 })),
                 "policy.engine_required",
                 "policy internal error: fixture",
+            ),
+            (
+                AuthorityRefusal::Refusal(MainnetRefusal::Engine(PolicyError::AccountingOverflow)),
+                "policy.accounting_overflow",
+                "the policy accounting sum overflows",
+            ),
+            (
+                AuthorityRefusal::Refusal(MainnetRefusal::Engine(PolicyError::AccountingInvalid)),
+                "policy.accounting_invalid",
+                "a policy accounting amount or fee is invalid",
             ),
             (
                 AuthorityRefusal::Refusal(MainnetRefusal::Clock(
