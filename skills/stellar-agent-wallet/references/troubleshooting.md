@@ -429,7 +429,7 @@ own check comes after the nonce is consumed.
 | `network.envelope_signed_for_mainnet` | A signature fails under the endpoint network and verifies under mainnet. | Do not retry; the envelope cannot be relayed onto this chain. Re-run the simulate step for the intended network. |
 | `network.envelope_signature_unverifiable` | A signature verifies under neither the endpoint's network nor mainnet, or no eligible ed25519 signer accounts for it (hash-x and pre-auth-tx signers contribute no ed25519 key). | Do not retry the same envelope. Re-run the simulate step and sign with a key the source account lists as a signer. |
 | `network.envelope_unsigned` | The envelope carries no signature, or on a fee-bump the outer or the inner transaction carries none; typically a build-only envelope handed straight to a submit step. | Sign the envelope first, then submit. On a fee-bump, both the inner transaction and the fee source must sign. |
-| `network.account_not_found` | A transaction-source or operation-source account on the envelope is absent from the ledger, so its signer set cannot be read. | Nothing was sent. Confirm the account exists and is funded on the target network. |
+| `network.account_not_found` | A transaction-source or operation-source account on the envelope is absent from the ledger, so its signer set cannot be read. Both SEP-43 transaction tools read it before the policy decision. | Nothing was signed or sent. Confirm the account exists and is funded on the target network. |
 
 `network.rpc_credential_refused` means the credential is empty, exceeds 1024 bytes,
 holds a control character, or an endpoint answers a request with HTTP 401 or 403.

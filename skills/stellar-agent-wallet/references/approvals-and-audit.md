@@ -469,6 +469,7 @@ The CLI summary and both inbox detail pages show the profile name, CAIP-2 chain 
 An enrollment placeholder appears as `(not enrolled)`.
 Payment, claim, and trustline summaries are decoded from the envelope the approval attests: every destination, amount, asset, memo, limit, balance id, fee, and sequence number shown is the envelope's.
 The effective source is the operation source when the operation has one, otherwise the transaction source.
+A SEP-43 transaction tool counts another source's operations only when that source's signer set lists the wallet key; this never makes a transaction of two or more operations approvable, and the approval binds the complete envelope.
 A claim names the balance by id only, so its asset and amount read `not part of the signed claim transaction`.
 Every value renders control characters as visible escapes such as `\u{1b}`.
 A request whose stored digest is not the digest of its stored envelope, whose envelope does not decode, or whose rule proposal digest does not match what it shows appears as `INCONSISTENT`, offers no approve action, and is refused with `approval.entry_inconsistent`.

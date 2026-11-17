@@ -880,6 +880,10 @@ pub(crate) async fn fetch_account_recovery(
 /// response: it is the ledger a submission made straight after this read is
 /// recorded against.
 ///
+/// The SEP-43 transaction tools read the same sets to decide whose operations
+/// the wallet's signature authorizes: a source counts when its set holds the
+/// wallet key at any weight. An error is never an empty set.
+///
 /// # Errors
 ///
 /// - [`WalletError::Protocol`] wrapping [`ProtocolError::XdrCodecFailed`] if an
@@ -891,7 +895,7 @@ pub(crate) async fn fetch_account_recovery(
 ///   query does not complete before `deadline`.
 /// - [`WalletError::Network`] wrapping [`NetworkError::RpcResponseMalformed`]
 ///   if the response's `latestLedger` is 0 or does not fit a ledger sequence.
-pub(crate) async fn fetch_account_signers(
+pub async fn fetch_account_signers(
     client: &StellarRpcClient,
     account_ids: &[String],
     deadline: tokio::time::Instant,
@@ -1613,6 +1617,212 @@ mod tests {
                 .unwrap_err();
             assert_eq!(error.code(), code, "HTTP {status}: {error}");
         }
+    }
+
+    /// An account entry of `owner` that lists `signers` with their weights.
+    fn signed_account_entry(
+        owner: [u8; 32],
+        signers: Vec<(stellar_xdr::SignerKey, u32)>,
+    ) -> String {
+        use stellar_xdr::{AccountEntry, AccountEntryExt, SequenceNumber, Signer, Thresholds};
+        LedgerEntryData::Account(AccountEntry {
+            account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(owner))),
+            balance: 100,
+            seq_num: SequenceNumber(1),
+            num_sub_entries: 0,
+            inflation_dest: None,
+            flags: 0,
+            home_domain: Default::default(),
+            thresholds: Thresholds([1, 5, 5, 5]),
+            signers: signers
+                .into_iter()
+                .map(|(key, weight)| Signer { key, weight })
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap(),
+            ext: AccountEntryExt::V0,
+        })
+        .to_xdr_base64(stellar_xdr::Limits::none())
+        .unwrap()
+    }
+
+    /// A signer-set server answering one `getLedgerEntries` call with `entries`.
+    async fn signer_server(
+        entries: Vec<serde_json::Value>,
+        latest: serde_json::Value,
+    ) -> wiremock::MockServer {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(stellar_agent_test_support::EchoIdResponder::new(
+                serde_json::json!({"entries": entries, "latestLedger": latest}),
+            ))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn entry_json(owner: [u8; 32], xdr: &str) -> serde_json::Value {
+        let id = stellar_strkey::ed25519::PublicKey(owner).to_string();
+        serde_json::json!({
+            "key": stellar_agent_test_support::xdr_fixtures::account_ledger_key_xdr(id.as_str()),
+            "xdr": xdr,
+            "lastModifiedLedgerSeq": 6,
+        })
+    }
+
+    /// A foreign source's payment counts when the read signer set lists the
+    /// wallet key, at weight 1 or 0 and below every threshold; it is
+    /// excluded when the key is absent or listed only as a hash-x,
+    /// pre-auth-tx or signed-payload signer.
+    #[tokio::test]
+    async fn foreign_source_membership_controls_attribution() {
+        use stellar_agent_core::policy::transaction_effects::{
+            transaction_effects_for_sources, transaction_source_candidates,
+        };
+        use stellar_xdr::{
+            Asset, MuxedAccount, MuxedAccountMed25519, Operation, OperationBody, PaymentOp,
+            SignerKey, SignerKeyEd25519SignedPayload, Transaction, TransactionEnvelope,
+            TransactionV1Envelope,
+        };
+        const WALLET: [u8; 32] = [1; 32];
+        const SOURCE: [u8; 32] = [2; 32];
+        const PEER: [u8; 32] = [3; 32];
+        let pay = |source| Operation {
+            source_account: Some(source),
+            body: OperationBody::Payment(PaymentOp {
+                destination: MuxedAccount::Ed25519(Uint256([4; 32])),
+                asset: Asset::Native,
+                amount: 5,
+            }),
+        };
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx: Transaction {
+                source_account: MuxedAccount::Ed25519(Uint256(WALLET)),
+                operations: vec![
+                    pay(MuxedAccount::Ed25519(Uint256(SOURCE))),
+                    pay(MuxedAccount::MuxedEd25519(MuxedAccountMed25519 {
+                        id: 9,
+                        ed25519: Uint256(SOURCE),
+                    })),
+                ]
+                .try_into()
+                .unwrap(),
+                ..Default::default()
+            },
+            signatures: Default::default(),
+        })
+        .to_xdr_base64(stellar_xdr::Limits::none())
+        .unwrap();
+        let candidates = transaction_source_candidates(&envelope, Some(&WALLET)).unwrap();
+        let ids = candidates.account_ids();
+        assert_eq!(ids.len(), 1, "G and M spellings share one request");
+        let ed = |key| SignerKey::Ed25519(Uint256(key));
+        let cases = [
+            ("weight 1", vec![(ed(WALLET), 1)], 2),
+            ("weight 0", vec![(ed(WALLET), 0)], 2),
+            (
+                "two subthreshold keys",
+                vec![(ed(PEER), 1), (ed(WALLET), 1)],
+                2,
+            ),
+            ("absent", vec![(ed(PEER), 5)], 0),
+            (
+                "other signer types",
+                vec![
+                    (SignerKey::HashX(Uint256(WALLET)), 5),
+                    (SignerKey::PreAuthTx(Uint256(WALLET)), 5),
+                    (
+                        SignerKey::Ed25519SignedPayload(SignerKeyEd25519SignedPayload {
+                            ed25519: Uint256(WALLET),
+                            payload: vec![1].try_into().unwrap(),
+                        }),
+                        5,
+                    ),
+                ],
+                0,
+            ),
+        ];
+        for (case, signers, legs) in cases {
+            let server = signer_server(
+                vec![entry_json(SOURCE, &signed_account_entry(SOURCE, signers))],
+                serde_json::json!(100),
+            )
+            .await;
+            let client = StellarRpcClient::new(&server.uri()).unwrap();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            let (sets, ledger) = fetch_account_signers(&client, &ids, deadline)
+                .await
+                .unwrap();
+            assert_eq!(ledger, 100);
+            let membership = candidates
+                .observe(|key| {
+                    sets.get(
+                        stellar_strkey::ed25519::PublicKey(*key)
+                            .to_string()
+                            .as_str(),
+                    )
+                    .map(Vec::as_slice)
+                })
+                .unwrap();
+            let effects = transaction_effects_for_sources(&envelope, &membership, "").unwrap();
+            assert_eq!(effects.valued.len(), legs, "{case}");
+            assert_eq!(server.received_requests().await.unwrap().len(), 1, "{case}");
+        }
+    }
+
+    /// Every requested account needs an entry, and every read failure keeps
+    /// its own code: none of them is an empty signer set.
+    #[tokio::test]
+    async fn source_reader_requires_all_requested_accounts() {
+        const SOURCE: [u8; 32] = [2; 32];
+        const ABSENT: [u8; 32] = [5; 32];
+        let id = |key| {
+            stellar_strkey::ed25519::PublicKey(key)
+                .to_string()
+                .as_str()
+                .to_owned()
+        };
+        let valid = entry_json(SOURCE, &signed_account_entry(SOURCE, Vec::new()));
+        let mut bad_xdr = valid.clone();
+        bad_xdr["xdr"] = "AAAA".into();
+        let cases = [
+            (
+                vec![valid.clone()],
+                serde_json::json!(100),
+                vec![id(SOURCE), id(ABSENT)],
+                "network.account_not_found",
+            ),
+            (
+                vec![bad_xdr],
+                serde_json::json!(100),
+                vec![id(SOURCE)],
+                "protocol.xdr_codec_failed",
+            ),
+            (
+                vec![valid.clone()],
+                serde_json::json!(0),
+                vec![id(SOURCE)],
+                "network.rpc_response_malformed",
+            ),
+        ];
+        for (entries, latest, requested, code) in cases {
+            let server = signer_server(entries, latest).await;
+            let client = StellarRpcClient::new(&server.uri()).unwrap();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            let error = fetch_account_signers(&client, &requested, deadline)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), code);
+        }
+        let server = signer_server(vec![valid], serde_json::json!(100)).await;
+        let client = StellarRpcClient::new(&server.uri()).unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let (sets, _) = fetch_account_signers(&client, &[id(SOURCE), id(SOURCE)], deadline)
+            .await
+            .unwrap();
+        assert_eq!(sets[&id(SOURCE)], vec![SOURCE]);
     }
 
     /// A refused account or data key reaches no query event and no request;

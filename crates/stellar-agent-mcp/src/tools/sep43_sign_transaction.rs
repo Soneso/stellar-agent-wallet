@@ -147,6 +147,8 @@ impl WalletServer {
         description = "Sign a TransactionEnvelope XDR (SEP-43 signTransaction). \
                        Does NOT submit — signing only. \
                        Returns { signedTxXdr: string, signerAddress: string }. \
+                       An approval requirement returns { approval } instead; the repeat \
+                       passes approval_nonce and approval_attestation. \
                        read_only_hint=false; destructive_hint=false.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]

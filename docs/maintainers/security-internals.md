@@ -859,6 +859,23 @@ criteria count no debit for it and known-issuer checks fail closed. A fee paid
 by another account has no cap and no reserve debit in this gate. Address
 credentials carry their own signatures and add no effect.
 
+Source attribution: `transaction_source_candidates` runs the structural and
+negative-amount checks over the whole envelope, then lists the distinct base
+keys of operation sources other than the wallet, skipping operations without
+an effect for any source. The gate reads their signer sets with
+`fetch_account_signers` in one request on the probed primary endpoint, before
+classification, audit and admission, and holds no lock across the read. A
+source counts when its master key or a plain ed25519 signer, at any weight,
+is the wallet key; no threshold is solved. `transaction_effects_for_sources`
+skips every other source's operations before `decode_operation`, so they add
+no leg, opt-in, refusal or memo refusal. Every read error refuses with its
+own code. A fee bump, a call without a wallet key and a parsed wallet-only
+transaction read nothing. Fee ownership and the wallet tests for inflows,
+claimants and sponsorship are unchanged. The set is the one observed for this
+call and nothing caches it: a later signer change can make a retained
+signature relevant to a source this call excluded. Approval eligibility and
+binding use the original envelope, so two raw operations never qualify.
+
 ### SEP-43 auth-entry effects
 
 Invariant: an auth-entry signature leaves the wallet only after the tool's own

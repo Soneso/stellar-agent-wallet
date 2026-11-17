@@ -4,9 +4,10 @@
 //! tool's own rule, this effects decision, audit pre-flight, admission,
 //! signer, signature. The decoder in
 //! [`stellar_agent_core::policy::transaction_effects`] classifies every
-//! operation. Each payment leg is then decided by the rule of its payment
-//! tool, with its signed asset, amount, recipient and memo, inside the frame
-//! of the tool's own allowed decision.
+//! operation of the wallet and of each other source whose signer set, read
+//! in this call, lists the wallet key. Each payment leg is then decided by the
+//! rule of its payment tool, with its signed asset, amount, recipient and
+//! memo, inside the frame of the tool's own allowed decision.
 //!
 //! Admission records the usage of every allowed leg in one durable batch
 //! before the signer is loaded. A later signer, signing or send failure keeps
@@ -37,16 +38,17 @@ use stellar_agent_core::envelope_decode::{
 use stellar_agent_core::error::FeeSource;
 use stellar_agent_core::payment_accounts::PaymentAccount;
 use stellar_agent_core::policy::transaction_effects::{
-    FeeEffect, PaymentRoute, RefusedEffect, TransactionEffects, TransactionEffectsError,
-    UnvaluedEffect, ValuedOperation, authorized_invocation_effects, transaction_effects,
+    FeeEffect, PaymentRoute, RefusedEffect, SourceCandidates, SourceMembership, TransactionEffects,
+    TransactionEffectsError, UnvaluedEffect, ValuedOperation, authorized_invocation_effects,
+    transaction_effects_for_sources, transaction_source_candidates,
 };
 use stellar_agent_core::policy::v1::value::{ValueLeg, derive_value_class};
 use stellar_agent_core::policy::v1::{
     AccountObservation, AccountReserveLookupError, AccountReservesView, ValueClass, ValueEffects,
 };
 use stellar_agent_core::policy::{ApprovalRequest, Decision, DenyReason, ToolDescriptor};
-use stellar_agent_network::AccountView;
 use stellar_agent_network::policy_state::{WindowStoreError, record_authorized_window_states};
+use stellar_agent_network::{AccountView, StellarRpcClient};
 use stellar_xdr::{AccountId, PublicKey, ScAddress, Uint256};
 
 use crate::policy_adapter::AccountViewAdapter;
@@ -68,12 +70,29 @@ pub(crate) struct Sep43Effects {
     pub decision: PolicyDecision,
 }
 
-/// A transaction the approval surfaces show, with its decoded summary.
+/// A transaction the approval surfaces show, with the fields its pending
+/// approval stores.
 enum Approvable {
-    /// A payment, a path payment or an account creation.
-    Payment(ClassicSummary),
+    /// A payment; its pending approval reads the envelope.
+    Payment,
+    /// A path payment or an account creation, stored as a payment of its
+    /// send asset and amount.
+    Send {
+        destination: String,
+        asset: String,
+        amount_stroops: i64,
+        fee_stroops: u32,
+        seq_num: i64,
+    },
     /// A trustline change.
-    Trustline(ClassicSummary),
+    Trustline {
+        holder: String,
+        asset_code: String,
+        asset_issuer: String,
+        limit_stroops: Option<i64>,
+        fee_stroops: u32,
+        seq_num: i64,
+    },
 }
 
 /// The approvable form of a transaction: one operation, valued by its
@@ -85,20 +104,65 @@ fn approvable(transaction_xdr: &str, effects: &TransactionEffects) -> Option<App
     if !effects.unvalued.is_empty() || operation.value.is_some() {
         return None;
     }
-    let (kind, wrap): (_, fn(ClassicSummary) -> Approvable) = match operation.route {
-        PaymentRoute::Pay | PaymentRoute::CreateAccount => {
-            (ClassicTransactionKind::Payment, Approvable::Payment)
-        }
-        PaymentRoute::Trustline => (ClassicTransactionKind::Trustline, Approvable::Trustline),
+    let kind = match operation.route {
+        PaymentRoute::Pay | PaymentRoute::CreateAccount => ClassicTransactionKind::Payment,
+        PaymentRoute::Trustline => ClassicTransactionKind::Trustline,
         _ => return None,
     };
     // The summary decode refuses a fee bump, a legacy envelope and every
     // operation count other than one.
-    classic_summary(transaction_xdr, kind).ok().map(wrap)
+    let ClassicSummary {
+        source,
+        fee_stroops,
+        seq_num,
+        operation,
+        ..
+    } = classic_summary(transaction_xdr, kind).ok()?;
+    let send = |destination, asset, amount_stroops| Approvable::Send {
+        destination,
+        asset,
+        amount_stroops,
+        fee_stroops,
+        seq_num,
+    };
+    match operation {
+        ClassicOperation::Payment { .. } => Some(Approvable::Payment),
+        ClassicOperation::PathPayment {
+            destination,
+            send_asset,
+            send_amount_stroops,
+            ..
+        } => Some(send(destination, send_asset, send_amount_stroops)),
+        ClassicOperation::CreateAccount {
+            destination,
+            starting_balance_stroops,
+        } => Some(send(
+            destination,
+            "XLM".to_owned(),
+            starting_balance_stroops,
+        )),
+        ClassicOperation::ChangeTrust {
+            asset_code,
+            asset_issuer,
+            limit_stroops,
+        } => Some(Approvable::Trustline {
+            holder: source,
+            asset_code,
+            asset_issuer,
+            limit_stroops,
+            fee_stroops,
+            seq_num,
+        }),
+        _ => None,
+    }
 }
 
 /// An approval requirement: the request and its governing lifetime.
 type Requirement = (ApprovalRequest, u64);
+
+/// A payment rule's approval requirement, its returned effects and the
+/// approvable shape it applies to.
+type OperationRequirement<'shape> = (Requirement, Option<ValueEffects>, &'shape Approvable);
 
 fn store_error(detail: impl std::fmt::Display) -> ToolError {
     ToolError::Protocol(ErrorData::internal_error(
@@ -160,10 +224,9 @@ fn sep43_check_address(
     if address == account {
         return Ok(());
     }
-    Err(stellar_agent_sep43::Sep43Error::InvalidAddress {
-        detail: format!("provided address does not match the signing key (expected {account:?})"),
-        expected_type: "G-strkey matching the signing key",
-    })
+    Err(stellar_agent_sep43::Sep43Error::signing_key_mismatch(
+        account,
+    ))
 }
 
 /// The pay-route evaluation of a token leg `account` authorizes in an
@@ -227,7 +290,8 @@ impl WalletServer {
     /// Every evaluation reads the outer allowed dispatch's `snapshot`, so all
     /// of them see one policy state, cache and instant. With
     /// `charge_own_rule`, admission also charges the tool's own count limits.
-    /// A transaction without a payment leg sends no account read.
+    /// The signer sets of other operation sources are read first, once; a
+    /// transaction without such a source or a payment leg sends no read.
     ///
     /// An approval requirement of `outcome` or of a payment rule needs an
     /// approvable transaction. Without `proof`, the gate stores a pending
@@ -254,21 +318,24 @@ impl WalletServer {
         )
         .ok()
         .map(|key| key.0);
-        let effects = transaction_effects(
+        let candidates = transaction_source_candidates(transaction_xdr, wallet.as_ref())
+            .map_err(decoder_refusal)?;
+        let (membership, client) = self.sep43_observe_sources(&candidates).await?;
+        let effects = transaction_effects_for_sources(
             transaction_xdr,
-            wallet.as_ref(),
+            &membership,
             self.context.network_passphrase(),
         )
         .map_err(decoder_refusal)?;
         let shape = approvable(transaction_xdr, &effects);
-        let tool_requirement = match outcome {
-            DispatchOutcome::RequireApproval(_) if shape.is_none() => {
+        let tool_requirement = match (outcome, &shape) {
+            (DispatchOutcome::RequireApproval(_), None) => {
                 return Err(refusal(single_shot_require_approval_error()));
             }
-            DispatchOutcome::RequireApproval(approval) => {
-                Some((approval.request.clone(), approval.governing_ttl_ms))
+            (DispatchOutcome::RequireApproval(approval), Some(shape)) => {
+                Some(((approval.request.clone(), approval.governing_ttl_ms), shape))
             }
-            DispatchOutcome::Allow(_) => None,
+            (DispatchOutcome::Allow(_), _) => None,
         };
         let descriptor = self.registered_descriptor(tool)?;
         if let Some(operation) = effects.unvalued.first() {
@@ -292,38 +359,37 @@ impl WalletServer {
                 effects.payment_legs(),
                 chain_id,
                 spent_stroops,
-                shape.is_some(),
+                shape.as_ref(),
                 snapshot,
+                client,
                 &mut gated,
             )
             .await?;
         // The shorter lifetime governs; on a tie, the operation's request.
-        let (operation_requirement, value_effects) = operation_requirement.unzip();
-        let ((request, governing_ttl_ms), value_effects) =
+        let ((request, governing_ttl_ms), value_effects, shape) =
             match (tool_requirement, operation_requirement) {
                 (None, None) => return Ok(gated),
-                (Some(own), Some(operation)) if own.0.ttl_seconds < operation.0.ttl_seconds => {
-                    (own, None)
+                (Some((own, shape)), Some((operation, _, _)))
+                    if own.0.ttl_seconds < operation.0.ttl_seconds =>
+                {
+                    (own, None, shape)
                 }
-                (_, Some(operation)) => (operation, value_effects.flatten()),
-                (Some(own), None) => (own, None),
+                (_, Some((operation, value_effects, shape))) => (operation, value_effects, shape),
+                (Some((own, shape)), None) => (own, None, shape),
             };
-        let Some(shape) = shape else {
-            return Err(refusal(single_shot_require_approval_error()));
-        };
         let now_ms = snapshot.now_ms();
         if proof.nonce.is_none() && proof.attestation.is_none() {
             return Err(refusal(self.sep43_pending_approval(
                 transaction_xdr,
-                &shape,
+                shape,
                 &request,
                 now_ms,
                 governing_ttl_ms,
             )?));
         }
         let kind = match shape {
-            Approvable::Payment(_) => GatedApprovalKind::Payment,
-            Approvable::Trustline(_) => GatedApprovalKind::Trustline,
+            Approvable::Payment | Approvable::Send { .. } => GatedApprovalKind::Payment,
+            Approvable::Trustline { .. } => GatedApprovalKind::Trustline,
         };
         let required = DispatchOutcome::RequireApproval(ApprovalOutcome {
             request,
@@ -354,20 +420,21 @@ impl WalletServer {
     ///
     /// The preimage passes the SEP-43 input checks for that account first,
     /// and a caller `address` must name that account before any read or
-    /// admission. Every token leg the account authorizes is then decided by the pay rule
-    /// in the outer allowed dispatch's `snapshot`, with the signed asset,
-    /// quantity and recipient and without a memo or fee. A call the wallet
-    /// cannot value needs the tool rule's `allow_opaque_signing`. Admission
-    /// always charges the tool's own count limits. An approval requirement of
-    /// a pay rule refuses with `policy.approval_required_unsupported`.
+    /// admission. Every token leg the account authorizes is then decided by
+    /// the pay rule in the outer allowed dispatch's `snapshot`, with the
+    /// signed asset, quantity and recipient and without a memo or fee. A call
+    /// the wallet cannot value needs the tool rule's `allow_opaque_signing`.
+    /// Admission always charges the tool's own count limits. An approval
+    /// requirement of a pay rule refuses with
+    /// `policy.approval_required_unsupported`.
     ///
     /// # Errors
     ///
     /// `policy.engine_required` when the profile signer is not a G-strkey;
     /// the SEP-43 refusals of an invalid preimage; `sep43.invalid_address`
-    /// when `address` is not the profile signer's G-strkey; business refusals for
-    /// unopted calls, account reads and pay-rule decisions; protocol errors
-    /// for registry and argument faults.
+    /// when `address` is not the profile signer's G-strkey; business
+    /// refusals for unopted calls, account reads and pay-rule decisions;
+    /// protocol errors for registry and argument faults.
     pub(crate) async fn sep43_auth_entry_gate(
         &self,
         tool: &'static str,
@@ -427,12 +494,74 @@ impl WalletServer {
             legs.iter().collect(),
             chain_id,
             0,
-            false,
+            None,
             snapshot,
+            None,
             &mut gated,
         )
         .await?;
         Ok(gated)
+    }
+
+    /// The primary write endpoint, probed under the pre-send budget.
+    async fn sep43_probed_client(&self) -> Result<StellarRpcClient, ToolError> {
+        let client =
+            self.write_primary_client()
+                .map_err(|error| match rpc_client_failure(&error) {
+                    Ok(result) => ToolError::Business(result),
+                    Err(data) => ToolError::Protocol(data),
+                })?;
+        self.probe_write_endpoint(
+            &client,
+            tokio::time::Instant::now() + stellar_agent_network::PRE_SEND_BUDGET,
+        )
+        .await
+        .map_err(|error| refusal(endpoint_refusal_result(&error)))?;
+        Ok(client)
+    }
+
+    /// Reads the signer sets of `candidates` in one request on the probed
+    /// endpoint and returns the membership with that endpoint.
+    ///
+    /// Without a candidate, nothing is read. Each call reads again; a read
+    /// error refuses with its own code and excludes no source.
+    async fn sep43_observe_sources(
+        &self,
+        candidates: &SourceCandidates,
+    ) -> Result<(SourceMembership, Option<StellarRpcClient>), ToolError> {
+        // The reader refuses a response without every requested account, so
+        // a missing set is a malformed answer, never a nonmember.
+        let unobserved = || {
+            refusal(business_error_result(
+                "network.rpc_response_malformed",
+                "the signer set of an operation source is missing from the response",
+            ))
+        };
+        let (sets, client) = match candidates.keys().len() {
+            0 => (std::collections::BTreeMap::new(), None),
+            _ => {
+                let client = self.sep43_probed_client().await?;
+                let (sets, _) = stellar_agent_network::account::fetch_account_signers(
+                    &client,
+                    &candidates.account_ids(),
+                    tokio::time::Instant::now() + stellar_agent_network::PRE_SEND_BUDGET,
+                )
+                .await
+                .map_err(|error| refusal(ledger_err_result(&error)))?;
+                (sets, Some(client))
+            }
+        };
+        let membership = candidates
+            .observe(|key| {
+                sets.get(
+                    stellar_strkey::ed25519::PublicKey(*key)
+                        .to_string()
+                        .as_str(),
+                )
+                .map(Vec::as_slice)
+            })
+            .ok_or_else(unobserved)?;
+        Ok((membership, client))
     }
 
     /// Refuses an effect the wallet cannot value unless the first rule that
@@ -461,18 +590,24 @@ impl WalletServer {
     /// wallet account the profile names is read once; each recipient base
     /// account at most once. Without a leg, nothing is read.
     ///
-    /// An approval requirement of a leg is returned when `approvable`;
-    /// otherwise it refuses with `policy.approval_required_unsupported` and
-    /// the result is `None`.
-    async fn sep43_decide_legs(
+    /// An approval requirement of a leg is returned with the `approvable`
+    /// shape; without one it refuses with
+    /// `policy.approval_required_unsupported`. `client` is an endpoint this
+    /// call already probed.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one frame of the effects decision"
+    )]
+    async fn sep43_decide_legs<'shape>(
         &self,
         payment_legs: Vec<&ValuedOperation>,
         chain_id: &str,
         mut spent_stroops: i128,
-        approvable: bool,
+        approvable: Option<&'shape Approvable>,
         snapshot: &GateSnapshot,
+        client: Option<StellarRpcClient>,
         gated: &mut Sep43Effects,
-    ) -> Result<Option<(Requirement, Option<ValueEffects>)>, ToolError> {
+    ) -> Result<Option<OperationRequirement<'shape>>, ToolError> {
         let mut operation_requirement = None;
         if payment_legs.is_empty() {
             return Ok(operation_requirement);
@@ -481,18 +616,10 @@ impl WalletServer {
             &self.profile.mcp_signer_default.account,
         )
         .ok();
-        let client =
-            self.write_primary_client()
-                .map_err(|error| match rpc_client_failure(&error) {
-                    Ok(result) => ToolError::Business(result),
-                    Err(data) => ToolError::Protocol(data),
-                })?;
-        self.probe_write_endpoint(
-            &client,
-            tokio::time::Instant::now() + stellar_agent_network::PRE_SEND_BUDGET,
-        )
-        .await
-        .map_err(|error| refusal(endpoint_refusal_result(&error)))?;
+        let client = match client {
+            Some(client) => client,
+            None => self.sep43_probed_client().await?,
+        };
         let source = match wallet {
             Some(_) => Some(
                 stellar_agent_network::fetch_account(
@@ -560,16 +687,17 @@ impl WalletServer {
             match evaluation.decision {
                 Decision::Allow => {}
                 Decision::Deny(reason) => return Err(refusal(policy_denial_error_result(&reason))),
-                Decision::RequireApproval(_) if !approvable => {
-                    return Err(refusal(single_shot_require_approval_error()));
-                }
                 // An approvable transaction holds this one leg.
-                Decision::RequireApproval(request) => {
-                    operation_requirement = Some((
-                        (request, evaluation.governing_ttl_ms),
-                        evaluation.value_effects.clone(),
-                    ));
-                }
+                Decision::RequireApproval(request) => match approvable {
+                    Some(shape) => {
+                        operation_requirement = Some((
+                            (request, evaluation.governing_ttl_ms),
+                            evaluation.value_effects.clone(),
+                            shape,
+                        ));
+                    }
+                    None => return Err(refusal(single_shot_require_approval_error())),
+                },
                 _ => {
                     return Err(refusal(business_error_result(
                         "policy.unexpected_decision",
@@ -611,36 +739,26 @@ impl WalletServer {
     ) -> Result<CallToolResult, ToolError> {
         let profile_name = self.profile_name_for_approval();
         let entry = match shape {
-            Approvable::Payment(summary @ ClassicSummary { operation, .. })
-                if !matches!(operation, ClassicOperation::Payment { .. }) =>
-            {
-                let (destination, asset, amount) = match operation {
-                    ClassicOperation::CreateAccount {
-                        destination,
-                        starting_balance_stroops,
-                    } => (destination, "XLM", *starting_balance_stroops),
-                    ClassicOperation::PathPayment {
-                        destination,
-                        send_asset,
-                        send_amount_stroops,
-                        ..
-                    } => (destination, send_asset.as_str(), *send_amount_stroops),
-                    _ => return Err(store_error("the payment summary is not approvable")),
-                };
-                self.persist_create_account_pending_approval(
+            Approvable::Send {
+                destination,
+                asset,
+                amount_stroops,
+                fee_stroops,
+                seq_num,
+            } => self
+                .persist_send_pending_approval(
                     transaction_xdr,
                     destination,
                     asset,
-                    amount,
-                    summary.fee_stroops,
-                    summary.seq_num,
+                    *amount_stroops,
+                    *fee_stroops,
+                    *seq_num,
                     &profile_name,
                     request,
                     None,
                 )
-                .map_err(store_error)?
-            }
-            Approvable::Payment(_) => {
+                .map_err(store_error)?,
+            Approvable::Payment => {
                 let expires_at_ms = created_at_ms
                     .checked_add(governing_ttl_ms)
                     .ok_or_else(|| store_error("the approval lifetime overflows"))?;
@@ -659,21 +777,17 @@ impl WalletServer {
                     }
                 })?
             }
-            Approvable::Trustline(ClassicSummary {
-                source,
+            Approvable::Trustline {
+                holder,
+                asset_code,
+                asset_issuer,
+                limit_stroops,
                 fee_stroops,
                 seq_num,
-                operation:
-                    ClassicOperation::ChangeTrust {
-                        asset_code,
-                        asset_issuer,
-                        limit_stroops,
-                    },
-                ..
-            }) => self
+            } => self
                 .persist_trustline_pending_approval(
                     transaction_xdr,
-                    source,
+                    holder,
                     asset_code,
                     asset_issuer,
                     *limit_stroops,
@@ -684,7 +798,6 @@ impl WalletServer {
                     None,
                 )
                 .map_err(store_error)?,
-            Approvable::Trustline(_) => return Err(store_error("the trustline summary is absent")),
         };
         let approval = serde_json::json!({
             "approval_nonce": entry.approval_nonce,
@@ -753,6 +866,10 @@ impl WalletServer {
         });
         if !live {
             return Err(unavailable("the approval is no longer pending".to_owned()));
+        }
+        #[cfg(test)]
+        if tests::SPEND_FAULT.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(unavailable("injected tombstone fault".to_owned()));
         }
         store
             .consume(nonce, &tx_hash, ConsumedOutcome::Unknown)

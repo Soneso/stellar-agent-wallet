@@ -6,6 +6,7 @@
 //! Another source's payments and merges into the wallet, and its reserve sponsorship, carry no value effect.
 //! Its claimable balances count only claimants other than that source and the wallet.
 //! Its other operations retain their effective source and receive the same classification as the wallet's operations.
+//! [`transaction_effects_for_sources`](crate::policy::transaction_effects::transaction_effects_for_sources) also drops every operation of a source whose observed signer set lacks the wallet key.
 //!
 //! A transaction signature authorizes `SourceAccount` entries for the operation's source account.
 //! Address credentials carry their own signatures; the transaction signature adds no authorization to them.
@@ -13,6 +14,8 @@
 //! Other contract functions can move value held inside a contract without a decodable bound.
 //! A native asset contract transfer debits XLM and retains its contract address in the leg.
 //! An asset contract address hashes the network and asset; the address cannot reveal the asset.
+
+use std::collections::BTreeSet;
 
 use stellar_xdr::{
     AccountId, ChangeTrustAsset, Claimant, ClawbackOp, CreateClaimableBalanceOp,
@@ -546,6 +549,146 @@ pub fn transaction_effects(
     wallet: Option<&[u8; 32]>,
     _network_passphrase: &str,
 ) -> Result<TransactionEffects, TransactionEffectsError> {
+    scoped_effects(envelope_xdr_b64, wallet, &BTreeSet::new())
+}
+
+/// The distinct base keys of the operation sources other than the wallet
+/// whose operations can carry an effect.
+///
+/// A source enters once for its G and every M spelling. Operations without a
+/// value effect for any source, such as `BumpSequence` and offer deletions,
+/// add no source. A fee bump and a call without a wallet key have none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceCandidates {
+    wallet: Option<[u8; 32]>,
+    keys: BTreeSet<[u8; 32]>,
+}
+
+impl SourceCandidates {
+    /// The candidate keys in ascending byte order.
+    pub fn keys(&self) -> impl ExactSizeIterator<Item = &[u8; 32]> {
+        self.keys.iter()
+    }
+
+    /// The candidate accounts as G-strkeys, in [`Self::keys`] order.
+    pub fn account_ids(&self) -> Vec<String> {
+        self.keys
+            .iter()
+            .map(|key| {
+                stellar_strkey::ed25519::PublicKey(*key)
+                    .to_string()
+                    .as_str()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// The membership that the signer sets observed for every candidate give.
+    ///
+    /// `signers` returns the raw ed25519 keys an account lists, its master key
+    /// included, or `None` when no set was observed for it. A candidate whose
+    /// set lacks the wallet key is excluded; weights are not consulted.
+    /// Returns `None` when any candidate has no observed set.
+    pub fn observe<'a>(
+        &self,
+        mut signers: impl FnMut(&[u8; 32]) -> Option<&'a [[u8; 32]]>,
+    ) -> Option<SourceMembership> {
+        let mut excluded = BTreeSet::new();
+        if let Some(wallet) = &self.wallet {
+            for key in &self.keys {
+                if !signers(key)?.contains(wallet) {
+                    excluded.insert(*key);
+                }
+            }
+        }
+        Some(SourceMembership {
+            wallet: self.wallet,
+            excluded,
+        })
+    }
+}
+
+/// The sources whose observed signer sets do not list the wallet key.
+///
+/// [`SourceCandidates::observe`] builds it; the wallet key it names decides
+/// fee payment, inflows and sponsorship exactly as in [`transaction_effects`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceMembership {
+    wallet: Option<[u8; 32]>,
+    excluded: BTreeSet<[u8; 32]>,
+}
+
+/// Lists the operation sources whose signer sets decide which effects the
+/// wallet's signature authorizes.
+///
+/// Runs the structural checks of [`transaction_effects`] over the whole
+/// envelope, including every signed amount field, before it names a source.
+///
+/// # Errors
+///
+/// The decode, legacy-envelope, empty-transaction, negative-fee and
+/// negative-amount errors of [`transaction_effects`].
+pub fn transaction_source_candidates(
+    envelope_xdr_b64: &str,
+    wallet: Option<&[u8; 32]>,
+) -> Result<SourceCandidates, TransactionEffectsError> {
+    let mut candidates = SourceCandidates {
+        wallet: wallet.copied(),
+        keys: BTreeSet::new(),
+    };
+    let Prepared::Tx(tx, _) = prepare(envelope_xdr_b64, wallet)? else {
+        return Ok(candidates);
+    };
+    if wallet.is_some() {
+        for operation in tx.operations.iter() {
+            let source = operation
+                .source_account
+                .as_ref()
+                .unwrap_or(&tx.source_account);
+            if !is_wallet(source, wallet) && !has_no_effect(&operation.body) {
+                candidates.keys.insert(*base_key(source));
+            }
+        }
+    }
+    Ok(candidates)
+}
+
+/// Decodes the effects of the operations whose source is the wallet or lists
+/// the wallet key in its observed signer set.
+///
+/// Every check of [`transaction_effects`] runs over the whole envelope first.
+/// An operation of an excluded source then adds no valued, unvalued or
+/// refused effect, and its payment leg no memo refusal. Without a wallet key,
+/// nothing is excluded.
+///
+/// # Errors
+///
+/// The errors of [`transaction_effects`] for the included operations, and
+/// its structural errors for the whole envelope.
+pub fn transaction_effects_for_sources(
+    envelope_xdr_b64: &str,
+    membership: &SourceMembership,
+    _network_passphrase: &str,
+) -> Result<TransactionEffects, TransactionEffectsError> {
+    scoped_effects(
+        envelope_xdr_b64,
+        membership.wallet.as_ref(),
+        &membership.excluded,
+    )
+}
+
+/// A structurally valid envelope.
+enum Prepared {
+    /// A fee bump's complete effects.
+    FeeBump(TransactionEffects),
+    /// A `Tx` envelope and its fee and memo, before operation decoding.
+    Tx(Box<Transaction>, TransactionEffects),
+}
+
+fn prepare(
+    envelope_xdr_b64: &str,
+    wallet: Option<&[u8; 32]>,
+) -> Result<Prepared, TransactionEffectsError> {
     let envelope = read_envelope(envelope_xdr_b64).map_err(|error| {
         decode_error(match error {
             EnvelopeReadError::InputTooLong => ENVELOPE_INPUT_TOO_LONG,
@@ -566,12 +709,12 @@ pub fn transaction_effects(
             }
             let fee = fee_effect(&inner, &outer.tx.fee_source, total, true, wallet)?;
             validate_amounts(&inner)?;
-            return Ok(TransactionEffects {
+            return Ok(Prepared::FeeBump(TransactionEffects {
                 fee,
                 valued: Vec::new(),
                 unvalued: Vec::new(),
                 memo: None,
-            });
+            }));
         }
     };
     if tx.operations.is_empty() {
@@ -586,7 +729,7 @@ pub fn transaction_effects(
         Memo::Hash(hash) => Some(ClassicMemo::Hash(hash.0)),
         Memo::Return(hash) => Some(ClassicMemo::Return(hash.0)),
     };
-    let mut effects = TransactionEffects {
+    let effects = TransactionEffects {
         fee: fee_effect(&tx, &tx.source_account, u64::from(tx.fee), false, wallet)?,
         valued: Vec::new(),
         unvalued: Vec::new(),
@@ -594,7 +737,26 @@ pub fn transaction_effects(
     };
     // Refuse the whole transaction before deriving any operation's value.
     validate_amounts(&tx)?;
+    Ok(Prepared::Tx(Box::new(tx), effects))
+}
+
+fn scoped_effects(
+    envelope_xdr_b64: &str,
+    wallet: Option<&[u8; 32]>,
+    excluded: &BTreeSet<[u8; 32]>,
+) -> Result<TransactionEffects, TransactionEffectsError> {
+    let (tx, mut effects) = match prepare(envelope_xdr_b64, wallet)? {
+        Prepared::FeeBump(effects) => return Ok(effects),
+        Prepared::Tx(tx, effects) => (tx, effects),
+    };
     for (operation_index, operation) in (0u32..).zip(tx.operations.iter()) {
+        let source = operation
+            .source_account
+            .as_ref()
+            .unwrap_or(&tx.source_account);
+        if wallet.is_some() && excluded.contains(base_key(source)) {
+            continue;
+        }
         decode_operation(&tx, operation, operation_index, wallet, &mut effects)?;
     }
     if effects.memo.is_none() && !effects.payment_legs().is_empty() {
@@ -637,6 +799,28 @@ fn invocation_operation(
     }
 }
 
+/// Whether an operation carries no value effect whatever its source is.
+fn has_no_effect(body: &OperationBody) -> bool {
+    match body {
+        OperationBody::ManageSellOffer(offer) => offer.amount == 0,
+        OperationBody::CreatePassiveSellOffer(offer) => offer.amount == 0,
+        OperationBody::ManageBuyOffer(offer) => offer.buy_amount == 0,
+        OperationBody::ChangeTrust(trust) => matches!(trust.line, ChangeTrustAsset::PoolShare(_)),
+        OperationBody::ManageData(_)
+        | OperationBody::BumpSequence(_)
+        | OperationBody::Inflation
+        | OperationBody::AllowTrust(_)
+        | OperationBody::SetTrustLineFlags(_)
+        | OperationBody::ClawbackClaimableBalance(_)
+        | OperationBody::EndSponsoringFutureReserves
+        | OperationBody::RevokeSponsorship(_)
+        | OperationBody::LiquidityPoolWithdraw(_)
+        | OperationBody::ExtendFootprintTtl(_)
+        | OperationBody::RestoreFootprint(_) => true,
+        _ => false,
+    }
+}
+
 fn decode_operation(
     tx: &Transaction,
     operation: &Operation,
@@ -646,6 +830,9 @@ fn decode_operation(
 ) -> Result<(), TransactionEffectsError> {
     #[cfg(test)]
     tests::record_operation();
+    if has_no_effect(&operation.body) {
+        return Ok(());
+    }
     let source = operation
         .source_account
         .as_ref()
@@ -731,21 +918,10 @@ fn decode_operation(
                 )?);
             }
         }
-        OperationBody::ManageSellOffer(offer) => {
-            if offer.amount != 0 {
-                unvalued(UnvaluedEffect::Offer);
-            }
-        }
-        OperationBody::CreatePassiveSellOffer(offer) => {
-            if offer.amount != 0 {
-                unvalued(UnvaluedEffect::Offer);
-            }
-        }
-        OperationBody::ManageBuyOffer(offer) => {
-            if offer.buy_amount != 0 {
-                unvalued(UnvaluedEffect::Offer);
-            }
-        }
+        // `has_no_effect` holds the offer deletions.
+        OperationBody::ManageSellOffer(_)
+        | OperationBody::CreatePassiveSellOffer(_)
+        | OperationBody::ManageBuyOffer(_) => unvalued(UnvaluedEffect::Offer),
         OperationBody::LiquidityPoolDeposit(_) => unvalued(UnvaluedEffect::LiquidityPoolDeposit),
         OperationBody::BeginSponsoringFutureReserves(_) => {
             if !other_source {
@@ -3130,5 +3306,269 @@ mod tests {
             };
         }
         panic!("the invocation exceeds the decode depth limit");
+    }
+
+    // ─── Source membership ───────────────────────────────────────────────────
+
+    const FOURTH: [u8; 32] = [4; 32];
+
+    fn sourced(key: [u8; 32], id: Option<u64>, body: OperationBody) -> Operation {
+        Operation {
+            source_account: Some(muxed(key, id)),
+            body,
+        }
+    }
+
+    fn candidates(xdr: &str) -> Vec<[u8; 32]> {
+        transaction_source_candidates(xdr, Some(&WALLET))
+            .unwrap()
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    /// The membership in which exactly `members` list the wallet key.
+    fn membership(xdr: &str, members: &[[u8; 32]]) -> SourceMembership {
+        let candidates = transaction_source_candidates(xdr, Some(&WALLET)).unwrap();
+        let sets: Vec<([u8; 32], Vec<[u8; 32]>)> = candidates
+            .keys()
+            .map(|key| match members.contains(key) {
+                true => (*key, vec![*key, WALLET]),
+                false => (*key, vec![*key]),
+            })
+            .collect();
+        candidates
+            .observe(|key| {
+                sets.iter()
+                    .find(|(listed, _)| listed == key)
+                    .map(|(_, set)| set.as_slice())
+            })
+            .unwrap()
+    }
+
+    fn scoped(
+        tx: &Transaction,
+        members: &[[u8; 32]],
+    ) -> Result<TransactionEffects, TransactionEffectsError> {
+        let xdr = encode(&envelope(tx));
+        transaction_effects_for_sources(&xdr, &membership(&xdr, members), TESTNET)
+    }
+
+    #[test]
+    fn source_candidates_preserve_overrides_and_validation() {
+        let tx = transaction(vec![
+            operation(payment(muxed(THIRD, None))),
+            sourced(OTHER, None, payment(muxed(THIRD, None))),
+            sourced(OTHER, Some(5), fixture(OperationType::ManageSellOffer).0),
+            sourced(THIRD, Some(0), payment(muxed(OTHER, None))),
+            sourced(
+                FOURTH,
+                None,
+                OperationBody::BumpSequence(Default::default()),
+            ),
+            sourced(
+                FOURTH,
+                Some(8),
+                OperationBody::ManageBuyOffer(ManageBuyOfferOp::default()),
+            ),
+            sourced(WALLET, Some(3), payment(muxed(THIRD, None))),
+        ]);
+        let xdr = encode(&envelope(&tx));
+        assert_eq!(candidates(&xdr), vec![OTHER, THIRD]);
+        let found = transaction_source_candidates(&xdr, Some(&WALLET)).unwrap();
+        assert_eq!(found.account_ids(), vec![strkey(OTHER), strkey(THIRD)]);
+        assert_eq!(
+            transaction_source_candidates(&xdr, None)
+                .unwrap()
+                .keys()
+                .len(),
+            0
+        );
+        let mut inherited = transaction(vec![
+            operation(payment(muxed(THIRD, None))),
+            sourced(WALLET, None, payment(muxed(THIRD, None))),
+        ]);
+        inherited.source_account = muxed(OTHER, Some(11));
+        assert_eq!(candidates(&encode(&envelope(&inherited))), vec![OTHER]);
+        // A fee bump authorizes no inner operation.
+        assert_eq!(
+            candidates(&encode(&fee_bump(&inherited, muxed(WALLET, None), 2000))),
+            Vec::<[u8; 32]>::new()
+        );
+        let legacy = encode(&TransactionEnvelope::TxV0(TransactionV0Envelope::default()));
+        let oversized = "A".repeat(crate::envelope_decode::MAX_ENVELOPE_BASE64_LEN + 4);
+        for (text, expected) in [
+            (legacy, TransactionEffectsError::LegacyEnvelope),
+            (
+                "private-invalid!".to_owned(),
+                decode_error(TRANSACTION_ENVELOPE_XDR_FORM),
+            ),
+            (oversized, decode_error(ENVELOPE_INPUT_TOO_LONG)),
+            (
+                encode(&envelope(&transaction(Vec::new()))),
+                decode_error("the transaction holds no operation"),
+            ),
+        ] {
+            assert_eq!(
+                transaction_source_candidates(&text, Some(&WALLET)),
+                Err(expected)
+            );
+        }
+        // Every signed amount field refuses, also for an excluded source and
+        // inside a fee bump.
+        for (kind, field) in AMOUNT_FIELDS {
+            let build = |amount| {
+                transaction(vec![
+                    operation(OperationBody::Inflation),
+                    sourced(OTHER, Some(1), amount_fixture(kind, field, amount)),
+                    sourced(OTHER, None, payment(muxed(FOURTH, None))),
+                ])
+            };
+            let tx = build(-1);
+            let negative: Result<(), _> = Err(TransactionEffectsError::NegativeAmount {
+                operation_index: 1,
+                operation_kind: kind,
+                field,
+            });
+            let plain = encode(&envelope(&tx));
+            let bumped = encode(&fee_bump(&tx, muxed(WALLET, None), 2000));
+            for text in [&plain, &bumped] {
+                assert_eq!(
+                    transaction_source_candidates(text, Some(&WALLET)).map(|_| ()),
+                    negative,
+                    "{kind:?}.{field}"
+                );
+            }
+            let excluded = membership(&encode(&envelope(&build(1))), &[]);
+            assert_eq!(excluded.excluded.len(), 1);
+            assert_eq!(
+                transaction_effects_for_sources(&plain, &excluded, TESTNET).map(|_| ()),
+                negative,
+                "excluded {kind:?}.{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn membership_needs_a_set_for_every_candidate() {
+        let tx = transaction(vec![
+            sourced(OTHER, None, payment(muxed(THIRD, None))),
+            sourced(THIRD, None, payment(muxed(FOURTH, None))),
+        ]);
+        let found = transaction_source_candidates(&encode(&envelope(&tx)), Some(&WALLET)).unwrap();
+        let listed = [OTHER, WALLET];
+        let missing = found.observe(|key| (key == &OTHER).then_some(listed.as_slice()));
+        assert_eq!(missing, None);
+        let no_wallet = transaction_source_candidates(&encode(&envelope(&tx)), None).unwrap();
+        let conservative = no_wallet.observe(|_| None).unwrap();
+        assert_eq!(
+            transaction_effects_for_sources(&encode(&envelope(&tx)), &conservative, TESTNET),
+            transaction_effects(&encode(&envelope(&tx)), None, TESTNET)
+        );
+    }
+
+    #[test]
+    fn foreign_source_membership_controls_attribution() {
+        for id in [None, Some(0), Some(31)] {
+            let tx = transaction(vec![
+                sourced(OTHER, id, payment(muxed(FOURTH, None))),
+                sourced(THIRD, id, payment(muxed(FOURTH, None))),
+            ]);
+            let xdr = encode(&envelope(&tx));
+            let effects = scoped(&tx, &[OTHER]).unwrap();
+            assert_eq!(effects.valued.len(), 1, "{id:?}");
+            assert_eq!(effects.valued[0].operation_index, 0);
+            assert_eq!(effects.valued[0].policy_args["source"], strkey(OTHER));
+            assert_eq!(effects.valued[0].policy_args["destination"], strkey(FOURTH));
+            assert_eq!(
+                scoped(&tx, &[OTHER, THIRD]),
+                transaction_effects(&xdr, Some(&WALLET), TESTNET)
+            );
+            empty(&scoped(&tx, &[]).unwrap());
+        }
+        let mixed = transaction(vec![
+            sourced(OTHER, None, payment(muxed(FOURTH, None))),
+            sourced(OTHER, Some(2), payment(muxed(FOURTH, None))),
+        ]);
+        assert_eq!(candidates(&encode(&envelope(&mixed))), vec![OTHER]);
+    }
+
+    #[test]
+    fn unrelated_effects_are_excluded_before_classification() {
+        let set_signer = OperationBody::SetOptions(SetOptionsOp {
+            signer: Some(Signer::default()),
+            ..Default::default()
+        });
+        let tree = invocation_body(vec![
+            call("transfer", token_args("transfer", OTHER, 5)),
+            call("swap", vec![]),
+        ]);
+        let bodies = [
+            payment(muxed(FOURTH, None)),
+            fixture(OperationType::ManageSellOffer).0,
+            OperationBody::AccountMerge(muxed(FOURTH, None)),
+            set_signer,
+            tree,
+            balance(&[FOURTH]),
+            fixture(OperationType::BeginSponsoringFutureReserves).0,
+        ];
+        for body in bodies {
+            for explicit in [true, false] {
+                let foreign = match explicit {
+                    true => sourced(OTHER, Some(9), body.clone()),
+                    false => operation(body.clone()),
+                };
+                let mut tx = transaction(vec![
+                    operation(OperationBody::Inflation),
+                    foreign,
+                    sourced(WALLET, None, payment(muxed(THIRD, None))),
+                ]);
+                if !explicit {
+                    tx.source_account = muxed(OTHER, None);
+                }
+                let xdr = encode(&envelope(&tx));
+                let label = format!("{:?} explicit={explicit}", body.discriminant());
+                let excluded = scoped(&tx, &[]).unwrap();
+                assert!(excluded.unvalued.is_empty(), "{label}");
+                assert_eq!(excluded.valued.len(), 1, "{label}");
+                assert_eq!(excluded.valued[0].operation_index, 2, "{label}");
+                assert_eq!(excluded.valued[0].policy_args["source"], strkey(WALLET));
+                assert_eq!(
+                    scoped(&tx, &[OTHER]),
+                    transaction_effects(&xdr, Some(&WALLET), TESTNET),
+                    "{label}"
+                );
+            }
+        }
+        // A member's retained token leg keeps its own source and index.
+        let tx = transaction(vec![sourced(
+            OTHER,
+            None,
+            invocation_body(vec![
+                call("transfer", token_args("transfer", OTHER, 5)),
+                call("swap", vec![]),
+            ]),
+        )]);
+        let member = scoped(&tx, &[OTHER]).unwrap();
+        assert_eq!(member.unvalued.len(), 1);
+        let leg = &member.unvalued[0].valued_legs[0];
+        assert_eq!(leg.operation_index, 0);
+        assert_eq!(leg.policy_args["source"], strkey(OTHER));
+        // An excluded payment leaves no leg for an unreadable memo to refuse.
+        let mut tx = transaction(vec![sourced(OTHER, None, payment(muxed(FOURTH, None)))]);
+        tx.memo = Memo::Text(vec![0xff].try_into().unwrap());
+        let excluded = scoped(&tx, &[]).unwrap();
+        empty(&excluded);
+        assert_eq!(excluded.memo, None);
+        assert_eq!(
+            scoped(&tx, &[OTHER]),
+            Err(TransactionEffectsError::UnreadableMemo)
+        );
+        // The wallet's fee and a foreign payer's absence of one are unchanged.
+        let tx = transaction(vec![sourced(OTHER, None, payment(muxed(FOURTH, None)))]);
+        assert_eq!(scoped(&tx, &[]).unwrap().fee, decode(&tx).fee);
+        let mut foreign_fee = tx.clone();
+        foreign_fee.source_account = muxed(OTHER, None);
+        assert_eq!(scoped(&foreign_fee, &[OTHER]).unwrap().fee, None);
     }
 }

@@ -241,29 +241,29 @@ impl std::fmt::Debug for StellarCreateAccountCommitArgs {
 // ─────────────────────────────────────────────────────────────────────────────
 
 impl WalletServer {
-    /// Persists a [`PendingApproval`] entry for a `stellar_create_account`
-    /// simulate call.
+    /// Persists a payment [`PendingApproval`] entry that sends
+    /// `summary_amount_stroops` of `summary_asset` to `summary_destination`.
     ///
     /// Opens (or creates) the profile-scoped approval store at
     /// `~/.local/share/stellar-agent/approvals/<profile_name>.toml`, constructs
-    /// an unattested entry from the create-account arguments, inserts it, and
-    /// returns the entry for nonce / expiry extraction by the caller.
-    /// A SEP-43 path payment stores its payment approval here too, with its
-    /// send asset as `summary_asset`.
+    /// an unattested entry, inserts it, and returns the entry for nonce /
+    /// expiry extraction by the caller. A `stellar_create_account` simulate
+    /// call stores its starting balance in XLM; a SEP-43 path payment stores
+    /// its send asset and send amount.
     ///
     /// # Errors
     ///
     /// Returns a string error description on any I/O, store-lock, or clock failure.
     #[allow(
         clippy::too_many_arguments,
-        reason = "approval binds the simulated account creation and its policy request"
+        reason = "approval binds the simulated payment and its policy request"
     )]
-    pub(crate) fn persist_create_account_pending_approval(
+    pub(crate) fn persist_send_pending_approval(
         &self,
         envelope_xdr: &str,
         summary_destination: &str,
         summary_asset: &str,
-        summary_starting_stroops: i64,
+        summary_amount_stroops: i64,
         summary_simulated_total_stroops: u32,
         summary_simulated_seq_num: i64,
         profile_name: &str,
@@ -285,7 +285,7 @@ impl WalletServer {
             envelope_xdr.to_owned(),
             envelope_xdr.as_bytes(),
             summary_destination.to_owned(),
-            summary_starting_stroops,
+            summary_amount_stroops,
             summary_asset.to_owned(),
             None, // The approval surfaces read the memo from the envelope.
             summary_simulated_total_stroops,
@@ -716,7 +716,7 @@ impl WalletServer {
                 stellar_agent_core::approval::witness::ApprovedKind::Payment,
                 dispatch_outcome.audit_decision(),
                 |intent| {
-                    self.persist_create_account_pending_approval(
+                    self.persist_send_pending_approval(
                         &envelope_xdr,
                         &args.destination,
                         "XLM",
