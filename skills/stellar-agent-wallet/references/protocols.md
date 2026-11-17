@@ -126,7 +126,7 @@ Agent-side `ModuleInterface` dispatch. Results use the standard `{ ok, data | er
 Common signing args: `chain_id` (required), the payload field, optional `network_passphrase` (if provided must equal the profile passphrase exactly; mismatch → `sep43.invalid_network_passphrase`), optional `address` G-strkey (if provided must match the active signer; mismatch → `sep43.invalid_address`).
 
 - `get_address` / `get_network`: `chain_id` is optional (chain-agnostic per spec); when omitted, the profile's chain is used. No keyring access.
-- `sign_transaction`: arg `transaction_xdr` (base64 `TransactionEnvelope`). Signs only; the optional SEP-43 `submit`/`submitUrl` opts are NOT implemented here.
+- `sign_transaction`: arg `transaction_xdr` (base64 `TransactionEnvelope`). Signs only; the optional SEP-43 `submit`/`submitUrl` opts are NOT implemented here. A transaction with a payment reads the wallet and recipient accounts over the profile's RPC endpoint for its policy decision; it still never sends the transaction.
 - `sign_auth_entry`: arg `auth_entry_xdr` (the base64 `HashIdPreimage` of the authorization entry, envelope type 9 `SorobanAuthorization` or type 10 `SorobanAuthorizationWithAddress`). Signs the SHA-256 of the received preimage with one ed25519 G-key and returns the raw signature; the requester assembles it into the entry. A type 10 preimage must be bound to the signing key's account; other addresses refuse with `sep43.invalid_address`; other preimage cases refuse with `sep43.malformed_auth_entry`. The preimage does not carry the credential arm, so the address binding is the check whichever credential type the entry uses. No multi-signer quorum.
 - `sign_message`: arg `message` (non-empty UTF-8). Signs the SEP-53 digest `sha256("Stellar Signed Message:\n" || message_bytes)`; result `signedMessage` is standard base64. Optional `network_passphrase` is a caller-intent gate only: it is not mixed into the signed bytes (message signing is network-independent).
 - `sign_and_submit_transaction`: arg `transaction_xdr`. Signs, submits via Stellar RPC, and polls until ledger confirmation. `status` is `"success"` (confirmed; `txHash` is a hex64) or `"pending"` (the submission ended without a confirmed outcome: the polling deadline passed, the endpoint reported an unexpected status, or a transport failure struck during or after the send; `txHash` is the hex64 the wallet computed before the send, and the tx may still apply). For a pending transaction, settle it by passing `txHash` to `stellar_transaction_status`, and never resubmit. RPC endpoint/timeout errors strip the URL before surfacing.
@@ -147,7 +147,7 @@ The structural mainnet refusal (sign-only tools, before any key access) carries 
 
 `sign_message` refusals before key load (an overlaid or out-of-scope signer, an unavailable audit writer) carry `profile.*` and `audit.*` codes, not `sep43.*` codes.
 
-SEP-43 opens no HTTP/HTTPS connections of its own (interop is stdio via MCP); `sign_and_submit` is the only path that submits, via the profile-configured RPC.
+SEP-43 opens no HTTP/HTTPS connections of its own (interop is stdio via MCP); `sign_and_submit` is the only path that submits, via the profile-configured RPC. The two MCP transaction tools read accounts over that RPC for their payment decision.
 
 ## SEP-45: Web Authentication for Contract Accounts
 

@@ -129,7 +129,11 @@ impl Criterion for PerTxCapCriterion {
     /// Returns [`PolicyError::CriterionEvaluationFailed`] when the required
     /// argument field is missing or cannot be parsed as a valid Stellar amount.
     fn evaluate(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
-        let sum = match asset_debit_sum(ctx, &self.asset, self.kind())? {
+        let overflow = DenyReason::PerTxCapOverflow {
+            asset: self.asset.clone(),
+            max_stroops: self.max_stroops,
+        };
+        let sum = match checked_asset_debit_sum(ctx, &self.asset, self.kind(), &overflow)? {
             AssetDebitSum::NotApplicable => return Ok(None),
             AssetDebitSum::Deny(reason) => return Ok(Some(reason)),
             AssetDebitSum::Amount(sum) => sum,
@@ -152,17 +156,6 @@ pub(super) enum AssetDebitSum {
     NotApplicable,
     Deny(DenyReason),
     Amount(i128),
-}
-
-/// Sums matching debit legs with saturation and preserves sizing failures.
-pub(super) fn asset_debit_sum(
-    ctx: &EvalContext<'_>,
-    asset: &str,
-    criterion: &str,
-) -> Result<AssetDebitSum, PolicyError> {
-    debit_sum(ctx, asset, criterion, |sum, amount| {
-        Ok(sum.saturating_add(amount))
-    })
 }
 
 /// Sums matching debit legs with checked addition and preserves sizing

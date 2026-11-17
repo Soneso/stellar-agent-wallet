@@ -6,7 +6,7 @@ This crate implements the agent-side SEP-43 `ModuleInterface`, covering the five
 
 It does not implement the optional submit/submitUrl options of `signTransaction`; transactions are returned signed, not submitted.
 
-It is part of the stellar-agent-wallet workspace. Most users interact with it through the six `stellar_sep43_*` tools in `stellar-agent-mcp` rather than directly: one per method, plus `stellar_sep43_sign_and_submit_transaction`, which signs and submits.
+It is part of the stellar-agent-wallet workspace. Most users interact with it through the six `stellar_sep43_*` tools in `stellar-agent-mcp` rather than directly: one per method, plus `stellar_sep43_sign_and_submit_transaction`, which signs and submits. Those MCP tools decide each payment of a transaction under the wallet's payment policy before calling this crate; the crate itself evaluates no policy.
 
 ## Status
 

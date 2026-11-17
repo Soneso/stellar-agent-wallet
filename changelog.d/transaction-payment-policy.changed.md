@@ -1,0 +1,7 @@
+- `stellar_sep43_sign_transaction` and `stellar_sep43_sign_and_submit_transaction` decide each payment of a transaction under the rule of its payment tool, with the signed asset, amount, recipient and memo. A payment that rule refuses or escalates is not signed.
+- Both tools admit the payment usage to the policy windows before they load the signer. A signer, signing or send failure keeps it, and each sign-only call charges again.
+- An account merge, except another account's merge into the wallet account, and a signer, master weight or threshold change refuse with `policy.deny.unsizable_value_effect`. Offers, pool deposits, sponsorship, wallet clawbacks and contract calls the wallet cannot value need `allow_opaque_signing = true` on the tool's rule.
+- A fee the wallet account pays passes the classic per-operation cap, and a resource transaction's full fee passes the contract transfer fee cap.
+- A negative operation amount, a resource fee above the transaction fee, and a text memo that is not UTF-8 on a valued transaction refuse with `sep43.invalid_xdr`.
+- `opaque_payload_signed` rows of the sign-only transaction tool and the pending rows of the submitting tool carry the allowed payment legs.
+- `per_tx_cap` and `approval_above` refuse or escalate a debit sum beyond the representable range.
