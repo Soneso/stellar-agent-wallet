@@ -173,6 +173,7 @@ pub(crate) fn mint_header(header: &mut Header, binding: &DomainBinding, holds: &
                 holds: holds.to_vec(),
                 parent: None,
                 operation: None,
+                floor: None,
                 native_reservation: None,
             },
         )
@@ -661,6 +662,7 @@ impl LedgerFixture {
                     holds: holds.to_vec(),
                     parent: None,
                     operation,
+                    floor: None,
                     native_reservation: None,
                 },
             )
@@ -1055,7 +1057,7 @@ impl ResolverFixture {
                     MainnetEvaluationRequest {
                         chain_id: profile.chain_id.caip2_str(),
                         tool: &descriptor,
-                        args: &serde_json::json!({}),
+                        args: &serde_json::json!({ "total_fee_stroops": 0 }),
                         profile: &profile,
                         value: Some(ValueClass::single(ValueLeg {
                             kind: if tool.starts_with("stellar_pay") {

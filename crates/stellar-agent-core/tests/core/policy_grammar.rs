@@ -548,7 +548,7 @@ fn strict(
 ) -> Result<Evaluation, PolicyError> {
     engine.evaluate_with_value_full(
         &pay(),
-        &Value::Null,
+        &json!({"total_fee_stroops": 0}),
         &profile(),
         value,
         account_view,
@@ -3568,7 +3568,7 @@ fn observed_floor_checks_age_and_exact_balance() {
     let _storage_home =
         stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let _clock = set_query_time_for_test(NOW_MS);
-    let null = Value::Null;
+    let null = json!({"total_fee_stroops": 0});
     let observed = |balance: i64, age_ms: u64| {
         ObservedAccount::new(
             Balance(balance),
@@ -3672,6 +3672,239 @@ fn observed_floor_checks_age_and_exact_balance() {
     );
 }
 
+#[test]
+#[serial_test::serial]
+fn floor_native_identity_fee_and_reserve_matrix() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let native = CanonicalAsset::Native
+        .sac_contract_id(TESTNET_PASSPHRASE)
+        .unwrap();
+    let foreign = CanonicalAsset::Native
+        .sac_contract_id(stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE)
+        .unwrap();
+    let run = |criteria: &str, value: ValueClass, args: Value, at: u64, now: u64| {
+        let account = ObservedAccount::new(Balance(20_000_000), 7, at, at - 5_000);
+        let input = FloorInput {
+            observed: &account,
+            effective_reservations_stroops: 2_000_000,
+        };
+        engine_from_criteria(criteria).evaluate_with_value_full(
+            &pay(),
+            &args,
+            &profile(),
+            value,
+            Some(&input),
+            None,
+            None,
+            None,
+            None,
+            now,
+        )
+    };
+    let floor = "{ kind = \"balance_floor\", min_stroops = 17000000 }";
+    for asset in ["native", "XLM", "xlm", &native] {
+        let value = ValueClass::single(leg(ActionKind::Payment, 999_900, asset, Some(LISTED)));
+        let exact = run(
+            floor,
+            value.clone(),
+            json!({"total_fee_stroops": 100}),
+            NOW_MS,
+            NOW_MS,
+        )
+        .unwrap();
+        assert_eq!(exact.decision, Decision::Allow, "native identity {asset}");
+        let below = run(
+            floor,
+            value,
+            json!({"total_fee_stroops": 101}),
+            NOW_MS,
+            NOW_MS,
+        )
+        .unwrap();
+        assert_eq!(
+            below.decision,
+            Decision::Deny(DenyReason::AccountFloorRefused {
+                min_stroops: 17_000_000,
+                balance_after_stroops: 16_999_999,
+            }),
+            "native debit and fee {asset}"
+        );
+    }
+    for asset in [&foreign, &usd(), &contract(9)] {
+        let value = ValueClass::single(leg(ActionKind::Payment, i128::MAX, asset, Some(LISTED)));
+        assert_eq!(
+            run(
+                floor,
+                value,
+                json!({"total_fee_stroops": 1_000_000}),
+                NOW_MS,
+                NOW_MS
+            )
+            .unwrap()
+            .decision,
+            Decision::Allow,
+            "non-native debit {asset}"
+        );
+    }
+    for destination in [LISTED.to_owned(), muxed(LISTED, 0), muxed(LISTED, u64::MAX)] {
+        assert_eq!(
+            run(
+                floor,
+                payment(1_000_000, &destination),
+                json!({"total_fee_stroops": 0}),
+                NOW_MS,
+                NOW_MS
+            )
+            .unwrap()
+            .decision,
+            Decision::Allow,
+            "payee spelling does not select the operating balance"
+        );
+    }
+    for kind in [
+        ActionKind::Claim,
+        ActionKind::Trustline,
+        ActionKind::PathPaymentReceive,
+    ] {
+        let value = ValueClass::single(leg(kind, i128::MAX, "native", Some(LISTED)));
+        assert_eq!(
+            run(
+                floor,
+                value,
+                json!({"total_fee_stroops": 1_000_001}),
+                NOW_MS,
+                NOW_MS
+            )
+            .unwrap()
+            .decision,
+            Decision::Deny(DenyReason::AccountFloorRefused {
+                min_stroops: 17_000_000,
+                balance_after_stroops: 16_999_999,
+            }),
+            "fee-only {kind:?}"
+        );
+    }
+    let x402 = ValueClass::single(leg(
+        ActionKind::X402Payment,
+        1_000_001,
+        &native,
+        Some(LISTED),
+    ));
+    assert!(
+        matches!(
+            run(floor, x402, Value::Null, NOW_MS, NOW_MS)
+                .unwrap()
+                .decision,
+            Decision::Deny(DenyReason::AccountFloorRefused { .. })
+        ),
+        "native SAC without payer fee"
+    );
+    for (at, now, expected) in [
+        (
+            NOW_MS + 1,
+            NOW_MS,
+            Decision::Deny(DenyReason::AccountUnread),
+        ),
+        (NOW_MS, NOW_MS + 120_000, Decision::Allow),
+        (
+            NOW_MS,
+            NOW_MS + 120_001,
+            Decision::Deny(DenyReason::AccountStale { age_ms: 120_001 }),
+        ),
+    ] {
+        assert_eq!(
+            run(
+                floor,
+                payment(0, LISTED),
+                json!({"total_fee_stroops": 0}),
+                at,
+                now
+            )
+            .unwrap()
+            .decision,
+            expected,
+            "observation age"
+        );
+    }
+    for criteria in [floor, "{ kind = \"minimum_reserve\", margin_stroops = 0 }"] {
+        for (value, args) in [
+            (payment(-1, LISTED), json!({"total_fee_stroops": 0})),
+            (payment(0, LISTED), json!({"total_fee_stroops": -1})),
+            (payment(0, LISTED), json!({"total_fee_stroops": "bad"})),
+            (payment(0, LISTED), Value::Null),
+        ] {
+            let result = run(criteria, value, args, NOW_MS, NOW_MS);
+            assert!(
+                matches!(result, Err(PolicyError::AccountingInvalid)),
+                "invalid accounting {criteria}"
+            );
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "a policy accounting amount or fee is invalid",
+                "invalid native facts have an accurate accounting diagnostic"
+            );
+        }
+        for (value, fee) in [
+            (payment(i128::MAX, LISTED), 1),
+            (
+                ValueClass::Value(ValueEffects::new(vec![
+                    leg(ActionKind::Payment, i128::MAX, "native", Some(LISTED)),
+                    leg(ActionKind::Payment, 1, "native", Some(LISTED)),
+                ])),
+                0,
+            ),
+        ] {
+            let result = run(
+                criteria,
+                value,
+                json!({"total_fee_stroops": fee}),
+                NOW_MS,
+                NOW_MS,
+            );
+            assert!(
+                matches!(result, Err(PolicyError::AccountingOverflow)),
+                "checked overflow {criteria}"
+            );
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "the policy accounting sum overflows",
+                "native overflow has an accurate accounting diagnostic"
+            );
+        }
+        let mut missing = leg(ActionKind::Payment, 1, "native", Some(LISTED));
+        missing.amount = None;
+        assert!(
+            matches!(
+                run(
+                    criteria,
+                    ValueClass::single(missing),
+                    json!({"total_fee_stroops": 0}),
+                    NOW_MS,
+                    NOW_MS
+                ),
+                Err(PolicyError::CriterionEvaluationFailed { .. })
+            ),
+            "missing debit"
+        );
+    }
+    let both = "{ kind = \"balance_floor\", min_stroops = 17000000 }, { kind = \"minimum_reserve\", margin_stroops = 0 }";
+    assert_eq!(
+        run(
+            both,
+            payment(1_000_000, LISTED),
+            json!({"total_fee_stroops": 0}),
+            NOW_MS,
+            NOW_MS
+        )
+        .unwrap()
+        .decision,
+        Decision::Allow,
+        "the absolute floor does not add protocol reserve"
+    );
+}
+
 /// The unlisted budget, the total budget and the balance floor of one rule
 /// decide and record at the supplied instant, which lies years before the
 /// host clock: the floor's observation is fresh only at that instant, the
@@ -3699,7 +3932,7 @@ fn grammar_criteria_read_the_evaluation_instant() {
         engine
             .evaluate_with_value_full(
                 &pay(),
-                &Value::Null,
+                &json!({"total_fee_stroops": 0}),
                 &profile(),
                 value,
                 Some(&input),

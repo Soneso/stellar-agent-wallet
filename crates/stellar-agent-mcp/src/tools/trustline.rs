@@ -21,17 +21,16 @@
 //!    `fetch_account` → `AccountFlagsView` (for the clawback gate).
 //! 3. Source account fetch via `fetch_account` (for the policy gate's
 //!    `account_view`; sequence number consumed at envelope-build time).
-//! 4. `dispatch_gate_with_views` — policy engine evaluation (chain_id, rate
-//!    limits, and `minimum_reserve` against the step-3 `account_view`;
-//!    `identity_view` stays `None`, so identity-class criteria fail closed).
+//! 4. Select and cap the fee, then call `dispatch_gate_with_views` for chain_id,
+//!    rate limits and `minimum_reserve` against the step-3 `account_view`.
+//!    `identity_view` stays `None`, so identity-class criteria fail closed.
 //! 5. `clawback_gate(flags, opt_in_present)` where `opt_in_present` is
 //!    derived from the wallet-controlled approval store ONLY — NOT an
 //!    agent-suppliable bool.
 //! 6. `TrustlinePreview::build` — typed JSON preview for the operator.
 //! 7. `RefuseWithWarning` / `Refuse` gate decisions return early.
-//! 8. Fee resolution.
-//! 9. Build `ChangeTrust` envelope via `ClassicOpBuilder::change_trust`.
-//! 10. Mint nonce bound to `"stellar_trustline_commit"`.
+//! 8. Build `ChangeTrust` envelope via `ClassicOpBuilder::change_trust`.
+//! 9. Mint nonce bound to `"stellar_trustline_commit"`.
 //!
 //! # Behavior
 //!
@@ -64,8 +63,7 @@ use stellar_agent_core::observability::redact_strkey_first5_last5;
 use stellar_agent_core::profile::schema::default_approval_dir;
 use stellar_agent_core::timefmt::now_unix_ms;
 use stellar_agent_network::{
-    AccountView, Asset, ClassicOpBuilder, account::AccountFlagsView, classic_fee_source,
-    fetch_account, parse_classic_fee_choice, resolve_classic_fee_selection,
+    AccountView, Asset, ClassicOpBuilder, account::AccountFlagsView, fetch_account,
     submit::SubmissionResult,
 };
 
@@ -79,7 +77,7 @@ use crate::server::WalletServer;
 use crate::tools::common::{
     APPROVAL_TTL_MS, CLASSIC_SINGLE_OPERATION_COUNT, DEFAULT_NONCE_TTL_MS, DispatchOutcome,
     commit_path_error_result, ledger_err_result, nonce_id_prefix, redacted_wallet_error_envelope,
-    resolve_classic_fee_per_op_stroops, total_classic_fee_stroops, verify_attestation_gate,
+    total_classic_fee_stroops, verify_attestation_gate,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -424,16 +422,8 @@ impl WalletServer {
     ///
     /// # Gate order (fail-closed at every step)
     ///
-    /// 1. `dispatch_gate` — policy engine.
-    /// 2. `resolve_denomination` — USDT refusal + lookalike denylist +
-    ///    pinned-issuer-mismatch + unpinned-bare-code.
-    /// 3. Live issuer account fetch → `AccountFlagsView`. An issuer read error
-    ///    refuses with its own code; an absent issuer yields `Refuse`.
-    /// 4. `clawback_gate` — wallet-controlled opt-in check (NOT agent-suppliable).
-    /// 5. `TrustlinePreview::build` — typed JSON preview.
-    /// 6. `RefuseWithWarning` / `Refuse` gate → early return.
-    /// 7. Build `ChangeTrust` envelope via `ClassicOpBuilder::change_trust`.
-    /// 8. Mint nonce bound to `"stellar_trustline_commit"`.
+    /// The live gate order is documented in this module's overview. Fee
+    /// selection precedes policy evaluation; policy precedes opt-in creation.
     ///
     /// # Tool annotations
     ///
@@ -464,7 +454,7 @@ impl WalletServer {
         &self,
         Parameters(args): Parameters<StellarTrustlineArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let args_value = json!({
+        let mut args_value = json!({
             "chain_id": &args.chain_id,
             "from": &args.from,
             "asset": &args.asset,
@@ -557,7 +547,8 @@ impl WalletServer {
         {
             Some(id) => {
                 let fee_choice =
-                    parse_classic_fee_choice(args.classic_base.as_deref()).map_err(|err| {
+                    stellar_agent_network::parse_classic_fee_choice(args.classic_base.as_deref())
+                        .map_err(|err| {
                         rmcp::ErrorData::invalid_params(
                             format!("invalid fee: {}", err.code()),
                             None,
@@ -665,6 +656,17 @@ impl WalletServer {
         // its self-asserted `home_domain` must not feed allowlist matching
         // (see the Step 2 comment), so identity-class criteria configured on
         // this verb fail closed.
+        let fee_selection = match self
+            .resolve_classic_policy_fee(&client, args.classic_base.as_deref())
+            .await
+        {
+            Ok(selection) => selection,
+            Err(error) => return error.into_result(),
+        };
+        let fee_per_op_stroops = fee_selection.per_op_stroops;
+        let total_fee_stroops =
+            total_classic_fee_stroops(fee_per_op_stroops, CLASSIC_SINGLE_OPERATION_COUNT)?;
+        args_value["total_fee_stroops"] = json!(total_fee_stroops);
         let source_adapter = AccountViewAdapter::new(&source_account_view);
         let dispatch_outcome = match self
             .dispatch_gate_with_views(
@@ -856,42 +858,7 @@ impl WalletServer {
             }
         }
 
-        // ── Step 8: Fee resolution ────────────────────────────────────────────
-        let fee_choice = parse_classic_fee_choice(args.classic_base.as_deref()).map_err(|err| {
-            rmcp::ErrorData::invalid_params(format!("invalid fee: {}", err.code()), None)
-        })?;
-        let fee_selection = match resolve_classic_fee_selection(
-            &client,
-            resolve_classic_fee_per_op_stroops(self.security_profile()),
-            fee_choice,
-        )
-        .await
-        {
-            Ok(selection) => selection,
-            Err(err @ stellar_agent_core::WalletError::Network(_)) => {
-                return Ok(ledger_err_result(&err));
-            }
-            Err(err) => {
-                return Err(rmcp::ErrorData::invalid_params(
-                    format!("invalid fee: {}", err.code()),
-                    None,
-                ));
-            }
-        };
-        if let Err(err) = self.check_write_fee(
-            fee_selection.per_op_stroops,
-            classic_fee_source(
-                fee_choice,
-                stellar_agent_core::error::FeeSource::ProfileDefault,
-            ),
-        ) {
-            return Ok(ledger_err_result(&err));
-        }
-        let fee_per_op_stroops = fee_selection.per_op_stroops;
-        let total_fee_stroops =
-            total_classic_fee_stroops(fee_per_op_stroops, CLASSIC_SINGLE_OPERATION_COUNT)?;
-
-        // ── Step 9: Build unsigned ChangeTrust envelope ───────────────────────
+        // Build the unsigned ChangeTrust envelope with the policy-checked fee.
         let asset = Asset::from_code_and_issuer(&resolved.code, &resolved.issuer).map_err(|e| {
             rmcp::ErrorData::internal_error(
                 format!("envelope_build_error: asset construction: {e}"),
@@ -953,7 +920,7 @@ impl WalletServer {
             },
         );
 
-        // ── Step 10: Mint nonce ───────────────────────────────────────────────
+        // Mint nonce.
         let expiry_unix_ms = now_ms.saturating_add(DEFAULT_NONCE_TTL_MS);
 
         let nonce = match self.nonce_mint.mint(
@@ -986,7 +953,7 @@ impl WalletServer {
             "ChangeTrust simulation complete; nonce minted"
         );
 
-        // ── Step 11: Persist pending approval if policy requires it ──────────
+        // Persist pending approval if policy requires it.
         let dispatch_outcome = match self
             .paired_commit_outcome(
                 dispatch_outcome,

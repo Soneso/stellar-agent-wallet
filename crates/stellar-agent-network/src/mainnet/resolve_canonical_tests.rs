@@ -811,6 +811,7 @@ async fn consented_unminted_intent_survives_waiting_end() {
                     intent_digest: Some(*fx.intent.digest().as_bytes()),
                     predecessor: None,
                     native_reservation: None,
+                    floor: None,
                 }))
             };
             let first =

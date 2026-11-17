@@ -3970,6 +3970,7 @@ mod tests {
 
     fn pay_args(to: &str, amount: i128) -> serde_json::Value {
         serde_json::json!({
+            "total_fee_stroops": 0,
             "destination": to,
             "asset": format!("USDC:{ISSUER}"),
             "amount_stroops": amount.to_string(),
@@ -4538,6 +4539,7 @@ mod tests {
                 "destination": listed,
                 "asset": d.asset.policy_id(),
                 "amount_stroops": d.typical_payment_stroops.to_string(),
+                "total_fee_stroops": 0,
             });
             let observed = ObservedAccount::new(Balance(1_000 * 10_000_000), 1, T0, T0 - 5_000);
             let floor = FloorInput {

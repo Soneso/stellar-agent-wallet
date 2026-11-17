@@ -1098,6 +1098,7 @@ mod enabled {
             holds,
             parent: None,
             operation: None,
+            floor: None,
             native_reservation: None,
         }
     }
@@ -1656,6 +1657,7 @@ mod enabled {
             holds: vec![],
             parent: None,
             operation: None,
+            floor: None,
             native_reservation: None,
         };
         let minted = req
@@ -1820,6 +1822,7 @@ mod enabled {
             holds: vec![],
             parent: Some(parent),
             operation: None,
+            floor: None,
             native_reservation: None,
         };
         let minted = req

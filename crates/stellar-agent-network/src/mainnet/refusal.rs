@@ -402,13 +402,13 @@ pub enum MainnetAuthorizationError {
     /// The durable total-budget accounting refuses the authorization's holds.
     #[error("{0}")]
     TotalEpoch(TotalEpochRefusal),
-    /// The durable unlisted-recipient accounting refuses the authorization's
-    /// holds.
+    /// Durable unlisted-recipient or native accounting refuses the
+    /// authorization.
     #[error("{0}")]
     Accounting(AccountingRefusal),
 }
 
-/// A refusal of the durable unlisted-recipient accounting, kept apart from
+/// A refusal of durable unlisted-recipient or native accounting, kept apart from
 /// the generic refusal because each names its own remedy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
@@ -416,11 +416,11 @@ pub enum AccountingRefusal {
     /// The allowance is spent and the mint runs under policy authority.
     #[error("the unlisted-recipient allowance is spent; this payment needs a per-payment approval")]
     ApprovalRequired,
-    /// An unlisted-recipient sum exceeds its representation.
-    #[error("the unlisted-recipient spending sum overflows; nothing was recorded")]
+    /// An unlisted or native accounting sum exceeds its representation.
+    #[error("the policy accounting sum overflows; nothing was recorded")]
     Overflow,
-    /// The window holds a negative unlisted-recipient amount.
-    #[error("the spending window holds a negative unlisted-recipient amount")]
+    /// An accounting contributor or native fee is negative.
+    #[error("a policy accounting amount or fee is invalid")]
     Invalid,
 }
 
@@ -527,7 +527,7 @@ impl From<MainnetAuthorizationError> for WalletError {
     /// denial, `network.mainnet_write_forbidden` for a build without mainnet
     /// writes, `policy.total_epoch_*` for a total-budget epoch refusal,
     /// `policy.approval_required`, `policy.accounting_overflow` or
-    /// `policy.accounting_invalid` for an unlisted-recipient accounting
+    /// `policy.accounting_invalid` for an unlisted or native accounting
     /// refusal, and `network.mainnet_authorization_refused` for every refused
     /// precondition. The precondition does not cross into the error: the
     /// caller logs it.

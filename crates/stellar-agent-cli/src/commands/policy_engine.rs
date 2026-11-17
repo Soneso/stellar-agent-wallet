@@ -2078,7 +2078,7 @@ decision = "allow"
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let engine = minimum_reserve_engine("stellar_pay", 0);
         let profile = parity_profile();
-        let policy_args = pay_policy_args(500_000_000, "native", PARITY_DEST_G);
+        let policy_args = with_total_fee(pay_policy_args(500_000_000, "native", PARITY_DEST_G), 0);
         // 100 XLM native balance, 0 subentries: reserve floor is
         // (2+0)*5_000_000 = 10_000_000 stroops — comfortably satisfied.
         let source_view = parity_account_view(1_000_000_000, 0, None);
@@ -2112,7 +2112,7 @@ decision = "allow"
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let engine = minimum_reserve_engine("stellar_pay", 0);
         let profile = parity_profile();
-        let policy_args = pay_policy_args(500_000_000, "native", PARITY_DEST_G);
+        let policy_args = with_total_fee(pay_policy_args(500_000_000, "native", PARITY_DEST_G), 0);
         // Zero balance, 0 subentries: reserve floor 10_000_000 stroops is not met.
         let source_view = parity_account_view(0, 0, None);
         let source_adapter = AccountViewAdapter::new(&source_view);
@@ -2206,7 +2206,7 @@ decision = "allow"
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let engine = minimum_reserve_engine("stellar_claim", 0);
         let profile = parity_profile();
-        let policy_args = claim_policy_args(&"0".repeat(72));
+        let policy_args = with_total_fee(claim_policy_args(&"0".repeat(72)), 0);
         let source_view = parity_account_view(0, 0, None);
         let source_adapter = AccountViewAdapter::new(&source_view);
         let result = evaluate_value_moving_policy(
@@ -2240,7 +2240,7 @@ decision = "allow"
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let engine = minimum_reserve_engine("stellar_create_account", 0);
         let profile = parity_profile();
-        let policy_args = create_policy_args(500_000_000, PARITY_DEST_G);
+        let policy_args = with_total_fee(create_policy_args(500_000_000, PARITY_DEST_G), 0);
         let sponsor_view = parity_account_view(0, 0, None);
         let sponsor_adapter = AccountViewAdapter::new(&sponsor_view);
         let result = evaluate_value_moving_policy(
@@ -2273,7 +2273,7 @@ decision = "allow"
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let engine = minimum_reserve_engine("stellar_trustline", 0);
         let profile = parity_profile();
-        let policy_args = trustline_policy_args(PARITY_DEST_G, "native");
+        let policy_args = with_total_fee(trustline_policy_args(PARITY_DEST_G, "native"), 0);
         let source_view = parity_account_view(1_000_000_000, 0, None);
         let source_adapter = AccountViewAdapter::new(&source_view);
         let result = evaluate_value_moving_policy(
@@ -2305,7 +2305,7 @@ decision = "allow"
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let engine = minimum_reserve_engine("stellar_trustline", 0);
         let profile = parity_profile();
-        let policy_args = trustline_policy_args(PARITY_DEST_G, "native");
+        let policy_args = with_total_fee(trustline_policy_args(PARITY_DEST_G, "native"), 0);
         let source_view = parity_account_view(0, 0, None);
         let source_adapter = AccountViewAdapter::new(&source_view);
         let result = evaluate_value_moving_policy(

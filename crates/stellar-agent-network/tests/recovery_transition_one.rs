@@ -148,6 +148,7 @@ impl Fixture {
                 operation_id: handle.id(),
                 attempt_index: 1,
             }),
+            floor: None,
             native_reservation: None,
         };
         let started = OperationRecorder::new(&window, &profile, &mut audit, "request")
