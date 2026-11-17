@@ -910,7 +910,8 @@ impl CounterpartyAllowlistCriterion {
     ///
     /// # Errors
     ///
-    /// [`PolicyError::AccountingOverflow`] when a sum overflows.
+    /// [`PolicyError::AccountingOverflow`] when a sum overflows, or
+    /// [`PolicyError::AccountingInvalid`] for a negative accounting contributor.
     fn check_budget(
         &self,
         ctx: &EvalContext<'_>,

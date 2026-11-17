@@ -143,6 +143,7 @@ impl Fixture {
             )],
             parent: None,
             operation: None,
+            floor: None,
             native_reservation: None,
         };
         let started = OperationRecorder::new(&window, &profile, &mut audit, "request")

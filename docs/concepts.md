@@ -284,15 +284,26 @@ balance below an absolute floor:
 criteria = [{ kind = "balance_floor", min_stroops = 2_0000000 }]
 ```
 
-The check subtracts the native reservations of open authorizations, the
-native debit, and the fee from a live account read.
+The check subtracts effective native reservations, the native debit, and the
+account-paid fee from a live account read. A used authorization stays reserved
+until release evidence covers that balance read. Native aliases and the current
+network's native asset contract count alike. Debit and fee arithmetic is checked.
 A result below `min_stroops` refuses with `account.floor_refused`.
-A missing read refuses with `account.unread`, and a read older than 120 seconds
+A missing or future-dated read refuses with `account.unread`, and a read older than 120 seconds
 refuses with `account.stale`. Any decision may carry the criterion.
 Provisional evaluation skips the floor; the strict evaluation before signing
 runs it. The criterion is enforceable only where a caller supplies an observed
 read with its reservation sum. The shipped CLI and MCP payment paths supply a
 plain account view, so a matched floor refuses there with `account.unread`.
+
+The store can recheck bound floor facts under the mint lock against its latest
+authenticated reservations. A retained value obligation with missing amounts,
+or a zero Soroban reservation without a bound non-native payment intent,
+refuses floor use. Listing and recovery remain available. This projection covers
+retained history only: unlinked obligations can leave that history under existing
+retention. Public activation requires proof that no unreleased obligation can be
+lost, or a refusal while that coverage is uncertain. Re-signing and resetting do
+not reconstruct missing exposure.
 
 `memo_binding` requires the memo a destination expects, such as an exchange
 deposit's customer memo:

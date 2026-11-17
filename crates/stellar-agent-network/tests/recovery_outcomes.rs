@@ -177,6 +177,7 @@ impl Fixture {
                 )],
                 parent: None,
                 operation: None,
+                floor: None,
                 native_reservation: Some(NativeReservation {
                     debit_stroops: 100,
                     fee_stroops: 100,

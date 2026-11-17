@@ -1410,14 +1410,14 @@ pub enum PolicyError {
         detail: String,
     },
 
-    /// The unlisted-recipient spending of a call, its window, and its bundle
-    /// overflow their sum, so the evaluation refuses.
-    #[error("the unlisted-recipient spending sum overflows")]
+    /// An unlisted or native amount, fee, or aggregate exceeds its accounting
+    /// range, so the evaluation refuses.
+    #[error("the policy accounting sum overflows")]
     AccountingOverflow,
 
-    /// The unlisted-recipient window holds a negative amount, so the
-    /// evaluation refuses.
-    #[error("the unlisted-recipient window holds a negative amount")]
+    /// An accounting contributor is negative, or a required native fee is
+    /// missing or malformed, so the evaluation refuses.
+    #[error("a policy accounting amount or fee is invalid")]
     AccountingInvalid,
 
     /// A policy evaluation reached a state its own invariants exclude, such

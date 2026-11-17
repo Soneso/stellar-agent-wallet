@@ -203,6 +203,7 @@
 //! Reset refuses pending approvals inside their waiting windows and preserves every other approval record.
 
 mod accounting;
+pub use accounting::CheckedFloor;
 pub mod approvals;
 pub mod budget;
 pub mod ledger;
@@ -699,14 +700,14 @@ pub enum WindowStoreError {
     #[error("the unlisted-recipient allowance is spent; this payment needs a per-payment approval")]
     UnlistedApprovalRequired,
 
-    /// An unlisted-recipient sum exceeds its representation. Nothing is
-    /// written.
-    #[error("the unlisted-recipient spending sum overflows; nothing was recorded")]
+    /// An unlisted or native accounting sum exceeds its representation.
+    /// Nothing is written.
+    #[error("the policy accounting sum overflows; nothing was recorded")]
     AccountingOverflow,
 
-    /// The spending window holds a negative unlisted-recipient amount.
+    /// An accounting contributor or native fee is negative.
     /// Nothing is written.
-    #[error("the spending window holds a negative unlisted-recipient amount")]
+    #[error("a policy accounting amount or fee is invalid")]
     AccountingInvalid,
 
     /// The reset refuses while approvals remain inside their waiting windows.
@@ -825,6 +826,18 @@ impl WindowStoreError {
             Self::UnlistedApprovalRequired => ValidationError::UnlistedApprovalRequired.into(),
             Self::AccountingOverflow => ValidationError::AccountingOverflow.into(),
             Self::AccountingInvalid => ValidationError::AccountingInvalid.into(),
+            Self::PolicyDenied { reason }
+                if matches!(
+                    reason.as_ref(),
+                    stellar_agent_core::policy::DenyReason::AccountUnread
+                        | stellar_agent_core::policy::DenyReason::AccountStale { .. }
+                        | stellar_agent_core::policy::DenyReason::AccountFloorRefused { .. }
+                ) =>
+            {
+                stellar_agent_core::error::WalletError::PolicyDenied {
+                    reason: reason.clone(),
+                }
+            }
             Self::AuditAppendFailed { detail } => ValidationError::AuditAppendFailed {
                 detail: detail.clone(),
             }

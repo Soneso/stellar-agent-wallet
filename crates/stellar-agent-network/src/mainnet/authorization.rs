@@ -2275,6 +2275,7 @@ mod tests {
                 holds: holds.clone(),
                 parent: None,
                 operation: None,
+                floor: None,
                 native_reservation: None,
             };
             let minted = store.mint_authorization(&profile, &request).unwrap();

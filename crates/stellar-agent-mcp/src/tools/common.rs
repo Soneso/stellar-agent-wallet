@@ -3363,6 +3363,42 @@ pub(crate) async fn verify_attestation_subject_gate(
 }
 
 impl WalletServer {
+    /// Selects and caps the fee shared by policy evaluation and the envelope.
+    pub(crate) async fn resolve_classic_policy_fee(
+        &self,
+        client: &stellar_agent_network::StellarRpcClient,
+        raw: Option<&str>,
+    ) -> Result<stellar_agent_network::fees::ClassicFeeSelection, ToolError> {
+        let invalid = |error: stellar_agent_core::WalletError| {
+            ToolError::Protocol(ErrorData::invalid_params(
+                format!("invalid fee: {}", error.code()),
+                None,
+            ))
+        };
+        let choice = stellar_agent_network::parse_classic_fee_choice(raw).map_err(invalid)?;
+        let selection = stellar_agent_network::resolve_classic_fee_selection(
+            client,
+            resolve_classic_fee_per_op_stroops(self.security_profile()),
+            choice,
+        )
+        .await
+        .map_err(|error| match error {
+            stellar_agent_core::WalletError::Network(_) => {
+                ToolError::Business(ledger_err_result(&error))
+            }
+            _ => invalid(error),
+        })?;
+        self.check_write_fee(
+            selection.per_op_stroops,
+            stellar_agent_network::classic_fee_source(
+                choice,
+                stellar_agent_core::error::FeeSource::ProfileDefault,
+            ),
+        )
+        .map_err(|error| ToolError::Business(ledger_err_result(&error)))?;
+        Ok(selection)
+    }
+
     pub(crate) fn check_write_fee(
         &self,
         fee: u32,
