@@ -313,6 +313,18 @@ impl Sep43Error {
         }
     }
 
+    /// The refusal of a caller address that is not `signer_address`, the
+    /// G-strkey of the signing key.
+    #[must_use]
+    pub fn signing_key_mismatch(signer_address: &str) -> Self {
+        Self::InvalidAddress {
+            detail: format!(
+                "provided address does not match the signing key (expected {signer_address:?})"
+            ),
+            expected_type: "G-strkey matching the signing key",
+        }
+    }
+
     /// Returns the canonical wire error code string for this variant.
     ///
     /// The returned `&'static str` is the typed code emitted in audit-log

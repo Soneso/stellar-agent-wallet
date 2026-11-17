@@ -665,6 +665,137 @@ async fn a_reported_sep43_success_keeps_its_pending_row_owed() {
     );
 }
 
+/// An approved SEP-43 submission that the endpoint confirms returns the signed
+/// envelope and its hash, and the send spends the approval.
+#[tokio::test]
+#[serial]
+async fn an_approved_sep43_submission_reports_success_and_spends_the_approval() {
+    use base64::Engine as _;
+    use stellar_agent_core::approval::attestation::{compute_attestation_v4, envelope_sha256};
+    use stellar_agent_core::approval::{
+        ApprovalKind, AttestationBinding, AttestedApprover, PendingApprovalStore,
+        process_uid_for_attestation,
+    };
+    use stellar_agent_core::policy::{ApprovalRequest, Decision};
+    use stellar_agent_core::{PolicyDocument, PolicyEngineV1, PolicyRule, RuleMatch, ScopeId};
+
+    let _root = crate::common::isolated_data_root();
+    keyring_mock::install().expect("mock keyring");
+    install_test_nonce_key();
+    let seed = [0x79; 32];
+    let envelope = stellar_agent_test_support::signed_envelope::SignedTestEnvelope::builder(seed)
+        .sequence(SOURCE_SEQ + 1)
+        .build();
+    let xdr = envelope.envelope_xdr().to_owned();
+    let rpc = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            crate::common::TimeoutRpc::new(vec![(
+                account_ledger_key_xdr(envelope.source()),
+                account_entry_xdr_with_seq(
+                    envelope.source(),
+                    SOURCE_BALANCE_STROOPS,
+                    0,
+                    SOURCE_SEQ,
+                ),
+            )])
+            .confirming_in(1001),
+        )
+        .mount(&rpc)
+        .await;
+    let (profile, mut server, _) = timeout_server(&rpc.uri(), envelope.source(), seed);
+    let approvals = tempfile::TempDir::new().expect("approval dir");
+    server.set_approval_dir_for_test(approvals.path().to_owned());
+    let attestation_key = [0xD2_u8; 32];
+    keyring_core::Entry::new(
+        &profile.attestation_key_id.service,
+        &profile.attestation_key_id.account,
+    )
+    .expect("Entry::new")
+    .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(attestation_key))
+    .expect("set_password");
+    let name = server.profile_name_for_approval();
+    let rule = |tool: &str, decision| PolicyRule {
+        r#match: RuleMatch {
+            tool: tool.into(),
+            chain: "*".into(),
+        },
+        criteria: vec![],
+        decision,
+        allow_opaque_signing: false,
+    };
+    server.set_policy_engine_for_test(std::sync::Arc::new(PolicyEngineV1::new(
+        PolicyDocument {
+            version: 1,
+            scope: ScopeId::AllProfiles,
+            signature: None,
+            rules: vec![
+                rule(
+                    "stellar_sep43_sign_and_submit_transaction",
+                    Decision::RequireApproval(ApprovalRequest::new("rule".into(), 600)),
+                ),
+                rule("*", Decision::Allow),
+            ],
+        },
+        name.clone(),
+    )));
+    let args =
+        |nonce: Option<String>, attestation: Option<String>| Sep43SignAndSubmitTransactionArgs {
+            chain_id: "stellar:testnet".into(),
+            transaction_xdr: xdr.clone(),
+            network_passphrase: None,
+            address: None,
+            approval_nonce: nonce,
+            approval_attestation: attestation,
+        };
+    let first = server
+        .call_stellar_sep43_sign_and_submit_transaction(args(None, None))
+        .await
+        .expect("first call");
+    let first = call_result_json(&first);
+    let nonce = first["data"]["approval"]["approval_nonce"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a pending approval: {first}"))
+        .to_owned();
+    let store_path = approvals.path().join(format!("{name}.toml"));
+    let mut store = PendingApprovalStore::open(store_path.clone()).expect("approval store");
+    let entry = store.get(&nonce).cloned().expect("the stored approval");
+    let blob = compute_attestation_v4(
+        &attestation_key,
+        &AttestationBinding::new(&name, "stellar:testnet"),
+        &nonce,
+        &envelope_sha256(xdr.as_bytes()),
+        &process_uid_for_attestation().expect("process uid"),
+        &entry.attested_lifetime(),
+        &AttestedApprover::Local,
+    );
+    store
+        .record_attestation(&nonce, blob, AttestedApprover::Local)
+        .expect("attestation");
+    drop(store);
+    let second = server
+        .call_stellar_sep43_sign_and_submit_transaction(args(
+            Some(nonce.clone()),
+            Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob)),
+        ))
+        .await
+        .expect("approved call");
+    let second = call_result_json(&second);
+    assert_eq!(second["ok"], true, "{second}");
+    assert_eq!(second["data"]["status"], "success", "{second}");
+    assert!(second["data"]["signedTxXdr"].is_string(), "{second}");
+    let tx_hash = second["data"]["txHash"].as_str().expect("txHash");
+    assert_eq!(tx_hash.len(), 64, "{second}");
+    let store = PendingApprovalStore::open(store_path).expect("approval store");
+    assert!(
+        matches!(
+            store.get(&nonce).expect("the entry").kind,
+            ApprovalKind::Consumed { .. }
+        ),
+        "the send spends the approval"
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn profile_chain_sep43_accounting_persists_rate_limit() {

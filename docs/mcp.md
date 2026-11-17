@@ -1058,6 +1058,12 @@ effects decision, audit pre-flight, admission, signer, signature.
   counts only claimants other than its source and the wallet, so a balance
   without such a claimant has no payment. Another account's payment or merge
   into the wallet has no value effect; a wallet merge refuses.
+- An operation of another source account counts only when that account's
+  signer set lists the wallet key, at any weight. Each call reads those signer
+  sets once, before any classification, and a read failure refuses with its
+  own code, such as `network.account_not_found`. The set is the one observed
+  at signing time: a later signer change can make a retained signature
+  relevant to a source this call excluded. Fees and fee bumps keep their rules.
 - An offer, a liquidity pool deposit, reserve sponsorship, a wallet clawback
   or a contract call the wallet cannot value needs `allow_opaque_signing = true`
   on the tool's own rule. A contract call that also transfers tokens needs the
@@ -1084,7 +1090,9 @@ once.
 An approval requirement of the tool's own rule or of a payment rule is met in
 two calls. The transaction holds exactly one operation: a payment, a path
 payment, an account creation or a trustline change. Every other shape refuses
-with `policy.approval_required_unsupported`.
+with `policy.approval_required_unsupported`. An envelope that does not decode
+refuses with `sep43.invalid_xdr` before any approval decision and stores no
+pending approval.
 
 1. The first call stores a pending approval over the exact `transaction_xdr`
    text and returns `{ "approval": { approval_nonce, profile, chain_id,
@@ -1112,7 +1120,8 @@ signer, signature.
 - The preimage passes the signing checks for the profile signer's G-key before
   any read: base64 and bounded XDR (`sep43.invalid_xdr`), envelope type 9 or
   10 (`sep43.malformed_auth_entry`), the profile network
-  (`sep43.invalid_network_passphrase`) and a type 10 binding to that account
+  (`sep43.invalid_network_passphrase`), a type 10 binding to that account
+  (`sep43.invalid_address`), and a caller `address` that is not that G-key
   (`sep43.invalid_address`). A profile signer that is not a G-strkey refuses
   with `policy.engine_required`, since the debited account is unknown.
 - Each `transfer`, `transfer_from`, `approve` and `burn` or `burn_from` call

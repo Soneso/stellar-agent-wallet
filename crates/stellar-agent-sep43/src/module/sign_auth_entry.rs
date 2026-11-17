@@ -88,12 +88,7 @@ pub async fn dispatch(
     if let Some(addr) = address
         && addr != signer_address
     {
-        return Err(Sep43Error::InvalidAddress {
-            detail: format!(
-                "provided address does not match the signing key (expected {signer_address:?})"
-            ),
-            expected_type: "G-strkey matching the signing key",
-        });
+        return Err(Sep43Error::signing_key_mismatch(&signer_address));
     }
 
     let signature_b64 = sign_soroban_auth_entry(

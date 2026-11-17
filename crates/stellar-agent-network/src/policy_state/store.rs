@@ -2480,6 +2480,8 @@ impl PersistedWindowStore {
         // prepared image: the counter moves first, and a failed file write
         // refuses later spends instead of reading a total without it.
         write_generation(&gen_entry, &wire)?;
+        #[cfg(feature = "test-helpers")]
+        commit_faults::settled_fault(commit_faults::COMMIT_FAULT_SETTLED_AFTER_COUNTER)?;
         self.write_atomic(&key, &wire)?;
         Ok(mint_outcome)
     }
@@ -7982,6 +7984,23 @@ pub mod commit_faults {
             ACCOUNTING_FAULT.set(0);
             OBSERVER.with_borrow_mut(|observer| *observer = None);
         }
+    }
+
+    /// The seam of a settled batch after the generation counter commits,
+    /// before the window file is written. Commit observers do not see it.
+    #[cfg(feature = "test-helpers")]
+    pub const COMMIT_FAULT_SETTLED_AFTER_COUNTER: u8 = 7;
+
+    /// Stops a settled batch at `point` once when a test armed that point.
+    #[cfg(feature = "test-helpers")]
+    pub(crate) fn settled_fault(point: u8) -> Result<(), WindowStoreError> {
+        if ACCOUNTING_FAULT.get() == point {
+            ACCOUNTING_FAULT.set(0);
+            return Err(WindowStoreError::Io {
+                kind: std::io::ErrorKind::Interrupted,
+            });
+        }
+        Ok(())
     }
 
     /// Stops the next operation that reaches `point` on this thread.

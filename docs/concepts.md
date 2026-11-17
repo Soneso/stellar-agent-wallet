@@ -606,7 +606,9 @@ value need `allow_opaque_signing = true` on the tool's own rule. A wallet
 payment to itself is a payment. A claimable balance counts only claimants
 other than its source and the wallet. A wallet merge and a signer or
 threshold change always refuse; another account's merge into the wallet has
-no value effect. An approval requirement of one payment, path payment,
+no value effect. An operation of another account counts only when that
+account's signer set, read at signing time, lists the wallet key. An
+approval requirement of one payment, path payment,
 account creation or trustline change returns a pending approval, and the
 attested repeat signs and spends it. See
 [the MCP guide](./mcp.md#sep-43-transaction-effects).

@@ -5,11 +5,11 @@
 //! assembles into the entry, with the signer's address.
 //!
 //! The steps run in order: mainnet refusal, address forms, the tool's own
-//! rule, preimage validation and the pay-rule decision of every token leg
-//! the signer's account authorizes, audit pre-flight, admission, signer,
-//! signature. Admission charges the legs and the tool's own count limits in
-//! one durable batch before the signer is loaded; a later failure keeps that
-//! usage, and every call charges again.
+//! rule, preimage validation, the caller address match and the pay-rule
+//! decision of every token leg the signer's account authorizes, audit
+//! pre-flight, admission, signer, signature. Admission charges the legs and
+//! the tool's own count limits in one durable batch before the signer is
+//! loaded; a later failure keeps that usage, and every call charges again.
 //!
 //! Per `sep-0043.md` lines :77-89.
 
@@ -100,6 +100,7 @@ pub struct Sep43SignAuthEntryArgs {
 ///   (`sep43.malformed_auth_entry`).
 /// - A type 10 preimage is bound to an address other than the signing key's
 ///   account (`sep43.invalid_address`).
+/// - `address` is not the signing key's G-strkey (`sep43.invalid_address`).
 /// - `network_passphrase` does not match the profile.
 /// - The keyring entry for the signer cannot be loaded.
 ///

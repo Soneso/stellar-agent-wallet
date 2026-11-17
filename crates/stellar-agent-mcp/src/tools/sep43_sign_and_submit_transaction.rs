@@ -221,6 +221,8 @@ impl WalletServer {
                        WC v2 stellar_signAndSubmitXDR). Signs with the active profile signer, \
                        submits via RPC, polls until confirmed. \
                        Returns { signedTxXdr: string, txHash: string, status: \"success\" | \"pending\" }. \
+                       An approval requirement returns { approval } instead; the repeat \
+                       passes approval_nonce and approval_attestation. \
                        read_only_hint=false; destructive_hint=true.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
