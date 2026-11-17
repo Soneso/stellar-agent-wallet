@@ -72,12 +72,18 @@ impl ApprovalAuthority<'_> {
         self.witness
     }
 
-    /// The earlier of the witness expiry and the captured decision end.
+    /// The earlier of the approval's applicable expiry and the captured decision end.
     #[must_use]
     pub fn expires_at_ms(&self) -> u64 {
-        self.witness
-            .expires_at_ms()
-            .min(self.bound.governing_until_ms())
+        let end = match self.witness.subject_kind() {
+            stellar_agent_core::approval::subject::SubjectKind::IntentDigest => {
+                self.witness.execution_expires_at_ms()
+            }
+            stellar_agent_core::approval::subject::SubjectKind::EnvelopeText => {
+                self.witness.expires_at_ms()
+            }
+        };
+        end.min(self.bound.governing_until_ms())
     }
 }
 

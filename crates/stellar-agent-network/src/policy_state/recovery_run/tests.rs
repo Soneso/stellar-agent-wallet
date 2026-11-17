@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::too_many_lines)]
 
 use super::*;
-use crate::policy_state::operations::tests::{Fx, unknown_with};
+use crate::policy_state::operations::tests::{Fx, unknown_with, unknown_with_slot};
 use crate::policy_state::operations::{
     EvidenceInput, OperationStatus, RecoveryAttempt, RecoveryUpdate,
 };
@@ -218,7 +218,20 @@ fn run_wire_and_exposure() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let _storage_home =
         stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-    let (fx, id, attempt) = fixture();
+    let mut fx = Fx::new();
+    let id = unknown_with_slot(
+        &mut fx,
+        1,
+        10,
+        vec![],
+        crate::policy_state::IntentSlot::Envelope {
+            intent_digest: [1; 32],
+            unsigned_envelope_sha256: [1; 32],
+            max_time: 0,
+        },
+    )
+    .id();
+    let attempt = fx.record(id).attempts[0].clone();
     let before = std::fs::read(fx.store.path()).unwrap();
     assert_eq!(fx.wire().version, WIRE_VERSION_TOTAL_EPOCH);
     let view = OperationStatus::new(&fx.store, &fx.profile)
