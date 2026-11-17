@@ -459,6 +459,7 @@ impl WalletServer {
                     summary.seq_num,
                     &profile_name,
                     request,
+                    None,
                 )
                 .map_err(store_error)?
             }
@@ -503,6 +504,7 @@ impl WalletServer {
                     *seq_num,
                     &profile_name,
                     request,
+                    None,
                 )
                 .map_err(store_error)?,
             Approvable::Trustline(_) => return Err(store_error("the trustline summary is absent")),
