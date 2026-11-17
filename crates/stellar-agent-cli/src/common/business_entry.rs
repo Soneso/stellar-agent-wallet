@@ -16,10 +16,10 @@ use stellar_agent_core::profile::receipt::PaymentDestinations;
 use stellar_agent_network::MainnetWriteContext;
 use stellar_agent_network::fees::ClassicFeeChoice;
 use stellar_agent_network::operation_entry::{
-    self, ClassicEntry, IdentityFacts, IntentBaseFacts, OpenedEntry,
+    self, ClassicEntry, IdentityFacts, IntentBaseFacts, OpenedEntry, Preparation,
 };
 use stellar_agent_network::policy_state::{
-    ApprovalRecorder, BusinessId, OpenRequest, OperationAudit, OperationHandle, OperationKind,
+    ApprovalRecorder, BusinessId, OperationAudit, OperationHandle, OperationKind,
     OperationRecorder, OperationState, OperationTool, OperationView, PersistedWindowStore,
 };
 
@@ -62,7 +62,7 @@ pub(crate) fn mainnet_business_id(raw: Option<&str>) -> Result<BusinessId, Walle
 #[derive(Debug)]
 pub(crate) struct ClassicOperation {
     business_id: BusinessId,
-    identity: [u8; 32],
+    preparation: Preparation,
     resume: Option<OperationHandle>,
 }
 
@@ -185,8 +185,16 @@ pub(crate) fn classic_start(
         ),
         facts,
     )?;
+    start_preparation(context, business_id, Preparation::Envelope(identity))
+}
+
+fn start_preparation(
+    context: &MainnetWriteContext,
+    business_id: BusinessId,
+    preparation: Preparation,
+) -> Result<ClassicStart, WalletError> {
     let entry = operation_step(context, |recorder| {
-        operation_entry::lookup_classic(recorder, &business_id, &identity)
+        preparation.lookup(recorder, &business_id)
     })?;
     let resume = match entry {
         ClassicEntry::Build => None,
@@ -195,7 +203,7 @@ pub(crate) fn classic_start(
     };
     Ok(ClassicStart::Proceed(ClassicOperation {
         business_id,
-        identity,
+        preparation,
         resume,
     }))
 }
@@ -221,19 +229,11 @@ pub(crate) fn bind_envelope(
     if let Some(handle) = operation.resume {
         return Ok(BoundEnvelope::Sign(handle));
     }
-    let max_time = operation_entry::envelope_max_time(candidate)?;
-    let request = OpenRequest {
-        business_id: operation.business_id,
-        tool,
-        kind,
-        intent: operation_entry::envelope_slot(&operation.identity, candidate, max_time),
-        envelope_xdr: Some(candidate.to_owned()),
-        prepared_decision: None,
-        rule_ttl_ms: None,
-    };
     Ok(
         match operation_step(context, |recorder| {
-            operation_entry::open_classic(recorder, &request)
+            operation
+                .preparation
+                .open(recorder, operation.business_id, tool, kind, candidate)
         })? {
             OpenedEntry::Resume(handle) => BoundEnvelope::Sign(handle),
             OpenedEntry::Replay(view) => BoundEnvelope::Replay(view),
@@ -359,6 +359,205 @@ mod tests {
 
     const G: &str = "GADQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOZPI";
     const M_MAX: &str = "MADQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQP77777777777754MA";
+
+    #[cfg(feature = "mainnet-write")]
+    #[test]
+    #[serial_test::serial]
+    fn canonical_staging_keeps_the_winning_handle() {
+        use stellar_agent_core::approval::{IntentAsset, IntentPayload, MemoFact};
+        let (fixture, context, envelope) =
+            crate::common::mainnet_confirm::tests::confirmation_fixture("canonical-staging");
+        let args = stellar_agent_core::envelope_decode::decode_authoritative_args(
+            &envelope,
+            "stellar_pay_commit",
+        )
+        .unwrap();
+        let intent = operation_entry::classic_intent(
+            IntentBaseFacts::new(
+                context.profile(),
+                args["source"].as_str().unwrap(),
+                &fixture.current_policy(),
+                ClassicFeeChoice::Explicit(500),
+                MemoFact::None,
+            ),
+            IntentPayload::Pay {
+                destination: args["destination"].as_str().unwrap().into(),
+                asset: IntentAsset::Native,
+                amount_stroops: 17,
+            },
+        )
+        .unwrap();
+        let preparation = Preparation::Canonical {
+            intent: Box::new(intent.clone()),
+            decision: stellar_agent_core::audit_log::PolicyDecision::Allow,
+            rule_ttl_ms: None,
+        };
+        let id = BusinessId::parse("winning-handle").unwrap();
+        let ClassicStart::Proceed(first) =
+            start_preparation(&context, id.clone(), preparation.clone()).unwrap()
+        else {
+            unreachable!()
+        };
+        let ClassicStart::Proceed(stale) =
+            start_preparation(&context, id.clone(), preparation.clone()).unwrap()
+        else {
+            unreachable!()
+        };
+        let BoundEnvelope::Sign(winner) = bind_envelope(
+            &context,
+            first,
+            OperationTool::CliPay,
+            OperationKind::Pay,
+            &envelope,
+        )
+        .unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(
+            winner.intent().kind(),
+            SlotKind::Canonical,
+            "CLI stages Canonical explicitly"
+        );
+        let other = operation_entry::intent_envelope(
+            &intent,
+            context.network_passphrase(),
+            7,
+            100,
+            stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1000 + 120,
+        )
+        .unwrap();
+        let BoundEnvelope::Sign(raced) = bind_envelope(
+            &context,
+            stale,
+            OperationTool::CliPay,
+            OperationKind::Pay,
+            &other,
+        )
+        .unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(
+            raced.id(),
+            winner.id(),
+            "CLI concurrent open returns winning handle"
+        );
+        assert_eq!(
+            raced.envelope_xdr(),
+            Some(envelope.as_str()),
+            "CLI concurrent open retains original envelope"
+        );
+        let ClassicStart::Proceed(resumed) = start_preparation(&context, id, preparation).unwrap()
+        else {
+            unreachable!()
+        };
+        let BoundEnvelope::Sign(resumed) = bind_envelope(
+            &context,
+            resumed,
+            OperationTool::CliPay,
+            OperationKind::Pay,
+            &other,
+        )
+        .unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(
+            resumed.id(),
+            winner.id(),
+            "CLI resume returns winning handle"
+        );
+        assert_eq!(
+            resumed.intent(),
+            winner.intent(),
+            "CLI resume retains full intent"
+        );
+        let ClassicStart::Proceed(legacy) = start_preparation(
+            &context,
+            BusinessId::parse("legacy-binding").unwrap(),
+            Preparation::Envelope(*intent.digest().as_bytes()),
+        )
+        .unwrap() else {
+            unreachable!()
+        };
+        let BoundEnvelope::Sign(legacy) = bind_envelope(
+            &context,
+            legacy,
+            OperationTool::CliPay,
+            OperationKind::Pay,
+            &envelope,
+        )
+        .unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(
+            legacy.intent().kind(),
+            SlotKind::Envelope,
+            "CLI legacy preparation stays Envelope"
+        );
+        let claim = operation_entry::classic_intent(
+            IntentBaseFacts::new(
+                context.profile(),
+                intent.base().source(),
+                &fixture.current_policy(),
+                ClassicFeeChoice::Explicit(500),
+                MemoFact::None,
+            ),
+            IntentPayload::Claim {
+                balance_id: format!("00000000{}", "09".repeat(32)),
+                claimant: intent.base().source().into(),
+                asset: IntentAsset::Native,
+                amount_stroops: 17,
+            },
+        )
+        .unwrap();
+        let id = BusinessId::parse("retained-claim").unwrap();
+        let staged = Preparation::Canonical {
+            intent: Box::new(claim.clone()),
+            decision: stellar_agent_core::audit_log::PolicyDecision::Allow,
+            rule_ttl_ms: Some(300_000),
+        };
+        let ClassicStart::Proceed(operation) =
+            start_preparation(&context, id.clone(), staged).unwrap()
+        else {
+            unreachable!()
+        };
+        let xdr = operation_entry::intent_envelope(
+            &claim,
+            context.network_passphrase(),
+            9,
+            100,
+            stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1000 + 120,
+        )
+        .unwrap();
+        bind_envelope(
+            &context,
+            operation,
+            OperationTool::CliClaim,
+            OperationKind::Claim,
+            &xdr,
+        )
+        .unwrap();
+        let partial = operation_step(&context, |recorder| {
+            operation_entry::lookup_canonical(
+                recorder,
+                &id,
+                IntentBaseFacts::new(
+                    context.profile(),
+                    claim.base().source(),
+                    &fixture.current_policy(),
+                    ClassicFeeChoice::Explicit(500),
+                    MemoFact::None,
+                ),
+                IdentityFacts::Claim {
+                    balance_id: format!("00000000{}", "09".repeat(32)),
+                    claimant: claim.base().source().into(),
+                },
+            )
+        });
+        assert!(
+            matches!(partial, Ok(ClassicEntry::Resume(h)) if h.intent().intent_digest() == *claim.digest().as_bytes()),
+            "CLI partial claim retains full digest without an RPC client"
+        );
+    }
 
     fn view(destinations: PaymentDestinations, compacted: bool) -> OperationView {
         OperationView {

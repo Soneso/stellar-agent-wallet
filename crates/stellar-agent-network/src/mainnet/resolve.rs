@@ -1155,7 +1155,7 @@ mod enabled {
                 .client
                 .get_ledger_entries(&[key])
                 .await
-                .map_err(|_| refused(P::IntentMismatch))?;
+                .map_err(|_| refused(P::EndpointUnavailable))?;
             response
                 .entries
                 .unwrap_or_default()

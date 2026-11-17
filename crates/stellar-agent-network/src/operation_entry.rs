@@ -43,6 +43,12 @@ use crate::policy_state::{
 };
 use crate::submission_record::{AuditWriterHandle, OperationAttempt};
 
+mod preparation;
+pub use preparation::{
+    Preparation, approval_producer_lock, intent_for_consent, lookup_canonical, preparation_intent,
+    stage_pending,
+};
+
 /// The facts every classic intent shares, as the prepare step knows them.
 #[derive(Debug, Clone)]
 pub struct IntentBaseFacts<'a> {
@@ -1176,7 +1182,13 @@ pub fn pending_approval_facts(
         nonce: entry.approval_nonce.clone(),
         kind,
         subject_kind: entry.subject_kind,
-        subject,
+        subject: if entry.subject_kind
+            == stellar_agent_core::approval::subject::SubjectKind::IntentDigest
+        {
+            handle.intent().intent_digest()
+        } else {
+            subject
+        },
         intent_digest: handle.intent().intent_digest(),
         created_at_ms: entry.created_at_unix_ms,
         waiting_expires_at_ms: entry.expires_at_unix_ms,

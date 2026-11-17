@@ -475,7 +475,7 @@ mod producers {
             None,
             ApprovedKind::Claim,
             PolicyDecision::RequireApproval,
-            || panic!("missing handle must refuse before insertion"),
+            |_| panic!("missing handle must refuse before insertion"),
         );
         assert_eq!(
             result.unwrap_err().code(),
@@ -487,7 +487,7 @@ mod producers {
             Some(&handle),
             ApprovedKind::Claim,
             PolicyDecision::RequireApproval,
-            || Err("fixture insertion failure".to_owned()),
+            |_| Err("fixture insertion failure".to_owned()),
         );
         let super::super::common::ToolError::Protocol(error) = result.unwrap_err() else {
             panic!("insertion keeps its protocol channel")
@@ -503,7 +503,7 @@ mod producers {
                 Some(&handle),
                 ApprovedKind::Claim,
                 PolicyDecision::RequireApproval,
-                || {
+                |_| {
                     let mut inbox = PendingApprovalStore::open(store_path(&run.f)).unwrap();
                     inbox.insert(winner.clone(), now_ms()).unwrap();
                     inbox.insert(loser.clone(), now_ms()).unwrap();
@@ -542,7 +542,7 @@ mod producers {
                 Some(&invalid_handle),
                 ApprovedKind::Claim,
                 PolicyDecision::RequireApproval,
-                || Ok(invalid),
+                |_| Ok(invalid),
             )
             .unwrap_err();
         let result = wire(&error.into_result().unwrap());
@@ -574,7 +574,7 @@ mod producers {
                 None,
                 ApprovedKind::Claim,
                 PolicyDecision::RequireApproval,
-                || Ok(loser.clone()),
+                |_| Ok(loser.clone()),
             )
             .unwrap();
         assert_eq!(
