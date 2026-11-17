@@ -37,6 +37,8 @@
 //! - [`validate_path_component_ascii_safe`] — validates that a string is safe
 //!   to use as a path component (no path traversal, no special characters).
 
+#[cfg(test)]
+pub(crate) mod approval_fixture;
 pub(crate) mod business_entry;
 #[cfg(test)]
 mod capture_isolation;

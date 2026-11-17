@@ -247,6 +247,8 @@ fn mainnet_home(home: &std::path::Path) -> (Profile, String) {
     )
     .unwrap();
     let nonce = entry.approval_nonce.clone();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home);
+    crate::approval_fixture::open_record(NAME, &profile, &entry);
     let mut approvals =
         PendingApprovalStore::open(home.join("approvals").join(format!("{NAME}.toml"))).unwrap();
     approvals
@@ -502,7 +504,7 @@ mod signed {
             .unwrap()
             .clone()
         }
-        fn expire_after_startup(&self) -> u64 {
+        fn expire_after_startup(&mut self) -> u64 {
             let mut store = PendingApprovalStore::open(
                 self.dir
                     .path()
@@ -512,10 +514,24 @@ mod signed {
             .unwrap();
             let mut entry = store.get(&self.nonce).unwrap().clone();
             store.remove(&self.nonce).unwrap();
+            entry.approval_nonce = URL_SAFE_NO_PAD.encode(uuid::Uuid::new_v4().as_bytes());
+            self.nonce.clone_from(&entry.approval_nonce);
             // This child-process case waits for the entry's wall-clock expiry.
             let expiry = stellar_agent_core::timefmt::now_unix_ms().unwrap()
                 + u64::try_from(CHILD_EXPIRY.as_millis()).unwrap();
             entry.expires_at_unix_ms = expiry;
+            let profile: Profile = toml::from_str(
+                &std::fs::read_to_string(
+                    self.dir
+                        .path()
+                        .join("profiles")
+                        .join(format!("{NAME}.toml")),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(self.dir.path());
+            crate::approval_fixture::open_record(NAME, &profile, &entry);
             store
                 .insert(entry, stellar_agent_core::timefmt::now_unix_ms().unwrap())
                 .unwrap();
@@ -937,7 +953,7 @@ mod signed {
     #[serial]
     async fn signed_origin_one_shot_closes_after_consent_cancel_expiry_or_interrupt() {
         for action in ["consent", "cancel", "expiry", "interrupt"] {
-            let home = Home::new();
+            let mut home = Home::new();
             let expiry = (action == "expiry").then(|| home.expire_after_startup());
             let mut child: OwnedChild = home.command(false).spawn().unwrap().into();
             ready(&mut child, &home).await;
@@ -1333,6 +1349,7 @@ mod signed {
         )
         .unwrap();
         home.nonce = pending.approval_nonce.clone();
+        let record = crate::approval_fixture::open_record(NAME, &profile, &pending);
         let store_path = home
             .dir
             .path()
@@ -1564,7 +1581,10 @@ mod signed {
                 authority: &MainnetAuthority::from_decision(&decision, Some(&approval)).unwrap(),
                 audit,
                 store: &window,
-                operation: None,
+                operation: Some(stellar_agent_network::policy_state::OperationLink {
+                    operation_id: record.operation_id,
+                    attempt_index: 1,
+                }),
             }),
             |_| async {},
         )

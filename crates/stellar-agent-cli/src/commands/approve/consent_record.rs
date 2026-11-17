@@ -22,6 +22,21 @@ impl DurableConsents {
 }
 
 impl ConsentRecording for DurableConsents {
+    fn precheck(
+        &self,
+        entry: &stellar_agent_core::approval::PendingApproval,
+    ) -> Result<(), WalletError> {
+        stellar_agent_network::policy_state::ApprovalStatus::new(&self.store, &self.profile)
+            .find_by_nonce(&entry.approval_nonce)
+            .map_err(stellar_agent_network::operation_entry::operation_refusal)?
+            .ok_or_else(|| {
+                WalletError::Approval(stellar_agent_core::ApprovalFailure::NotFound {
+                    detail: "no durable approval record for that nonce".to_owned(),
+                })
+            })?;
+        Ok(())
+    }
+
     /// Reads the record that names the consent's nonce, then commits the
     /// consent under the window lock alone; the commit checks the witness
     /// against the record. An entry without a record keeps the path of an
@@ -123,6 +138,50 @@ mod tests {
     /// The window file's bytes.
     fn window(f: &Fixture) -> Vec<u8> {
         std::fs::read(f.store.path()).unwrap()
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[serial_test::serial(mainnet_clock)]
+    async fn inbox_precheck_requires_a_real_record_in_both_listeners() {
+        for signed in [false, true] {
+            let (mut f, _tls) = if signed {
+                let (f, tls) = signed_fixture();
+                (f, Some(tls))
+            } else {
+                (Fixture::new(), None)
+            };
+            f.entry = f.core.payment(300_000);
+            PendingApprovalStore::open(f.core.store_path())
+                .unwrap()
+                .insert(f.entry.clone(), f.entry.created_at_unix_ms)
+                .unwrap();
+            let before = window(&f);
+            let (listener, browser) = Browser::start(&f, signed).await;
+            let page = browser.page(&f.entry.approval_nonce).await;
+            let data = island(&page, "presence-data");
+            let response = browser
+                .action(
+                    &f.entry.approval_nonce,
+                    data["csrf"].as_str().unwrap(),
+                    "challenge",
+                    &json!({"consent_view_digest": data["consent_view_digest"]}),
+                )
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let body: Value = response.json().await.unwrap();
+            assert_eq!(status, 200);
+            assert_eq!(
+                body["status"], "not_found",
+                "real durable precheck refuses before a challenge: {body}"
+            );
+            assert!(body.get("challenge").is_none());
+            assert_eq!(window(&f), before);
+            assert_eq!(attested_rows(&f), 0);
+            listener.shutdown().await;
+        }
     }
 
     /// Approves `entry` through the context `serve` installs, under a fresh

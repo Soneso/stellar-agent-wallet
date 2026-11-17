@@ -128,7 +128,7 @@ fn muxed_policy(raw: &str, payee: &str, contract: bool) -> String {
     )
 }
 
-async fn call_muxed(
+pub(super) async fn call_muxed(
     run: &Run,
     authenticated: bool,
     args: X402AuthenticatedPaymentArgs,
@@ -937,7 +937,7 @@ pub(super) fn authenticated_policy_with(
     doc.to_string()
 }
 
-fn authenticated_policy(raw: &str) -> String {
+pub(super) fn authenticated_policy(raw: &str) -> String {
     authenticated_policy_with(raw, |_| {})
 }
 
@@ -1036,7 +1036,7 @@ impl Run {
         Self::build(|raw| authenticated_policy(&raw)).await
     }
 
-    async fn build(policy: impl FnOnce(String) -> String) -> Self {
+    pub(super) async fn build(policy: impl FnOnce(String) -> String) -> Self {
         let primary = wiremock::MockServer::start().await;
         let oracle = wiremock::MockServer::start().await;
         let mut f = routed_fixture_with(policy, |_| {}, &primary, &oracle);
@@ -1067,7 +1067,11 @@ impl Run {
             address: None,
             approval_nonce: approval.map(|(nonce, _)| nonce.to_owned()),
             approval_attestation: approval.map(|(_, attestation)| attestation.to_owned()),
-            business_id: Some(crate::tools::common::tests::fresh_business_id()),
+            business_id: approval
+                .and_then(|(nonce, _)| {
+                    super::common::tests::mainnet::approval_business_id(&self.f, nonce)
+                })
+                .or_else(|| Some(crate::tools::common::tests::fresh_business_id())),
         }
     }
 
@@ -1325,6 +1329,74 @@ async fn call_two_accepts_below_the_threshold() {
         "the oracle's identity request and its latest ledger below the threshold"
     );
     assert_accepted(&run, &approval, &result).await;
+}
+
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn authenticated_x402_message_mint_consumes_for_its_operation() {
+    use stellar_agent_network::policy_state::{ApprovalState, ApprovalStatus};
+    let run = Run::new().await;
+    let approval = run.prepare().await;
+    let status = ApprovalStatus::new(&run.f.server.window_store, run.f.server.security_profile());
+    let before = status.find_by_nonce(&approval.0).unwrap().unwrap().record;
+    // Stop after message use, before an intent can consume the same approval.
+    run.oracle_control
+        .latest_ledger_behind
+        .store(3, Ordering::SeqCst);
+    let result = run.pay(HOME, &approval).await;
+    assert_eq!(
+        result["error"]["code"], "simulation.divergence",
+        "the message mint passes the retained record check"
+    );
+    let after = status.find_by_nonce(&approval.0).unwrap().unwrap().record;
+    assert_eq!(
+        after.state,
+        ApprovalState::Consumed,
+        "the message mint consumes its call-one approval"
+    );
+    assert_eq!(after.operation_id, before.operation_id);
+    let message = records(&run.f, "message");
+    assert_eq!(message.len(), 1);
+    assert!(
+        message[0]["operation"].is_null(),
+        "a message stores no operation link"
+    );
+    let state = ledger(&run.f).unwrap();
+    assert_eq!(
+        state["operations"]["records"][0]["state"],
+        "awaiting_approval"
+    );
+    assert!(
+        state["operations"]["records"][0]["attempts"].is_null(),
+        "empty attempts are omitted from the operation"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn authenticated_x402_message_mint_refuses_another_operation_identity() {
+    let run = Run::new().await;
+    let approval = run.prepare().await;
+    let mut args = run.args(HOME, Some((&approval.0, &approval.1)));
+    args.business_id = Some(super::common::tests::fresh_business_id());
+    let (capture, _guard) =
+        stellar_agent_test_support::WarningCapture::capture(Some("stellar_agent"));
+    let result = run.call(args).await;
+    assert_eq!(
+        result["error"]["code"], "network.mainnet_authorization_refused",
+        "another operation refuses at the message record check"
+    );
+    assert_eq!(
+        refusals(&capture),
+        [(
+            "resolve_message_sign".to_owned(),
+            "approval_nonce_reused".to_owned()
+        )]
+    );
+    assert!(authorizations(&run.f).is_empty());
+    assert!(signings().is_empty());
 }
 
 /// Call 2 below the threshold refuses when the oracle's latest ledger trails
@@ -1891,6 +1963,7 @@ impl Boundary {
         )
         .unwrap();
         let authorization = resolve_message_sign(MessageSignRequest {
+            approval_operation: None,
             context: guard.context,
             consumer: MainnetConsumer::X402Authenticated,
             intent: &intent,
@@ -2167,6 +2240,7 @@ async fn the_identity_gate_refuses_a_future_created_approval() {
         &Sep10Double::http(),
         Some(&b.double.endpoint()),
         stellar_agent_x402_identity::MainnetIdentityInputs {
+            approval_operation: None,
             context: guard.context,
             intent: &intent,
             policy: guard.policy,
@@ -2223,6 +2297,7 @@ async fn the_identity_gate_refuses_an_ended_policy_authority() {
         &Sep10Double::http(),
         Some(&b.double.endpoint()),
         stellar_agent_x402_identity::MainnetIdentityInputs {
+            approval_operation: None,
             context: guard.context,
             intent: &intent,
             policy: guard.policy,
@@ -2261,6 +2336,7 @@ async fn the_identity_inputs_print_the_profile_only() {
     )
     .unwrap();
     let inputs = stellar_agent_x402_identity::MainnetIdentityInputs {
+        approval_operation: None,
         context: guard.context,
         intent: &intent,
         policy: guard.policy,
@@ -2309,6 +2385,7 @@ async fn the_identity_inputs_print_the_profile_only() {
     )
     .unwrap();
     let inputs = stellar_agent_x402_identity::MainnetIdentityInputs {
+        approval_operation: None,
         context: guard.context,
         intent: &intent,
         policy: guard.policy,
@@ -2357,6 +2434,7 @@ async fn the_mainnet_session_prints_no_jwt_and_no_envelope() {
         &Sep10Double::http(),
         Some(&b.double.endpoint()),
         stellar_agent_x402_identity::MainnetIdentityInputs {
+            approval_operation: None,
             context: guard.context,
             intent: &intent,
             policy: guard.policy,
@@ -2424,6 +2502,7 @@ async fn the_policy_session_prints_no_jwt_and_no_envelope() {
         &Sep10Double::http(),
         Some(&b.double.endpoint()),
         stellar_agent_x402_identity::MainnetIdentityInputs {
+            approval_operation: None,
             context: guard.context,
             intent: &intent,
             policy: guard.policy,

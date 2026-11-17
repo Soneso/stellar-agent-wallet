@@ -837,7 +837,11 @@ mod tests {
             )),
             None,
         )
-        .with_mainnet_authority(fixture.authority());
+        .with_mainnet_authority(fixture.authority())
+        .with_consent_recording(Arc::new(
+            super::super::consent_record::DurableConsents::new(fixture.name(), fixture.profile()),
+        ));
+        crate::common::approval_fixture::open_record(fixture.name(), fixture.profile(), &entry);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = start_serve(ServeConfig::new(
             SocketAddr::from(([127, 0, 0, 1], 0)),

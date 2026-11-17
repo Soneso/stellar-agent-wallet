@@ -1265,10 +1265,12 @@ an oracle.
 On an admitted mainnet server, an x402 payment under Allow takes one call
 without approval arguments, and that call signs and pays. Under
 RequireApproval it takes two calls: call 1 stores the pending approval, and
-call 2 presents it and pays. The call that pays is the signing call. For the
-authenticated tool it also runs the SEP-10 exchange. Each authorization the
-signing call mints lasts at most 120 seconds. Both tools take the optional
-`approval_nonce` and `approval_attestation` arguments.
+call 2 presents it and pays. On mainnet, call 2 reuses call 1's `business_id`
+for both tools, and a call 2 under another `business_id` refuses with
+`network.mainnet_authorization_refused`. The call that pays is the signing
+call. For the authenticated tool it also runs the SEP-10 exchange. Each
+authorization the signing call mints lasts at most 120 seconds. Both tools
+take the optional `approval_nonce` and `approval_attestation` arguments.
 
 Each call opens the payment's operation record under its `business_id` once
 the requirements and the payer are known, so a retained payment answers with

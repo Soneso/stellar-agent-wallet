@@ -523,6 +523,8 @@ async fn approve_mainnet(
     let admission = authority.admit()?;
     let mut store = open_with_retry(store_path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF)
         .map_err(|e| super::common::approval_store_open_error(&e))?;
+    // Revocation may commit while the presence ceremony holds no inbox lock.
+    durable_approval(&window, profile, context, entry, intent.as_ref())?;
     let policy = authority.load_admitted(&admission)?.into_policy();
     let key = load_attestation_key(
         &profile.attestation_key_id,
@@ -604,11 +606,14 @@ fn durable_approval(
     init_platform_keyring_store()?;
     let view = ApprovalStatus::new(window, profile)
         .find_by_nonce(&entry.approval_nonce)
-        .map_err(operation_refusal)?;
-    if let Some(view) = &view {
-        validate_durable_approval(view, entry, context, intent)?;
-    }
-    Ok(view)
+        .map_err(operation_refusal)?
+        .ok_or_else(|| {
+            WalletError::Approval(ApprovalFailure::NotFound {
+                detail: "no durable approval record for that nonce".to_owned(),
+            })
+        })?;
+    validate_durable_approval(&view, entry, context, intent)?;
+    Ok(Some(view))
 }
 
 /// Checks the durable disposition and signed inbox facts before consent.
@@ -684,22 +689,23 @@ fn recover_durable_consent(
     profile: &Profile,
     nonce: &str,
 ) -> Result<PendingApprovalStore, WalletError> {
-    let Some(entry) = store
-        .get(nonce)
-        .filter(|entry| entry.attestation_blob_b64.is_some())
-        .cloned()
-    else {
+    let Some(entry) = store.get(nonce).cloned() else {
         return Ok(store);
     };
     if !profile.chain_id.is_mainnet() {
         return Ok(store);
     }
     let window = PersistedWindowStore::for_profile(&context.profile_name);
-    // Keep legacy non-value and already-completed entries outside the ceremony.
-    if entry.subject_kind == stellar_agent_core::approval::subject::SubjectKind::EnvelopeText
-        && durable_approval(&window, profile, context, &entry, None)?
-            .is_none_or(|view| view.record.consent.is_some())
-    {
+    // Keep legacy non-value, unattested and already-completed entries outside
+    // the ceremony. An envelope value entry needs its record even unattested.
+    if entry.subject_kind == stellar_agent_core::approval::subject::SubjectKind::EnvelopeText {
+        let durable = durable_approval(&window, profile, context, &entry, None)?;
+        if entry.attestation_blob_b64.is_none()
+            || durable.is_none_or(|view| view.record.consent.is_some())
+        {
+            return Ok(store);
+        }
+    } else if entry.attestation_blob_b64.is_none() {
         return Ok(store);
     }
     drop(store);
@@ -1667,6 +1673,18 @@ mod tests {
     use stellar_agent_test_support::{StellarAgentHomeGuard, keyring_mock};
     use tempfile::TempDir;
 
+    fn park(
+        fixture: &stellar_agent_core::approval::mainnet_fixtures::MainnetConsentFixture,
+        entry: &PendingApproval,
+    ) -> stellar_agent_network::policy_state::WireApproval {
+        let mut pending = PendingApprovalStore::open(fixture.store_path()).unwrap();
+        pending
+            .insert(entry.clone(), entry.created_at_unix_ms)
+            .unwrap();
+        drop(pending);
+        crate::common::approval_fixture::open_record(fixture.name(), fixture.profile(), entry)
+    }
+
     #[cfg(feature = "test-helpers")]
     mod durable {
         #![allow(clippy::panic, reason = "crash simulation and test assertions")]
@@ -1678,16 +1696,12 @@ mod tests {
         use sha2::Digest as _;
         use stellar_agent_core::approval::mainnet_fixtures::MainnetConsentFixture;
         use stellar_agent_core::approval::witness::ApprovedKind;
-        use stellar_agent_core::audit_log::PolicyDecision;
-        use stellar_agent_network::operation_entry::pending_approval_facts;
         use stellar_agent_network::policy_state::store::commit_faults::{
             COMMIT_FAULT_AFTER_COUNTER, COMMIT_FAULT_AFTER_PREPARED, arm_accounting_fault,
             observe_commit,
         };
         use stellar_agent_network::policy_state::{
-            ApprovalRecorder, BusinessId, IntentSlot, OpenOutcome, OpenRequest, OperationAudit,
-            OperationKind, OperationRecorder, OperationTool, RowProvenance, WireApproval,
-            X402Intent, approvals::facade_calls,
+            ApprovalRecorder, OperationAudit, RowProvenance, WireApproval, approvals::facade_calls,
         };
 
         struct Rows;
@@ -1706,102 +1720,6 @@ mod tests {
             stellar_agent_network::keyring::rotate_keyring_secret_32(&key.service, &key.account)
                 .unwrap();
             fixture
-        }
-
-        fn park(fixture: &MainnetConsentFixture, entry: &PendingApproval) -> WireApproval {
-            let window = PersistedWindowStore::for_profile(fixture.name());
-            let (kind, tool, approved, intent, envelope) = match &entry.kind {
-                ApprovalKind::X402Payment {
-                    intent_digest,
-                    asset,
-                    payee,
-                    amount,
-                    ..
-                } => (
-                    OperationKind::X402Payment,
-                    OperationTool::X402CreatePayment,
-                    ApprovedKind::X402Payment,
-                    IntentSlot::X402 {
-                        intent_digest: *intent_digest,
-                        intent: X402Intent {
-                            network: fixture.profile().chain_id.caip2_str().to_owned(),
-                            asset: asset.clone(),
-                            payer: stellar_strkey::ed25519::PublicKey([1; 32])
-                                .to_string()
-                                .to_string(),
-                            pay_to: payee.clone(),
-                            amount: amount.clone(),
-                        },
-                    },
-                    None,
-                ),
-                other => {
-                    let (kind, tool, approved, xdr) = match other {
-                        ApprovalKind::PaymentSimulated {
-                            envelope_xdr_b64, ..
-                        } => (
-                            OperationKind::Pay,
-                            OperationTool::StellarPay,
-                            ApprovedKind::Payment,
-                            envelope_xdr_b64,
-                        ),
-                        ApprovalKind::ClaimSimulated {
-                            envelope_xdr_b64, ..
-                        } => (
-                            OperationKind::Claim,
-                            OperationTool::StellarClaim,
-                            ApprovedKind::Claim,
-                            envelope_xdr_b64,
-                        ),
-                        ApprovalKind::TrustlineSimulated {
-                            envelope_xdr_b64, ..
-                        } => (
-                            OperationKind::Trustline,
-                            OperationTool::StellarTrustline,
-                            ApprovedKind::Trustline,
-                            envelope_xdr_b64,
-                        ),
-                        _ => unreachable!(),
-                    };
-                    (
-                        kind,
-                        tool,
-                        approved,
-                        stellar_agent_network::operation_entry::envelope_slot(&[7; 32], xdr, 0),
-                        Some(xdr.clone()),
-                    )
-                }
-            };
-            let opened = OperationRecorder::new(&window, fixture.profile(), &mut Rows, "fixture")
-                .open(&OpenRequest {
-                    business_id: BusinessId::parse(fixture.name()).unwrap(),
-                    tool,
-                    kind,
-                    intent,
-                    envelope_xdr: envelope,
-                    prepared_decision: None,
-                    rule_ttl_ms: None,
-                })
-                .unwrap();
-            let OpenOutcome::New(handle) = opened else {
-                unreachable!()
-            };
-            let mut pending = PendingApprovalStore::open(fixture.store_path()).unwrap();
-            pending
-                .insert(entry.clone(), entry.created_at_unix_ms)
-                .unwrap();
-            drop(pending);
-            let facts = pending_approval_facts(
-                entry,
-                &handle,
-                approved,
-                mainnet_consent_subject(entry, &fixture.binding()).unwrap(),
-                entry.expires_at_unix_ms - entry.created_at_unix_ms,
-            );
-            ApprovalRecorder::new(&window, fixture.profile(), &mut Rows, "fixture")
-                .open_pending(handle.id(), &facts, PolicyDecision::RequireApproval)
-                .unwrap()
-                .record
         }
 
         fn record(fixture: &MainnetConsentFixture, nonce: &str) -> WireApproval {
@@ -1912,6 +1830,106 @@ mod tests {
                 assert_eq!(consent_rows(fixture.profile()).len(), 1);
                 assert_eq!(driver::ceremonies().len(), 1);
             }
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn approve_run_consented_repeat_neither_reverifies_nor_commits() {
+            let fixture = fixture("approve-consented-repeat");
+            let entry = fixture.payment(300_000);
+            park(&fixture, &entry);
+            let _driver = driver::install(driver::fixture_credential());
+            assert_eq!(
+                invoke(fixture.name(), &entry.approval_nonce, false).await.0,
+                0
+            );
+            let attested = stored(&fixture, &entry.approval_nonce);
+            let original = std::fs::read_to_string(fixture.store_path()).unwrap();
+            let changed = original.replace(
+                attested.attestation_blob_b64.as_ref().unwrap(),
+                &URL_SAFE_NO_PAD.encode([0; 32]),
+            );
+            assert_ne!(original, changed);
+            std::fs::write(fixture.store_path(), &changed).unwrap();
+            let window = PersistedWindowStore::for_profile(fixture.name());
+            let before = std::fs::read(window.path()).unwrap();
+            let commits = std::rc::Rc::new(std::cell::Cell::new(0));
+            let seen = commits.clone();
+            let observed = observe_commit(move |_| seen.set(seen.get() + 1));
+            let (code, output) = invoke(fixture.name(), &entry.approval_nonce, false).await;
+            drop(observed);
+            assert_eq!(code, 1);
+            assert_eq!(
+                output["error"]["code"], "approval.already_attested",
+                "a consented repeat does not reverify the inbox attestation"
+            );
+            assert_eq!(commits.get(), 0, "a consented repeat attempts no commit");
+            assert_eq!(std::fs::read(window.path()).unwrap(), before);
+            assert_eq!(
+                std::fs::read_to_string(fixture.store_path()).unwrap(),
+                changed
+            );
+            assert_eq!(driver::ceremonies().len(), 1);
+            assert_eq!(consent_rows(fixture.profile()).len(), 1);
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn approve_run_refuses_a_value_entry_without_a_record_before_presence() {
+            let fixture = fixture("approve-missing-record");
+            let entry = fixture.payment(300_000);
+            PendingApprovalStore::open(fixture.store_path())
+                .unwrap()
+                .insert(entry.clone(), timefmt::now_unix_ms().unwrap())
+                .unwrap();
+            let _driver = driver::install(driver::fixture_credential());
+            let (code, output) = invoke(fixture.name(), &entry.approval_nonce, false).await;
+            assert_eq!(code, 1);
+            assert_eq!(
+                output["error"]["code"], "approval.not_found",
+                "missing records refuse before presence"
+            );
+            assert!(driver::ceremonies().is_empty());
+            assert!(consent_rows(fixture.profile()).is_empty());
+            assert!(
+                stored(&fixture, &entry.approval_nonce)
+                    .attestation_blob_b64
+                    .is_none()
+            );
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn approve_run_revocation_during_presence_precedes_the_row() {
+            let fixture = fixture("approve-presence-revocation");
+            let entry = fixture.payment(300_000);
+            let pending = park(&fixture, &entry);
+            let window = PersistedWindowStore::for_profile(fixture.name());
+            let profile = fixture.profile().clone();
+            let mut credential = driver::fixture_credential();
+            let _driver = driver::install(Box::new(move |ceremony| {
+                ApprovalRecorder::new(&window, &profile, &mut Rows, "revoke-during-presence")
+                    .revoke(pending.id)
+                    .unwrap();
+                credential(ceremony)
+            }));
+            let (code, output) = invoke(fixture.name(), &entry.approval_nonce, false).await;
+            assert_eq!(code, 1);
+            assert_eq!(
+                output["error"]["code"], "approval.revoked",
+                "revocation during presence refuses before attestation"
+            );
+            assert!(
+                consent_rows(fixture.profile()).is_empty(),
+                "revocation writes no consent row"
+            );
+            assert!(
+                stored(&fixture, &entry.approval_nonce)
+                    .attestation_blob_b64
+                    .is_none()
+            );
+            assert!(record(&fixture, &entry.approval_nonce).consent.is_none());
+            assert_eq!(driver::ceremonies().len(), 1);
         }
 
         #[tokio::test]
@@ -2995,10 +3013,13 @@ mod tests {
             "browser-refusal",
         );
         let entry = fixture.payment(DEFAULT_TTL_MS);
+        park(&fixture, &entry);
         let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
-        store
-            .insert(entry.clone(), timefmt::now_unix_ms().unwrap())
-            .unwrap();
+        if store.get(&entry.approval_nonce).is_none() {
+            store
+                .insert(entry.clone(), timefmt::now_unix_ms().unwrap())
+                .unwrap();
+        }
         let context = ApprovalContext::from_profile(fixture.name(), fixture.profile());
         let _driver = crate::common::mainnet_presence::driver::install(Box::new(|_| {
             Err(WalletError::Approval(

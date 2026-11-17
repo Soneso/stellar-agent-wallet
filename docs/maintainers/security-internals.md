@@ -2382,12 +2382,23 @@ the record. A producer lock serializes that sequence; consent paths never take
 it. Acquisition uses the inbox's five attempts with 20 milliseconds between
 attempts. A preparation that still finds the lock held after those attempts
 refuses with `approval.writer_locked`; retry with the same business id. The
-open retains the prepare decision and the entry's signed interval as its rule
+approval directory and initial inbox-open failures use the MCP protocol error
+channel with `approval.store_error`, as inbox insertion failures do.
+The open retains the prepare decision and the entry's signed interval as its rule
 lifetime. After an open error, authenticated status determines whether cleanup
 is safe. A committed record keeps its nonce; a competing record returns its
 winner. An unreadable status keeps the entry for retry. Rejection creates no
 durable consent, and signed expiry ends the waiting window. Allow, testnet and
 clawback opt-ins keep their existing paths without the approval facade.
+
+Both x402 tools open durable approval records through the same producer lock.
+They reuse a linked entry, or remove live unattested orphans by intent digest
+before insertion. Authenticated payment subjects also bind the home domain.
+The message mint carries the call-one operation as its approval identity,
+without storing an operation link or authorizing an operation attempt.
+Every mint record check and consumption uses the request's operation link,
+or its separate approval identity when the link is absent. Supplying both
+refuses with `internal.unexpected_state` before any record read.
 
 The payment producer keeps its inbox recovery binding as the link between
 entry and record. An unlinked payment entry is recoverable work: the producer
@@ -2406,6 +2417,11 @@ rollback keeps the refusal. CLI preparation takes no producer
 lock, so it can remove a payment entry while the MCP producer opens its
 record; the producer then refuses with `approval.not_found`.
 
+`approve --id` and both inbox challenge routes require a durable record for
+mainnet value entries before presence starts. A missing record refuses with
+`approval.not_found`. Prepare the operation again and approve its new nonce;
+the unlinked entry retains its list, reject, expiry and collection paths.
+
 `approve --id` completes an existing mainnet value record after its consent row
 and inbox attestation persist. It releases the inbox before committing consent
 under the window lock, then reports success. A queued row retains its exact
@@ -2417,8 +2433,12 @@ original timestamp and `recovered` provenance. It then returns
 `approval.already_attested`. A revoked, consumed or expired record, or one that
 does not match the inbox entry, refuses with its approval code before presence
 and before recovery. These refusals write nothing. An already consented record
-writes nothing on this path. Testnet, clawback opt-ins, and credential
-registration keep their consent paths without accessing durable approval records.
+writes nothing on this path and skips re-verification of its inbox attestation.
+After presence returns, the command rereads the durable record before writing
+the consent row or attestation. A revocation during the ceremony therefore
+returns `approval.revoked` without publishing consent. Testnet, clawback opt-ins,
+and credential registration keep their consent paths without accessing durable
+approval records.
 
 `approve serve` installs a consent recording on the one decision context that
 the loopback inbox and the signed-origin listener share. A mainnet payment,

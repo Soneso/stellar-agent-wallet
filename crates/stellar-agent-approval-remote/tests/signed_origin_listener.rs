@@ -43,6 +43,10 @@ mod signed_origin_commit;
 struct NoDurableRecords;
 
 impl stellar_agent_approval_ui::decision::ConsentRecording for NoDurableRecords {
+    fn precheck(&self, _: &PendingApproval) -> Result<(), stellar_agent_core::error::WalletError> {
+        Ok(())
+    }
+
     fn complete(
         &self,
         _: stellar_agent_approval_ui::decision::VerifiedConsent,

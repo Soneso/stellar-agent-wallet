@@ -780,12 +780,15 @@ impl WalletServer {
                 let DispatchOutcome::RequireApproval(approval) = &dispatch else {
                     return Ok(approval_required_indistinguishable(name));
                 };
-                let entry = self.write_x402_pending_approval(
-                    &root,
-                    None,
-                    approval,
-                    stellar_agent_network::mainnet::clock::now_ms,
-                );
+                let entry =
+                    self.x402_pending_approval(entry.as_ref(), dispatch.audit_decision(), || {
+                        self.write_x402_pending_approval(
+                            &root,
+                            None,
+                            approval,
+                            stellar_agent_network::mainnet::clock::now_ms,
+                        )
+                    });
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(error) => {
@@ -4672,6 +4675,8 @@ mod tests {
             ("approval_attestation", "policy.approval_required"),
         ] {
             let mut args = x402_args(&run.f, Some((&run.nonce, &run.attestation)));
+            // The altered intent probes the approval gate under a fresh operation.
+            args.business_id = Some(crate::tools::common::tests::fresh_business_id());
             let mut requirements = run.f.requirements();
             match field {
                 "amount" => requirements.amount = "11".to_owned(),

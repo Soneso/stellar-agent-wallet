@@ -835,6 +835,7 @@ async fn consented_unminted_intent_survives_waiting_end() {
                     operation: Some(fx.link),
                     intent_digest: Some(*fx.intent.digest().as_bytes()),
                     predecessor: None,
+                    approval_operation: None,
                     native_reservation: None,
                     floor: None,
                 }))

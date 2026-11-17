@@ -668,6 +668,8 @@ fn sep10_client(
 /// home domain; one authority covers the message and the payment.
 #[cfg(feature = "mainnet-write")]
 pub struct MainnetIdentityInputs<'a> {
+    /// The operation whose approval authorizes the message mint.
+    pub approval_operation: Option<stellar_agent_network::policy_state::OperationId>,
     /// The mainnet write context; its passphrase is the SEP-10 network.
     pub context: &'a MainnetWriteContext,
     /// The authenticated payment intent the authority covers.
@@ -856,6 +858,7 @@ async fn run_authorized_gate(
     .map_err(sep10_failure)?;
     let message = prepared.message_facts();
     let authorization = resolve_message_sign(MessageSignRequest {
+        approval_operation: inputs.approval_operation,
         context: inputs.context,
         consumer: MainnetConsumer::X402Authenticated,
         intent: inputs.intent,

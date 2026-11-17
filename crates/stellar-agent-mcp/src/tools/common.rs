@@ -9524,6 +9524,14 @@ pub(crate) mod tests {
                 server: &WalletServer,
                 args: &serde_json::Value,
             ) -> rmcp::model::CallToolResult {
+                self.prepare_result(server, args).await.unwrap()
+            }
+
+            pub(crate) async fn prepare_result(
+                self,
+                server: &WalletServer,
+                args: &serde_json::Value,
+            ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
                 let args = args.clone();
                 match self {
                     Self::Pay => {
@@ -9547,7 +9555,6 @@ pub(crate) mod tests {
                             .await
                     }
                 }
-                .unwrap()
             }
 
             pub(crate) async fn commit(
@@ -12005,6 +12012,41 @@ pub(crate) mod tests {
                 *run.control.entries.lock().unwrap() = Some(entries.clone());
                 *run.oracle_control.entries.lock().unwrap() = Some(entries);
                 assert_refused_before_mint(&run, &run.commit().await, code);
+                if matches!(tool, Tool::Trustline) {
+                    let response = wire(&tool.prepare(&run.f.server, &run.args).await);
+                    assert_eq!(
+                        response["error"]["code"],
+                        "trustline.clawback_opt_in_required"
+                    );
+                    let inbox = stellar_agent_core::approval::PendingApprovalStore::open(
+                        run.f
+                            .server
+                            .resolve_approval_dir()
+                            .unwrap()
+                            .join("operator.toml"),
+                    )
+                    .unwrap();
+                    let opt_in = inbox
+                        .snapshot(stellar_agent_core::timefmt::now_unix_ms().unwrap())
+                        .into_iter()
+                        .find(|view| {
+                            matches!(
+                                inbox.get(&view.approval_nonce).unwrap().kind,
+                                stellar_agent_core::approval::ApprovalKind::TrustlineClawbackOptIn { .. }
+                            )
+                        })
+                        .expect("the preparation inserts the opt-in");
+                    assert!(
+                        stellar_agent_network::policy_state::ApprovalStatus::new(
+                            &run.f.server.window_store,
+                            run.f.server.security_profile(),
+                        )
+                        .find_by_nonce(&opt_in.approval_nonce)
+                        .unwrap()
+                        .is_none(),
+                        "clawback opt-in insertion opens no durable value record"
+                    );
+                }
             }
         }
 
@@ -12785,7 +12827,23 @@ pub(crate) mod tests {
             assert!(f.server.verify_mainnet_freshness(&guard).is_ok());
         }
 
-        /// The mainnet create-payment arguments of the fixture's payment.
+        /// Resumes an unfinished approval operation. A spent-proof probe uses
+        /// a fresh business id so it reaches the approval gate, not replay.
+        pub(crate) fn approval_business_id(f: &Fixture, nonce: &str) -> Option<String> {
+            let state = ledger(f)?;
+            let record = state["approvals"]["records"]
+                .as_array()?
+                .iter()
+                .find(|r| r["nonce"] == nonce)?;
+            state["operations"]["records"]
+                .as_array()?
+                .iter()
+                .find(|r| r["id"] == record["operation_id"] && r["state"] == "awaiting_approval")?["business_id"]
+                .as_str()
+                .map(str::to_owned)
+        }
+
+        /// The payment call resumes the operation that produced its approval.
         pub(crate) fn x402_args(
             f: &Fixture,
             approval: Option<(&str, &str)>,
@@ -12796,7 +12854,9 @@ pub(crate) mod tests {
                 address: None,
                 approval_nonce: approval.map(|(nonce, _)| nonce.to_owned()),
                 approval_attestation: approval.map(|(_, attestation)| attestation.to_owned()),
-                business_id: Some(crate::tools::common::tests::fresh_business_id()),
+                business_id: approval
+                    .and_then(|(nonce, _)| approval_business_id(f, nonce))
+                    .or_else(|| Some(crate::tools::common::tests::fresh_business_id())),
             }
         }
 
