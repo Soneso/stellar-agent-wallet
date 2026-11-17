@@ -977,7 +977,9 @@ no-profile-required posture; a profile named through `--profile` or
 `STELLAR_AGENT_PROFILE` whose file does not exist is refused outright. The
 SEP-43 sign-only pair (`signTransaction`, `signAuthEntry`) runs the same
 pre-flight and records an `opaque_payload_signed` row when the signature is
-produced.
+produced. The row carries the allowed payment legs. An auth entry has no
+approval flow: an approval requirement of its tool rule or of the pay rule
+refuses with `policy.approval_required_unsupported`.
 
 ### `audit verify` command reference
 
