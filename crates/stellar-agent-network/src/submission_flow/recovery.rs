@@ -38,6 +38,13 @@ pub(crate) struct RepairRefused {
 }
 
 impl RepairRefused {
+    /// Whether the exact decision, or the read that selects it, refused repair.
+    pub(crate) fn includes(&self, decision: CommitId) -> bool {
+        self.refused
+            .iter()
+            .any(|(commit, _)| commit.is_none_or(|commit| commit == decision))
+    }
+
     /// The first refusal's stable code.
     pub(crate) fn code(&self) -> &'static str {
         self.refused
@@ -274,6 +281,8 @@ pub(crate) mod tests {
     const T0: u64 = 1_800_000_000_000;
     /// The source account every [`Fx`] binding names.
     const SOURCE: &str = "GAAQEAYEAUDAOCAJBIFQYDIOB4IBCEQTCQKRMFYYDENBWHA5DYPSABGM";
+
+    mod progress;
 
     type ReplacementHook = Box<dyn FnMut() -> Result<(), WalletError>>;
 
@@ -1063,11 +1072,15 @@ pub(crate) mod tests {
         assert_eq!(rig.receipt(1), Some(expected_receipt.clone()));
         rig.reopen();
         assert!(!rig.projected(1), "the marker stays unset");
+        let progress = crate::policy_state::operations::tests::progress::progress(&rig.fx, 1);
+        assert!(progress.projection_pending && !progress.retry_eligible);
 
         let bytes = rig.receipt_bytes();
         rig.repair(None).unwrap();
         assert!(rig.projected(1));
         assert_eq!(rig.receipt_bytes(), bytes, "no second receipt write");
+        let progress = crate::policy_state::operations::tests::progress::progress(&rig.fx, 1);
+        assert!(progress.retry_eligible && !progress.projection_pending);
         assert_eq!(rig.receipt(1), Some(expected_receipt));
         assert_linked(&rig.receipt(1).unwrap(), 1, 101, commit);
         let (after, _) = accounting_state(&rig.fx.store, &rig.fx.profile);
@@ -1163,6 +1176,12 @@ pub(crate) mod tests {
         for _ in 0..2 {
             rig.repair(None).unwrap();
             assert_eq!(rig.window_bytes(), window, "the window bytes stay");
+            for n in 1..=3 {
+                let progress =
+                    crate::policy_state::operations::tests::progress::progress(&rig.fx, n);
+                assert!(!progress.projection_pending);
+                assert_eq!(progress.retry_eligible, n == 3);
+            }
             assert_eq!(accounting_state(&rig.fx.store, &rig.fx.profile), state);
             assert_eq!(rig.receipt_bytes(), receipts);
             assert_eq!(rig.audit_bytes(), audit);
@@ -1232,6 +1251,12 @@ pub(crate) mod tests {
         historical_without(&mut rig.fx, 1, Checked::NotIncluded, "submission_ledger");
         let (later, commit) = commit_checked(&mut rig.fx, 2, Checked::NotIncluded);
         let error = rig.repair(None).unwrap_err();
+        let progress = crate::policy_state::operations::tests::progress::progress(&rig.fx, 1);
+        assert_eq!(
+            progress.projection_missing_fact.as_deref(),
+            Some("submission_ledger")
+        );
+        assert!(progress.projection_pending && !progress.retry_eligible);
         assert!(
             error
                 .to_string()
@@ -1285,6 +1310,9 @@ pub(crate) mod tests {
             let (handle, _) = historical_without(&mut rig.fx, 1, checked, field);
             let decision = rig.decision(1);
             assert_eq!(decision.missing_projection_fact.as_deref(), Some(field));
+            let progress = crate::policy_state::operations::tests::progress::progress(&rig.fx, 1);
+            assert_eq!(progress.projection_missing_fact.as_deref(), Some(field));
+            assert!(progress.projection_pending);
             let window = rig.window_bytes();
             let receipts = rig.receipt_bytes();
             let error = rig.repair(None).unwrap_err();
@@ -2009,6 +2037,14 @@ pub(crate) mod tests {
         assert_eq!(answer.record, None);
         assert_eq!(answer.reservation, None);
         assert!(!answer.reservation_open);
+        let progress = answer.progress.as_ref().unwrap();
+        assert!(progress.projection_pending);
+        assert!(!progress.retry_eligible);
+        assert_eq!(
+            progress.retry_refusal.as_deref(),
+            Some("recovery.retry_refused")
+        );
+        assert_eq!(progress.projection_missing_fact, None);
         let log = capture.captured_str();
         assert!(
             log.contains("checked receipt repair refused")
@@ -2914,6 +2950,79 @@ pub(crate) mod tests {
             assert!(owed(&rig).is_empty());
         }
 
+        #[tokio::test]
+        #[serial]
+        async fn recovery_schedule_ages_pair_before_second_release() {
+            let (mut rig, _guard, _home) = homed();
+            let first = x402_exposed(&mut rig.fx, 1, OperationState::SentOutcomeUnknown);
+            let second = x402_exposed(&mut rig.fx, 2, OperationState::SentOutcomeUnknown);
+            let due = pair((501, CLOSE), (501, CLOSE)).await;
+            let armed = on_release(|index, deadline| {
+                if index == 1 {
+                    std::thread::sleep(std::time::Duration::from_millis(5_100));
+                    assert!(
+                        tokio::time::Instant::now() < *deadline,
+                        "pair ages before the call deadline"
+                    );
+                }
+            });
+            let (pass, edges) = dispatch_on(&rig, &due).await;
+            drop(armed);
+            let ReconcilePass::RecoveryFailed { recovery, .. } = pass else {
+                panic!("stale pair stops before the second release: {pass:?}");
+            };
+            assert_eq!(
+                recovery.missing.map(|missing| missing.reason),
+                Some(RecoveryReason::Lagging)
+            );
+            assert_eq!(edges, vec![(first.id(), OperationState::Expired)]);
+            assert_eq!(owed(&rig), vec![second.id()]);
+            let (_, edges) = dispatch_on(&rig, &due).await;
+            assert_eq!(edges, vec![(second.id(), OperationState::Expired)]);
+            assert!(owed(&rig).is_empty());
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn recovery_progress_writer_is_unlocked_during_rpc() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            use wiremock::Respond;
+            let (mut rig, _guard, _home) = homed();
+            unknown_due(&mut rig.fx, 1);
+            let endpoints = pair((501, CLOSE), (501, CLOSE)).await;
+            let locked = Arc::new(AtomicUsize::new(0));
+            let reads = Arc::new(AtomicUsize::new(0));
+            for (server, _) in &endpoints {
+                let writer = Arc::clone(&rig.writer);
+                let locked = Arc::clone(&locked);
+                let reads = Arc::clone(&reads);
+                Mock::given(method("POST"))
+                    .and(body_partial_json(json!({"method": "getHealth"})))
+                    .respond_with(move |request: &wiremock::Request| {
+                        reads.fetch_add(1, Ordering::SeqCst);
+                        if writer.try_lock().is_err() {
+                            locked.fetch_add(1, Ordering::SeqCst);
+                            return wiremock::ResponseTemplate::new(500);
+                        }
+                        EchoIdResponder::new(json!({"status":"healthy", "latestLedger":501,
+                            "oldestLedger":1, "ledgerRetentionWindow":501,
+                            "latestLedgerCloseTime":CLOSE, "oldestLedgerCloseTime":1}))
+                        .respond(request)
+                    })
+                    .with_priority(1)
+                    .mount(server)
+                    .await;
+            }
+            let answer = status_on(&rig, 1, &endpoints).await;
+            assert_eq!(
+                locked.load(Ordering::SeqCst),
+                0,
+                "RPC awaits hold no writer mutex"
+            );
+            assert_eq!(reads.load(Ordering::SeqCst), 2);
+            assert!(answer.progress.is_some());
+        }
+
         /// A fault inside a release commit selects the complete old or the
         /// complete new unit, and the repeated pass completes each release
         /// exactly once. A later release's refusal keeps the earlier
@@ -3013,8 +3122,25 @@ pub(crate) mod tests {
             let x402 = x402_exposed(&mut rig.fx, 5, OperationState::SentOutcomeUnknown);
             terminal_classic(&mut rig.fx, 6, CLOSE - 10);
             let untimed = terminal_classic(&mut rig.fx, 7, 0);
+            let native_before =
+                crate::policy_state::operations::tests::progress::fill_native_capacity(&mut rig.fx);
+            let full = rig.window_bytes();
+            let view = crate::policy_state::operations::tests::progress::progress(&rig.fx, 1);
+            assert!(view.outcome_recoverable && !view.retry_eligible);
+            assert_eq!(
+                rig.window_bytes(),
+                full,
+                "progress does not free or reserve capacity"
+            );
             let due = pair((501, CLOSE), (501, CLOSE)).await;
             let (_, edges) = dispatch_on(&rig, &due).await;
+            assert_eq!(
+                OperationStatus::new(&rig.fx.store, &rig.fx.profile)
+                    .native_reserved_stroops(None)
+                    .unwrap(),
+                native_before - 60,
+                "only the two proved obligations free native capacity"
+            );
             assert_eq!(edges, vec![(x402.id(), OperationState::Expired)]);
             assert_eq!(owed(&rig), vec![untimed.id()]);
             for (server, _) in &due {
