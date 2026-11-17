@@ -354,6 +354,7 @@ The commit tool's rule is binding, so the example carries the criterion on both 
 The threshold applies to its configured asset.
 A payment in another asset passes it, as it passes `per_tx_cap`.
 Single-shot tools and multicall refuse an escalation with their existing approval-required refusal.
+The SEP-43 transaction tools carry the escalation of a single payment, path payment, account creation or trustline change to a pending approval.
 A bundle is sized per inner transfer.
 
 These payment rules allow up to 500 XLM without approval, request approval
@@ -595,8 +596,13 @@ Both SEP-43 transaction tools decide each payment the transaction authorizes
 under the rule of its payment tool, after the tool's own rule allows. They
 charge the policy windows for that usage before the signer loads; a later
 signer, signing or send failure keeps the charge. Effects the wallet cannot
-value need `allow_opaque_signing = true` on the tool's own rule. Account
-merges and signer or threshold changes always refuse. See
+value need `allow_opaque_signing = true` on the tool's own rule. A wallet
+payment to itself is a payment. A claimable balance counts only claimants
+other than its source and the wallet. A wallet merge and a signer or
+threshold change always refuse; another account's merge into the wallet has
+no value effect. An approval requirement of one payment, path payment,
+account creation or trustline change returns a pending approval, and the
+attested repeat signs and spends it. See
 [the MCP guide](./mcp.md#sep-43-transaction-effects).
 
 ## Emergency stop
