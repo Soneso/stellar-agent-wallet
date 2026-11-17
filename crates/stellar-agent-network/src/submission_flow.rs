@@ -706,6 +706,7 @@ async fn reconcile_stages(
         committed,
     )
     .await;
+    release_ended_after_recovery(window, profile);
     let mut recovery_report = match &sequences {
         Ok(report) => report.clone(),
         Err(error) => error.report().cloned().unwrap_or_else(|| {
@@ -845,6 +846,22 @@ fn expire_due_operations(
     }
     drop(guard);
     Ok(writer)
+}
+
+/// Releases the consent evidence of records a recovery pass ended, after the
+/// pass returns and outside the window lock. A failure leaves the evidence
+/// for the next admission, recovery or revocation and changes no outcome.
+fn release_ended_after_recovery(window: &PersistedWindowStore, profile: &Profile) {
+    #[cfg(test)]
+    RECOVERY_STAGE_TRACE.with_borrow_mut(|trace| trace.push("release"));
+    if let Err(error) =
+        crate::policy_state::approvals::consent_evidence_maintenance(window, profile)
+    {
+        tracing::warn!(
+            code = error.code(),
+            "consent evidence: release after recovery failed; a later sweep retries it"
+        );
+    }
 }
 
 /// Inputs for reconciling and displaying one transaction.
@@ -1139,7 +1156,7 @@ pub async fn transaction_status_committed(
         )
         .map_err(StatusFailure::WindowUnreadable)?;
         if let Some(handle) = writer.handle() {
-            match crate::policy_state::recovery::recover_outcomes_committed(
+            let recovered = crate::policy_state::recovery::recover_outcomes_committed(
                 window,
                 profile,
                 crate::policy_state::EndpointPair::from_clients(client, oracle),
@@ -1148,8 +1165,9 @@ pub async fn transaction_status_committed(
                 retry_recovery,
                 committed,
             )
-            .await
-            {
+            .await;
+            release_ended_after_recovery(window, profile);
+            match recovered {
                 Ok(report) => {
                     sequences = if report.missing.is_some() {
                         "evidence missing"

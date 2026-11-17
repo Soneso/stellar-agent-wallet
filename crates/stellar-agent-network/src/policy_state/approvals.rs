@@ -22,7 +22,7 @@ use stellar_agent_core::approval::{
     },
 };
 use stellar_agent_core::audit_log::{
-    AuditOutbox, EvidenceReservation, OutboxRowRef, PolicyDecision, WriterError,
+    AuditOutbox, BindingCheck, EvidenceReservation, OutboxRowRef, PolicyDecision, WriterError,
     audit_writer_refusal,
 };
 use stellar_agent_core::policy::state_lock::WindowStoreLock;
@@ -1262,6 +1262,218 @@ pub fn require_consent_evidence_time(
     Ok(())
 }
 
+/// Whether `profile` enforces delivery for any approval kind.
+fn enforces_any_kind(profile: &str) -> bool {
+    [
+        ApprovedKind::Payment,
+        ApprovedKind::Claim,
+        ApprovedKind::Trustline,
+        ApprovedKind::X402Payment,
+    ]
+    .into_iter()
+    .any(|kind| delivery_enforced(profile, kind))
+}
+
+/// The keyed outbox of `profile`'s audit log, which holds its consent evidence.
+///
+/// # Errors
+/// The refusals of [`crate::keyring::keyed_audit_access`].
+pub fn consent_evidence_outbox(
+    profile: &Profile,
+    profile_name: &str,
+    binding: BindingCheck,
+) -> Result<AuditOutbox, WalletError> {
+    let (key, anchor) =
+        crate::keyring::keyed_audit_access(profile, profile_name, binding)?.into_parts();
+    Ok(AuditOutbox::for_log_keyed(
+        &profile.audit_log_path,
+        anchor,
+        key,
+    ))
+}
+
+/// Reads the persistent evidence floor of `profile`'s owner scope through a
+/// keyed outbox built for this call. An absent owner reads as zero.
+///
+/// The read takes the outbox carrier, no audit writer and no window lock,
+/// and nothing caches its result.
+///
+/// # Errors
+/// The refusals of [`consent_evidence_outbox`] and of
+/// [`AuditOutbox::evidence_time_floor`], including orphan slots and a rotation fence.
+pub fn consent_evidence_time_floor(
+    profile: &Profile,
+    profile_name: &str,
+) -> Result<u64, WalletError> {
+    consent_evidence_outbox(profile, profile_name, BindingCheck::CheckOnly)?
+        .evidence_time_floor()
+        .map_err(|error| audit_writer_refusal(profile_name, &error))
+}
+
+/// The time an Approval decision on `nonce` uses on the authenticated
+/// `wire`: the greater of `now` and a fresh evidence floor when the record's
+/// kind enforces delivery, and `now` otherwise.
+///
+/// A floor that cannot be read refuses as a storage error, which the
+/// authorization interface reports as `StoreUnavailable`, never as expiry.
+/// It logs a warning with the evidence failure's code first.
+pub(super) fn decision_time(
+    wire: &WireFile,
+    profile: &Profile,
+    nonce: &str,
+    now: u64,
+) -> Result<u64, WindowStoreError> {
+    let name = profile_name_for_approval(profile);
+    if !records(wire)
+        .iter()
+        .any(|r| r.nonce == nonce && delivery_enforced(&name, r.kind))
+    {
+        return Ok(now);
+    }
+    consent_evidence_time_floor(profile, &name)
+        .map(|floor| now.max(floor))
+        .inspect_err(|error| {
+            tracing::warn!(
+                code = error.code(),
+                "consent evidence: the floor read failed; the decision refuses as a storage error"
+            );
+        })
+        .map_err(|error| WindowStoreError::Keyring {
+            detail: format!(
+                "the consent evidence floor is unavailable ({})",
+                error.code()
+            ),
+        })
+}
+
+#[cfg(feature = "mainnet-write")]
+impl PersistedWindowStore {
+    /// [`decision_time`] on the authenticated image of `profile`. The image
+    /// is read only when one of the profile's kinds enforces delivery.
+    pub(crate) fn approval_decision_time(
+        &self,
+        profile: &Profile,
+        nonce: &str,
+        now: u64,
+    ) -> Result<u64, WindowStoreError> {
+        let name = profile_name_for_approval(profile);
+        if !enforces_any_kind(&name) {
+            return Ok(now);
+        }
+        match self.read_for_inspection(profile)? {
+            Some(wire) => decision_time(&wire, profile, nonce, now),
+            None => Ok(now),
+        }
+    }
+}
+
+/// Whether the authenticated `wire` holds the operation `id` in a terminal
+/// state or as a tombstone. NotIncluded is not terminal.
+fn operation_ended(wire: &WireFile, id: OperationId) -> bool {
+    wire.operations.as_ref().is_some_and(|s| {
+        s.records
+            .iter()
+            .any(|op| op.id == id && op.state.is_terminal())
+            || s.tombstones.iter().any(|op| op.id == id)
+    })
+}
+
+/// Whether committed revocation or the end of the linked operation ends
+/// `record` on `wire`. Consumption alone never ends it.
+fn record_ended(wire: &WireFile, record: &WireApproval) -> bool {
+    record.state == ApprovalState::Revoked || operation_ended(wire, record.operation_id)
+}
+
+/// Releases the consent evidence of the approval record `id` of `profile`.
+///
+/// The raw authenticated image, read without pruning, must hold the record
+/// with committed revocation, or with its linked operation terminal or
+/// tombstoned. Consumption, NotIncluded and a missing record never release.
+/// Call this after the window transaction ends: a failed
+/// release leaves the committed revocation or outcome in place, and a later
+/// call retries it.
+///
+/// # Errors
+/// `internal.unexpected_state` for an absent or live record,
+/// `submission.record_unavailable` for store failures, and the refusals of
+/// [`AuditOutbox::release_evidence`].
+pub fn release_ended_consent_evidence(
+    store: &PersistedWindowStore,
+    profile: &Profile,
+    outbox: &AuditOutbox,
+    id: [u8; 32],
+) -> Result<(), WalletError> {
+    let refusal = crate::operation_entry::operation_refusal;
+    let wire = store
+        .read_for_inspection(profile)
+        .map_err(refusal)?
+        .unwrap_or_default();
+    if !records(&wire)
+        .iter()
+        .any(|r| r.id == id && record_ended(&wire, r))
+    {
+        return Err(refusal(unexpected("the approval record has not ended")));
+    }
+    outbox
+        .release_evidence(id)
+        .map_err(|error| audit_writer_refusal(&profile_name_for_approval(profile), &error))
+}
+
+/// Releases the evidence of every retained record of `profile` that has
+/// ended, as [`release_ended_consent_evidence`] decides, and that `outbox`
+/// holds. Returns the number released.
+///
+/// The window image and the evidence are each read once, and no carrier is
+/// held while the records are enumerated. Evidence without a retained
+/// record stays until the persistent floor passes its deadline.
+///
+/// # Errors
+/// The store refusals of [`release_ended_consent_evidence`] and the evidence
+/// refusals of [`AuditOutbox::evidence`] and [`AuditOutbox::release_evidence`].
+pub fn sweep_ended_consent_evidence(
+    store: &PersistedWindowStore,
+    profile: &Profile,
+    outbox: &AuditOutbox,
+) -> Result<usize, WalletError> {
+    let name = profile_name_for_approval(profile);
+    let evidence_refusal = |error: WriterError| audit_writer_refusal(&name, &error);
+    let wire = store
+        .read_for_inspection(profile)
+        .map_err(crate::operation_entry::operation_refusal)?
+        .unwrap_or_default();
+    let Some(evidence) = outbox.evidence().map_err(evidence_refusal)? else {
+        return Ok(0);
+    };
+    let ended: Vec<[u8; 32]> = records(&wire)
+        .iter()
+        .filter(|r| record_ended(&wire, r) && evidence.holds_record(&r.id))
+        .map(|r| r.id)
+        .collect();
+    for id in &ended {
+        outbox.release_evidence(*id).map_err(evidence_refusal)?;
+    }
+    Ok(ended.len())
+}
+
+/// Runs [`sweep_ended_consent_evidence`] over `profile`'s keyed outbox when
+/// one of its kinds enforces delivery. Otherwise it reads nothing and
+/// returns zero.
+///
+/// # Errors
+/// The refusals of [`consent_evidence_outbox`] and
+/// [`sweep_ended_consent_evidence`].
+pub fn consent_evidence_maintenance(
+    store: &PersistedWindowStore,
+    profile: &Profile,
+) -> Result<usize, WalletError> {
+    let name = profile_name_for_approval(profile);
+    if !enforces_any_kind(&name) {
+        return Ok(0);
+    }
+    let outbox = consent_evidence_outbox(profile, &name, BindingCheck::Enforce)?;
+    sweep_ended_consent_evidence(store, profile, &outbox)
+}
+
 impl<'a> ApprovalStatus<'a> {
     /// Reads the profile's authenticated approval section.
     #[must_use]
@@ -1415,12 +1627,7 @@ impl<'a> ApprovalStatus<'a> {
                 >= consent
                     .execution_expires_at_ms
                     .min(witness.execution_expires_at_ms())
-            || wire.operations.as_ref().is_some_and(|s| {
-                s.records
-                    .iter()
-                    .any(|op| op.id == record.operation_id && op.state.is_terminal())
-                    || s.tombstones.iter().any(|op| op.id == record.operation_id)
-            });
+            || operation_ended(&wire, record.operation_id);
         if ended {
             return Ok(VerifiedConsentDelivery::Ended {
                 identity: record.id,
@@ -1584,6 +1791,8 @@ pub(super) fn consume(
 mod admission_tests;
 #[cfg(test)]
 pub(crate) mod durable_tests;
+#[cfg(test)]
+pub(crate) mod lifecycle_tests;
 
 #[cfg(test)]
 pub(in crate::policy_state) mod tests {
@@ -2990,6 +3199,10 @@ pub(in crate::policy_state) mod tests {
             let mut fx = Fx::new(300_000);
             let _enabled =
                 ConsentEvidenceEnforcementGuard::new(fx.fixture.name(), ApprovedKind::Payment);
+            // An enforced mint reads the evidence floor of the profile's keyed
+            // audit log, which integrated admission always initializes.
+            let _evidence =
+                super::lifecycle_tests::keyed_evidence(fx.fixture.profile(), fx.fixture.name());
             fx.open();
             let reference = fx.reference("retry-delivery.log");
             fx.delivery(ConsentProvenance::Queued, Some(reference))

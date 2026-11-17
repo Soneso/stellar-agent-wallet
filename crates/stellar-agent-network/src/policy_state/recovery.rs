@@ -5746,7 +5746,7 @@ mod tests {
         );
         assert_eq!(fx.receipts.get(&hold.id).unwrap(), receipt);
         crate::submission_flow::RECOVERY_STAGE_TRACE
-            .with_borrow(|trace| assert_eq!(trace, &["expire", "legacy", "recovery"]));
+            .with_borrow(|trace| assert_eq!(trace, &["expire", "legacy", "recovery", "release"]));
     }
 
     /// The methods `server` receives, in order.
@@ -5994,7 +5994,7 @@ mod tests {
         assert_eq!(actual.rpc_calls, 0);
         assert_eq!(calls.get(), 1);
         crate::submission_flow::RECOVERY_STAGE_TRACE
-            .with_borrow(|trace| assert_eq!(trace, &["expire", "legacy", "recovery"]));
+            .with_borrow(|trace| assert_eq!(trace, &["expire", "legacy", "recovery", "release"]));
     }
 
     #[cfg(feature = "mainnet-write")]
@@ -6032,6 +6032,7 @@ mod tests {
         let receipt_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let home = receipt_sandbox.path();
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home);
+        crate::submission_flow::RECOVERY_STAGE_TRACE.with_borrow_mut(Vec::clear);
         let result = crate::submission_flow::transaction_status(
             crate::submission_flow::StatusRequest {
                 profile: &fx.profile,
@@ -6068,6 +6069,13 @@ mod tests {
         );
         assert_eq!(rpc_request_count(&primary, "getLedgers").await, 1);
         assert_eq!(rpc_request_count(&oracle, "getLedgers").await, 1);
+        crate::submission_flow::RECOVERY_STAGE_TRACE.with_borrow(|trace| {
+            assert_eq!(
+                trace,
+                &["release"],
+                "the targeted pass ends with one release sweep"
+            )
+        });
     }
 
     /// Records one owed accounting expiry, so the drain needs the audit
