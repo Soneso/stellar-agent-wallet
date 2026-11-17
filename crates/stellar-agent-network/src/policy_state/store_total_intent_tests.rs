@@ -910,6 +910,7 @@ fn intent_total_old_non_total_lifecycle() {
         let proof = admitted.unwrap();
         let mut wire = f.wire();
         wire.version = version;
+        strip_native_coverage_for_test(&mut wire);
         let bytes = serde_json::to_string(&wire.signed_intents).unwrap();
         assert!(!bytes.contains("epoch"));
         f.store.seal_unchecked_for_test(&f.profile, &wire);
@@ -1041,11 +1042,12 @@ fn intent_total_version_floor_and_reader() {
         .admit_signed_intent(&f.profile, &total_plan(1, &[f.total(6, D1)]))
         .unwrap();
     let wire = f.wire();
-    assert_eq!(wire.version, 16);
+    assert_eq!(wire.version, WIRE_VERSION_NATIVE_COVERAGE);
     for prepared in [false, true] {
         let mut image = wire.clone();
         if prepared {
             image.version = 15;
+            strip_native_coverage_for_test(&mut image);
             image.signed_intents.clear();
             let mut next = wire.clone();
             next.generation += 1;
@@ -1062,7 +1064,7 @@ fn intent_total_version_floor_and_reader() {
     }
     f.store.seal_unchecked_for_test(&f.profile, &wire);
     f.store.cancel_signed_intent(&f.profile, proof).unwrap();
-    assert_eq!(f.wire().version, 16);
+    assert_eq!(f.wire().version, WIRE_VERSION_NATIVE_COVERAGE);
     assert!(f.wire().signed_intents.is_empty());
     for version in [12, 13] {
         let g = fx("intent-upgrade");
@@ -1073,7 +1075,7 @@ fn intent_total_version_floor_and_reader() {
         g.push_row(&mut old, 6, Some(D1));
         g.store.seal_unchecked_for_test(&g.profile, &old);
         g.authorized(&[g.total(0, D1)]).unwrap();
-        assert_eq!(g.wire().version, 15);
+        assert_eq!(g.wire().version, WIRE_VERSION_NATIVE_COVERAGE);
         assert_eq!(g.wire().retired_total_epoch, None);
         assert_eq!(g.sum(D1), 6);
     }

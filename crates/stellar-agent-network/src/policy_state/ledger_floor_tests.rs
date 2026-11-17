@@ -8,6 +8,17 @@ fn floor_seen() -> super::super::operations::WindowObservation {
     }
 }
 
+/// Commits the first write of `l` early enough that the native coverage
+/// marker it establishes covers [`floor_seen`] and every observation
+/// [`super::super::accounting::CheckedFloor::for_test`] builds within the
+/// 120 s age bound at `T0`, then returns the clock to `T0`.
+fn cover(l: &Ledger) {
+    l.clock
+        .set(T0 - 125_000 - super::super::store::ESTABLISHMENT_ALLOWANCE_MS);
+    l.store.record_and_persist(&l.profile, &[]).unwrap();
+    l.clock.set(T0);
+}
+
 fn floor_sum(
     l: &Ledger,
     seen: Option<super::super::operations::WindowObservation>,
@@ -50,6 +61,7 @@ fn floor_projection_release_and_legacy_matrix() {
     let _storage_home =
         stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let l = Ledger::new();
+    cover(&l);
     let mut request = l.request(
         tx(1),
         vec![hold(25), hold_in("other", 25), hold_in("third", 25)],
@@ -125,6 +137,7 @@ fn floor_projection_release_and_legacy_matrix() {
         );
     }
     let l = Ledger::new();
+    cover(&l);
     l.mint(&l.request(message(1), vec![])).unwrap();
     assert_eq!(
         floor_sum(&l, Some(floor_seen())).unwrap(),
@@ -152,9 +165,14 @@ fn floor_projection_release_and_legacy_matrix() {
     );
     l.clock.set(T0 + 100 * 86_400_000);
     l.store.record_and_persist(&l.profile, &[]).unwrap();
-    assert!(
-        l.wire().authorizations.is_empty(),
-        "ended legacy records remain collectable"
+    assert_eq!(
+        l.wire()
+            .authorizations
+            .iter()
+            .map(|auth| auth.id)
+            .collect::<Vec<_>>(),
+        vec![legacy.id],
+        "released and valueless records are collected; the revoked value record has no release row and stays"
     );
 }
 
@@ -165,6 +183,7 @@ fn floor_numeric_and_ambiguous_zero_refuse_only_use() {
     let _storage_home =
         stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let l = Ledger::new();
+    cover(&l);
     for id in 1..=3 {
         let mut request = l.request(tx(id), vec![]);
         request.native_reservation = Some(NativeReservation {
@@ -188,6 +207,7 @@ fn floor_numeric_and_ambiguous_zero_refuse_only_use() {
         "several valid i64 records exceed u64"
     );
     let l = Ledger::new();
+    cover(&l);
     let mut request = l.request(
         DomainBinding::Soroban {
             intent_digest: [6; 32],
@@ -236,6 +256,7 @@ fn floor_locked_admission_rechecks_and_preserves_refusals() {
     let _storage_home =
         stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let l = Ledger::new();
+    cover(&l);
     let mut first = floor_request(&l, 1, T0, 100);
     first.holds.clear();
     l.mint(&first).unwrap();
@@ -339,6 +360,7 @@ fn two_process_floor_admission_is_serial() {
         return;
     }
     l.pin(7, [7; 32]);
+    cover(&l);
     l.store.record_and_persist(&l.profile, &[hold(0)]).unwrap();
     let child = composed::child_at_boundary(
         dir,
@@ -375,6 +397,7 @@ fn floor_mint_commit_crash_matrix() {
         let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
         let l = Ledger::new();
+        cover(&l);
         l.store.record_and_persist(&l.profile, &[hold(0)]).unwrap();
         let mut old = l.request(tx(9), vec![]);
         old.native_reservation = Some(NativeReservation {
@@ -436,9 +459,15 @@ fn floor_first_image_failure_never_reads_empty() {
     let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
     let l = Ledger::new();
     let request = floor_request(&l, 1, T0, 100);
+    assert!(
+        floor_unread(l.mint(&request)),
+        "a floor on the first image has no native coverage"
+    );
+    let mut first = request.clone();
+    first.floor = None;
     {
         let _fault = super::super::store::fail_store_writes();
-        assert!(matches!(l.mint(&request), Err(WindowStoreError::Io { .. })));
+        assert!(matches!(l.mint(&first), Err(WindowStoreError::Io { .. })));
     }
     for error in [
         floor_sum(&l, Some(floor_seen())).unwrap_err(),
@@ -466,6 +495,7 @@ fn floor_capacity_sweeps_only_provably_unused_entries() {
     let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
     let l = Ledger::new();
+    cover(&l);
     l.mint(&l.request(tx(1), vec![])).unwrap();
     l.clock.set(T0 + 1);
     for id in 2..=16 {
@@ -506,10 +536,13 @@ fn floor_capacity_sweeps_only_provably_unused_entries() {
 #[serial]
 fn floor_refusal_does_not_consume_durable_approval() {
     use super::super::approvals::{ApprovalState, tests::Fx};
-    let mut fx = Fx::new(300_000);
+    let mut fx = Fx::new(600_000);
     fx.open();
     fx.consent();
-    let now = fx.payload.receipt.verified_at_unix_ms();
+    let now = fx.payload.receipt.verified_at_unix_ms()
+        + super::super::store::ESTABLISHMENT_ALLOWANCE_MS
+        + 5_000;
+    fx.clock.set(now);
     let mut request = fx.mint_request();
     request.native_reservation = Some(NativeReservation {
         debit_stroops: 50,
@@ -551,6 +584,7 @@ fn floor_malformed_native_shape_refuses_every_read_and_mint() {
     let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
     let l = Ledger::new();
+    cover(&l);
     let minted = l.mint(&floor_request(&l, 1, T0, 100)).unwrap();
     let baseline = l.bytes();
     let key = crate::keyring::load_hmac_key_32(&l.profile.policy_window_state_key_id).unwrap();
@@ -559,6 +593,7 @@ fn floor_malformed_native_shape_refuses_every_read_and_mint() {
         "missing fee",
         "missing debit",
         "unknown",
+        "unknown marker field",
         "version",
     ] {
         let mut value: serde_json::Value = serde_json::from_slice(&baseline[32..]).unwrap();
@@ -582,6 +617,9 @@ fn floor_malformed_native_shape_refuses_every_read_and_mint() {
             }
             "unknown" => {
                 value["authorizations"][0]["native_reservation"]["extra"] = serde_json::json!(0);
+            }
+            "unknown marker field" => {
+                value["native_coverage"]["extra"] = serde_json::json!(0);
             }
             "version" => {
                 value["version"] = serde_json::json!(super::super::store::WIRE_VERSION_MAX + 1);
@@ -653,6 +691,7 @@ fn two_process_floor_removal_keeps_coverage() {
         return;
     }
     l.pin(7, [7; 32]);
+    cover(&l);
     let mut request = floor_request(&l, 1, T0, 200);
     request.holds.clear();
     let minted = l.mint(&request).unwrap();
@@ -698,26 +737,336 @@ fn two_process_floor_removal_keeps_coverage() {
     assert_eq!(l.wire().admissible_floor_ledger, Some(101));
 }
 
-#[test]
-#[serial]
-fn floor_unlinked_retention_is_not_history_coverage() {
-    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
-    let l = Ledger::new();
-    let mut request = floor_request(&l, 1, T0, 100);
-    request.holds.clear();
+const DAY_MS: u64 = 86_400_000;
+
+/// A used, unlinked authorization reserving 50 native stroops.
+fn used_native(l: &Ledger, id: u8) -> (MintRequest, MintedRecord) {
+    let mut request = l.request(tx(id), vec![]);
+    request.native_reservation = Some(NativeReservation {
+        debit_stroops: 50,
+        fee_stroops: 0,
+    });
     let minted = l.mint(&request).unwrap();
     l.claim(&request, &minted).unwrap();
     l.consume(&request, &minted, &consumption_of(&request.binding))
         .unwrap();
+    (request, minted)
+}
+
+fn retains(l: &Ledger, id: AuthorizationId) -> bool {
+    l.wire().authorizations.iter().any(|auth| auth.id == id)
+}
+
+/// A balance observation `close_time_floor_ms` closes at, read 5 s later.
+fn seen_at_close(close_time_floor_ms: u64) -> super::super::operations::WindowObservation {
+    super::super::operations::WindowObservation {
+        ledger: 100,
+        close_time_floor_ms,
+        observed_at_ms: close_time_floor_ms + 5_000,
+    }
+}
+
+#[test]
+#[serial]
+fn floor_unreleased_history_is_retained() {
+    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+    let l = Ledger::new();
+    cover(&l);
+    let (_, minted) = used_native(&l, 1);
     assert_eq!(floor_sum(&l, Some(floor_seen())).unwrap(), 50);
-    l.clock.set(T0 + 100 * 86_400_000);
+    for at in [T0 + 100 * DAY_MS, T0 + 200 * DAY_MS, T0 + 1_000] {
+        l.clock.set(at);
+        l.store.record_and_persist(&l.profile, &[]).unwrap();
+        assert!(
+            retains(&l, minted.id),
+            "an unreleased value row stays whatever its link, age or clock: {at}"
+        );
+        assert_eq!(
+            floor_sum(&l, Some(floor_seen())).unwrap(),
+            50,
+            "the retained obligation still counts at {at}"
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn legacy_unlinked_rows_refuse_floor_use_forever() {
+    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+    let l = Ledger::new();
+    let request = l.request(tx(1), vec![]);
+    let minted = l.mint(&request).unwrap();
+    l.claim(&request, &minted).unwrap();
+    let mut legacy = l.wire();
+    legacy.version = super::super::store::WIRE_VERSION_POLICY_AUTHORITY;
+    legacy.native_coverage = None;
+    legacy.admissible_floor_close_time_ms = None;
+    seal_floor(&l, legacy);
     l.store.record_and_persist(&l.profile, &[]).unwrap();
     assert!(
-        l.wire()
-            .authorizations
-            .iter()
-            .all(|auth| auth.id != minted.id),
-        "unlinked history can leave retention; this image cannot establish complete exposure"
+        l.wire().native_coverage.is_some(),
+        "the upgrade write establishes the marker"
+    );
+    let covered = seen_at_close(l.wire().admissible_floor_close_time_ms.unwrap());
+    assert!(
+        floor_unread(floor_sum(&l, Some(covered))),
+        "a claimed row without amounts refuses floor use after establishment"
+    );
+    // The first write settles the claim as expired; the second lies past
+    // the retention window of that settlement.
+    for at in [T0 + 100 * DAY_MS, T0 + 110 * DAY_MS] {
+        l.clock.set(at);
+        l.store.record_and_persist(&l.profile, &[]).unwrap();
+    }
+    assert!(
+        retains(&l, minted.id),
+        "a legacy claimed unlinked row stays after 110 days"
+    );
+    let covered = seen_at_close(l.wire().admissible_floor_close_time_ms.unwrap());
+    assert!(
+        floor_unread(floor_sum(&l, Some(covered))),
+        "a legacy claimed unlinked row refuses floor use after 100 days"
+    );
+}
+
+#[test]
+#[serial]
+fn native_coverage_writes_version_18_and_older_max_refuses() {
+    use super::super::store::{
+        DESTINATION_READER_CAP, WIRE_VERSION_CANONICAL_LINEAGE, WIRE_VERSION_NATIVE_COVERAGE,
+    };
+    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+    let l = Ledger::new();
+    let written = l.mint(&l.request(tx(1), vec![]));
+    assert!(
+        written.is_ok(),
+        "a marker write selects its version: {written:?}"
+    );
+    let wire = l.wire();
+    assert!(wire.native_coverage.is_some());
+    assert_eq!(wire.version, WIRE_VERSION_NATIVE_COVERAGE);
+    assert_eq!(WIRE_VERSION_NATIVE_COVERAGE, 18);
+    let bytes = l.bytes();
+    DESTINATION_READER_CAP.set(Some(WIRE_VERSION_CANONICAL_LINEAGE));
+    let read = l.store.read_for_inspection(&l.profile).map(|_| ());
+    let mint = l.mint(&l.request(tx(2), vec![])).map(|_| ());
+    DESTINATION_READER_CAP.set(None);
+    for result in [read, mint] {
+        assert!(
+            matches!(result, Err(WindowStoreError::UnsupportedVersion)),
+            "a reader capped at 17 refuses a covered file: {result:?}"
+        );
+    }
+    assert_eq!(l.bytes(), bytes, "a capped reader never rewrites it");
+}
+
+#[test]
+#[serial]
+fn native_coverage_below_version_18_is_invalid() {
+    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+    let l = Ledger::new();
+    let minted = l.mint(&l.request(tx(1), vec![])).unwrap();
+    let mut wire = l.wire();
+    wire.version = super::super::store::WIRE_VERSION_CANONICAL_LINEAGE;
+    seal_floor(&l, wire);
+    let bytes = l.bytes();
+    let results = [
+        l.store.read_for_inspection(&l.profile).map(|_| ()),
+        floor_sum(&l, Some(floor_seen())).map(|_| ()),
+        l.store.open_authorizations(&l.profile, T0).map(|_| ()),
+        l.mint(&l.request(tx(2), vec![])).map(|_| ()),
+        l.store
+            .invalidate_authorization(&l.profile, minted.id, "unused")
+            .map(|_| ()),
+    ];
+    for result in results {
+        assert!(
+            matches!(&result, Err(error) if malformed_floor(error)),
+            "a marker below version 18 is invalid: {result:?}"
+        );
+    }
+    assert_eq!(l.bytes(), bytes, "an invalid marker is never rewritten");
+}
+
+#[test]
+#[serial]
+fn reset_keeps_unreleased_native_rows() {
+    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+    let l = Ledger::new();
+    let (_, kept) = used_native(&l, 1);
+    let (_, bounded) = used_native(&l, 2);
+    let mut wire = l.wire();
+    wire.authorizations
+        .iter_mut()
+        .find(|auth| auth.id == bounded.id)
+        .unwrap()
+        .native_release = Some(ReleaseRow {
+        class: ReleaseClass::Settled,
+        bound: super::super::operations::ReleaseBound::Ledger(101),
+        observed_ledger: Some(101),
+        commit_id: CommitId::random(),
+    });
+    seal_floor(&l, wire);
+    let ended = T0 + APPROVAL_MS + 1;
+    l.clock.set(ended);
+    l.reset(ended).unwrap();
+    assert!(
+        retains(&l, kept.id),
+        "an unreleased value row survives a reset past its authority end"
+    );
+    assert!(!retains(&l, bounded.id), "a released ended row leaves");
+    assert_eq!(
+        l.wire().admissible_floor_ledger,
+        Some(101),
+        "the dropped bounded row raises the ledger floor"
+    );
+}
+
+#[test]
+#[serial]
+fn reset_carries_floors_and_marker() {
+    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+    let l = Ledger::new();
+    l.mint(&l.request(tx(1), vec![])).unwrap();
+    let mut wire = l.wire();
+    let marker = wire.native_coverage;
+    assert!(marker.is_some());
+    wire.admissible_floor_ledger = Some(200);
+    wire.admissible_floor_close_time_ms = Some(T0 + 900_000);
+    seal_floor(&l, wire);
+    let ended = T0 + APPROVAL_MS + 1;
+    l.clock.set(ended);
+    l.reset(ended).unwrap();
+    let after = l.wire();
+    assert_eq!(after.native_coverage, marker, "the successor keeps the marker");
+    assert_eq!(after.admissible_floor_ledger, Some(200));
+    assert_eq!(after.admissible_floor_close_time_ms, Some(T0 + 900_000));
+}
+
+#[test]
+#[serial]
+fn removal_of_unreleased_row_clears_marker() {
+    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+    let l = Ledger::new();
+    let (_, minted) = used_native(&l, 1);
+    let note = l.mint(&l.request(message(1), vec![])).unwrap();
+    let mut wire = l.wire();
+    assert!(wire.native_coverage.is_some());
+    super::super::operations::remove_authorizations(&mut wire, |auth| auth.id == note.id);
+    assert!(
+        wire.native_coverage.is_some(),
+        "a row without native effect leaves the marker"
+    );
+    super::super::operations::remove_authorizations(&mut wire, |auth| auth.id == minted.id);
+    assert_eq!(
+        wire.native_coverage, None,
+        "removing an unreleased value row clears the marker"
+    );
+    seal_floor(&l, wire);
+    assert!(floor_unread(floor_sum(&l, Some(floor_seen()))));
+}
+
+#[test]
+#[serial]
+fn marker_establishment_matrix() {
+    use super::super::store::ESTABLISHMENT_ALLOWANCE_MS;
+    let later = T0 + 1_000;
+    let above = later + ESTABLISHMENT_ALLOWANCE_MS + 600_000;
+    for case in [
+        "fresh",
+        "v16 upgrade",
+        "v17 upgrade",
+        "v17 upgrade above the floor",
+        "reset",
+    ] {
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let l = Ledger::new();
+        l.store.record_and_persist(&l.profile, &[]).unwrap();
+        let established = if case == "fresh" {
+            T0
+        } else {
+            let mut wire = l.wire();
+            wire.version = match case {
+                "v16 upgrade" => super::super::store::WIRE_VERSION_TOTAL_INTENTS,
+                _ => super::super::store::WIRE_VERSION_CANONICAL_LINEAGE,
+            };
+            wire.native_coverage = None;
+            wire.admissible_floor_close_time_ms =
+                (case == "v17 upgrade above the floor").then_some(above);
+            seal_floor(&l, wire);
+            l.clock.set(later);
+            if case == "reset" {
+                l.reset(later).unwrap();
+            } else {
+                l.store.record_and_persist(&l.profile, &[]).unwrap();
+            }
+            later
+        };
+        let wire = l.wire();
+        let floor = if case == "v17 upgrade above the floor" {
+            above
+        } else {
+            established + ESTABLISHMENT_ALLOWANCE_MS
+        };
+        assert_eq!(
+            wire.native_coverage.map(|marker| marker.since_ms),
+            Some(established),
+            "{case}: the write establishes the marker"
+        );
+        assert_eq!(
+            wire.admissible_floor_close_time_ms,
+            Some(floor),
+            "{case}: the establishing write raises the floor and never lowers it"
+        );
+        assert!(
+            floor_unread(floor_sum(&l, Some(seen_at_close(floor - 1)))),
+            "{case}: an observation below the establishment floor refuses"
+        );
+        assert_eq!(
+            floor_sum(&l, Some(seen_at_close(floor))).unwrap(),
+            0,
+            "{case}: an observation at the establishment floor counts"
+        );
+        l.clock.set(later + 60_000);
+        l.store.record_and_persist(&l.profile, &[]).unwrap();
+        let again = l.wire();
+        assert_eq!(
+            (again.native_coverage, again.admissible_floor_close_time_ms),
+            (wire.native_coverage, Some(floor)),
+            "{case}: a later write keeps the marker and its floor"
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn floor_projection_requires_native_coverage() {
+    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+    let l = Ledger::new();
+    assert!(
+        floor_unread(floor_sum(&l, Some(floor_seen()))),
+        "a missing file proves no coverage"
+    );
+    cover(&l);
+    assert_eq!(
+        floor_sum(&l, Some(floor_seen())).unwrap(),
+        0,
+        "a covered empty image sums zero"
+    );
+    let mut wire = l.wire();
+    wire.native_coverage = None;
+    seal_floor(&l, wire);
+    assert!(
+        floor_unread(floor_sum(&l, Some(floor_seen()))),
+        "an image without the marker refuses"
     );
 }

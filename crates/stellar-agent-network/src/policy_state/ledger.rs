@@ -977,42 +977,56 @@ pub(super) fn prunable(auth: &WireAuthorization, cutoff: u64, now_ms: u64) -> bo
 /// Drops settled authorization history older than `cutoff` whose authority
 /// ends at or before `now_ms`: the approval's expiry, or a policy authority's
 /// governing end. Open and claimed records stay whatever their age, and so
-/// does an authorization an operation links until it has a release row. The
-/// removal raises the window's admissible floors.
+/// does an authorization an operation links, or one of a value-holding or
+/// fee-holding domain, until it has a release row. The removal raises the
+/// window's admissible floors.
 pub(super) fn prune_history(wire: &mut WireFile, cutoff: u64, now_ms: u64) {
     operations::remove_authorizations(wire, |auth| {
-        prunable(auth, cutoff, now_ms) && !operations::unreleased_link(auth)
+        prunable(auth, cutoff, now_ms)
+            && !operations::unreleased_link(auth)
+            && !operations::unreleased_native(auth)
     });
 }
 
 /// The authorization records a window state reset keeps: every record whose
 /// authority can still be presented at `now_ms`, by the approval's expiry or
-/// a policy authority's governing end, and every record an operation links
-/// that has no release row. The successor holds no holds, so a record that
-/// holds capacity becomes expired at `now_ms`. As in the sweep, a record that
-/// was never claimed and that no committed exposure names also becomes
-/// unused with an `Always` release row. A record linking a retained
-/// operation that has not ended stays as it is, since the reset keeps no
-/// operation audit.
-pub(super) fn reset_survivors(wire: &WireFile, now_ms: u64) -> Vec<WireAuthorization> {
+/// a policy authority's governing end, and every record an operation links,
+/// or of a value-holding or fee-holding domain, that has no release row. A
+/// record that holds, was never claimed and that no committed exposure names
+/// is unused, which releases it. The
+/// other records leave `wire` through [`operations::remove_authorizations`],
+/// so their release bounds raise its admissible floors. The successor holds
+/// no holds, so a record that holds capacity becomes expired at `now_ms`. As
+/// in the sweep, a record that was never claimed and that no committed
+/// exposure names also becomes unused with an `Always` release row. A record
+/// linking a retained operation that has not ended stays as it is, since the
+/// reset keeps no operation audit.
+pub(super) fn reset_survivors(wire: &mut WireFile, now_ms: u64) -> Vec<WireAuthorization> {
     let commit = CommitId::random();
     let exposed = operations::exposed_authorizations(wire);
     let live = operations::live_operations(wire);
+    let serves_live = |auth: &WireAuthorization| {
+        auth.operation
+            .is_some_and(|link| live.contains(&link.operation_id))
+    };
+    let unused = |auth: &WireAuthorization| {
+        auth.state.holds() && auth.claimed_ms.is_none() && !exposed.contains(&auth.id)
+    };
+    operations::remove_authorizations(wire, |auth| {
+        !serves_live(auth)
+            && auth.authority_end_ms() <= now_ms
+            && !operations::unreleased_link(auth)
+            && (unused(auth) || !operations::unreleased_native(auth))
+    });
     wire.authorizations
         .iter()
-        .filter_map(|auth| {
-            if auth
-                .operation
-                .is_some_and(|link| live.contains(&link.operation_id))
-            {
-                return Some(auth.clone());
-            }
-            if auth.authority_end_ms() <= now_ms && !operations::unreleased_link(auth) {
-                return None;
+        .map(|auth| {
+            if serves_live(auth) {
+                return auth.clone();
             }
             let mut kept = auth.clone();
             if kept.state.holds() {
-                if kept.claimed_ms.is_none() && !exposed.contains(&kept.id) {
+                if unused(auth) {
                     kept.disposition = Some(Disposition::Unused);
                     kept.native_release =
                         Some(ReleaseRow::always(ReleaseClass::ProvedUnspent, commit));
@@ -1020,7 +1034,7 @@ pub(super) fn reset_survivors(wire: &WireFile, now_ms: u64) -> Vec<WireAuthoriza
                 kept.state = AuthorizationState::Expired;
                 kept.settled_ms = Some(now_ms);
             }
-            Some(kept)
+            kept
         })
         .collect()
 }
@@ -3314,11 +3328,14 @@ mod tests {
         let minted = l.mint(&request).unwrap();
         assert_eq!(
             l.wire().version,
-            super::super::store::WIRE_VERSION_TOTAL_EPOCH
+            super::super::store::WIRE_VERSION_NATIVE_COVERAGE
         );
         l.claim(&request, &minted).unwrap();
         let wire = l.wire();
-        assert_eq!(wire.version, super::super::store::WIRE_VERSION_TOTAL_EPOCH);
+        assert_eq!(
+            wire.version,
+            super::super::store::WIRE_VERSION_NATIVE_COVERAGE
+        );
         let reopened = PersistedWindowStore::at_path(l.store.path().to_path_buf());
         let read = reopened.read_for_inspection(&l.profile).unwrap().unwrap();
         assert_eq!(read.authorizations, wire.authorizations);
@@ -3733,7 +3750,10 @@ mod tests {
         assert_eq!(reservation.profile(), l.name());
 
         let wire = l.wire();
-        assert_eq!(wire.version, 12);
+        assert_eq!(
+            wire.version,
+            super::super::store::WIRE_VERSION_NATIVE_COVERAGE
+        );
         let record = l.record(minted.id);
         assert_eq!(record.state, AuthorizationState::Open);
         assert_eq!(record.domain, AuthorizationDomain::Transaction);
@@ -3949,7 +3969,10 @@ mod tests {
                     .unwrap();
             }
             let wire = l.store.read_for_inspection(&l.profile).unwrap().unwrap();
-            assert_eq!(wire.version, 12);
+            assert_eq!(
+                wire.version,
+                super::super::store::WIRE_VERSION_NATIVE_COVERAGE
+            );
             let body = serde_json::to_value(&wire).unwrap();
             assert!(body.get("approvals").is_none());
             assert_eq!(
@@ -5133,7 +5156,11 @@ mod tests {
         let minted = l.mint(&request).unwrap();
         l.consume(&request, &minted, &consumption_of(&request.binding))
             .unwrap();
-        assert_eq!(l.wire().version, 12, "settled history retains its scope");
+        assert_eq!(
+            l.wire().version,
+            super::super::store::WIRE_VERSION_NATIVE_COVERAGE,
+            "settled history retains its scope"
+        );
 
         l.clock.set(T0 + RETENTION_MS);
         l.store.record_and_persist(&l.profile, &[hold(1)]).unwrap();
@@ -5151,7 +5178,8 @@ mod tests {
         let wire = l.wire();
         assert!(wire.authorizations.is_empty());
         assert_eq!(
-            wire.version, 12,
+            wire.version,
+            super::super::store::WIRE_VERSION_NATIVE_COVERAGE,
             "pruning retains authenticated network scope"
         );
         let body: serde_json::Value = serde_json::from_slice(&l.bytes()[32..]).unwrap();
@@ -5166,7 +5194,7 @@ mod tests {
             ..WireFile::default()
         };
         let open = sample(AuthorizationState::Open, 0, None);
-        let old_settled = sample(AuthorizationState::Expired, 0, Some(5));
+        let old_settled = released(sample(AuthorizationState::Expired, 0, Some(5)));
         let recent_settled = sample(AuthorizationState::Expired, 0, Some(100));
         wire.authorizations = vec![open.clone(), old_settled, recent_settled.clone()];
         prune_history(&mut wire, 100, 1_000);
@@ -5175,9 +5203,9 @@ mod tests {
             vec![open.clone(), recent_settled.clone()]
         );
 
-        // An old settlement stays while its approval can still be presented,
-        // and goes once the approval ends at the pruning time.
-        let mut presentable = sample(AuthorizationState::Expired, 3, Some(5));
+        // An old released settlement stays while its approval can still be
+        // presented, and goes once the approval ends at the pruning time.
+        let mut presentable = released(sample(AuthorizationState::Expired, 3, Some(5)));
         presentable.approval_expires_ms = Some(1_001);
         let mut ended = presentable.clone();
         ended.approval_expires_ms = Some(1_000);
@@ -5337,6 +5365,16 @@ mod tests {
             l.claim(&request, &minted).unwrap();
             l.consume(&request, &minted, &consumption_of(&request.binding))
                 .unwrap();
+            // A settled release row lets the authority end decide; an
+            // unreleased value row survives every reset.
+            let mut wire = l.wire();
+            wire.authorizations[0].native_release = Some(ReleaseRow {
+                class: ReleaseClass::Settled,
+                bound: super::super::operations::ReleaseBound::Ledger(100),
+                observed_ledger: Some(100),
+                commit_id: CommitId::from_bytes([1; 16]),
+            });
+            seal_floor(&l, wire);
             l.clock.set(clock);
             let outcome = l.reset(T0).unwrap();
             assert_eq!(outcome.accrual.retained_authorizations, kept, "{clock}");
@@ -5614,6 +5652,16 @@ mod tests {
             native_release: None,
             native_reservation: None,
         }
+    }
+
+    /// `auth` with the `Always` row an unclaimed expiry writes, so that only
+    /// its age and authority end decide its removal.
+    fn released(mut auth: WireAuthorization) -> WireAuthorization {
+        auth.native_release = Some(ReleaseRow::always(
+            ReleaseClass::ProvedUnspent,
+            CommitId::from_bytes([1; 16]),
+        ));
+        auth
     }
 
     fn sample_hold(id: AuthorizationId, ordinal: u32) -> WireAuthorizationHold {
@@ -7334,13 +7382,16 @@ mod tests {
         let version = l.wire().version;
         assert_eq!(
             version,
-            super::super::store::WIRE_VERSION_TOTAL_EPOCH,
+            super::super::store::WIRE_VERSION_NATIVE_COVERAGE,
             "{version}"
         );
         let policy = under_policy(l.request(tx(2), vec![hold(5)]), T0 + APPROVAL_MS);
         let minted = l.mint(&policy).unwrap();
         let wire = l.wire();
-        assert_eq!(wire.version, super::super::store::WIRE_VERSION_TOTAL_EPOCH);
+        assert_eq!(
+            wire.version,
+            super::super::store::WIRE_VERSION_NATIVE_COVERAGE
+        );
         let record = l.record(minted.id);
         assert_eq!(record.approval_nonce, None);
         assert_eq!(record.approval_expires_ms, None);
@@ -7365,6 +7416,7 @@ mod tests {
 
         let mut lowered = wire;
         lowered.version = WIRE_VERSION_POLICY_AUTHORITY - 1;
+        super::super::store::strip_native_coverage_for_test(&mut lowered);
         l.store.seal_unchecked_for_test(&l.profile, &lowered);
         let result = l.store.read_for_inspection(&l.profile);
         #[cfg(feature = "mainnet-write")]
@@ -7549,7 +7601,7 @@ mod tests {
     fn policy_records_survive_by_their_governing_end() {
         let open = sample(AuthorizationState::Open, 0, None);
         let recent_settled = sample(AuthorizationState::Expired, 0, Some(100));
-        let mut presentable = sample(AuthorizationState::Expired, 3, Some(5));
+        let mut presentable = released(sample(AuthorizationState::Expired, 3, Some(5)));
         presentable.approval_nonce = None;
         presentable.approval_expires_ms = None;
         presentable.policy_authority = Some(policy_binding(1_001).into());
@@ -7564,7 +7616,7 @@ mod tests {
             prune_history(&mut wire, 100, 1_000);
             assert_eq!(wire.authorizations.contains(&old), kept);
             let survivors = reset_survivors(
-                &WireFile {
+                &mut WireFile {
                     authorizations: vec![old.clone()],
                     ..WireFile::default()
                 },
@@ -7752,6 +7804,7 @@ mod tests {
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
+        cover(&l);
         let mut request = l.request(tx(1), vec![hold(25)]);
         request.native_reservation = Some(NATIVE);
         let minted = l.mint(&request).unwrap();
@@ -7850,7 +7903,7 @@ mod tests {
         assert_eq!(serde_json::to_string(&back).unwrap(), bytes);
         assert_eq!(
             l.wire().version,
-            super::super::store::WIRE_VERSION_TOTAL_EPOCH
+            super::super::store::WIRE_VERSION_NATIVE_COVERAGE
         );
         assert_eq!(
             super::super::operations::native_reserved(&l.wire(), None),
@@ -9009,7 +9062,7 @@ mod tests {
 
         #[test]
         #[serial]
-        fn reset_retains_a_claim_its_survivors_omit() {
+        fn reset_retains_a_claimed_total_once() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
             assert!(
                 guard_home
@@ -9029,7 +9082,11 @@ mod tests {
             l.clock.set(after);
             l.reset(after).unwrap();
             let wire = l.wire();
-            assert!(wire.authorizations.iter().all(|auth| auth.id != minted.id));
+            assert!(
+                wire.authorizations.iter().any(|auth| auth.id == minted.id),
+                "the claimed value row survives without a release row"
+            );
+            assert!(wire.holds.is_empty(), "the successor holds no hold");
             let rows: Vec<_> = wire
                 .entries
                 .iter()
@@ -9085,9 +9142,15 @@ mod tests {
         // ── retirement and hydration on the mainnet route ────────────────
 
         /// Rewrites the committed file through `change`, sealing it unchecked.
+        /// A file `change` lowers below version 18 loses the native coverage
+        /// marker, as an earlier build writes it.
         fn reseal(l: &Ledger, change: impl FnOnce(&mut WireFile)) {
+            use super::super::super::store;
             let mut wire = l.wire();
             change(&mut wire);
+            if wire.version < store::WIRE_VERSION_NATIVE_COVERAGE {
+                store::strip_native_coverage_for_test(&mut wire);
+            }
             l.store.seal_unchecked_for_test(&l.profile, &wire);
         }
 

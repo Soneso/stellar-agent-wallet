@@ -11775,12 +11775,24 @@ pub(crate) mod tests {
             );
         }
 
+        /// Commits the window store's first write 310 s before now, so that
+        /// the native coverage marker it establishes covers a balance read
+        /// that the endpoint reports closed now.
+        fn cover_native_history(f: &Fixture) {
+            let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+            let _clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(now - 310_000);
+            f.server
+                .window_store
+                .record_and_persist(f.server.security_profile(), &[])
+                .unwrap();
+        }
+
         /// A balance floor on either name of a nonpayment classic tool reads
         /// the operating account once for the preparation and its paired
-        /// commit evaluation. The fee takes the observed balance below a
-        /// floor at that balance; a funded floor refuses `account.unread`,
-        /// as retained history cannot prove its native exposure complete.
-        /// Neither mints nor sends.
+        /// commit evaluation over a covered window. The fee takes the
+        /// observed balance below a floor at that balance; a funded floor
+        /// refuses `account.unread`, as no public path binds a passing floor
+        /// into locked admission. Neither mints nor sends.
         #[tokio::test]
         #[serial_test::serial(keyring)]
         #[serial_test::serial]
@@ -11801,6 +11813,7 @@ pub(crate) mod tests {
                         );
                         let control = mount_rpc(&f, &primary).await;
                         let _oracle_control = mount_rpc(&f, &oracle).await;
+                        cover_native_history(&f);
                         let result = wire(&tool.prepare(&f.server, &tool.prepare_args(&f)).await);
                         assert_eq!(result["error"]["code"], code, "{name}: {result}");
                         assert_eq!(
