@@ -12,18 +12,6 @@ ignore = [
     # There is no fixed release and no way to drop them without abandoning the
     # on-chain ABI types the smart-account encoding is verified against.
     "RUSTSEC-2024-0436", # paste: unmaintained
-    # Dependency path: stellar-baselib 0.7.1 -> libsodium-sys-stable 1.24.0 ->
-    # zip 8.6.0, as a build dependency. Every libsodium-sys-stable release
-    # through 1.24.3 requires zip ^8.6, while the fix for these advisories is in
-    # zip 9. zip runs only in the libsodium-sys-stable build script on Windows
-    # MSVC targets. There it extracts the prebuilt libsodium archive after the
-    # script verifies its minisign signature against a fixed key, so the archive
-    # is not attacker-controlled. zip is not linked into the binaries. Remove
-    # these entries once a libsodium-sys-stable release accepts zip 9.
-    "RUSTSEC-2026-0367", # zip: SUID and SGID bits preserved on extraction
-    "RUSTSEC-2026-0368", # zip: symlink targets outside the extraction directory
-    "RUSTSEC-2026-0369", # zip: permissions applied through extracted symlinks
-    "RUSTSEC-2026-0429", # zip: extract aborts on a symlink entry with a large declared size
     # RUSTSEC-2026-0387: crypto-bigint before 0.7.6 can execute secret-dependent
     # branches in operations intended to be constant-time. The fix is only in
     # 0.7.6, which elliptic-curve 0.14 uses. soroban-env-host, reached through
@@ -52,6 +40,24 @@ ignore = [
     # versions above the pinned 1.8.0. Remove this entry once the server moves
     # to rmcp 3.9 or later.
     "RUSTSEC-2026-0462", # rmcp: unbounded response bodies in the HTTP clients
+    # RUSTSEC-2026-0543: chrono is unmaintained, and no release resolves the
+    # advisory. Dependency paths to chrono 0.4.45: rmcp 1.8.0, as a
+    # non-optional dependency; the rmcp schemars feature -> schemars 1.2.1 with
+    # its chrono04 feature; stellar-rpc-client 30.0.0 -> serde-aux 4.7.0 with
+    # its default chrono feature. rmcp uses chrono for the lastModified field of
+    # content annotations (src/model/annotated.rs:21), the RFC 3339 timestamps
+    # of its task manager (src/task_manager.rs:104), and the text of its request
+    # timeout error (src/service.rs:87). schemars uses it only for the JSON
+    # schemas of chrono types (src/json_schema_impls/chrono04.rs, compiled
+    # through src/json_schema_impls/mod.rs:66). serde-aux uses it only in two
+    # timestamp deserializers (src/field_attributes.rs:200 and :235) that
+    # stellar-rpc-client does not import. No workspace crate names or calls
+    # chrono, sets an annotation timestamp, or runs the rmcp task manager. An
+    # unmaintained advisory reports no vulnerability. Remove this entry once
+    # rmcp and schemars release versions without chrono and stellar-rpc-client
+    # stops enabling the serde-aux chrono feature, or chrono gets a maintained
+    # release.
+    "RUSTSEC-2026-0543", # chrono: unmaintained
 ]
 
 [licenses]
