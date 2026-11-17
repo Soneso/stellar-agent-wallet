@@ -343,6 +343,7 @@ async fn mainnet_presence_page_drives_real_webauthn() {
         .unwrap();
     drop(store);
     let mut presence = start_mainnet_presence(MainnetPresenceConfig {
+        intent: None,
         entry: ceremony.clone(),
         context: ApprovalContext::from_profile(fixture.name(), fixture.profile()),
         authority: fixture.authority(),

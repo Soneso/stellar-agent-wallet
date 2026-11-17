@@ -2319,8 +2319,25 @@ The MCP payment producer keeps its separate payment-recovery path.
 The authenticated intent handoff resolves the inbox nonce, approval record and
 operation link from one verified image. It checks the full slot against the
 admitted chain, source and current policy, and separately checks the original
-challenge envelope. This read grants no signing authority. Canonical consent
-transport and completion remain separate from preparation staging.
+challenge envelope. This read grants no signing authority.
+
+Canonical consent renders the lasting intent facts, including the fee bound and
+stored claim value, without an exact fee or sequence. CLI confirmation and both
+one-shot listener sites carry that authenticated intent. Persistent listeners use
+the serving binary's intent lookup capability; the UI has no window-store
+dependency. Missing canonical records refuse handoff. Page, challenge and final
+assertion use the same intent view digest and the current signed policy.
+
+First consent verifies the V6 attestation and receipt under the request's policy
+admission. Its lifetime comes from the signed waiting interval; verification
+does not fabricate an execution decision. Recovery preserves the original
+waiting timestamps, receipt time and challenge envelope. Fresh, repeated, raced,
+stored-page and consumed-assertion completion all verify before exposing a blob.
+The inbox and admission are released before durable commit. Written, queued and
+recovered audit provenance retain their existing meanings. Envelope consent
+continues to use V5. Ordinary producers still select envelope preparation;
+canonical execution activation and the separate MCP payment producer are outside
+this consent path. The store wire version is unchanged.
 
 `approve revoke --id <nonce> --profile <name>` resolves the nonce through authenticated status.
 Only `ApprovalRecorder::revoke` changes the durable record.

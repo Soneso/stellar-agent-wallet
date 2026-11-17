@@ -7333,7 +7333,7 @@ pub(crate) mod tests {
                 use stellar_agent_core::approval::{
                     AttestationBinding, ConsentAudit, ConsentAuthorization, Surface,
                     attest_and_persist, attestation::AttestationScope, compute_attestation_v5,
-                    issue_mainnet_presence, load_attestation_key, mainnet_consent_subject,
+                    issue_mainnet_intent_presence, load_attestation_key, mainnet_consent_subject,
                     mainnet_fixtures::MainnetConsentFixture, presence::MAINNET_CHAIN_ID,
                     verify_mainnet_presence,
                 };
@@ -7385,11 +7385,20 @@ pub(crate) mod tests {
                         .load_current()
                         .unwrap()
                         .into_policy();
-                let pending = issue_mainnet_presence(
+                let intent = stellar_agent_network::operation_entry::consent_intent(
+                    &server.window_store,
+                    profile,
+                    entry,
+                    &policy,
+                )
+                .unwrap();
+                let origin = MainnetConsentFixture::origin();
+                let pending = issue_mainnet_intent_presence(
                     entry,
                     &binding,
                     &policy,
-                    &MainnetConsentFixture::origin(),
+                    stellar_agent_core::approval::PresenceListener::Loopback(&origin),
+                    intent.as_ref(),
                     stellar_agent_core::timefmt::now_unix_ms().unwrap(),
                     std::time::Instant::now(),
                 )
@@ -7419,6 +7428,16 @@ pub(crate) mod tests {
                     |_, _| Err("unexpected grant".to_owned()),
                 )
                 .unwrap();
+                drop(store);
+                let admission =
+                    stellar_agent_core::approval::MainnetApprovalAuthority::for_profile("operator")
+                        .unwrap()
+                        .admit()
+                        .unwrap();
+                let store = stellar_agent_core::approval::PendingApprovalStore::open(
+                    server.resolve_approval_dir().unwrap().join("operator.toml"),
+                )
+                .unwrap();
                 let completion = stellar_agent_network::policy_state::ApprovalStatus::new(
                     &server.window_store,
                     profile,
@@ -7434,11 +7453,13 @@ pub(crate) mod tests {
                         &entry.approval_nonce,
                         &policy,
                         stellar_agent_network::policy_state::ConsentRow::Written,
+                        &admission,
                     )
                     .unwrap()
                 });
                 let stored = store.get(&entry.approval_nonce).unwrap().clone();
                 drop(store);
+                drop(admission);
                 if let Some(completion) = completion {
                     stellar_agent_network::operation_entry::commit_consent(
                         &server.window_store,

@@ -45,6 +45,7 @@ pub(crate) mod consent;
 pub(crate) mod identity_fixture;
 #[cfg(test)]
 pub(crate) mod installation_key_fixture;
+pub(crate) mod intent_summary;
 #[cfg(all(test, feature = "mainnet-write"))]
 pub(crate) mod mainnet_authority_tests;
 pub(crate) mod mainnet_confirm;

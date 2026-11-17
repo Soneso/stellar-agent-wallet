@@ -301,6 +301,20 @@ pub trait ConsentRecording: Send + Sync {
     fn complete(&self, consent: VerifiedConsent, row: ConsentRowSource) -> Result<(), WalletError>;
 }
 
+/// Authenticated intent lookup supplied by the serving binary.
+pub trait IntentLookup: Send + Sync {
+    /// Reads the nonce's durable approval and operation under the current policy.
+    /// The caller holds no inbox lock. Missing canonical records must refuse.
+    ///
+    /// # Errors
+    /// Returns the typed refusal of the authenticated lookup.
+    fn lookup(
+        &self,
+        nonce: &str,
+        current: &stellar_agent_core::approval::CurrentMainnetApprovalPolicy,
+    ) -> Result<Option<stellar_agent_core::approval::ClassicIntent>, WalletError>;
+}
+
 /// Whether consent to `kind` needs a durable record on this context's chain:
 /// a mainnet payment, claim, trustline or x402 approval.
 pub(crate) fn needs_durable_consent(ctx: &DecisionContext, kind: &ApprovalKind) -> bool {
@@ -328,6 +342,7 @@ pub(crate) fn verified_consent(
     current: &stellar_agent_core::approval::CurrentMainnetApprovalPolicy,
     nonce: &str,
     admission: &PolicyAdmission,
+    intent: Option<&stellar_agent_core::approval::ClassicIntent>,
 ) -> Result<VerifiedConsent, WalletError> {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     let invalid = || WalletError::Approval(stellar_agent_core::ApprovalFailure::PresenceInvalid);
@@ -350,19 +365,34 @@ pub(crate) fn verified_consent(
         kind,
         subject: stellar_agent_core::approval::mainnet_consent_subject(entry, &context.binding())?,
     };
-    let witness = verify_approval_admitted(
-        store,
-        current.profile(),
-        &context.profile_name,
-        nonce,
-        &attestation,
-        &expected,
-        current.policy(),
-        timefmt::now_unix_ms().map_err(|_| {
-            WalletError::Approval(stellar_agent_core::ApprovalFailure::PresenceUnavailable)
-        })?,
-        admission,
-    )?;
+    let now = timefmt::now_unix_ms().map_err(|_| {
+        WalletError::Approval(stellar_agent_core::ApprovalFailure::PresenceUnavailable)
+    })?;
+    let witness = if let Some(intent) = intent {
+        stellar_agent_core::approval::witness::verify_intent_consent_admitted(
+            store,
+            current.profile(),
+            &context.profile_name,
+            nonce,
+            &attestation,
+            intent,
+            current.policy(),
+            now,
+            admission,
+        )?
+    } else {
+        verify_approval_admitted(
+            store,
+            current.profile(),
+            &context.profile_name,
+            nonce,
+            &attestation,
+            &expected,
+            current.policy(),
+            now,
+            admission,
+        )?
+    };
     Ok(VerifiedConsent {
         witness,
         attestation,
@@ -388,7 +418,22 @@ pub(crate) fn complete_consent(
     admission: PolicyAdmission,
     row: ConsentRowSource,
 ) -> Result<(), WalletError> {
-    let consent = verified_consent(&ctx.context, &store, current, nonce, &admission);
+    drop(store);
+    let intent = ctx.lookup_intent(nonce, current)?;
+    let store = open_with_retry(
+        &ctx.store_path,
+        DEFAULT_RETRY_ATTEMPTS,
+        DEFAULT_RETRY_BACKOFF,
+    )
+    .map_err(|error| stellar_agent_core::approval::attest::record_error(&error))?;
+    let consent = verified_consent(
+        &ctx.context,
+        &store,
+        current,
+        nonce,
+        &admission,
+        intent.as_ref(),
+    );
     drop(store);
     drop(admission);
     let recording = ctx.consent.as_ref().ok_or(WalletError::Approval(
@@ -440,6 +485,7 @@ fn current_policy(
 pub struct DecisionContext {
     revocation: Option<Arc<dyn RevocationAccess>>,
     consent: Option<Arc<dyn ConsentRecording>>,
+    intent_lookup: Option<Arc<dyn IntentLookup>>,
     /// Current signed authority for mainnet consent.
     pub mainnet_authority: Option<stellar_agent_core::approval::MainnetApprovalAuthority>,
     /// Serving profile context: the store name, the chain id, the endpoint host and
@@ -466,6 +512,22 @@ pub struct DecisionContext {
 }
 
 impl DecisionContext {
+    /// Installs the authenticated intent source used before opening the inbox.
+    #[must_use]
+    pub fn with_intent_lookup(mut self, lookup: Arc<dyn IntentLookup>) -> Self {
+        self.intent_lookup = Some(lookup);
+        self
+    }
+
+    pub(crate) fn lookup_intent(
+        &self,
+        nonce: &str,
+        current: &stellar_agent_core::approval::CurrentMainnetApprovalPolicy,
+    ) -> Result<Option<stellar_agent_core::approval::ClassicIntent>, WalletError> {
+        self.intent_lookup
+            .as_ref()
+            .map_or(Ok(None), |lookup| lookup.lookup(nonce, current))
+    }
     /// Installs authenticated durable approval access for inbox revocation.
     #[must_use]
     pub fn with_revocation_access(mut self, access: Arc<dyn RevocationAccess>) -> Self {
@@ -516,6 +578,7 @@ impl DecisionContext {
         Self {
             revocation: None,
             consent: None,
+            intent_lookup: None,
             mainnet_authority: None,
             context,
             store_path,
