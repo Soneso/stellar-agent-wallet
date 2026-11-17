@@ -12149,7 +12149,10 @@ pub(crate) mod event_reason_tests {
                 .matches("waiting to retry busy simulation")
                 .count();
             if observed > sleeps {
-                tokio::time::advance(Duration::from_secs(1)).await;
+                // A retry sleep lasts at most 1,000 ms of jitter, and the
+                // timer rounds its deadline up to the next millisecond, so
+                // 1,001 ms always fires it.
+                tokio::time::advance(Duration::from_millis(1_001)).await;
                 sleeps = observed;
             }
         };
