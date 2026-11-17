@@ -2035,9 +2035,15 @@ impl WalletServer {
             .map(|snapshot| snapshot as &dyn stellar_agent_core::policy::v1::CounterpartyCacheView);
         // Engine error → fail closed as `policy.engine_required` (fires for
         // `Noop` and for `V1` engine errors such as a missing policy document).
+        // An accounting error keeps its own code.
         let engine_required = |err: stellar_agent_core::policy::PolicyError| {
+            use stellar_agent_core::policy::PolicyError;
+            let code = match err {
+                PolicyError::AccountingOverflow | PolicyError::AccountingInvalid => err.wire_code(),
+                _ => "policy.engine_required",
+            };
             ToolError::Business(business_error_result(
-                "policy.engine_required",
+                code,
                 format!("policy engine evaluation failed: {err}"),
             ))
         };
@@ -2058,7 +2064,10 @@ impl WalletServer {
                     sep10_sessions: None,
                     sep45_sessions: None,
                 },
-            ) {
+            )
+            .and_then(|decision| {
+                stellar_agent_network::policy_state::refuse_unproved_floor(policy, decision)
+            }) {
                 Ok(decision) => Ok(GateEvaluation::mainnet(decision)),
                 Err(MainnetRefusal::Denied { reason, .. }) => Ok(GateEvaluation::denied(reason)),
                 Err(MainnetRefusal::Engine(err)) => Err(engine_required(err)),
@@ -2175,6 +2184,51 @@ impl WalletServer {
             policy: PolicyEvaluationSnapshot::new(store, now_ms),
             cache,
         }))
+    }
+
+    /// The observed source facts of the classic mainnet evaluations of
+    /// `tools`: `Some` when the server evaluates under a verified mainnet
+    /// policy whose first rule matching one of the tools carries a balance
+    /// floor. One preparation or commit passes the same facts to each of its
+    /// evaluations.
+    ///
+    /// # Errors
+    ///
+    /// The readiness, account read, and native exposure refusals of
+    /// [`stellar_agent_network::policy_state::FloorSource::read`], as business
+    /// results.
+    pub(crate) async fn classic_floor_source(
+        &self,
+        client: &stellar_agent_network::StellarRpcClient,
+        source: &str,
+        tools: &[&'static str],
+    ) -> Result<Option<stellar_agent_network::policy_state::FloorSource>, ToolError> {
+        use stellar_agent_network::policy_state::{FloorSource, floor_rule_matches};
+        let Some(policy) = self.mainnet_evaluation_policy() else {
+            return Ok(None);
+        };
+        let engine = policy.engine();
+        if !tools
+            .iter()
+            .filter_map(|tool| self.policy_descriptor(tool))
+            .any(|tool| floor_rule_matches(&engine, &tool))
+        {
+            return Ok(None);
+        }
+        FloorSource::read(
+            client,
+            source,
+            &self.window_store,
+            self.security_profile(),
+            stellar_agent_network::operational::readiness_deadline(),
+        )
+        .await
+        .map(Some)
+        .map_err(|error| {
+            ToolError::Business(ledger_err_result(&stellar_agent_core::WalletError::from(
+                error,
+            )))
+        })
     }
 
     /// Evaluates the paired commit before an admitted preparation persists approval.
@@ -11561,6 +11615,142 @@ pub(crate) mod tests {
                 }
             }
             doc.to_string()
+        }
+
+        /// `raw` with the criterion `kind` of one `field` on the rule of `name`.
+        fn with_criterion(
+            raw: &str,
+            name: &str,
+            kind: &str,
+            field: &str,
+            value: &toml_edit::Value,
+        ) -> String {
+            let mut doc = raw.parse::<toml_edit::DocumentMut>().unwrap();
+            for rule in doc["rules"].as_array_of_tables_mut().unwrap().iter_mut() {
+                if rule["match"]["tool"].as_str() == Some(name) {
+                    let mut criterion = toml_edit::InlineTable::new();
+                    criterion.insert("kind", toml_edit::Value::from(kind));
+                    criterion.insert(field, value.clone());
+                    rule["criteria"].as_array_mut().unwrap().push(criterion);
+                }
+            }
+            doc.to_string()
+        }
+
+        /// `raw` with a `balance_floor` of `min_stroops` on the rule of `name`.
+        fn with_floor(raw: &str, name: &str, min_stroops: i64) -> String {
+            with_criterion(
+                raw,
+                name,
+                "balance_floor",
+                "min_stroops",
+                &toml_edit::Value::from(min_stroops.to_string()),
+            )
+        }
+
+        /// An accounting error of a strict mainnet evaluation keeps its code
+        /// at the MCP gate: a malformed fee under `minimum_reserve` refuses
+        /// `policy.accounting_invalid`, not `policy.engine_required`.
+        #[tokio::test]
+        #[serial_test::serial(keyring)]
+        #[serial_test::serial]
+        async fn mainnet_gate_keeps_accounting_codes() {
+            struct Funded;
+            impl stellar_agent_core::policy::v1::AccountReservesView for Funded {
+                fn reserves_stroops(&self, _: i64) -> i64 {
+                    0
+                }
+                fn balance_stroops(
+                    &self,
+                ) -> Result<i64, stellar_agent_core::policy::v1::AccountReserveLookupError>
+                {
+                    Ok(i64::MAX)
+                }
+            }
+            let primary = wiremock::MockServer::start().await;
+            let oracle = wiremock::MockServer::start().await;
+            let f = routed_fixture_with(
+                |raw| {
+                    with_criterion(
+                        &classic_policy(&raw),
+                        "stellar_create_account",
+                        "minimum_reserve",
+                        "margin_stroops",
+                        &toml_edit::Value::from(0),
+                    )
+                },
+                |_| {},
+                &primary,
+                &oracle,
+            );
+            let _primary_control = mount_rpc(&f, &primary).await;
+            let _oracle_control = mount_rpc(&f, &oracle).await;
+            let args = serde_json::json!({
+                "chain_id": "stellar:mainnet",
+                "source": f.envelope.source(),
+                "destination": f.envelope.destination(),
+                "starting_balance_stroops": "10000000",
+                "total_fee_stroops": "malformed",
+            });
+            let Err(ToolError::Business(result)) = f
+                .server
+                .dispatch_gate_with_views(
+                    "stellar_create_account",
+                    &args,
+                    "stellar:mainnet",
+                    Some(&Funded),
+                    None,
+                )
+                .await
+            else {
+                panic!("the gate refuses a malformed fee");
+            };
+            assert_eq!(
+                wire(&result)["error"]["code"],
+                "policy.accounting_invalid",
+                "{}",
+                wire(&result)
+            );
+        }
+
+        /// A balance floor on either name of a nonpayment classic tool reads
+        /// the operating account once for the preparation and its paired
+        /// commit evaluation. The fee takes the observed balance below a
+        /// floor at that balance; a funded floor refuses `account.unread`,
+        /// as retained history cannot prove its native exposure complete.
+        /// Neither mints nor sends.
+        #[tokio::test]
+        #[serial_test::serial(keyring)]
+        #[serial_test::serial]
+        async fn mainnet_classic_preparations_read_the_floor_source() {
+            const BALANCE: i64 = 100_000_000_000;
+            for tool in [Tool::Claim, Tool::CreateAccount, Tool::Trustline] {
+                for name in [tool.prepare_name(), tool.commit_name()] {
+                    for (min_stroops, code) in
+                        [(BALANCE, "account.floor_refused"), (1, "account.unread")]
+                    {
+                        let primary = wiremock::MockServer::start().await;
+                        let oracle = wiremock::MockServer::start().await;
+                        let f = routed_fixture_with(
+                            |raw| with_floor(&classic_policy(&raw), name, min_stroops),
+                            |_| {},
+                            &primary,
+                            &oracle,
+                        );
+                        let control = mount_rpc(&f, &primary).await;
+                        let _oracle_control = mount_rpc(&f, &oracle).await;
+                        let result = wire(&tool.prepare(&f.server, &tool.prepare_args(&f)).await);
+                        assert_eq!(result["error"]["code"], code, "{name}: {result}");
+                        assert_eq!(
+                            control.count("getHealth"),
+                            2,
+                            "{name}: one readiness check for the build and one for the floor read"
+                        );
+                        assert!(authorizations(&f).is_empty(), "{name}");
+                        assert_eq!(control.count("sendTransaction"), 0, "{name}");
+                    }
+                }
+            }
         }
 
         #[tokio::test]

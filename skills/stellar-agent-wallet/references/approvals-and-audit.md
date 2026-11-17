@@ -305,9 +305,12 @@ and evaluates both versions. Every nested value is signed.
 - `balance_floor` (`min_stroops`) refuses unless balance minus reservations,
   debit, and fee stays at or above the floor. It needs an observation at most
   120,000 ms old and refuses `account.unread` or `account.stale` without one.
-  Provisional evaluation skips it; strict evaluation does not. Shipped CLI and
-  MCP payment paths supply no observed account, so a matched floor refuses
-  `account.unread` there.
+  Provisional evaluation skips it; strict evaluation does not. Mainnet CLI
+  `pay`, `claim`, `trustline`, and `accounts create` and the MCP claim,
+  create-account, and trustline tools read the operating balance and
+  reservations, so a breach refuses `account.floor_refused`. A floor that
+  passes still refuses `account.unread` while retained history cannot prove
+  complete native exposure; MCP `stellar_pay` and x402 supply no read.
 - `memo_binding` (`bindings`, 1 to 64 distinct G destinations) requires the
   exact memo `kind` and `value` (`text`, `id`, `hash`, `return`, or `any`) on
   every debit to a bound destination or an M address over it. `any` refuses no

@@ -295,17 +295,22 @@ A missing or future-dated read refuses with `account.unread`, and a read older t
 refuses with `account.stale`. Any decision may carry the criterion.
 Provisional evaluation skips the floor; the strict evaluation before signing
 runs it. The criterion is enforceable only where a caller supplies an observed
-read with its reservation sum. The shipped CLI and MCP payment paths supply a
-plain account view, so a matched floor refuses there with `account.unread`.
+read with its reservation sum. On mainnet, the CLI `pay`, `claim`, `trustline`,
+and `accounts create` verbs and the MCP claim, create-account, and trustline
+tools supply both. Signing resolution reads them again before the mint.
+MCP `stellar_pay` and the x402 tools supply a plain account view, so a matched
+floor refuses there with `account.unread`.
 
 The store can recheck bound floor facts under the mint lock against its latest
 authenticated reservations. A retained value obligation with missing amounts,
 or a zero Soroban reservation without a bound non-native payment intent,
 refuses floor use. Listing and recovery remain available. This projection covers
 retained history only: unlinked obligations can leave that history under existing
-retention. Public activation requires proof that no unreleased obligation can be
-lost, or a refusal while that coverage is uncertain. Re-signing and resetting do
-not reconstruct missing exposure.
+retention. No retained image proves that no unreleased obligation was lost, so a
+floor that passes on the retained reservations still refuses with
+`account.unread`. Only a breach that the retained reservations already show
+refuses with `account.floor_refused`. Re-signing and resetting do not
+reconstruct missing exposure.
 
 `memo_binding` requires the memo a destination expects, such as an exchange
 deposit's customer memo:

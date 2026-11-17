@@ -164,7 +164,7 @@ use stellar_agent_network::{
 use crate::commands::policy_engine::{
     build_v1_policy_engine, claim_policy_args, effective_classic_fee_cap, envelope_total_fee,
     evaluate_mainnet_policy, evaluate_opaque_signing_policy, evaluate_value_moving_policy,
-    load_mainnet_policy_engine, with_total_fee,
+    load_mainnet_policy_engine, mainnet_floor_source, with_total_fee,
 };
 use crate::common::business_entry::{
     BoundEnvelope, ClassicStart, bind_envelope, classic_start, entry_business_id,
@@ -190,7 +190,9 @@ use crate::common::signer_ceremony::{
 };
 use crate::common::{ResolvedProfileName, resolve_profile_name};
 use stellar_agent_network::operational::read_within_readiness_deadline;
-use stellar_agent_network::policy_state::{OperationKind, OperationTool, OperationView};
+use stellar_agent_network::policy_state::{
+    FloorSource, OperationKind, OperationTool, OperationView,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -2141,6 +2143,18 @@ where
         Err(e) => return failed(Envelope::<()>::err(&e)),
     };
     let policy_args = with_total_fee(claim_policy_args(&built.balance_id_hex72), total_fee);
+    let floor = match mainnet_floor_source(
+        &context,
+        &client,
+        &policy.verified,
+        "stellar_claim",
+        &built.account_view.account_id,
+    )
+    .await
+    {
+        Ok(floor) => floor,
+        Err(e) => return failed(Envelope::<()>::err(&e)),
+    };
     let source_adapter =
         stellar_agent_network::policy_view::AccountViewAdapter::new(&built.account_view);
     let evaluation = match evaluate_mainnet_policy(
@@ -2150,7 +2164,7 @@ where
         stellar_agent_core::policy::ToolValueKind::MovesValue,
         context.chain().caip2_str(),
         &policy_args,
-        Some(&source_adapter),
+        Some(FloorSource::view_or(floor.as_ref(), &source_adapter)),
         None,
     ) {
         Ok(evaluation) => evaluation,
@@ -4838,8 +4852,8 @@ pub(crate) mod tests {
         };
         use crate::common::mainnet_write_fixture::{
             AGENT_SEED, AGENT_VAR, CLOCK_LEAD_MS, DESTINATION, ISSUER, MainnetFixture, Spec,
-            claim_rule, install_ledger_double, minimum_reserve, open_authorizations_of,
-            refusal_warnings,
+            balance_floor, claim_rule, install_ledger_double, minimum_reserve,
+            open_authorizations_of, refusal_warnings,
         };
         use crate::common::signer_ceremony::signer_resolutions_on_this_thread;
         use crate::test_rpc::ClassicRpc;
@@ -5489,6 +5503,26 @@ pub(crate) mod tests {
                 "policy.deny.minimum_reserve_breached",
             )
             .await;
+        }
+
+        /// A matched balance floor reads the operating account: the claim's
+        /// fee takes the observed balance below a floor at that balance.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_floor_reads_the_observed_account_on_mainnet() {
+            let fixture = Spec::new("mainnet-claim-floor")
+                .primary(ledger(true, 100_000_000).entries_at_readiness_ledger())
+                .oracle(ledger(true, 100_000_000))
+                .rules(vec![claim_rule(
+                    "require_approval",
+                    &balance_floor(BALANCE),
+                )])
+                .build()
+                .await;
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_refused_before_confirmation(&fixture, &run, "account.floor_refused").await;
         }
 
         /// Fee in the policy arguments, testnet.
