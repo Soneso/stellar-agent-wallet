@@ -126,10 +126,13 @@ fn canonical_mint_binds_the_previous_attempt() {
     });
     mint.intent_digest = Some(handle.intent().intent_digest());
     mint.predecessor = Some(previous);
-    for case in ["digest", "predecessor"] {
+    for case in ["digest", "predecessor", "predecessor-without-digest"] {
         let mut wrong = mint.clone();
         let expected = if case == "digest" {
             wrong.intent_digest = Some([0xff; 32]);
+            MainnetPrecondition::IntentMismatch
+        } else if case == "predecessor-without-digest" {
+            wrong.intent_digest = None;
             MainnetPrecondition::IntentMismatch
         } else {
             wrong.predecessor = Some(AuthorizationId::from_bytes([0xff; 32]));
@@ -137,8 +140,11 @@ fn canonical_mint_binds_the_previous_attempt() {
         };
         let bytes = file_bytes(&fx);
         for _ in 0..2 {
-            assert!(matches!(fx.store.mint_authorization(&fx.profile, &wrong),
-                Err(WindowStoreError::AuthorizationRefused { precondition }) if precondition == expected));
+            assert!(
+                matches!(fx.store.mint_authorization(&fx.profile, &wrong),
+                Err(WindowStoreError::AuthorizationRefused { precondition }) if precondition == expected),
+                "lineage refusal: {case}"
+            );
             assert_eq!(file_bytes(&fx), bytes, "refused lineage writes nothing");
         }
     }

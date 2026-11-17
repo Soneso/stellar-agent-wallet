@@ -439,7 +439,7 @@ async fn canonical_resolver_binds_intent_and_envelope() {
 #[tokio::test]
 #[serial_test::serial]
 async fn canonical_resolver_rereads_the_claim() {
-    for changed in ["same", "amount", "vanished"] {
+    for changed in ["same", "amount", "vanished", "transport", "decode"] {
         let fx = CanonicalFx::new(true, 900_000, claim_policy);
         let server = fx.f.server().await;
         let context = fx.context(&server);
@@ -447,19 +447,44 @@ async fn canonical_resolver_rereads_the_claim() {
         if changed == "amount" {
             entry.amount += 1;
         }
-        fx.claim_response(&server, (changed != "vanished").then_some(&entry))
-            .await;
+        if !matches!(changed, "transport" | "decode") {
+            fx.claim_response(&server, (changed != "vanished").then_some(&entry))
+                .await;
+        }
+        if matches!(changed, "transport" | "decode") {
+            let response = move |request: &wiremock::Request| {
+                if changed == "transport" {
+                    wiremock::ResponseTemplate::new(503)
+                } else {
+                    wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0", "id": serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["id"], "result": {"entries": [{
+                        "key": "", "xdr": "invalid", "lastModifiedLedgerSeq": 1
+                    }], "latestLedger": 1}
+                }))
+                }
+            };
+            wiremock::Mock::given(wiremock::matchers::body_partial_json(serde_json::json!({
+                "method": "getLedgerEntries", "params": {"keys": [stellar_xdr::LedgerKey::ClaimableBalance(stellar_xdr::LedgerKeyClaimableBalance {
+                    balance_id: entry.balance_id.clone(),
+                }).to_xdr_base64(Limits::none()).unwrap()]}
+            }))).respond_with(response).with_priority(1).mount(&server).await;
+        }
         let before = fx.f.wire();
         let result = fx.resolve(&context, &fx.f.envelope, fx.f.now, true).await;
         if changed == "same" {
             fx.sign(&context, &fx.f.envelope, &result.unwrap()).await;
         } else {
+            let expected = if changed == "transport" {
+                P::EndpointUnavailable
+            } else {
+                P::IntentMismatch
+            };
             assert!(
                 matches!(
                     result,
-                    Err(MainnetAuthorizationError::Refused(P::IntentMismatch))
+                    Err(MainnetAuthorizationError::Refused(p)) if p == expected
                 ),
-                "{result:?}"
+                "claim reread {changed}: {result:?}"
             );
             assert_eq!(fx.f.wire(), before);
         }

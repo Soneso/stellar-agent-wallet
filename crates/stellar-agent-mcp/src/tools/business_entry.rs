@@ -22,9 +22,10 @@ use stellar_agent_network::fees::ClassicFeeChoice;
 use stellar_agent_network::mainnet::MainnetConsumer;
 use stellar_agent_network::operation_entry::{
     self, ClassicEntry, CommitEntry, EnvelopeFacts, IdentityFacts, IntentBaseFacts, OpenedEntry,
+    Preparation,
 };
 use stellar_agent_network::policy_state::{
-    ApprovalRecorder, ApprovalStatus, BusinessId, OpenRequest, OperationHandle, OperationKind,
+    ApprovalRecorder, ApprovalStatus, BusinessId, OperationHandle, OperationKind,
     OperationRecorder, OperationState, OperationTool,
 };
 
@@ -34,7 +35,7 @@ use crate::server::WalletServer;
 #[derive(Debug)]
 pub(crate) struct ClassicOperation {
     business_id: BusinessId,
-    identity: [u8; 32],
+    preparation: Preparation,
     resume: Option<OperationHandle>,
 }
 
@@ -149,7 +150,10 @@ fn remove_orphans(
     status: &ApprovalStatus<'_>,
     handle: &OperationHandle,
 ) -> Result<(), WalletError> {
-    let Some(envelope) = handle.unsigned_envelope_sha256() else {
+    let Some(envelope) = handle
+        .envelope_xdr()
+        .map(operation_entry::unsigned_envelope_sha256)
+    else {
         return Ok(());
     };
     let envelope = stellar_agent_core::hex::encode(&envelope);
@@ -203,7 +207,9 @@ impl WalletServer {
         handle: Option<&OperationHandle>,
         kind: ApprovedKind,
         decision: PolicyDecision,
-        persist: impl FnOnce() -> Result<PendingApproval, String>,
+        persist: impl FnOnce(
+            Option<&stellar_agent_core::approval::ClassicIntent>,
+        ) -> Result<PendingApproval, String>,
     ) -> Result<PendingApproval, crate::tools::common::ToolError> {
         use crate::tools::common::ToolError;
         self.start_classic_approval(handle, kind, decision, persist)
@@ -221,10 +227,12 @@ impl WalletServer {
         handle: Option<&OperationHandle>,
         kind: ApprovedKind,
         decision: PolicyDecision,
-        persist: impl FnOnce() -> Result<PendingApproval, String>,
+        persist: impl FnOnce(
+            Option<&stellar_agent_core::approval::ClassicIntent>,
+        ) -> Result<PendingApproval, String>,
     ) -> Result<Result<PendingApproval, String>, WalletError> {
         if !self.context.chain_id.is_mainnet() {
-            return Ok(persist());
+            return Ok(persist(None));
         }
         let handle = handle.ok_or_else(|| {
             WalletError::Internal(InternalError::UnexpectedState {
@@ -256,7 +264,16 @@ impl WalletServer {
             let mut pending = open_inbox(&path)?;
             remove_orphans(&mut pending, &status, handle)?;
         }
-        let entry = match persist() {
+        let intent =
+            if handle.intent().kind() == stellar_agent_network::policy_state::SlotKind::Canonical {
+                let policy = self.current_mainnet_policy().ok_or(WalletError::Approval(
+                    ApprovalFailure::PresencePolicyUnavailable,
+                ))?;
+                operation_entry::preparation_intent(handle, self.security_profile(), policy)?
+            } else {
+                None
+            };
+        let entry = match persist(intent.as_ref()) {
             Ok(entry) => entry,
             Err(error) => return Ok(Err(error)),
         };
@@ -439,9 +456,16 @@ impl WalletServer {
             facts,
         )
         .map_err(|error| refusal(&error))?;
-        let entry = self.with_operation_recorder(|recorder| {
-            operation_entry::lookup_classic(recorder, &business_id, &identity)
-        })?;
+        self.prepare_entry(business_id, Preparation::Envelope(identity))
+    }
+
+    fn prepare_entry(
+        &self,
+        business_id: BusinessId,
+        preparation: Preparation,
+    ) -> Result<ClassicOperation, CallToolResult> {
+        let entry =
+            self.with_operation_recorder(|recorder| preparation.lookup(recorder, &business_id))?;
         let resume = match entry {
             ClassicEntry::Build => None,
             ClassicEntry::Resume(handle) => Some(handle),
@@ -449,7 +473,7 @@ impl WalletServer {
         };
         Ok(ClassicOperation {
             business_id,
-            identity,
+            preparation,
             resume,
         })
     }
@@ -500,19 +524,14 @@ impl WalletServer {
         {
             return stored(&candidate, handle);
         }
-        let max_time =
-            operation_entry::envelope_max_time(&candidate).map_err(|error| refusal(&error))?;
-        let request = OpenRequest {
-            business_id: operation.business_id.clone(),
-            tool,
-            kind,
-            intent: operation_entry::envelope_slot(&operation.identity, &candidate, max_time),
-            envelope_xdr: Some(candidate.clone()),
-            prepared_decision: None,
-            rule_ttl_ms: None,
-        };
         let entry = self.with_operation_recorder(|recorder| {
-            operation_entry::open_classic(recorder, &request)
+            operation.preparation.open(
+                recorder,
+                operation.business_id.clone(),
+                tool,
+                kind,
+                &candidate,
+            )
         })?;
         match entry {
             OpenedEntry::Resume(handle) => match handle.envelope_xdr() {
@@ -643,7 +662,7 @@ impl WalletServer {
         let Some(id) = business_id.filter(|_| self.context.chain_id.is_mainnet()) else {
             return Ok(None);
         };
-        let request = OpenRequest {
+        let request = stellar_agent_network::policy_state::OpenRequest {
             business_id: id,
             tool,
             kind,
@@ -908,6 +927,352 @@ mod tests {
         assert!(
             producer_lock(&path).is_ok(),
             "a released producer lock can be acquired"
+        );
+    }
+
+    #[cfg(feature = "mainnet-write")]
+    #[test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    fn canonical_staging_keeps_the_winning_handle() {
+        use crate::tools::common::tests::mainnet::Fixture;
+        use stellar_agent_core::approval::{IntentPayload, MemoFact};
+        let f = Fixture::new(|raw| raw);
+        let server = &f.server;
+        let intent = operation_entry::classic_intent(
+            IntentBaseFacts::new(
+                server.security_profile(),
+                f.envelope.source(),
+                server.current_mainnet_policy().unwrap(),
+                ClassicFeeChoice::Explicit(500),
+                MemoFact::None,
+            ),
+            IntentPayload::CreateAccount {
+                destination: f.envelope.destination().into(),
+                starting_balance_stroops: 17,
+            },
+        )
+        .unwrap();
+        let preparation = Preparation::Canonical {
+            intent: Box::new(intent.clone()),
+            decision: PolicyDecision::Allow,
+            rule_ttl_ms: Some(300_000),
+        };
+        let id = BusinessId::parse("canonical-winner").unwrap();
+        let first = server
+            .prepare_entry(id.clone(), preparation.clone())
+            .unwrap();
+        let stale = server
+            .prepare_entry(id.clone(), preparation.clone())
+            .unwrap();
+        let candidate = operation_entry::intent_envelope(
+            &intent,
+            server.context.network_passphrase(),
+            2,
+            100,
+            stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1000 + 120,
+        )
+        .unwrap();
+        let built = server
+            .prepared_envelope(
+                Some(&first),
+                OperationTool::StellarCreateAccount,
+                OperationKind::CreateAccount,
+                candidate.clone(),
+            )
+            .unwrap();
+        let winner = built.handle.unwrap();
+        assert_eq!(
+            winner.intent().kind(),
+            SlotKind::Canonical,
+            "staged open selects Canonical"
+        );
+        let losing = operation_entry::intent_envelope(
+            &intent,
+            server.context.network_passphrase(),
+            3,
+            100,
+            stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1000 + 120,
+        )
+        .unwrap();
+        let raced = server
+            .prepared_envelope(
+                Some(&stale),
+                OperationTool::StellarCreateAccount,
+                OperationKind::CreateAccount,
+                losing,
+            )
+            .unwrap();
+        assert_eq!(
+            raced.handle.as_ref().map(OperationHandle::id),
+            Some(winner.id()),
+            "concurrent open keeps winning handle"
+        );
+        assert_eq!(
+            raced.xdr, candidate,
+            "concurrent open keeps winning envelope"
+        );
+        let resumed = server.prepare_entry(id, preparation).unwrap();
+        let retained = server
+            .prepared_envelope(
+                Some(&resumed),
+                OperationTool::StellarCreateAccount,
+                OperationKind::CreateAccount,
+                candidate.clone(),
+            )
+            .unwrap();
+        assert_eq!(
+            retained.handle.as_ref().map(OperationHandle::id),
+            Some(winner.id()),
+            "resume keeps winning handle"
+        );
+        let unrecorded = server
+            .prepared_envelope(
+                None,
+                OperationTool::StellarCreateAccount,
+                OperationKind::CreateAccount,
+                candidate.clone(),
+            )
+            .unwrap();
+        assert!(unrecorded.handle.is_none() && unrecorded.operation_id.is_none());
+        let legacy = server
+            .classic_prepare_entry(
+                BusinessId::parse("legacy-winner").unwrap(),
+                MainnetConsumer::McpCreateAccount,
+                f.envelope.source(),
+                ClassicFeeChoice::Explicit(500),
+                &stellar_xdr::Memo::None,
+                IdentityFacts::Intent(intent.payload().clone()),
+            )
+            .unwrap();
+        let legacy = server
+            .prepared_envelope(
+                Some(&legacy),
+                OperationTool::StellarCreateAccount,
+                OperationKind::CreateAccount,
+                candidate,
+            )
+            .unwrap();
+        assert_eq!(
+            legacy.handle.unwrap().intent().kind(),
+            SlotKind::Envelope,
+            "ordinary producer stays Envelope"
+        );
+        let claim = operation_entry::classic_intent(
+            IntentBaseFacts::new(
+                server.security_profile(),
+                f.envelope.source(),
+                server.current_mainnet_policy().unwrap(),
+                ClassicFeeChoice::Explicit(500),
+                MemoFact::None,
+            ),
+            IntentPayload::Claim {
+                balance_id: format!("00000000{}", "09".repeat(32)),
+                claimant: f.envelope.source().into(),
+                asset: stellar_agent_core::approval::IntentAsset::Native,
+                amount_stroops: 17,
+            },
+        )
+        .unwrap();
+        let id = BusinessId::parse("retained-claim").unwrap();
+        let staged = server
+            .prepare_entry(
+                id.clone(),
+                Preparation::Canonical {
+                    intent: Box::new(claim.clone()),
+                    decision: PolicyDecision::Allow,
+                    rule_ttl_ms: Some(300_000),
+                },
+            )
+            .unwrap();
+        let xdr = operation_entry::intent_envelope(
+            &claim,
+            server.context.network_passphrase(),
+            9,
+            100,
+            stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1000 + 120,
+        )
+        .unwrap();
+        server
+            .prepared_envelope(
+                Some(&staged),
+                OperationTool::StellarClaim,
+                OperationKind::Claim,
+                xdr,
+            )
+            .unwrap();
+        let partial = server.with_operation_recorder(|recorder| {
+            operation_entry::lookup_canonical(
+                recorder,
+                &id,
+                IntentBaseFacts::new(
+                    server.security_profile(),
+                    f.envelope.source(),
+                    server.current_mainnet_policy().unwrap(),
+                    ClassicFeeChoice::Explicit(500),
+                    MemoFact::None,
+                ),
+                IdentityFacts::Claim {
+                    balance_id: format!("00000000{}", "09".repeat(32)),
+                    claimant: f.envelope.source().into(),
+                },
+            )
+        });
+        assert!(
+            matches!(partial, Ok(ClassicEntry::Resume(h)) if h.intent().intent_digest() == *claim.digest().as_bytes()),
+            "MCP partial claim retains full digest without an RPC client"
+        );
+    }
+
+    #[cfg(feature = "mainnet-write")]
+    #[test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    fn canonical_prepare_crashes_and_races_converge() {
+        use crate::tools::common::tests::mainnet::Fixture;
+        use stellar_agent_core::approval::{IntentPayload, MemoFact};
+        let f = Fixture::new(|raw| raw);
+        let server = &f.server;
+        let intent = operation_entry::classic_intent(
+            IntentBaseFacts::new(
+                server.security_profile(),
+                f.envelope.source(),
+                server.current_mainnet_policy().unwrap(),
+                ClassicFeeChoice::Explicit(500),
+                MemoFact::None,
+            ),
+            IntentPayload::CreateAccount {
+                destination: f.envelope.destination().into(),
+                starting_balance_stroops: 17,
+            },
+        )
+        .unwrap();
+        let preparation = Preparation::Canonical {
+            intent: Box::new(intent.clone()),
+            decision: PolicyDecision::RequireApproval,
+            rule_ttl_ms: Some(300_000),
+        };
+        let operation = server
+            .prepare_entry(
+                BusinessId::parse("canonical-producer").unwrap(),
+                preparation,
+            )
+            .unwrap();
+        let xdr = operation_entry::intent_envelope(
+            &intent,
+            server.context.network_passphrase(),
+            2,
+            100,
+            stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1000 + 60,
+        )
+        .unwrap();
+        let handle = server
+            .prepared_envelope(
+                Some(&operation),
+                OperationTool::StellarCreateAccount,
+                OperationKind::CreateAccount,
+                xdr.clone(),
+            )
+            .unwrap()
+            .handle
+            .unwrap();
+        let directory = server.resolve_approval_dir().unwrap();
+        let path = directory.join(format!("{}.toml", server.profile_name_for_approval()));
+        let make = || {
+            PendingApproval::new_payment_pending(
+                xdr.clone(),
+                xdr.as_bytes(),
+                f.envelope.destination().into(),
+                17,
+                "XLM".into(),
+                None,
+                100,
+                2,
+                "1000".into(),
+                300_000,
+            )
+            .unwrap()
+        };
+        let orphan = make();
+        let mut unrelated = make();
+        if let ApprovalKind::PaymentSimulated {
+            envelope_sha256_hex,
+            ..
+        } = &mut unrelated.kind
+        {
+            *envelope_sha256_hex = "ff".repeat(32);
+        }
+        {
+            let mut inbox = open_inbox(&path).unwrap();
+            inbox
+                .insert(orphan.clone(), orphan.created_at_unix_ms)
+                .unwrap();
+            inbox
+                .insert(unrelated.clone(), unrelated.created_at_unix_ms)
+                .unwrap();
+        }
+        let result = server.classic_pending_approval(
+            Some(&handle),
+            ApprovedKind::Payment,
+            PolicyDecision::RequireApproval,
+            |stored| {
+                assert_eq!(
+                    stored,
+                    Some(&intent),
+                    "producer receives validated stored intent"
+                );
+                let mut entry = make();
+                entry.expires_at_unix_ms = entry.created_at_unix_ms + 120_000;
+                operation_entry::stage_pending(&mut entry, stored, 300_000).unwrap();
+                open_inbox(&path)
+                    .unwrap()
+                    .insert(entry.clone(), entry.created_at_unix_ms)
+                    .unwrap();
+                Ok(entry)
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "producer records the signed shortened interval"
+        );
+        let result = result.unwrap();
+        let inbox = open_inbox(&path).unwrap();
+        assert!(
+            inbox.get(&orphan.approval_nonce).is_none(),
+            "canonical retry removes only the retained-envelope orphan"
+        );
+        assert!(
+            inbox.get(&unrelated.approval_nonce).is_some(),
+            "different envelope survives"
+        );
+        assert!(
+            inbox.get(&result.approval_nonce).is_some(),
+            "linked winner survives"
+        );
+        drop(inbox);
+        let record = ApprovalStatus::new(&server.window_store, server.security_profile())
+            .find_by_nonce(&result.approval_nonce)
+            .unwrap()
+            .unwrap()
+            .record;
+        assert_eq!(
+            record.subject,
+            *intent.digest().as_bytes(),
+            "producer record binds intent"
+        );
+        assert_eq!(record.rule_ttl_ms, 120_000, "producer uses signed interval");
+        assert_eq!(record.waiting_expires_at_ms, result.expires_at_unix_ms);
+        let repeated = server
+            .classic_pending_approval(
+                Some(&handle),
+                ApprovedKind::Payment,
+                PolicyDecision::RequireApproval,
+                |_| unreachable!("retry must reuse the linked entry"),
+            )
+            .unwrap();
+        assert_eq!(
+            repeated.approval_nonce, result.approval_nonce,
+            "restart adopts durable winner"
         );
     }
 
