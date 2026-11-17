@@ -9668,7 +9668,7 @@ mod tests {
                     .unwrap()
                     .unwrap()
                     .version,
-                16
+                WIRE_VERSION_MAX
             );
         }
     }
