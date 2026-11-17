@@ -1653,11 +1653,19 @@ impl AuditOutbox {
     /// # Errors
     /// Returns carrier, evidence, key, and storage refusals, including a rotation fence.
     pub fn evidence_time_floor(&self) -> Result<u64, WriterError> {
+        Ok(self
+            .evidence()?
+            .map_or(0, |evidence| evidence.time_floor_ms()))
+    }
+
+    /// Reads authenticated evidence through the keyed carrier, recovering a
+    /// newer committed image. Absence never initializes an owner.
+    ///
+    /// # Errors
+    /// Returns carrier, evidence, key, and storage refusals.
+    pub fn evidence(&self) -> Result<Option<super::OutboxEvidence>, WriterError> {
         let (batch, key) = self.evidence_batch()?;
-        Ok(
-            read_owner_evidence(&self.log_path, self.state.as_ref(), &batch, Some(&key))?
-                .map_or(0, |evidence| evidence.time_floor_ms()),
-        )
+        read_owner_evidence(&self.log_path, self.state.as_ref(), &batch, Some(&key))
     }
 
     fn evidence_batch(&self) -> Result<(OutboxBatch, Zeroizing<[u8; 32]>), WriterError> {
@@ -13323,6 +13331,133 @@ mod tests {
     struct ProcessEvidenceStore {
         root: PathBuf,
         exit_after_store: bool,
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn routed_admissions_are_serializable_across_processes() {
+        use std::io::{BufRead, Read};
+        use std::process::{Command, Stdio};
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        if let Ok(root) = std::env::var("ADMISSION_RACE_ROOT") {
+            let root = PathBuf::from(root);
+            let id: u8 = std::env::var("ADMISSION_RACE_ID").unwrap().parse().unwrap();
+            let outbox = AuditOutbox::for_log_keyed(
+                &root.join("audit/audit.jsonl"),
+                Arc::new(ProcessEvidenceStore {
+                    root: root.clone(),
+                    exit_after_store: false,
+                }),
+                Zeroizing::new(ROW_KEY),
+            );
+            assert!(outbox.evidence().unwrap().is_some());
+            std::io::stdout().write_all(b"admission ready\n").unwrap();
+            std::io::stdout().flush().unwrap();
+            std::io::stdin().read_exact(&mut [0]).unwrap();
+            let result = outbox
+                .reserve_evidence([id; 32], 100_000, 1)
+                .map_err(|error| error.code().to_owned())
+                .map(|reservation| {
+                    outbox
+                        .with_evidence_reservation(reservation)
+                        .append_queued(&row(&format!("admission-{id}")))
+                        .unwrap()
+                });
+            fs::write(
+                root.join(format!("result-{id}")),
+                serde_json::to_vec(&result).unwrap(),
+            )
+            .unwrap();
+            return;
+        }
+        for occupied in [0, MAX_EVIDENCE_ENTRIES - 1] {
+            let (dir, path, store, mut writer) = keyed_fixture();
+            writer.initialize_consent_evidence().unwrap();
+            seed_records(&path, &store, occupied, false);
+            let root = dir.path();
+            fs::write(
+                root.join("owner-1"),
+                store.load_outbox_owner_state(1).unwrap().unwrap(),
+            )
+            .unwrap();
+            fs::write(
+                root.join("carrier"),
+                serde_json::to_vec(&store.load_carrier_record().unwrap().unwrap()).unwrap(),
+            )
+            .unwrap();
+            fs::write(root.join("scope"), store.outbox_evidence_scope().unwrap()).unwrap();
+            let child_home = root.join("child-home");
+            stellar_agent_test_support::sandbox::mark_sandbox(&child_home).unwrap();
+            let mut children = Vec::new();
+            for id in [0x77_u8, 0x88] {
+                let mut child = Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "audit_log::outbox::tests::routed_admissions_are_serializable_across_processes", "--nocapture"])
+                    .env("ADMISSION_RACE_ROOT", root).env("ADMISSION_RACE_ID", id.to_string())
+                    .env("STELLAR_AGENT_HOME", &child_home)
+                    .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+                let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(
+                        output.read_line(&mut line).unwrap(),
+                        0,
+                        "child reaches the stale-read barrier"
+                    );
+                    if line.contains("admission ready") {
+                        break;
+                    }
+                }
+                children.push((child, output));
+            }
+            for (child, _) in &mut children {
+                child.stdin.take().unwrap().write_all(&[1]).unwrap();
+            }
+            for (child, _stdout) in children {
+                let output = child.wait_with_output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            store
+                .store_outbox_owner_state(1, &fs::read_to_string(root.join("owner-1")).unwrap())
+                .unwrap();
+            let results: Vec<Result<OutboxRowRef, String>> = [0x77_u8, 0x88]
+                .iter()
+                .map(|id| {
+                    serde_json::from_slice(&fs::read(root.join(format!("result-{id}"))).unwrap())
+                        .unwrap()
+                })
+                .collect();
+            assert_eq!(
+                results.iter().filter(|r| r.is_ok()).count(),
+                if occupied == 0 { 2 } else { 1 },
+                "every available slot is admitted exactly once"
+            );
+            for error in results.iter().filter_map(|r| r.as_ref().err()) {
+                assert_eq!(
+                    error, "approval.evidence_capacity",
+                    "the final slot has one typed loser"
+                );
+            }
+            writer.drain_outbox().unwrap();
+            let evidence = writer.outbox_evidence().unwrap().unwrap();
+            assert_eq!(
+                evidence.records().len(),
+                occupied + results.iter().filter(|r| r.is_ok()).count(),
+                "a stale reader cannot erase prior admissions"
+            );
+            for (id, result) in [0x77_u8, 0x88].into_iter().zip(results) {
+                if let Ok(reference) = result {
+                    assert!(
+                        evidence.contains_delivered(&[id; 32], &reference),
+                        "every successful process publishes its exact reserved row"
+                    );
+                }
+            }
+        }
     }
 
     impl TipAnchorStore for ProcessEvidenceStore {

@@ -274,13 +274,21 @@ and evaluates both versions. Every nested value is signed.
   `RequireApproval` with the reason `counterparty_allowlist: an unlisted
   recipient requires approval` and the default one-day lifetime.
   `mode = "budget"` allows within `per_tx_stroops` and `per_period_stroops`
-  over `window`, in `asset` (default `native`). Both bounds are inclusive;
-  excess refuses `policy.deny.unlisted_budget_exceeded`. A debit in another
-  asset keeps the counterparty denial.
+  over `window`, in `asset` (default `native`). Both bounds are inclusive.
+  On mainnet, excess requests per-payment approval with the same reason and
+  lifetime as approval mode. Approved spending counts in full. Every other
+  network refuses excess with `policy.deny.unlisted_budget_exceeded`.
+  A debit in another asset keeps the counterparty denial.
 - Approval and budget need `decision = "allow"`, and budget bounds must be
   strictly below the rule's matching hard caps. A rule carries one table.
   Tables in several rules must be equal, and then share one counter per asset
-  and window. Listed payments add nothing to it.
+  and window. Listed payments add nothing to it. Approval never lifts a hard
+  cap, rate limit, or total allocation. The spending summary reports
+  `unlisted_exhaustion = "approval"` on mainnet and `"deny"` elsewhere.
+  Classic and SAC spellings of one asset share that counter. Earlier stored
+  spellings retain their bytes and count together after hydration. Re-signing
+  and restart preserve the rolling usage. Unlisted sums reject negative
+  contributors and overflow; approval cannot bypass those checks.
 - Only a verified unlisted debit reaches the mode. A missing destination, an
   unverified domain, or a gated inflow keeps the counterparty denial. First
   match still decides, and a later failing criterion of the same rule still
@@ -1160,7 +1168,7 @@ The policy-file owner key is not rotated here. It is enrolled with `profile enro
 | `profile rotate-audit-key <NAME>` | 32-byte HMAC | Re-signs every existing per-file chain-root sidecar with the new key; `audit verify <LOG_PATH> --profile <p>` stays green across the rotation and the old key stops verifying; the response carries `sidecars_resigned`. Takes the audit writer's exclusive lock, so it refuses while an MCP server holds the writer. |
 | `profile rotate-nonce-key <NAME>` | 32-byte HMAC | All outstanding nonces minted with the old key are invalidated. |
 | `profile rotate-counterparty-key <NAME>` | 32-byte HMAC | Invalidates cached bindings. `counterparty refresh <domain>` rewrites one binding, and `counterparty warm-up` refreshes only the `HOME_DOMAIN` entries of the policy allowlist. |
-| `profile rotate-policy-state-key <NAME>` | 32-byte HMAC | Verifies the window-state store under the old key, then re-signs it under the new key, so accumulated `per_period_cap` / `rate_limit` history is preserved. A store that does not verify refuses the rotation. Integrity failures and missing authenticated network provenance have no recovery verb in this release; create a profile under a new name. Before rotation, file I/O failures refuse without changing state; retry after access is restored. |
+| `profile rotate-policy-state-key <NAME>` | 32-byte HMAC | Verifies the window-state store under the old key, then re-signs it under the new key, so accumulated `per_period_cap` / `rate_limit` history and unlisted and total-budget usage are preserved. A store that does not verify refuses the rotation. Integrity failures and missing authenticated network provenance have no recovery verb in this release; create a profile under a new name. Before rotation, file I/O failures refuse without changing state; retry after access is restored. |
 
 ```bash
 stellar-agent profile rotate-attestation-key default

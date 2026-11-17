@@ -258,8 +258,11 @@ The W check runs before records, approvals, spending admission and SEP-10.
 Endpoint identity and the mainnet range gate precede it. Simulation decides
 whether the asset accepts a muxed contract payee.
 Mainnet M and eligible W follow Allow or the two-call RequireApproval flow.
-Testnet RequireApproval queues every supported address form; an unlisted
-`budget` admits only within its caps. M anchoring compares its base G with
+Testnet RequireApproval queues every supported address form. An unlisted
+`budget` admits unattended payments within both allowance bounds. Mainnet
+excess requests per-payment approval and counts in full when approved;
+testnet excess denies. Hard caps, rate limits, and total allocations still
+apply. M anchoring compares its base G with
 SEP-1 `ACCOUNTS`; C, W and empty account lists give `unknown`.
 
 - Payer/client only, no payee or facilitator logic.

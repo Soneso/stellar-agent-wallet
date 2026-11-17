@@ -3154,6 +3154,7 @@ mod tests {
                 signer_redacted: crate::observability::RedactedStrkey::from_already_redacted(
                     "GBPXX...WIVL",
                 ),
+                legs: Vec::new(),
             },
             EventKind::MppChargeAuthorized {
                 authorization_id_hash: "a".repeat(64),

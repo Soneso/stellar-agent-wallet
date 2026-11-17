@@ -135,6 +135,14 @@ impl BundlePerPeriodCapCriterion {
         }
     }
 
+    fn overflow_refusal(&self) -> DenyReason {
+        DenyReason::PerPeriodCapOverflow {
+            asset: self.asset.clone(),
+            window: self.window.label().to_owned(),
+            max_stroops: self.max_stroops,
+        }
+    }
+
     /// Returns the configured maximum stroops per window.
     #[must_use]
     pub fn max_stroops(&self) -> i128 {
@@ -176,6 +184,8 @@ impl Criterion for BundlePerPeriodCapCriterion {
     ///   the cap.
     /// - `Ok(Some(DenyReason::BundleDenied { inner_index, deny_reason: PerPeriodCapExceeded { .. } }))` —
     ///   the running sum tips the cap at inner `inner_index`.
+    /// - Stored history overflow returns `BundleDenied` at index 0 with
+    ///   `PerPeriodCapOverflow`, which omits the unrepresentable usage total.
     ///
     /// # Errors
     ///
@@ -202,18 +212,26 @@ impl Criterion for BundlePerPeriodCapCriterion {
             self.window.as_secs(),
         );
 
-        let (period_used_recorded, _) =
-            ctx.state_store
-                .query_window(&state_key, now_ms)
-                .map_err(|e| PolicyError::CriterionEvaluationFailed {
+        let period_used_recorded = match ctx.state_store.query_window(&state_key, now_ms) {
+            Ok((amount, _)) => amount,
+            Err(super::state_store::StateStoreError::SumOverflow) => {
+                return Ok(Some(DenyReason::BundleDenied {
+                    inner_index: 0,
+                    deny_reason: Box::new(self.overflow_refusal()),
+                }));
+            }
+            Err(e) => {
+                return Err(PolicyError::CriterionEvaluationFailed {
                     detail: format!("bundle_per_period_cap: state store error: {e}"),
-                })?;
+                });
+            }
+        };
 
         // Accumulate inner amounts against the period cap, tracking which inner
         // tips the sum.  Only `TokenTransfer` inners whose asset matches fire.
         // `i128` end-to-end (no clamp): `period_used_recorded` is already
         // `i128` from the state store (see `PolicyStateStore::query_window`).
-        let mut running_sum: i128 = 0;
+        let mut running_sum = Some(0_i128);
 
         for (idx, inner) in view.inners.iter().enumerate() {
             let InnerOpDescriptor::TokenTransfer { asset, amount, .. } = inner else {
@@ -234,26 +252,28 @@ impl Criterion for BundlePerPeriodCapCriterion {
             let inner_stroops = *amount;
 
             // Check cap: period_used_recorded + running_sum + inner_stroops > max?
-            let would_use = period_used_recorded
-                .saturating_add(running_sum)
-                .saturating_add(inner_stroops);
-
-            if would_use > self.max_stroops {
-                let period_used_stroops = period_used_recorded.saturating_add(running_sum);
-                return Ok(Some(DenyReason::BundleDenied {
-                    inner_index: u32::try_from(idx).unwrap_or(u32::MAX),
-                    deny_reason: Box::new(DenyReason::PerPeriodCapExceeded {
+            let period_used_stroops =
+                running_sum.and_then(|sum| period_used_recorded.checked_add(sum));
+            running_sum = running_sum.and_then(|sum| sum.checked_add(inner_stroops));
+            if running_sum
+                .and_then(|sum| period_used_recorded.checked_add(sum))
+                .is_none_or(|sum| sum > self.max_stroops)
+            {
+                let deny_reason = match period_used_stroops {
+                    Some(period_used_stroops) => DenyReason::PerPeriodCapExceeded {
                         asset: self.asset.clone(),
                         window: self.window.label().to_owned(),
                         max_stroops: self.max_stroops,
                         attempted_stroops: inner_stroops,
                         period_used_stroops,
-                    }),
+                    },
+                    None => self.overflow_refusal(),
+                };
+                return Ok(Some(DenyReason::BundleDenied {
+                    inner_index: u32::try_from(idx).unwrap_or(u32::MAX),
+                    deny_reason: Box::new(deny_reason),
                 }));
             }
-
-            // Inner within cap — accumulate for next inner's check.
-            running_sum = running_sum.saturating_add(inner_stroops);
         }
 
         Ok(None)
@@ -561,6 +581,68 @@ mod tests {
             ),
             "inner 1 must be denied with period_used=90; got {result:?}"
         );
+    }
+
+    /// Overflow refuses with the governing cap; exact-cap use succeeds.
+    #[test]
+    #[serial]
+    fn overflowing_sums_refuse_with_the_bundle_period_cap() {
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let tool = make_tool();
+        let profile = make_profile();
+        let criterion = BundlePerPeriodCapCriterion::new(
+            "native".into(),
+            Window::parse("1h").unwrap(),
+            i128::MAX,
+        );
+        for (case, recorded, amounts, offending_inner) in [
+            ("stored history", vec![i128::MAX, 1], vec![0], Some(0)),
+            ("inner sum", vec![], vec![i128::MAX, 1], Some(1)),
+            ("recorded plus inner", vec![i128::MAX], vec![1], Some(0)),
+            ("exact stored cap", vec![i128::MAX], vec![0], None),
+            ("exact inner cap", vec![], vec![i128::MAX], None),
+            ("exact combined cap", vec![i128::MAX - 2], vec![1, 1], None),
+        ] {
+            let store = PolicyStateStore::new();
+            let inners: Vec<_> = amounts.into_iter().map(token_transfer_native).collect();
+            let overlay = BundleStateOverlay::default();
+            let view = BundleView {
+                inners: &inners,
+                overlay: &overlay,
+            };
+            let ctx = make_ctx_with_bundle(&tool, &profile, &store, Some(&view));
+            let key = StateKey::new(ctx.profile_name, 1, "native", 3_600);
+            for amount in recorded {
+                store.append(&key, now_ms(), amount).unwrap();
+            }
+            let expected = offending_inner.map(|inner_index| DenyReason::BundleDenied {
+                inner_index,
+                deny_reason: Box::new(if case == "stored history" {
+                    DenyReason::PerPeriodCapOverflow {
+                        asset: "native".into(),
+                        window: "1h".into(),
+                        max_stroops: i128::MAX,
+                    }
+                } else {
+                    DenyReason::PerPeriodCapExceeded {
+                        asset: "native".into(),
+                        window: "1h".into(),
+                        max_stroops: i128::MAX,
+                        attempted_stroops: 1,
+                        period_used_stroops: i128::MAX,
+                    }
+                }),
+            });
+            let result = criterion.evaluate(&ctx);
+            assert_eq!(result.as_ref().ok(), Some(&expected), "{case}: {result:?}");
+            if let Some(DenyReason::BundleDenied { deny_reason, .. }) = result.unwrap() {
+                assert_eq!(
+                    deny_reason.wire_code(),
+                    "policy.deny.per_period_cap_exceeded"
+                );
+            }
+        }
     }
 
     // ── asset mismatch inners are skipped ────────────────────────────────

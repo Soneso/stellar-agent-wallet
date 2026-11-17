@@ -1,0 +1,28 @@
+{
+  "test_kind": "sequence",
+  "name": "mainnet_unlisted_per_tx_approval",
+  "category": "extended_grammar",
+  "description": "Mainnet allows equality at the unlisted per-payment bound and requests approval one stroop beyond it.",
+  "tool": {
+    "name": "stellar_pay",
+    "destructive_hint": true,
+    "read_only_hint": false,
+    "chain_id_required": true,
+    "chain_id": "stellar:mainnet"
+  },
+  "profile_name": "default",
+  "steps": [
+    {
+      "args": { "amount_stroops": "100", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+      "expected": { "kind": "Allow" }
+    },
+    {
+      "args": { "amount_stroops": "101", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+      "expected": {
+        "kind": "RequireApproval",
+        "approval_reason": "counterparty_allowlist: an unlisted recipient requires approval",
+        "approval_ttl_secs": 86400
+      }
+    }
+  ]
+}

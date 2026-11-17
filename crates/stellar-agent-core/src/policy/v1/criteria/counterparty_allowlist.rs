@@ -956,8 +956,9 @@ impl CounterpartyAllowlistCriterion {
             })?;
         let bundle_accumulated_stroops = ctx
             .bundle
-            .map(|view| view.overlay.get(&state_key))
-            .unwrap_or(0);
+            .map(|view| view.overlay.checked_get(&state_key))
+            .unwrap_or(Some(0))
+            .ok_or(PolicyError::AccountingOverflow)?;
         let would_use = window_used_stroops
             .checked_add(bundle_accumulated_stroops)
             .and_then(|used| used.checked_add(attempted_stroops))

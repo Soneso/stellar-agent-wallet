@@ -600,6 +600,28 @@ pub enum DenyReason {
         #[serde(with = "crate::wire_stroops::i128")]
         period_used_stroops: i128,
     },
+    /// A period sum exceeds i128, so no exact usage total can be reported.
+    /// Uses the same refusal code as [`Self::PerPeriodCapExceeded`].
+    PerPeriodCapOverflow {
+        /// The configured asset identifier.
+        asset: String,
+        /// The configured window label.
+        window: String,
+        /// The exceeded cap.
+        #[serde(with = "crate::wire_stroops::i128")]
+        max_stroops: i128,
+    },
+    /// An unlisted debit sum exceeds i128 and every representable bound.
+    /// Uses the same refusal code as [`Self::UnlistedBudgetExceeded`].
+    UnlistedBudgetOverflow {
+        /// The configured asset identifier.
+        asset: String,
+        /// The exceeded budget bound.
+        bound: UnlistedBound,
+        /// The exceeded cap.
+        #[serde(with = "crate::wire_stroops::i128")]
+        max_stroops: i128,
+    },
     /// The rate-limit (calls per window) was exceeded.
     RateLimitExceeded {
         /// Human-readable window description (e.g. `"rolling_1h"`).
@@ -968,7 +990,9 @@ impl DenyReason {
             Self::AssetNotAllowlisted => "asset_not_allowlisted",
             Self::PerTxCapExceeded { .. } => "per_tx_cap_exceeded",
             Self::ApprovalAboveExceeded { .. } => "approval_above_exceeded",
-            Self::PerPeriodCapExceeded { .. } => "per_period_cap_exceeded",
+            Self::PerPeriodCapExceeded { .. } | Self::PerPeriodCapOverflow { .. } => {
+                "per_period_cap_exceeded"
+            }
             Self::RateLimitExceeded { .. } => "rate_limit_exceeded",
             Self::CounterpartyDenied { .. } => "counterparty_denied",
             Self::MinimumReserveBreached { .. } => "minimum_reserve_breached",
@@ -987,7 +1011,9 @@ impl DenyReason {
             Self::Sep10SessionMissing { .. } => "sep10.session_missing",
             Self::Sep45SessionMissing { .. } => "sep45.session_missing",
             Self::TotalBudgetExhausted { .. } => "total_budget_exhausted",
-            Self::UnlistedBudgetExceeded { .. } => "unlisted_budget_exceeded",
+            Self::UnlistedBudgetExceeded { .. } | Self::UnlistedBudgetOverflow { .. } => {
+                "unlisted_budget_exceeded"
+            }
             Self::MemoBindingMismatch { .. } => "memo_binding_mismatch",
             Self::AccountFloorRefused { .. } => "account.floor_refused",
             Self::AccountUnread => "account.unread",
@@ -1028,7 +1054,9 @@ impl DenyReason {
             Self::AssetNotAllowlisted => "policy.deny.asset_not_allowlisted",
             Self::PerTxCapExceeded { .. } => "policy.deny.per_tx_cap_exceeded",
             Self::ApprovalAboveExceeded { .. } => "policy.deny.approval_above_exceeded",
-            Self::PerPeriodCapExceeded { .. } => "policy.deny.per_period_cap_exceeded",
+            Self::PerPeriodCapExceeded { .. } | Self::PerPeriodCapOverflow { .. } => {
+                "policy.deny.per_period_cap_exceeded"
+            }
             Self::RateLimitExceeded { .. } => "policy.deny.rate_limit_exceeded",
             Self::CounterpartyDenied { .. } => "policy.deny.counterparty_denied",
             Self::MinimumReserveBreached { .. } => "policy.deny.minimum_reserve_breached",
@@ -1049,7 +1077,9 @@ impl DenyReason {
             Self::Sep10SessionMissing { .. } => "policy.deny.sep10.session_missing",
             Self::Sep45SessionMissing { .. } => "policy.deny.sep45.session_missing",
             Self::TotalBudgetExhausted { .. } => "policy.deny.total_budget_exhausted",
-            Self::UnlistedBudgetExceeded { .. } => "policy.deny.unlisted_budget_exceeded",
+            Self::UnlistedBudgetExceeded { .. } | Self::UnlistedBudgetOverflow { .. } => {
+                "policy.deny.unlisted_budget_exceeded"
+            }
             Self::MemoBindingMismatch { .. } => "policy.deny.memo_binding_mismatch",
             Self::AccountFloorRefused { .. } => "account.floor_refused",
             Self::AccountUnread => "account.unread",
@@ -1541,6 +1571,12 @@ impl PolicyError {
 /// caller maps `Err(PolicyError::NotImplemented)` to the `policy.engine_required`
 /// wire-format error code.
 pub trait PolicyEngine: Send + Sync {
+    /// Reports whether the first matching rule explicitly permits opaque signing.
+    /// This consent query does not replace the rule's policy decision.
+    fn opaque_signing_opted_in(&self, _tool: &ToolDescriptor) -> bool {
+        false
+    }
+
     /// Evaluates against a privately owned window image and its fixed instant.
     ///
     /// # Errors
@@ -2038,6 +2074,10 @@ pub struct Evaluation {
 pub struct NoopPolicyEngine;
 
 impl PolicyEngine for NoopPolicyEngine {
+    fn opaque_signing_opted_in(&self, _tool: &ToolDescriptor) -> bool {
+        true
+    }
+
     /// Returns `NoApplicableLimit` because this engine holds no window state.
     ///
     /// # Errors

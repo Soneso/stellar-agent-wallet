@@ -876,7 +876,7 @@ mod budget {
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let handle = fx.open_new(&request("budget-class", canonical(1)));
-        let mut minted = fx.mint_request(tx(1), fx.policy(), vec![]);
+        let mut minted = fx.operation_mint_request(&handle, tx(1), fx.policy(), vec![]);
         minted.native_reservation = Some(NativeReservation {
             debit_stroops: 40,
             fee_stroops: 2,

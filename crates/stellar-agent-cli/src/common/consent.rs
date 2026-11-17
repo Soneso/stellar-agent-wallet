@@ -11,6 +11,92 @@ use stellar_agent_core::audit_log::{
 };
 use stellar_agent_core::{error::WalletError, profile::schema::Profile};
 
+/// The keyed outbox for reservation and publication under this profile.
+pub(crate) fn consent_outbox(profile: &Profile, name: &str) -> Result<AuditOutbox, WalletError> {
+    let access =
+        stellar_agent_network::keyring::keyed_audit_access(profile, name, BindingCheck::Enforce)?;
+    let (key, anchor) = access.into_parts();
+    Ok(AuditOutbox::for_log_keyed(
+        &profile.audit_log_path,
+        anchor,
+        key,
+    ))
+}
+
+/// Verifies the original receipt and handoff while admitted, then releases
+/// both guards before constructing the durable publication.
+pub(crate) fn publication_completion(
+    pending: stellar_agent_core::approval::PendingApprovalStore,
+    profile: &Profile,
+    name: &str,
+    nonce: &str,
+    policy: &stellar_agent_core::mainnet::verified_policy::VerifiedPolicy,
+    admission: stellar_agent_core::approval::presence_policy::PolicyAdmission,
+) -> Result<stellar_agent_network::operation_entry::ConsentCompletion, WalletError> {
+    use stellar_agent_core::approval::{
+        AttestationBinding, load_attestation_key, verify_consent_publication,
+        witness::{ApprovalExpectation, verify_approval_admitted},
+    };
+    use stellar_agent_network::operation_entry::{
+        operation_refusal, persisted_attestation, witnessed_publication_completion,
+    };
+    use stellar_agent_network::policy_state::{
+        ApprovalStatus, ConsentPayload, ConsentRow, PersistedWindowStore,
+    };
+    let absent = || {
+        WalletError::Approval(stellar_agent_core::ApprovalFailure::NotFound {
+            detail: "the consent has no durable record or inbox entry".to_owned(),
+        })
+    };
+    let window = PersistedWindowStore::for_profile(name);
+    let record = ApprovalStatus::new(&window, profile)
+        .find_by_nonce(nonce)
+        .map_err(operation_refusal)?
+        .ok_or_else(absent)?
+        .record;
+    let entry = pending.get(nonce).ok_or_else(absent)?;
+    let attestation = persisted_attestation(&pending, nonce)?;
+    let receipt = entry.mainnet_presence.clone().ok_or(WalletError::Approval(
+        stellar_agent_core::ApprovalFailure::PresenceRequired,
+    ))?;
+    let witness = verify_approval_admitted(
+        &pending,
+        profile,
+        name,
+        nonce,
+        &attestation,
+        &ApprovalExpectation {
+            kind: record.kind,
+            subject: record.subject,
+        },
+        policy,
+        stellar_agent_core::timefmt::now_unix_ms().map_err(|error| {
+            WalletError::Approval(stellar_agent_core::ApprovalFailure::ClockError {
+                detail: error.to_string(),
+            })
+        })?,
+        &admission,
+    )?;
+    let key = load_attestation_key(
+        &profile.attestation_key_id,
+        &stellar_agent_core::profile::owner_key::OwnerKeyContext::for_profile(name, profile),
+    )?;
+    let publication = verify_consent_publication(
+        entry,
+        &key,
+        &AttestationBinding::new(name, profile.chain_id.caip2_str()),
+    )?;
+    let payload = ConsentPayload::new(
+        attestation,
+        receipt,
+        entry.process_uid.clone(),
+        ConsentRow::Written,
+    );
+    drop(pending);
+    drop(admission);
+    witnessed_publication_completion(&window, profile, witness, payload, &publication)
+}
+
 /// The sink an operator row is written through: the consent row of
 /// `approve --id` and of the mainnet confirmation, and the halt and resume
 /// rows of `profile halt` and `profile resume`.

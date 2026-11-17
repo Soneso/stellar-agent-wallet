@@ -11,7 +11,8 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use stellar_agent_core::approval::{
     AttestationBinding, ClassicIntent, IntentAsset, IntentBase, IntentPayload, MemoFact,
-    PendingApproval, PendingApprovalStore, load_attestation_key, verify_consent_publication,
+    PendingApproval, PendingApprovalStore, VerifiedConsentPublication, load_attestation_key,
+    verify_consent_publication,
     witness::{ApprovalExpectation, ApprovalWitness, ApprovedKind, verify_approval},
 };
 use stellar_agent_core::audit_log::{
@@ -1403,6 +1404,52 @@ pub fn witnessed_completion(
         }))
 }
 
+/// Completes a witnessed consent using its verified publication handoff.
+/// The caller verifies both from the same inbox entry under policy admission,
+/// then releases the writer, inbox and admission before calling this builder.
+/// Only the handoff supplies delivery and the exact queued reference.
+///
+/// # Errors
+/// Returns store refusals, `approval.not_found` without a durable record,
+/// and `approval.attestation_invalid` when the handoff names another subject.
+pub fn witnessed_publication_completion(
+    store: &PersistedWindowStore,
+    profile: &Profile,
+    witness: ApprovalWitness,
+    mut payload: ConsentPayload,
+    publication: &VerifiedConsentPublication,
+) -> Result<ConsentCompletion, WalletError> {
+    let record = ApprovalStatus::new(store, profile)
+        .find_by_nonce(witness.nonce())
+        .map_err(operation_refusal)?
+        .ok_or_else(|| {
+            WalletError::Approval(ApprovalFailure::NotFound {
+                detail: "the publication has no durable approval record".to_owned(),
+            })
+        })?
+        .record;
+    if publication.subject() != record.subject {
+        return Err(WalletError::Approval(ApprovalFailure::AttestationInvalid {
+            detail: "the consent publication names another subject".to_owned(),
+        }));
+    }
+    payload.outbox_row = publication.outbox_row().copied();
+    payload.row_provenance = publication
+        .outbox_row()
+        .is_none()
+        .then_some(crate::policy_state::RowProvenance::Written);
+    Ok(ConsentCompletion {
+        id: record.id,
+        witness,
+        payload,
+        delivery: Some(if publication.is_direct_anchored() {
+            ConsentDeliveryV1::direct_anchored(record.id)
+        } else {
+            ConsentDeliveryV1::queued(record.id)
+        }),
+    })
+}
+
 /// The audit sink of a consent commit, which appends no row. An append is a
 /// defect and fails the step as `audit.append_failed`.
 pub(crate) struct ConsentOnlyAudit;
@@ -1480,7 +1527,7 @@ impl ConsentAdmission<'_> {
         &mut self,
         operation: OperationId,
         facts: &PendingApprovalFacts,
-        open: impl FnOnce(&PendingApprovalFacts) -> Result<ApprovalView, WalletError>,
+        open: impl FnOnce(&mut AuditWriter, &PendingApprovalFacts) -> Result<ApprovalView, WalletError>,
         present: impl FnOnce(&WireApproval, &EvidenceReservation) -> Result<T, WalletError>,
     ) -> Result<T, WalletError> {
         let name = profile_name_for_approval(self.profile);
@@ -1493,7 +1540,7 @@ impl ConsentAdmission<'_> {
         };
         let record = match committed()? {
             Some(view) => view.record,
-            None => match open(facts) {
+            None => match open(self.writer, facts) {
                 Ok(view) => view.record,
                 Err(error) => committed()?.ok_or(error)?.record,
             },
@@ -1502,9 +1549,35 @@ impl ConsentAdmission<'_> {
         self.writer
             .initialize_consent_evidence()
             .map_err(evidence_refusal)?;
-        if self
-            .writer
-            .outbox_evidence()
+        let reservation = Self::reacquire(
+            self.store,
+            self.profile,
+            record.operation_id,
+            &record.facts(),
+            self.outbox,
+        )?;
+        present(&record, &reservation)
+    }
+
+    /// Reacquires an existing record's slot without acquiring an audit writer.
+    /// Inventory, initialized evidence and authenticated facts must all agree.
+    /// This path never initializes from absent ownership or evidence files.
+    ///
+    /// # Errors
+    /// Returns inventory, evidence and authenticated record refusals, including
+    /// `approval.evidence_capacity`. Unresolved migration pins refuse admission.
+    pub fn reacquire(
+        store: &PersistedWindowStore,
+        profile: &Profile,
+        operation: OperationId,
+        facts: &PendingApprovalFacts,
+        outbox: &AuditOutbox,
+    ) -> Result<EvidenceReservation, WalletError> {
+        let name = profile_name_for_approval(profile);
+        require_consent_evidence_inventory(&name)?;
+        let evidence_refusal = |error: WriterError| audit_writer_refusal(&name, &error);
+        if outbox
+            .evidence()
             .map_err(evidence_refusal)?
             .is_none_or(|evidence| evidence.holds_migration_pins())
         {
@@ -1513,13 +1586,13 @@ impl ConsentAdmission<'_> {
             }));
         }
         let reservation = ApprovalRecorder::new(
-            self.store,
-            self.profile,
+            store,
+            profile,
             &mut ConsentOnlyAudit,
             uuid::Uuid::new_v4().to_string(),
         )
-        .reserve_consent_evidence(record.operation_id, &record.facts(), self.outbox)?;
-        present(&record, &reservation)
+        .reserve_consent_evidence(operation, facts, outbox)?;
+        Ok(reservation)
     }
 }
 
@@ -2549,6 +2622,46 @@ pub(crate) mod tests {
         let above = rebuild(ClassicFeeChoice::Explicit(501)).await.unwrap_err();
         assert_eq!(above.code(), "fees.percentile_exceeds_cap");
         assert!(rebuild(ClassicFeeChoice::Explicit(500)).await.is_ok());
+        for selected in [240_u32, 500, 501] {
+            use stellar_agent_test_support::EchoIdResponder;
+            use wiremock::{Mock, matchers::body_partial_json};
+            serve_chain(&f, &primary, &oracle, 5, "healthy").await;
+            let mut distribution = json!({"transactionCount": "1", "ledgerCount": 1});
+            for key in [
+                "min", "max", "mode", "p10", "p20", "p30", "p40", "p50", "p60", "p70", "p80",
+                "p90", "p95", "p99",
+            ] {
+                distribution[key] = json!(selected.to_string());
+            }
+            Mock::given(body_partial_json(json!({"method": "getFeeStats"})))
+                .respond_with(EchoIdResponder::new(json!({
+                    "inclusionFee": distribution,
+                    "sorobanInclusionFee": distribution,
+                    "latestLedger": 100,
+                })))
+                .mount(&primary)
+                .await;
+            let result = rebuild(ClassicFeeChoice::Auto(crate::fees::FeePercentile::P95)).await;
+            assert_eq!(
+                methods(&primary).await,
+                ["getHealth", "getLedgers", "getLedgerEntries", "getFeeStats"],
+                "Auto reads fresh fees after readiness and the account"
+            );
+            if selected <= 500 {
+                let rebuilt = result.unwrap();
+                assert_eq!(
+                    match_envelope(&rebuilt.unsigned_envelope_b64, &check)
+                        .unwrap()
+                        .fee_stroops,
+                    selected,
+                    "the envelope binds the fresh percentile"
+                );
+                assert_eq!(subject(&rebuilt), tx_hash(&rebuilt.unsigned_envelope_b64));
+            } else {
+                assert_eq!(result.unwrap_err().code(), "fees.percentile_exceeds_cap");
+                assert!(methods(&oracle).await.is_empty());
+            }
+        }
         serve_chain(&f, &primary, &oracle, i64::MAX, "healthy").await;
         let exhausted = rebuild(ClassicFeeChoice::ProfileDefault).await.unwrap_err();
         assert_eq!(exhausted.code(), "protocol.xdr_codec_failed");

@@ -225,10 +225,17 @@ async fn all_value_verbs_require_delivered_consent() {
             .zip(names)
         {
             let fixture = verb.spec(name).build().await;
-            let _enabled = ConsentEvidenceEnforcementGuard::new(fixture.name, kind);
+            let enabled = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let at_consumer = enabled.clone();
             let _hook = crate::common::mainnet_write::consent_test::on_witness(
                 fixture.name,
-                move |profile, witness| record_delivery_fixture(profile, witness, queued, dropped),
+                move |profile, witness| {
+                    record_delivery_fixture(profile, witness, queued, dropped);
+                    at_consumer.replace(Some(ConsentEvidenceEnforcementGuard::new(
+                        witness.profile(),
+                        kind,
+                    )));
+                },
             );
             let before = signer_resolutions_on_this_thread();
             let (code, envelope) = verb.run(&fixture).await;
@@ -618,5 +625,157 @@ async fn cli_policy_refusals_render_once_at_the_boundary() {
             .unwrap();
         let boundary = &source[start..start + source[start..].find("\n    };").unwrap()];
         assert_eq!(boundary.matches("render_authority_refusal(").count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod publication {
+    use super::*;
+    use stellar_agent_core::approval::witness::ApprovedKind;
+    use stellar_agent_core::audit_log::{
+        BindingCheck, MAX_EVIDENCE_ENTRIES, test_helpers::seed_reserved_evidence,
+    };
+    use stellar_agent_network::policy_state::PersistedWindowStore;
+    use stellar_agent_network::policy_state::approvals::{
+        ApprovalStatus, ConsentEvidenceEnforcementGuard, ConsentEvidenceInventoryGuard,
+    };
+
+    fn fill_scope(fixture: &MainnetFixture) {
+        let profile = fixture.profile();
+        let writer =
+            crate::commands::value_audit::require_value_audit_writer(&profile, fixture.name)
+                .unwrap();
+        writer
+            .lock()
+            .unwrap()
+            .initialize_consent_evidence()
+            .unwrap();
+        let (key, anchor) = stellar_agent_network::keyring::keyed_audit_access(
+            &profile,
+            fixture.name,
+            BindingCheck::Enforce,
+        )
+        .unwrap()
+        .into_parts();
+        let identities: Vec<_> = (0..MAX_EVIDENCE_ENTRIES)
+            .map(|i| {
+                let mut identity = [0xdd; 32];
+                identity[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                identity
+            })
+            .collect();
+        seed_reserved_evidence(
+            &profile.audit_log_path,
+            anchor.as_ref(),
+            &key,
+            &identities,
+            u64::MAX,
+        )
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn all_value_verbs_reserve_before_ceremony() {
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let names = [
+            [
+                "publication-pay-full",
+                "publication-pay-inventory",
+                "publication-pay-enabled",
+                "publication-pay-disabled",
+            ],
+            [
+                "publication-claim-full",
+                "publication-claim-inventory",
+                "publication-claim-enabled",
+                "publication-claim-disabled",
+            ],
+            [
+                "publication-create-full",
+                "publication-create-inventory",
+                "publication-create-enabled",
+                "publication-create-disabled",
+            ],
+            [
+                "publication-trust-full",
+                "publication-trust-inventory",
+                "publication-trust-enabled",
+                "publication-trust-disabled",
+            ],
+        ];
+        for (verb, names) in Verb::ALL.into_iter().zip(names) {
+            let kind = match verb {
+                Verb::Pay | Verb::Create => ApprovedKind::Payment,
+                Verb::Claim => ApprovedKind::Claim,
+                Verb::Trustline => ApprovedKind::Trustline,
+            };
+            for (mode, name) in names.into_iter().enumerate() {
+                let fixture = verb.spec(name).build().await;
+                let _enabled =
+                    (mode != 3).then(|| ConsentEvidenceEnforcementGuard::new(name, kind));
+                let _ready = (mode != 1).then(|| ConsentEvidenceInventoryGuard::new(name));
+                if mode == 0 || mode == 3 {
+                    fill_scope(&fixture);
+                }
+                let before = signer_resolutions_on_this_thread();
+                let (code, envelope) = verb.run(&fixture).await;
+                if mode < 2 {
+                    assert_eq!(code, 1, "admission refuses the real command: {envelope}");
+                    assert_eq!(
+                        envelope["error"]["code"],
+                        if mode == 0 {
+                            "approval.evidence_capacity"
+                        } else {
+                            "audit.outbox_evidence_unusable"
+                        },
+                        "the command preserves the admission refusal: {envelope}"
+                    );
+                    assert!(
+                        fixture.summaries().is_empty(),
+                        "admission precedes command display"
+                    );
+                    assert!(
+                        fixture.ceremonies().is_empty(),
+                        "admission precedes command presence"
+                    );
+                    assert!(
+                        fixture.pending_entries().is_empty(),
+                        "admission precedes inbox insertion"
+                    );
+                    assert!(fixture.audit_rows("approval_attested").is_empty());
+                    assert_eq!(signer_resolutions_on_this_thread(), before);
+                    assert!(fixture.sent_envelopes().await.is_empty());
+                    assert!(
+                        fixture
+                            .open_authorizations(
+                                stellar_agent_core::timefmt::now_unix_ms().unwrap()
+                            )
+                            .is_empty()
+                    );
+                } else {
+                    assert_eq!(code, 0, "command publication succeeds: {envelope}");
+                    assert_eq!(fixture.ceremonies().len(), 1);
+                    assert_eq!(fixture.audit_rows("approval_attested").len(), 1);
+                    assert_eq!(fixture.sent_envelopes().await.len(), 1);
+                    let window = PersistedWindowStore::for_profile(name);
+                    let record = ApprovalStatus::new(&window, &fixture.profile())
+                        .find_by_nonce(&fixture.ceremonies()[0].nonce)
+                        .unwrap()
+                        .unwrap()
+                        .record;
+                    let consent = record.consent.unwrap();
+                    assert_eq!(
+                        consent.delivery.is_some(),
+                        mode == 2,
+                        "only integrated commands publish delivery"
+                    );
+                    if let Some(delivery) = consent.delivery {
+                        assert_eq!(delivery, stellar_agent_network::policy_state::approvals::ConsentDeliveryV1::direct_anchored(record.id));
+                    }
+                }
+            }
+        }
     }
 }

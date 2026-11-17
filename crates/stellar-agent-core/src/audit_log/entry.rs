@@ -2780,12 +2780,10 @@ impl AuditEntry {
 
     /// Constructs an `OpaquePayloadSigned` audit entry.
     ///
-    /// Emitted at the point a SEP-43 sign-only tool produces a signature the
-    /// caller broadcasts externally — the wallet never observes a submit, so
-    /// this row records that the signature EXISTS, not that anything
-    /// confirmed. `payload_sha256_redacted` MUST be pre-redacted
-    /// (first-8-last-8 of the hex digest) at the call site; the signature and
-    /// payload are never recorded.
+    /// Records a signature the caller can broadcast externally, with optional
+    /// evaluated legs in signed operation order. The row does not prove settlement.
+    /// `payload_sha256_redacted` must contain only the first and last eight digest
+    /// characters. The signature and payload are never recorded.
     #[must_use]
     pub fn new_opaque_payload_signed(
         tool: impl Into<String>,
@@ -2793,6 +2791,7 @@ impl AuditEntry {
         payload_sha256_redacted: impl Into<String>,
         signer_redacted: RedactedStrkey,
         request_id: impl Into<String>,
+        legs: Vec<ValueLegRecord>,
     ) -> Self {
         Self {
             ts: current_iso8601_utc(),
@@ -2809,6 +2808,7 @@ impl AuditEntry {
             event_kind: EventKind::OpaquePayloadSigned {
                 payload_sha256_redacted: payload_sha256_redacted.into(),
                 signer_redacted,
+                legs,
             },
             previous_entry_hash: String::new(),
             entry_tag: None,

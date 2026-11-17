@@ -98,7 +98,7 @@ fn submission_progress_one_verified_image() {
     let (_guard, _home) = homed();
     let mut fx = Fx::new();
     let sending = fx.open_new(&request("order-1", canonical(1)));
-    let mint = fx.mint_request(tx(1), fx.policy(), vec![]);
+    let mint = fx.operation_mint_request(&sending, tx(1), fx.policy(), vec![]);
     let started = fx.begin_mint(&sending, &mint).unwrap();
     fx.claim(&mint, started.minted.as_ref().unwrap());
     fx.recorder()
@@ -209,7 +209,7 @@ fn submission_progress_and_admission_share_predecessor_guards() {
         };
         assert!(!found.retry_eligible, "{case}: predecessor refuses");
         assert_eq!(found.retry_refusal.as_deref(), Some(expected), "{case}");
-        let mint = fx.mint_request(tx(11), fx.policy(), vec![]);
+        let mint = fx.operation_mint_request(&handle, tx(11), fx.policy(), vec![]);
         let error = fx.begin_mint(&handle, &mint).unwrap_err();
         if case == "expired" {
             assert!(matches!(
@@ -239,7 +239,7 @@ fn submission_progress_and_admission_share_predecessor_guards() {
             link_next(&fx, &handle, 21, approval);
             begin_linked(&mut fx, &handle).unwrap()
         } else {
-            let mint = fx.mint_request(tx(21), approval, vec![]);
+            let mint = fx.operation_mint_request(&handle, tx(21), approval, vec![]);
             fx.begin_mint(&handle, &mint).unwrap()
         };
         assert_eq!(next.attempt_index, 2, "fresh Approval successor");
@@ -560,7 +560,7 @@ fn submission_progress_two_process_generations() {
             "both processes read the predecessor"
         );
         let handle = OperationHandle::of(&records(&fx.wire())[0]);
-        let mint = fx.mint_request(tx(21), fx.policy(), vec![]);
+        let mint = fx.operation_mint_request(&handle, tx(21), fx.policy(), vec![]);
         fx.begin_mint(&handle, &mint).unwrap();
         let coordinate = generation_entry_ref(&fx.profile);
         let generation = keyring_core::Entry::new(&coordinate.service, &coordinate.account)
@@ -659,7 +659,8 @@ fn submission_progress_candidate_checks_remain_admission_only() {
         progress(&fx, 1).retry_eligible,
         "spent predecessor approval permits a fresh candidate"
     );
-    let reused = fx.mint_request(
+    let reused = fx.operation_mint_request(
+        &handle,
         tx(21),
         MintAuthority::Approval {
             nonce,

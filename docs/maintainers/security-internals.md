@@ -752,6 +752,35 @@ The value descriptor reaches the emission site through the policy engine's `eval
 
 The submission recorder writes the pending row in its pre-send step (`WalletSubmissionRecorder::pre_send` and its bound and authorized forms in `stellar-agent-network`), the same site on every surface. The DEX and DeFindex adapters write only the `sa_raw_invocation` row of a failed submit (`emit_sa_raw_invocation_failure` in `stellar-agent-smart-account`). The smart-account verbs also write their own `sa_*` domain rows.
 
+### Authorized accounting batches
+
+`record_authorized_window_states` prepares each tool's evaluated effects in order.
+It collects every accounting entry before calling durable admission once.
+Admission holds the window-state lock while rereading authenticated state and checking all entries.
+A refused batch adds no usage, including when a later item cannot be sized.
+Preparation can change memory; the next dispatch clears it and reloads durable state.
+The singular authorization helper retains its existing contract.
+
+The batch helper's durable admission runs generation work under the window-state lock.
+The lock is released when durable admission returns.
+The generation counter advances before replacing the file.
+A failed replacement leaves a generation mismatch and stops later use.
+No recovery verb repairs that mismatch; create a profile under a new name.
+
+Amount admission checks stored rows, fallback shares, bundle overlays, and proposed legs without saturation.
+Raw queries return typed overflow errors and keep the stored records.
+Callers with a governing period, total, or unlisted limit return that limit's denial code.
+Period and unlisted overflow payloads omit unrepresentable usage figures.
+Count, clock, and reporting projections retain their existing arithmetic.
+Authorized rows use existing window formats; the highest supported version remains 16.
+
+`opaque_signing_opted_in` reads the first matching rule's flag.
+It defaults to false and returns true for the Noop engine.
+The query supplies consent information; the rule's decision still governs the call.
+The signing audit constructor accepts ordered evaluated legs.
+An empty vector is omitted and historical rows deserialize with empty legs.
+Current transaction, auth-entry, and message-signing callers pass empty vectors.
+
 ### Key-write emission sites
 
 Each profile command that writes long-lived key material to the keyring records a `keyring_key_written` row after the write succeeds, naming the key slot (`key_purpose`) and the keyring coordinates. The signer and owner-key enroll commands additionally record a redacted (first-5-last-5) public address; the RPC credential enrollment and the HMAC-key rotations record none. The row NEVER carries a key value, seed, base64 material, or any derived secret.
@@ -1586,6 +1615,8 @@ same counter and keep their stored bytes. Unlisted sums there are checked: an
 overflow refuses with `policy.accounting_overflow` and a negative stored amount
 with `policy.accounting_invalid`, before any write. Hydration keeps a negative
 row as stored, and evaluation refuses its bucket with the same code.
+The unlisted key contains no policy digest. Re-signing preserves its rolling
+usage, and reopening the store hydrates the same counter.
 `mint_into` derives the admission mode from the mint's own verified authority,
 after the nonce check and consumption or the parent check. Under an approval
 authority an unlisted hold passes the spent allowance and still counts in
@@ -1710,6 +1741,7 @@ Stateful spending criteria read amounts and counts from `PolicyStateStore`. Conf
   Destination fields on records, consumption bindings, or accounting expiries require version 14 (`WIRE_VERSION_DESTINATION`). Builds capped at 13 refuse it.
   Final total-budget charges and settled sums require version 15 (`WIRE_VERSION_TOTAL_SUMS`). Builds capped at 14 refuse it.
   Total-budget intent legs require version 16 (`WIRE_VERSION_TOTAL_INTENTS`). Builds capped at 15 refuse both current and prepared images.
+  Canonical authorization lineage requires version 17 (`WIRE_VERSION_CANONICAL_LINEAGE`). Builds capped at 16 refuse it.
   Each committed version floor stays after its fields are removed.
 - **Authorization ledger**: open and claimed records hold window capacity outside the bucket records. Durable admission counts every total hold until a committed sweep removes it. Hydration counts total holds as an ordinary writer's sweep would leave them at its clock reading. Reconciliation, confirmation, and release never see a hold. Expiry is measured on the store's own clock, and a transaction sweeps expired authorizations under the lock before it counts. Invalidation or expiry releases only unclaimed holds. A signing claim records its time before the signer runs. Expiry converts claimed holds to confirmed spend dated at the claim and bound to its chain. A consumed transaction authorization's holds become submission pending records; a consumed Soroban intent's become confirmed authorized spend. Settled history is pruned after the retention window once its approval ends; open and claimed records stay. A window state reset keeps every record whose approval can still be presented and settles a record that holds capacity as expired.
 - **Key**: the profile's `policy_window_state_key_id` keyring coordinate (`stellar-agent-policy-window-<profile>` by convention), lazily minted on first write.
@@ -1735,6 +1767,8 @@ A total debit leaves its sum in four ways. An unclaimed hold is invalidated, or 
 `select_wire_version` writes version 12 unless stored fields or a committed floor require a higher version.
 A recovery run record requires at least version 13; destination fields require version 14; final total-budget charges and settled sums require version 15. Each committed floor stays after pruning.
 Total-bearing intents require version 16. A committed version 16 floor stays after collection or cancellation.
+Canonical authorization intent digests and attempt predecessors require version 17. That floor stays after collection.
+Absent lineage fields retain their legacy serialized form. Duplicate or unknown fields refuse the authenticated file.
 Builds capped at 12 refuse version 13, builds capped at 13 refuse version 14, and builds capped at 14 refuse version 15 with `UnsupportedVersion`.
 
 A total row is final when no supported release can change it. Admitted authorized spend and a consumption without a transaction are final. So is a counted row of an authorization whose retained attempt holds a checked success, whatever status it reached. A success decided while its claim still holds keeps the hold charged; the conversion of the hold marks the row final while the decision is retained. Final means no later release applies, not that an external authorization executed.
@@ -2163,6 +2197,22 @@ without renewing an earlier execution expiry. Consent alone leaves the operation
 awaiting approval until a linked mint supplies authority.
 The recorder creates no operation transition or audit row.
 
+A waiting operation survives its waiting expiry while its linked intent approval has unrevoked consent with a retained payload and an unexpired execution window.
+The sweep and first-attempt admission check the same authenticated record under `WindowStoreLock`.
+Execution expiry is exclusive. Released payloads, unconsented records, and envelope approvals keep the waiting-expiry rule.
+Consented waiting operations continue to count toward the 16-record capacity limit.
+
+For a canonical slot, transaction resolution validates the stored intent against the current chain, signing account, and signed policy.
+It matches the candidate envelope and rereads a claimable balance through the primary client.
+The approval subject is the reconstructed intent digest. The signing binding keeps the exact unsigned envelope hash.
+Intent approval authority ends at the earlier of execution expiry and the captured decision end.
+The signed waiting-expiry getter retains its original meaning.
+
+A canonical authorization carries its intent digest, operation link, and predecessor in its sealed header and signing claim.
+The mint compares the digest with the stored slot and the predecessor with the latest attempt's authorization under the window lock.
+The x402 parent retains its separate meaning. Malformed canonical content refuses resolution while lifecycle operations remain available.
+Current commands create envelope slots; canonical slot creation is not exposed by the command or tool surfaces.
+
 `approve revoke --id <nonce> --profile <name>` resolves the nonce through authenticated status.
 Only `ApprovalRecorder::revoke` changes the durable record.
 The profile owner can revoke consumed records inside execution, including after inbox collection.
@@ -2256,6 +2306,17 @@ with any queued reference. Compatibility, testnet and clawback opt-in consents
 store none. The integrated completion takes the sink only from a verified
 handoff and commits it as the record's delivery facts. Integrated admission
 refuses while no authenticated owner-scope inventory exists.
+
+The CLI confirmation and existing-record `approve --id` routes select integrated
+publication through the same kind capability as consumption. All capabilities
+remain disabled. Enabled confirmations reserve before inserting or showing a
+request; existing-record approval reacquires through the keyed outbox before
+presence. Strict consent carries its reservation into a queued append.
+Verification uses the held policy admission, then releases writer, inbox, and
+admission before committing the authenticated delivery. Recovery preserves the
+original sink and receipt time. A missing handoff refuses instead of supplying
+direct provenance. The compatibility recovery described above still uses
+`recovered` provenance. Inbox and MCP integration remain separate prerequisites.
 
 Consent retains the attestation, receipt and signed process identifier for
 reconstruction. The record supplies the signed nonce, kind, subject and

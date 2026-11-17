@@ -361,7 +361,9 @@ fn enumerate_deny_reason_for_test(v: &DenyReason) -> &'static str {
     match v {
         DenyReason::PerTxCapExceeded { .. } => "per_tx_cap_exceeded",
         DenyReason::ApprovalAboveExceeded { .. } => "approval_above_exceeded",
-        DenyReason::PerPeriodCapExceeded { .. } => "per_period_cap_exceeded",
+        DenyReason::PerPeriodCapExceeded { .. } | DenyReason::PerPeriodCapOverflow { .. } => {
+            "per_period_cap_exceeded"
+        }
         DenyReason::RateLimitExceeded { .. } => "rate_limit_exceeded",
         DenyReason::CounterpartyDenied { .. } => "counterparty_denied",
         DenyReason::MinimumReserveBreached { .. } => "minimum_reserve_breached",
@@ -381,7 +383,9 @@ fn enumerate_deny_reason_for_test(v: &DenyReason) -> &'static str {
         DenyReason::Sep10SessionMissing { .. } => "sep10.session_missing",
         DenyReason::Sep45SessionMissing { .. } => "sep45.session_missing",
         DenyReason::TotalBudgetExhausted { .. } => "total_budget_exhausted",
-        DenyReason::UnlistedBudgetExceeded { .. } => "unlisted_budget_exceeded",
+        DenyReason::UnlistedBudgetExceeded { .. } | DenyReason::UnlistedBudgetOverflow { .. } => {
+            "unlisted_budget_exceeded"
+        }
         DenyReason::MemoBindingMismatch { .. } => "memo_binding_mismatch",
         DenyReason::AccountFloorRefused { .. } => "account.floor_refused",
         DenyReason::AccountUnread => "account.unread",

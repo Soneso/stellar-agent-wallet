@@ -470,6 +470,26 @@ async fn approve_mainnet(
     let window = PersistedWindowStore::for_profile(&context.profile_name);
     let durable = durable_approval(&window, profile, context, entry)?;
     drop(store);
+    let integrated = durable.as_ref().is_some_and(|view| {
+        stellar_agent_network::policy_state::approvals::delivery_enforced(
+            &context.profile_name,
+            view.record.kind,
+        )
+    });
+    let reservation = durable
+        .as_ref()
+        .filter(|_| integrated)
+        .map(|view| {
+            let outbox = crate::common::consent::consent_outbox(profile, &context.profile_name)?;
+            stellar_agent_network::operation_entry::ConsentAdmission::reacquire(
+                &window,
+                profile,
+                view.record.operation_id,
+                &view.record.facts(),
+                &outbox,
+            )
+        })
+        .transpose()?;
     #[allow(clippy::print_stderr, reason = "CLI operator consent instructions")]
     {
         let signed = crate::commands::profile::policy_check::has_signed_origin(
@@ -493,9 +513,14 @@ async fn approve_mainnet(
         credential_fingerprint: presence.credential_fingerprint().to_owned(),
         request_id: presence.request_id().to_owned(),
     };
+    let admission = integrated.then(|| authority.admit()).transpose()?;
     let mut store = open_with_retry(store_path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF)
         .map_err(|e| super::common::approval_store_open_error(&e))?;
-    let policy = authority.load_current_compare_only()?.into_policy();
+    let policy = match &admission {
+        Some(admission) => authority.load_admitted(admission)?,
+        None => authority.load_current_compare_only()?,
+    }
+    .into_policy();
     let key = load_attestation_key(
         &profile.attestation_key_id,
         &stellar_agent_core::profile::owner_key::OwnerKeyContext::for_profile(
@@ -509,25 +534,45 @@ async fn approve_mainnet(
         &key,
         context,
         profile,
-        ConsentAuthorization::Mainnet {
-            presence,
-            policy: &policy,
+        match &admission {
+            Some(admission) => ConsentAuthorization::MainnetAdmitted {
+                presence,
+                policy: &policy,
+                admission,
+            },
+            None => ConsentAuthorization::Mainnet {
+                presence,
+                policy: &policy,
+            },
         },
+        reservation,
     )?;
-    let completion = durable
-        .map(|_| {
-            consent_completion(
-                &store,
-                &window,
-                profile,
-                &context.profile_name,
-                &entry.approval_nonce,
-                &policy,
-                outbox_row.map_or(ConsentRow::Written, ConsentRow::Queued),
-            )
-        })
-        .transpose()?;
-    drop(store);
+    let completion = if let Some(admission) = admission {
+        Some(crate::common::consent::publication_completion(
+            store,
+            profile,
+            &context.profile_name,
+            &entry.approval_nonce,
+            &policy,
+            admission,
+        )?)
+    } else {
+        let completion = durable
+            .map(|_| {
+                consent_completion(
+                    &store,
+                    &window,
+                    profile,
+                    &context.profile_name,
+                    &entry.approval_nonce,
+                    &policy,
+                    outbox_row.map_or(ConsentRow::Written, ConsentRow::Queued),
+                )
+            })
+            .transpose()?;
+        drop(store);
+        completion
+    };
     if let Some(completion) = completion {
         commit_consent(&window, profile, &completion)?;
     }
@@ -640,10 +685,44 @@ fn recover_durable_consent(
         return Ok(store);
     };
     let window = PersistedWindowStore::for_profile(&context.profile_name);
-    if durable_approval(&window, profile, context, entry)?
+    let durable = durable_approval(&window, profile, context, entry)?;
+    if durable
+        .as_ref()
         .is_none_or(|view| view.record.consent.is_some())
     {
         return Ok(store);
+    }
+    if let Some(view) = durable.filter(|view| {
+        stellar_agent_network::policy_state::approvals::delivery_enforced(
+            &context.profile_name,
+            view.record.kind,
+        )
+    }) {
+        drop(store);
+        let outbox = crate::common::consent::consent_outbox(profile, &context.profile_name)?;
+        stellar_agent_network::operation_entry::ConsentAdmission::reacquire(
+            &window,
+            profile,
+            view.record.operation_id,
+            &view.record.facts(),
+            &outbox,
+        )?;
+        let authority = MainnetApprovalAuthority::for_profile(&context.profile_name)?;
+        let admission = authority.admit()?;
+        let policy = authority.load_admitted(&admission)?.into_policy();
+        let store = open_with_retry(store_path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF)
+            .map_err(|error| super::common::approval_store_open_error(&error))?;
+        let completion = crate::common::consent::publication_completion(
+            store,
+            profile,
+            &context.profile_name,
+            nonce,
+            &policy,
+            admission,
+        )?;
+        commit_consent(&window, profile, &completion)?;
+        return open_with_retry(store_path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF)
+            .map_err(|error| super::common::approval_store_open_error(&error));
     }
     let policy = MainnetApprovalAuthority::for_profile(&context.profile_name)?
         .load_current_compare_only()?
@@ -705,6 +784,7 @@ fn approve_with_consent_row(
         context,
         profile,
         ConsentAuthorization::Standard(&AttestedApprover::Local),
+        None,
     )
     .map(|(attestation, outcome, _row)| (attestation, outcome))
 }
@@ -724,6 +804,7 @@ fn record_consent(
     context: &ApprovalContext,
     profile: &Profile,
     authorization: ConsentAuthorization<'_>,
+    reservation: Option<stellar_agent_core::audit_log::EvidenceReservation>,
 ) -> Result<
     (
         Option<String>,
@@ -754,7 +835,15 @@ fn record_consent(
         .map(|_grant| ())
         .map_err(|e| e.to_string())
     };
-    let sink = acquire_operator_row_sink(profile, profile_name)?;
+    let sink = match (
+        acquire_operator_row_sink(profile, profile_name)?,
+        reservation,
+    ) {
+        (OperatorRowSink::Outbox(outbox), Some(reservation)) => {
+            OperatorRowSink::Outbox(outbox.with_evidence_reservation(reservation))
+        }
+        (sink, _) => sink,
+    };
     let mut guard;
     let (audit, outcome) = match &sink {
         OperatorRowSink::Writer(writer) => {
@@ -1553,6 +1642,8 @@ mod tests {
     mod durable {
         #![allow(clippy::panic, reason = "crash simulation and test assertions")]
 
+        mod publication;
+
         use super::*;
         use crate::common::mainnet_presence::driver;
         use sha2::Digest as _;
@@ -2196,71 +2287,126 @@ mod tests {
                 std::io::stdin().read_exact(&mut [0]).unwrap();
                 return;
             }
-            let fixture = fixture("approve-contended");
-            let entry = fixture.payment(300_000);
-            park(&fixture, &entry);
-            let mut writer = AuditWriter::open(
-                fixture.audit_path(),
-                Some(
-                    stellar_agent_network::keyring::keyed_audit_access(
-                        fixture.profile(),
-                        fixture.name(),
-                        stellar_agent_core::audit_log::BindingCheck::Enforce,
-                    )
-                    .unwrap(),
-                ),
-            )
-            .unwrap();
-            writer.initialize_consent_evidence().unwrap();
-            drop(writer);
-            let mut child = Command::new(std::env::current_exe().unwrap())
+            for (integrated, recover) in [(false, false), (true, false), (true, true)] {
+                let fixture = fixture(&format!("approve-contended-{integrated}-{recover}"));
+                let _enabled = integrated.then(|| stellar_agent_network::policy_state::approvals::ConsentEvidenceEnforcementGuard::new(fixture.name(), ApprovedKind::Payment));
+                let _ready = integrated.then(|| stellar_agent_network::policy_state::approvals::ConsentEvidenceInventoryGuard::new(fixture.name()));
+                let entry = fixture.payment(300_000);
+                park(&fixture, &entry);
+                let mut writer = AuditWriter::open(
+                    fixture.audit_path(),
+                    Some(
+                        stellar_agent_network::keyring::keyed_audit_access(
+                            fixture.profile(),
+                            fixture.name(),
+                            stellar_agent_core::audit_log::BindingCheck::Enforce,
+                        )
+                        .unwrap(),
+                    ),
+                )
+                .unwrap();
+                writer.initialize_consent_evidence().unwrap();
+                drop(writer);
+                let mut child = Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "commands::approve::run::tests::durable::contended_approve_run_records_durable_consent_and_queues_the_row", "--nocapture"])
                 .env("APPROVE_WRITER_CHILD", fixture.audit_path())
                 .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
-            let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
-            loop {
-                let mut line = String::new();
-                assert_ne!(
-                    output.read_line(&mut line).unwrap(),
-                    0,
-                    "child acquires writer locks"
-                );
-                if line.contains("writer ready") {
-                    break;
+                let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(
+                        output.read_line(&mut line).unwrap(),
+                        0,
+                        "child acquires writer locks"
+                    );
+                    if line.contains("writer ready") {
+                        break;
+                    }
                 }
-            }
-            let _driver = driver::install(driver::fixture_credential());
-            let (code, result) = invoke(fixture.name(), &entry.approval_nonce, false).await;
-            child.stdin.take().unwrap().write_all(&[1]).unwrap();
-            assert!(child.wait().unwrap().success());
-            assert_eq!(code, 0, "{result}");
-            assert_eq!(result["data"]["audit"], "queued");
-            assert_eq!(result["data"]["audit_code"], "audit.outbox_queued");
-            let consent = record(&fixture, &entry.approval_nonce)
-                .consent
-                .expect("queued consent commits in this process");
-            let payload = consent.payload.unwrap();
-            let reference = payload
-                .outbox_row
-                .expect("queued reference stays in the durable record");
-            assert_eq!(payload.row_provenance, None);
-            let bytes = std::fs::read(stellar_agent_core::audit_log::outbox_path(
-                &fixture.audit_path(),
-            ))
-            .unwrap();
-            let line = bytes
-                .split(|byte| *byte == b'\n')
-                .rfind(|line| !line.is_empty())
+                let _driver = driver::install(driver::fixture_credential());
+                let fault = recover.then(|| arm_accounting_fault(COMMIT_FAULT_AFTER_PREPARED));
+                let (code, result) = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    invoke(fixture.name(), &entry.approval_nonce, false),
+                )
+                .await
+                .expect("queued success never waits for the holder to deliver");
+                drop(fault);
+                if recover {
+                    assert_eq!(code, 1);
+                    assert_eq!(result["error"]["code"], "submission.record_unavailable");
+                    assert!(record(&fixture, &entry.approval_nonce).consent.is_none());
+                    let original = stored(&fixture, &entry.approval_nonce);
+                    let (_, retry) = invoke(fixture.name(), &entry.approval_nonce, false).await;
+                    assert_eq!(retry["error"]["code"], "approval.already_attested");
+                    assert_eq!(
+                        record(&fixture, &entry.approval_nonce)
+                            .consent
+                            .unwrap()
+                            .consent_at_ms,
+                        original.mainnet_presence.unwrap().verified_at_unix_ms(),
+                        "queued recovery retains the original grant clock"
+                    );
+                } else {
+                    assert_eq!(code, 0, "{result}");
+                    assert_eq!(result["data"]["audit"], "queued");
+                    assert_eq!(result["data"]["audit_code"], "audit.outbox_queued");
+                }
+                if integrated {
+                    let window = PersistedWindowStore::for_profile(fixture.name());
+                    let before = std::fs::read(window.path()).unwrap();
+                    let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
+                    let mut changed = store.get(&entry.approval_nonce).unwrap().clone();
+                    changed.attestation_blob_b64 = Some(URL_SAFE_NO_PAD.encode([0; 32]));
+                    changed.consent_publication = None;
+                    store.remove(&entry.approval_nonce).unwrap();
+                    store.insert(changed, entry.created_at_unix_ms).unwrap();
+                    drop(store);
+                    let observed =
+                        observe_commit(|_| panic!("published queued repeats perform no commit"));
+                    let (_, repeat) = invoke(fixture.name(), &entry.approval_nonce, false).await;
+                    drop(observed);
+                    assert_eq!(repeat["error"]["code"], "approval.already_attested");
+                    assert_eq!(std::fs::read(window.path()).unwrap(), before);
+                    assert_eq!(driver::ceremonies().len(), 1);
+                }
+                child.stdin.take().unwrap().write_all(&[1]).unwrap();
+                assert!(child.wait().unwrap().success());
+                let consent = record(&fixture, &entry.approval_nonce)
+                    .consent
+                    .expect("queued consent commits in this process");
+                assert_eq!(
+                    consent.delivery,
+                    integrated.then(|| {
+                        stellar_agent_network::policy_state::approvals::ConsentDeliveryV1::queued(
+                            record(&fixture, &entry.approval_nonce).id,
+                        )
+                    }),
+                    "queued success commits authenticated delivery"
+                );
+                let payload = consent.payload.unwrap();
+                let reference = payload
+                    .outbox_row
+                    .expect("queued reference stays in the durable record");
+                assert_eq!(payload.row_provenance, None);
+                let bytes = std::fs::read(stellar_agent_core::audit_log::outbox_path(
+                    &fixture.audit_path(),
+                ))
                 .unwrap();
-            let (_, digest) =
-                stellar_agent_core::audit_log::outbox::test_seam::delivered_row_digest(line)
+                let line = bytes
+                    .split(|byte| *byte == b'\n')
+                    .rfind(|line| !line.is_empty())
                     .unwrap();
-            let row: serde_json::Value = serde_json::from_slice(line).unwrap();
-            assert_eq!(*reference.digest(), digest);
-            assert_eq!(reference.generation(), row["g"].as_u64().unwrap());
-            assert_eq!(reference.sequence(), row["s"].as_u64().unwrap());
-            assert!(consent_rows(fixture.profile()).is_empty());
-            assert_eq!(inspect_outbox(&fixture.audit_path()).unwrap().pending, 1);
+                let (_, digest) =
+                    stellar_agent_core::audit_log::outbox::test_seam::delivered_row_digest(line)
+                        .unwrap();
+                let row: serde_json::Value = serde_json::from_slice(line).unwrap();
+                assert_eq!(*reference.digest(), digest);
+                assert_eq!(reference.generation(), row["g"].as_u64().unwrap());
+                assert_eq!(reference.sequence(), row["s"].as_u64().unwrap());
+                assert!(consent_rows(fixture.profile()).is_empty());
+                assert_eq!(inspect_outbox(&fixture.audit_path()).unwrap().pending, 1);
+            }
         }
 
         #[tokio::test]
@@ -4047,6 +4193,7 @@ mod tests {
             &context,
             &profile,
             ConsentAuthorization::Standard(&AttestedApprover::Local),
+            None,
         )
         .unwrap();
         let reference =

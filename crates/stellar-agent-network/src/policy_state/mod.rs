@@ -362,6 +362,41 @@ pub fn record_authorized_window_state(
         .map(|_outcome| ())
 }
 
+/// Prepares ordered policy accounting and admits every item in one durable batch.
+///
+/// A preparation failure can leave in-memory entries. Refresh the engine's
+/// window state from the durable store before the next dispatch.
+///
+/// # Errors
+/// Returns a typed store error for preparation, admission, or persistence failure.
+/// A refused batch persists no new usage.
+pub fn record_authorized_window_states(
+    engine: &dyn stellar_agent_core::policy::PolicyEngine,
+    items: &[(
+        stellar_agent_core::policy::ToolDescriptor,
+        stellar_agent_core::policy::v1::ValueClass,
+    )],
+    profile: &stellar_agent_core::profile::schema::Profile,
+    profile_name: &str,
+) -> Result<(), WindowStoreError> {
+    let mut recorded = Vec::new();
+    for (tool, value) in items {
+        recorded.extend(
+            engine
+                .record_confirmed(tool, profile, value)
+                .map_err(|error| WindowStoreError::Invalid {
+                    detail: format!("policy authorization accounting failed: {error}"),
+                })?,
+        );
+    }
+    if recorded.is_empty() {
+        return Ok(());
+    }
+    PersistedWindowStore::for_profile(profile_name)
+        .record_authorized(profile, &recorded)
+        .map(|_outcome| ())
+}
+
 /// Error variants for [`PersistedWindowStore`] operations.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]

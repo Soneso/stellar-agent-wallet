@@ -3713,9 +3713,8 @@ pub enum EventKind {
     ///
     /// Emitted at the point the signature is produced and about to be
     /// returned; the caller broadcasts externally, so the wallet never
-    /// observes a submit. Records only non-secret identifiers — a redacted
-    /// digest of the signed payload and the redacted signer address — never
-    /// the signature or the payload itself.
+    /// observes a submit. Records the redacted payload digest, redacted signer,
+    /// and optional evaluated legs. It never records the signature or payload.
     ///
     /// This variant intentionally has NO field named `request_id` or `tool`
     /// (the outer [`AuditEntry`](super::entry::AuditEntry) owns those).
@@ -3730,6 +3729,9 @@ pub enum EventKind {
         /// First-5-last-5 redacted signer address the signature was produced
         /// with.
         signer_redacted: RedactedStrkey,
+        /// Evaluated value legs in signed operation order.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        legs: Vec<ValueLegRecord>,
     },
 
     /// A sponsored MPP charge credential passed every delivery gate.
@@ -7031,8 +7033,12 @@ mod tests {
         let ev = EventKind::OpaquePayloadSigned {
             payload_sha256_redacted: "dfe78222...9d11baf1".to_owned(),
             signer_redacted: RedactedStrkey::from_already_redacted("GBPXX...MWIVL"),
+            legs: Vec::new(),
         };
         let s = serde_json::to_string(&ev).unwrap();
+        let old = r#"{"kind":"opaque_payload_signed","payload_sha256_redacted":"dfe78222...9d11baf1","signer_redacted":"GBPXX...MWIVL"}"#;
+        assert_eq!(s, old, "empty legs preserve historical row bytes");
+        assert_eq!(serde_json::from_str::<EventKind>(old).unwrap(), ev);
         let back: EventKind = serde_json::from_str(&s).unwrap();
         assert_eq!(ev, back, "OpaquePayloadSigned must round-trip cleanly");
         assert!(
@@ -7061,6 +7067,40 @@ mod tests {
         assert!(
             result.is_err(),
             "missing-field deserialisation must fail for OpaquePayloadSigned"
+        );
+    }
+
+    #[test]
+    fn a_signed_payload_keeps_its_evaluated_legs() {
+        use crate::audit_log::entry::AuditEntry;
+        let legs = vec![ValueLegRecord {
+            action: ValueActionKind::Payment,
+            amount: Some(i128::MAX),
+            asset: Some("native".to_owned()),
+            destination_redacted: Some("GAAAA...AWHF".to_owned()),
+            destination_sha256: Some("ab".repeat(32)),
+        }];
+        let entry = AuditEntry::new_opaque_payload_signed(
+            "stellar_sep43_sign_transaction",
+            "stellar:testnet",
+            "dfe78222...9d11baf1",
+            RedactedStrkey::from_already_redacted("GBPXX...MWIVL"),
+            "request",
+            legs.clone(),
+        );
+        let expected = EventKind::OpaquePayloadSigned {
+            payload_sha256_redacted: "dfe78222...9d11baf1".to_owned(),
+            signer_redacted: RedactedStrkey::from_already_redacted("GBPXX...MWIVL"),
+            legs,
+        };
+        assert_eq!(
+            entry.event_kind, expected,
+            "the constructor preserves every leg field"
+        );
+        let encoded = serde_json::to_string(&entry.event_kind).unwrap();
+        assert_eq!(
+            serde_json::from_str::<EventKind>(&encoded).unwrap(),
+            expected
         );
     }
 
