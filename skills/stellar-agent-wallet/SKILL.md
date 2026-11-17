@@ -473,7 +473,8 @@ will keep failing.
 
 **Mainnet actions require operator setup and approval.** Mainnet consent
 requires a verified passkey assertion from an approval credential in the
-owner-signed policy. The operator approves through the local browser.
+owner-signed policy. The operator approves through the local browser or at
+the signed approval origin.
 Never attempt the approval yourself. The version marker
 reports compiled state. `network.mainnet_write_forbidden` identifies an excluded
 operation, a feature-off build, or a missing admitted context. Resolver gaps

@@ -607,8 +607,8 @@ An MCP payment needs both payment rules: `stellar_pay` builds and simulates it,
 its own tool name.
 Other gated actions wait for operator approval in MCP tools with an approval
 workflow and the CLI `stellar-agent mpp charge authorize` flow. On mainnet, full-mode `pay`, `claim`,
-sponsored `accounts create`, and `trustline` ask for passkey confirmation in
-the local browser for `RequireApproval`. On testnet these four commands,
+sponsored `accounts create`, and `trustline` ask for passkey confirmation for
+`RequireApproval`. On testnet these four commands,
 `trade`, and the vault commands refuse `RequireApproval` with
 `policy.approval_required`. `smart-account multicall` refuses it with
 `sa.multicall_failed`, and its denied audit row records

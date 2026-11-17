@@ -229,8 +229,9 @@ Omit `per_tx_cap` from both rules to request approval above 500 XLM without
 a per-payment ceiling. Other failing criteria deny, including period caps.
 The MCP payment tool stores the pending request with a reason naming
 `approval_above` and its threshold. Operators approve through the CLI approvals
-commands, terminal, inbox, or remote approver. The CLI `pay` command returns
-`policy.approval_required` and directs the caller to MCP.
+commands, terminal, inbox, or remote approver. On testnet, the CLI `pay`
+command returns `policy.approval_required` and directs the caller to MCP. On
+mainnet, full-mode CLI `pay` runs the passkey ceremony for the escalation.
 
 `rate_limit` caps how many counted calls a rolling window holds:
 
