@@ -47,8 +47,11 @@
 //! `network.mainnet_write_forbidden` before the keyring and any request. With
 //! the feature, the run takes the stored profile of an explicit `--profile`
 //! selection, a verified signed policy with a `[mainnet]` table and its
-//! enablement, the enrolled keyring signer, the independent witness, and a
-//! browser consent with an owner-pinned passkey. The signed fee cap applies
+//! enablement, the enrolled keyring signer, and the independent witness.
+//! Under `allow` the run signs with policy authority and no passkey ceremony.
+//! An `approval_above` escalation or a `require_approval` rule runs the
+//! passkey ceremony, which records consent from an approval credential in the
+//! signed policy. The signed fee cap applies
 //! before the audit pre-flight and the clawback gate, and the keyring seed is
 //! read only after the authorization is minted.
 //!

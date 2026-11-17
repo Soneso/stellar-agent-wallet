@@ -18,7 +18,7 @@ On testnet these commands create no pending policy approval. On mainnet, trade
 and vault commands refuse with `network.mainnet_write_forbidden`. Full-mode
 payment, claim, sponsored creation, and trustline commands sign `Allow` without
 a passkey ceremony. `RequireApproval` creates a pending entry and runs the
-local passkey ceremony. Setup, signed policy minimums, and sealed authorization
+passkey ceremony. Setup, signed policy minimums, and sealed authorization
 remain required. Use their MCP tools for agent actions; DeFi tools also refuse
 policy approval decisions without a pending loop.
 
@@ -162,7 +162,7 @@ Without a signed approval origin, mainnet consent uses the localhost passkey pag
 Headless consent, `--yes`, `--no-open` on the local inbox, and remote mainnet approval then refuse.
 With a signed approval origin, the HTTPS listener serves consent using an owner-pinned credential.
 The CLI prints the signed approval link without opening a browser or requiring a display.
-Ledger signing also requires this passkey ceremony.
+Ledger signing also requires this passkey ceremony when the CLI policy requires approval.
 
 An MCP mainnet commit accepts only a version 5 approval with its verified
 presence receipt. An invalid proof refuses with `policy.approval_required`.
@@ -1263,7 +1263,7 @@ A signed origin refuses before store access with `approval.origin_signed_remote`
 | `--profile <NAME>` | Profile whose attestation key + pending-approval store to use (resolves `--profile` → env → `default`) |
 | `--yes` | Non-interactive auto-approve on a testnet profile; the summary is still printed. A mainnet profile refuses it before store access with `approve.yes_refused_on_mainnet` |
 
-On a mainnet profile the command prints the summary and opens the local passkey page; it reads no terminal input. On a testnet profile it interactively prompts `Approve? [y/N]:`; anything other than `y`/`yes` denies. Exits `1` when the nonce is unknown, expired, already attested, created by a different local user, denied, or on I/O error. For payment-style approvals the response returns `approval_attestation` (the HMAC blob the agent must pass as the `approval_attestation` argument to the matching `*_commit` tool); omitted for kinds whose gate reads recorded consent directly (toolset first-invoke grants, trustline clawback opt-ins).
+On a mainnet profile the command prints the summary and reads no terminal input. It opens the local passkey page, or prints the signed-origin approval link to stderr when policy configures that origin. On a testnet profile it interactively prompts `Approve? [y/N]:`; anything other than `y`/`yes` denies. Exits `1` when the nonce is unknown, expired, already attested, created by a different local user, denied, or on I/O error. For payment-style approvals the response returns `approval_attestation` (the HMAC blob the agent must pass as the `approval_attestation` argument to the matching `*_commit` tool); omitted for kinds whose gate reads recorded consent directly (toolset first-invoke grants, trustline clawback opt-ins).
 
 The `approval_attested` row is written before the approval is persisted. `audit` is `"written"`, or `"queued"` when a running MCP server or `approve serve` inbox holds the audit writer. That process appends the queued row to the log before any process loads a signing key for the approved action. The command exits `1` and persists nothing beside a process that does not drain the outbox (`audit.writer_locked`) and on any other audit failure. After upgrading, restart a running MCP server and `approve serve`: `approve --id` refuses beside an older one.
 

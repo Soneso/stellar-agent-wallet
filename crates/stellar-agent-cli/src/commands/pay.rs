@@ -26,9 +26,12 @@
 //! A build without the `mainnet-write` feature refuses every mainnet run with
 //! that code. With the feature, the run takes the stored profile of an
 //! explicit `--profile` selection, a verified signed policy with a
-//! `[mainnet]` table and its enablement, the enrolled signer, the independent
-//! witness the effective witness rule requires, and browser consent with an
-//! owner-pinned passkey. The seed is read and the Ledger opened only after
+//! `[mainnet]` table and its enablement, the enrolled signer, and the
+//! independent witness the effective witness rule requires. Under `allow` the
+//! run signs with policy authority and no passkey ceremony. An
+//! `approval_above` escalation or a `require_approval` rule runs the passkey
+//! ceremony, which records consent from an approval credential in the signed
+//! policy. The seed is read and the Ledger opened only after
 //! the authorization is minted, and the submit layer checks the endpoint and
 //! passphrase again.
 //!
@@ -8885,6 +8888,44 @@ pub(crate) mod tests {
                 run.envelope
             );
             assert!(fixture.sent_envelopes().await.is_empty());
+        }
+
+        /// An `approval_above` escalation of an `allow` rule on testnet
+        /// refuses the full pipeline with `policy.approval_required` and
+        /// points to MCP. It resolves no signer, sends nothing, and parks no
+        /// pending entry.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn an_approval_above_escalation_refuses_on_testnet() {
+            let threshold = AMOUNT / 2;
+            let fixture = Spec::new("testnet-pay-approval-above")
+                .testnet()
+                .primary(ClassicRpc::testnet(&[
+                    &stellar_agent_test_support::signed_envelope::account_id_for_seed(AGENT_SEED),
+                    DESTINATION,
+                ]))
+                .rules(vec![pay_rule(
+                    "allow",
+                    &format!(
+                        "{{ kind = \"approval_above\", asset = \"native\", max_stroops = \"{threshold}\" }},\n"
+                    ),
+                )])
+                .build()
+                .await;
+            let before = signer_resolutions_on_this_thread();
+
+            let run = run(&fixture, &testnet_args(&fixture)).await;
+
+            assert_eq!(run.code, 1, "{}", run.envelope);
+            assert_eq!(run.code(), "policy.approval_required", "{}", run.envelope);
+            assert_eq!(
+                run.message(),
+                "pay operation requires approval; use the MCP server for two-phase approval"
+            );
+            assert_eq!(signer_resolutions_on_this_thread(), before, "no signature");
+            assert!(fixture.sent_envelopes().await.is_empty(), "no submission");
+            assert!(fixture.pending_entries().is_empty());
+            assert!(fixture.audit_rows("value_action_pending").is_empty());
         }
 
         /// A mainnet and a testnet payment to M0 and M17 of the allowlisted

@@ -41,9 +41,12 @@
 //! A build without the `mainnet-write` feature refuses every mainnet run with
 //! that code. With the feature, the run takes the stored profile of an
 //! explicit `--profile` selection, a verified signed policy with a
-//! `[mainnet]` table and its enablement, the enrolled signer, the independent
-//! witness the effective witness rule requires, and browser consent with an
-//! owner-pinned passkey. The seed is read and the Ledger opened only after
+//! `[mainnet]` table and its enablement, the enrolled signer, and the
+//! independent witness the effective witness rule requires. Under `allow` the
+//! run signs with policy authority and no passkey ceremony. An
+//! `approval_above` escalation or a `require_approval` rule runs the passkey
+//! ceremony, which records consent from an approval credential in the signed
+//! policy. The seed is read and the Ledger opened only after
 //! the authorization is minted, and the submit layer checks the endpoint and
 //! passphrase again.
 //!

@@ -279,7 +279,8 @@ verified presence receipt: a version 4 approval, an assertion that does not
 verify or comes from a credential the signed policy does not list, and a
 receipt bound to a policy other than the current one. Mainnet consent
 requires a verified passkey assertion from an approval credential in the
-owner-signed policy, and the operator approves on the local passkey page. Never
+owner-signed policy, and the operator approves on the local passkey page or at
+the signed approval origin. Never
 try to produce an approval yourself; report the refusal to the operator. A
 live rejection uses `policy.approval_rejected`. A
 live consumed approval or an approval held by a submission receipt uses
