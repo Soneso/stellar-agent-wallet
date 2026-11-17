@@ -13,7 +13,10 @@ use stellar_agent_core::approval::{
     AttestationBinding, ClassicIntent, IntentAsset, IntentBase, IntentPayload, MemoFact,
     PendingApproval, PendingApprovalStore, VerifiedConsentPublication, load_attestation_key,
     verify_consent_publication,
-    witness::{ApprovalExpectation, ApprovalWitness, ApprovedKind, verify_approval},
+    witness::{
+        ApprovalExpectation, ApprovalWitness, ApprovedKind, verify_approval,
+        verify_approval_admitted, verify_intent_consent_admitted,
+    },
 };
 use stellar_agent_core::audit_log::{
     AuditEntry, AuditOutbox, AuditWriter, EvidenceReservation, WriterError, audit_writer_refusal,
@@ -1259,8 +1262,12 @@ pub fn persisted_attestation(
 ///
 /// `approval.not_found` when no record or entry names the nonce,
 /// `approval.presence_required` for an entry without a receipt, the
-/// refusals of [`persisted_attestation`] and `verify_approval`, and the
+/// refusals of [`persisted_attestation`] and admitted consent verification, and the
 /// store's refusals.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "completion retains its policy admission"
+)]
 pub fn consent_completion(
     pending: &PendingApprovalStore,
     store: &PersistedWindowStore,
@@ -1269,10 +1276,44 @@ pub fn consent_completion(
     nonce: &str,
     policy: &VerifiedPolicy,
     row: ConsentRow,
+    admission: &stellar_agent_core::approval::presence_policy::PolicyAdmission,
 ) -> Result<ConsentCompletion, WalletError> {
-    complete(pending, store, profile, name, nonce, policy, |_, _| {
-        Ok((row, None))
-    })
+    complete(
+        pending,
+        store,
+        profile,
+        name,
+        nonce,
+        policy,
+        Some(admission),
+        |_, _| Ok((row, None)),
+    )
+}
+
+/// Resolves consent intent under the current policy and the original envelope's source.
+/// The durable nonce and operation links are authenticated by [`intent_for_consent`].
+///
+/// # Errors
+/// Returns inconsistent-entry and authenticated intent lookup refusals.
+pub fn consent_intent(
+    store: &PersistedWindowStore,
+    profile: &Profile,
+    entry: &PendingApproval,
+    policy: &VerifiedPolicy,
+) -> Result<Option<ClassicIntent>, WalletError> {
+    let summary = stellar_agent_core::approval::classic_entry_summary(&entry.kind).transpose()?;
+    intent_for_consent(
+        store,
+        profile,
+        entry,
+        &CanonicalUse {
+            chain_id: profile.chain_id.caip2_str(),
+            source: summary
+                .as_ref()
+                .map_or("", |summary| summary.source.as_str()),
+            policy_digest: policy.digest(),
+        },
+    )
 }
 
 /// [`consent_completion`] for a strict consent: the sink and queued
@@ -1303,6 +1344,7 @@ pub fn publication_completion(
         name,
         nonce,
         policy,
+        None,
         |record, entry| {
             let key = load_attestation_key(
                 &profile.attestation_key_id,
@@ -1333,7 +1375,13 @@ pub fn publication_completion(
 }
 
 /// The shared body of the completions: `sink` names the row and delivery
-/// from the authenticated record and the inbox entry.
+/// from the authenticated record and the inbox entry. With `admission`, an
+/// authenticated stored intent verifies as an intent consent and any other
+/// entry as an envelope consent, both under that admission.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the completion inputs and optional admission are explicit"
+)]
 fn complete(
     pending: &PendingApprovalStore,
     store: &PersistedWindowStore,
@@ -1341,6 +1389,7 @@ fn complete(
     name: &str,
     nonce: &str,
     policy: &VerifiedPolicy,
+    admission: Option<&stellar_agent_core::approval::presence_policy::PolicyAdmission>,
     sink: impl FnOnce(
         &WireApproval,
         &PendingApproval,
@@ -1358,6 +1407,10 @@ fn complete(
         .record;
     let entry = pending.get(nonce).cloned().ok_or_else(not_found)?;
     let attestation = persisted_attestation(pending, nonce)?;
+    let intent = admission
+        .map(|_| consent_intent(store, profile, &entry, policy))
+        .transpose()?
+        .flatten();
     let receipt = entry
         .mainnet_presence
         .clone()
@@ -1367,19 +1420,44 @@ fn complete(
             detail: error.to_string(),
         })
     })?;
-    let witness = verify_approval(
-        pending,
-        profile,
-        name,
-        nonce,
-        &attestation,
-        &ApprovalExpectation {
-            kind: record.kind,
-            subject: record.subject,
-        },
-        policy,
-        now,
-    )?;
+    let expectation = ApprovalExpectation {
+        kind: record.kind,
+        subject: record.subject,
+    };
+    let witness = match (admission, intent.as_ref()) {
+        (Some(admission), Some(intent)) => verify_intent_consent_admitted(
+            pending,
+            profile,
+            name,
+            nonce,
+            &attestation,
+            intent,
+            policy,
+            now,
+            admission,
+        )?,
+        (Some(admission), None) => verify_approval_admitted(
+            pending,
+            profile,
+            name,
+            nonce,
+            &attestation,
+            &expectation,
+            policy,
+            now,
+            admission,
+        )?,
+        (None, _) => verify_approval(
+            pending,
+            profile,
+            name,
+            nonce,
+            &attestation,
+            &expectation,
+            policy,
+            now,
+        )?,
+    };
     let (row, delivery) = sink(&record, &entry)?;
     Ok(ConsentCompletion {
         id: record.id,
