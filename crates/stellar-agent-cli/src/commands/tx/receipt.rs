@@ -3273,7 +3273,8 @@ mod tests {
             crate::common::render::take_rendered_for_test();
 
             let code = crate::commands::tx::status::run(&crate::commands::tx::status::StatusArgs {
-                tx_hash: TX_HASH.to_owned(),
+                tx_hash: Some(TX_HASH.to_owned()),
+                business_id: None,
                 profile: Some(fixture.name.to_owned()),
                 output: OutputFormat::Json,
                 retry_recovery: false,

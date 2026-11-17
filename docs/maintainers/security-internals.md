@@ -1814,7 +1814,7 @@ Stateful spending criteria read amounts and counts from `PolicyStateStore`. Conf
 - **Descriptors**: each rule lists its `per_tx_cap`, `per_period_cap`, `total_budget`, and unlisted `budget` bounds from the signed fields, through `Criterion::descriptors`. A total has no window.
 - **Buckets**: per rule, `used` sums settled rows and settled total sums, and `reserved` sums holds, pending and exposed rows, and signed intent legs, each representation once, as admission counts them. `remaining` is `max(0, cap - used - reserved)`. A total counts its policy epoch only. The unlisted bucket and a retired epoch report why they have no figures.
 - **Native obligations**: every authorization of every epoch and state lists its stored state and disposition. Its reservation is counted from the stored observation, never a live read. An `Always` row is not counted under any observation. Every other count needs a stored observation at or above both admissible floors; a bounded row releases at equality, and without a row the reservation counts, including after `Used`. The total adds debit plus fee once per counted authorization. An authorization without amounts counts zero and is listed as an unreserved legacy obligation.
-- **Limitations**: the projection carries recorded amounts only. An x402 authorization records a zero native debit. Earlier-epoch obligations, the unlisted allowance, the live balance, floor headroom, and a counter reconciliation time are absent, because no stored fact supplies them. Expiry is a view at the supplied clock; no read records a watermark. A stored observation dated after the clock refuses with `wallet.clock_error`.
+- **Limitations**: the projection carries recorded amounts only. An x402 authorization records a zero native debit. Earlier-epoch total figures and the unlisted allowance are deferred pending the accounting integration; live account figures and a reconciliation timestamp are not supplied by this snapshot. A period bucket whose used and reserved figures overflow together refuses with its own detail, distinct from the total-budget sum. Expiry is a view at the supplied clock; no read records a watermark. A stored observation dated after the clock refuses with `wallet.clock_error`.
 
 A total debit leaves its sum in four ways. An unclaimed hold is invalidated, or a committed sweep expires it. A checked failure or non-inclusion of its own attempt releases it once. The writer that reserved it cancels it before the signed bytes leave the process. Every other transition keeps it counted, including operator clears, accounting expiry, and other cancellations. A fee that a failed transaction paid stays charged.
 
@@ -2161,6 +2161,18 @@ unreadable authenticated state returns the existing typed status error.
 Missing history, expired authority and the eight-attempt limit cannot be
 repaired by editing receipts. The CLI and MCP payloads retain their existing
 fields; progress is a library handoff.
+
+`OperationStatus::select` resolves the status selectors before recovery from
+one authenticated image, and `OperationStatus::projection` reads one more
+image after reconciliation and repair. Both are lock-free inspection reads
+with the store's generation-race retries; they take no window, audit-writer
+or inbox lock and write nothing. A mainnet business id names a record before
+a tombstone. A hash with it must match one of that record's retained classic
+exposures or the tombstone's result hash. A business id alone targets the latest
+exposure, so a retried operation reconciles its current attempt. The projection
+carries stored facts only: no amount, no next action and no recovery outcome.
+A pass that fails its witness health read persists neither `last_pass_at_ms`
+nor the outcome class.
 
 A new record refuses with `operation.capacity` when its envelope, intent slot
 or record exceeds its bound, when 16 records wait, or when the committed file

@@ -8066,6 +8066,20 @@ mod tests {
             write_generation(&generation_entry_ref(profile), wire).unwrap();
         }
 
+        /// Writes `body` under the profile's key with `wire`'s generation, so a
+        /// test can present an authentic body no serializer produces.
+        pub(in crate::policy_state) fn seal_body_unchecked_for_test(
+            &self,
+            profile: &Profile,
+            body: &[u8],
+            wire: &WireFile,
+        ) {
+            let (key, _) = self.load_or_mint_key(profile).unwrap();
+            self.write_atomic_raw(&compute_tag(key.as_slice(), body).unwrap(), body)
+                .unwrap();
+            write_generation(&generation_entry_ref(profile), wire).unwrap();
+        }
+
         /// The reset snapshot under a freshly acquired lock.
         fn reset_snapshot_locked(
             &self,

@@ -5,7 +5,7 @@ use crate::policy_state::WireRecoveryRun;
 use std::cell::RefCell;
 
 thread_local! {
-    static READS: Cell<u32> = const { Cell::new(0) };
+    pub(crate) static READS: Cell<u32> = const { Cell::new(0) };
     static AFTER_READ: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
 }
 
@@ -36,7 +36,7 @@ pub(crate) fn progress(fx: &Fx, n: u8) -> SubmissionProgress {
         .unwrap()
 }
 
-fn homed() -> (
+pub(crate) fn homed() -> (
     stellar_agent_test_support::StellarAgentHomeGuard,
     stellar_agent_test_support::sandbox::StateSandbox,
 ) {

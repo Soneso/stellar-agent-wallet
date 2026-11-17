@@ -1704,7 +1704,8 @@ async fn transaction_status_forwards_retry_on_a_managed_attempt() {
     let status = |chain_id: &str, retry_recovery| {
         let args = crate::server::StellarTransactionStatusArgs {
             chain_id: chain_id.to_owned(),
-            tx_hash: tx_hash.clone(),
+            tx_hash: Some(tx_hash.clone()),
+            business_id: None,
             retry_recovery,
         };
         let server = &run.f.server;

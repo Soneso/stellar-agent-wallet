@@ -564,7 +564,8 @@ async fn exercise(tool: Tool, initially_confirmed: bool, fault: Option<SignerFau
         let status = server
             .call_stellar_transaction_status(StellarTransactionStatusArgs {
                 chain_id: "stellar:testnet".to_owned(),
-                tx_hash: tx_hash.clone(),
+                tx_hash: Some(tx_hash.clone()),
+                business_id: None,
                 retry_recovery: false,
             })
             .await
