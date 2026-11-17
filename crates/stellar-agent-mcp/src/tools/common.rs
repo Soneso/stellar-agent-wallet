@@ -7310,11 +7310,30 @@ pub(crate) mod tests {
                 Self::attest_server(&self.server, entry, profile_name, chain)
             }
 
+            /// Attests `entry` on mainnet as [`Self::attest`] does and leaves
+            /// its durable record without consent.
+            fn attest_unrecorded(
+                &self,
+                entry: &stellar_agent_core::approval::PendingApproval,
+            ) -> String {
+                Self::attest_with(&self.server, entry, "operator", "stellar:mainnet", false)
+            }
+
             fn attest_server(
                 server: &WalletServer,
                 entry: &stellar_agent_core::approval::PendingApproval,
                 profile_name: &str,
                 chain: &str,
+            ) -> String {
+                Self::attest_with(server, entry, profile_name, chain, true)
+            }
+
+            fn attest_with(
+                server: &WalletServer,
+                entry: &stellar_agent_core::approval::PendingApproval,
+                profile_name: &str,
+                chain: &str,
+                complete: bool,
             ) -> String {
                 use base64::Engine as _;
                 use stellar_agent_core::approval::{
@@ -7431,6 +7450,7 @@ pub(crate) mod tests {
                 )
                 .find_by_nonce(&entry.approval_nonce)
                 .unwrap()
+                .filter(|_| complete)
                 .map(|_| {
                     stellar_agent_network::operation_entry::consent_completion(
                         &store,
@@ -9629,7 +9649,9 @@ pub(crate) mod tests {
                     ApprovalRecorder, ConsentDeliveryV1, ConsentPayload, PendingApprovalFacts,
                     record_consent_with_row_for_test,
                 };
-                use stellar_agent_network::policy_state::{BusinessId, OperationStatus};
+                use stellar_agent_network::policy_state::{
+                    ApprovalStatus, BusinessId, OperationStatus,
+                };
                 let server = &self.f.server;
                 let profile = server.security_profile();
                 let name = server.profile_name_for_approval();
@@ -9702,16 +9724,14 @@ pub(crate) mod tests {
                 let (writer, _readiness) = server.write_audit().unwrap();
                 let mut writer = writer.lock().unwrap();
                 writer.initialize_consent_evidence().unwrap();
-                let id =
-                    ApprovalRecorder::new(&server.window_store, profile, &mut *writer, "fixture")
-                        .open_pending(
-                            operation.operation_id,
-                            &facts,
-                            stellar_agent_core::audit_log::PolicyDecision::RequireApproval,
-                        )
-                        .unwrap()
-                        .record
-                        .id;
+                let record = ApprovalStatus::new(&server.window_store, profile)
+                    .find_by_nonce(witness.nonce())
+                    .unwrap()
+                    .expect("the preparation opens the durable record")
+                    .record;
+                assert_eq!(record.operation_id, operation.operation_id);
+                assert!(record.consent.is_none(), "the fixture records the consent");
+                let id = record.id;
                 let (key, anchor) = stellar_agent_network::keyring::keyed_audit_access(
                     profile,
                     &name,
@@ -9806,22 +9826,31 @@ pub(crate) mod tests {
                 profile: impl FnOnce(&mut Profile),
                 prepare: impl FnOnce(&mut serde_json::Value),
             ) -> Self {
-                Self::build(tool, true, policy, profile, prepare).await
+                Self::build(tool, Some(true), policy, profile, prepare).await
+            }
+
+            /// A run of [`Self::new`] whose durable record holds no consent
+            /// after the attestation.
+            async fn unconsented(tool: Tool) -> Self {
+                Self::build(tool, Some(false), |raw| raw, |_| {}, |_| {}).await
             }
 
             /// A run of `tool` whose rules allow both names: the preparation
             /// stores no approval and the commit arguments carry no proof.
             pub(crate) async fn allowed(tool: Tool) -> Self {
-                Self::build(tool, false, |raw| raw, |_| {}, |_| {}).await
+                Self::build(tool, None, |raw| raw, |_| {}, |_| {}).await
             }
 
+            /// `consent` is `None` under `Allow`; otherwise it says whether
+            /// the attestation completes the durable record.
             async fn build(
                 tool: Tool,
-                require_approval: bool,
+                consent: Option<bool>,
                 policy: impl FnOnce(String) -> String,
                 profile: impl FnOnce(&mut Profile),
                 prepare: impl FnOnce(&mut serde_json::Value),
             ) -> Self {
+                let require_approval = consent.is_some();
                 let primary = wiremock::MockServer::start().await;
                 let oracle = wiremock::MockServer::start().await;
                 let f = routed_fixture_with(
@@ -9845,10 +9874,9 @@ pub(crate) mod tests {
                 let oracle_control = mount_rpc(&f, &oracle).await;
                 let mut args = tool.prepare_args(&f);
                 prepare(&mut args);
-                let (args, entry, prepared) = if require_approval {
-                    Self::prepared(&f, tool, args).await
-                } else {
-                    Self::prepared_allowed(&f, tool, args).await
+                let (args, entry, prepared) = match consent {
+                    Some(complete) => Self::prepared(&f, tool, args, complete).await,
+                    None => Self::prepared_allowed(&f, tool, args).await,
                 };
                 Self {
                     f,
@@ -9865,11 +9893,13 @@ pub(crate) mod tests {
 
             /// Prepares `args` through the tool's handler, attests the stored
             /// approval, and returns the commit arguments, that approval and
-            /// the preparation's result data.
+            /// the preparation's result data. `complete` says whether the
+            /// attestation completes the durable record.
             async fn prepared(
                 f: &Fixture,
                 tool: Tool,
                 args: serde_json::Value,
+                complete: bool,
             ) -> (
                 serde_json::Value,
                 stellar_agent_core::approval::PendingApproval,
@@ -9882,7 +9912,11 @@ pub(crate) mod tests {
                 let entry = stored_approval(f, nonce).unwrap();
                 let mut args = args;
                 args["approval_nonce"] = serde_json::json!(nonce);
-                args["approval_attestation"] = serde_json::json!(f.attest(&entry));
+                args["approval_attestation"] = serde_json::json!(if complete {
+                    f.attest(&entry)
+                } else {
+                    f.attest_unrecorded(&entry)
+                });
                 for field in ["envelope_xdr", "nonce", "expires_at_unix_ms"] {
                     args[field] = data[field].clone();
                 }
@@ -9970,7 +10004,7 @@ pub(crate) mod tests {
                 stellar_agent_core::approval::PendingApproval,
             ) {
                 let (args, entry, _) =
-                    Self::prepared(&self.f, self.tool, self.tool.prepare_args(&self.f)).await;
+                    Self::prepared(&self.f, self.tool, self.tool.prepare_args(&self.f), true).await;
                 (args, entry)
             }
 
@@ -10137,7 +10171,7 @@ pub(crate) mod tests {
                 "writer",
                 "poison",
             ] {
-                let run = ClassicRun::new(Tool::Pay).await;
+                let run = ClassicRun::unconsented(Tool::Pay).await;
                 let reference = run.delivery_fixture(case != "direct", case == "dropped");
                 let name = run.f.server.profile_name_for_approval();
                 let _enabled = ConsentEvidenceEnforcementGuard::new(&name, ApprovedKind::Payment);

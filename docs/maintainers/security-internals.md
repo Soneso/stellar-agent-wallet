@@ -2347,23 +2347,39 @@ and record, and the waiting expiry ends both. A rerun therefore converges on
 one nonce per operation. A queued consent row's outbox reference stays in the
 payload. A payload without one names its row `written` or `recovered`.
 
-MCP create-account, trustline and claim preparations under an approval rule
-also open durable records. Payment preparation retains its inbox recovery
-binding and creates no durable approval record. Each durable producer carries
+MCP payment, create-account, trustline and claim preparations under an
+approval rule also open durable records. Each durable producer carries
 the retained operation through envelope reuse and returns its linked approval
 on retry. A missing linked entry refuses with `approval.not_found`. Without a
-link, the producer removes live unattested orphans of the same envelope,
-inserts the entry, releases the inbox, and opens the record. A producer lock
-serializes that sequence; consent paths never take it. Acquisition uses the
-inbox's five attempts with 20 milliseconds between attempts. A preparation that
-still finds the lock held after those attempts refuses with
-`approval.writer_locked`; retry with the same business id. The open retains the
-prepare decision and the entry's signed interval as its rule lifetime.
-After an open error, authenticated status determines whether cleanup is safe.
-A committed record keeps its nonce; a competing record returns its winner.
-An unreadable status keeps the entry for retry. Rejection creates no durable
-consent, and signed expiry ends the waiting window. Allow, testnet and
+link, the create-account, trustline and claim producers remove live unattested
+orphans of the same envelope, insert the entry, release the inbox, and open
+the record. A producer lock serializes that sequence; consent paths never take
+it. Acquisition uses the inbox's five attempts with 20 milliseconds between
+attempts. A preparation that still finds the lock held after those attempts
+refuses with `approval.writer_locked`; retry with the same business id. The
+open retains the prepare decision and the entry's signed interval as its rule
+lifetime. After an open error, authenticated status determines whether cleanup
+is safe. A committed record keeps its nonce; a competing record returns its
+winner. An unreadable status keeps the entry for retry. Rejection creates no
+durable consent, and signed expiry ends the waiting window. Allow, testnet and
 clawback opt-ins keep their existing paths without the approval facade.
+
+The payment producer keeps its inbox recovery binding as the link between
+entry and record. An unlinked payment entry is recoverable work: the producer
+recovers it by its exact recovery identity and opens the record for that
+nonce. It removes no orphan, and it keeps the entry whenever the open's
+outcome is unresolved, so a retry recovers the same nonce and clocks. Entries
+without a recovery binding, or bound under another identity, are never
+adopted; they keep their list, reject, expiry and collection paths. Before a
+payment producer returns a linked or newly opened entry, it rereads the entry
+under the inbox lock. The entry must be unique, live and unrejected, and its
+kind, subject and signed clocks must match the record. The operation's
+retained envelope must have the same subject, or the producer refuses with
+`approval.entry_inconsistent`. That check persists an observed binding expiry
+before it refuses, also for a record already expired, so a restart or clock
+rollback keeps the refusal. CLI preparation takes no producer
+lock, so it can remove a payment entry while the MCP producer opens its
+record; the producer then refuses with `approval.not_found`.
 
 `approve --id` completes an existing mainnet value record after its consent row
 and inbox attestation persist. It releases the inbox before committing consent
