@@ -18691,6 +18691,7 @@ mod tests {
         ledger::MintRequest {
             intent_digest: None,
             predecessor: None,
+            approval_operation: None,
             chain: Caip2::Mainnet,
             consumer: crate::mainnet::MainnetConsumer::CliPay,
             binding: ledger::DomainBinding::Transaction {

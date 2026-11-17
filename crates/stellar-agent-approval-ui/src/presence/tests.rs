@@ -27,6 +27,46 @@ struct Harness {
     session: SessionState,
     consent: Arc<crate::tests::RecordingConsent>,
 }
+
+#[tokio::test]
+#[serial_test::serial]
+async fn inbox_challenge_prechecks_the_record_in_both_listeners() {
+    use std::sync::atomic::Ordering;
+    {
+        let h = Harness::new();
+        h.consent.missing_record.store(true, Ordering::SeqCst);
+        let (status, body) = h
+            .post("challenge", json!({"consent_view_digest": h.digest()}), "")
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["status"], "not_found",
+            "loopback prechecks before issue: {body}"
+        );
+        assert!(body.get("challenge").is_none());
+        h.consent.missing_record.store(false, Ordering::SeqCst);
+        assert!(h.challenge().await.get("challenge").is_some());
+    }
+    {
+        let h = SignedOrigin::new("signed-precheck");
+        let page = h.page().await;
+        h.consent.missing_record.store(true, Ordering::SeqCst);
+        let (status, body) = h
+            .post(
+                "challenge",
+                &json!({"consent_view_digest": page["consent_view_digest"]}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["status"], "not_found",
+            "signed origin prechecks before issue: {body}"
+        );
+        assert!(body.get("challenge").is_none());
+        h.consent.missing_record.store(false, Ordering::SeqCst);
+        assert!(h.challenge().await.get("challenge").is_some());
+    }
+}
 impl Harness {
     fn new() -> Self {
         Self::named("presence")

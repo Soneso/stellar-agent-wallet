@@ -4573,6 +4573,7 @@ impl<'a> OperationRecorder<'a> {
         // A malformed mint entry refuses before the lock, the key, and any
         // read.
         if let Some((request, _)) = mint {
+            request.approval_identity()?;
             super::store::check_total_shape(&request.holds)?;
         }
         if !profile.chain_id.is_mainnet() {
@@ -4601,6 +4602,9 @@ impl<'a> OperationRecorder<'a> {
         mint: Option<(&MintRequest, OperationId)>,
         step: impl FnOnce(&mut Session<'_>) -> Result<T, WindowStoreError>,
     ) -> Result<T, WindowStoreError> {
+        if let Some((request, _)) = mint {
+            request.approval_identity()?;
+        }
         let store = self.store;
         let profile = self.profile;
         if !profile.chain_id.is_mainnet() {
@@ -4616,7 +4620,8 @@ impl<'a> OperationRecorder<'a> {
         let now = now_ms()?;
         let mint_expires = match mint {
             Some((request, operation)) => {
-                let cap = store.mint_record_checks(profile, request, Some(operation), now)?;
+                let identity = request.approval_identity()?.or(Some(operation));
+                let cap = store.mint_record_checks(profile, request, identity, now)?;
                 Some(store.mint_prechecks(lock, profile, request, now, cap)?)
             }
             None => None,
@@ -4738,8 +4743,9 @@ impl<'a> OperationRecorder<'a> {
     /// - `recovery.retry_refused` for a successor whose predecessor has no
     ///   current attempt, no non-inclusion proof, no checked decision, or no
     ///   projection marker.
-    /// - `internal.unexpected_state` for an edge outside the table or an
-    ///   exposed authorization a remint would retire.
+    /// - `internal.unexpected_state` for an edge outside the table, an
+    ///   exposed authorization a remint would retire, or, before any read, a
+    ///   mint that carries a separate approval operation.
     /// - The mint's refusals and every store error. Nothing is written on a
     ///   refusal.
     pub fn begin_attempt(
@@ -4747,6 +4753,18 @@ impl<'a> OperationRecorder<'a> {
         handle: &OperationHandle,
         request: &AttemptRequest,
     ) -> Result<AttemptStarted, WindowStoreError> {
+        if let AttemptAuthorization::Mint(mint) = &request.authorization {
+            mint.approval_identity()?;
+            // The step links the mint to `handle`'s operation, so a separate
+            // approval identity would be a second one; it refuses before any
+            // record read.
+            if mint.approval_operation.is_some() {
+                return Err(WindowStoreError::UnexpectedState {
+                    detail: "an operation step mint takes its approval identity from the operation"
+                        .to_owned(),
+                });
+            }
+        }
         if request
             .envelope
             .as_ref()
@@ -6718,6 +6736,7 @@ pub(crate) mod tests {
             MintRequest {
                 intent_digest: None,
                 predecessor: None,
+                approval_operation: None,
                 chain: Caip2::Mainnet,
                 consumer: match binding.domain() {
                     AuthorizationDomain::Soroban => MainnetConsumer::X402Create,

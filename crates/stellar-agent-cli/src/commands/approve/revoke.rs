@@ -609,6 +609,7 @@ pub(super) mod tests {
             MintRequest {
                 intent_digest: None,
                 predecessor: None,
+                approval_operation: None,
                 chain: self.core.profile().chain_id,
                 consumer: MainnetConsumer::CliPay,
                 binding: DomainBinding::Transaction {

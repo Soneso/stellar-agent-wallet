@@ -33,7 +33,7 @@ use stellar_agent_core::profile::{
 use super::WindowStoreError;
 use super::notices::CommittedBatch;
 use super::operations::{
-    APPROVAL_NONCE_MAX, CapacityDetail, FILE_THRESHOLD, OperationAudit, OperationId, OperationLink,
+    APPROVAL_NONCE_MAX, CapacityDetail, FILE_THRESHOLD, OperationAudit, OperationId,
     OperationRecorder, Session, WindowSection,
 };
 use super::store::{PersistedWindowStore, RETENTION_MS, WIRE_VERSION_OPERATIONS, WireFile, now_ms};
@@ -1562,10 +1562,10 @@ pub(super) fn check_record(
 pub(super) fn consume(
     wire: &mut WireFile,
     nonce: &str,
-    operation: Option<OperationLink>,
+    operation: Option<OperationId>,
     now: u64,
 ) -> Result<(), WindowStoreError> {
-    check_record(wire, nonce, operation.map(|link| link.operation_id), now)?;
+    check_record(wire, nonce, operation, now)?;
     let Some(record) = wire
         .approvals
         .as_mut()
@@ -1596,8 +1596,8 @@ pub(in crate::policy_state) mod tests {
 
     use super::super::ledger::{DomainBinding, MintAuthority, MintRequest};
     use super::super::operations::{
-        BusinessId, IntentSlot, OpenOutcome, OpenRequest, OperationKind, OperationState,
-        OperationTool,
+        BusinessId, IntentSlot, OpenOutcome, OpenRequest, OperationKind, OperationLink,
+        OperationState, OperationTool,
     };
     use super::*;
     use crate::mainnet::{
@@ -1911,6 +1911,7 @@ pub(in crate::policy_state) mod tests {
             MintRequest {
                 intent_digest: None,
                 predecessor: None,
+                approval_operation: None,
                 chain: self.fixture.profile().chain_id,
                 consumer: MainnetConsumer::CliPay,
                 binding: DomainBinding::Transaction {

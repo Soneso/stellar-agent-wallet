@@ -926,6 +926,7 @@ mod tests {
             .unwrap();
         drop(store);
         let _driver = listener_driver::install(5);
+        crate::common::approval_fixture::open_record(name, fixture.profile(), &entry);
         let cli = crate::Cli::try_parse_from([
             "stellar-agent",
             "approve",

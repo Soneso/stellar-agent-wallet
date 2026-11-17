@@ -259,6 +259,12 @@ fn enrollment_operator_flag_reaches_the_listener() {
 fn one_shot_operator_flag_reaches_the_listener() {
     let fixture = fixture();
     let entry = fixture.payment(5_000);
+    stellar_agent_network::keyring::rotate_keyring_secret_32(
+        &fixture.profile().policy_window_state_key_id.service,
+        &fixture.profile().policy_window_state_key_id.account,
+    )
+    .unwrap();
+    crate::approval_fixture::open_record(NAME, fixture.profile(), &entry);
     let nonce = entry.approval_nonce.clone();
     let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
     store

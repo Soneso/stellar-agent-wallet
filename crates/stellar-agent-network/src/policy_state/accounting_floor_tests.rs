@@ -139,6 +139,7 @@ fn floor_checked_input_uses_verified_first_rule_and_operating_source() {
         operation: None,
         intent_digest: None,
         predecessor: None,
+        approval_operation: None,
         native_reservation: Some(NativeReservation {
             debit_stroops: 50,
             fee_stroops: 0,

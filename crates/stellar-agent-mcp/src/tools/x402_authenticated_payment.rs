@@ -1190,12 +1190,15 @@ impl WalletServer {
                 let DispatchOutcome::RequireApproval(approval) = &dispatch else {
                     return Ok(approval_required_indistinguishable(name));
                 };
-                let entry = self.write_x402_pending_approval(
-                    &root,
-                    Some(args.home_domain.clone()),
-                    approval,
-                    stellar_agent_network::mainnet::clock::now_ms,
-                );
+                let entry =
+                    self.x402_pending_approval(entry.as_ref(), dispatch.audit_decision(), || {
+                        self.write_x402_pending_approval(
+                            &root,
+                            Some(args.home_domain.clone()),
+                            approval,
+                            stellar_agent_network::mainnet::clock::now_ms,
+                        )
+                    });
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(error) => {
@@ -1245,6 +1248,7 @@ impl WalletServer {
             Err(error) => return Ok(endpoint_refusal_result(&error)),
         };
         let inputs = MainnetIdentityInputs {
+            approval_operation: entry.as_ref().map(|handle| handle.id()),
             context: guard.context,
             intent: &intent,
             policy: guard.policy,

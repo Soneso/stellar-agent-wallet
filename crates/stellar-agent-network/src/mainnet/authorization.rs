@@ -2265,6 +2265,7 @@ mod tests {
             let request = MintRequest {
                 intent_digest: None,
                 predecessor: None,
+                approval_operation: None,
                 chain: Caip2::Mainnet,
                 binding: binding.clone(),
                 // A Message record is minted only for the authenticated x402

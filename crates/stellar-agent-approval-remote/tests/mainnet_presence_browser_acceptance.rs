@@ -50,6 +50,13 @@ mod trusted_browser;
 struct NoDurableRecords;
 
 impl stellar_agent_approval_ui::decision::ConsentRecording for NoDurableRecords {
+    fn precheck(
+        &self,
+        _: &stellar_agent_core::approval::PendingApproval,
+    ) -> Result<(), stellar_agent_core::error::WalletError> {
+        Ok(())
+    }
+
     fn complete(
         &self,
         _: stellar_agent_approval_ui::decision::VerifiedConsent,

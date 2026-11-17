@@ -62,6 +62,225 @@ mod producers {
 
     const TOOLS: [Tool; 3] = [Tool::CreateAccount, Tool::Trustline, Tool::Claim];
 
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn x402_producers_open_facts_and_reuse_the_linked_entry() {
+        use super::super::common::tests::mainnet::{ledger, require_approval_rules};
+        use super::super::x402_authenticated_mainnet_tests::{authenticated_policy, call_muxed};
+        for authenticated in [false, true] {
+            for ttl in [300, 3600] {
+                let run = AuthenticatedRun::build(|raw| {
+                    require_approval_rules(
+                        &authenticated_policy(&raw),
+                        &[
+                            "stellar_x402_create_payment",
+                            "stellar_x402_authenticated_payment",
+                        ],
+                        ttl,
+                    )
+                })
+                .await;
+                let args = run.args(HOME, None);
+                let business = BusinessId::parse(args.business_id.as_ref().unwrap()).unwrap();
+                let mut first = run.args(HOME, None);
+                first.business_id = args.business_id.clone();
+                let result = call_muxed(&run, authenticated, first).await;
+                assert_eq!(result["ok"], true, "{result}");
+                let nonce = result["data"]["approval"]["approval_nonce"]
+                    .as_str()
+                    .unwrap();
+                let entry = stored_approval(&run.f, nonce).unwrap();
+                let status = ApprovalStatus::new(
+                    &run.f.server.window_store,
+                    run.f.server.security_profile(),
+                );
+                let record = status
+                    .find_by_nonce(nonce)
+                    .unwrap()
+                    .expect("each x402 producer opens its record")
+                    .record;
+                let operation = OperationStatus::new(
+                    &run.f.server.window_store,
+                    run.f.server.security_profile(),
+                )
+                .view(&business)
+                .unwrap()
+                .unwrap();
+                assert_eq!(record.kind, ApprovedKind::X402Payment);
+                assert_eq!(
+                    record.subject,
+                    mainnet_consent_subject(&entry, &binding()).unwrap(),
+                    "authenticated producer facts bind the home domain"
+                );
+                assert_eq!(record.subject_kind, entry.subject_kind);
+                assert_eq!(record.intent_digest, operation.intent_digest);
+                assert_eq!(record.operation_id, operation.operation_id);
+                assert_eq!(
+                    (record.created_at_ms, record.waiting_expires_at_ms),
+                    (entry.created_at_unix_ms, entry.expires_at_unix_ms)
+                );
+                assert_eq!(record.rule_ttl_ms, u64::try_from(ttl).unwrap() * 1000);
+                assert_eq!(
+                    operation.waiting_expires_at_ms,
+                    Some(entry.expires_at_unix_ms)
+                );
+                assert_eq!(operation.state, OperationState::AwaitingApproval);
+                let state = ledger(&run.f).unwrap();
+                assert_eq!(
+                    state["operations"]["records"][0]["prepared_decision"],
+                    "require_approval"
+                );
+                let before = std::fs::read(store_path(&run.f)).unwrap();
+                let repeated = call_muxed(&run, authenticated, args).await;
+                assert_eq!(repeated["ok"], true);
+                assert_eq!(
+                    repeated["data"], result["data"],
+                    "x402 preparation returns the linked approval"
+                );
+                assert_eq!(std::fs::read(store_path(&run.f)).unwrap(), before);
+                assert_eq!(ledger(&run.f).unwrap(), state);
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn x402_rerun_removes_orphans_and_recovers_open_failures() {
+        use super::super::common::tests::mainnet::require_approval_rules;
+        use super::super::x402_authenticated_mainnet_tests::{authenticated_policy, call_muxed};
+        for authenticated in [false, true] {
+            for fault in [COMMIT_FAULT_AFTER_PREPARED, COMMIT_FAULT_AFTER_COUNTER] {
+                let run = AuthenticatedRun::build(|raw| {
+                    require_approval_rules(
+                        &authenticated_policy(&raw),
+                        &[
+                            "stellar_x402_create_payment",
+                            "stellar_x402_authenticated_payment",
+                        ],
+                        300,
+                    )
+                })
+                .await;
+                let args = run.args(HOME, None);
+                // Establish the operation, then leave only an unattested inbox orphan.
+                let root = stellar_agent_x402::exact::payment_root(
+                    &run.f.requirements(),
+                    run.f.envelope.source(),
+                )
+                .unwrap();
+                let digest = stellar_agent_x402::exact::intent_digest(
+                    &run.f.requirements(),
+                    run.f.envelope.source(),
+                )
+                .unwrap();
+                let handle = run.f.server.x402_entry("stellar:mainnet", args.business_id.as_deref(), if authenticated { stellar_agent_network::policy_state::OperationTool::X402AuthenticatedPayment } else { stellar_agent_network::policy_state::OperationTool::X402CreatePayment }, if authenticated { stellar_agent_network::policy_state::OperationKind::X402AuthenticatedPayment } else { stellar_agent_network::policy_state::OperationKind::X402Payment }, digest, stellar_agent_network::policy_state::X402Intent {
+                    network: run.f.requirements().network, asset: run.f.requirements().asset,
+                    payer: run.f.envelope.source().to_owned(), pay_to: run.f.requirements().pay_to, amount: run.f.requirements().amount,
+                }).unwrap().unwrap();
+                use sha2::Digest as _;
+                let orphan = PendingApproval::new_x402_pending(
+                    &sha2::Sha256::digest(run.f.server.context.network_passphrase().as_bytes())
+                        .into(),
+                    &root,
+                    authenticated.then(|| HOME.to_owned()),
+                    stellar_agent_core::approval::process_uid_for_attestation().unwrap(),
+                    300_000,
+                )
+                .unwrap();
+                PendingApprovalStore::open(store_path(&run.f))
+                    .unwrap()
+                    .insert(orphan.clone(), now_ms())
+                    .unwrap();
+                let crash = arm_accounting_fault(fault);
+                let mut first = run.args(HOME, None);
+                first.business_id = args.business_id.clone();
+                let failed = call_muxed(&run, authenticated, first).await;
+                drop(crash);
+                assert_eq!(
+                    failed["error"]["code"], "submission.record_unavailable",
+                    "durable x402 errors retain their code: {failed}"
+                );
+                assert!(
+                    stored_approval(&run.f, &orphan.approval_nonce).is_none(),
+                    "x402 orphans are removed by intent digest"
+                );
+                let status = ApprovalStatus::new(
+                    &run.f.server.window_store,
+                    run.f.server.security_profile(),
+                );
+                let committed = status.find_by_operation(handle.id()).unwrap();
+                assert_eq!(committed.is_some(), fault == COMMIT_FAULT_AFTER_COUNTER);
+                if let Some(view) = &committed {
+                    assert!(
+                        stored_approval(&run.f, &view.record.nonce).is_some(),
+                        "a committed open retains its inbox entry"
+                    );
+                }
+                let retry = call_muxed(&run, authenticated, args).await;
+                assert_eq!(retry["ok"], true, "{retry}");
+                let view = status.find_by_operation(handle.id()).unwrap().unwrap();
+                assert_eq!(
+                    retry["data"]["approval"]["approval_nonce"],
+                    view.record.nonce
+                );
+                assert_eq!(
+                    status
+                        .find_by_nonce(&view.record.nonce)
+                        .unwrap()
+                        .unwrap()
+                        .record
+                        .id,
+                    view.record.id,
+                    "authenticated lookup converges on the same unique record"
+                );
+                assert_eq!(
+                    PendingApprovalStore::open(store_path(&run.f))
+                        .unwrap()
+                        .snapshot(now_ms())
+                        .len(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn preinsert_inbox_failures_use_the_protocol_channel() {
+        for tool in Tool::ALL {
+            for directory_failure in [false, true] {
+                let mut run = ClassicRun::new(tool).await;
+                let (args, _) = fresh(&run);
+                let scratch = tempfile::tempdir().unwrap();
+                let invalid = scratch.path().join("invalid-approval-home");
+                let _home = if directory_failure {
+                    run.f.server.approval_dir_override = None;
+                    Some(stellar_agent_test_support::env_guard::ScopedEnvVar::new(
+                        "STELLAR_AGENT_HOME",
+                        Some(invalid.as_os_str()),
+                    ))
+                } else {
+                    std::fs::write(&invalid, b"not a directory").unwrap();
+                    run.f.server.approval_dir_override = Some(invalid);
+                    None
+                };
+                let result = tool.prepare_result(&run.f.server, &args).await;
+                assert!(
+                    result.is_err(),
+                    "pre-insert failures use the protocol channel: {tool:?}, directory={directory_failure}"
+                );
+                let error = result.unwrap_err();
+                assert!(
+                    error.message.starts_with("approval.store_error:"),
+                    "pre-insert failures keep approval.store_error: {error:?}"
+                );
+            }
+        }
+    }
+
     fn status(run: &ClassicRun) -> ApprovalStatus<'_> {
         ApprovalStatus::new(&run.f.server.window_store, run.f.server.security_profile())
     }

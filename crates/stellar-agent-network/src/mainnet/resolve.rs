@@ -231,6 +231,8 @@ pub struct SorobanIntentRequest<'a> {
 /// is the ephemeral key the message facts name. The context supplies the
 /// profile name and the stored profile.
 pub struct MessageSignRequest<'a> {
+    /// The operation whose approval authorizes the message mint.
+    pub approval_operation: Option<crate::policy_state::OperationId>,
     /// Validated stored profile.
     pub context: &'a MainnetWriteContext,
     /// The verb that will consume the authorization.
@@ -1119,6 +1121,7 @@ mod enabled {
         MintRequest {
             intent_digest: None,
             predecessor: None,
+            approval_operation: None,
             chain: context.chain(),
             binding,
             consumer,
@@ -1692,6 +1695,7 @@ mod enabled {
         let request = MintRequest {
             intent_digest: None,
             predecessor: None,
+            approval_operation: req.approval_operation,
             chain: req.context.chain(),
             binding: DomainBinding::Message {
                 domain: message.domain.clone(),
@@ -1870,6 +1874,7 @@ mod enabled {
         let request = MintRequest {
             intent_digest: None,
             predecessor: None,
+            approval_operation: None,
             chain: header.chain,
             binding: DomainBinding::X402Submit {
                 final_envelope_sha256: approval_subject_classic(req.final_envelope_xdr),
@@ -7155,6 +7160,7 @@ mod tests {
             operation: None,
             intent_digest: None,
             predecessor: None,
+            approval_operation: None,
             native_reservation: Some(crate::policy_state::NativeReservation {
                 debit_stroops: 40,
                 fee_stroops: 10,

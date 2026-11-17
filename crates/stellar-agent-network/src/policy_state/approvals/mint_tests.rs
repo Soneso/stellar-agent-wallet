@@ -239,7 +239,9 @@ fn envelope_mint_caps_at_the_signed_expiry() {
     }
 }
 
-fn approval_handle(fx: &mut Fx) -> super::super::operations::OperationHandle {
+pub(in crate::policy_state) fn approval_handle(
+    fx: &mut Fx,
+) -> super::super::operations::OperationHandle {
     let outcome = OperationRecorder::new(&fx.store, fx.fixture.profile(), &mut fx.rows, "lookup")
         .lookup(&BusinessId::parse("order-1").unwrap())
         .unwrap()
@@ -254,10 +256,19 @@ fn begin_approval(
     fx: &mut Fx,
     request: MintRequest,
 ) -> Result<super::super::operations::AttemptStarted, WindowStoreError> {
-    use super::super::operations::{AttemptAuthorization, AttemptEnvelope, AttemptRequest};
     let handle = approval_handle(fx);
+    begin_step_mint(fx, &handle, request)
+}
+
+/// Begins an attempt of `handle` whose authorization mints `request`.
+pub(in crate::policy_state) fn begin_step_mint(
+    fx: &mut Fx,
+    handle: &super::super::operations::OperationHandle,
+    request: MintRequest,
+) -> Result<super::super::operations::AttemptStarted, WindowStoreError> {
+    use super::super::operations::{AttemptAuthorization, AttemptEnvelope, AttemptRequest};
     OperationRecorder::new(&fx.store, fx.fixture.profile(), &mut fx.rows, "begin").begin_attempt(
-        &handle,
+        handle,
         &AttemptRequest {
             envelope: Some(AttemptEnvelope {
                 xdr: "AAAA".to_owned(),

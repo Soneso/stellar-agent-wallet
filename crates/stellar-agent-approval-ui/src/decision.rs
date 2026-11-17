@@ -88,9 +88,9 @@ use stellar_agent_core::approval::witness::{
 };
 use stellar_agent_core::approval::{
     ApprovalKind, ApproverIdentity, AttestedApprover, ConsentAudit, ConsentAuthorization,
-    DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, PendingApprovalStore, RemoteApprovalAuthority,
-    Surface, approval_view_digest, attest_and_persist, decode_sha256_hex, load_and_validate_entry,
-    load_attestation_key, open_with_retry, process_uid_for_attestation,
+    DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, PendingApproval, PendingApprovalStore,
+    RemoteApprovalAuthority, Surface, approval_view_digest, attest_and_persist, decode_sha256_hex,
+    load_and_validate_entry, load_attestation_key, open_with_retry, process_uid_for_attestation,
 };
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::writer::AuditWriter;
@@ -292,6 +292,14 @@ pub struct VerifiedConsent {
 /// A mainnet payment, claim, trustline or x402 approval reports its
 /// attestation only after [`Self::complete`] succeeds.
 pub trait ConsentRecording: Send + Sync {
+    /// Checks that a durable record names this value entry before presence.
+    /// The caller holds the inbox; implementations inspect state without
+    /// taking the window lock.
+    ///
+    /// # Errors
+    /// Returns `approval.not_found` without a record, or the store refusal.
+    fn precheck(&self, entry: &PendingApproval) -> Result<(), WalletError>;
+
     /// Records `consent` in the durable record that names its nonce. The
     /// request holds neither the pending store nor the policy guard, so the
     /// implementation may take the window lock.
@@ -326,6 +334,22 @@ pub(crate) fn needs_durable_consent(ctx: &DecisionContext, kind: &ApprovalKind) 
                 | ApprovalKind::TrustlineSimulated { .. }
                 | ApprovalKind::X402Payment { .. }
         )
+}
+
+/// Checks the inbox's durable prerequisite without taking a window lock.
+pub(crate) fn precheck_consent(
+    ctx: &DecisionContext,
+    entry: &PendingApproval,
+) -> Result<(), WalletError> {
+    if needs_durable_consent(ctx, &entry.kind) {
+        ctx.consent
+            .as_ref()
+            .ok_or(WalletError::Approval(
+                stellar_agent_core::ApprovalFailure::PresenceUnavailable,
+            ))?
+            .precheck(entry)?;
+    }
+    Ok(())
 }
 
 /// Verifies the stored attestation of the value entry `nonce` in `store`

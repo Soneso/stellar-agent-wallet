@@ -1,5 +1,8 @@
 //! Offline integration tests for the Stellar agent CLI.
 
+#[path = "../src/common/approval_fixture.rs"]
+mod approval_fixture;
+
 #[path = "cli/unified_dispatch.rs"]
 mod unified_dispatch;
 #[path = "cli/unified_protocol.rs"]
