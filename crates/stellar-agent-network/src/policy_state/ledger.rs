@@ -529,6 +529,12 @@ pub(super) struct WireAuthorization {
     /// The operation attempt the authorization was minted for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) operation: Option<OperationLink>,
+    /// The canonical intent checked for this envelope.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_hex32")]
+    pub(super) intent_digest: Option<[u8; 32]>,
+    /// The authorization of the operation's previous attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) predecessor: Option<AuthorizationId>,
     /// How the authorization ended: used once, or ended unused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) disposition: Option<Disposition>,
@@ -1191,6 +1197,10 @@ pub struct MintRequest {
     /// The operation attempt the authorization serves; the operation must
     /// be retained and open. Absent for a mint outside an operation.
     pub operation: Option<OperationLink>,
+    /// The matched canonical intent, checked against the linked operation.
+    pub intent_digest: Option<[u8; 32]>,
+    /// The authorization of that operation's latest attempt, if any.
+    pub predecessor: Option<AuthorizationId>,
     /// The native amounts the authorization reserves, stored with the
     /// record whether or not it holds window entries.
     pub native_reservation: Option<NativeReservation>,
@@ -1456,6 +1466,9 @@ pub struct ClaimExpect {
     pub(crate) policy_sequence: i64,
     pub(crate) policy_digest: [u8; 32],
     pub(crate) authority: MintAuthority,
+    pub(crate) operation: Option<OperationLink>,
+    pub(crate) intent_digest: Option<[u8; 32]>,
+    pub(crate) predecessor: Option<AuthorizationId>,
 }
 
 /// The expectation a consumption is compared against: an authorization's
@@ -1960,6 +1973,12 @@ pub(super) fn mint_into(
     if let Some(link) = request.operation {
         operations::check_mint_link(wire, link)?;
     }
+    operations::check_mint_lineage(
+        wire,
+        request.operation,
+        request.intent_digest,
+        request.predecessor,
+    )?;
     check(
         options.exempt_cap
             || wire
@@ -2045,6 +2064,8 @@ pub(super) fn mint_into(
         consumption: None,
         invalidation: None,
         operation: request.operation,
+        intent_digest: request.intent_digest,
+        predecessor: request.predecessor,
         disposition: None,
         native_release: None,
         native_reservation: request.native_reservation,
@@ -2349,6 +2370,17 @@ impl PersistedWindowStore {
             P::PolicySequence,
         )?;
         check(auth.policy_digest == expect.policy_digest, P::PolicyDigest)?;
+        check(
+            auth.intent_digest == expect.intent_digest,
+            P::IntentMismatch,
+        )?;
+        if expect.intent_digest.is_some() {
+            check(auth.operation == expect.operation, P::BindingMismatch)?;
+        }
+        check(
+            auth.predecessor == expect.predecessor,
+            P::PredecessorMismatch,
+        )?;
         compare_authority(&auth.authority()?, &expect.authority)?;
         pin::compare(
             &lock,
@@ -2848,6 +2880,8 @@ mod tests {
             let n = self.nonces.get() + 1;
             self.nonces.set(n);
             MintRequest {
+                intent_digest: None,
+                predecessor: None,
                 chain: Caip2::Mainnet,
                 consumer: match binding.domain() {
                     AuthorizationDomain::Soroban | AuthorizationDomain::X402Submit => {
@@ -2888,6 +2922,9 @@ mod tests {
 
         fn claim_expect(&self, request: &MintRequest, minted: &MintedRecord) -> ClaimExpect {
             ClaimExpect {
+                operation: request.operation,
+                intent_digest: request.intent_digest,
+                predecessor: request.predecessor,
                 domain: request.binding.domain(),
                 consumer: request.consumer,
                 bindings_digest: minted.bindings_digest,
@@ -5489,6 +5526,8 @@ mod tests {
     fn sample(state: AuthorizationState, n: u8, settled_ms: Option<u64>) -> WireAuthorization {
         let binding = tx(n);
         WireAuthorization {
+            intent_digest: None,
+            predecessor: None,
             id: AuthorizationId::from_bytes([n.wrapping_add(0x60); 32]),
             profile: "ledger".to_owned(),
             chain: Caip2::Mainnet,
@@ -8132,6 +8171,7 @@ mod tests {
         ] {
             let mut request = l.request(tx(1), vec![]);
             request.operation = Some(stray);
+            request.intent_digest = Some(handle.intent().intent_digest());
             assert!(
                 matches!(
                     l.mint(&request),
@@ -8143,6 +8183,7 @@ mod tests {
         }
         let mut request = l.request(tx(1), vec![]);
         request.operation = Some(link);
+        request.intent_digest = Some(handle.intent().intent_digest());
         let minted = l.mint(&request).unwrap();
         assert_eq!(l.record(minted.id).operation, Some(link));
         let reopened = PersistedWindowStore::at_path(l.store.path().to_owned());

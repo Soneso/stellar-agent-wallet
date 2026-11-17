@@ -35,11 +35,13 @@ fn durable_record(f: &ResolverFixture, witness: &ApprovalWitness, consent: bool)
             business_id: BusinessId::parse(witness.nonce()).unwrap(),
             tool: OperationTool::CliPay,
             kind: OperationKind::Pay,
-            intent: IntentSlot::Canonical {
+            intent: IntentSlot::Envelope {
                 intent_digest: [1; 32],
-                intent: serde_json::json!({"op":"pay"}),
+                unsigned_envelope_sha256:
+                    stellar_agent_core::approval::subject::approval_subject_classic(&f.envelope),
+                max_time: 0,
             },
-            envelope_xdr: None,
+            envelope_xdr: Some(f.envelope.clone()),
             prepared_decision: None,
             rule_ttl_ms: Some(witness.expires_at_ms() - witness.created_at_ms()),
         })
@@ -562,6 +564,8 @@ fn header_preserves_bindings_and_bounds() {
         audit: audit.fact_digest(),
     };
     let request = MintRequest {
+        intent_digest: None,
+        predecessor: None,
         chain: f.profile.chain_id,
         binding: DomainBinding::Transaction {
             unsigned_envelope_sha256: witness.subject(),
@@ -700,14 +704,15 @@ fn intent_restart_seam() {
         .unwrap();
     let mut rows = ApprovalRows;
     let mut recorder = OperationRecorder::new(&store, fx.fixture.profile(), &mut rows, "restart");
-    // The raw mint is the explicit rebuilt-intent seam. Production authority still
-    // keeps its captured decision bound and signed witness expiry.
+    // The raw mint isolates the retained-record execution bound from resolution.
     let link = OperationLink {
         operation_id: crate::policy_state::OperationId::from_bytes(facts.record().operation_id),
         attempt_index: 1,
     };
     assert!(enabled::check_approval_facts(Some(&facts), &witness, Some(link), now).is_ok());
     let mint = MintRequest {
+        intent_digest: Some(facts.record().intent_digest),
+        predecessor: None,
         chain: fx.fixture.profile().chain_id,
         binding: DomainBinding::Transaction {
             unsigned_envelope_sha256: [1; 32],
@@ -743,6 +748,17 @@ fn intent_restart_seam() {
     first.operation = Some(link);
     first.authorization_ttl_ms = 1;
     fx._clock.set(witness.consent_at_ms());
+    let mut without_digest = first.clone();
+    without_digest.intent_digest = None;
+    assert!(
+        matches!(
+            store.mint_authorization(fx.fixture.profile(), &without_digest),
+            Err(crate::policy_state::WindowStoreError::AuthorizationRefused {
+                precondition: P::IntentMismatch,
+            })
+        ),
+        "canonical mint without an intent digest refuses IntentMismatch"
+    );
     store
         .mint_authorization(fx.fixture.profile(), &first)
         .unwrap();

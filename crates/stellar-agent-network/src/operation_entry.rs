@@ -2622,6 +2622,46 @@ pub(crate) mod tests {
         let above = rebuild(ClassicFeeChoice::Explicit(501)).await.unwrap_err();
         assert_eq!(above.code(), "fees.percentile_exceeds_cap");
         assert!(rebuild(ClassicFeeChoice::Explicit(500)).await.is_ok());
+        for selected in [240_u32, 500, 501] {
+            use stellar_agent_test_support::EchoIdResponder;
+            use wiremock::{Mock, matchers::body_partial_json};
+            serve_chain(&f, &primary, &oracle, 5, "healthy").await;
+            let mut distribution = json!({"transactionCount": "1", "ledgerCount": 1});
+            for key in [
+                "min", "max", "mode", "p10", "p20", "p30", "p40", "p50", "p60", "p70", "p80",
+                "p90", "p95", "p99",
+            ] {
+                distribution[key] = json!(selected.to_string());
+            }
+            Mock::given(body_partial_json(json!({"method": "getFeeStats"})))
+                .respond_with(EchoIdResponder::new(json!({
+                    "inclusionFee": distribution,
+                    "sorobanInclusionFee": distribution,
+                    "latestLedger": 100,
+                })))
+                .mount(&primary)
+                .await;
+            let result = rebuild(ClassicFeeChoice::Auto(crate::fees::FeePercentile::P95)).await;
+            assert_eq!(
+                methods(&primary).await,
+                ["getHealth", "getLedgers", "getLedgerEntries", "getFeeStats"],
+                "Auto reads fresh fees after readiness and the account"
+            );
+            if selected <= 500 {
+                let rebuilt = result.unwrap();
+                assert_eq!(
+                    match_envelope(&rebuilt.unsigned_envelope_b64, &check)
+                        .unwrap()
+                        .fee_stroops,
+                    selected,
+                    "the envelope binds the fresh percentile"
+                );
+                assert_eq!(subject(&rebuilt), tx_hash(&rebuilt.unsigned_envelope_b64));
+            } else {
+                assert_eq!(result.unwrap_err().code(), "fees.percentile_exceeds_cap");
+                assert!(methods(&oracle).await.is_empty());
+            }
+        }
         serve_chain(&f, &primary, &oracle, i64::MAX, "healthy").await;
         let exhausted = rebuild(ClassicFeeChoice::ProfileDefault).await.unwrap_err();
         assert_eq!(exhausted.code(), "protocol.xdr_codec_failed");
