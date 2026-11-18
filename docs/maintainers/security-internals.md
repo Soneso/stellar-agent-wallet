@@ -2538,7 +2538,11 @@ process identifier, attestation and receipt digests, and the successful sink
 with any queued reference. Compatibility, testnet and clawback opt-in consents
 store none. The integrated completion takes the sink only from a verified
 handoff and commits it as the record's delivery facts. Integrated admission
-refuses while no authenticated owner-scope inventory exists.
+first proves the owner scope ready from stored state: no sibling profile names
+its audit coordinates, every profile file reads, and the verified window holds
+no live grant of an enforced kind without delivery facts. Reacquisition then
+adopts only migration pins that a live grant's queued reference matches
+exactly; any other pin refuses.
 
 The CLI confirmation and existing-record `approve --id` routes select integrated
 publication through the same kind capability as consumption. All capabilities
@@ -2549,7 +2553,23 @@ Verification uses the held policy admission, then releases writer, inbox, and
 admission before committing the authenticated delivery. Recovery preserves the
 original sink and receipt time. A missing handoff refuses instead of supplying
 direct provenance. The compatibility recovery described above still uses
-`recovered` provenance. Inbox and MCP integration remain separate prerequisites.
+`recovered` provenance.
+
+Both inbox listeners select publication through the same capability. An
+enabled inbox consent reserves before its challenge and again before its row,
+uses the strict direct attester, and every response that shows its
+attestation first commits the handoff verified under policy admission.
+Before the handoff of an uncommitted consent, the listener reacquires the
+reservation and checks the inventory, and a failure refuses and commits no
+consent.
+
+The six MCP producers select publication through the same capability. An
+enabled producer reserves the committed record's slot before it stores the
+inbox entry or returns an approval block, and a retry reacquires that slot
+first. A retry of a revoked record refuses with `approval.revoked`. The audited open borrows the held value audit writer. The entry is
+stored after that writer is released, and a conflicting open answers with the
+winner's entry. The payment producer binds its recovery entry only after the
+reservation.
 
 Consent retains the attestation, receipt and signed process identifier for
 reconstruction. The record supplies the signed nonce, kind, subject and

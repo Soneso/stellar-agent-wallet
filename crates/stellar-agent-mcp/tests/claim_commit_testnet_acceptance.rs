@@ -27,8 +27,9 @@
 //!
 //! # Approval-store note
 //!
-//! `WalletServer::persist_claim_pending_approval` (the internal helper
-//! `stellar_claim` calls when the policy engine requires approval) resolves
+//! `WalletServer::claim_pending_entry` and
+//! `WalletServer::insert_classic_pending` (the internal helpers
+//! `stellar_claim` calls when the policy engine requires approval) resolve
 //! the approval-store directory via `default_approval_dir()` unconditionally
 //! — it does not consult the `approval_dir_override` test hook that
 //! `verify_attestation_gate` honours. Driving the real persist path therefore

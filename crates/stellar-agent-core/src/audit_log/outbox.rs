@@ -10937,6 +10937,43 @@ mod tests {
         }
     }
 
+    /// Release of a migration pin's identity refuses with `unresolved pin`
+    /// and changes no durable byte, so the pin keeps its slot until an
+    /// exact adoption.
+    #[test]
+    #[serial_test::serial]
+    fn release_keeps_migration_pins() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let (_dir, path, store, _writer, [first, _]) = pinned();
+        let outbox = keyed_outbox(&path, &store);
+        let before = durable(&path, &store);
+        let pin = EvidenceRecord::legacy_pin(first.digest).identity;
+        let refused = outbox.release_evidence(pin).unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                WriterError::OutboxEvidenceUnusable {
+                    reason: "unresolved pin"
+                }
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(
+            durable(&path, &store),
+            before,
+            "a refused release writes nothing"
+        );
+        assert!(
+            outbox
+                .evidence()
+                .unwrap()
+                .unwrap()
+                .holds_migration_pin(&first)
+        );
+    }
+
     #[test]
     #[serial_test::serial]
     fn migration_adoption_checks_context() {

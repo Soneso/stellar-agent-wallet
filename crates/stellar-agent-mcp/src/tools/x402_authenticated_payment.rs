@@ -1190,15 +1190,21 @@ impl WalletServer {
                 let DispatchOutcome::RequireApproval(approval) = &dispatch else {
                     return Ok(approval_required_indistinguishable(name));
                 };
-                let entry =
-                    self.x402_pending_approval(entry.as_ref(), dispatch.audit_decision(), || {
-                        self.write_x402_pending_approval(
-                            &root,
-                            Some(args.home_domain.clone()),
-                            approval,
-                            stellar_agent_network::mainnet::clock::now_ms,
-                        )
-                    });
+                let entry = self.x402_pending_approval(
+                    entry.as_ref(),
+                    dispatch.audit_decision(),
+                    crate::tools::business_entry::Staged {
+                        build: |_: Option<&stellar_agent_core::approval::ClassicIntent>| {
+                            self.x402_pending_entry(&root, Some(args.home_domain.clone()), approval)
+                        },
+                        insert: |entry| {
+                            self.insert_x402_pending(
+                                entry,
+                                stellar_agent_network::mainnet::clock::now_ms,
+                            )
+                        },
+                    },
+                );
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(error) => {

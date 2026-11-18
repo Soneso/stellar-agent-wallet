@@ -199,7 +199,6 @@ fn admission_retains_the_exact_execution_allowance() {
     let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
     for ttl in [300_000, 3_600_000] {
         let fx = Fx::new(ttl);
-        let _ready = ConsentEvidenceInventoryGuard::new(fx.fixture.name());
         let mut evidence = evidence(&fx, "deadline.log");
         admit(&fx, &mut evidence, &fx.facts, |_, _| Ok(())).unwrap();
         assert!(
@@ -314,7 +313,6 @@ fn publication_has_capacity_headroom() {
     for queued in [false, true] {
         let mut fx = Fx::new(300_000);
         fx.open();
-        let _ready = ConsentEvidenceInventoryGuard::new(fx.fixture.name());
         let mut evidence = evidence(&fx, "headroom.log");
         let (inbox, reference) = strict_inbox(&fx, &mut evidence, "strict.toml", queued);
         let others: Vec<_> = (0..MAX_EVIDENCE_ENTRIES - 1)
@@ -405,7 +403,6 @@ fn routed_admission_refuses_pins_and_orphans() {
     for mode in ["pin", "v1", "missing"] {
         let mut fx = Fx::new(300_000);
         fx.open();
-        let _ready = ConsentEvidenceInventoryGuard::new(fx.fixture.name());
         let mut evidence = evidence(&fx, "unready.log");
         evidence
             .outbox
@@ -493,9 +490,9 @@ fn queued_row(outbox: &AuditOutbox, reservation: &EvidenceReservation) -> Outbox
         .unwrap()
 }
 
-/// Admission refuses while the owner-scope inventory is unavailable, before
-/// it opens a record, initializes evidence or presents anything. With an
-/// authenticated fixture inventory it initializes the owner before the
+/// Admission refuses while the owner scope is unproven, before it opens a
+/// record, initializes evidence or presents anything. A fresh scope is
+/// ready from stored state: admission initializes the owner before the
 /// first reservation, and a second admission reuses both.
 #[test]
 #[serial(mainnet_clock)]
@@ -512,19 +509,20 @@ fn producer_admission_requires_scope_readiness() {
             presented.set(presented.get() + 1);
             Ok(queued.then(|| queued_row(&outbox, reservation)))
         };
+        let unreadable = UnreadableSiblingProfile::plant();
         let refused = admit(&fx, &mut evidence, &fx.facts.clone(), present).unwrap_err();
         assert_eq!(refused.code(), "audit.outbox_evidence_unusable");
         assert!(
             refused
                 .to_string()
-                .contains("owner-scope inventory unavailable")
+                .contains("owner scope shared or unreadable")
         );
         assert_eq!(presented.get(), 0);
         assert_eq!(evidence.writer.outbox_evidence().unwrap(), None);
         let status = ApprovalStatus::new(&fx.store, fx.fixture.profile());
         assert_eq!(status.find_by_operation(fx.operation).unwrap(), None);
 
-        let _ready = ConsentEvidenceInventoryGuard::new(fx.fixture.name());
+        drop(unreadable);
         for attempt in 1..=2 {
             let presented = Cell::new(0);
             let reference = admit(
@@ -566,7 +564,6 @@ fn reserve_before_request_and_without_window_lock() {
         .collect();
     for queued in [false, true] {
         let fx = Fx::new(300_000);
-        let _ready = ConsentEvidenceInventoryGuard::new(fx.fixture.name());
         let mut evidence = evidence(&fx, "capacity.log");
         evidence.writer.initialize_consent_evidence().unwrap();
         seed_reserved_evidence(
@@ -598,7 +595,6 @@ fn reserve_before_request_and_without_window_lock() {
     }
 
     let fx = Fx::new(300_000);
-    let _ready = ConsentEvidenceInventoryGuard::new(fx.fixture.name());
     let mut evidence = evidence(&fx, "one-slot.log");
     evidence.writer.initialize_consent_evidence().unwrap();
     seed_reserved_evidence(
@@ -679,7 +675,6 @@ fn producer_linkage_and_retry_are_fact_bound() {
     let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
     let fx = Fx::new(300_000);
-    let _ready = ConsentEvidenceInventoryGuard::new(fx.fixture.name());
     let mut evidence = evidence(&fx, "linkage.log");
     let mut retry = fx.facts.clone();
     retry.nonce.push('r');
@@ -966,15 +961,18 @@ fn publication_refuses_revoked_retry() {
 }
 
 /// The maintainer protocol states each commit point of admission and
-/// publication once, and keeps readiness closed and queued reporting
-/// immediate.
+/// publication once, states the readiness proof and its refusals, and keeps
+/// queued reporting immediate.
 #[test]
 fn publication_protocol_documents_commit_points() {
     let recovery = include_str!("../../../../../docs/maintainers/audit-log-recovery.md");
     let internals = include_str!("../../../../../docs/maintainers/security-internals.md");
     for sentence in [
         "An integrated request is presented only after its committed pending record holds a reservation.",
-        "No such inventory exists yet, so integrated admission refuses with `owner-scope inventory unavailable`.",
+        "Admission requires a readiness proof of the whole owner scope from stored state, then explicit owner initialization, then the reservation.",
+        "It refuses with `live grant without delivery facts` while the verified window holds a live consent of an enforced kind without delivery facts.",
+        "Any other pin keeps refusing admission with `unresolved migration pin`, and no command clears it, so a migrated scope with an unmatched pin stays blocked.",
+        "A grant held only in the inbox, without a window record, is outside the proof and refuses at use for an enforced kind.",
         "Integrated consent succeeds only after the window commit holds the receipt, the authenticated sink, and the exact queued reference.",
         "Recovery takes the sink only from a verified handoff, and a `written` or `recovered` row never becomes direct anchoring.",
         "Queued success reports `audit.outbox_queued` at once and never waits for delivery.",
@@ -982,6 +980,11 @@ fn publication_protocol_documents_commit_points() {
         "It releases the writer, inbox, and admission before the window commit, and returns a witness or success only after that commit.",
         "A crash after the consent row but before inbox persistence leaves no authenticated grant.",
         "A present Queued row and a Delivered row cannot be retargeted to a different consent digest.",
+        "When enabled, the challenge precheck reacquires the record's reservation before either challenge form is issued.",
+        "Every inbox response that shows a value attestation verifies the handoff under policy admission and shows it only after the window commit.",
+        "When enabled, an MCP producer opens or selects the committed record and reserves before it stores the inbox entry or returns an approval block.",
+        "A retry reacquires the committed record's slot before it returns the linked approval block, so a full scope still answers the retry.",
+        "A crash between the reservation and the inbox insert leaves a reserved record without an entry, and a retry refuses with `approval.not_found`.",
     ] {
         assert_eq!(recovery.matches(sentence).count(), 1, "{sentence}");
         assert!(sentence.split_whitespace().count() < 35, "{sentence}");
@@ -995,4 +998,9 @@ fn publication_protocol_documents_commit_points() {
     }
     assert!(internals.contains("in the replacement that stores the blob and receipt"));
     assert!(internals.contains("takes the sink only from a verified"));
+    assert!(internals.contains("reserves before its challenge and again before its row"));
+    assert!(
+        internals
+            .contains("enabled producer reserves the committed record's slot before it stores")
+    );
 }

@@ -10232,7 +10232,7 @@ pub(crate) mod tests {
 
             /// A run of [`Self::new`] whose durable record holds no consent
             /// after the attestation.
-            async fn unconsented(tool: Tool) -> Self {
+            pub(crate) async fn unconsented(tool: Tool) -> Self {
                 Self::build(tool, Some(false), |raw| raw, |_| {}, |_| {}).await
             }
 
@@ -10244,7 +10244,7 @@ pub(crate) mod tests {
 
             /// `consent` is `None` under `Allow`; otherwise it says whether
             /// the attestation completes the durable record.
-            async fn build(
+            pub(crate) async fn build(
                 tool: Tool,
                 consent: Option<bool>,
                 policy: impl FnOnce(String) -> String,

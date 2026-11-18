@@ -52,6 +52,7 @@ mod producers {
     use stellar_agent_core::approval::witness::ApprovedKind;
     use stellar_agent_core::audit_log::PolicyDecision;
     use stellar_agent_network::operation_entry::{self, ClassicEntry};
+    use stellar_agent_network::policy_state::approvals::UnreadableSiblingProfile;
     use stellar_agent_network::policy_state::store::commit_faults::{
         COMMIT_FAULT_AFTER_COUNTER, COMMIT_FAULT_AFTER_PREPARED, arm_accounting_fault,
         observe_commit,
@@ -61,6 +62,35 @@ mod producers {
     };
 
     const TOOLS: [Tool; 3] = [Tool::CreateAccount, Tool::Trustline, Tool::Claim];
+
+    /// A producer write of an unpublished kind that stores its entry in one
+    /// step through `F`; the published route, which builds first, never runs it.
+    pub(super) struct Persist<F>(pub(super) F);
+
+    impl<F, E> super::super::business_entry::InboxWrite for Persist<F>
+    where
+        F: FnOnce() -> Result<PendingApproval, E>,
+    {
+        type Error = E;
+
+        fn build(
+            &self,
+            _: Option<&stellar_agent_core::approval::ClassicIntent>,
+        ) -> Result<PendingApproval, E> {
+            panic!("an unpublished fixture write is never built alone")
+        }
+
+        fn insert(self, _: PendingApproval) -> Result<PendingApproval, E> {
+            panic!("an unpublished fixture write is never inserted alone")
+        }
+
+        fn persist(
+            self,
+            _: Option<&stellar_agent_core::approval::ClassicIntent>,
+        ) -> Result<PendingApproval, E> {
+            (self.0)()
+        }
+    }
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
@@ -694,7 +724,7 @@ mod producers {
             None,
             ApprovedKind::Claim,
             PolicyDecision::RequireApproval,
-            |_| panic!("missing handle must refuse before insertion"),
+            Persist(|| panic!("missing handle must refuse before insertion")),
         );
         assert_eq!(
             result.unwrap_err().code(),
@@ -706,7 +736,7 @@ mod producers {
             Some(&handle),
             ApprovedKind::Claim,
             PolicyDecision::RequireApproval,
-            |_| Err("fixture insertion failure".to_owned()),
+            Persist(|| Err("fixture insertion failure".to_owned())),
         );
         let super::super::common::ToolError::Protocol(error) = result.unwrap_err() else {
             panic!("insertion keeps its protocol channel")
@@ -722,7 +752,7 @@ mod producers {
                 Some(&handle),
                 ApprovedKind::Claim,
                 PolicyDecision::RequireApproval,
-                |_| {
+                Persist(|| {
                     let mut inbox = PendingApprovalStore::open(store_path(&run.f)).unwrap();
                     inbox.insert(winner.clone(), now_ms()).unwrap();
                     inbox.insert(loser.clone(), now_ms()).unwrap();
@@ -742,7 +772,7 @@ mod producers {
                         })
                         .unwrap();
                     Ok(loser.clone())
-                },
+                }),
             )
             .unwrap();
         assert_eq!(
@@ -761,7 +791,7 @@ mod producers {
                 Some(&invalid_handle),
                 ApprovedKind::Claim,
                 PolicyDecision::RequireApproval,
-                |_| Ok(invalid),
+                Persist(|| Ok(invalid)),
             )
             .unwrap_err();
         let result = wire(&error.into_result().unwrap());
@@ -793,7 +823,7 @@ mod producers {
                 None,
                 ApprovedKind::Claim,
                 PolicyDecision::RequireApproval,
-                |_| Ok(loser.clone()),
+                Persist(|| Ok(loser.clone())),
             )
             .unwrap();
         assert_eq!(
@@ -808,6 +838,703 @@ mod producers {
             before,
             "testnet calls no approval facade"
         );
+    }
+
+    /// The evidence slots one scope holds.
+    const MAX_SLOTS: usize = stellar_agent_core::audit_log::MAX_EVIDENCE_ENTRIES;
+
+    /// Publishes `server`'s consents of `kind`: the scoped capability, an
+    /// unreadable sibling profile unless the scope is `ready`, initialized
+    /// evidence, and `foreign` reserved slots of other identities.
+    fn publish_scope(
+        server: &crate::server::WalletServer,
+        kind: ApprovedKind,
+        ready: bool,
+        foreign: usize,
+    ) -> (
+        stellar_agent_network::policy_state::approvals::ConsentEvidenceEnforcementGuard,
+        Option<UnreadableSiblingProfile>,
+    ) {
+        use stellar_agent_network::policy_state::approvals::ConsentEvidenceEnforcementGuard;
+        let name = server.profile_name_for_approval();
+        let profile = server.security_profile();
+        crate::tools::value_audit::require_value_audit_writer(profile, &name, server.audit_binding)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .initialize_consent_evidence()
+            .unwrap();
+        let (key, anchor) = stellar_agent_network::keyring::keyed_audit_access(
+            profile,
+            &name,
+            server.audit_binding,
+        )
+        .unwrap()
+        .into_parts();
+        let ids: Vec<_> = (0..foreign)
+            .map(|i| {
+                let mut id = [0xee; 32];
+                id[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                id
+            })
+            .collect();
+        stellar_agent_core::audit_log::test_helpers::seed_reserved_evidence(
+            &profile.audit_log_path,
+            anchor.as_ref(),
+            &key,
+            &ids,
+            u64::MAX,
+        )
+        .unwrap();
+        (
+            ConsentEvidenceEnforcementGuard::new(&name, kind),
+            (!ready).then(UnreadableSiblingProfile::plant),
+        )
+    }
+
+    /// Reacquires the slot of `view`'s record with its authenticated facts,
+    /// as a retry does; at full capacity only the record's own exact slot
+    /// succeeds.
+    fn reacquire(
+        server: &crate::server::WalletServer,
+        view: &stellar_agent_network::policy_state::ApprovalView,
+    ) -> Result<(), String> {
+        let name = server.profile_name_for_approval();
+        let profile = server.security_profile();
+        let (key, anchor) = stellar_agent_network::keyring::keyed_audit_access(
+            profile,
+            &name,
+            server.audit_binding,
+        )
+        .unwrap()
+        .into_parts();
+        operation_entry::ConsentAdmission::reacquire(
+            &server.window_store,
+            profile,
+            view.record.operation_id,
+            &view.record.facts(),
+            &stellar_agent_core::audit_log::AuditOutbox::for_log_keyed(
+                &profile.audit_log_path,
+                anchor,
+                key,
+            ),
+        )
+        .map(drop)
+        .map_err(|error| error.code().to_owned())
+    }
+
+    /// Every classic tool reserves its published request before the inbox
+    /// entry and the approval block exist. An unproven scope refuses before
+    /// the open, also when the scope is ready but the run's consented setup
+    /// grant has no delivery facts; a full scope keeps the committed record.
+    /// Each refusal stores nothing
+    /// and keep their wire codes. A successful request holds its exact slot,
+    /// so the next operation finds the scope full.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn mcp_classic_requests_reserve_before_exposure() {
+        for tool in [Tool::CreateAccount, Tool::Pay, Tool::Trustline, Tool::Claim] {
+            for mode in ["inventory", "legacy", "capacity", "reserved"] {
+                let run = if mode == "legacy" {
+                    ClassicRun::new(tool).await
+                } else {
+                    ClassicRun::unconsented(tool).await
+                };
+                let _published = publish_scope(
+                    &run.f.server,
+                    kind(tool),
+                    mode != "inventory",
+                    if mode == "capacity" {
+                        MAX_SLOTS
+                    } else {
+                        MAX_SLOTS - 1
+                    },
+                );
+                let (args, handle) = fresh(&run);
+                let inbox = std::fs::read(store_path(&run.f)).unwrap();
+                let response = wire(&tool.prepare(&run.f.server, &args).await);
+                let record = status(&run).find_by_operation(handle.id()).unwrap();
+                if mode == "reserved" {
+                    assert_eq!(response["ok"], true, "{tool:?}: {response}");
+                    let nonce = response["data"]["approval"]["approval_nonce"]
+                        .as_str()
+                        .unwrap();
+                    let record = record.unwrap();
+                    assert_eq!(record.record.nonce, nonce, "{tool:?}");
+                    let entry = stored_approval(&run.f, nonce).unwrap();
+                    if tool == Tool::Pay {
+                        assert!(
+                            matches!(
+                                PendingApprovalStore::open(store_path(&run.f))
+                                    .unwrap()
+                                    .check_payment_recovery_at(nonce, entry.expires_at_unix_ms),
+                                Err(stellar_agent_core::approval::ApprovalError::Expired)
+                            ),
+                            "the published payment keeps its recovery binding"
+                        );
+                    }
+                    let (other, _) = fresh(&run);
+                    let other_inbox = std::fs::read(store_path(&run.f)).unwrap();
+                    let full = wire(&tool.prepare(&run.f.server, &other).await);
+                    assert_eq!(
+                        full["error"]["code"], "approval.evidence_capacity",
+                        "{tool:?}: the published request holds its reservation"
+                    );
+                    assert_eq!(std::fs::read(store_path(&run.f)).unwrap(), other_inbox);
+                    assert_eq!(
+                        reacquire(&run.f.server, &record),
+                        Ok(()),
+                        "{tool:?}: the slot is the record's exact reservation"
+                    );
+                } else {
+                    assert_eq!(
+                        response["error"]["code"],
+                        if mode == "capacity" {
+                            "approval.evidence_capacity"
+                        } else {
+                            "audit.outbox_evidence_unusable"
+                        },
+                        "{tool:?} {mode}: the producer keeps the admission refusal: {response}"
+                    );
+                    if mode == "legacy" {
+                        assert!(
+                            response["error"]["message"]
+                                .as_str()
+                                .unwrap()
+                                .contains("live grant without delivery facts"),
+                            "{tool:?}: the setup grant alone leaves a ready scope unready: {response}"
+                        );
+                    }
+                    assert!(
+                        response["data"]["approval"].is_null(),
+                        "{tool:?} {mode}: a refused admission exposes no approval block"
+                    );
+                    assert_eq!(
+                        std::fs::read(store_path(&run.f)).unwrap(),
+                        inbox,
+                        "{tool:?} {mode}: a refused admission stores no inbox entry"
+                    );
+                    assert_eq!(
+                        record.is_some(),
+                        mode == "capacity",
+                        "{tool:?} {mode}: only the open precedes the reservation"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A published open keeps the prepared decision. A published retry
+    /// reacquires the committed record's slot at capacity and answers with
+    /// the same approval block. It refuses before exposure when the scope is
+    /// unproven, answers `approval.not_found` for a missing linked entry, and
+    /// answers `approval.revoked` for a revoked record. A conflicting open reserves and answers with the winner,
+    /// never storing the loser. A 300-second payment request whose signed
+    /// interval the operation deadline shortens reserves that interval.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn classic_retry_admission_uses_winner_facts() {
+        use super::super::common::tests::mainnet::require_approval_rules;
+        for tool in Tool::ALL {
+            let run = ClassicRun::unconsented(tool).await;
+            let _published = publish_scope(&run.f.server, kind(tool), true, MAX_SLOTS - 1);
+            let (args, _) = fresh(&run);
+            let first = wire(&tool.prepare(&run.f.server, &args).await);
+            assert_eq!(first["ok"], true, "{tool:?}: {first}");
+            let window = super::super::common::tests::mainnet::ledger(&run.f).unwrap();
+            let opened = window["operations"]["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|record| record["business_id"] == args["business_id"])
+                .unwrap();
+            assert_eq!(
+                opened["prepared_decision"], "require_approval",
+                "{tool:?}: the published open keeps the prepared decision"
+            );
+            let retry = wire(&tool.prepare(&run.f.server, &args).await);
+            assert_eq!(
+                retry["data"]["approval"], first["data"]["approval"],
+                "{tool:?}: a retry reacquires its own slot at capacity"
+            );
+            let nonce = first["data"]["approval"]["approval_nonce"]
+                .as_str()
+                .unwrap();
+            let unready = UnreadableSiblingProfile::plant();
+            let refused = wire(&tool.prepare(&run.f.server, &args).await);
+            assert_eq!(
+                refused["error"]["code"], "audit.outbox_evidence_unusable",
+                "{tool:?}: a linked retry reacquires before it exposes the approval"
+            );
+            drop(unready);
+            PendingApprovalStore::open(store_path(&run.f))
+                .unwrap()
+                .remove(nonce)
+                .unwrap();
+            let missing = wire(&tool.prepare(&run.f.server, &args).await);
+            assert_eq!(
+                missing["error"]["code"], "approval.not_found",
+                "{tool:?}: a missing linked entry is not replaced"
+            );
+            if matches!(tool, Tool::Pay | Tool::Claim) {
+                let id = status(&run)
+                    .find_by_nonce(nonce)
+                    .unwrap()
+                    .unwrap()
+                    .record
+                    .id;
+                run.f
+                    .server
+                    .approval_step(|recorder| {
+                        recorder
+                            .revoke(id)
+                            .map_err(operation_entry::operation_refusal)
+                    })
+                    .unwrap();
+                let revoked = wire(&tool.prepare(&run.f.server, &args).await);
+                assert_eq!(
+                    revoked["error"]["code"], "approval.revoked",
+                    "{tool:?}: a published retry names the revoked record: {revoked}"
+                );
+            }
+        }
+
+        let run = ClassicRun::unconsented(Tool::Claim).await;
+        let _published = publish_scope(&run.f.server, ApprovedKind::Claim, true, MAX_SLOTS - 1);
+        let server = &run.f.server;
+        let (_, handle) = fresh(&run);
+        let winner = approval_for(Tool::Claim, &run.f, handle.envelope_xdr().unwrap(), 300_000);
+        let loser = approval_for(Tool::Claim, &run.f, handle.envelope_xdr().unwrap(), 300_000);
+        let name = server.profile_name_for_approval();
+        let result = server
+            .classic_pending_approval(
+                Some(&handle),
+                ApprovedKind::Claim,
+                PolicyDecision::RequireApproval,
+                super::super::business_entry::Staged {
+                    build: |_: Option<&stellar_agent_core::approval::ClassicIntent>| {
+                        PendingApprovalStore::open(store_path(&run.f))
+                            .unwrap()
+                            .insert(winner.clone(), now_ms())
+                            .unwrap();
+                        let facts = operation_entry::pending_approval_facts(
+                            &winner,
+                            &handle,
+                            ApprovedKind::Claim,
+                            mainnet_consent_subject(&winner, &binding()).unwrap(),
+                            300_000,
+                        );
+                        server
+                            .approval_step(|recorder| {
+                                recorder
+                                    .open_pending(
+                                        handle.id(),
+                                        &facts,
+                                        PolicyDecision::RequireApproval,
+                                    )
+                                    .map_err(operation_entry::operation_refusal)
+                            })
+                            .unwrap();
+                        Ok(loser.clone())
+                    },
+                    insert: |entry| server.insert_classic_pending(&name, entry),
+                },
+            )
+            .map_err(|error| wire(&error.into_result().unwrap_or_else(|e| panic!("{e:?}"))));
+        let Ok(result) = result else {
+            panic!("a published conflict reserves the winner's facts: {result:?}")
+        };
+        assert_eq!(
+            result.approval_nonce, winner.approval_nonce,
+            "a published conflict answers with the winner"
+        );
+        assert!(
+            stored_approval(&run.f, &loser.approval_nonce).is_none(),
+            "the loser is never stored"
+        );
+        let view = status(&run)
+            .find_by_operation(handle.id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reacquire(server, &view),
+            Ok(()),
+            "the winner's exact slot holds the last free reservation"
+        );
+
+        let run = ClassicRun::build(
+            Tool::Pay,
+            Some(false),
+            |raw| {
+                require_approval_rules(
+                    &raw,
+                    &[Tool::Pay.prepare_name(), Tool::Pay.commit_name()],
+                    300,
+                )
+            },
+            |_| {},
+            |_| {},
+        )
+        .await;
+        let _published = publish_scope(&run.f.server, ApprovedKind::Payment, true, MAX_SLOTS - 1);
+        let (args, handle) = fresh(&run);
+        let response = wire(&Tool::Pay.prepare(&run.f.server, &args).await);
+        assert_eq!(response["ok"], true, "{response}");
+        let view = status(&run)
+            .find_by_operation(handle.id())
+            .unwrap()
+            .unwrap();
+        let entry = stored_approval(&run.f, &view.record.nonce).unwrap();
+        let signed = entry.expires_at_unix_ms - entry.created_at_unix_ms;
+        assert!(
+            signed <= 120_000,
+            "the deadline shortens the request: {signed}"
+        );
+        assert_eq!(
+            view.record.rule_ttl_ms, signed,
+            "the reserved record keeps the signed interval"
+        );
+        assert_eq!(
+            reacquire(&run.f.server, &view),
+            Ok(()),
+            "the reservation's deadline is the signed record's"
+        );
+    }
+
+    /// A record opened before its kind is published holds no reservation.
+    /// Once the kind is enabled, a retry admits the record into a free slot
+    /// and answers with the same approval block; at full capacity it refuses
+    /// before exposure. Neither retry writes the inbox.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn a_record_opened_before_publication_admits_on_retry() {
+        for tool in Tool::ALL {
+            for full in [false, true] {
+                let run = ClassicRun::unconsented(tool).await;
+                let view = status(&run)
+                    .find_by_nonce(&run.entry.approval_nonce)
+                    .unwrap()
+                    .expect("the unpublished preparation opens its record");
+                let _published = publish_scope(
+                    &run.f.server,
+                    kind(tool),
+                    true,
+                    if full { MAX_SLOTS } else { MAX_SLOTS - 1 },
+                );
+                let inbox = std::fs::read(store_path(&run.f)).unwrap();
+                let retry = wire(&tool.prepare(&run.f.server, &run.args).await);
+                if full {
+                    assert_eq!(
+                        retry["error"]["code"], "approval.evidence_capacity",
+                        "{tool:?}: an unreserved record refuses at full capacity: {retry}"
+                    );
+                    assert!(retry["data"]["approval"].is_null(), "{tool:?}");
+                } else {
+                    assert_eq!(
+                        retry["data"]["approval"], run.prepared["approval"],
+                        "{tool:?}: an unreserved record admits into a free slot: {retry}"
+                    );
+                    assert_eq!(
+                        reacquire(&run.f.server, &view),
+                        Ok(()),
+                        "{tool:?}: the retry holds the record's exact slot"
+                    );
+                }
+                assert_eq!(
+                    std::fs::read(store_path(&run.f)).unwrap(),
+                    inbox,
+                    "{tool:?} full={full}: a retry writes no inbox entry"
+                );
+            }
+        }
+    }
+
+    /// Both x402 tools reserve their published request before exposure. A
+    /// full scope or an unproven scope refuses with its wire code and stores
+    /// nothing. A reserved request keeps the home-domain subject, a dispatch
+    /// under another home domain reserves another subject, and a retry at
+    /// capacity answers with the same approval. The production capability
+    /// stays closed. The D5 message
+    /// path consumes the reserved record for its own operation.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn x402_requests_keep_scope_and_admission() {
+        use super::super::common::tests::mainnet::require_approval_rules;
+        use super::super::x402_authenticated_mainnet_tests::{authenticated_policy, call_muxed};
+        use stellar_agent_network::policy_state::ApprovalState;
+        for kind in [
+            ApprovedKind::Payment,
+            ApprovedKind::Claim,
+            ApprovedKind::Trustline,
+            ApprovedKind::X402Payment,
+        ] {
+            assert!(
+                !stellar_agent_network::policy_state::approvals::consent_evidence_enforced(kind),
+                "{kind:?}: the production capability stays closed"
+            );
+        }
+        for authenticated in [true, false] {
+            for mode in ["inventory", "capacity", "reserved"] {
+                let run = AuthenticatedRun::build(|raw| {
+                    require_approval_rules(
+                        &authenticated_policy(&raw),
+                        &[
+                            "stellar_x402_create_payment",
+                            "stellar_x402_authenticated_payment",
+                        ],
+                        300,
+                    )
+                })
+                .await;
+                let published = publish_scope(
+                    &run.f.server,
+                    ApprovedKind::X402Payment,
+                    mode != "inventory",
+                    match mode {
+                        "capacity" => MAX_SLOTS,
+                        // The other home domain's dispatch takes one more slot.
+                        "reserved" if authenticated => MAX_SLOTS - 2,
+                        _ => MAX_SLOTS - 1,
+                    },
+                );
+                let args = run.args(HOME, None);
+                let mut first = run.args(HOME, None);
+                first.business_id = args.business_id.clone();
+                let inbox = std::fs::read(store_path(&run.f)).unwrap_or_default();
+                let result = call_muxed(&run, authenticated, first).await;
+                if mode != "reserved" {
+                    assert_eq!(
+                        result["error"]["code"],
+                        if mode == "capacity" {
+                            "approval.evidence_capacity"
+                        } else {
+                            "audit.outbox_evidence_unusable"
+                        },
+                        "{authenticated} {mode}: the x402 producer keeps the admission refusal: {result}"
+                    );
+                    assert_eq!(
+                        std::fs::read(store_path(&run.f)).unwrap_or_default(),
+                        inbox,
+                        "{authenticated} {mode}: a refused admission stores no inbox entry"
+                    );
+                    continue;
+                }
+                assert_eq!(result["ok"], true, "{authenticated}: {result}");
+                let nonce = result["data"]["approval"]["approval_nonce"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let entry = stored_approval(&run.f, &nonce).unwrap();
+                let status = ApprovalStatus::new(
+                    &run.f.server.window_store,
+                    run.f.server.security_profile(),
+                );
+                let view = status.find_by_nonce(&nonce).unwrap().unwrap();
+                assert_eq!(
+                    view.record.subject,
+                    mainnet_consent_subject(&entry, &binding()).unwrap(),
+                    "{authenticated}: the published record keeps the authenticated subject"
+                );
+                if authenticated {
+                    // A second dispatch under another home domain takes the
+                    // last free slot with its own subject.
+                    let other = call_muxed(&run, true, run.args("other.example.com", None)).await;
+                    assert_eq!(other["ok"], true, "{other}");
+                    let other_nonce = other["data"]["approval"]["approval_nonce"]
+                        .as_str()
+                        .unwrap();
+                    let other_entry = stored_approval(&run.f, other_nonce).unwrap();
+                    let other_view = status.find_by_nonce(other_nonce).unwrap().unwrap();
+                    assert_eq!(
+                        other_view.record.subject,
+                        mainnet_consent_subject(&other_entry, &binding()).unwrap(),
+                        "the other home domain's record keeps its own subject"
+                    );
+                    assert_ne!(
+                        other_view.record.subject, view.record.subject,
+                        "another home domain names another subject"
+                    );
+                }
+                assert_eq!(reacquire(&run.f.server, &view), Ok(()));
+                let repeated = call_muxed(&run, authenticated, args).await;
+                assert_eq!(
+                    repeated["data"], result["data"],
+                    "{authenticated}: a resumed request reacquires at capacity"
+                );
+                if !authenticated {
+                    continue;
+                }
+                // The message mint names the reserved record's operation.
+                drop(published);
+                let attestation = run.f.attest(&entry);
+                run.oracle_control
+                    .latest_ledger_behind
+                    .store(3, std::sync::atomic::Ordering::SeqCst);
+                let paid = run.pay(HOME, &(nonce.clone(), attestation)).await;
+                assert_eq!(paid["error"]["code"], "simulation.divergence", "{paid}");
+                let after = status.find_by_nonce(&nonce).unwrap().unwrap().record;
+                assert_eq!(
+                    (after.state, after.operation_id),
+                    (ApprovalState::Consumed, view.record.operation_id),
+                    "the message mint consumes the reserved record of its operation"
+                );
+            }
+        }
+    }
+
+    /// Tears both evidence slots of `server`'s audit log and returns their
+    /// paths and original bytes; `None` names a slot that did not exist.
+    fn tear_evidence(
+        server: &crate::server::WalletServer,
+    ) -> Vec<(std::path::PathBuf, Option<Vec<u8>>)> {
+        [".evidence.0", ".evidence.1"]
+            .into_iter()
+            .map(|suffix| {
+                let mut path = stellar_agent_core::audit_log::outbox_path(
+                    &server.security_profile().audit_log_path,
+                )
+                .into_os_string();
+                path.push(suffix);
+                let path = std::path::PathBuf::from(path);
+                let original = std::fs::read(&path).ok();
+                std::fs::write(&path, b"torn evidence").unwrap();
+                (path, original)
+            })
+            .collect()
+    }
+
+    /// The six MCP producers keep the precise wire code of an admission
+    /// refusal: torn evidence gives `audit.outbox_evidence_unusable`, and a
+    /// window commit that fails during the admitted open gives
+    /// `submission.record_unavailable`. Neither exposes an approval block or
+    /// stores an inbox entry. Torn evidence refuses after the open, so a
+    /// classic repeat with the evidence restored answers `approval.not_found`.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn producer_adapters_preserve_refusal_codes() {
+        use super::super::common::tests::mainnet::require_approval_rules;
+        use super::super::x402_authenticated_mainnet_tests::{authenticated_policy, call_muxed};
+        let expected = |mode: &str| match mode {
+            "corrupt" => "audit.outbox_evidence_unusable",
+            _ => "submission.record_unavailable",
+        };
+        for tool in Tool::ALL {
+            for mode in ["corrupt", "store"] {
+                let run = ClassicRun::unconsented(tool).await;
+                let _published = publish_scope(&run.f.server, kind(tool), true, 0);
+                let (args, handle) = fresh(&run);
+                let torn = (mode == "corrupt").then(|| tear_evidence(&run.f.server));
+                let inbox = std::fs::read(store_path(&run.f)).unwrap();
+                let fault =
+                    (mode == "store").then(|| arm_accounting_fault(COMMIT_FAULT_AFTER_PREPARED));
+                let response = match tool.prepare_result(&run.f.server, &args).await {
+                    Ok(result) => wire(&result),
+                    Err(error) => serde_json::json!({ "protocol": error.message }),
+                };
+                drop(fault);
+                assert_eq!(
+                    response["error"]["code"],
+                    expected(mode),
+                    "{tool:?} {mode}: the adapter keeps the precise code: {response}"
+                );
+                assert!(response["data"]["approval"].is_null(), "{tool:?} {mode}");
+                assert_eq!(
+                    std::fs::read(store_path(&run.f)).unwrap(),
+                    inbox,
+                    "{tool:?} {mode}: a refused admission stores no inbox entry"
+                );
+                if mode == "store" {
+                    assert!(
+                        status(&run)
+                            .find_by_operation(handle.id())
+                            .unwrap()
+                            .is_none(),
+                        "{tool:?}: the failed open commits no record"
+                    );
+                }
+                if let Some(torn) = torn {
+                    // The refusal follows the open: the committed record has
+                    // no inbox entry, which a repeat never replaces.
+                    assert!(
+                        status(&run)
+                            .find_by_operation(handle.id())
+                            .unwrap()
+                            .is_some(),
+                        "{tool:?}: torn evidence refuses after the open"
+                    );
+                    for (path, original) in torn {
+                        match original {
+                            Some(bytes) => std::fs::write(path, bytes).unwrap(),
+                            None => std::fs::remove_file(path).unwrap(),
+                        }
+                    }
+                    let repeated = wire(&tool.prepare(&run.f.server, &args).await);
+                    assert_eq!(
+                        repeated["error"]["code"], "approval.not_found",
+                        "{tool:?}: a repeat after the restored evidence ends the business id: {repeated}"
+                    );
+                    assert_eq!(std::fs::read(store_path(&run.f)).unwrap(), inbox);
+                }
+            }
+        }
+        for authenticated in [true, false] {
+            for mode in ["corrupt", "store"] {
+                let run = AuthenticatedRun::build(|raw| {
+                    require_approval_rules(
+                        &authenticated_policy(&raw),
+                        &[
+                            "stellar_x402_create_payment",
+                            "stellar_x402_authenticated_payment",
+                        ],
+                        300,
+                    )
+                })
+                .await;
+                let (_enabled, unready) =
+                    publish_scope(&run.f.server, ApprovedKind::X402Payment, false, 0);
+                let args = run.args(HOME, None);
+                let mut first = run.args(HOME, None);
+                first.business_id = args.business_id.clone();
+                // The refused first call leaves the operation without a record.
+                let refused = call_muxed(&run, authenticated, first).await;
+                assert_eq!(refused["error"]["code"], "audit.outbox_evidence_unusable");
+                drop(unready);
+                if mode == "corrupt" {
+                    tear_evidence(&run.f.server);
+                }
+                let inbox = std::fs::read(store_path(&run.f)).unwrap_or_default();
+                let fault =
+                    (mode == "store").then(|| arm_accounting_fault(COMMIT_FAULT_AFTER_PREPARED));
+                let result = call_muxed(&run, authenticated, args).await;
+                drop(fault);
+                assert_eq!(
+                    result["error"]["code"],
+                    expected(mode),
+                    "{authenticated} {mode}: the x402 adapter keeps the precise code: {result}"
+                );
+                assert!(result["data"]["approval"].is_null());
+                assert_eq!(
+                    std::fs::read(store_path(&run.f)).unwrap_or_default(),
+                    inbox,
+                    "{authenticated} {mode}: a refused admission stores no inbox entry"
+                );
+            }
+        }
+    }
+
+    /// Off mainnet both x402 tools, dispatched with the x402 kind enabled,
+    /// queue their approvals through the direct write and call no approval
+    /// facade.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn x402_tools_off_mainnet_call_no_facade() {
+        crate::tools::x402_create_payment::approval_tests::off_mainnet_published_case().await;
     }
 
     mod payment {
@@ -829,7 +1556,7 @@ mod producers {
                 Some(handle),
                 PolicyDecision::RequireApproval,
                 (entry.created_at_unix_ms, entry.expires_at_unix_ms),
-                persist,
+                Persist(persist),
             )
         }
 
