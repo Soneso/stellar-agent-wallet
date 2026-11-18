@@ -2310,7 +2310,6 @@ mod tests {
             .bound_for_crate_tests(tx_hash);
             let now = approval.created_at_ms();
             let _clock = set_now_ms_for_test(now);
-            let nonce = approval.nonce().to_owned();
             let subject = approval_subject_classic(&envelope_text);
             crate::keyring::rotate_keyring_secret_32(
                 &profile.audit_log_hash_chain_key_id.service,
@@ -2334,6 +2333,18 @@ mod tests {
                 }
             }
             let audit = crate::mainnet::audit_readiness::audit_readiness(&profile, &name).unwrap();
+            // The composition's subject is the proofs and the ledger record,
+            // so it proceeds under the policy: an approval authority needs a
+            // durable record, which this profile's replaced keyring cannot
+            // consent to.
+            let policy_authority = crate::policy_state::PolicyAuthorityBinding {
+                policy_digest,
+                policy_sequence,
+                rule_index: 0,
+                evaluated_at_ms: now,
+                governing_until_ms: approval.expires_at_ms(),
+                scope: stellar_agent_core::mainnet::decision::AuthorityScope::Classic,
+            };
             let mut facts = BindingFacts {
                 endpoint: Some(endpoint.fact_digest()),
                 signer: enrolled.fact_digest(),
@@ -2341,7 +2352,7 @@ mod tests {
                 enablement: enablement_fact.finish(),
                 witness: Some(witness.fact_digest()),
                 reservation: None,
-                authority: approval.fact_digest(),
+                authority: policy_authority.digest(),
                 audit: audit.fact_digest(),
                 restriction: None,
             };
@@ -2436,10 +2447,7 @@ mod tests {
                 },
                 policy_sequence,
                 policy_digest,
-                authority: crate::policy_state::MintAuthority::Approval {
-                    nonce: approval.nonce().to_owned(),
-                    expires_at_ms: approval.expires_at_ms(),
-                },
+                authority: crate::policy_state::MintAuthority::Policy(policy_authority.clone()),
                 chain_deadline_ms: None,
                 restriction_end_ms: None,
                 authorization_ttl_ms: 60_000,
@@ -2482,10 +2490,7 @@ mod tests {
                     digest: policy_digest,
                 },
                 enablement_nonce_digest: nonce_digest,
-                authority: AuthorityBinding::Approval(ApprovalBinding {
-                    nonce,
-                    expires_at_ms: approval.expires_at_ms(),
-                }),
+                authority: AuthorityBinding::Policy(policy_authority),
                 reservation: minted.reservation,
                 witness_subject: witness.subject(),
                 submission_anchor: None,
@@ -2683,7 +2688,7 @@ mod tests {
                 authority: &authority,
                 audit: f.audit(),
                 store: &f.window,
-                operation: None,
+                operation: f.link_of(&authority),
                 restriction: None,
                 sac_payment_context: None,
             };

@@ -21,12 +21,12 @@ use stellar_agent_core::mainnet::verified_policy::VerifiedPolicy;
 use stellar_agent_network::fees::ClassicFeeChoice;
 use stellar_agent_network::mainnet::MainnetConsumer;
 use stellar_agent_network::operation_entry::{
-    self, ClassicEntry, CommitEntry, ConsentAdmission, EnvelopeFacts, IdentityFacts,
+    self, ClassicEntry, CommitEntry, CommitPreview, ConsentAdmission, EnvelopeFacts, IdentityFacts,
     IntentBaseFacts, OpenedEntry, Preparation,
 };
 use stellar_agent_network::policy_state::{
     ApprovalRecorder, ApprovalState, ApprovalStatus, ApprovalView, BusinessId, OperationHandle,
-    OperationKind, OperationRecorder, OperationState, OperationTool,
+    OperationId, OperationKind, OperationRecorder, OperationState, OperationTool,
     approvals::PendingApprovalFacts,
 };
 
@@ -384,7 +384,7 @@ impl WalletServer {
     ///
     /// The record must be pending, unexpired and match the entry's kind,
     /// subject and signed clocks. The entry must be unique and live, and
-    /// its recovery binding active; an observed expiry persists first.
+    /// any recovery binding must be active; an observed expiry persists first.
     ///
     /// The subject of `handle`'s retained envelope must equal the entry's
     /// and the record's subject.
@@ -1015,9 +1015,10 @@ impl WalletServer {
     /// state, so a commit retried after a lost reply does no new work. A
     /// tombstone answers so only for the identity the envelope carries as an
     /// operation of `kind` under `policy`, the commit's verified mainnet policy.
-    /// A record that continues,
-    /// or a window the read cannot read, gives `Ok(())`, and the commit runs
-    /// its gates. Off mainnet there is no record and the call proceeds.
+    /// A record that continues gives its operation id, which the approval gate
+    /// compares with the approval's record. A window the read cannot read
+    /// gives `Ok(None)`, and the commit's gates refuse it. Off mainnet there is
+    /// no record and the call proceeds with `Ok(None)`.
     ///
     /// # Errors
     ///
@@ -1031,14 +1032,14 @@ impl WalletServer {
         kind: OperationKind,
         business_id: Option<&BusinessId>,
         envelope_xdr: &str,
-    ) -> Result<(), CallToolResult> {
+    ) -> Result<Option<OperationId>, CallToolResult> {
         let (Some(business_id), Some(policy)) = (
             business_id.filter(|_| self.context.chain_id.is_mainnet()),
             policy,
         ) else {
-            return Ok(());
+            return Ok(None);
         };
-        match operation_entry::commit_replay(
+        match operation_entry::commit_preview(
             &self.window_store,
             self.security_profile(),
             business_id,
@@ -1050,8 +1051,9 @@ impl WalletServer {
                 envelope_xdr,
             ),
         ) {
-            Ok(None) => Ok(()),
-            Ok(Some(view)) => Err(replay_result(&view)),
+            Ok(CommitPreview::Continues(operation)) => Ok(Some(operation)),
+            Ok(CommitPreview::Unread) => Ok(None),
+            Ok(CommitPreview::Replay(view)) => Err(replay_result(&view)),
             Err(error) => Err(refusal(&error)),
         }
     }

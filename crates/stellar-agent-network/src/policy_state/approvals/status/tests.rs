@@ -69,7 +69,14 @@ fn approval_status_durable_lifecycle_and_clock_views() {
                             xdr: "AAAA".into(),
                             unsigned_envelope_sha256: [1; 32],
                         }),
-                        authorization: AttemptAuthorization::Mint(Box::new(request.clone())),
+                        // The operation route takes the approval identity
+                        // from the handle.
+                        authorization: AttemptAuthorization::Mint(Box::new(
+                            crate::policy_state::MintRequest {
+                                operation: None,
+                                ..request.clone()
+                            },
+                        )),
                         send_by_ms: consent.execution_expires_at_ms,
                     },
                 )

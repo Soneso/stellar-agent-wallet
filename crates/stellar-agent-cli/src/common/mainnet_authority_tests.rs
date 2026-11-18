@@ -104,11 +104,12 @@ impl Verb {
     }
 }
 
-fn record_delivery_fixture(
+/// Records queued delivery for the witness's record, then drops the queued
+/// row from the outbox, so delivery cannot be proven. Production publication
+/// cannot lose the row after the commit; this fixture builds that state.
+fn record_dropped_delivery_fixture(
     profile: &stellar_agent_core::profile::Profile,
     witness: &stellar_agent_core::approval::witness::ApprovalWitness,
-    queued: bool,
-    dropped: bool,
 ) {
     use stellar_agent_core::audit_log::{AuditEntry, AuditOutbox, BindingCheck};
     use stellar_agent_network::policy_state::PersistedWindowStore;
@@ -143,40 +144,31 @@ fn record_delivery_fixture(
             witness.consent_at_ms(),
         )
         .unwrap();
-    let reference = queued.then(|| {
-        outbox
-            .clone()
-            .with_evidence_reservation(reservation)
-            .append_queued(&AuditEntry::new_approval_attested(
-                witness.kind().kind_name(),
-                "stellar_pay_commit",
-                None,
-                witness.nonce(),
-                "cli",
-                "delivery-fixture",
-            ))
-            .unwrap()
-    });
-    if dropped {
-        std::fs::write(
-            outbox.path(),
-            stellar_agent_core::audit_log::outbox::test_seam::generation_line(
-                &key,
-                reference.as_ref().unwrap().generation(),
-            ),
-        )
+    let reference = outbox
+        .clone()
+        .with_evidence_reservation(reservation)
+        .append_queued(&AuditEntry::new_approval_attested(
+            witness.kind().kind_name(),
+            "stellar_pay_commit",
+            None,
+            witness.nonce(),
+            "cli",
+            "delivery-fixture",
+        ))
         .unwrap();
-    }
-    let delivery = if queued {
-        ConsentDeliveryV1::queued(id)
-    } else {
-        ConsentDeliveryV1::direct_anchored(id)
-    };
+    std::fs::write(
+        outbox.path(),
+        stellar_agent_core::audit_log::outbox::test_seam::generation_line(
+            &key,
+            reference.generation(),
+        ),
+    )
+    .unwrap();
     seed_existing_consent_delivery_for_test(
         &mut ApprovalRecorder::new(&store, profile, &mut *writer, "fixture"),
         id,
-        reference,
-        delivery,
+        Some(reference),
+        ConsentDeliveryV1::queued(id),
     )
     .unwrap();
 }
@@ -189,30 +181,10 @@ async fn all_value_verbs_require_delivered_consent() {
     let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
     let names = [
-        [
-            "delivery-pay-missing",
-            "delivery-pay-queued",
-            "delivery-pay-direct",
-            "delivery-pay-allow",
-        ],
-        [
-            "delivery-claim-missing",
-            "delivery-claim-queued",
-            "delivery-claim-direct",
-            "delivery-claim-allow",
-        ],
-        [
-            "delivery-create-missing",
-            "delivery-create-queued",
-            "delivery-create-direct",
-            "delivery-create-allow",
-        ],
-        [
-            "delivery-trust-missing",
-            "delivery-trust-queued",
-            "delivery-trust-direct",
-            "delivery-trust-allow",
-        ],
+        ["delivery-pay-missing", "delivery-pay-allow"],
+        ["delivery-claim-missing", "delivery-claim-allow"],
+        ["delivery-create-missing", "delivery-create-allow"],
+        ["delivery-trust-missing", "delivery-trust-allow"],
     ];
     for (verb, names) in Verb::ALL.into_iter().zip(names) {
         let kind = match verb {
@@ -220,50 +192,41 @@ async fn all_value_verbs_require_delivered_consent() {
             Verb::Claim => ApprovedKind::Claim,
             Verb::Trustline => ApprovedKind::Trustline,
         };
-        for ((queued, dropped), name) in [(true, true), (true, false), (false, false)]
-            .into_iter()
-            .zip(names)
-        {
-            let fixture = verb.spec(name).build().await;
-            let enabled = std::rc::Rc::new(std::cell::RefCell::new(None));
-            let at_consumer = enabled.clone();
-            let _hook = crate::common::mainnet_write::consent_test::on_witness(
-                fixture.name,
-                move |profile, witness| {
-                    record_delivery_fixture(profile, witness, queued, dropped);
-                    at_consumer.replace(Some(ConsentEvidenceEnforcementGuard::new(
-                        witness.profile(),
-                        kind,
-                    )));
-                },
-            );
-            let before = signer_resolutions_on_this_thread();
-            let (code, envelope) = verb.run(&fixture).await;
-            if dropped {
-                assert_eq!(code, 1, "missing delivery: {envelope}");
-                assert_eq!(
-                    envelope["error"]["code"], "approval.consent_undelivered",
-                    "{envelope}"
-                );
-                assert_eq!(
-                    signer_resolutions_on_this_thread(),
-                    before,
-                    "delivery precedes the signer"
-                );
-                assert!(fixture.sent_envelopes().await.is_empty());
-                assert!(
-                    fixture
-                        .open_authorizations(stellar_agent_core::timefmt::now_unix_ms().unwrap())
-                        .is_empty()
-                );
-            } else {
-                assert_eq!(code, 0, "delivered consent: {envelope}");
-                assert!(signer_resolutions_on_this_thread() > before);
-                assert_eq!(fixture.sent_envelopes().await.len(), 1);
-            }
-        }
+        let fixture = verb.spec(names[0]).build().await;
+        let enabled = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let at_consumer = enabled.clone();
+        let hook = crate::common::mainnet_write::consent_test::on_witness(
+            fixture.name,
+            move |profile, witness| {
+                record_dropped_delivery_fixture(profile, witness);
+                at_consumer.replace(Some(ConsentEvidenceEnforcementGuard::new(
+                    witness.profile(),
+                    kind,
+                )));
+            },
+        );
+        let before = signer_resolutions_on_this_thread();
+        let (code, envelope) = verb.run(&fixture).await;
+        assert_eq!(code, 1, "missing delivery: {envelope}");
+        assert_eq!(
+            envelope["error"]["code"], "approval.consent_undelivered",
+            "{envelope}"
+        );
+        assert_eq!(
+            signer_resolutions_on_this_thread(),
+            before,
+            "delivery precedes the signer"
+        );
+        assert!(fixture.sent_envelopes().await.is_empty());
+        assert!(
+            fixture
+                .open_authorizations(stellar_agent_core::timefmt::now_unix_ms().unwrap())
+                .is_empty()
+        );
+        drop(hook);
+        drop(enabled);
         let fixture = verb
-            .spec(names[3])
+            .spec(names[1])
             .rules(vec![verb.rule("allow", "")])
             .build()
             .await;
@@ -317,6 +280,240 @@ async fn all_value_verbs_require_delivered_consent() {
             "Allow reads no evidence"
         );
         fixture.assert_no_consent_ceremony();
+    }
+}
+
+/// With delivery enforced from preparation on, each value verb publishes its
+/// consent through the production producer and resolves its signer exactly
+/// once. A revocation or a submission receipt between the consent commit and the
+/// authority refuses with its exact envelope and exit 1, before the signer,
+/// with nothing sent and no open authorization.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn cli_durable_state_envelopes() {
+    use crate::common::mainnet_confirm::commit_test;
+    use crate::common::mainnet_confirm::tests::committed::{hold_receipt, revoke};
+    use stellar_agent_core::approval::witness::ApprovedKind;
+    use stellar_agent_network::policy_state::approvals::ConsentEvidenceEnforcementGuard;
+    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+    let names = [
+        ["state-pay-ok", "state-pay-revoked", "state-pay-spent"],
+        ["state-claim-ok", "state-claim-revoked", "state-claim-spent"],
+        [
+            "state-create-ok",
+            "state-create-revoked",
+            "state-create-spent",
+        ],
+        ["state-trust-ok", "state-trust-revoked", "state-trust-spent"],
+    ];
+    for (verb, names) in Verb::ALL.into_iter().zip(names) {
+        let kind = match verb {
+            Verb::Pay | Verb::Create => ApprovedKind::Payment,
+            Verb::Claim => ApprovedKind::Claim,
+            Verb::Trustline => ApprovedKind::Trustline,
+        };
+        for (state, name) in [None, Some("approval.revoked"), Some("approval.consumed")]
+            .into_iter()
+            .zip(names)
+        {
+            let fixture = verb.spec(name).build().await;
+            let _enabled = ConsentEvidenceEnforcementGuard::new(fixture.name, kind);
+            let profile = fixture.profile();
+            let owner = fixture.name.to_owned();
+            let committed = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+            let slot = committed.clone();
+            let _hook = commit_test::after_commit(fixture.name, move |nonce| {
+                slot.replace(nonce.to_owned());
+                match state {
+                    Some("approval.revoked") => revoke(&profile, &owner, nonce),
+                    Some(_) => hold_receipt(&owner, nonce),
+                    None => {}
+                }
+            });
+            let before = signer_resolutions_on_this_thread();
+            let (code, envelope) = verb.run(&fixture).await;
+            let Some(expected) = state else {
+                assert_eq!(code, 0, "{} published consent: {envelope}", verb.name());
+                assert_eq!(
+                    signer_resolutions_on_this_thread(),
+                    before + 1,
+                    "{}: one signer resolution",
+                    verb.name()
+                );
+                assert_eq!(fixture.sent_envelopes().await.len(), 1);
+                continue;
+            };
+            let message = if expected == "approval.revoked" {
+                "this approval has been revoked"
+            } else {
+                "this approval was already spent on a submission"
+            };
+            assert_eq!(code, 1, "{} {expected}: {envelope}", verb.name());
+            assert_eq!(envelope["ok"], false, "{envelope}");
+            assert_eq!(envelope["error"]["code"], expected, "{envelope}");
+            assert_eq!(envelope["error"]["message"], message, "{envelope}");
+            let nonce = committed.borrow().clone();
+            assert!(!nonce.is_empty(), "the consent committed");
+            assert!(!envelope.to_string().contains(&nonce), "{envelope}");
+            assert_eq!(signer_resolutions_on_this_thread(), before);
+            assert!(fixture.sent_envelopes().await.is_empty());
+            assert!(
+                fixture
+                    .open_authorizations(stellar_agent_core::timefmt::now_unix_ms().unwrap())
+                    .is_empty()
+            );
+        }
+    }
+}
+
+/// The approval kind a verb's consent records.
+fn approved_kind(verb: Verb) -> stellar_agent_core::approval::witness::ApprovedKind {
+    use stellar_agent_core::approval::witness::ApprovedKind;
+    match verb {
+        Verb::Pay | Verb::Create => ApprovedKind::Payment,
+        Verb::Claim => ApprovedKind::Claim,
+        Verb::Trustline => ApprovedKind::Trustline,
+    }
+}
+
+/// The delivered-consent boundary, which holds the audit writer from a second
+/// registry name; the source scans read this module as test code.
+#[cfg(test)]
+mod delivered {
+    use super::*;
+
+    /// With delivery enforced from preparation on, each value verb publishes its
+    /// consent through the production producer, directly or queued, and signs
+    /// only after the drain delivers it. A queued consent is published while
+    /// another holder keeps the audit writer through the ceremony; the holder
+    /// releases it after the consent commit, and the drain then anchors the row.
+    /// A revocation after the committed-consent check refuses at the locked
+    /// mint: no signer, nothing sent and no open authorization.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn cli_delivered_consent_before_signing() {
+        use crate::common::mainnet_confirm::commit_test;
+        use crate::common::mainnet_confirm::tests::committed::revoke;
+        use crate::common::mainnet_presence::driver;
+        use stellar_agent_core::audit_log::writer::AuditWriterRegistry;
+        use stellar_agent_network::policy_state::approvals::ConsentEvidenceEnforcementGuard;
+        use stellar_agent_network::policy_state::{ApprovalStatus, PersistedWindowStore};
+        const HOLDER: &str = "delivery-holder";
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let names = [
+            [
+                "published-pay-direct",
+                "published-pay-queued",
+                "published-pay-revoked",
+            ],
+            [
+                "published-claim-direct",
+                "published-claim-queued",
+                "published-claim-revoked",
+            ],
+            [
+                "published-create-direct",
+                "published-create-queued",
+                "published-create-revoked",
+            ],
+            [
+                "published-trust-direct",
+                "published-trust-queued",
+                "published-trust-revoked",
+            ],
+        ];
+        for (verb, names) in Verb::ALL.into_iter().zip(names) {
+            let kind = approved_kind(verb);
+            for (queued, name) in [(false, names[0]), (true, names[1])] {
+                let mut fixture = verb.spec(name).build().await;
+                let _enabled = ConsentEvidenceEnforcementGuard::new(fixture.name, kind);
+                let holder = std::rc::Rc::new(std::cell::RefCell::new(None));
+                if queued {
+                    let profile = fixture.profile();
+                    let owner = fixture.name.to_owned();
+                    let slot = holder.clone();
+                    let mut answer = driver::fixture_credential();
+                    fixture.present_with(move |ceremony| {
+                        AuditWriterRegistry::remove_for_test(&owner);
+                        *slot.borrow_mut() = Some(
+                            AuditWriterRegistry::get_or_open_keyed(
+                                HOLDER,
+                                &profile.audit_log_path,
+                                stellar_agent_network::keyring::keyed_audit_access(
+                                    &profile,
+                                    &owner,
+                                    stellar_agent_core::audit_log::BindingCheck::Enforce,
+                                )
+                                .unwrap(),
+                            )
+                            .unwrap(),
+                        );
+                        answer(ceremony)
+                    });
+                }
+                let profile = fixture.profile();
+                let owner = fixture.name.to_owned();
+                let released = holder.clone();
+                let row = std::rc::Rc::new(std::cell::Cell::new(None));
+                let seen = row.clone();
+                let _hook = commit_test::after_commit(fixture.name, move |nonce| {
+                    let store = PersistedWindowStore::for_profile(&owner);
+                    let payload = ApprovalStatus::new(&store, &profile)
+                        .find_by_nonce(nonce)
+                        .unwrap()
+                        .unwrap()
+                        .record
+                        .consent
+                        .unwrap()
+                        .payload
+                        .unwrap();
+                    seen.set(Some(payload.outbox_row.is_some()));
+                    drop(released.borrow_mut().take());
+                    AuditWriterRegistry::remove_for_test(HOLDER);
+                });
+                let before = signer_resolutions_on_this_thread();
+                let (code, envelope) = verb.run(&fixture).await;
+                assert_eq!(code, 0, "{} queued={queued}: {envelope}", verb.name());
+                assert_eq!(
+                    row.get(),
+                    Some(queued),
+                    "{}: the record retains the queued reference only when queued",
+                    verb.name()
+                );
+                assert!(signer_resolutions_on_this_thread() > before);
+                assert_eq!(fixture.sent_envelopes().await.len(), 1, "{}", verb.name());
+            }
+
+            let fixture = verb.spec(names[2]).build().await;
+            let _enabled = ConsentEvidenceEnforcementGuard::new(fixture.name, kind);
+            let profile = fixture.profile();
+            let owner = fixture.name.to_owned();
+            let _revoke = crate::common::mainnet_write::consent_test::on_witness(
+                fixture.name,
+                move |_, witness| revoke(&profile, &owner, witness.nonce()),
+            );
+            let before = signer_resolutions_on_this_thread();
+            let (code, envelope) = verb.run(&fixture).await;
+            assert_eq!(
+                code,
+                1,
+                "{} revoked after the check: {envelope}",
+                verb.name()
+            );
+            assert_eq!(
+                envelope["error"]["code"], "network.mainnet_authorization_refused",
+                "{envelope}"
+            );
+            assert_eq!(signer_resolutions_on_this_thread(), before);
+            assert!(fixture.sent_envelopes().await.is_empty());
+            assert!(
+                fixture
+                    .open_authorizations(stellar_agent_core::timefmt::now_unix_ms().unwrap())
+                    .is_empty()
+            );
+        }
     }
 }
 

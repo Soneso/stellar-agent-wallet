@@ -154,6 +154,67 @@ fn mint_caps_at_the_record_execution_expiry() {
     }
 }
 
+/// The consented x402 intent request of `fx`.
+fn x402_intent_request(fx: &Fx) -> MintRequest {
+    let mut request = fx.mint_request();
+    request.authorization_ttl_ms = 600_000;
+    request.consumer = MainnetConsumer::X402Create;
+    request.binding = DomainBinding::Soroban {
+        intent_digest: fx.facts.intent_digest,
+    };
+    request
+}
+
+/// Mints and consumes `request` as the parent, then returns its submission
+/// child request.
+fn x402_child_request(fx: &Fx, mut request: MintRequest) -> MintRequest {
+    use super::super::ledger::{ConsumeExpect, ConsumptionBinding};
+    use crate::mainnet::{AuditFacts, RecomputedFacts};
+    let parent = fx
+        .store
+        .mint_authorization(fx.fixture.profile(), &request)
+        .unwrap();
+    let audit = AuditFacts {
+        log_path_digest: [1; 32],
+        segment: [2; 32],
+        anchored_count: 1,
+    };
+    let expect = ConsumeExpect::new(
+        fx.fixture.name().to_owned(),
+        request.chain,
+        request.consumer,
+        request.binding.clone(),
+        request.policy_sequence,
+        request.policy_digest,
+        request.authority.clone(),
+        None,
+        parent.bindings_digest,
+        audit,
+        &RecomputedFacts {
+            content_digest: request.binding.content_digest(),
+            entries_digest: crate::mainnet::digest::entries_digest(&[]),
+            audit,
+        },
+    );
+    fx.store
+        .consume_authorization(
+            fx.fixture.profile(),
+            parent.id,
+            &expect,
+            &ConsumptionBinding::RetainedIntent {
+                intent_digest: fx.facts.intent_digest,
+            },
+        )
+        .unwrap();
+    request.parent = Some(parent.id);
+    request.operation = None;
+    request.binding = DomainBinding::X402Submit {
+        final_envelope_sha256: [8; 32],
+        root_invocation_digest: [9; 32],
+    };
+    request
+}
+
 #[test]
 #[serial(mainnet_clock)]
 #[serial]
@@ -174,50 +235,7 @@ fn envelope_mint_caps_at_the_signed_expiry() {
             intent_digest: fx.facts.intent_digest,
         };
         if child {
-            let parent = fx
-                .store
-                .mint_authorization(fx.fixture.profile(), &request)
-                .unwrap();
-            use super::super::ledger::{ConsumeExpect, ConsumptionBinding};
-            use crate::mainnet::{AuditFacts, RecomputedFacts};
-            let audit = AuditFacts {
-                log_path_digest: [1; 32],
-                segment: [2; 32],
-                anchored_count: 1,
-            };
-            let expect = ConsumeExpect::new(
-                fx.fixture.name().to_owned(),
-                request.chain,
-                request.consumer,
-                request.binding.clone(),
-                request.policy_sequence,
-                request.policy_digest,
-                request.authority.clone(),
-                None,
-                parent.bindings_digest,
-                audit,
-                &RecomputedFacts {
-                    content_digest: request.binding.content_digest(),
-                    entries_digest: crate::mainnet::digest::entries_digest(&[]),
-                    audit,
-                },
-            );
-            fx.store
-                .consume_authorization(
-                    fx.fixture.profile(),
-                    parent.id,
-                    &expect,
-                    &ConsumptionBinding::RetainedIntent {
-                        intent_digest: fx.facts.intent_digest,
-                    },
-                )
-                .unwrap();
-            request.parent = Some(parent.id);
-            request.operation = None;
-            request.binding = DomainBinding::X402Submit {
-                final_envelope_sha256: [8; 32],
-                root_invocation_digest: [9; 32],
-            };
+            request = x402_child_request(&fx, request);
         }
         let minted = fx
             .store
@@ -302,14 +320,162 @@ fn operation_mint_uses_admitted_identity() {
     fx.consent();
     let mut request = fx.mint_request();
     request.operation = None;
+    // A raw mint naming another operation or a separate approval identity
+    // refuses before any read, even of an unreadable store, and before the
+    // envelope size check. A link to the handle's own operation passes.
+    let mut foreign = request.clone();
+    foreign.operation = Some(OperationLink {
+        operation_id: OperationId::from_bytes([9; 16]),
+        attempt_index: 1,
+    });
+    let mut own = request.clone();
+    own.operation = fx.mint_request().operation;
+    let mut message = request;
+    message.approval_operation = Some(fx.operation);
+    let handle = approval_handle(&mut fx);
+    let original = fx.bytes();
+    let mut unreadable = original.clone();
+    unreadable[0] ^= 1;
+    std::fs::write(fx.store.path(), &unreadable).unwrap();
+    let begin = |fx: &mut Fx, raw: &MintRequest, oversized: bool| {
+        use super::super::operations::{AttemptAuthorization, AttemptEnvelope, AttemptRequest};
+        OperationRecorder::new(&fx.store, fx.fixture.profile(), &mut fx.rows, "begin")
+            .begin_attempt(
+                &handle,
+                &AttemptRequest {
+                    envelope: Some(AttemptEnvelope {
+                        xdr: if oversized {
+                            "A".repeat(super::super::operations::ENVELOPE_XDR_MAX + 1)
+                        } else {
+                            "AAAA".to_owned()
+                        },
+                        unsigned_envelope_sha256: [1; 32],
+                    }),
+                    authorization: AttemptAuthorization::Mint(Box::new(raw.clone())),
+                    send_by_ms: u64::MAX,
+                },
+            )
+    };
+    for (name, raw) in [("foreign", &foreign), ("message", &message)] {
+        for oversized in [false, true] {
+            let result = begin(&mut fx, raw, oversized);
+            assert!(
+                matches!(&result, Err(WindowStoreError::UnexpectedState { .. })),
+                "{name}, oversized {oversized}: {result:?}"
+            );
+            assert_eq!(fx.bytes(), unreadable, "{name}");
+        }
+    }
+    // The handle's own link passes the identity check: an oversized envelope
+    // reaches the size check, which also precedes any read.
+    let result = begin(&mut fx, &own, true);
     assert!(
-        begin_approval(&mut fx, request).is_ok(),
+        matches!(&result, Err(WindowStoreError::OperationCapacity { .. })),
+        "own, oversized: {result:?}"
+    );
+    assert_eq!(fx.bytes(), unreadable, "own");
+    std::fs::write(fx.store.path(), &original).unwrap();
+    assert!(
+        begin(&mut fx, &own, false).is_ok(),
+        "the handle's own operation link passes"
+    );
+
+    // A raw mint without an identity of its own takes the handle's.
+    let mut fx = Fx::new(86_400_000);
+    fx.open();
+    fx.consent();
+    let mut neither = fx.mint_request();
+    neither.operation = None;
+    assert!(
+        begin_approval(&mut fx, neither).is_ok(),
         "operation handle supplies the approval identity"
     );
 }
 
 #[test]
 #[serial(mainnet_clock)]
+#[serial]
+fn missing_record_refuses_with_its_own_precondition() {
+    use super::super::operations::{AttemptAuthorization, AttemptEnvelope, AttemptRequest};
+    // The operation exists and the store has its file; the approval has a
+    // consented inbox entry and no record.
+    let mut fx = Fx::new(300_000);
+    let handle = approval_handle(&mut fx);
+    let before = fx.bytes();
+    let generation = fx.wire().generation;
+    let mut raw = fx.mint_request();
+    raw.operation = None;
+    for _ in 0..2 {
+        mint_refusal(
+            &fx.store
+                .mint_authorization(fx.fixture.profile(), &fx.mint_request()),
+            MainnetPrecondition::ApprovalNotFound,
+        );
+        mint_refusal(
+            &begin_approval(&mut fx, raw.clone()),
+            MainnetPrecondition::ApprovalNotFound,
+        );
+        assert_eq!(fx.bytes(), before, "a missing record writes nothing");
+        assert_eq!(fx.wire().generation, generation);
+    }
+    // A store without a file refuses before its window key exists.
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut profile = fx.fixture.profile().clone();
+    profile.policy_window_state_key_id =
+        stellar_agent_core::profile::schema::KeyringEntryRef::new("missing-record", "window");
+    let empty = PersistedWindowStore::at_path(dir.path().join("empty.window"));
+    let mut rows = Rows::default();
+    for attempt in [false, true] {
+        let result = if attempt {
+            OperationRecorder::new(&empty, &profile, &mut rows, "begin")
+                .begin_attempt(
+                    &handle,
+                    &AttemptRequest {
+                        envelope: Some(AttemptEnvelope {
+                            xdr: "AAAA".to_owned(),
+                            unsigned_envelope_sha256: [1; 32],
+                        }),
+                        authorization: AttemptAuthorization::Mint(Box::new(raw.clone())),
+                        send_by_ms: u64::MAX,
+                    },
+                )
+                .map(|_| ())
+        } else {
+            empty
+                .mint_authorization(&profile, &fx.mint_request())
+                .map(|_| ())
+        };
+        mint_refusal(&result, MainnetPrecondition::ApprovalNotFound);
+        assert!(!empty.path().exists(), "no store file: attempt {attempt}");
+        assert_eq!(
+            crate::keyring::read_keyring_string(&profile.policy_window_state_key_id).unwrap(),
+            None,
+            "no window key: attempt {attempt}"
+        );
+    }
+    drop(fx);
+    // A continuation under a used parent whose record is gone refuses too,
+    // although the parent holds the nonce.
+    let mut fx = Fx::x402(300_000);
+    fx.open();
+    fx.consent();
+    let child = x402_child_request(&fx, x402_intent_request(&fx));
+    let mut wire = fx.wire();
+    wire.approvals.as_mut().unwrap().records.clear();
+    fx.store.seal_unchecked_for_test(fx.fixture.profile(), &wire);
+    let before = fx.bytes();
+    let generation = fx.wire().generation;
+    for _ in 0..2 {
+        mint_refusal(
+            &fx.store.mint_authorization(fx.fixture.profile(), &child),
+            MainnetPrecondition::ApprovalNotFound,
+        );
+        assert_eq!(fx.bytes(), before, "a recordless continuation writes nothing");
+        assert_eq!(fx.wire().generation, generation);
+    }
+}
+
+#[test]
 #[serial]
 fn consent_keeps_waiting_until_first_mint() {
     for route in ["begin", "adopt-live", "sweep", "waiting-expiry"] {
@@ -324,6 +490,8 @@ fn consent_keeps_waiting_until_first_mint() {
         request.authorization_ttl_ms = 1;
         match route {
             "begin" => {
+                // The operation route takes the approval identity from the handle.
+                request.operation = None;
                 begin_approval(&mut fx, request).unwrap();
             }
             "waiting-expiry" => {

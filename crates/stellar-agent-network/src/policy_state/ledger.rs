@@ -2232,7 +2232,9 @@ impl PersistedWindowStore {
     ///
     /// Conflicting operation identities refuse before every store read.
     /// Retained approvals are checked after the chain and before the other
-    /// prechecks, using a non-minting read under the lock. Their consent bound
+    /// prechecks, using a non-minting read under the lock. An approval without
+    /// a durable record, including one in a store without a file, refuses
+    /// `ApprovalNotFound`. A record's consent bound
     /// also caps the authorization, including a continuation under a used parent.
     /// An envelope approval additionally caps it at the signed pending expiry.
     ///
@@ -2310,11 +2312,13 @@ impl PersistedWindowStore {
         let MintAuthority::Approval { nonce, .. } = &request.authority else {
             return Ok(None);
         };
+        // A store without a file holds no record, so the approval refuses
+        // before the window key exists.
         let Some(wire) = self.read_for_inspection(profile)? else {
-            return Ok(None);
+            return Err(refused(MainnetPrecondition::ApprovalNotFound));
         };
         if request.parent.is_some() {
-            let cap = super::approvals::record_cap(&wire.approvals, nonce);
+            let cap = super::approvals::continuation_cap(&wire, nonce)?;
             let at = super::approvals::decision_time(&wire, profile, nonce, now)?;
             check(
                 cap.is_none_or(|end| at < end),
@@ -2920,6 +2924,9 @@ mod tests {
     const CAP: i128 = 1_000;
     const TTL_MS: u64 = 120_000;
     const APPROVAL_MS: u64 = 600_000;
+    /// The waiting and execution bound of a durable record `Ledger::approve`
+    /// creates: the execution maximum, past `APPROVAL_MS`.
+    const RECORD_MS: u64 = 900_000;
     const SOURCE: &str = "GAAQEAYEAUDAOCAJBIFQYDIOB4IBCEQTCQKRMFYYDENBWHA5DYPSABGM";
     const FEE_SOURCE: &str = "GAAQEAYEAUDAOCAJBIFQYDIOB4IBCEQTCQKRMFYYDENBWHA5DYPSABGN";
     const AUDIT: AuditFacts = AuditFacts {
@@ -2937,6 +2944,30 @@ mod tests {
         store: PersistedWindowStore,
         clock: TestClockGuard,
         nonces: Cell<u32>,
+        /// The consent fixture whose profile [`Self::approve`] records under.
+        consent: Option<stellar_agent_core::approval::mainnet_fixtures::MainnetConsentFixture>,
+    }
+
+    /// `request` under the policy `sequence` and `digest`, its policy
+    /// authority naming the same policy.
+    fn on_policy(mut request: MintRequest, sequence: i64, digest: [u8; 32]) -> MintRequest {
+        request.policy_sequence = sequence;
+        request.policy_digest = digest;
+        if let MintAuthority::Policy(binding) = &mut request.authority {
+            binding.policy_sequence = sequence;
+            binding.policy_digest = digest;
+        }
+        request
+    }
+
+    /// A wall clock fixed at one instant, so a consent ceremony runs on the
+    /// ledger clock.
+    struct FixedWall(u64);
+
+    impl stellar_agent_core::timefmt::Clock for FixedWall {
+        fn now_unix_ms(&self) -> Result<u64, stellar_agent_core::wallet::WalletLifecycleError> {
+            Ok(self.0)
+        }
     }
 
     impl Ledger {
@@ -2954,6 +2985,34 @@ mod tests {
             )
             .build();
             profile.audit_log_path = dir.path().join("audit.jsonl");
+            Self::with_profile(dir, profile, None)
+        }
+
+        /// [`Self::new`] on the profile of a consent fixture, so
+        /// [`Self::approve`] can record durable approvals.
+        fn with_approvals() -> Self {
+            let consent =
+                stellar_agent_core::approval::mainnet_fixtures::MainnetConsentFixture::new(
+                    "ledger",
+                );
+            let dir = TempDir::new().unwrap();
+            let mut profile = consent.profile().clone();
+            profile.audit_log_path = dir.path().join("audit.jsonl");
+            // The ledger's pin lives under its own window key, so the consent
+            // fixture keeps its policy pin.
+            profile.policy_window_state_key_id =
+                stellar_agent_core::profile::schema::KeyringEntryRef::new(
+                    "ledger-window",
+                    "ledger",
+                );
+            Self::with_profile(dir, profile, Some(consent))
+        }
+
+        fn with_profile(
+            dir: TempDir,
+            profile: Profile,
+            consent: Option<stellar_agent_core::approval::mainnet_fixtures::MainnetConsentFixture>,
+        ) -> Self {
             let store = PersistedWindowStore::at_path(dir.path().join("ledger.window"));
             let ledger = Self {
                 _dir: dir,
@@ -2961,9 +3020,95 @@ mod tests {
                 store,
                 clock: set_now_ms_for_test(T0),
                 nonces: Cell::new(0),
+                consent,
             };
             ledger.pin(7, [7; 32]);
             ledger
+        }
+
+        /// Records a durable approval for `request` on the ledger clock: an
+        /// operation, its pending record, and the operator's consent, through
+        /// the producer facades. The request then carries the approval's
+        /// nonce and, without an operation link of its own, the record's
+        /// operation as its approval identity.
+        fn approve(&self, request: &mut MintRequest) {
+            use super::super::approvals::{
+                ApprovalRecorder, PendingApprovalFacts,
+                tests::{Rows, proof},
+            };
+            use super::super::operations::{
+                BusinessId, IntentSlot, OpenOutcome, OpenRequest, OperationKind, OperationRecorder,
+                OperationTool,
+            };
+            let fixture = self.consent.as_ref().expect("a ledger with approvals");
+            let now = crate::mainnet::clock::now_ms().unwrap();
+            let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(fixture.home());
+            let _wall = stellar_agent_core::timefmt::test_clock::install(std::sync::Arc::new(
+                FixedWall(now),
+            ));
+            // The record outlives the request's approval expiry, so the
+            // authority, not the record, bounds the ledger's lifetimes.
+            let entry = fixture.payment(RECORD_MS);
+            let (witness, payload) =
+                proof(fixture, &entry, &format!("{}.toml", entry.approval_nonce));
+            let mut rows = Rows::default();
+            let operation = match request.operation {
+                Some(link) => link.operation_id,
+                None => {
+                    let opened =
+                        OperationRecorder::new(&self.store, &self.profile, &mut rows, "open")
+                            .open(&OpenRequest {
+                                business_id: BusinessId::parse(witness.nonce()).unwrap(),
+                                tool: OperationTool::CliPay,
+                                kind: OperationKind::Pay,
+                                intent: IntentSlot::Canonical {
+                                    intent_digest: [1; 32],
+                                    intent: serde_json::json!({"op":"pay"}),
+                                },
+                                envelope_xdr: None,
+                                prepared_decision: None,
+                                rule_ttl_ms: Some(RECORD_MS),
+                            })
+                            .unwrap();
+                    let OpenOutcome::New(handle) = opened else {
+                        panic!("a fresh nonce opens a new operation")
+                    };
+                    request.approval_operation = Some(handle.id());
+                    handle.id()
+                }
+            };
+            let mut recorder = ApprovalRecorder::new(&self.store, &self.profile, &mut rows, "ok");
+            let view = recorder
+                .open_pending(
+                    operation,
+                    &PendingApprovalFacts {
+                        nonce: witness.nonce().to_owned(),
+                        kind: witness.kind(),
+                        subject_kind: witness.subject_kind(),
+                        subject: witness.subject(),
+                        intent_digest: [1; 32],
+                        created_at_ms: witness.created_at_ms(),
+                        waiting_expires_at_ms: witness.expires_at_ms(),
+                        rule_ttl_ms: RECORD_MS,
+                    },
+                    stellar_agent_core::audit_log::PolicyDecision::RequireApproval,
+                )
+                .unwrap();
+            recorder
+                .record_consent(view.record.id, &witness, &payload)
+                .unwrap();
+            request.authority = MintAuthority::Approval {
+                nonce: witness.nonce().to_owned(),
+                expires_at_ms: T0 + APPROVAL_MS,
+            };
+        }
+
+        /// [`Self::request`] under a durable approval [`Self::approve`]
+        /// records.
+        fn approved(&self, binding: DomainBinding, holds: Vec<WindowEntry>) -> MintRequest {
+            let mut request = self.request(binding, holds);
+            self.approve(&mut request);
+            request
         }
 
         fn pin(&self, sequence: i64, digest: [u8; 32]) {
@@ -3002,10 +3147,16 @@ mod tests {
                 binding,
                 policy_sequence: 7,
                 policy_digest: [7; 32],
-                authority: MintAuthority::Approval {
-                    nonce: format!("nonce-{n}"),
-                    expires_at_ms: T0 + APPROVAL_MS,
-                },
+                // The request's subject is the ledger, so it proceeds under the
+                // policy; an approval needs a durable record (`Self::approve`).
+                authority: MintAuthority::Policy(PolicyAuthorityBinding {
+                    policy_digest: [7; 32],
+                    policy_sequence: 7,
+                    rule_index: n,
+                    evaluated_at_ms: T0,
+                    governing_until_ms: T0 + APPROVAL_MS,
+                    scope: stellar_agent_core::mainnet::decision::AuthorityScope::Classic,
+                }),
                 chain_deadline_ms: None,
                 restriction_end_ms: None,
                 authorization_ttl_ms: TTL_MS,
@@ -3395,8 +3546,8 @@ mod tests {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        let l = Ledger::new();
-        let mut request = l.request(tx(1), vec![hold(70)]);
+        let l = Ledger::with_approvals();
+        let mut request = l.approved(tx(1), vec![hold(70)]);
         let minted = l.mint(&request).unwrap();
         l.claim(&request, &minted).unwrap();
         let reopened = PersistedWindowStore::at_path(l.store.path().to_path_buf());
@@ -3597,8 +3748,8 @@ mod tests {
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         type ExpectChange = fn(&mut ClaimExpect);
-        let l = Ledger::new();
-        let request = l.request(tx(1), vec![hold(70)]);
+        let l = Ledger::with_approvals();
+        let request = l.approved(tx(1), vec![hold(70)]);
         let minted = l.mint(&request).unwrap();
         let before = l.bytes();
         let cases: [(ExpectChange, MainnetPrecondition); 6] = [
@@ -3848,8 +3999,8 @@ mod tests {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        let l = Ledger::new();
-        let request = l.request(tx(1), vec![hold(100), hold(50)]);
+        let l = Ledger::with_approvals();
+        let request = l.approved(tx(1), vec![hold(100), hold(50)]);
         let minted = l.mint(&request).unwrap();
         assert_eq!(minted.issued_at_ms, T0);
         assert_eq!(minted.expires_at_ms, T0 + TTL_MS);
@@ -3914,26 +4065,26 @@ mod tests {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        let l = Ledger::new();
-        let mut short_approval = l.request(message(1), vec![]);
+        let l = Ledger::with_approvals();
+        let mut short_approval = l.approved(message(1), vec![]);
         *short_approval.authority.approval_expiry_mut() = T0 + 30_000;
         assert_eq!(l.mint(&short_approval).unwrap().expires_at_ms, T0 + 30_000);
 
-        let longer = l.request(message(2), vec![]);
+        let longer = l.approved(message(2), vec![]);
         assert_eq!(l.mint(&longer).unwrap().expires_at_ms, T0 + TTL_MS);
 
-        let mut zero = l.request(message(3), vec![]);
+        let mut zero = l.approved(message(3), vec![]);
         zero.authorization_ttl_ms = 0;
         assert_eq!(refusal(l.mint(&zero)), MainnetPrecondition::LifetimeInvalid);
 
-        let mut overflow = l.request(message(4), vec![]);
+        let mut overflow = l.approved(message(4), vec![]);
         overflow.authorization_ttl_ms = u64::MAX;
         assert_eq!(
             refusal(l.mint(&overflow)),
             MainnetPrecondition::LifetimeInvalid
         );
 
-        let mut elapsed = l.request(message(5), vec![]);
+        let mut elapsed = l.approved(message(5), vec![]);
         *elapsed.authority.approval_expiry_mut() = T0;
         assert_eq!(
             refusal(l.mint(&elapsed)),
@@ -4048,8 +4199,8 @@ mod tests {
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for restricted in [true, false] {
-            let l = Ledger::new();
-            let mut first = l.request(if restricted { tx(1) } else { message(1) }, vec![]);
+            let l = Ledger::with_approvals();
+            let mut first = l.approved(if restricted { tx(1) } else { message(1) }, vec![]);
             if restricted {
                 first.restriction_end_ms = Some(T0 + 30_000);
                 first.bindings.restriction = Some([0x91; 32]);
@@ -4060,11 +4211,14 @@ mod tests {
                 "operation serialization must not decide proof reuse"
             );
             let minted = l.mint(&first).unwrap();
+            // The same approval identity passes the record check, so the
+            // retained authorization's nonce decides.
             let mut reuse = l.request(if restricted { tx(2) } else { message(2) }, vec![]);
             reuse.restriction_end_ms = first.restriction_end_ms;
             reuse.bindings.restriction = first.bindings.restriction;
             reuse.holds = first.holds.clone();
-            *reuse.authority.nonce_mut() = first.authority.nonce().clone();
+            reuse.authority = first.authority.clone();
+            reuse.approval_operation = first.approval_operation;
             assert_eq!(
                 refusal(l.mint(&reuse)),
                 MainnetPrecondition::ApprovalNonceReused
@@ -4085,29 +4239,36 @@ mod tests {
     #[test]
     #[serial(mainnet_clock)]
     #[serial]
-    fn approval_mint_without_a_record_keeps_its_body() {
+    fn approval_mint_without_a_record_refuses_not_found() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
-        let request = l.request(tx(1), vec![]);
-        let minted = l.mint(&request).unwrap();
-        for consumed in [false, true] {
-            if consumed {
-                l.consume(&request, &minted, &consumption_of(&request.binding))
-                    .unwrap();
-            }
-            let wire = l.store.read_for_inspection(&l.profile).unwrap().unwrap();
+        let mut request = l.request(tx(1), vec![]);
+        request.authority = MintAuthority::Approval {
+            nonce: "nonce-without-record".to_owned(),
+            expires_at_ms: T0 + APPROVAL_MS,
+        };
+        // A policy mint gives the store its file, so the record lookup runs
+        // on an authenticated image that holds no approval.
+        l.mint(&l.request(tx(2), vec![])).unwrap();
+        let before = fs::read(l.store.path()).unwrap();
+        let generation = l.wire().generation;
+        for _ in 0..2 {
+            assert_eq!(
+                refusal(l.mint(&request)),
+                MainnetPrecondition::ApprovalNotFound
+            );
+            assert_eq!(fs::read(l.store.path()).unwrap(), before);
+            let wire = l.wire();
+            assert_eq!(wire.generation, generation);
             assert_eq!(
                 wire.version,
                 super::super::store::WIRE_VERSION_NATIVE_COVERAGE
             );
             let body = serde_json::to_value(&wire).unwrap();
             assert!(body.get("approvals").is_none());
-            assert_eq!(
-                body["authorizations"][0]["state"],
-                if consumed { "used" } else { "open" }
-            );
+            assert_eq!(wire.authorizations.len(), 1);
         }
     }
 
@@ -4509,8 +4670,8 @@ mod tests {
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use MainnetPrecondition as P;
-        let l = Ledger::new();
-        let request = l.request(tx(1), vec![hold(10)]);
+        let l = Ledger::with_approvals();
+        let request = l.approved(tx(1), vec![hold(10)]);
         let minted = l.mint(&request).unwrap();
         let binding = consumption_of(&request.binding);
         let base = l.expect(&request, &minted);
@@ -4881,14 +5042,20 @@ mod tests {
 
     // ── x402 continuation ───────────────────────────────────────────────
 
-    /// A used Soroban intent and a continuation request for it.
+    /// A used Soroban intent and a continuation request for it under the
+    /// same authority: a durable approval on a ledger with approvals, the
+    /// policy otherwise.
     fn used_intent(l: &Ledger) -> (MintRequest, MintedRecord, MintRequest) {
-        let intent = l.request(soroban(1), vec![hold(40)]);
+        let intent = if l.consent.is_some() {
+            l.approved(soroban(1), vec![hold(40)])
+        } else {
+            l.request(soroban(1), vec![hold(40)])
+        };
         let minted = l.mint(&intent).unwrap();
         l.consume(&intent, &minted, &consumption_of(&intent.binding))
             .unwrap();
         let mut child = l.request(x402(1), vec![]);
-        *child.authority.nonce_mut() = intent.authority.nonce().clone();
+        child.authority = intent.authority.clone();
         child.parent = Some(minted.id);
         (intent, minted, child)
     }
@@ -4916,7 +5083,7 @@ mod tests {
         assert_eq!(records_before, records_after, "a release adds no spend");
 
         let mut second = l.request(x402(2), vec![]);
-        *second.authority.nonce_mut() = child.authority.nonce().clone();
+        second.authority = child.authority.clone();
         second.parent = Some(parent.id);
         assert_eq!(
             refusal(l.mint(&second)),
@@ -4939,7 +5106,7 @@ mod tests {
             let intent = l.request(soroban(1), vec![]);
             let open = l.mint(&intent).unwrap();
             let mut child = l.request(x402(1), vec![]);
-            *child.authority.nonce_mut() = intent.authority.nonce().clone();
+            child.authority = intent.authority.clone();
             child.parent = Some(open.id);
             assert_eq!(refusal(l.mint(&child)), P::IntentRecordMismatch);
         }
@@ -4957,14 +5124,20 @@ mod tests {
             }),
         ];
         for (name, mutate) in mutations {
-            let l = Ledger::new();
+            let l = Ledger::with_approvals();
             let (_, _, mut child) = used_intent(&l);
             mutate(&mut child);
+            if name == "nonce" {
+                // The other nonce has its own record, so the parent decides.
+                *child.authority.nonce_mut() =
+                    l.approved(soroban(9), vec![]).authority.nonce().clone();
+            }
             assert_eq!(refusal(l.mint(&child)), P::IntentRecordMismatch, "{name}");
         }
         // The policy is equal: the pin moves on and the child names it.
         for (sequence, digest) in [(8, [7; 32]), (7, [8; 32])] {
-            let l = Ledger::new();
+            // An approval binds no policy, so the parent comparison decides.
+            let l = Ledger::with_approvals();
             let (_, _, mut child) = used_intent(&l);
             l.pin(sequence, digest);
             child.policy_sequence = sequence;
@@ -4996,7 +5169,7 @@ mod tests {
             l.consume(&tx_request, &used, &consumption_of(&tx_request.binding))
                 .unwrap();
             let mut child = l.request(x402(1), vec![]);
-            *child.authority.nonce_mut() = tx_request.authority.nonce().clone();
+            child.authority = tx_request.authority.clone();
             child.parent = Some(used.id);
             assert_eq!(refusal(l.mint(&child)), P::IntentRecordMismatch);
         }
@@ -5314,8 +5487,9 @@ mod tests {
         let binding = consumption_of(&first.binding);
         l.consume(&first, &used, &binding).unwrap();
         assert!(l.store.pending_reservations(&l.profile).unwrap().is_empty());
-        let mut second = l.request(tx(1), vec![]);
-        *second.authority.nonce_mut() = "fresh-approval".to_owned();
+        // A fresh request carries a fresh policy authority (its own rule index).
+        let second = l.request(tx(1), vec![]);
+        assert_ne!(second.authority, first.authority);
         let open = l.mint(&second).unwrap();
         let before = l.bytes();
         let ConsumptionBinding::Transaction(mut different_tx_hash) = binding.clone() else {
@@ -5447,8 +5621,8 @@ mod tests {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        let l = Ledger::new();
-        let request = l.request(message(1), vec![]);
+        let l = Ledger::with_approvals();
+        let request = l.approved(message(1), vec![]);
         let minted = l.mint(&request).unwrap();
         l.consume(&request, &minted, &consumption_of(&request.binding))
             .unwrap();
@@ -5533,10 +5707,27 @@ mod tests {
     }
 
     /// A mint of another binding that copies `request`'s approval nonce.
+    /// Another mint under `request`'s approval without its identity, which
+    /// the consumed record refuses.
     fn nonce_copy(l: &Ledger, request: &MintRequest) -> MintRequest {
         let mut reuse = l.request(tx(2), vec![hold(1)]);
-        *reuse.authority.nonce_mut() = request.authority.nonce().clone();
+        reuse.authority = request.authority.clone();
         reuse
+    }
+
+    /// Ends the operation of `request`'s durable approval: a reset requires
+    /// that no operation is open.
+    fn end_operation(l: &Ledger, request: &MintRequest) {
+        use super::super::operations::{OperationRecorder, OperationState, TransitionEvidence};
+        let mut rows = super::super::approvals::tests::Rows::default();
+        OperationRecorder::new(&l.store, &l.profile, &mut rows, "end")
+            .transition(
+                request.approval_operation.expect("an approved request"),
+                None,
+                OperationState::Expired,
+                &TransitionEvidence::default(),
+            )
+            .unwrap();
     }
 
     /// A reset keeps every record whose approval can still be presented on
@@ -5551,7 +5742,7 @@ mod tests {
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         type Setup = fn(&Ledger) -> (MintRequest, AuthorizationId);
         let used: Setup = |l| {
-            let request = l.request(soroban(1), vec![hold(70)]);
+            let request = l.approved(soroban(1), vec![hold(70)]);
             let minted = l.mint(&request).unwrap();
             l.clock.set(T0 + 5);
             l.claim(&request, &minted).unwrap();
@@ -5560,7 +5751,7 @@ mod tests {
             (request, minted.id)
         };
         let invalidated: Setup = |l| {
-            let request = l.request(tx(1), vec![hold(70)]);
+            let request = l.approved(tx(1), vec![hold(70)]);
             let minted = l.mint(&request).unwrap();
             l.store
                 .invalidate_authorization(&l.profile, minted.id, "cancel")
@@ -5568,12 +5759,12 @@ mod tests {
             (request, minted.id)
         };
         let open: Setup = |l| {
-            let request = l.request(tx(1), vec![hold(70)]);
+            let request = l.approved(tx(1), vec![hold(70)]);
             let minted = l.mint(&request).unwrap();
             (request, minted.id)
         };
         let claimed: Setup = |l| {
-            let request = l.request(tx(1), vec![hold(70)]);
+            let request = l.approved(tx(1), vec![hold(70)]);
             let minted = l.mint(&request).unwrap();
             l.clock.set(T0 + 7);
             l.claim(&request, &minted).unwrap();
@@ -5593,8 +5784,9 @@ mod tests {
             ("claimed", claimed, T0 + 10_000, Kept::SettledClaimed, true),
         ];
         for (name, setup, clock, kept, holds_capacity) in cases {
-            let l = Ledger::new();
+            let l = Ledger::with_approvals();
             let (request, id) = setup(&l);
+            end_operation(&l, &request);
             l.clock.set(clock);
             let before = l.record(id);
             let bytes = l.bytes();
@@ -5656,13 +5848,14 @@ mod tests {
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for (clock, kept) in [(T0 + APPROVAL_MS, 0), (T0 + APPROVAL_MS - 1, 1)] {
-            let l = Ledger::new();
-            let request = l.request(soroban(1), vec![hold(70)]);
+            let l = Ledger::with_approvals();
+            let request = l.approved(soroban(1), vec![hold(70)]);
             let minted = l.mint(&request).unwrap();
             l.clock.set(T0 + 5);
             l.claim(&request, &minted).unwrap();
             l.consume(&request, &minted, &consumption_of(&request.binding))
                 .unwrap();
+            end_operation(&l, &request);
             // A settled release row lets the authority end decide; an
             // unreleased value row survives every reset.
             let mut wire = l.wire();
@@ -5679,11 +5872,13 @@ mod tests {
             let wire = l.wire();
             assert_eq!(wire.authorizations.len(), kept as usize, "{clock}");
             if kept == 0 {
+                // The dropped authorization no longer holds the nonce; the
+                // consumed durable record still refuses its reuse.
                 let mut again = l.request(soroban(2), vec![]);
-                *again.authority.nonce_mut() = request.authority.nonce().clone();
+                again.authority = request.authority.clone();
                 assert_eq!(
                     refusal(l.mint(&again)),
-                    MainnetPrecondition::LifetimeInvalid
+                    MainnetPrecondition::ApprovalNonceReused
                 );
             } else {
                 assert_eq!(wire.authorizations[0].id, minted.id);
@@ -5701,10 +5896,11 @@ mod tests {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        let l = Ledger::new();
-        let mut request = l.request(tx(1), vec![hold(70)]);
+        let l = Ledger::with_approvals();
+        let mut request = l.approved(tx(1), vec![hold(70)]);
         *request.authority.approval_expiry_mut() = T0 + RETENTION_MS;
         let minted = l.mint(&request).unwrap();
+        end_operation(&l, &request);
         l.clock.set(T0 - 1_000);
         let outcome = l.reset(T0 - 1_000).unwrap();
         assert_eq!(outcome.accrual.retained_authorizations, 1);
@@ -5769,7 +5965,7 @@ mod tests {
         };
         assert_eq!(find(parent.id), Some(parent_before));
         let mut second = l.request(x402(2), vec![]);
-        *second.authority.nonce_mut() = child.authority.nonce().clone();
+        second.authority = child.authority.clone();
         second.parent = Some(parent.id);
         assert_eq!(
             refusal(l.mint(&second)),
@@ -5788,14 +5984,15 @@ mod tests {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        let l = Ledger::new();
+        let l = Ledger::with_approvals();
         l.owe_expiry();
         let mut writer = l.delivery_writer();
         deliver_accounting_expiries(&mut writer, &l.store, &l.profile, &l.name(), None).unwrap();
-        let request = l.request(message(1), vec![]);
+        let request = l.approved(message(1), vec![]);
         let minted = l.mint(&request).unwrap();
         l.consume(&request, &minted, &consumption_of(&request.binding))
             .unwrap();
+        end_operation(&l, &request);
         let before = l.wire();
         let [expiry] = before.accounting_expiries.as_slice() else {
             panic!("one expiry record: {:?}", before.accounting_expiries);
@@ -6264,16 +6461,21 @@ mod tests {
                     MainnetPrecondition::IntentRecordMismatch
                 );
                 let (message_request, parent) = used_message(&l);
-                *request.authority.nonce_mut() = message_request.authority.nonce().clone();
+                request.authority = message_request.authority.clone();
                 request.parent = Some(parent.id);
             }
             l.mint(&request).unwrap();
         }
     }
 
-    /// A used message record whose approval an authenticated intent shares.
+    /// A used message record whose authority an authenticated intent shares:
+    /// a durable approval on a ledger with approvals, the policy otherwise.
     fn used_message(l: &Ledger) -> (MintRequest, MintedRecord) {
-        let request = l.request(message(0x40), vec![]);
+        let request = if l.consent.is_some() {
+            l.approved(message(0x40), vec![])
+        } else {
+            l.request(message(0x40), vec![])
+        };
         let minted = l.mint(&request).unwrap();
         l.consume(&request, &minted, &consumption_of(&request.binding))
             .unwrap();
@@ -6290,7 +6492,7 @@ mod tests {
     ) -> MintRequest {
         let mut child = l.request(soroban(n), vec![hold(40)]);
         child.consumer = MainnetConsumer::X402Authenticated;
-        *child.authority.nonce_mut() = message_request.authority.nonce().clone();
+        child.authority = message_request.authority.clone();
         child.parent = Some(parent.id);
         child
     }
@@ -6397,10 +6599,15 @@ mod tests {
             }),
         ];
         for (name, mutate) in mutations {
-            let l = Ledger::new();
+            let l = Ledger::with_approvals();
             let (message_request, parent) = used_message(&l);
             let mut child = authenticated_child(&l, &message_request, &parent, 1);
             mutate(&mut child);
+            if name == "nonce" {
+                // The other nonce has its own record, so the parent decides.
+                *child.authority.nonce_mut() =
+                    l.approved(soroban(9), vec![]).authority.nonce().clone();
+            }
             assert_unchanged_refusal(&l, &child, name);
         }
         // The profile is equal.
@@ -6425,7 +6632,8 @@ mod tests {
         }
         // The policy is equal: the pin moves on and the child names it.
         for (sequence, digest) in [(8, [7; 32]), (7, [8; 32])] {
-            let l = Ledger::new();
+            // An approval binds no policy, so the parent comparison decides.
+            let l = Ledger::with_approvals();
             let (message_request, parent) = used_message(&l);
             let mut child = authenticated_child(&l, &message_request, &parent, 1);
             l.pin(sequence, digest);
@@ -6453,7 +6661,7 @@ mod tests {
                 .unwrap();
             let mut child = l.request(soroban(2), vec![hold(40)]);
             child.consumer = MainnetConsumer::X402Authenticated;
-            *child.authority.nonce_mut() = message_request.authority.nonce().clone();
+            child.authority = message_request.authority.clone();
             child.parent = Some(used.id);
             assert_unchanged_refusal(&l, &child, "intent parent of an intent");
         }
@@ -6463,7 +6671,7 @@ mod tests {
             let (message_request, parent) = used_message(&l);
             let mut child = l.request(x402(1), vec![]);
             child.consumer = MainnetConsumer::X402Authenticated;
-            *child.authority.nonce_mut() = message_request.authority.nonce().clone();
+            child.authority = message_request.authority.clone();
             child.parent = Some(parent.id);
             assert_unchanged_refusal(&l, &child, "message parent of a submission");
         }
@@ -6472,7 +6680,7 @@ mod tests {
             let l = Ledger::new();
             let (message_request, parent) = used_message(&l);
             let mut child = l.request(binding, vec![]);
-            *child.authority.nonce_mut() = message_request.authority.nonce().clone();
+            child.authority = message_request.authority.clone();
             child.parent = Some(parent.id);
             assert_unchanged_refusal(&l, &child, "parent of a parentless record");
         }
@@ -6955,15 +7163,13 @@ mod tests {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        let l = Ledger::new();
+        let l = Ledger::with_approvals();
         l.mint(&l.request(tx(1), vec![hold(1)])).unwrap();
         let second = second_path(&l);
-        let request = l.request(tx(2), vec![hold(1)]);
+        let request = l.approved(tx(2), vec![hold(1)]);
         let mut rival = l.request(tx(3), vec![hold(1)]);
-        rival
-            .authority
-            .nonce_mut()
-            .clone_from(request.authority.nonce());
+        rival.authority = request.authority.clone();
+        rival.approval_operation = request.approval_operation;
 
         let outcome = std::rc::Rc::new(std::cell::RefCell::new(None));
         let observed = outcome.clone();
@@ -7664,8 +7870,8 @@ mod tests {
 
         #[cfg(feature = "mainnet-write")]
         {
-            let l = Ledger::new();
-            let request = l.request(tx(1), vec![]);
+            let l = Ledger::with_approvals();
+            let request = l.approved(tx(1), vec![]);
             let minted = l.mint(&request).unwrap();
             let mut sealed = l.wire();
             let record = sealed
@@ -7707,8 +7913,8 @@ mod tests {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        let l = Ledger::new();
-        let approval = l.request(tx(1), vec![hold(5)]);
+        let l = Ledger::with_approvals();
+        let approval = l.approved(tx(1), vec![hold(5)]);
         l.mint(&approval).unwrap();
         let version = l.wire().version;
         assert_eq!(
@@ -8876,7 +9082,13 @@ mod tests {
             let mut request = l.request(binding, holds);
             request.policy_sequence = p.sequence;
             request.policy_digest = p.digest;
-            *request.authority.approval_expiry_mut() = now + APPROVAL_MS;
+            let MintAuthority::Policy(authority) = &mut request.authority else {
+                panic!("a ledger request proceeds under the policy")
+            };
+            authority.policy_sequence = p.sequence;
+            authority.policy_digest = p.digest;
+            authority.evaluated_at_ms = now;
+            authority.governing_until_ms = now + APPROVAL_MS;
             let minted = store.mint_authorization(&l.profile, &request);
             (request, minted)
         }
@@ -9159,10 +9371,7 @@ mod tests {
                     let holds = engine
                         .size_window_entries(&pay_tool(), &l.profile, &payment(6), T0)
                         .unwrap();
-                    let mut request = l.request(tx(n), holds);
-                    request.policy_sequence = p.sequence;
-                    request.policy_digest = p.digest;
-                    request
+                    on_policy(l.request(tx(n), holds), p.sequence, p.digest)
                 })
                 .collect();
             let profile = l.profile.clone();
@@ -9340,9 +9549,7 @@ mod tests {
             let l = Ledger::new();
             l.mint(&l.request(tx(1), vec![total(6, P7)])).unwrap();
             l.pin(8, [8; 32]);
-            let mut request = l.request(tx(2), vec![total(10, [8; 32])]);
-            request.policy_sequence = 8;
-            request.policy_digest = [8; 32];
+            let request = on_policy(l.request(tx(2), vec![total(10, [8; 32])]), 8, [8; 32]);
             l.mint(&request).unwrap();
         }
 
@@ -9792,9 +9999,7 @@ mod tests {
             let holds = engine
                 .size_window_entries(tool, &l.profile, value, now)
                 .unwrap();
-            let mut request = l.request(tx(n), holds);
-            request.policy_sequence = p.sequence;
-            request.policy_digest = p.digest;
+            let request = on_policy(l.request(tx(n), holds), p.sequence, p.digest);
             (decision, store.mint_authorization(&l.profile, &request))
         }
 

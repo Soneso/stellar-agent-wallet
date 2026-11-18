@@ -125,6 +125,7 @@ mod tests {
                     &fixture.store_path(),
                     Some(&handle),
                     PolicyDecision::RequireApproval,
+                    &governing(&context, &fixture.current_policy(), 300_000),
                 )
                 .await;
                 let error = result.unwrap_err();
@@ -245,6 +246,7 @@ mod tests {
                 &fixture.store_path(),
                 Some(&handle),
                 PolicyDecision::RequireApproval,
+                &governing(&context, &fixture.current_policy(), 300_000),
             )
             .await;
             assert!(result.is_err(), "the enabled route must call admission");
@@ -273,6 +275,7 @@ mod tests {
                 &fixture.store_path(),
                 Some(&handle),
                 PolicyDecision::RequireApproval,
+                &governing(&context, &fixture.current_policy(), 300_000),
             )
             .await
             .unwrap();

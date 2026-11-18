@@ -1014,8 +1014,17 @@ async fn canonical_header_binds_attempt_and_intent() {
 #[serial_test::serial(mainnet_clock)]
 #[serial_test::serial]
 async fn legacy_binding_is_never_promoted() {
-    for slot in ["absent", "envelope", "x402"] {
+    // An unrecorded approval refuses `ApprovalNotFound`. A recorded approval
+    // resolves only for its own operation's link; no link and another
+    // operation's link refuse `ApprovalNonceReused`.
+    for (slot, refusal) in [
+        ("unrecorded", Some(P::ApprovalNotFound)),
+        ("absent", Some(P::ApprovalNonceReused)),
+        ("envelope", None),
+        ("x402", Some(P::ApprovalNonceReused)),
+    ] {
         let f = current_record_fixture(false);
+        f.record_approvals.set(slot != "unrecorded");
         let server = f.server().await;
         let url = f.profile.rpc_url.parse::<url::Url>().unwrap();
         let context = f.context_with_routes(&[(url.host_str().unwrap(), &server.uri())]);
@@ -1062,18 +1071,22 @@ async fn legacy_binding_is_never_promoted() {
         req.operation = link;
         req.unsigned_envelope_xdr = &other;
         let refused = resolve_tx_sign(req).await;
+        let expected = refusal.unwrap_or(P::ApprovalSubjectMismatch);
         assert!(
-            matches!(
-                refused,
-                Err(MainnetAuthorizationError::Refused(
-                    P::ApprovalSubjectMismatch
-                ))
-            ),
+            matches!(refused, Err(MainnetAuthorizationError::Refused(p)) if p == expected),
             "legacy envelope remains exact: {slot}: {refused:?}"
         );
         let mut req = request(&f, &context, &client, &authority);
         req.operation = link;
-        let auth = resolve_tx_sign(req).await.unwrap();
+        let resolved = resolve_tx_sign(req).await;
+        if let Some(refusal) = refusal {
+            assert!(
+                matches!(resolved, Err(MainnetAuthorizationError::Refused(p)) if p == refusal),
+                "{slot}: {resolved:?}"
+            );
+            continue;
+        }
+        let auth = resolved.unwrap();
         assert_eq!(auth.0.header.intent_digest, None);
         assert_eq!(auth.0.header.predecessor, None);
         let signer = crate::signing::test_doubles::CountingSigner::new(

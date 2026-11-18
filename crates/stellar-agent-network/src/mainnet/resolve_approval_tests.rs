@@ -29,6 +29,10 @@ fn durable_record(f: &ResolverFixture, witness: &ApprovalWitness, consent: bool)
         OpenRequest, OperationKind, OperationRecorder, OperationTool, PendingApprovalFacts,
     };
     use base64::Engine as _;
+    if let Some(link) = f.link(witness.nonce()) {
+        assert!(consent, "the fixture records consent with the approval");
+        return link;
+    }
     let mut rows = ApprovalRows;
     let OpenOutcome::New(handle) = OperationRecorder::new(&f.window, &f.profile, &mut rows, "open")
         .open(&OpenRequest {
@@ -98,6 +102,37 @@ fn durable_record(f: &ResolverFixture, witness: &ApprovalWitness, consent: bool)
     }
 }
 
+/// The first attempt of a second open operation, which names no record.
+fn other_operation(f: &ResolverFixture) -> OperationLink {
+    use crate::policy_state::{
+        BusinessId, IntentSlot, OpenOutcome, OpenRequest, OperationKind, OperationRecorder,
+        OperationTool,
+    };
+    let OpenOutcome::New(handle) =
+        OperationRecorder::new(&f.window, &f.profile, &mut ApprovalRows, "open")
+            .open(&OpenRequest {
+                business_id: BusinessId::parse("another-operation").unwrap(),
+                tool: OperationTool::CliPay,
+                kind: OperationKind::Pay,
+                intent: IntentSlot::Envelope {
+                    intent_digest: [2; 32],
+                    unsigned_envelope_sha256: [2; 32],
+                    max_time: 0,
+                },
+                envelope_xdr: None,
+                prepared_decision: None,
+                rule_ttl_ms: Some(600_000),
+            })
+            .unwrap()
+    else {
+        panic!("new operation")
+    };
+    OperationLink {
+        operation_id: handle.id(),
+        attempt_index: 1,
+    }
+}
+
 fn record_facts(
     f: &ResolverFixture,
     witness: &ApprovalWitness,
@@ -159,12 +194,18 @@ async fn consumed_resolver_refusals_precede_expiry_for_another_operation() {
         let facts = record_facts(&f, &witness);
         let now = super::super::clock::now_ms().unwrap();
         assert_eq!(
-            enabled::check_approval_facts(Some(&facts), &witness, None, now),
+            enabled::check_approval_facts(Some(&facts), &witness, None, None, now),
             Err(MainnetAuthorizationError::Refused(P::ApprovalNonceReused)),
             "consumed nonce reuse precedes expiry: {case}"
         );
         assert_eq!(
-            enabled::check_approval_facts(Some(&facts), &witness, Some(link), now),
+            enabled::check_approval_facts(
+                Some(&facts),
+                &witness,
+                Some(link.operation_id),
+                None,
+                now
+            ),
             Err(MainnetAuthorizationError::Refused(P::ApprovalExpired)),
             "the same operation keeps its expiry refusal: {case}"
         );
@@ -248,6 +289,7 @@ async fn resolver_state_matrix() {
             "consumed",
         ] {
             let f = current_record_fixture(soroban);
+            f.record_approvals.set(!case.starts_with("waiting"));
             let root = root(&f);
             let intent = intent(&root);
             let witness = if soroban {
@@ -272,7 +314,7 @@ async fn resolver_state_matrix() {
                 _ => None,
             };
             let operation = if case == "other-operation" {
-                None
+                Some(other_operation(&f))
             } else {
                 Some(link)
             };
@@ -281,7 +323,8 @@ async fn resolver_state_matrix() {
                 enabled::check_approval_facts(
                     Some(&facts),
                     &witness,
-                    operation,
+                    operation.map(|link| link.operation_id),
+                    None,
                     super::super::clock::now_ms().unwrap()
                 ),
                 expected.map_or(Ok(()), |p| Err(MainnetAuthorizationError::Refused(p))),
@@ -327,7 +370,14 @@ async fn resolver_state_matrix() {
             if case == "consumed" {
                 let facts = record_facts(&f, &witness);
                 assert!(
-                    enabled::check_approval_facts(Some(&facts), &witness, Some(link), at).is_ok()
+                    enabled::check_approval_facts(
+                        Some(&facts),
+                        &witness,
+                        Some(link.operation_id),
+                        None,
+                        at
+                    )
+                    .is_ok()
                 );
                 assert_eq!(
                     resolve().await,
@@ -361,7 +411,8 @@ fn facts_comparisons_refuse_alone() {
         enabled::check_approval_facts(
             Some(&record_facts(&f, &other)),
             &witness,
-            Some(other_link),
+            Some(other_link.operation_id),
+            None,
             other.consent_at_ms()
         ),
         Err(MainnetAuthorizationError::Refused(P::ApprovalNonce)),
@@ -397,7 +448,8 @@ fn facts_comparisons_refuse_alone() {
             enabled::check_approval_facts(
                 Some(&changed),
                 &witness,
-                Some(link),
+                Some(link.operation_id),
+                None,
                 witness.consent_at_ms()
             ),
             Err(MainnetAuthorizationError::Refused(expected)),
@@ -492,11 +544,27 @@ async fn gates_never_fall_back_to_the_inbox() {
             &f.signer,
             witness.consent_at_ms(),
             &f.window,
-            Some(link)
+            Some(link),
+            None
         ),
         Err(MainnetAuthorizationError::Refused(P::StoreUnavailable)),
         "facts read failure refuses before mint"
     );
+    // A valid admitting inbox entry beside a readable store without its
+    // record refuses as missing.
+    drop(f);
+    let f = current_record_fixture(false);
+    f.record_approvals.set(false);
+    let witness = f.approval(&f.envelope, f.now, 600_000);
+    let link = other_operation(&f);
+    let server = f.server().await;
+    let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
+    let client = context.primary_client().unwrap();
+    let authority = f.approval_authority(&witness);
+    let mut req = request(&f, &context, &client, &authority);
+    req.operation = Some(link);
+    let before = f.wire();
+    assert_refused(resolve_tx_sign(req).await, P::ApprovalNotFound, &f, &before);
 }
 
 #[tokio::test]
@@ -521,7 +589,13 @@ async fn released_payload_refuses_as_expired() {
     let facts = record_facts(&f, &witness);
     assert!(facts.record().consent.as_ref().unwrap().payload.is_none());
     assert_eq!(
-        enabled::check_approval_facts(Some(&facts), &witness, Some(link), witness.consent_at_ms()),
+        enabled::check_approval_facts(
+            Some(&facts),
+            &witness,
+            Some(link.operation_id),
+            None,
+            witness.consent_at_ms()
+        ),
         Err(MainnetAuthorizationError::Refused(P::ApprovalExpired)),
         "released payload refuses at the facts check"
     );
@@ -545,7 +619,8 @@ async fn released_payload_refuses_as_expired() {
         enabled::check_approval_facts(
             Some(&record_facts(&f, &witness)),
             &witness,
-            Some(link),
+            Some(link.operation_id),
+            None,
             witness.consent_at_ms()
         ),
         Err(MainnetAuthorizationError::Refused(P::ApprovalRevoked))
@@ -713,7 +788,7 @@ fn intent_restart_seam() {
     };
     let fx = crate::policy_state::approvals::durable_tests::IntentFx::new(300_000);
     let now = fx.facts.record().expires_at_ms + 1;
-    fx._clock.set(now);
+    fx.clock.set(now);
     let decision = fx.decision(Decision::Allow, 1_000, now);
     let witness = fx.verify(&fx.facts, &decision, now).unwrap();
     let context = crate::NetworkContext::mainnet_write(
@@ -772,7 +847,16 @@ fn intent_restart_seam() {
         operation_id: crate::policy_state::OperationId::from_bytes(facts.record().operation_id),
         attempt_index: 1,
     };
-    assert!(enabled::check_approval_facts(Some(&facts), &witness, Some(link), now).is_ok());
+    assert!(
+        enabled::check_approval_facts(
+            Some(&facts),
+            &witness,
+            Some(link.operation_id),
+            None,
+            now
+        )
+        .is_ok()
+    );
     let mint = MintRequest {
         intent_digest: Some(facts.record().intent_digest),
         predecessor: None,
@@ -814,7 +898,7 @@ fn intent_restart_seam() {
     let mut first = mint.clone();
     first.operation = Some(link);
     first.authorization_ttl_ms = 1;
-    fx._clock.set(witness.consent_at_ms());
+    fx.clock.set(witness.consent_at_ms());
     let mut without_digest = first.clone();
     without_digest.intent_digest = None;
     assert!(
@@ -829,7 +913,7 @@ fn intent_restart_seam() {
     store
         .mint_authorization(fx.fixture.profile(), &first)
         .unwrap();
-    fx._clock.set(now);
+    fx.clock.set(now);
     let Some(LookupOutcome::Resumable(handle)) = recorder
         .lookup(&BusinessId::parse("durable-intent").unwrap())
         .unwrap()
@@ -848,4 +932,568 @@ fn intent_restart_seam() {
         },
     );
     assert!(result.is_ok(), "raw operation mint survives waiting expiry");
+}
+
+/// The path of the inbox store [`ResolverFixture::attested`] consents `witness` in.
+fn inbox_path(f: &ResolverFixture, witness: &ApprovalWitness) -> std::path::PathBuf {
+    f.dir.path().join(format!(
+        "{}-{}.toml",
+        witness.nonce(),
+        stellar_agent_core::hex::encode(&witness.subject())
+    ))
+}
+
+/// The x402 parts every message and authenticated intent test shares.
+struct X402Parts {
+    root: stellar_xdr::SorobanAuthorizedInvocation,
+    message: super::super::message::MessageFacts,
+}
+
+fn x402_parts(f: &ResolverFixture, content: u8) -> X402Parts {
+    X402Parts {
+        root: x402_root(f),
+        message: message_facts([content; 32], EPHEMERAL),
+    }
+}
+
+/// Resolves a message signing under `witness` with the approval identity
+/// `identity`.
+fn message_under(
+    f: &ResolverFixture,
+    parts: &X402Parts,
+    witness: &ApprovalWitness,
+    identity: Option<crate::policy_state::OperationId>,
+) -> Result<MainnetMessageSignAuthorization, MainnetAuthorizationError> {
+    let intent = x402_intent(&parts.root, MainnetConsumer::X402Authenticated);
+    let authority = f.approval_authority(witness);
+    let mut req = f.message_request(&intent, &parts.message, &authority);
+    req.approval_operation = identity;
+    resolve_message_sign(req)
+}
+
+/// Resolves an authenticated intent under `witness` continuing `receipt`
+/// for the operation `operation`.
+async fn authenticated_under(
+    f: &ResolverFixture,
+    parts: &X402Parts,
+    witness: &ApprovalWitness,
+    receipt: Option<&super::super::message::MessageUseReceipt>,
+    operation: Option<OperationLink>,
+) -> Result<MainnetSorobanIntentAuthorization, MainnetAuthorizationError> {
+    let server = f.server().await;
+    let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
+    let client = context.primary_client().unwrap();
+    let consumer = if receipt.is_some() {
+        MainnetConsumer::X402Authenticated
+    } else {
+        MainnetConsumer::X402Create
+    };
+    let intent = x402_intent(&parts.root, consumer);
+    let authority = f.approval_authority(witness);
+    let mut req = intent_request(f, &context, &client, &intent, &authority);
+    req.authenticated = receipt;
+    req.operation = operation;
+    resolve_soroban_intent(req).await
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn missing_record_refuses_with_its_own_precondition() {
+    use crate::policy_state::ApprovalStatus;
+    use stellar_agent_core::approval::PendingApprovalStore;
+    // A transaction approval with a consented inbox entry and no record,
+    // in a store without a file and then beside another operation.
+    let f = ResolverFixture::new();
+    f.record_approvals.set(false);
+    let witness = f.approval(&f.envelope, f.now, 600_000);
+    let inbox = inbox_path(&f, &witness);
+    assert!(
+        PendingApprovalStore::open(inbox.clone())
+            .unwrap()
+            .get(witness.nonce())
+            .unwrap()
+            .attestation_blob_b64
+            .is_some(),
+        "the inbox entry admits on its own"
+    );
+    let server = f.server().await;
+    let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
+    let client = context.primary_client().unwrap();
+    let authority = f.approval_authority(&witness);
+    for with_file in [false, true] {
+        let operation = with_file.then(|| other_operation(&f));
+        assert_eq!(f.window_path().exists(), with_file);
+        let before = f.wire();
+        let bytes = std::fs::read(f.window_path()).ok();
+        for _ in 0..2 {
+            let mut req = request(&f, &context, &client, &authority);
+            req.operation = operation;
+            assert_refused(
+                resolve_tx_sign(req).await,
+                P::ApprovalNotFound,
+                &f,
+                &before,
+            );
+            assert_eq!(
+                std::fs::read(f.window_path()).ok(),
+                bytes,
+                "a repeated refusal writes nothing: file {with_file}"
+            );
+        }
+    }
+    // The entry an older build left keeps its inbox lifecycle.
+    let mut store = PendingApprovalStore::open(inbox).unwrap();
+    assert!(store.get(witness.nonce()).is_some(), "the entry stays listed");
+    assert!(
+        store
+            .reject(
+                witness.nonce(),
+                stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+                600_000
+            )
+            .unwrap(),
+        "the entry stays rejectable"
+    );
+    // A policy authority reads no record and still resolves.
+    let policy = policy_authority(&f, AuthorityScope::Classic, f.now, 30_000);
+    resolve_tx_sign(request(&f, &context, &client, &policy))
+        .await
+        .unwrap();
+
+    // One identity in two spellings: another case selects no record.
+    f.record_approvals.set(true);
+    let recorded = f.approval(&f.envelope, f.now, 600_000);
+    let upper = recorded.nonce().to_ascii_uppercase();
+    if upper != recorded.nonce() {
+        let facts = ApprovalStatus::new(&f.window, &f.profile)
+            .facts_by_nonce(&upper)
+            .unwrap();
+        assert!(facts.is_none(), "the nonce lookup is exact");
+        assert_eq!(
+            enabled::check_approval_facts(
+                facts.as_ref(),
+                &recorded,
+                f.link(recorded.nonce()).map(|link| link.operation_id),
+                None,
+                f.now
+            ),
+            Err(MainnetAuthorizationError::Refused(P::ApprovalNotFound))
+        );
+    }
+
+    // The plain intent, the authenticated intent and the message.
+    drop(f);
+    let f = x402_fixture();
+    let parts = x402_parts(&f, 1);
+    let receipt = f.message_receipt(&parts.root, &parts.message);
+    f.record_approvals.set(false);
+    let plain = f.x402_approval(&parts.root, None, f.now);
+    let authenticated = f.x402_approval(&parts.root, Some(MESSAGE_HOME_DOMAIN), f.now);
+    let link = other_operation(&f);
+    let before = f.wire();
+    assert_refused(
+        authenticated_under(&f, &parts, &plain, None, Some(link)).await,
+        P::ApprovalNotFound,
+        &f,
+        &before,
+    );
+    assert_refused(
+        authenticated_under(&f, &parts, &authenticated, Some(&receipt), Some(link)).await,
+        P::ApprovalNotFound,
+        &f,
+        &before,
+    );
+    let other = x402_parts(&f, 2);
+    assert_refused(
+        message_under(&f, &other, &authenticated, Some(link.operation_id)),
+        P::ApprovalNotFound,
+        &f,
+        &before,
+    );
+}
+
+/// The message branch keeps its own checks first, then compares the
+/// retained record with the identity it carries; the comparison rows are
+/// refusals only the resolver makes, each with a live record and the
+/// correct identity.
+#[tokio::test]
+#[serial_test::serial]
+async fn message_branch_state_matrix() {
+    use crate::policy_state::approvals::facade_calls;
+    use stellar_agent_core::approval::{PendingApproval, witness::ApprovedKind};
+    for case in [
+        "kind",
+        "subject",
+        "signed-times",
+        "receipt",
+        "live",
+        "waiting",
+        "waiting-ended",
+        "revoked",
+        "revoked-expired",
+        "expired",
+        "other-operation",
+        "consumed",
+        "missing",
+    ] {
+        let f = x402_fixture();
+        let parts = x402_parts(&f, 1);
+        let intent = x402_intent(&parts.root, MainnetConsumer::X402Authenticated);
+        let x402_entry = |home: Option<&str>| {
+            let mut entry = PendingApproval::new_x402_pending(
+                &intent.network_id,
+                &parts.root,
+                home.map(str::to_owned),
+                "1000".into(),
+                600_000,
+            )
+            .unwrap();
+            entry.created_at_unix_ms = f.now;
+            entry.expires_at_unix_ms = f.now + 600_000;
+            entry
+        };
+        let subject_of = |home: Option<&str>| {
+            use stellar_agent_core::approval::subject::{
+                approval_subject_x402_authenticated, soroban_intent_digest,
+            };
+            approval_subject_x402_authenticated(
+                &soroban_intent_digest(&intent.network_id, &parts.root).unwrap(),
+                home.unwrap(),
+            )
+        };
+        let mut presented = x402_entry(Some(MESSAGE_HOME_DOMAIN));
+        f.record_approvals
+            .set(!matches!(case, "waiting" | "waiting-ended" | "missing"));
+        // The comparison rows record another witness of the same nonce, so
+        // the retained record differs from the presented witness in one fact.
+        let witness = match case {
+            "kind" | "subject" | "signed-times" | "receipt" => {
+                let recorded = match case {
+                    "kind" => f.approval(&f.envelope, f.now, 600_000),
+                    "subject" => f.attested(
+                        &x402_entry(Some("other.example.com")),
+                        ApprovedKind::X402Payment,
+                        subject_of(Some("other.example.com")),
+                    ),
+                    _ => f.attested(
+                        &presented,
+                        ApprovedKind::X402Payment,
+                        subject_of(Some(MESSAGE_HOME_DOMAIN)),
+                    ),
+                };
+                // The presented witness comes from its own inbox entry.
+                let _ = std::fs::remove_file(inbox_path(&f, &recorded));
+                presented.approval_nonce = recorded.nonce().to_owned();
+                if case == "signed-times" {
+                    presented.created_at_unix_ms -= 1;
+                    presented.expires_at_unix_ms -= 1;
+                }
+                f.record_approvals.set(false);
+                f.attested(
+                    &presented,
+                    ApprovedKind::X402Payment,
+                    subject_of(Some(MESSAGE_HOME_DOMAIN)),
+                )
+            }
+            _ => f.attested(
+                &presented,
+                ApprovedKind::X402Payment,
+                subject_of(Some(MESSAGE_HOME_DOMAIN)),
+            ),
+        };
+        let mut identity = f.link(witness.nonce()).map(|link| link.operation_id);
+        if matches!(case, "waiting" | "waiting-ended") {
+            identity = Some(durable_record(&f, &witness, false).operation_id);
+        }
+        if case == "missing" {
+            identity = Some(other_operation(&f).operation_id);
+        }
+        match case {
+            "revoked" | "revoked-expired" => revoke_record(&f, &witness),
+            "other-operation" => identity = Some(other_operation(&f).operation_id),
+            "consumed" => {
+                message_under(&f, &x402_parts(&f, 2), &witness, identity).unwrap();
+            }
+            _ => {}
+        }
+        if matches!(case, "waiting-ended" | "revoked-expired" | "expired") {
+            f.clock.set(witness.expires_at_ms());
+        }
+        // The message's own checks precede the record: a signed expiry
+        // refuses there, whatever the record holds.
+        let expected = match case {
+            "live" => None,
+            "waiting" => Some(P::ApprovalConsentMissing),
+            "waiting-ended" | "revoked-expired" | "expired" => Some(P::ApprovalExpired),
+            "revoked" => Some(P::ApprovalRevoked),
+            "other-operation" | "consumed" => Some(P::ApprovalNonceReused),
+            "missing" => Some(P::ApprovalNotFound),
+            "kind" => Some(P::ApprovalKindMismatch),
+            "subject" => Some(P::ApprovalSubjectMismatch),
+            "signed-times" => Some(P::ApprovalExpiry),
+            _ => Some(P::ApprovalReceiptMismatch),
+        };
+        let before = f.wire();
+        let reads = facade_calls::count(f.window.path());
+        let result = message_under(&f, &parts, &witness, identity);
+        match expected {
+            None => {
+                result.unwrap();
+            }
+            Some(expected) => assert_refused(result, expected, &f, &before),
+        }
+        let expected_reads = usize::from(!matches!(case, "waiting-ended" | "revoked-expired" | "expired"));
+        assert_eq!(
+            facade_calls::count(f.window.path()) - reads,
+            expected_reads,
+            "the message branch reads its record once: {case}"
+        );
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn message_mint_without_identity_refuses() {
+    use crate::policy_state::approvals::facade_calls;
+    let f = x402_fixture();
+    let parts = x402_parts(&f, 1);
+    let witness = f.x402_approval(&parts.root, Some(MESSAGE_HOME_DOMAIN), f.now);
+    let before = f.wire();
+    let reads = facade_calls::count(f.window.path());
+    assert_refused(
+        message_under(&f, &parts, &witness, None),
+        P::ApprovalNonceReused,
+        &f,
+        &before,
+    );
+    assert_eq!(facade_calls::count(f.window.path()) - reads, 1);
+    assert_eq!(
+        record_facts(&f, &witness).record().disposition,
+        stellar_agent_core::approval::witness::ApprovalDisposition::Pending,
+        "the record stays unconsumed"
+    );
+    assert!(
+        f.wire()["authorizations"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "no message authorization exists"
+    );
+}
+
+/// A used message proof of the same approval, consumed for the request's
+/// operation, exempts the authenticated payment from a later revocation at
+/// the resolver; the mint then caps it at the retained bound.
+#[tokio::test]
+#[serial_test::serial]
+async fn used_parent_exemption_holds_at_both_layers() {
+    for case in [
+        "used-then-revoked",
+        "revoked-before-use",
+        "wrong-parent",
+        "wrong-operation",
+        "plain",
+        "at-cap",
+        "before-consent",
+    ] {
+        let f = x402_fixture();
+        let parts = x402_parts(&f, 1);
+        let witness = f.x402_approval(&parts.root, Some(MESSAGE_HOME_DOMAIN), f.now);
+        let link = f.link(witness.nonce()).unwrap();
+        if case == "revoked-before-use" {
+            revoke_record(&f, &witness);
+            let before = f.wire();
+            assert_refused(
+                message_under(&f, &parts, &witness, Some(link.operation_id)),
+                P::ApprovalRevoked,
+                &f,
+                &before,
+            );
+            continue;
+        }
+        let receipt = if case == "wrong-parent" {
+            let other = x402_parts(&f, 2);
+            let another = f.x402_approval(&other.root, Some(MESSAGE_HOME_DOMAIN), f.now);
+            f.message_receipt_for(&other.root, &other.message, &another)
+        } else {
+            f.message_receipt_for(&parts.root, &parts.message, &witness)
+        };
+        let consumed_at = record_facts(&f, &witness).record().consumed_at_ms;
+        assert_eq!(
+            consumed_at.is_some(),
+            case != "wrong-parent",
+            "the message consumes only its own record"
+        );
+        // The revocation lands between the message and the payment.
+        revoke_record(&f, &witness);
+        let cap = record_facts(&f, &witness)
+            .record()
+            .consent
+            .as_ref()
+            .unwrap()
+            .execution_expires_at_ms
+            .min(witness.expires_at_ms());
+        let (receipt, operation, expected) = match case {
+            "used-then-revoked" => (Some(&receipt), Some(link), None),
+            "wrong-parent" => (Some(&receipt), Some(link), Some(P::ApprovalRevoked)),
+            "wrong-operation" => (
+                Some(&receipt),
+                Some(other_operation(&f)),
+                Some(P::ApprovalRevoked),
+            ),
+            "plain" => (None, Some(link), Some(P::ApprovalRevoked)),
+            "at-cap" => {
+                f.clock.set(cap);
+                (Some(&receipt), Some(link), Some(P::ApprovalExpired))
+            }
+            _ => {
+                let consent_at = record_facts(&f, &witness)
+                    .record()
+                    .consent
+                    .as_ref()
+                    .unwrap()
+                    .consent_at_ms;
+                f.clock.set(consent_at - 1);
+                (Some(&receipt), Some(link), Some(P::ApprovalExpired))
+            }
+        };
+        let before = f.wire();
+        let result = authenticated_under(&f, &parts, &witness, receipt, operation).await;
+        match expected {
+            None => {
+                let auth = result.unwrap();
+                assert!(auth.expires_at_ms() <= cap, "the mint caps at the record");
+                let facts = record_facts(&f, &witness);
+                assert_eq!(
+                    facts.record().disposition,
+                    stellar_agent_core::approval::witness::ApprovalDisposition::Revoked
+                );
+                assert_eq!(
+                    facts.record().consumed_at_ms,
+                    consumed_at,
+                    "the record keeps its first consumption"
+                );
+                // At the cap the mint refuses on the same exemption.
+                f.clock.set(cap);
+                let facts = record_facts(&f, &witness);
+                assert_eq!(
+                    enabled::check_approval_facts(
+                        Some(&facts),
+                        &witness,
+                        Some(link.operation_id),
+                        receipt.and_then(super::super::message::MessageUseReceipt::approval_nonce),
+                        cap
+                    ),
+                    Err(MainnetAuthorizationError::Refused(P::ApprovalExpired))
+                );
+            }
+            Some(expected) => assert_refused(result, expected, &f, &before),
+        }
+    }
+}
+
+/// Message consumption leaves the operation waiting with no link and no
+/// authority; the authenticated payment child then takes the record cap,
+/// and its link sets the operation's authority and execution expiry.
+#[tokio::test]
+#[serial_test::serial]
+async fn message_mint_leaves_the_operation_waiting() {
+    use crate::policy_state::{OperationRecorder, OperationState};
+    let f = x402_fixture();
+    let parts = x402_parts(&f, 1);
+    let witness = f.x402_approval(&parts.root, Some(MESSAGE_HOME_DOMAIN), f.now);
+    let link = f.link(witness.nonce()).unwrap();
+    let receipt = f.message_receipt_for(&parts.root, &parts.message, &witness);
+    let facts = record_facts(&f, &witness);
+    assert_eq!(
+        facts.record().disposition,
+        stellar_agent_core::approval::witness::ApprovalDisposition::Consumed
+    );
+    assert_eq!(facts.record().operation_id, *link.operation_id.as_bytes());
+    let wire = f.wire();
+    let message = wire["authorizations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["domain"] == "message")
+        .unwrap()
+        .clone();
+    assert!(
+        message.get("operation").is_none_or(serde_json::Value::is_null),
+        "the message authorization stores no operation link"
+    );
+    let waiting = |f: &ResolverFixture| {
+        let lookup = |wire: &serde_json::Value| {
+            wire["operations"]["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|record| record["id"] == serde_json::to_value(link.operation_id).unwrap())
+                .unwrap()
+                .clone()
+        };
+        lookup(&f.wire())
+    };
+    let record = waiting(&f);
+    assert_eq!(
+        record["state"],
+        serde_json::to_value(OperationState::AwaitingApproval).unwrap()
+    );
+    assert!(record.get("authority").is_none_or(serde_json::Value::is_null));
+    assert!(
+        record["attempts"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+    );
+    let cap = facts
+        .record()
+        .consent
+        .as_ref()
+        .unwrap()
+        .execution_expires_at_ms
+        .min(witness.expires_at_ms());
+    let auth = authenticated_under(&f, &parts, &witness, Some(&receipt), Some(link))
+        .await
+        .unwrap();
+    assert!(auth.expires_at_ms() <= cap);
+    // The child's link adopts the authority at the next locked step.
+    OperationRecorder::new(&f.window, &f.profile, &mut ApprovalRows, "adopt")
+        .lookup(&crate::policy_state::BusinessId::parse(witness.nonce()).unwrap())
+        .unwrap();
+    let record = waiting(&f);
+    assert!(
+        !record["authority"].is_null(),
+        "the linked child adopts the authority"
+    );
+    let execution = record["execution_expires_at_ms"].as_u64().unwrap();
+    assert!(
+        auth.expires_at_ms() <= execution && execution <= cap,
+        "{} {execution} {cap}",
+        auth.expires_at_ms()
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn second_message_mint_refuses_reuse() {
+    let f = x402_fixture();
+    let parts = x402_parts(&f, 1);
+    let witness = f.x402_approval(&parts.root, Some(MESSAGE_HOME_DOMAIN), f.now);
+    let identity = f.link(witness.nonce()).map(|link| link.operation_id);
+    message_under(&f, &parts, &witness, identity).unwrap();
+    let before = f.wire();
+    for content in [2, 3] {
+        assert_refused(
+            message_under(&f, &x402_parts(&f, content), &witness, identity),
+            P::ApprovalNonceReused,
+            &f,
+            &before,
+        );
+    }
+    let holders = f.wire()["authorizations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|record| record["approval_nonce"] == witness.nonce())
+        .count();
+    assert_eq!(holders, 1, "one authorization holds the nonce");
 }

@@ -168,8 +168,9 @@ impl AuthorizedSubmissionFixture {
     }
 
     /// Mints a grant over `envelope` for `client`'s endpoint under the
-    /// approval `nonce`, holding `hold_stroops` in the window when given and
-    /// nothing otherwise.
+    /// fixture's policy authority, holding `hold_stroops` in the window when
+    /// given and nothing otherwise. `nonce` labels the caller's grant and
+    /// binds no approval: an approval authority needs a durable record.
     #[must_use]
     pub fn grant(
         &self,

@@ -315,7 +315,7 @@ mod producers {
         ApprovalStatus::new(&run.f.server.window_store, run.f.server.security_profile())
     }
 
-    fn fresh(run: &ClassicRun) -> (serde_json::Value, OperationHandle) {
+    pub(super) fn fresh(run: &ClassicRun) -> (serde_json::Value, OperationHandle) {
         let mut args = run.args.clone();
         args["business_id"] = serde_json::json!(run.bind_new_business_id());
         let id = BusinessId::parse(args["business_id"].as_str().unwrap()).unwrap();
@@ -1746,11 +1746,11 @@ mod producers {
                 .unwrap()
                 .unwrap()
                 .record;
+            // Just past the signed expiry the consent's execution window is
+            // still open, so the signed lifetime alone decides.
             let consent = record.consent.as_ref().unwrap();
-            let rollback = consent.consent_at_ms + 1;
-            let end = consent
-                .execution_expires_at_ms
-                .max(run.entry.expires_at_unix_ms);
+            let end = run.entry.expires_at_unix_ms + 1;
+            assert!(end < consent.execution_expires_at_ms);
             let stored = std::fs::read_to_string(store_path(&run.f))
                 .unwrap()
                 .parse::<toml_edit::DocumentMut>()
@@ -1769,6 +1769,21 @@ mod producers {
             );
             let window_time = stellar_agent_network::mainnet::clock::set_now_ms_for_test(end);
             set_clocks(&mut run, end);
+            // The commit runs before any other call settles the operation at
+            // this time. It decides on the mainnet authorization clock: the
+            // durable proof refuses with the uniform envelope and nothing is
+            // sent.
+            let committed = run.commit().await;
+            assert_eq!(
+                normalized(committed.clone()),
+                normalized(wire(&approval_required_indistinguishable(PROFILE))),
+                "an expired retry refuses at the approval gate: {committed}"
+            );
+            assert_eq!(
+                run.control.count("sendTransaction"),
+                0,
+                "an expired record admits no send: {committed}"
+            );
             assert!(
                 matches!(
                     produce(&run, &handle, &run.entry, || panic!(
@@ -1780,32 +1795,30 @@ mod producers {
             );
             let policy_time =
                 stellar_agent_core::policy::v1::criteria::state_store::set_query_time_for_test(end);
-            for now in [end, rollback] {
-                window_time.set(now);
-                policy_time.set(now);
-                run.restart().unwrap();
-                set_clocks(&mut run, now);
-                assert!(
-                    matches!(
-                        PendingApprovalStore::open(store_path(&run.f))
-                            .unwrap()
-                            .check_payment_recovery(&run.entry.approval_nonce),
-                        Err(ApprovalError::Expired)
-                    ),
-                    "an observed record expiry survives restart and rollback at {now}"
-                );
-            }
+            run.restart().unwrap();
+            set_clocks(&mut run, end);
+            assert!(
+                matches!(
+                    PendingApprovalStore::open(store_path(&run.f))
+                        .unwrap()
+                        .check_payment_recovery(&run.entry.approval_nonce),
+                    Err(ApprovalError::Expired)
+                ),
+                "an observed record expiry survives restart"
+            );
+            // The operation's waiting time ended with the signed expiry, so a
+            // later preparation answers the expired operation and returns no
+            // approval.
             let prepared = wire(&Tool::Pay.prepare(&run.f.server, &run.args).await);
-            let committed = run.commit().await;
-            assert_eq!(
-                prepared["error"]["code"], "policy.approval_required",
-                "a rolled-back clock refuses the expired record: {prepared}"
+            assert!(
+                prepared["data"]["approval"].is_null(),
+                "an expired retry returns no approval: {prepared}"
             );
             assert_eq!(
-                run.control.count("sendTransaction"),
-                0,
-                "an expired record admits no send: {committed}"
+                prepared["data"]["operation"]["state"], "expired",
+                "{prepared}"
             );
+            assert_eq!(run.control.count("sendTransaction"), 0);
             drop((policy_time, window_time));
         }
 
@@ -1837,6 +1850,75 @@ mod producers {
             assert_eq!(
                 result["error"]["code"], "approval.entry_inconsistent",
                 "an entry and record for another envelope refuse: {result}"
+            );
+        }
+
+        /// An open that fails and whose following status read meets an
+        /// unreadable image returns the open's error, keeps the pair byte for
+        /// byte, reads no seed and sends nothing; once the image reads again,
+        /// a retry recovers the same nonce.
+        #[tokio::test]
+        #[serial_test::serial(keyring)]
+        #[serial_test::serial]
+        async fn payment_open_error_with_an_unreadable_status_keeps_the_pair() {
+            let mut run = ClassicRun::new(Tool::Pay).await;
+            let known = run.entry.approval_nonce.clone();
+            let (args, handle) = fresh(&run);
+            let window = run.f.server.window_store.path().to_owned();
+            let inbox = store_path(&run.f);
+            let saved = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let capture = saved.clone();
+            let (window_seam, inbox_seam) = (window.clone(), inbox.clone());
+            let observer = observe_commit(move |point| {
+                if point != COMMIT_FAULT_AFTER_PREPARED {
+                    return;
+                }
+                let bytes = std::fs::read(&window_seam).unwrap();
+                let mut unreadable = bytes.clone();
+                unreadable[0] ^= 1;
+                std::fs::write(&window_seam, unreadable).unwrap();
+                *capture.borrow_mut() = Some((bytes, std::fs::read(&inbox_seam).unwrap()));
+            });
+            let seeds = run.seed_reads();
+            let armed = arm_accounting_fault(COMMIT_FAULT_AFTER_PREPARED);
+            let response = wire(&Tool::Pay.prepare(&run.f.server, &args).await);
+            drop(armed);
+            drop(observer);
+            assert_eq!(
+                response["error"]["code"], "submission.record_unavailable",
+                "the open's own error returns: {response}"
+            );
+            let (image, pair) = saved.borrow_mut().take().unwrap();
+            assert_eq!(
+                std::fs::read(&inbox).unwrap(),
+                pair,
+                "the recovered pair keeps its bytes"
+            );
+            assert_eq!(run.seed_reads(), seeds, "no seed is read");
+            assert_eq!(run.control.count("sendTransaction"), 0, "nothing is sent");
+            let nonce = PendingApprovalStore::open(inbox.clone())
+                .unwrap()
+                .snapshot(now_ms())
+                .into_iter()
+                .find(|entry| entry.approval_nonce != known)
+                .map(|entry| entry.approval_nonce)
+                .unwrap();
+            // The condition clears: the image reads again.
+            std::fs::write(&window, image).unwrap();
+            run.restart().unwrap();
+            let retried = wire(&Tool::Pay.prepare(&run.f.server, &args).await);
+            assert_eq!(
+                retried["data"]["approval"]["approval_nonce"], nonce,
+                "a retry recovers the same nonce: {retried}"
+            );
+            assert_eq!(
+                status(&run)
+                    .find_by_operation(handle.id())
+                    .unwrap()
+                    .unwrap()
+                    .record
+                    .nonce,
+                nonce
             );
         }
 
@@ -2154,8 +2236,9 @@ fn store_path(f: &Fixture) -> std::path::PathBuf {
         .join(format!("{PROFILE}.toml"))
 }
 
-/// Stores `entry` with the genuine version 4 attestation of `approver`, as a
-/// process without the mainnet witness records it, and returns the blob.
+/// Stores `entry`, unless a producer already stored it, with the genuine
+/// version 4 attestation of `approver`, as a process without the mainnet
+/// witness records it, and returns the blob.
 fn record_v4(f: &Fixture, entry: &PendingApproval, approver: &AttestedApprover) -> String {
     let key = attestation_key(f);
     let subject = mainnet_consent_subject(entry, &binding()).unwrap();
@@ -2169,7 +2252,9 @@ fn record_v4(f: &Fixture, entry: &PendingApproval, approver: &AttestedApprover) 
         approver,
     );
     let mut store = PendingApprovalStore::open(store_path(f)).unwrap();
-    store.insert(entry.clone(), now_ms()).unwrap();
+    if store.get(&entry.approval_nonce).is_none() {
+        store.insert(entry.clone(), now_ms()).unwrap();
+    }
     store
         .record_attestation(&entry.approval_nonce, blob, approver.clone())
         .unwrap();
@@ -2363,8 +2448,35 @@ impl Diagnostics {
     }
 }
 
-/// The stable code the witness refuses a forged assertion with.
-const PRESENCE_INVALID: &str = "approval.presence_invalid";
+/// The stable code the durable verifier refuses a proof over a forged
+/// assertion with: the forged receipt is only in the inbox, so the presented
+/// bytes do not authenticate the record's genuine consent.
+const FORGED_PROOF_REFUSAL: &str = "approval.attestation_invalid";
+
+/// A fresh operation of `run`'s prepared envelope and the durable record of
+/// a new, unattested pay entry for it, opened through the classic producer,
+/// which stores the entry. Returns the operation's business id and the entry.
+fn recorded_fresh_entry(run: &ClassicRun) -> (serde_json::Value, PendingApproval) {
+    let (args, handle) = producers::fresh(run);
+    let xdr = run.args["envelope_xdr"].as_str().unwrap();
+    let entry = approval_for(Tool::Pay, &run.f, xdr, 600_000);
+    run.f
+        .server
+        .classic_pending_approval(
+            Some(&handle),
+            stellar_agent_core::approval::witness::ApprovedKind::Payment,
+            stellar_agent_core::audit_log::PolicyDecision::RequireApproval,
+            producers::Persist(|| {
+                PendingApprovalStore::open(store_path(&run.f))
+                    .unwrap()
+                    .insert(entry.clone(), now_ms())
+                    .unwrap();
+                Ok(entry.clone())
+            }),
+        )
+        .unwrap();
+    (args["business_id"].clone(), entry)
+}
 
 /// `value` without its `request_id` fields.
 fn normalized(mut value: serde_json::Value) -> serde_json::Value {
@@ -2472,11 +2584,15 @@ async fn mainnet_commit_rejects_a_genuine_local_v4_attestation() {
         },
     ] {
         let context = format!("{approver:?}");
+        // The producer records the approval for its own operation; the
+        // version 4 HMAC leaves that record without consent.
+        let business_id = run.bind_new_business_id();
         let entry = approval_for(Tool::Pay, &run.f, &xdr, 600_000);
+        run.record_pending(&business_id, &entry);
         let blob = record_v4(&run.f, &entry, &approver);
-        let result = run
-            .commit_with(run.commit_args_for(&xdr, &entry.approval_nonce, &blob))
-            .await;
+        let mut args = run.commit_args_for(&xdr, &entry.approval_nonce, &blob);
+        args["business_id"] = serde_json::json!(business_id);
+        let result = run.commit_with(args).await;
         assert_uniform(&context, &result);
         diagnostics.assert_refused_with(&context, "approval.presence_required");
         assert_classic_unsigned(&context, &run, &entry);
@@ -2505,8 +2621,9 @@ async fn mainnet_prepare_checks_readiness_before_the_account_read() {
     }
 }
 
-/// Each commit kind refuses a version 5 record over an assertion the
-/// verifier refuses, with the uniform envelope and before any signing, and
+/// Each commit kind refuses a proof computed over a forged assertion, which
+/// does not authenticate the record's consent, with the uniform envelope and
+/// before any signing, and
 /// proceeds with the genuine assertion of the pinned credential: the four
 /// classic commits, the plain x402 payment and the authenticated x402
 /// payment.
@@ -2524,7 +2641,7 @@ async fn mainnet_commit_requires_the_pinned_assertion_for_every_kind() {
                 serde_json::json!(forge(&run.f, &entry.approval_nonce, forged));
             let result = run.commit_with(args).await;
             assert_uniform(&context, &result);
-            diagnostics.assert_refused_with(&context, PRESENCE_INVALID);
+            diagnostics.assert_refused_with(&context, FORGED_PROOF_REFUSAL);
             assert_classic_unsigned(&context, &run, &entry);
         }
         let result = run.commit().await;
@@ -2538,7 +2655,7 @@ async fn mainnet_commit_requires_the_pinned_assertion_for_every_kind() {
         let blob = forge(&run.f, &nonce, forged);
         let result = run.pay_with(x402_args(&run.f, Some((&nonce, &blob)))).await;
         assert_uniform(&context, &result);
-        diagnostics.assert_refused_with(&context, PRESENCE_INVALID);
+        diagnostics.assert_refused_with(&context, FORGED_PROOF_REFUSAL);
         assert_x402_refused_before_intent(&run, &result, "policy.approval_required", 0);
     }
     let result = run.pay().await;
@@ -2552,7 +2669,7 @@ async fn mainnet_commit_requires_the_pinned_assertion_for_every_kind() {
         let blob = forge(&run.f, &nonce, forged);
         let result = run.pay(HOME, &(nonce, blob)).await;
         assert_uniform(&context, &result);
-        diagnostics.assert_refused_with(&context, PRESENCE_INVALID);
+        diagnostics.assert_refused_with(&context, FORGED_PROOF_REFUSAL);
         assert!(signings().is_empty(), "{context}");
         assert_eq!(run.double.posts().await, 0, "{context}");
         assert!(authorizations(&run.f).is_empty(), "{context}");
@@ -2633,7 +2750,8 @@ async fn signed_origin_resign_between_issuance_and_persistence_refuses() {
             .into_policy();
         let identity = ListenerIdentity::capture(&policy).unwrap();
         let xdr = run.args["envelope_xdr"].as_str().unwrap().to_owned();
-        let entry = approval_for(Tool::Pay, &run.f, &xdr, 600_000);
+        // The ceremony's entry has its own operation and durable record.
+        let (business_id, entry) = recorded_fresh_entry(&run);
         let pending = issue_mainnet_intent_presence(
             &entry,
             &binding(),
@@ -2664,7 +2782,6 @@ async fn signed_origin_resign_between_issuance_and_persistence_refuses() {
             });
         }
         let mut store = PendingApprovalStore::open(store_path(&run.f)).unwrap();
-        store.insert(entry.clone(), now_ms()).unwrap();
         let before = std::fs::read(store_path(&run.f)).unwrap();
         let audit = stellar_agent_network::mainnet::audit_readiness::audit_readiness(
             run.f.server.security_profile(),
@@ -2718,6 +2835,9 @@ async fn signed_origin_resign_between_issuance_and_persistence_refuses() {
             .clone()
             .unwrap_or_else(|| URL_SAFE_NO_PAD.encode([0; 32]));
         drop(store);
+        if change == "control" {
+            run.f.complete_consent(&entry.approval_nonce);
+        }
         let rows =
             std::fs::read_to_string(&run.f.server.security_profile().audit_log_path).unwrap();
         let consents = rows
@@ -2734,9 +2854,9 @@ async fn signed_origin_resign_between_issuance_and_persistence_refuses() {
             run.restart().unwrap();
         }
         let diagnostics = Diagnostics::install();
-        let result = run
-            .commit_with(run.commit_args_for(&xdr, &entry.approval_nonce, &blob))
-            .await;
+        let mut args = run.commit_args_for(&xdr, &entry.approval_nonce, &blob);
+        args["business_id"] = business_id;
+        let result = run.commit_with(args).await;
         if change == "control" {
             assert_classic_accepted_for(change, &run, &result, &entry.approval_nonce);
         } else {
@@ -2752,9 +2872,9 @@ async fn signed_origin_resign_between_issuance_and_persistence_refuses() {
 /// gate with the uniform refusal; a server started on a policy re-signed at
 /// a higher sequence, with the credential revoked or kept, refuses the
 /// consent uniformly; an unsigned edit and an absent pin stop the start
-/// itself. A changed envelope refuses uniformly; an altered stored expiry
-/// refuses the inconsistent recovery link, and on an unbound entry fails the
-/// attestation uniformly. No row signs.
+/// itself. A changed envelope refuses uniformly. No refused row signs. An
+/// inbox entry with an altered stored expiry, bound to its recovery link or
+/// not, leaves the durable record's proof admitted, and the commit sends once.
 #[tokio::test]
 #[serial_test::serial(keyring)]
 #[serial_test::serial]
@@ -2858,39 +2978,27 @@ async fn mainnet_commit_rechecks_consent_after_policy_change() {
     diagnostics.assert_refused_with("changed envelope", "approval.attestation_invalid");
     assert_classic_unsigned("changed envelope", &run, &run.entry);
 
-    edit_stored(&run.f, &run.entry.approval_nonce, |entry| {
-        let expires = entry["expires_at_unix_ms"].as_integer().unwrap();
-        entry["expires_at_unix_ms"] = toml_edit::value(expires - 1_000);
-    });
-    let inconsistent = std::fs::read(store_path(&run.f)).unwrap();
-    let result = run.commit().await;
-    assert_eq!(result["ok"], false, "altered expiry: {result}");
-    assert_eq!(
-        result["error"]["code"], "approval.entry_inconsistent",
-        "altered expiry: inconsistent recovery link"
-    );
-    diagnostics.assert_refused_with("altered expiry", "payment recovery binding refused");
-    assert_eq!(
-        std::fs::read(store_path(&run.f)).unwrap(),
-        inconsistent,
-        "the refused inconsistent entry remains unspent and byte-identical"
-    );
-    assert_eq!(run.seed_reads(), 0, "altered expiry");
-    assert_eq!(run.control.count("sendTransaction"), 0, "altered expiry");
-    assert!(authorizations(&run.f).is_empty(), "altered expiry");
-    assert_no_pre_send_entry(&run);
-
-    // The same edit on an unbound entry, as a build without recovery
-    // bindings writes it, reaches the attestation, which covers the expiry.
-    let path = store_path(&run.f);
-    let mut document: toml_edit::DocumentMut =
-        std::fs::read_to_string(&path).unwrap().parse().unwrap();
-    assert!(document.remove("payment_recovery").is_some());
-    std::fs::write(&path, document.to_string()).unwrap();
-    let result = run.commit().await;
-    assert_uniform("unbound altered expiry", &result);
-    diagnostics.assert_refused_with("unbound altered expiry", "approval.attestation_invalid");
-    assert_classic_unsigned("unbound altered expiry", &run, &run.entry);
+    // The approval inbox grants no mainnet authority: an inbox entry whose
+    // expiry contradicts its recovery link, or that lost its recovery
+    // binding, leaves the durable record's proof admitted.
+    for case in ["altered expiry", "unbound altered expiry"] {
+        let run = ClassicRun::new(Tool::Pay).await;
+        edit_stored(&run.f, &run.entry.approval_nonce, |entry| {
+            let expires = entry["expires_at_unix_ms"].as_integer().unwrap();
+            entry["expires_at_unix_ms"] = toml_edit::value(expires - 1_000);
+        });
+        if case == "unbound altered expiry" {
+            let path = store_path(&run.f);
+            let mut document: toml_edit::DocumentMut =
+                std::fs::read_to_string(&path).unwrap().parse().unwrap();
+            assert!(document.remove("payment_recovery").is_some());
+            std::fs::write(&path, document.to_string()).unwrap();
+        }
+        let result = run.commit().await;
+        assert_eq!(result["ok"], true, "{case}: {result}");
+        assert_eq!(run.control.count("sendTransaction"), 1, "{case}");
+        assert_eq!(authorizations(&run.f).len(), 1, "{case}");
+    }
 }
 
 /// Commits `args` on `run` and asserts that the commit read no seed and sent
@@ -2906,8 +3014,8 @@ async fn refused_commit(run: &ClassicRun, args: serde_json::Value) -> serde_json
 /// Every failed proof answers with the same envelope: a missing record, a
 /// genuine version 4 record, an assertion over another challenge, a bad
 /// signature, an assertion without user verification, an unpinned
-/// credential and a malformed receipt. A rejected and a consumed approval
-/// keep their own codes.
+/// credential, and a forged proof beside a malformed inbox receipt. A
+/// rejected and a consumed approval keep their own codes.
 #[tokio::test]
 #[serial_test::serial(keyring)]
 #[serial_test::serial]
@@ -2945,16 +3053,16 @@ async fn mainnet_presence_failures_are_indistinguishable() {
         )
         .await,
     ));
-    diagnostics.assert_refused_with("missing record", "approval entry not found");
+    diagnostics.assert_refused_with("missing record", "approval.not_found");
+    let legacy_business_id = run.bind_new_business_id();
     let legacy = approval_for(Tool::Pay, &run.f, &xdr, 600_000);
+    run.record_pending(&legacy_business_id, &legacy);
     let blob = record_v4(&run.f, &legacy, &AttestedApprover::Local);
+    let mut legacy_args = run.commit_args_for(&xdr, &legacy.approval_nonce, &blob);
+    legacy_args["business_id"] = serde_json::json!(legacy_business_id);
     refusals.push((
         "version 4".to_owned(),
-        refused_commit(
-            &run,
-            run.commit_args_for(&xdr, &legacy.approval_nonce, &blob),
-        )
-        .await,
+        refused_commit(&run, legacy_args).await,
     ));
     diagnostics.assert_refused_with("version 4", "approval.presence_required");
     for forged in FORGED {
@@ -2962,12 +3070,15 @@ async fn mainnet_presence_failures_are_indistinguishable() {
         args["approval_attestation"] =
             serde_json::json!(forge(&run.f, &entry.approval_nonce, forged));
         refusals.push((format!("{forged:?}"), refused_commit(&run, args).await));
-        diagnostics.assert_refused_with(&format!("{forged:?}"), PRESENCE_INVALID);
+        diagnostics.assert_refused_with(&format!("{forged:?}"), FORGED_PROOF_REFUSAL);
     }
 
-    // A malformed receipt leaves the whole store unreadable; the store is
-    // restored afterwards for the remaining rows.
-    let (args, malformed) = run.prepare_again().await;
+    // A malformed receipt leaves the whole inbox unreadable. A proof that
+    // does not authenticate the record's consent still refuses uniformly:
+    // the unreadable inbox replaces no refusal. The inbox is restored
+    // afterwards for the remaining rows.
+    let (mut args, malformed) = run.prepare_again().await;
+    args["approval_attestation"] = serde_json::json!("A".repeat(43));
     let intact = std::fs::read(store_path(&run.f)).unwrap();
     edit_stored(&run.f, &malformed.approval_nonce, |entry| {
         entry["mainnet_presence"]["random_b64url"] = toml_edit::value("AAAA");
@@ -2976,7 +3087,7 @@ async fn mainnet_presence_failures_are_indistinguishable() {
         "malformed receipt".to_owned(),
         refused_commit(&run, args).await,
     ));
-    diagnostics.assert_refused_with("malformed receipt", "approval store open failed");
+    diagnostics.assert_refused_with("malformed receipt", "approval.attestation_invalid");
     std::fs::write(store_path(&run.f), intact).unwrap();
 
     let result = run.commit().await;
@@ -3425,14 +3536,15 @@ async fn commit_requires_approval_when_either_name_requires_it() {
     }
 }
 
-/// Under `Allow`, a complete proof of an attested approval verifies, signs
-/// under that approval and spends it, and the pending row records `allow`
-/// with its provenance. A forged attestation refuses with the uniform
-/// envelope before anything signs.
+/// Under `Allow`, a complete proof of an attested approval has no durable
+/// record, since an allowed preparation opens none, so it refuses at the
+/// mainnet gate with the uniform approval-required envelope, before the
+/// protocol nonce is consumed, repeatedly, and nothing signs. A forged
+/// attestation refuses with the uniform envelope before anything signs.
 #[tokio::test]
 #[serial_test::serial(keyring)]
 #[serial_test::serial]
-async fn allow_with_supplied_proof_verifies_and_spends_it() {
+async fn allow_with_supplied_proof_without_a_record_refuses() {
     for tool in Tool::ALL {
         let context = format!("{tool:?}");
         let run = ClassicRun::allowed(tool).await;
@@ -3446,19 +3558,21 @@ async fn allow_with_supplied_proof_verifies_and_spends_it() {
         assert_uniform(&format!("{context} forged"), &result);
         assert_classic_unsigned(&context, &run, &forged);
 
+        // An allowed preparation opens no durable record, so a valid supplied
+        // proof stays inbox material and the mainnet gate refuses it. The
+        // repeat carries the same protocol nonce: the gate refuses before
+        // the nonce is consumed, so it refuses again the same way.
         let blob = run.f.attest(&run.entry);
-        let result = run
-            .commit_with(run.commit_args_for(&xdr, &run.entry.approval_nonce, &blob))
-            .await;
-        assert_classic_accepted(&context, &run, &result);
-        let records = authorizations(&run.f);
-        assert_eq!(records.len(), 1, "{context}: {records:?}");
-        assert_eq!(
-            records[0]["approval_nonce"], run.entry.approval_nonce,
-            "{context}: {records:?}"
-        );
-        assert!(records[0]["policy_authority"].is_null(), "{context}");
-        assert_pending_row(&context, &run, "allow", tool.commit_name());
+        let args = run.commit_args_for(&xdr, &run.entry.approval_nonce, &blob);
+        for _ in 0..2 {
+            let result = run.commit_with(args.clone()).await;
+            crate::tools::common::tests::mainnet::assert_not_found_mapping(
+                &context,
+                &result,
+                &run.entry.approval_nonce,
+            );
+            assert_classic_unsigned(&context, &run, &run.entry);
+        }
     }
 }
 
@@ -3509,10 +3623,8 @@ async fn mcp_approve_browser_round_trip_records_before_signing() {
     };
     let run = ClassicRun::new(Tool::Pay).await;
     let xdr = run.args["envelope_xdr"].as_str().unwrap();
-    let entry = approval_for(Tool::Pay, &run.f, xdr, 600_000);
-    let mut store = PendingApprovalStore::open(store_path(&run.f)).unwrap();
-    store.insert(entry.clone(), now_ms()).unwrap();
-    drop(store);
+    // The ceremony's entry has its own operation and durable record.
+    let (business_id, entry) = recorded_fresh_entry(&run);
     let profile = run.f.server.security_profile();
     let context = ApprovalContext::from_profile(PROFILE, profile);
     let authority = MainnetApprovalAuthority::for_profile(PROFILE).unwrap();
@@ -3577,6 +3689,7 @@ async fn mcp_approve_browser_round_trip_records_before_signing() {
     .unwrap()
     .unwrap();
     drop(store);
+    run.f.complete_consent(&entry.approval_nonce);
     let audit_path = profile.audit_log_path.clone();
     *run.f.on_seed_read.lock().unwrap() = Some(std::sync::Arc::new(move || {
         let rows = std::fs::read_to_string(&audit_path).unwrap();
@@ -3590,12 +3703,557 @@ async fn mcp_approve_browser_round_trip_records_before_signing() {
         assert!(correlated[0].contains(&fingerprint));
         assert!(correlated[0].contains(&policy_digest));
     }));
-    let result = run
-        .commit_with(run.commit_args_for(xdr, &entry.approval_nonce, &blob))
-        .await;
+    let mut args = run.commit_args_for(xdr, &entry.approval_nonce, &blob);
+    args["business_id"] = business_id;
+    let result = run.commit_with(args).await;
     assert_classic_accepted_for("browser consent", &run, &result, &entry.approval_nonce);
     assert!(
         !is_consumed(&stored_approval(&run.f, &run.entry.approval_nonce).unwrap()),
         "browser consent: the preparation's own approval stays unspent"
     );
+}
+
+/// The mainnet approval gate decides a proof from the approval's durable
+/// record and the call's admitted operation; the inbox grants nothing.
+mod durable_gate {
+    use super::*;
+    use crate::tools::common::{SuppliedProof, approval_consumed_error, mainnet_authority};
+    use stellar_agent_core::approval::subject::approval_subject_classic;
+    use stellar_agent_network::mainnet::authority::{AuthorityRefusal, MainnetAuthority};
+    use stellar_agent_network::policy_state::approvals::facade_calls;
+    use stellar_agent_network::policy_state::{
+        ApprovalRecorder, ApprovalStatus, BusinessId, OperationId, OperationStatus,
+    };
+
+    /// What the mainnet authority wrapper gives the payment commit of `run`
+    /// for the proof `nonce` and `blob` under the admitted `operation`.
+    enum Gate {
+        Approval,
+        Policy,
+        Refused(rmcp::model::CallToolResult),
+    }
+
+    async fn pay_gate(
+        run: &ClassicRun,
+        proof: SuppliedProof,
+        operation: Option<OperationId>,
+    ) -> Gate {
+        pay_gate_under(run, &pay_decision(run).await, proof, operation).await
+    }
+
+    async fn pay_decision(run: &ClassicRun) -> DispatchOutcome {
+        run.f
+            .server
+            .dispatch_gate("stellar_pay_commit", &run.f.args(), "stellar:mainnet")
+            .await
+            .unwrap()
+    }
+
+    /// [`pay_gate`] under the decision `outcome`.
+    async fn pay_gate_under(
+        run: &ClassicRun,
+        outcome: &DispatchOutcome,
+        proof: SuppliedProof,
+        operation: Option<OperationId>,
+    ) -> Gate {
+        let xdr = run.args["envelope_xdr"].as_str().unwrap();
+        let mut witness = None;
+        let result = mainnet_authority(
+            &run.f.server,
+            outcome,
+            GatedApprovalKind::Payment.expectation(approval_subject_classic(xdr)),
+            &proof,
+            operation,
+            "stellar_pay_commit",
+            &mut witness,
+        )
+        .await;
+        match result {
+            Ok(MainnetAuthority::Approval(_)) => Gate::Approval,
+            Ok(MainnetAuthority::Policy(_)) => Gate::Policy,
+            Err(AuthorityRefusal::Gate(result)) => Gate::Refused(result),
+            Err(_) => panic!("the wrapper refuses only at its gate here"),
+        }
+    }
+
+    fn proof(nonce: &str, blob: &str) -> SuppliedProof {
+        SuppliedProof {
+            nonce: Some(nonce.to_owned()),
+            attestation: Some(blob.to_owned()),
+        }
+    }
+
+    fn own_proof(run: &ClassicRun) -> SuppliedProof {
+        proof(
+            &run.entry.approval_nonce,
+            run.args["approval_attestation"].as_str().unwrap(),
+        )
+    }
+
+    /// Asserts that `gate` refused with exactly `expected`.
+    fn assert_refused(context: &str, gate: Gate, expected: &rmcp::model::CallToolResult) {
+        let Gate::Refused(result) = gate else {
+            panic!("{context}: the gate admitted the proof")
+        };
+        assert_eq!(
+            normalized(wire(&result)),
+            normalized(wire(expected)),
+            "{context}"
+        );
+    }
+
+    fn assert_admitted(context: &str, gate: Gate) {
+        match gate {
+            Gate::Approval => {}
+            Gate::Policy => panic!("{context}: a proof gave policy authority"),
+            Gate::Refused(result) => panic!("{context}: {}", wire(&result)),
+        }
+    }
+
+    fn facts_reads(run: &ClassicRun) -> usize {
+        facade_calls::count(run.f.server.window_store.path())
+    }
+
+    /// A consented durable record admits its proof with the inbox file
+    /// removed, locked by an in-process store handle that holds the inbox
+    /// through the commit, or contradicting the record. A
+    /// valid inbox consent without a record, and a forged or another
+    /// approval's valid proof beside a matching live record, refuse with
+    /// the uniform envelope.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn mcp_commit_uses_durable_facts_after_collection() {
+        for tool in Tool::ALL {
+            let run = ClassicRun::new(tool).await;
+            std::fs::remove_file(store_path(&run.f)).unwrap();
+            let result = run.commit().await;
+            assert_eq!(result["ok"], true, "{tool:?} collected: {result}");
+            assert_eq!(run.control.count("sendTransaction"), 1, "{tool:?}");
+            assert_eq!(authorizations(&run.f).len(), 1, "{tool:?}");
+        }
+
+        for case in ["locked", "contradictory"] {
+            let run = ClassicRun::new(Tool::Pay).await;
+            if case == "contradictory" {
+                edit_stored(&run.f, &run.entry.approval_nonce, |entry| {
+                    let expires = entry["expires_at_unix_ms"].as_integer().unwrap();
+                    entry["expires_at_unix_ms"] = toml_edit::value(expires - 1_000);
+                    entry["attestation_blob_b64"] = toml_edit::value("A".repeat(43));
+                });
+            }
+            let held =
+                (case == "locked").then(|| PendingApprovalStore::open(store_path(&run.f)).unwrap());
+            let gate = pay_gate(&run, own_proof(&run), Some(run.operation_id())).await;
+            drop(held);
+            assert_admitted(case, gate);
+            let result = run.commit().await;
+            assert_eq!(result["ok"], true, "{case}: {result}");
+        }
+
+        let run = ClassicRun::new(Tool::Pay).await;
+        let operation = Some(run.operation_id());
+        let (other_args, _) = run.prepare_again().await;
+        let uniform = approval_required_indistinguishable(PROFILE);
+        for (case, blob) in [
+            ("forged", URL_SAFE_NO_PAD.encode([7_u8; 32])),
+            (
+                "foreign",
+                other_args["approval_attestation"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            ),
+        ] {
+            let gate = pay_gate(&run, proof(&run.entry.approval_nonce, &blob), operation).await;
+            assert_refused(case, gate, &uniform);
+        }
+        let xdr = run.args["envelope_xdr"].as_str().unwrap();
+        let unrecorded = approval_for(Tool::Pay, &run.f, xdr, 600_000);
+        let blob = run.f.attest(&unrecorded);
+        assert!(
+            stored_approval(&run.f, &unrecorded.approval_nonce)
+                .unwrap()
+                .attestation_blob_b64
+                .is_some(),
+            "the inbox holds the consent"
+        );
+        let gate = pay_gate(&run, proof(&unrecorded.approval_nonce, &blob), operation).await;
+        assert_refused("inbox consent without a record", gate, &uniform);
+        assert_admitted(
+            "the genuine proof",
+            pay_gate(&run, own_proof(&run), operation).await,
+        );
+        assert_classic_unsigned("gate only", &run, &run.entry);
+    }
+
+    /// Revokes the durable record of `run`'s approval through the recorder.
+    fn revoke(run: &ClassicRun) {
+        let server = &run.f.server;
+        let profile = server.security_profile();
+        let record = ApprovalStatus::new(&server.window_store, profile)
+            .find_by_nonce(&run.entry.approval_nonce)
+            .unwrap()
+            .unwrap()
+            .record;
+        let (writer, _readiness) = server.write_audit().unwrap();
+        let mut writer = writer.lock().unwrap();
+        ApprovalRecorder::new(&server.window_store, profile, &mut *writer, "revoke")
+            .revoke(record.id)
+            .unwrap();
+    }
+
+    /// A revoked record renders the redacted `approval.revoked` envelope,
+    /// also after its lifetime ends, and names no nonce, proof or path. A
+    /// corrupt window and another profile's proof stay uniform.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn mcp_durable_state_envelopes() {
+        for case in ["revoked", "revoked and expired"] {
+            let run = ClassicRun::new(Tool::Pay).await;
+            revoke(&run);
+            let outcome = pay_decision(&run).await;
+            let clock = (case == "revoked and expired").then(|| {
+                stellar_agent_network::mainnet::clock::set_now_ms_for_test(
+                    run.entry.expires_at_unix_ms + 1,
+                )
+            });
+            let gate =
+                pay_gate_under(&run, &outcome, own_proof(&run), Some(run.operation_id())).await;
+            drop(clock);
+            let Gate::Refused(result) = gate else {
+                panic!("{case}: a revoked approval admitted")
+            };
+            assert_eq!(result.is_error, Some(true), "{case}");
+            let text = serde_json::to_string(&wire(&result)).unwrap();
+            let value = wire(&result);
+            assert_eq!(value["ok"], false, "{case}: {value}");
+            assert_eq!(
+                value["error"]["code"], "approval.revoked",
+                "{case}: {value}"
+            );
+            assert_eq!(
+                value["error"]["message"], "this approval has been revoked",
+                "{case}: {value}"
+            );
+            assert!(value["error"]["details"].is_null(), "{case}: {value}");
+            for secret in [
+                run.entry.approval_nonce.as_str(),
+                run.args["approval_attestation"].as_str().unwrap(),
+                PROFILE,
+                "toml",
+            ] {
+                assert!(!text.contains(secret), "{case}: {text}");
+            }
+            if case == "revoked" {
+                let result = run.commit().await;
+                assert_eq!(result["error"]["code"], "approval.revoked", "{result}");
+                assert_classic_unsigned(case, &run, &run.entry);
+            }
+        }
+
+        let run = ClassicRun::new(Tool::Pay).await;
+        let (business_id, fresh) = recorded_fresh_entry(&run);
+        let other = run.f.attest_bound(&fresh, "other", "stellar:mainnet");
+        let fresh_operation =
+            OperationStatus::new(&run.f.server.window_store, run.f.server.security_profile())
+                .view(&BusinessId::parse(business_id.as_str().unwrap()).unwrap())
+                .unwrap()
+                .unwrap()
+                .operation_id;
+        let gate = pay_gate(
+            &run,
+            proof(&fresh.approval_nonce, &other),
+            Some(fresh_operation),
+        )
+        .await;
+        assert_refused(
+            "another profile's proof",
+            gate,
+            &approval_required_indistinguishable(PROFILE),
+        );
+        let outcome = pay_decision(&run).await;
+        let operation = Some(run.operation_id());
+        std::fs::write(run.f.server.window_store.path(), b"corrupt window").unwrap();
+        let gate = pay_gate_under(&run, &outcome, own_proof(&run), operation).await;
+        assert_refused(
+            "corrupt window",
+            gate,
+            &approval_required_indistinguishable(PROFILE),
+        );
+    }
+
+    /// A verified proof binds the operation the call admitted: another
+    /// opened operation of the same subject refuses as spent, and a call
+    /// without an admitted operation refuses uniformly. A receipt holding
+    /// the nonce, and an unreadable receipt store, refuse before any
+    /// durable record is read.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn mcp_reuse_keeps_receipt_and_operation_boundaries() {
+        let run = ClassicRun::new(Tool::Pay).await;
+        let own = run.operation_id();
+        let other_id = run.bind_new_business_id();
+        let other =
+            OperationStatus::new(&run.f.server.window_store, run.f.server.security_profile())
+                .view(&BusinessId::parse(&other_id).unwrap())
+                .unwrap()
+                .unwrap()
+                .operation_id;
+        assert_ne!(other, own);
+        let gate = pay_gate(&run, own_proof(&run), Some(other)).await;
+        assert_refused("another operation", gate, &approval_consumed_error());
+        let gate = pay_gate(&run, own_proof(&run), None).await;
+        assert_refused(
+            "no admitted operation",
+            gate,
+            &approval_required_indistinguishable(PROFILE),
+        );
+        let mut args = run.args.clone();
+        args["business_id"] = serde_json::json!(other_id);
+        let result = refused_commit(&run, args).await;
+        assert_eq!(
+            normalized(result),
+            normalized(wire(&approval_consumed_error()))
+        );
+        assert_admitted(
+            "own operation",
+            pay_gate(&run, own_proof(&run), Some(own)).await,
+        );
+
+        assert_classic_accepted("first use", &run, &run.commit().await);
+        std::fs::remove_file(store_path(&run.f)).unwrap();
+        let reads = facts_reads(&run);
+        let gate = pay_gate(&run, own_proof(&run), Some(own)).await;
+        assert_refused(
+            "receipt held, inbox collected",
+            gate,
+            &approval_consumed_error(),
+        );
+        assert_eq!(
+            facts_reads(&run),
+            reads,
+            "the receipt refuses before the record read"
+        );
+
+        let run = ClassicRun::new(Tool::Pay).await;
+        let receipts = stellar_agent_core::profile::receipt::ReceiptStore::open(PROFILE).unwrap();
+        std::fs::write(receipts.file_path().unwrap(), "{unparsable").unwrap();
+        let reads = facts_reads(&run);
+        let gate = pay_gate(&run, own_proof(&run), Some(run.operation_id())).await;
+        assert_refused(
+            "unreadable receipts",
+            gate,
+            &approval_required_indistinguishable(PROFILE),
+        );
+        assert_eq!(
+            facts_reads(&run),
+            reads,
+            "an unreadable receipt reads no record"
+        );
+    }
+
+    /// The commit's early lookup returns the continuing operation from a
+    /// read that writes nothing, also while the window holds another
+    /// operation whose waiting time has ended, which a recorder lookup
+    /// would expire.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn classic_commit_identity_is_read_only() {
+        use stellar_agent_network::operation_entry::{self, OpenedEntry};
+        use stellar_agent_network::policy_state::{OpenRequest, OperationKind};
+        let run = ClassicRun::new(Tool::Pay).await;
+        let server = &run.f.server;
+        let profile = server.security_profile();
+        let xdr = run.args["envelope_xdr"].as_str().unwrap();
+        let view = OperationStatus::new(&server.window_store, profile)
+            .view(&BusinessId::parse(run.args["business_id"].as_str().unwrap()).unwrap())
+            .unwrap()
+            .unwrap();
+        let stale = crate::tools::common::tests::fresh_business_id();
+        let request = OpenRequest {
+            business_id: BusinessId::parse(&stale).unwrap(),
+            tool: view.tool.unwrap(),
+            kind: view.kind.unwrap(),
+            intent: operation_entry::envelope_slot(
+                &[9; 32],
+                xdr,
+                operation_entry::envelope_max_time(xdr).unwrap(),
+            ),
+            envelope_xdr: Some(xdr.to_owned()),
+            prepared_decision: None,
+            rule_ttl_ms: Some(1),
+        };
+        let opened = server
+            .operation_step(|recorder| operation_entry::open_classic(recorder, &request))
+            .unwrap();
+        assert!(matches!(opened, OpenedEntry::Resume(_)), "{opened:?}");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let window = std::fs::read(server.window_store.path()).unwrap();
+        let audit = std::fs::read(&profile.audit_log_path).ok();
+        for _ in 0..2 {
+            let found = server.classic_commit_lookup(
+                server.current_mainnet_policy(),
+                OperationKind::Pay,
+                Some(&BusinessId::parse(run.args["business_id"].as_str().unwrap()).unwrap()),
+                xdr,
+            );
+            assert_eq!(found.ok(), Some(Some(view.operation_id)));
+        }
+        assert_eq!(
+            std::fs::read(server.window_store.path()).unwrap(),
+            window,
+            "the lookup commits no window generation"
+        );
+        assert_eq!(
+            std::fs::read(&profile.audit_log_path).ok(),
+            audit,
+            "no audit row"
+        );
+        let stale_view = OperationStatus::new(&server.window_store, profile)
+            .view(&BusinessId::parse(&stale).unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(
+            stale_view.state.resumes(),
+            "the stale record stays as stored"
+        );
+    }
+
+    /// Without a proof an allowed commit reads no approval record; a forged
+    /// proof under `Allow` refuses; a valid proof of a recorded approval
+    /// under `Allow` signs under that approval.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn policy_path_reads_no_record() {
+        let run = ClassicRun::allowed(Tool::Pay).await;
+        let operation = Some(run.operation_id());
+        let reads = facts_reads(&run);
+        let gate = pay_gate(&run, SuppliedProof::default(), operation).await;
+        assert!(
+            matches!(gate, Gate::Policy),
+            "proof-free Allow is policy authority"
+        );
+        assert_eq!(facts_reads(&run), reads, "proof-free Allow reads no record");
+
+        let blob = run.record_own_approval();
+        let forged = URL_SAFE_NO_PAD.encode([7_u8; 32]);
+        let gate = pay_gate(&run, proof(&run.entry.approval_nonce, &forged), operation).await;
+        assert_refused(
+            "forged proof under Allow",
+            gate,
+            &approval_required_indistinguishable(PROFILE),
+        );
+        let mut args = run.args.clone();
+        args["approval_nonce"] = serde_json::json!(run.entry.approval_nonce);
+        args["approval_attestation"] = serde_json::json!(blob);
+        let result = run.commit_with(args).await;
+        assert_eq!(result["ok"], true, "{result}");
+        let records = authorizations(&run.f);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0]["approval_nonce"], run.entry.approval_nonce);
+        assert!(records[0]["policy_authority"].is_null(), "{records:?}");
+    }
+
+    /// The durable verifier decides at the consent evidence floor of an
+    /// enforced kind: a floor at the execution end expires the proof while
+    /// wall time is still inside it. An unenforced kind decides at wall time.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn mcp_durable_verifier_uses_fresh_floor() {
+        use stellar_agent_core::approval::witness::ApprovedKind;
+        use stellar_agent_network::policy_state::approvals::ConsentEvidenceEnforcementGuard;
+        let run = ClassicRun::new(Tool::Pay).await;
+        let server = &run.f.server;
+        let profile = server.security_profile();
+        let nonce = &run.entry.approval_nonce;
+        let facts = ApprovalStatus::new(&server.window_store, profile)
+            .facts_by_nonce(nonce)
+            .unwrap()
+            .unwrap();
+        let end = facts
+            .record()
+            .consent
+            .as_ref()
+            .unwrap()
+            .execution_expires_at_ms;
+        let (writer, _readiness) = server.write_audit().unwrap();
+        writer
+            .lock()
+            .unwrap()
+            .initialize_consent_evidence()
+            .unwrap();
+        let (key, anchor) = stellar_agent_network::keyring::keyed_audit_access(
+            profile,
+            PROFILE,
+            stellar_agent_core::audit_log::BindingCheck::Enforce,
+        )
+        .unwrap()
+        .into_parts();
+        stellar_agent_core::audit_log::AuditOutbox::for_log_keyed(
+            &profile.audit_log_path,
+            anchor,
+            key,
+        )
+        .reserve_evidence([9; 32], end + 3_600_000, end)
+        .unwrap();
+        let presented: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(run.args["approval_attestation"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let expected = GatedApprovalKind::Payment.expectation(approval_subject_classic(
+            run.args["envelope_xdr"].as_str().unwrap(),
+        ));
+        let verify = || {
+            crate::tools::common::durable_proof_witness(
+                server,
+                nonce,
+                &presented,
+                &expected,
+                server.current_mainnet_policy().unwrap(),
+                Some(run.operation_id()),
+            )
+        };
+        assert!(now_ms() < end, "wall time is inside the execution window");
+        let enabled = ConsentEvidenceEnforcementGuard::new(PROFILE, ApprovedKind::Payment);
+        assert_eq!(
+            verify().unwrap_err().code(),
+            "approval.expired",
+            "the floor decides an enforced kind"
+        );
+        drop(enabled);
+        assert!(verify().is_ok(), "wall time decides an unenforced kind");
+    }
+
+    /// A retried commit answers from its stored operation after the
+    /// approval inbox is collected, with the same reply and no new send.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn collected_inbox_keeps_the_stored_replay() {
+        for tool in Tool::ALL {
+            let run = ClassicRun::new(tool).await;
+            assert_eq!(run.commit().await["ok"], true, "{tool:?}");
+            let replay = run.commit().await;
+            assert_eq!(replay["data"]["status"], "replayed", "{tool:?}: {replay}");
+            std::fs::remove_file(store_path(&run.f)).unwrap();
+            let seeds = run.seed_reads();
+            let reads = facts_reads(&run);
+            let collected = run.commit().await;
+            assert_eq!(normalized(collected), normalized(replay), "{tool:?}");
+            assert_eq!(run.seed_reads(), seeds, "{tool:?}");
+            assert_eq!(run.control.count("sendTransaction"), 0, "{tool:?}");
+            assert_eq!(
+                facts_reads(&run),
+                reads,
+                "{tool:?}: the replay reads no record"
+            );
+        }
+    }
 }

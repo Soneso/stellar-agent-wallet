@@ -175,10 +175,10 @@ pub(crate) mod budget {
         )
         .with_epoch(Some([7; 32]));
         for holds in [vec![hold(10), hold(15)], vec![total_hold]] {
-            let request = fx.mint_request(tx(holds.len() as u8), fx.approval(), holds);
+            let request = fx.mint_request(tx(holds.len() as u8), fx.fresh_policy(), holds);
             fx.store.mint_authorization(&fx.profile, &request).unwrap();
         }
-        let mut native_only = fx.mint_request(tx(9), fx.approval(), Vec::new());
+        let mut native_only = fx.mint_request(tx(9), fx.fresh_policy(), Vec::new());
         native_only.native_reservation = Some(NativeReservation {
             debit_stroops: 70,
             fee_stroops: 1,
@@ -656,7 +656,7 @@ pub(crate) mod budget {
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let fx = Fx::new();
-        let request = fx.mint_request(tx(1), fx.approval(), vec![]);
+        let request = fx.mint_request(tx(1), fx.fresh_policy(), vec![]);
         let id = fx
             .store
             .mint_authorization(&fx.profile, &request)
@@ -741,7 +741,7 @@ pub(crate) mod budget {
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         fx.open_new(&request("budget-duplicate", canonical(1)));
-        let minted = fx.mint_request(tx(1), fx.approval(), vec![hold(10)]);
+        let minted = fx.mint_request(tx(1), fx.fresh_policy(), vec![hold(10)]);
         fx.store.mint_authorization(&fx.profile, &minted).unwrap();
         let policy = policy(vec![period("native", "1d", 100)]);
         let mut good = fx.wire();
@@ -926,7 +926,7 @@ pub(crate) mod budget {
         let fx = Fx::new();
         let ids: Vec<AuthorizationId> = (1..=7_u8)
             .map(|n| {
-                let mut request = fx.mint_request(tx(n), fx.approval(), vec![]);
+                let mut request = fx.mint_request(tx(n), fx.fresh_policy(), vec![]);
                 request.native_reservation = (n != 7).then_some(NativeReservation {
                     debit_stroops: 100 * i64::from(n),
                     fee_stroops: i64::from(n),
@@ -1061,6 +1061,10 @@ pub(crate) mod budget {
             .find(|auth| auth.id == ids[0])
             .unwrap();
         (live.policy_digest, live.policy_sequence) = ([9; 32], 6);
+        // A policy authority names the policy its authorization binds.
+        if let Some(authority) = live.policy_authority.as_mut() {
+            (authority.policy_digest, authority.policy_sequence) = ([9; 32], 6);
+        }
         epoch.last_observation = equal.native.observation;
         (
             epoch.admissible_floor_ledger,

@@ -154,6 +154,10 @@ Without a display, mainnet consent needs `--open-by-operator`, which prints the 
 With a signed approval origin, the HTTPS listener serves consent using an owner-pinned credential.
 The CLI prints the signed approval link without opening a browser or requiring a display.
 Ledger signing also requires this passkey ceremony when the CLI policy requires approval.
+After the ceremony the CLI verifies the consent against its durable record and exits 1 before signing on any refusal.
+An unreadable receipt store refuses with `submission.record_unavailable`, and a submission receipt or a record of another operation with `approval.consumed`.
+The record check refuses with `approval.not_found`, `approval.revoked`, `approval.expired`, `approval.presence_required`, `approval.presence_invalid`, `approval.presence_policy_unavailable`, `approval.attestation_invalid`, `approval.wrong_kind`, or `approval.binding_mismatch`.
+An unreadable wall clock refuses with `approval.clock_error`; window store, keyring, and audit evidence failures keep their own codes.
 
 A localhost ceremony binds `127.0.0.1` and `[::1]` on one port before it
 creates any token, serves the same session on both, and closes both together.

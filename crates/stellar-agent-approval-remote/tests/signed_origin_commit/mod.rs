@@ -498,6 +498,74 @@ pub(super) async fn commit(f: &Fixture) {
     let window = PersistedWindowStore::for_profile(f.fixture.name());
     let audit = audit_readiness(profile, f.fixture.name()).unwrap();
     let writer = audit.writer().clone();
+    // Every approval mint names its durable record: the producer opens it
+    // for the payment's operation and the consent step commits the consent.
+    let link = {
+        use stellar_agent_network::operation_entry::{
+            commit_consent, consent_completion, pending_approval_facts, unsigned_envelope_sha256,
+        };
+        use stellar_agent_network::policy_state::{
+            ApprovalRecorder, BusinessId, ConsentRow, IntentSlot, OpenOutcome, OpenRequest,
+            OperationKind, OperationLink, OperationRecorder, OperationTool,
+        };
+        let subject = stellar_agent_core::approval::mainnet_consent_subject(
+            &entry,
+            &stellar_agent_core::approval::AttestationBinding::new(
+                f.fixture.name(),
+                profile.chain_id.caip2_str(),
+            ),
+        )
+        .unwrap();
+        let ttl = entry.expires_at_unix_ms - entry.created_at_unix_ms;
+        let mut guard = writer.lock().unwrap();
+        let OpenOutcome::New(handle) =
+            OperationRecorder::new(&window, profile, &mut *guard, "open")
+                .open(&OpenRequest {
+                    business_id: BusinessId::parse(&entry.approval_nonce).unwrap(),
+                    tool: OperationTool::CliPay,
+                    kind: OperationKind::Pay,
+                    intent: IntentSlot::Envelope {
+                        intent_digest: subject,
+                        unsigned_envelope_sha256: unsigned_envelope_sha256(unsigned),
+                        max_time: 0,
+                    },
+                    envelope_xdr: Some(unsigned.clone()),
+                    prepared_decision: None,
+                    rule_ttl_ms: Some(ttl),
+                })
+                .unwrap()
+        else {
+            panic!("a fresh payment opens its operation")
+        };
+        ApprovalRecorder::new(&window, profile, &mut *guard, "pending")
+            .open_pending(
+                handle.id(),
+                &pending_approval_facts(&entry, &handle, ApprovedKind::Payment, subject, ttl),
+                stellar_agent_core::audit_log::PolicyDecision::RequireApproval,
+            )
+            .unwrap();
+        drop(guard);
+        let admission = f.fixture.authority().admit().unwrap();
+        let store = PendingApprovalStore::open(f.fixture.store_path()).unwrap();
+        let completion = consent_completion(
+            &store,
+            &window,
+            profile,
+            f.fixture.name(),
+            &entry.approval_nonce,
+            current.policy(),
+            ConsentRow::Written,
+            &admission,
+        )
+        .unwrap();
+        drop(store);
+        drop(admission);
+        commit_consent(&window, profile, &completion).unwrap();
+        OperationLink {
+            operation_id: handle.id(),
+            attempt_index: 1,
+        }
+    };
     let decision = payment_decision(current.policy(), profile, unsigned);
     let authorization = resolve_tx_sign(TxSignRequest {
         context: &context,
@@ -512,7 +580,7 @@ pub(super) async fn commit(f: &Fixture) {
         authority: &MainnetAuthority::from_decision(&decision, Some(&approval)).unwrap(),
         audit,
         store: &window,
-        operation: None,
+        operation: Some(link),
         restriction: None,
         sac_payment_context: None,
     })

@@ -1235,8 +1235,9 @@ immediately before the signing primitive, with no intervening I/O or await.
 
 An approval releases at most one signed authorization.
 A failed or interrupted call can spend it without returning a payment payload.
-A repeated proof with a live spent tombstone answers `policy.approval_consumed`.
+On testnet a repeated proof with a live spent tombstone answers `policy.approval_consumed`.
 An expired or pruned tombstone can answer `policy.approval_required`.
+On mainnet a repeated proof of a completed payment answers `policy.approval_required`; only a submission receipt or a proof of another operation answers `policy.approval_consumed`.
 The authorization expires within 60 ledgers of the paying call's simulation ledger.
 The protocol estimates five seconds per ledger.
 

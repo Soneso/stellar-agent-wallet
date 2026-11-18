@@ -368,7 +368,8 @@ async fn public_payment_crashes_preserve_recovery_at_every_durable_write() {
             // Two cuts stop the payment unsent, and the retry and the repeat
             // give the same typed refusal. A cut inside the operator's
             // consent write leaves the inbox attested and the durable record
-            // without consent. A cut after the authorization mint and before
+            // without consent, which the approval gate refuses uniformly
+            // before the resolver. A cut after the authorization mint and before
             // its attempt leaves the approval consumed by an unclaimed
             // authorization, which expiry or invalidation releases.
             let unsent =
@@ -376,7 +377,7 @@ async fn public_payment_crashes_preserve_recovery_at_every_durable_write() {
             let consent_unrecorded = unsent
                 && stored.state.wire_name() == "awaiting_approval"
                 && authorizations(&run.f).is_empty()
-                && retry["error"]["code"] == "network.mainnet_authorization_refused";
+                && retry["error"]["code"] == "policy.approval_required";
             let unclaimed = unsent
                 && stored.state.wire_name() == "authorized"
                 && authorizations(&run.f).len() == 1
@@ -439,10 +440,10 @@ async fn public_payment_crashes_preserve_recovery_at_every_durable_write() {
             .into_iter()
             .flat_map(|first| {
                 [
-                    "approval/Renamed network.mainnet_authorization_refused",
-                    "approval/FileSynced network.mainnet_authorization_refused",
-                    "approval/DirectorySynced network.mainnet_authorization_refused",
-                    "window/4/awaiting_approval network.mainnet_authorization_refused",
+                    "approval/Renamed policy.approval_required",
+                    "approval/FileSynced policy.approval_required",
+                    "approval/DirectorySynced policy.approval_required",
+                    "window/4/awaiting_approval policy.approval_required",
                     "window/5/awaiting_approval policy.approval_consumed",
                     "window/4/awaiting_approval policy.approval_consumed",
                 ]

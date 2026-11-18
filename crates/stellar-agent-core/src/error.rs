@@ -4085,6 +4085,24 @@ pub enum SubmissionError {
         detail: String,
     },
 
+    /// The submission receipt store could not be read, so the wallet cannot
+    /// show that an approval nonce is unspent and sends nothing.
+    ///
+    /// This check writes no record; it refuses before any signing.
+    ///
+    /// # Field semantics
+    ///
+    /// `detail` is a non-secret diagnostic of the read failure.
+    ///
+    /// # Wire code
+    ///
+    /// `submission.record_unavailable`
+    #[error("the submission receipt store could not be read, so nothing was sent: {detail}")]
+    ReceiptStoreUnreadable {
+        /// A non-secret diagnostic of the read failure.
+        detail: String,
+    },
+
     /// A settlement audit delivery named a decision identifier that the
     /// verified spending-window state does not hold.
     ///
@@ -4235,7 +4253,9 @@ impl SubmissionError {
             Self::FeeBumpInnerRejected { .. } => "submission.feebump_inner_rejected",
             Self::AuthMismatch { .. } => "submission.auth_mismatch",
             Self::OnChainFailed { .. } => "submission.on_chain_failed",
-            Self::RecordUnavailable { .. } => "submission.record_unavailable",
+            Self::RecordUnavailable { .. } | Self::ReceiptStoreUnreadable { .. } => {
+                "submission.record_unavailable"
+            }
             Self::SettlementUnverifiable => "submission.settlement_unverifiable",
             Self::HashMismatch { .. } => "submission.hash_mismatch",
             Self::IntentRecordUnavailable { .. } => "submission.intent_record_unavailable",
@@ -5888,6 +5908,12 @@ mod tests {
             (
                 SubmissionError::RecordUnavailable {
                     detail: "receipt store is not writable".to_owned(),
+                },
+                "submission.record_unavailable",
+            ),
+            (
+                SubmissionError::ReceiptStoreUnreadable {
+                    detail: "receipt store is not readable".to_owned(),
                 },
                 "submission.record_unavailable",
             ),

@@ -95,7 +95,7 @@ fn approved_unlisted_spend_is_counted_and_never_bypasses_hard_caps() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let _storage_home =
         stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-    let l = Ledger::new();
+    let l = Ledger::with_approvals();
     l.mint(&policy(&l, tx(1), payment(6))).unwrap();
     assert_eq!(held_everywhere(&l), [6, 6, 6]);
 
@@ -103,7 +103,7 @@ fn approved_unlisted_spend_is_counted_and_never_bypasses_hard_caps() {
     assert!(approval_required(l.mint(&policy(&l, tx(2), payment(6)))));
     assert_eq!(l.bytes(), before, "approval-needed writes nothing");
 
-    let approved = l.request(tx(2), payment(6));
+    let approved = l.approved(tx(2), payment(6));
     let minted = l.mint(&approved).unwrap();
     assert_eq!(held_everywhere(&l), [12, 12, 12]);
     assert_eq!(
@@ -112,13 +112,13 @@ fn approved_unlisted_spend_is_counted_and_never_bypasses_hard_caps() {
     );
 
     // The amount cap of 1000 and the total budget of 100 still refuse.
+    let over_cap = l.approved(tx(3), vec![unlisted(1), hold(CAP - 11), total(1)]);
+    let over_total = l.approved(tx(4), payment(TOTAL - 11));
     let before = l.bytes();
-    let over_cap = l.request(tx(3), vec![unlisted(1), hold(CAP - 11), total(1)]);
     assert!(denied_by(l.mint(&over_cap), |r| matches!(
         r,
         DenyReason::PerPeriodCapExceeded { .. }
     )));
-    let over_total = l.request(tx(4), payment(TOTAL - 11));
     assert!(denied_by(l.mint(&over_total), |r| matches!(
         r,
         DenyReason::TotalBudgetExhausted { .. }
@@ -127,7 +127,8 @@ fn approved_unlisted_spend_is_counted_and_never_bypasses_hard_caps() {
 
     // The refused approval stays unused and mints once its holds fit.
     let mut retry = l.request(tx(4), payment(TOTAL - 12));
-    *retry.authority.nonce_mut() = over_total.authority.nonce().clone();
+    retry.authority = over_total.authority.clone();
+    retry.approval_operation = over_total.approval_operation;
     l.mint(&retry).unwrap();
     assert_eq!(held_everywhere(&l), [TOTAL, TOTAL, TOTAL]);
 }
@@ -163,11 +164,11 @@ fn approved_unlisted_replay() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let _storage_home =
         stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-    let l = Ledger::new();
-    let approved = l.request(tx(1), payment(12));
+    let l = Ledger::with_approvals();
+    let approved = l.approved(tx(1), payment(12));
     l.mint(&approved).unwrap();
     let mut replay = l.request(tx(2), payment(1));
-    *replay.authority.nonce_mut() = approved.authority.nonce().clone();
+    replay.authority = approved.authority.clone();
     assert_eq!(
         refusal(l.mint(&replay)),
         MainnetPrecondition::ApprovalNonceReused
@@ -180,7 +181,7 @@ fn approved_unlisted_replay() {
         assert!(approval_required(l.mint(&needs)));
         assert_eq!(l.bytes(), before);
     }
-    l.mint(&l.request(tx(3), payment(1))).unwrap();
+    l.mint(&l.approved(tx(3), payment(1))).unwrap();
     assert_eq!(held_everywhere(&l), [13, 13, 13]);
 }
 
@@ -194,7 +195,7 @@ fn approved_unlisted_mint_at_capacity() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let _storage_home =
         stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-    let l = Ledger::new();
+    let l = Ledger::with_approvals();
     l.mint(&policy(&l, tx(1), payment(ALLOWANCE))).unwrap();
     for n in 0..15u8 {
         l.mint(&l.request(message(n), vec![])).unwrap();
@@ -203,7 +204,7 @@ fn approved_unlisted_mint_at_capacity() {
     let live: Vec<MintedRecord> = (15..30u8)
         .map(|n| l.mint(&l.request(message(n), vec![])).unwrap())
         .collect();
-    let approved = l.request(tx(2), payment(ALLOWANCE + 1));
+    let approved = l.approved(tx(2), payment(ALLOWANCE + 1));
     l.mint(&approved).unwrap();
     assert_eq!(
         held(&l, "unlisted:native"),
@@ -232,8 +233,8 @@ fn approved_unlisted_mint_at_capacity() {
         MAX_OPEN_AUTHORIZATIONS - 1,
         "approval-needed takes no capacity"
     );
-    l.mint(&l.request(tx(4), payment(ALLOWANCE))).unwrap();
-    let full = l.request(tx(5), payment(1));
+    l.mint(&l.approved(tx(4), payment(ALLOWANCE))).unwrap();
+    let full = l.approved(tx(5), payment(1));
     assert_eq!(refusal(l.mint(&full)), MainnetPrecondition::TooManyOpen);
     l.store
         .invalidate_authorization(&l.profile, live[1].id, "make room")
@@ -256,9 +257,9 @@ fn approved_unlisted_mint_crash_matrix() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        let l = Ledger::new();
+        let l = Ledger::with_approvals();
         l.mint(&policy(&l, tx(1), payment(6))).unwrap();
-        let approved = l.request(tx(2), payment(6));
+        let approved = l.approved(tx(2), payment(6));
         {
             let _fault = arm_accounting_fault(point);
             let result = l.mint(&approved);
@@ -279,7 +280,7 @@ fn approved_unlisted_mint_crash_matrix() {
             ..l
         };
         let mut replay = restarted.request(tx(3), payment(1));
-        *replay.authority.nonce_mut() = approved.authority.nonce().clone();
+        replay.authority = approved.authority.clone();
         if point == COMMIT_FAULT_AFTER_PREPARED {
             assert_eq!(held_everywhere(&restarted), [6, 6, 6], "{point}");
             assert_eq!(restarted.wire().authorizations.len(), 1, "{point}");
@@ -507,18 +508,19 @@ fn unlisted_store_sums_refuse() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let _storage_home =
         stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-    let l = Ledger::new();
+    let l = Ledger::with_approvals();
     let overflow = |result: Result<MintedRecord, WindowStoreError>| {
         matches!(result, Err(WindowStoreError::AccountingOverflow))
     };
     // A batch whose two entries overflow.
-    let batch = l.request(tx(1), vec![unlisted(i128::MAX), unlisted(1)]);
+    let batch = l.approved(tx(1), vec![unlisted(i128::MAX), unlisted(1)]);
     assert!(overflow(l.mint(&batch)));
     // A held amount at i128::MAX and one stroop more.
-    l.mint(&l.request(tx(2), vec![unlisted(i128::MAX)]))
+    l.mint(&l.approved(tx(2), vec![unlisted(i128::MAX)]))
         .unwrap();
+    let more = l.approved(tx(3), vec![unlisted(1)]);
     let before = l.bytes();
-    assert!(overflow(l.mint(&l.request(tx(3), vec![unlisted(1)]))));
+    assert!(overflow(l.mint(&more)));
     assert!(approval_required(l.mint(&policy(
         &l,
         tx(4),

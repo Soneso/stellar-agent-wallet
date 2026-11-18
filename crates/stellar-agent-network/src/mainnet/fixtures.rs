@@ -130,8 +130,29 @@ pub(crate) fn claim_target(dir: &std::path::Path, name: &str) -> ClaimTarget {
     }
 }
 
-/// Mints a fixture header's bound record in its own ledger.
+/// The policy authority fixture ledgers mint under, evaluated at `now`.
+///
+/// Their subject is the submission, claim and consumption of a record, so
+/// no durable approval record backs them: an approval authority without one
+/// refuses at the mint.
+pub(crate) fn fixture_policy_authority(now: u64) -> crate::policy_state::PolicyAuthorityBinding {
+    crate::policy_state::PolicyAuthorityBinding {
+        policy_digest: POLICY_DIGEST,
+        policy_sequence: POLICY_SEQUENCE,
+        rule_index: 0,
+        evaluated_at_ms: now,
+        governing_until_ms: now + APPROVAL_WINDOW_MS,
+        scope: stellar_agent_core::mainnet::decision::AuthorityScope::Classic,
+    }
+}
+
+/// Mints a fixture header's bound record in its own ledger, under
+/// [`fixture_policy_authority`] at the header's issue time.
 pub(crate) fn mint_header(header: &mut Header, binding: &DomainBinding, holds: &[WindowEntry]) {
+    let mut authority = fixture_policy_authority(header.issued_at_ms);
+    authority.policy_digest = header.policy.digest;
+    authority.policy_sequence = header.policy.sequence;
+    header.authority = AuthorityBinding::Policy(authority);
     let target = &header.claim;
     let lock = WindowStoreLock::acquire_for(
         target.store.path(),
@@ -494,17 +515,18 @@ impl LedgerFixture {
     }
 
     /// Mints a transaction authorization over `binding` holding `holds`, for
-    /// `endpoint`, under the approval `nonce`, and returns it with its header
-    /// built from the minted record and an audit proof of the fixture's
-    /// writer.
+    /// `endpoint`, under [`fixture_policy_authority`], and returns it with
+    /// its header built from the minted record and an audit proof of the
+    /// fixture's writer. `_label` names the caller's authorization and binds
+    /// nothing.
     pub(crate) fn mint(
         &self,
         binding: DomainBinding,
         holds: &[WindowEntry],
         endpoint: Option<(String, u64)>,
-        nonce: &str,
+        _label: &str,
     ) -> MainnetTxSignAuthorization {
-        self.mint_with_facts(binding, holds, endpoint, nonce, tip_facts(&self.writer))
+        self.mint_for(binding, holds, endpoint, tip_facts(&self.writer), None)
     }
 
     /// [`Self::mint`] with an audit proof over `facts`.
@@ -513,10 +535,10 @@ impl LedgerFixture {
         binding: DomainBinding,
         holds: &[WindowEntry],
         endpoint: Option<(String, u64)>,
-        nonce: &str,
+        _label: &str,
         facts: VerifiedTipFacts,
     ) -> MainnetTxSignAuthorization {
-        self.mint_for(binding, holds, endpoint, nonce, facts, None)
+        self.mint_for(binding, holds, endpoint, facts, None)
     }
 
     /// An operation record binding the fixture's unsigned envelope under
@@ -581,7 +603,6 @@ impl LedgerFixture {
             binding,
             holds,
             None,
-            "approval-1",
             tip_facts(&self.writer),
             Some(operation_entry::next_attempt_link(&handle)),
         );
@@ -624,7 +645,6 @@ impl LedgerFixture {
         binding: DomainBinding,
         holds: &[WindowEntry],
         endpoint: Option<(String, u64)>,
-        nonce: &str,
         facts: VerifiedTipFacts,
         operation: Option<OperationLink>,
     ) -> MainnetTxSignAuthorization {
@@ -636,6 +656,8 @@ impl LedgerFixture {
             facts,
             self.now,
         );
+        let authority = fixture_policy_authority(self.now);
+        header.authority = AuthorityBinding::Policy(authority.clone());
         let minted = self
             .window
             .mint_authorization(
@@ -649,10 +671,7 @@ impl LedgerFixture {
                     consumer: header.consumer,
                     policy_sequence: POLICY_SEQUENCE,
                     policy_digest: POLICY_DIGEST,
-                    authority: crate::policy_state::MintAuthority::Approval {
-                        nonce: nonce.to_owned(),
-                        expires_at_ms: header.authority.expires_at_ms(),
-                    },
+                    authority: crate::policy_state::MintAuthority::Policy(authority),
                     chain_deadline_ms: None,
                     restriction_end_ms: None,
                     authorization_ttl_ms: TTL_MS,
@@ -677,9 +696,6 @@ impl LedgerFixture {
             .unwrap();
         header.id = minted.id;
         header.operation = operation;
-        if let AuthorityBinding::Approval(approval) = &mut header.authority {
-            approval.nonce = nonce.to_owned();
-        }
         header.reservation = minted.reservation;
         header.issued_at_ms = minted.issued_at_ms;
         header.expires_at_ms = minted.expires_at_ms;
@@ -795,6 +811,29 @@ pub(crate) struct ResolverFixture {
     pub(crate) clock: TestClockGuard,
     pub(crate) anchor_failure: std::sync::Arc<std::sync::atomic::AtomicBool>,
     decisions: Vec<stellar_agent_core::mainnet::decision::MainnetDecision>,
+    /// The operation link of each approval nonce [`Self::attested`] recorded.
+    links: std::cell::RefCell<Vec<(String, OperationLink)>>,
+    /// Whether [`Self::attested`] records the approval durably; a test of a
+    /// missing or unconsented record clears it.
+    pub(crate) record_approvals: std::cell::Cell<bool>,
+}
+
+/// A wall clock fixed at one instant.
+struct FixedWall(u64);
+
+impl stellar_agent_core::timefmt::Clock for FixedWall {
+    fn now_unix_ms(&self) -> Result<u64, stellar_agent_core::wallet::WalletLifecycleError> {
+        Ok(self.0)
+    }
+}
+
+/// An audit sink for the fixture's own durable record writes.
+struct FixtureRows;
+
+impl crate::policy_state::OperationAudit for FixtureRows {
+    fn append(&mut self, _: stellar_agent_core::audit_log::AuditEntry) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 impl ResolverFixture {
@@ -1117,7 +1156,111 @@ impl ResolverFixture {
             now,
             clock,
             anchor_failure,
+            links: std::cell::RefCell::default(),
+            record_approvals: std::cell::Cell::new(true),
         }
+    }
+
+    /// The operation link [`Self::attested`] recorded for `nonce`'s approval.
+    pub(crate) fn link(&self, nonce: &str) -> Option<OperationLink> {
+        self.links
+            .borrow()
+            .iter()
+            .find(|(recorded, _)| recorded == nonce)
+            .map(|(_, link)| *link)
+    }
+
+    /// The operation link of `authority`'s approval; `None` for a policy
+    /// authority or an approval without a fixture record.
+    pub(crate) fn link_of(
+        &self,
+        authority: &super::authority::MainnetAuthority<'_>,
+    ) -> Option<OperationLink> {
+        match authority {
+            super::authority::MainnetAuthority::Approval(approval) => {
+                self.link(approval.witness().nonce())
+            }
+            super::authority::MainnetAuthority::Policy(_) => None,
+        }
+    }
+
+    /// Opens an operation and the durable record of `witness` and records
+    /// its consent through the producer facades, as a value producer does
+    /// before the operator approves.
+    fn record(
+        &self,
+        witness: &stellar_agent_core::approval::witness::ApprovalWitness,
+        attestation: [u8; 32],
+        entry: &stellar_agent_core::approval::PendingApproval,
+    ) {
+        use crate::policy_state::{
+            ApprovalRecorder, BusinessId, ConsentPayload, ConsentRow, IntentSlot, OpenOutcome,
+            OpenRequest, OperationKind, OperationRecorder, OperationTool, PendingApprovalFacts,
+        };
+        if self.link(witness.nonce()).is_some() {
+            // Another witness of the same approval shares its record.
+            return;
+        }
+        let rule_ttl_ms = witness.expires_at_ms() - witness.created_at_ms();
+        let opened = OperationRecorder::new(&self.window, &self.profile, &mut FixtureRows, "open")
+            .open(&OpenRequest {
+                business_id: BusinessId::parse(witness.nonce()).unwrap(),
+                tool: OperationTool::CliPay,
+                kind: OperationKind::Pay,
+                // A placeholder canonical intent matches no envelope, and an
+                // unmatched canonical link refuses lineage; the holder slot
+                // binds an envelope digest without a signed end instead.
+                intent: IntentSlot::Envelope {
+                    intent_digest: [1; 32],
+                    unsigned_envelope_sha256: [1; 32],
+                    max_time: 0,
+                },
+                envelope_xdr: None,
+                prepared_decision: None,
+                rule_ttl_ms: Some(rule_ttl_ms),
+            })
+            .unwrap();
+        let OpenOutcome::New(handle) = opened else {
+            panic!("a fresh approval nonce opens a new operation: {opened:?}")
+        };
+        let mut rows = FixtureRows;
+        let mut recorder =
+            ApprovalRecorder::new(&self.window, &self.profile, &mut rows, "approval");
+        let view = recorder
+            .open_pending(
+                handle.id(),
+                &PendingApprovalFacts {
+                    nonce: witness.nonce().to_owned(),
+                    kind: witness.kind(),
+                    subject_kind: witness.subject_kind(),
+                    subject: witness.subject(),
+                    intent_digest: [1; 32],
+                    created_at_ms: witness.created_at_ms(),
+                    waiting_expires_at_ms: witness.expires_at_ms(),
+                    rule_ttl_ms,
+                },
+                PolicyDecision::RequireApproval,
+            )
+            .unwrap();
+        recorder
+            .record_consent(
+                view.record.id,
+                witness,
+                &ConsentPayload::new(
+                    attestation,
+                    entry.mainnet_presence.clone().unwrap(),
+                    entry.process_uid.clone(),
+                    ConsentRow::Written,
+                ),
+            )
+            .unwrap();
+        self.links.borrow_mut().push((
+            witness.nonce().to_owned(),
+            OperationLink {
+                operation_id: handle.id(),
+                attempt_index: 1,
+            },
+        ));
     }
 
     /// The signed policy file, where the approval authority reads it.
@@ -1230,6 +1373,17 @@ impl ResolverFixture {
             verify_mainnet_presence,
             witness::{ApprovalExpectation, verify_approval},
         };
+        // The ceremony runs on the fixture clock, so the durable consent time
+        // is the resolver's present. A clock outside the first half of the
+        // entry's lifetime consents at that bound: an operator approves a
+        // live entry.
+        let created = entry.created_at_unix_ms;
+        let presence_at = super::clock::now_ms().unwrap().clamp(
+            created,
+            created + entry.expires_at_unix_ms.saturating_sub(created) / 2,
+        );
+        let _wall =
+            stellar_agent_core::timefmt::test_clock::install(Arc::new(FixedWall(presence_at)));
         let wall = || stellar_agent_core::timefmt::now_unix_ms().unwrap();
         let path = self.dir.path().join(format!(
             "{}-{}.toml",
@@ -1269,7 +1423,7 @@ impl ResolverFixture {
                 &binding,
                 &policy,
                 &MainnetConsentFixture::origin(),
-                wall(),
+                presence_at,
                 std::time::Instant::now(),
             )
         }
@@ -1281,7 +1435,7 @@ impl ResolverFixture {
         let presence = verify_mainnet_presence(
             challenge,
             MainnetConsentFixture::input(&assertion),
-            wall(),
+            presence_at,
             std::time::Instant::now(),
         )
         .unwrap();
@@ -1300,14 +1454,9 @@ impl ResolverFixture {
             |_, _| Err("unexpected grant".to_owned()),
         )
         .unwrap();
-        let encoded = store
-            .get(&entry.approval_nonce)
-            .unwrap()
-            .attestation_blob_b64
-            .as_ref()
-            .unwrap();
+        let approved = store.get(&entry.approval_nonce).unwrap().clone();
         let blob: [u8; 32] = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(encoded)
+            .decode(approved.attestation_blob_b64.as_ref().unwrap())
             .unwrap()
             .try_into()
             .unwrap();
@@ -1325,7 +1474,7 @@ impl ResolverFixture {
             )
             .unwrap();
         }
-        verify_approval(
+        let witness = verify_approval(
             &store,
             &self.profile,
             "operator",
@@ -1335,7 +1484,11 @@ impl ResolverFixture {
             &policy,
             wall(),
         )
-        .unwrap()
+        .unwrap();
+        if self.record_approvals.get() {
+            self.record(&witness, blob, &approved);
+        }
+        witness
     }
 
     /// The fixture's signed policy with `edit` applied, signed by the same
@@ -1656,7 +1809,7 @@ impl ResolverFixture {
         authority: &'a super::authority::MainnetAuthority<'a>,
     ) -> super::resolve::MessageSignRequest<'a> {
         super::resolve::MessageSignRequest {
-            approval_operation: None,
+            approval_operation: self.link_of(authority).map(|link| link.operation_id),
             context: &self.context,
             consumer: MainnetConsumer::X402Authenticated,
             intent,

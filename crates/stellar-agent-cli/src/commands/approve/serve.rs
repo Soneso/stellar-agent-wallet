@@ -1068,6 +1068,11 @@ mod tests {
                     &fixture.store_path(),
                     None,
                     stellar_agent_core::audit_log::PolicyDecision::Allow,
+                    &crate::common::mainnet_confirm::tests::governing(
+                        &context,
+                        &fixture.current_policy(),
+                        600_000,
+                    ),
                 ),
             )
             .await

@@ -648,6 +648,15 @@ pub(super) mod tests {
             )
             .unwrap()
         }
+        /// [`Self::mint`] for the operation route, whose handle names the
+        /// approval identity.
+        fn raw_mint(&self) -> MintRequest {
+            MintRequest {
+                operation: None,
+                ..self.mint()
+            }
+        }
+
         pub(in crate::commands::approve) fn mint(&self) -> MintRequest {
             let policy = self.core.current_policy();
             MintRequest {
@@ -1218,7 +1227,7 @@ pub(super) mod tests {
                                 xdr: "AAAA".to_owned(),
                                 unsigned_envelope_sha256: [1; 32],
                             }),
-                            authorization: AttemptAuthorization::Mint(Box::new(request.clone())),
+                            authorization: AttemptAuthorization::Mint(Box::new(f.raw_mint())),
                             send_by_ms: u64::MAX,
                         },
                     )
@@ -1335,7 +1344,7 @@ pub(super) mod tests {
                     xdr: "AAAA".to_owned(),
                     unsigned_envelope_sha256: [1; 32],
                 }),
-                authorization: AttemptAuthorization::Mint(Box::new(f.mint())),
+                authorization: AttemptAuthorization::Mint(Box::new(f.raw_mint())),
                 send_by_ms: u64::MAX,
             },
         );
@@ -1520,7 +1529,7 @@ pub(super) mod tests {
                             xdr: "AAAA".to_owned(),
                             unsigned_envelope_sha256: [1; 32],
                         }),
-                        authorization: AttemptAuthorization::Mint(Box::new(f.mint())),
+                        authorization: AttemptAuthorization::Mint(Box::new(f.raw_mint())),
                         send_by_ms: u64::MAX,
                     },
                 );

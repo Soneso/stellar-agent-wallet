@@ -97,6 +97,19 @@ impl MessageUseReceipt {
         }
     }
 
+    /// The approval nonce the consumed authorization bound; `None` under a
+    /// policy authority.
+    #[cfg(feature = "mainnet-write")]
+    #[must_use]
+    pub(crate) fn approval_nonce(&self) -> Option<&str> {
+        match &self.0.inner.header.authority {
+            super::authorization::AuthorityBinding::Approval(approval) => {
+                Some(approval.nonce.as_str())
+            }
+            super::authorization::AuthorityBinding::Policy(_) => None,
+        }
+    }
+
     /// The home domain the consumed authorization bound.
     #[must_use]
     pub fn home_domain(&self) -> &str {

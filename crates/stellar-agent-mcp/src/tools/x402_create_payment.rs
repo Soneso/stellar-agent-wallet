@@ -446,6 +446,7 @@ impl WalletServer {
                 GatedApprovalKind::X402.expectation(subject),
                 args.approval_nonce.as_deref(),
                 args.approval_attestation.as_deref(),
+                None,
                 "stellar_x402_create_payment",
             )
             .await
@@ -791,6 +792,7 @@ impl WalletServer {
                 nonce: args.approval_nonce.clone(),
                 attestation: args.approval_attestation.clone(),
             },
+            entry.as_ref().map(|handle| handle.id()),
             "stellar_x402_create_payment",
             &mut witness,
         )
@@ -2557,6 +2559,7 @@ pub(super) mod approval_tests {
                     GatedApprovalKind::X402.expectation(expected),
                     Some(&nonce),
                     Some(&proof.attestation),
+                    None,
                     "stellar_x402_create_payment",
                 )
                 .await
@@ -2603,6 +2606,7 @@ pub(super) mod approval_tests {
                         GatedApprovalKind::X402.expectation(foreign_subject),
                         Some(&nonce),
                         Some(&proof.attestation),
+                        None,
                         "stellar_x402_create_payment",
                     )
                     .await
@@ -2667,6 +2671,7 @@ pub(super) mod approval_tests {
                 ),
                 Some(&entry.approval_nonce),
                 Some(&blob),
+                None,
                 "stellar_x402_create_payment",
             )
             .await
@@ -4716,6 +4721,7 @@ mod tests {
             600_000,
         )
         .unwrap();
+        let operation = f.x402_plain_record(&entry);
         let blob = f.attest(&entry);
         let outcome = f
             .server
@@ -4737,6 +4743,7 @@ mod tests {
             GatedApprovalKind::X402.expectation(approval_subject_x402(&digest)),
             Some(&entry.approval_nonce),
             Some(&blob),
+            Some(operation),
             "stellar_x402_create_payment",
         )
         .await
@@ -4790,6 +4797,7 @@ mod tests {
             600_000,
         )
         .unwrap();
+        let operation = f.x402_plain_record(&entry);
         let blob = f.attest(&entry);
         let outcome = f
             .server
@@ -4805,7 +4813,9 @@ mod tests {
             .unwrap();
         let original =
             stellar_agent_x402::exact::intent_digest(&requirements, f.envelope.source()).unwrap();
-        let check = |subject, kind: GatedApprovalKind, nonce: String, blob: String| {
+        // Each approval below is recorded for its own operation, which the
+        // check names, so only the compared subject, kind or proof refuses.
+        let check = |subject, kind: GatedApprovalKind, nonce: String, blob: String, operation| {
             let server = &f.server;
             let outcome = &outcome;
             async move {
@@ -4815,6 +4825,7 @@ mod tests {
                     kind.expectation(subject),
                     Some(&nonce),
                     Some(&blob),
+                    Some(operation),
                     "stellar_x402_create_payment",
                 )
                 .await
@@ -4825,7 +4836,8 @@ mod tests {
                 approval_subject_x402(&original),
                 GatedApprovalKind::X402,
                 entry.approval_nonce.clone(),
-                blob.clone()
+                blob.clone(),
+                operation,
             )
             .await
             .unwrap()
@@ -4851,6 +4863,7 @@ mod tests {
                 GatedApprovalKind::X402,
                 entry.approval_nonce.clone(),
                 blob.clone(),
+                operation,
             )
             .await
             .unwrap_err();
@@ -4869,6 +4882,7 @@ mod tests {
                 kind,
                 entry.approval_nonce.clone(),
                 presented,
+                operation,
             )
             .await
             .unwrap_err();
@@ -4890,12 +4904,14 @@ mod tests {
                 600_000,
             )
             .unwrap();
+            let changed_operation = f.x402_plain_record(&changed);
             let changed_blob = f.attest(&changed);
             let refusal = check(
                 approval_subject_x402(&original),
                 GatedApprovalKind::X402,
                 changed.approval_nonce,
                 changed_blob,
+                changed_operation,
             )
             .await
             .unwrap_err();
@@ -4916,12 +4932,14 @@ mod tests {
                 600_000,
             )
             .unwrap();
+            let bound_operation = f.x402_plain_record(&bound);
             let bound_blob = f.attest_bound(&bound, profile_name, chain);
             let refusal = check(
                 approval_subject_x402(&original),
                 GatedApprovalKind::X402,
                 bound.approval_nonce,
                 bound_blob,
+                bound_operation,
             )
             .await
             .unwrap_err();
@@ -4931,20 +4949,16 @@ mod tests {
                 "{profile_name} {chain}"
             );
         }
-        struct FixedClock(u64);
-        impl stellar_agent_core::timefmt::Clock for FixedClock {
-            fn now_unix_ms(&self) -> Result<u64, stellar_agent_core::wallet::WalletLifecycleError> {
-                Ok(self.0)
-            }
-        }
-        let mut expired = f.server.clone();
-        expired.clock = std::sync::Arc::new(FixedClock(entry.expires_at_unix_ms));
+        // A mainnet proof is decided on the mainnet authorization clock.
+        let _clock =
+            stellar_agent_network::mainnet::clock::set_now_ms_for_test(entry.expires_at_unix_ms);
         let refusal = verify_attestation_subject_gate(
-            &expired,
+            &f.server,
             &outcome,
             GatedApprovalKind::X402.expectation(approval_subject_x402(&original)),
             Some(&entry.approval_nonce),
             Some(&blob),
+            Some(operation),
             "stellar_x402_create_payment",
         )
         .await

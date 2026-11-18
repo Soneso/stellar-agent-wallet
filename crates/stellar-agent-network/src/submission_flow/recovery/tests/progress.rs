@@ -161,7 +161,10 @@ async fn recovery_progress_invalid_and_historical_records() {
         }
     }
     for approval in [false, true] {
-        let (mut rig, _guard, _home) = homed();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _guard = StellarAgentHomeGuard::new(home.path());
+        // An approved zero entry records its approval durably.
+        let mut rig = Rig::with_approvals();
         let (_, nonce) = consumed_zero_entry(&mut rig.fx, 1, approval);
         commit_on(
             &mut rig.fx,

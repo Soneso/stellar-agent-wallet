@@ -2618,6 +2618,44 @@ async fn busy_mainnet_resimulation(busy: usize) {
     else {
         panic!("the operation is new");
     };
+    // The approval's durable record and consent, through the producer
+    // facades, as a value producer records them before payment.
+    {
+        use stellar_agent_network::policy_state::{
+            ApprovalRecorder, ConsentPayload, ConsentRow, PendingApprovalFacts,
+        };
+        let mut audit = writer.lock().unwrap();
+        let mut recorder = ApprovalRecorder::new(&store, profile, &mut *audit, "busy-approval");
+        let view = recorder
+            .open_pending(
+                operation.id(),
+                &PendingApprovalFacts {
+                    nonce: entry.approval_nonce.clone(),
+                    kind: ApprovedKind::X402Payment,
+                    subject_kind: approval.subject_kind(),
+                    subject: approval.subject(),
+                    intent_digest: digest,
+                    created_at_ms: approval.created_at_ms(),
+                    waiting_expires_at_ms: approval.expires_at_ms(),
+                    rule_ttl_ms: approval.expires_at_ms() - approval.created_at_ms(),
+                },
+                stellar_agent_core::audit_log::PolicyDecision::RequireApproval,
+            )
+            .unwrap();
+        let stored = approvals.get(&entry.approval_nonce).unwrap();
+        recorder
+            .record_consent(
+                view.record.id,
+                &approval,
+                &ConsentPayload::new(
+                    blob,
+                    stored.mainnet_presence.clone().unwrap(),
+                    stored.process_uid.clone(),
+                    ConsentRow::Written,
+                ),
+            )
+            .unwrap();
+    }
     let gates = AtomicUsize::new(0);
     let exposures = AtomicUsize::new(0);
     use stellar_agent_core::mainnet::decision::{

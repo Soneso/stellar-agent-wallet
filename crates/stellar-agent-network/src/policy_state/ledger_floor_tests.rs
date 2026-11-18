@@ -406,9 +406,7 @@ fn floor_mint_commit_crash_matrix() {
         });
         let old_id = l.mint(&old).unwrap().id;
         l.pin(8, [8; 32]);
-        let mut request = floor_request(&l, 1, T0, 100);
-        request.policy_sequence = 8;
-        request.policy_digest = [8; 32];
+        let mut request = on_policy(floor_request(&l, 1, T0, 100), 8, [8; 32]);
         request.floor = Some(super::super::accounting::CheckedFloor::for_test(
             &request, "ledger", T0, 100,
         ));

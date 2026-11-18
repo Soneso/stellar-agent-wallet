@@ -419,16 +419,26 @@ pub(crate) mod tests {
     /// A window fixture with its receipt store under a temporary home and a
     /// keyed writer.
     struct Rig {
+        // Dropped first: the home guard restores the home the fixture's own
+        // guard set, which the fixture then restores in turn.
+        _guard: StellarAgentHomeGuard,
         fx: Fx,
         receipts: ReceiptStore,
         writer: Arc<Mutex<AuditWriter>>,
-        _guard: StellarAgentHomeGuard,
         home: stellar_agent_test_support::sandbox::StateSandbox,
     }
 
     impl Rig {
         fn new() -> Self {
-            let fx = Fx::new();
+            Self::on(Fx::new())
+        }
+
+        /// [`Self::new`] over a fixture that records durable approvals.
+        fn with_approvals() -> Self {
+            Self::on(Fx::with_approvals())
+        }
+
+        fn on(fx: Fx) -> Self {
             let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
             assert!(
                 home.path()
@@ -1329,7 +1339,7 @@ pub(crate) mod tests {
             assert_eq!(successor_refusal(&mut rig.fx, &handle), refusal, "{field}");
         }
 
-        let mut rig = Rig::new();
+        let mut rig = Rig::with_approvals();
         commit_approved(&mut rig.fx, 1, Checked::NotIncluded);
         let mut decision = rig.decision(1);
         assert!(decision.projection_identity.is_some());
@@ -1517,7 +1527,7 @@ pub(crate) mod tests {
             "owned wallet root is marked before the home guard"
         );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
-        let mut rig = Rig::new();
+        let mut rig = Rig::with_approvals();
         let (_, commit, nonce) = commit_approved(&mut rig.fx, 1, Checked::NotIncluded);
         rig.seed_pending_approval(&nonce);
         rig.repair(None).unwrap();
@@ -1942,7 +1952,11 @@ pub(crate) mod tests {
         );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         for approval in [true, false] {
-            let mut rig = Rig::new();
+            let mut rig = if approval {
+                Rig::with_approvals()
+            } else {
+                Rig::new()
+            };
             let (handle, nonce) = consumed_zero_entry(&mut rig.fx, 1, approval);
             assert_eq!(nonce.is_some(), approval);
             let commit = commit_on(
@@ -2471,7 +2485,7 @@ pub(crate) mod tests {
             "owned wallet root is marked before the home guard"
         );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
-        let mut rig = Rig::new();
+        let mut rig = Rig::with_approvals();
         let (_, commit, nonce) = commit_approved(&mut rig.fx, 1, Checked::NotIncluded);
         rig.seed_pending_approval(&nonce);
         rig.repair(None).unwrap();
@@ -2639,18 +2653,20 @@ pub(crate) mod tests {
             ],
             "the exposure adds only the source and the submission ledger"
         );
-        let mut exact = ReceiptProjectionIdentity {
+        let exact = ReceiptProjectionIdentity {
             destinations: Default::default(),
             source: fixtures::account(SIGNER_SEED),
             sequence: SEQUENCE,
             max_time: intent.max_time,
             receipt_reference: intent.envelope_hash.clone(),
             submission_ledger: 100,
-            approval_nonce: Some("approval-1".to_owned()),
+            // The fixture mints under a policy authority; the approval nonce
+            // projection runs on a durable record in
+            // `recovery_projection_reads_historical_consumption_ledger`.
+            approval_nonce: None,
         };
         assert_eq!(identity(&reopened), Some(exact.clone()));
         policy_authority(&reopened, &fx.profile, hash);
-        exact.approval_nonce = None;
         assert_eq!(
             identity(&PersistedWindowStore::at_path(fx.window.path().to_owned())),
             Some(exact),

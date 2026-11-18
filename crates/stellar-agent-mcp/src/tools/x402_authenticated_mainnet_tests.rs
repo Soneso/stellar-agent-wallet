@@ -1156,11 +1156,15 @@ async fn assert_accepted(run: &Run, approval: &(String, String), result: &serde_
             )
         )
     );
+    // The ended payment released the record's consent payload, so the
+    // durable verifier refuses the replayed proof as outside its execution
+    // window; the inbox tombstone does not answer a mainnet proof.
     let replay = run.pay(HOME, approval).await;
     assert_eq!(
-        replay["error"]["code"], "policy.approval_consumed",
+        replay["error"]["code"], "policy.approval_required",
         "{replay}"
     );
+    assert_eq!(authorizations(&run.f).len(), 3, "the replay mints nothing");
 }
 
 /// Call 1 writes one pending approval for the intent and the home domain with
@@ -1469,17 +1473,15 @@ async fn authenticated_x402_message_mint_refuses_another_operation_identity() {
     let (capture, _guard) =
         stellar_agent_test_support::WarningCapture::capture(Some("stellar_agent"));
     let result = run.call(args).await;
+    // The approval's durable record names the prepared operation, so the
+    // approval gate refuses the call of another operation as spent before
+    // the message resolver runs.
     assert_eq!(
-        result["error"]["code"], "network.mainnet_authorization_refused",
-        "another operation refuses at the message record check"
+        result["error"],
+        wire(&super::common::approval_consumed_error())["error"],
+        "another operation refuses at the approval gate"
     );
-    assert_eq!(
-        refusals(&capture),
-        [(
-            "resolve_message_sign".to_owned(),
-            "approval_nonce_reused".to_owned()
-        )]
-    );
+    assert!(refusals(&capture).is_empty(), "the resolver never runs");
     assert!(authorizations(&run.f).is_empty());
     assert!(signings().is_empty());
 }
@@ -1949,6 +1951,22 @@ impl Boundary {
             600_000,
         )
         .unwrap();
+        // The producer opens the operation and the durable record the
+        // attestation then consents.
+        let link = self.f.x402_record(
+            stellar_agent_network::policy_state::OperationTool::X402AuthenticatedPayment,
+            stellar_agent_network::policy_state::OperationKind::X402AuthenticatedPayment,
+            stellar_agent_x402::exact::intent_digest(&self.requirements, self.f.envelope.source())
+                .unwrap(),
+            stellar_agent_network::policy_state::X402Intent {
+                network: self.requirements.network.clone(),
+                asset: self.requirements.asset.clone(),
+                payer: self.f.envelope.source().to_owned(),
+                pay_to: self.requirements.pay_to.clone(),
+                amount: self.requirements.amount.clone(),
+            },
+            &entry,
+        );
         let blob = self.f.attest(&entry);
         let outcome = self
             .f
@@ -1979,6 +1997,7 @@ impl Boundary {
             ),
             Some(&entry.approval_nonce),
             Some(&blob),
+            Some(link.operation_id),
             TOOL,
         )
         .await
@@ -2051,7 +2070,7 @@ impl Boundary {
         )
         .unwrap();
         let authorization = resolve_message_sign(MessageSignRequest {
-            approval_operation: None,
+            approval_operation: self.approval_operation(authority),
             context: guard.context,
             consumer: MainnetConsumer::X402Authenticated,
             intent: &intent,
@@ -2064,6 +2083,26 @@ impl Boundary {
         })
         .unwrap();
         consume_message_sign(guard.context, authorization, &store).unwrap()
+    }
+
+    /// The operation of `authority`'s durable approval record, read from the
+    /// window; `None` for a policy authority.
+    fn approval_operation(
+        &self,
+        authority: &stellar_agent_network::mainnet::authority::MainnetAuthority<'_>,
+    ) -> Option<stellar_agent_network::policy_state::OperationId> {
+        let stellar_agent_network::mainnet::authority::MainnetAuthority::Approval(approval) =
+            authority
+        else {
+            return None;
+        };
+        stellar_agent_network::policy_state::ApprovalStatus::new(
+            &self.store(),
+            self.f.server.security_profile(),
+        )
+        .find_by_nonce(approval.witness().nonce())
+        .unwrap()
+        .map(|view| view.record.operation_id)
     }
 
     /// Prepares on mainnet and returns the prepared value with the receipt of
@@ -2516,22 +2555,23 @@ async fn the_mainnet_session_prints_no_jwt_and_no_envelope() {
         "operator",
     )
     .unwrap();
+    let authority = stellar_agent_network::mainnet::authority::MainnetAuthority::from_decision(
+        &b.decision,
+        Some(&approval),
+    )
+    .unwrap();
     let session = stellar_agent_x402_identity::resolve_and_verify_counterparty_authorized_at(
         HOME,
         &b.double.server.uri(),
         &Sep10Double::http(),
         Some(&b.double.endpoint()),
         stellar_agent_x402_identity::MainnetIdentityInputs {
-            approval_operation: None,
+            approval_operation: b.approval_operation(&authority),
             context: guard.context,
             intent: &intent,
             policy: guard.policy,
             enablement: guard.enablement,
-            authority: &stellar_agent_network::mainnet::authority::MainnetAuthority::from_decision(
-                &b.decision,
-                Some(&approval),
-            )
-            .unwrap(),
+            authority: &authority,
             audit,
             store: &store,
         },

@@ -441,6 +441,7 @@ claim = "approval.mainnet_presence"
 rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment"]
 tests = [
   { package = "stellar-agent-mcp", target = "lib", name = "tools::mainnet_presence_tests::mainnet_commit_requires_the_pinned_assertion_for_every_kind", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::mainnet_presence_tests::mainnet_commit_rechecks_consent_after_policy_change", builds = "feature-on" },
 ]
 
 [[cell]]
@@ -571,7 +572,7 @@ tests = [
   { package = "stellar-agent-core", target = "lib", name = "approval::store::recovery::tests::payment_recovery_off_mainnet_retry_after_retention_gets_fresh_consent" },
   { package = "stellar-agent-core", target = "lib", name = "approval::store::recovery::tests::payment_recovery_retry_interval_refuses_on_reuse" },
   { package = "stellar-agent-core", target = "lib", name = "approval::store::recovery::tests::payment_recovery_remove_after_reject_keeps_rejection" },
-  { package = "stellar-agent-mcp", target = "lib", name = "tools::common::tests::mainnet::payment_recovery_mainnet_witness_refuses_recorded_expiry", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::common::tests::mainnet::payment_recovery_mainnet_witness_refuses_at_the_signed_expiry", builds = "feature-on" },
   { package = "stellar-agent-mcp", target = "lib", name = "tools::common::tests::mainnet::payment_recovery_concurrent_retries_after_commit_replay_with_one_effect", builds = "feature-on" },
   { package = "stellar-agent-mcp", target = "lib", name = "tools::common::tests::mainnet::payment_process_recovery_and_replay", builds = "feature-on" },
 ]
