@@ -288,10 +288,8 @@ pub struct StellarRulesListResult {
 impl WalletServer {
     /// Enumerates active context rules on a smart account (read-only).
     ///
-    /// Scans the on-chain OZ rule-ID space `[0, max_scan_id)`
-    /// (`max_scan_id` = [`DEFAULT_MAX_SCAN_ID`], the same default the CLI
-    /// `smart-account rules list` uses — the scan cannot silently truncate
-    /// relative to the CLI view).
+    /// Scans the on-chain OZ rule-ID space `[0, DEFAULT_MAX_SCAN_ID)`, which
+    /// is IDs 0 to 49. The bound is fixed and ignores the profile's scan setting.
     #[mcp_tool_item(
         name = "stellar_rules_list",
         destructive_hint = false,
@@ -305,8 +303,8 @@ impl WalletServer {
                        policy_count and baseline (the rule's signer-set baseline in the \
                        profile's audit log: none, v1, v2, unreadable or unknown; a rule \
                        reporting none refuses signing until its baseline is recorded), plus \
-                       the as_of_ledger the scan was read at. Scans up to max_scan_id rule IDs \
-                       (same default as the CLI `rules list`). Data comes from a single RPC \
+                       the as_of_ledger the scan was read at. Scans rule IDs 0 to 49. The \
+                       bound is fixed and ignores the profile's scan setting. Data comes from a single RPC \
                        endpoint (no two-RPC cross-check; advisory read, not a signing input). \
                        read_only_hint=true; destructive_hint=false.",
         annotations(read_only_hint = true, destructive_hint = false)

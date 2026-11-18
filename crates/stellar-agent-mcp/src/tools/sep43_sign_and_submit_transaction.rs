@@ -87,8 +87,8 @@ use crate::tools::common::redact_rpc_error_detail;
 ///
 /// # Schema
 ///
-/// - `chain_id` — CAIP-2 chain identifier (`"stellar:pubnet"` or
-///   `"stellar:testnet"`); validated against the active profile.
+/// - `chain_id`: CAIP-2 chain identifier, `stellar:testnet` or
+///   `stellar:mainnet`; validated against the active profile.
 /// - `transaction_xdr` — base64-encoded `TransactionEnvelope` XDR to sign and
 ///   submit.
 /// - `network_passphrase` — optional; if provided must equal the profile's
@@ -100,7 +100,7 @@ use crate::tools::common::redact_rpc_error_detail;
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(crate = "rmcp::serde")]
 pub struct Sep43SignAndSubmitTransactionArgs {
-    /// CAIP-2 chain identifier (`"stellar:pubnet"` or `"stellar:testnet"`).
+    /// CAIP-2 chain identifier: `stellar:testnet` or `stellar:mainnet`.
     ///
     /// Validated against the active profile. Mismatch returns JSON-RPC
     /// `ErrorData` from the `dispatch_gate` preamble.
@@ -219,7 +219,9 @@ impl WalletServer {
         name = "stellar_sep43_sign_and_submit_transaction",
         description = "Sign and submit a TransactionEnvelope XDR (SEP-43 signAndSubmit / \
                        WC v2 stellar_signAndSubmitXDR). Signs with the active profile signer, \
-                       submits via RPC, polls until confirmed. \
+                       submits via RPC, polls until confirmed. Testnet only. A mainnet profile \
+                       refuses with network.mainnet_write_forbidden before the policy gate, any \
+                       key access, and any RPC request. \
                        Returns { signedTxXdr: string, txHash: string, status: \"success\" | \"pending\" }. \
                        An approval requirement returns { approval } instead; the repeat \
                        passes approval_nonce and approval_attestation. \

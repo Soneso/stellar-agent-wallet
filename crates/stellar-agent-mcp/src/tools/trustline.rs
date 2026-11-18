@@ -177,7 +177,9 @@ pub struct StellarTrustlineArgs {
 /// 2. **Nonce verification:** HMAC-verified against `envelope_xdr` before signing.
 /// 3. **Replay prevention:** the full 48-byte nonce (salt and tag) is
 ///    recorded in the in-memory `ReplayWindow` after verification.
-/// 4. **Mainnet refusal:** `destructive_hint = true`.
+/// 4. **Mainnet admission:** a mainnet commit needs the V1 engine, a verified
+///    mainnet policy, and verified enablement. A missing requirement refuses
+///    with `network.mainnet_write_forbidden`.
 ///
 /// # Examples
 ///
@@ -219,15 +221,18 @@ pub struct StellarTrustlineCommitArgs {
 
     /// Wallet-issued approval nonce from the simulate-step `approval` block.
     ///
-    /// Required only when the simulate step returned a `policy.approval_required`
-    /// outcome.
+    /// Required when the simulate step returned an `approval` block. On
+    /// mainnet a supplied nonce is verified under `Allow` too.
     #[serde(default)]
     pub approval_nonce: Option<String>,
 
     /// HMAC-SHA256 attestation blob (URL-safe base64 no-pad, 32 bytes).
     ///
     /// Written by `stellar-agent approve --id <approval_nonce> --profile <name>` after the
-    /// operator confirms.  Required alongside `approval_nonce` when policy
+    /// operator approves. On testnet the operator confirms at a terminal or in
+    /// the `approve serve` page. On mainnet the operator approves with a verified
+    /// passkey assertion, in the local browser or at the signed approval
+    /// origin. Required alongside `approval_nonce` when policy
     /// requires approval.
     #[serde(default)]
     pub approval_attestation: Option<String>,
@@ -487,6 +492,8 @@ impl WalletServer {
                        The result carries operational {latest_ledger, close_time_unix, \
                        close_lag_seconds}, the endpoint ledger the readiness check observed. \
                        The approval response includes profile and chain_id. \
+                       On mainnet, a matching balance_floor rule adds an endpoint readiness \
+                       check and an operating account read. \
                        Pass all three to stellar_trustline_commit to sign and submit. \
                        USDT is refused unconditionally. \
                        destructive_hint=false; read_only_hint=false.",
@@ -1135,7 +1142,9 @@ impl WalletServer {
     ///    and the signer. A refusal up to here consumes no nonce.
     /// 4. **Nonce verification:** HMAC-verified before signing.
     /// 5. **Replay prevention:** nonce recorded in the `ReplayWindow`.
-    /// 6. **Mainnet refusal:** `destructive_hint = true`.
+    /// 6. **Mainnet admission:** a mainnet commit needs the V1 engine, a
+    ///    verified mainnet policy, and verified enablement. A missing
+    ///    requirement refuses with `network.mainnet_write_forbidden`.
     #[mcp_tool_item(
         name = "stellar_trustline_commit",
         destructive_hint = true,
@@ -1147,9 +1156,13 @@ impl WalletServer {
         name = "stellar_trustline_commit",
         description = "Sign and submit a ChangeTrust transaction (commit step). \
                        Requires the nonce, expires_at_unix_ms, and envelope_xdr returned \
-                       by stellar_trustline. Re-builds the envelope, re-reads the issuer \
+                       by stellar_trustline. Also pass approval_nonce and \
+                       approval_attestation when the simulate step returned an approval \
+                       block. Pass business_id on mainnet. Re-builds the envelope, re-reads the issuer \
                        and re-runs the clawback gate, obtains the cross-check witness, \
                        verifies the nonce, signs via keyring, and submits. \
+                       On mainnet, a matching balance_floor rule adds an endpoint readiness \
+                       check and an operating account read. \
                        Returns {tx_hash, ledger, cross_check}. \
                        On submission.tx_timeout the outcome is unknown: pass \
                        error.details.tx_hash to stellar_transaction_status, and never \

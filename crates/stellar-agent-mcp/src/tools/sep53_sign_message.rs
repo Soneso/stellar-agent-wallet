@@ -130,6 +130,7 @@ impl WalletServer {
         description = "Sign an arbitrary message using SEP-53 (SHA-256('Stellar Signed Message:\\n' + message) → ed25519). \
                        message_encoding: 'utf8' (default) or 'base64' for binary messages. \
                        Returns { signature: string (base64), signer_public_key: string (G-strkey), message_encoding: string }. \
+                       Testnet only. A mainnet profile refuses with network.mainnet_write_forbidden before signing. \
                        read_only_hint=false; destructive_hint=false. \
                        Produces the same SEP-53 signature bytes as stellar_sep43_sign_message; differs only in response field naming (signature/signer_public_key vs signedMessage/signerAddress) and accepts base64 binary input.",
         annotations(read_only_hint = false, destructive_hint = false)

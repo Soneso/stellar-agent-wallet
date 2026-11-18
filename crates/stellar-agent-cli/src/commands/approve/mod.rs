@@ -115,7 +115,8 @@ pub enum ApproveSubcommand {
     /// Binds a loopback HTTP server so the operator can review and
     /// approve/reject pending approvals in a browser. Runs until Ctrl-C.
     /// Pass `--remote` to bind the TLS-protected, passkey-authenticated
-    /// remote-approval surface instead.
+    /// remote-approval surface instead. On mainnet `--remote` requires a
+    /// signed approval origin.
     Serve(serve::ServeArgs),
 
     /// Manage operator-approval credentials for the remote-approval surface.

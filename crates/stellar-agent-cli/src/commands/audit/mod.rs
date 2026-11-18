@@ -6,6 +6,10 @@
 //!   integrity from the oldest rotated file to the current active file.
 //! - [`reanchor`] — move the log's keyring-held tip anchor to its current tip
 //!   after an operator-acknowledged rollback or audit binding change.
+//! - `acknowledge-outbox-loss`: revoke the profile's permissions, then record
+//!   the loss of queued operator rows.
+//! - `bind-carriers`: record the identities of the audit lock files and start
+//!   a new outbox generation, with every wallet process stopped.
 //!
 //! # Dispatch
 //!

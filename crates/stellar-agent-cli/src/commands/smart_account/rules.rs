@@ -398,8 +398,8 @@ pub enum RulesSubcommand {
     /// [`crate::commands::smart_account::list_rules::run`]; argument shape and
     /// JSON envelope are identical to `smart-account list-rules`.
     ///
-    /// `smart-account list-rules` is retained unchanged as a secondary entry point
-    /// for backwards-compat. No deprecation warning is emitted.
+    /// `smart-account list-rules` is a second entry point for the same command
+    /// and prints no warning.
     ///
     /// A `tracing::info!` row carrying `command = "smart-account rules list"` is
     /// emitted at the dispatch site so the operator-invoked command name is

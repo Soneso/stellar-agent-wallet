@@ -267,8 +267,8 @@ pub struct StellarRuleCreateCommitArgs {
     pub approval_nonce: String,
 
     /// HMAC-SHA256 attestation blob, URL-safe base64 no-pad encoded (32
-    /// bytes). Required when the policy engine (or the toolset-gated forced
-    /// path) requires approval.
+    /// bytes). Required on every call. The commit verifies the operator
+    /// attestation whatever the policy verdict.
     #[serde(default)]
     pub approval_attestation: Option<String>,
 }
@@ -882,7 +882,10 @@ impl WalletServer {
                        address or two simple-threshold policies refuse with sa.deployment_failed at phase \
                        build. An external entry whose pubkey_data_hex decodes to empty key data refuses with \
                        sa.auth_entry_construction_failed. Returns {approval_nonce, expires_at_unix_ms, \
-                       summary}. Simulate responses include profile and chain_id at the top level. Pass \
+                       summary}. The result also carries requires_operator_approval, \
+                       proposal_sha256_hex, latest_ledger, and the pin fields mutable_override and \
+                       unknown_override. The commit requires the attestation even when \
+                       requires_operator_approval is false. Simulate responses include profile and chain_id at the top level. Pass \
                        approval_nonce to stellar_rule_create_commit once the operator approves via \
                        `stellar-agent approve --id <nonce> --profile <profile>`. \
                        destructive_hint=false; read_only_hint=false.",

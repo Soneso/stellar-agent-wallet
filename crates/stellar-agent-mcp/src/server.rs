@@ -1537,7 +1537,9 @@ impl ServerHandler for WalletServer {
              name and passphrase, read-only); \
              stellar_sep43_sign_transaction (SEP-43 signTransaction: signs a \
              TransactionEnvelope XDR, returns signedTxXdr + signerAddress, \
-             NOT destructive — does not submit); \
+             NOT destructive, does not submit; testnet only, a mainnet profile \
+             refuses at entry; an approval requirement returns approval first, \
+             and the repeat passes approval_nonce and approval_attestation); \
              stellar_sep43_sign_auth_entry (SEP-43 signAuthEntry: signs the \
              base64 HashIdPreimage of a Soroban authorization entry, envelope \
              type 9 or 10, for the signing G-key, returns the raw signature as \
@@ -1549,7 +1551,9 @@ impl ServerHandler for WalletServer {
              stellar_sep43_sign_and_submit_transaction (SEP-43 signAndSubmit / \
              WC v2 stellar_signAndSubmitXDR: signs and submits a \
              TransactionEnvelope XDR, returns signedTxXdr + txHash + status, \
-             destructive); \
+             destructive; testnet only, a mainnet profile refuses at entry; an \
+             approval requirement returns approval first, and the repeat passes \
+             approval_nonce and approval_attestation); \
              stellar_x402_create_payment (x402 v2 Exact Stellar payer: construct \
              and sign a PAYMENT-SIGNATURE payload from a PaymentRequirements \
              object, returns paymentSignature + payer + asset + amount + payTo + \

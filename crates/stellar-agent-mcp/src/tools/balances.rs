@@ -86,7 +86,7 @@ pub struct TrustlineAssetArg {
 pub struct StellarBalancesArgs {
     /// CAIP-2 chain identifier: `stellar:testnet` or `stellar:mainnet`.
     ///
-    /// Resolved against the loaded profile to determine the RPC endpoint.
+    /// Must match the loaded profile's `chain_id`. The endpoint comes from the profile.
     pub chain_id: String,
 
     /// Stellar account G-strkey or M-strkey. An M-strkey reads its G base
@@ -99,7 +99,8 @@ pub struct StellarBalancesArgs {
     ///
     /// Each entry is `{ code: "USDC", issuer: "GA5Z..." }`.  Empty or absent
     /// returns native XLM only.  Invalid entries return `invalid_params`
-    /// before any network call.
+    /// before any network call. At most 100 assets per call. A longer list
+    /// returns `invalid_params` before any network call.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub assets: Vec<TrustlineAssetArg>,
 }

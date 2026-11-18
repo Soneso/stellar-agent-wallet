@@ -130,7 +130,9 @@ impl WalletServer {
                        (SorobanAuthorization) or 10 (SorobanAuthorizationWithAddress, \
                        bound to the signing key's account). Returns { signedAuthEntry: \
                        string, signerAddress: string }, where signedAuthEntry is the \
-                       base64 raw signature to assemble into the entry. \
+                       base64 raw signature to assemble into the entry. Testnet only. A \
+                       mainnet profile refuses with network.mainnet_write_forbidden before \
+                       signing. \
                        read_only_hint=false; destructive_hint=false.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]

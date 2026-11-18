@@ -104,6 +104,8 @@ impl WalletServer {
         description = "Sign an arbitrary UTF-8 message (SEP-43 signMessage). \
                        Signs the SEP-53 prefixed digest SHA-256('Stellar Signed Message:\\n' + message). \
                        Returns { signedMessage: string (base64), signerAddress: string }. \
+                       Testnet only. A mainnet profile refuses with \
+                       network.mainnet_write_forbidden before signing. \
                        read_only_hint=false; destructive_hint=false.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]

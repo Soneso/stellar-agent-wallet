@@ -26,6 +26,7 @@ pub(crate) struct RotateHmacKeyArgs {
     /// Profile name whose counterparty cache HMAC key should be rotated.
     ///
     /// Defaults to the `STELLAR_AGENT_PROFILE` env var, then `"default"`.
+    /// A mainnet profile must be named with this flag.
     #[arg(long = "profile", value_name = "NAME")]
     pub(crate) profile: Option<String>,
 }

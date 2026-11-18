@@ -79,6 +79,7 @@ pub(crate) struct EnrollOwnerKeyArgs {
     /// Profile whose owner public key should be enrolled.
     ///
     /// Defaults to the `STELLAR_AGENT_PROFILE` env var, then `"default"`.
+    /// A mainnet profile must be named with this flag.
     #[arg(long = "profile", value_name = "NAME")]
     pub(crate) profile: Option<String>,
 

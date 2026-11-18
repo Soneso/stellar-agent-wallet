@@ -179,8 +179,10 @@ pub enum ProfileSubcommand {
     /// Clear verified policy-window history.
     ///
     /// An absent file with no protected generation establishes an empty store.
-    /// Unverifiable state refuses. No verb recovers such state in this release;
-    /// create a profile under a new name. The reset is audited.
+    /// A profile with a policy pin or an enrolled owner requires
+    /// `--owner-secret-env <VAR>` holding that owner's seed.
+    /// Unverifiable state refuses. No verb recovers unverifiable window state;
+    /// create a profile under a new name instead. The reset is audited.
     ResetWindowState(reset_window_state::ResetWindowStateArgs),
     /// Recover MPP state with an explicit acknowledgement and an audit row.
     ///

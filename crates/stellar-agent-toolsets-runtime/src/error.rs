@@ -92,7 +92,8 @@ pub enum ToolsetRuntimeError {
     ///
     /// Reinstall the toolset from the signed package:
     /// ```text
-    /// stellar-agent toolset install <package> --force
+    /// stellar-agent toolsets install <PKG@VERSION> --file <PATH> --shasum <HEX> \
+    ///     --signature <HEX> --publisher <G-STRKEY> --force
     /// ```
     ///
     /// ## Security note

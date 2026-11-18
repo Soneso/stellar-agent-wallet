@@ -101,6 +101,7 @@ pub struct ServeArgs {
     pub port: u16,
 
     /// Do not open the bootstrap URL in a browser; only print it.
+    /// A mainnet local server refuses this flag; use `--open-by-operator` there.
     #[arg(long = "no-open")]
     pub no_open: bool,
 
@@ -125,6 +126,8 @@ pub struct ServeArgs {
     ///
     /// Refuses to start unless the profile has a `[remote_approval]` block
     /// with `enabled = true` AND `--confirm-remote-exposure` is also passed.
+    /// On mainnet it also requires a signed approval origin in the policy;
+    /// without one it refuses with `approval.mainnet_remote_unsupported`.
     /// `--port` / `--no-open` / `--notify` / `--bell` / `--include-expired`
     /// are ignored in this mode (the remote surface has its own bind address
     /// from the profile config and no browser auto-launch).
