@@ -181,6 +181,13 @@ async fn production_status_and_dispatch_use_outcomes() {
         }))
     });
     let hook = Hook;
+    // The driver ages its shared observation, 5 s at most, and its deadlines
+    // on the tokio clock. The paused clock stays at the pass start: the
+    // parked blocking task holds off auto-advance while reads wait on I/O.
+    // Each attempt then starts with a fresh observation under any load.
+    tokio::time::pause();
+    let (thaw, frozen) = std::sync::mpsc::channel::<()>();
+    let holder = tokio::task::spawn_blocking(move || frozen.recv());
     let pass = submission_flow::reconcile_pass(
         &fx.fx.profile,
         &fx.fx.store,
@@ -191,6 +198,9 @@ async fn production_status_and_dispatch_use_outcomes() {
         || Ok(Arc::clone(&fx.writer)),
     )
     .await;
+    drop(thaw);
+    assert!(holder.await.unwrap().is_err());
+    tokio::time::resume();
     drop(hook);
     let ReconcilePass::RecoveryFailed {
         legacy, recovery, ..
